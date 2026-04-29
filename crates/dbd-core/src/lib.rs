@@ -6,6 +6,7 @@ pub mod parser;
 pub mod references;
 pub mod scanner;
 pub mod script;
+pub mod snapshot;
 
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
