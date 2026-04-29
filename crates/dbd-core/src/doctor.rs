@@ -77,7 +77,11 @@ pub fn migrate_config(content: &str) -> Result<String> {
         if let Some(name) = op.get(&val("name")) {
             project.insert(val("name"), name.clone());
         }
-        // note is new, not in old format
+        if let Some(note) = op.get(&val("note")) {
+            if !note.is_null() {
+                project.insert(val("note"), note.clone());
+            }
+        }
     }
     new_doc.insert(val("project"), serde_yaml::Value::Mapping(project));
 
@@ -196,12 +200,29 @@ pub fn migrate_config(content: &str) -> Result<String> {
             new_import.insert(val("options"), serde_yaml::Value::Mapping(new_options));
         }
 
-        // tables, after — pass through
+        // tables, after — pass through (skip nulls, convert to empty sequences)
         if let Some(tables) = import.get(&val("tables")) {
-            new_import.insert(val("tables"), tables.clone());
+            if !tables.is_null() {
+                new_import.insert(val("tables"), tables.clone());
+            }
         }
         if let Some(after) = import.get(&val("after")) {
-            new_import.insert(val("after"), after.clone());
+            if after.is_null() {
+                // Skip null values — the default empty vec handles this
+            } else {
+                new_import.insert(val("after"), after.clone());
+            }
+        }
+
+        // Pass through any other import keys (env-specific after, schemas, etc.)
+        for (key, value) in import {
+            let key_str = key.as_str().unwrap_or("");
+            if ["options", "tables", "after", "staging"].contains(&key_str) {
+                continue; // Already handled
+            }
+            if !value.is_null() {
+                new_import.insert(key.clone(), value.clone());
+            }
         }
 
         new_doc.insert(val("import"), serde_yaml::Value::Mapping(new_import));
