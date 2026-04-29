@@ -65,7 +65,7 @@ pub async fn run(
 }
 
 /// Get or create a database adapter from the URL.
-#[cfg(feature = "postgres")]
+
 async fn get_adapter(
     config: &Path,
     database_url: Option<&str>,
@@ -91,13 +91,6 @@ async fn get_adapter(
         .context("Failed to connect to database")
 }
 
-#[cfg(not(feature = "postgres"))]
-async fn get_adapter(
-    _config: &Path,
-    _database_url: Option<&str>,
-) -> Result<dbd_core::adapter::mock::MockAdapter> {
-    anyhow::bail!("PostgreSQL adapter not compiled. Build with --features postgres")
-}
 
 /// Expand $ENV_VAR references in a string.
 fn resolve_env_vars(s: &str) -> String {
@@ -242,19 +235,35 @@ fn cmd_import_dry_run(
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
-    let tables: Vec<_> = design
-        .import_tables()
-        .iter()
-        .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
-        .collect();
+    let plan = design.import_plan(name);
 
-    for table in &tables {
-        let file = table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
-        let fmt = table.format.as_deref().unwrap_or("csv");
-        output::info(verbosity, &format!("  {} ({}) ← {}", table.name, fmt, file));
+    // Step 1: Data loading
+    for entry in &plan {
+        let file = entry.table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+        let fmt = entry.table.format.as_deref().unwrap_or("csv");
+        output::info(verbosity, &format!("  import {} ({}) ← {}", entry.table.name, fmt, file));
     }
 
-    output::summary(0, 0, tables.len());
+    // Step 2: Import procedures
+    let has_procedures = plan.iter().any(|e| e.procedure.is_some());
+    if has_procedures {
+        output::info(verbosity, "");
+    }
+    for entry in &plan {
+        if let Some(ref proc_name) = entry.procedure {
+            output::info(verbosity, &format!("  call {proc_name}()"));
+        }
+    }
+
+    // Step 3: After scripts
+    if !design.config().import.after.is_empty() {
+        output::info(verbosity, "");
+        for after_file in &design.config().import.after {
+            output::info(verbosity, &format!("  run {after_file}"));
+        }
+    }
+
+    output::summary(0, 0, plan.len());
     Ok(())
 }
 

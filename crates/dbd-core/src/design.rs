@@ -19,6 +19,13 @@ pub struct Report {
     pub warnings: Vec<Entity>,
 }
 
+/// An entry in the import plan: staging table + matching procedure (if found).
+#[derive(Debug)]
+pub struct ImportPlanEntry {
+    pub table: Entity,
+    pub procedure: Option<String>,
+}
+
 /// The Design orchestrator — main entry point for all operations.
 ///
 /// Loads configuration, discovers and parses entities, resolves dependencies,
@@ -328,13 +335,11 @@ impl Design {
         Ok(())
     }
 
-    /// Import staging data via the adapter.
-    pub async fn import_data(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        name: Option<&str>,
-        dry_run: bool,
-    ) -> Result<()> {
+    /// Build the import plan: each staging table paired with its import procedure.
+    ///
+    /// Convention: for staging table `staging.models`, the procedure is
+    /// `staging.import_models()` if it exists in the DDL entities.
+    pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
         let tables: Vec<&Entity> = self
             .import_tables
             .iter()
@@ -342,12 +347,81 @@ impl Design {
             .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
             .collect();
 
-        for table in &tables {
+        tables
+            .iter()
+            .map(|table| {
+                let procedure = self.find_import_procedure(&table.name);
+                ImportPlanEntry {
+                    table: (*table).clone(),
+                    procedure,
+                }
+            })
+            .collect()
+    }
+
+    /// Find the import procedure for a staging table by naming convention.
+    /// staging.models → staging.import_models
+    fn find_import_procedure(&self, table_name: &str) -> Option<String> {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (schema, base_name) = if parts.len() > 1 {
+            (parts[0], parts[1])
+        } else {
+            return None;
+        };
+
+        let proc_name = format!("{schema}.import_{base_name}");
+        if self.entities.iter().any(|e| {
+            (e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function)
+                && e.name == proc_name
+        }) {
+            Some(proc_name)
+        } else {
+            None
+        }
+    }
+
+    /// Import staging data via the adapter.
+    pub async fn import_data(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        dry_run: bool,
+    ) -> Result<()> {
+        let plan = self.import_plan(name);
+
+        // Step 1: Load data into staging tables
+        for entry in &plan {
             if dry_run {
-                println!("Would import {}", table.name);
+                println!("Would import {}", entry.table.name);
             } else {
-                println!("Importing {}", table.name);
-                adapter.import_data(table, false).await?;
+                println!("Importing {}", entry.table.name);
+                adapter.import_data(&entry.table, false).await?;
+            }
+        }
+
+        // Step 2: Call import procedures
+        for entry in &plan {
+            if let Some(ref proc_name) = entry.procedure {
+                if dry_run {
+                    println!("Would call {proc_name}()");
+                } else {
+                    println!("Calling {proc_name}()");
+                    adapter
+                        .execute_script(&format!("CALL {proc_name}();"))
+                        .await?;
+                }
+            }
+        }
+
+        // Step 3: Run after scripts
+        for after_file in &self.config.import.after {
+            let full_path = self.project_dir.join(after_file);
+            if dry_run {
+                println!("Would run {after_file}");
+            } else {
+                println!("Running {after_file}");
+                let sql = std::fs::read_to_string(&full_path)?;
+                adapter.execute_script(&sql).await?;
             }
         }
 
