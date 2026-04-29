@@ -11,7 +11,7 @@ name = "dbd"
 path = "src/main.rs"
 
 [dependencies]
-dbd-core = { path = "../dbd-core" }
+dbd-core = { path = "../dbd-core", features = ["postgres"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json.workspace = true
 serde_yaml.workspace = true

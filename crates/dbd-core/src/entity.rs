@@ -279,6 +279,70 @@ impl Entity {
         Self::new(EntityType::External, name)
     }
 
+    /// Create an import entity from a data file path.
+    ///
+    /// Path format: `import/<schema>/<name>.<ext>` or `import/<env>/<schema>/<name>.<ext>`
+    /// Returns the entity with the file path set, format derived from extension.
+    pub fn from_import_file(path: &Path) -> Self {
+        let parts: Vec<&str> = path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+
+        // Find "import" in the path and work from there
+        let import_pos = parts.iter().rposition(|&p| p == "import");
+        let after_import = match import_pos {
+            Some(pos) => &parts[pos + 1..],
+            None => &parts,
+        };
+
+        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
+        // vs import/staging/file.csv → env=None, schema=staging
+        let (env, schema_and_rest) = if after_import.len() >= 3
+            && (after_import[0] == "dev" || after_import[0] == "prod")
+        {
+            (Some(after_import[0].to_string()), &after_import[1..])
+        } else {
+            (None, after_import)
+        };
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("csv");
+
+        let (name, schema) = if schema_and_rest.len() >= 2 {
+            let schema = schema_and_rest[0].to_string();
+            (format!("{schema}.{stem}"), Some(schema))
+        } else {
+            (stem.to_string(), None)
+        };
+
+        let mut entity = Self {
+            entity_type: EntityType::Import,
+            name,
+            schema,
+            file: Some(path.to_path_buf()),
+            format: Some(ext.to_string()),
+            refers: Vec::new(),
+            references: Vec::new(),
+            search_paths: Vec::new(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            table_def: None,
+            enum_values: Vec::new(),
+        };
+
+        entity
+    }
+
     /// Whether this entity has validation errors.
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()

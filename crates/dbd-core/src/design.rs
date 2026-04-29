@@ -125,13 +125,13 @@ impl Design {
 
         let entities = [schemas, extensions, sorted_roles, sorted_enums, sorted_others, externals].concat();
 
-        // Scan import tables
+        // Scan import tables (data files, not DDL)
         let import_files = scanner::scan_import(&project_dir);
         let import_tables: Vec<Entity> = import_files
             .iter()
-            .filter_map(|file| {
+            .map(|file| {
                 let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-                Some(Entity::from_file(relative))
+                Entity::from_import_file(relative)
             })
             .collect();
 
@@ -153,6 +153,11 @@ impl Design {
     /// Access all entities (sorted in apply order).
     pub fn entities(&self) -> &[Entity] {
         &self.entities
+    }
+
+    /// Access import tables (data files found in import/).
+    pub fn import_tables(&self) -> &[Entity] {
+        &self.import_tables
     }
 
     /// Project directory path.

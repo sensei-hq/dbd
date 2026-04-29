@@ -26,7 +26,11 @@ pub async fn run(
         }
 
         Commands::Import { name, dry_run } => {
-            cmd_import(config, env, project_dir, database_url, name.as_deref(), *dry_run, verbosity).await
+            if *dry_run {
+                cmd_import_dry_run(config, env, project_dir, name.as_deref(), verbosity)
+            } else {
+                cmd_import(config, env, project_dir, database_url, name.as_deref(), verbosity).await
+            }
         }
 
         Commands::Reset { target, dry_run, force } => {
@@ -228,25 +232,48 @@ async fn cmd_apply(
     Ok(())
 }
 
+fn cmd_import_dry_run(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+
+    let tables: Vec<_> = design
+        .import_tables()
+        .iter()
+        .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
+        .collect();
+
+    for table in &tables {
+        let file = table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+        let fmt = table.format.as_deref().unwrap_or("csv");
+        output::info(verbosity, &format!("  {} ({}) ← {}", table.name, fmt, file));
+    }
+
+    output::summary(0, 0, tables.len());
+    Ok(())
+}
+
 async fn cmd_import(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
-    dry_run: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-
-    if dry_run {
-        output::info(verbosity, "Import dry-run:");
-        // The library handles dry-run printing
-    }
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
 
     let adapter = get_adapter(config, database_url).await?;
-    design.import_data(&adapter, name, dry_run).await?;
-    output::info(verbosity, "Import complete.");
+    design.import_data(&adapter, name, false).await?;
+
+    let count = design.import_tables().len();
+    output::info(verbosity, &format!("Imported {count} tables."));
     Ok(())
 }
 
