@@ -108,6 +108,8 @@ pub trait DatabaseAdapter: Send + Sync {
 }
 
 pub mod mock;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 #[cfg(test)]
 mod tests {
