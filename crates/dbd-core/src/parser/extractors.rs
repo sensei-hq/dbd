@@ -31,29 +31,75 @@ pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
     vec!["public".to_string()]
 }
 
-/// Extract table references from a VIEW's SELECT query.
+/// Extract table references from a VIEW's SELECT query using the AST.
+///
+/// Walks the parsed query's FROM clauses to find table references directly,
+/// avoiding the alias.column false positives from string-based regex matching.
 pub fn extract_view_info(
     statements: &[Statement],
     search_paths: &[String],
 ) -> (Vec<Reference>, Vec<String>) {
     let mut references = Vec::new();
     let columns = Vec::new();
+    let default_schema = search_paths.first().map(|s| s.as_str()).unwrap_or("public");
 
     for stmt in statements {
         if let Statement::CreateView(create_view) = stmt {
-            // Extract table references from the query body string
-            let query_str = create_view.query.to_string();
-            let tables = extract_tables_from_sql(&query_str, search_paths);
-            for table in tables {
-                references.push(Reference {
-                    name: table,
-                    ref_type: Some("table".to_string()),
-                });
-            }
+            extract_table_refs_from_query(&create_view.query, default_schema, &mut references);
         }
     }
 
     (references, columns)
+}
+
+/// Recursively extract table references from a query's FROM/JOIN clauses.
+fn extract_table_refs_from_query(
+    query: &sqlparser::ast::Query,
+    default_schema: &str,
+    refs: &mut Vec<Reference>,
+) {
+    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+        for table_with_joins in &select.from {
+            extract_table_ref_from_factor(&table_with_joins.relation, default_schema, refs);
+            for join in &table_with_joins.joins {
+                extract_table_ref_from_factor(&join.relation, default_schema, refs);
+            }
+        }
+    }
+}
+
+/// Extract a table name from a TableFactor AST node.
+fn extract_table_ref_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    default_schema: &str,
+    refs: &mut Vec<Reference>,
+) {
+    if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
+        let parts: Vec<&str> = name.0.iter()
+            .filter_map(|p| p.as_ident())
+            .map(|i| i.value.as_str())
+            .collect();
+
+        let qualified = if parts.len() >= 2 {
+            let schema = parts[0];
+            let table = parts[1];
+            if SYSTEM_SCHEMAS.contains(&schema) {
+                return;
+            }
+            format!("{schema}.{table}")
+        } else if let Some(table) = parts.first() {
+            format!("{default_schema}.{table}")
+        } else {
+            return;
+        };
+
+        if !refs.iter().any(|r| r.name == qualified) {
+            refs.push(Reference {
+                name: qualified,
+                ref_type: Some("table".to_string()),
+            });
+        }
+    }
 }
 
 /// Extract enum values from CREATE TYPE ... AS ENUM statements.
@@ -132,24 +178,33 @@ pub fn extract_proc_reads_writes(sql: &str) -> (Vec<String>, Vec<String>) {
     (reads, writes)
 }
 
+/// System schemas to exclude from references.
+const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
+
 /// Find qualified table names (schema.table) after a SQL keyword pattern.
+/// Excludes system schema references.
 fn regex_table_after(sql: &str, pattern: &str) -> Vec<String> {
     let re = regex::Regex::new(&format!(r"{pattern}([a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)"))
         .unwrap();
     re.captures_iter(sql)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
+        .filter(|name| {
+            let schema = name.split('.').next().unwrap_or("");
+            !SYSTEM_SCHEMAS.contains(&schema)
+        })
         .collect()
 }
 
-/// Extract table names from a SQL string using simple pattern matching.
-/// Qualifies unqualified names using search_paths.
+/// Extract table names from a SQL string by looking at structural positions only.
+///
+/// Only extracts names after FROM, JOIN, INTO, UPDATE — positions where table names appear.
+/// Does NOT scan the entire SQL for schema.table patterns, which would match alias.column.
 fn extract_tables_from_sql(sql: &str, search_paths: &[String]) -> Vec<String> {
     let lower = sql.to_lowercase();
     let mut tables = Vec::new();
     let default_schema = search_paths.first().map(|s| s.as_str()).unwrap_or("public");
 
-    // SQL keywords that should not be treated as table names
     let sql_keywords = [
         "select", "from", "where", "and", "or", "not", "in", "on", "as", "is",
         "null", "true", "false", "inner", "outer", "left", "right", "cross",
@@ -158,37 +213,40 @@ fn extract_tables_from_sql(sql: &str, search_paths: &[String]) -> Vec<String> {
         "group", "having", "limit", "offset", "union", "all", "distinct",
         "case", "when", "then", "else", "end", "cast", "coalesce", "current_user",
         "now", "trim", "excluded", "conflict", "do", "begin", "replace", "function",
-        "procedure",
+        "procedure", "lateral",
     ];
 
-    // Match qualified names: schema.table
-    let qualified_re =
-        regex::Regex::new(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b").unwrap();
-    for cap in qualified_re.captures_iter(&lower) {
-        let schema = cap.get(1).unwrap().as_str();
-        let table = cap.get(2).unwrap().as_str();
-        // Skip common non-table patterns (aliases like lv.id, lkp.name)
-        if ["lv", "lkp", "stg", "t", "s"].contains(&schema) {
-            continue; // table aliases
-        }
-        let qualified = format!("{schema}.{table}");
-        if !tables.contains(&qualified) {
-            tables.push(qualified);
-        }
-    }
+    // System schemas that should never be treated as project references
+    let system_schemas = [
+        "information_schema", "pg_catalog", "pg_toast",
+    ];
 
-    // Match unqualified table names after FROM and JOIN keywords.
-    // Qualify them with the default search_path schema.
-    let unqualified_re = regex::Regex::new(
-        r"(?i)\b(?:from|join)\s+([a-z_][a-z0-9_]*)\b"
+    // Only match table names in structural positions: after FROM, JOIN, UPDATE, INTO
+    // Handles both qualified (schema.table) and unqualified (table) names.
+    let table_position_re = regex::Regex::new(
+        r"(?i)\b(?:from|join|update|into)\s+([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)"
     ).unwrap();
-    for cap in unqualified_re.captures_iter(&lower) {
+
+    for cap in table_position_re.captures_iter(&lower) {
         let name = cap.get(1).unwrap().as_str();
-        // Skip SQL keywords and common aliases
+
+        // Skip SQL keywords
         if sql_keywords.contains(&name) {
             continue;
         }
-        let qualified = format!("{default_schema}.{name}");
+
+        let qualified = if name.contains('.') {
+            // Already qualified — check for system schemas
+            let schema = name.split('.').next().unwrap_or("");
+            if system_schemas.contains(&schema) {
+                continue;
+            }
+            name.to_string()
+        } else {
+            // Unqualified — apply search_path
+            format!("{default_schema}.{name}")
+        };
+
         if !tables.contains(&qualified) {
             tables.push(qualified);
         }
