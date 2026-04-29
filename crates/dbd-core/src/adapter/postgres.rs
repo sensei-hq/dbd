@@ -173,7 +173,6 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
         if dry_run {
-            println!("Would import {}", entity.name);
             return Ok(());
         }
 
@@ -184,40 +183,57 @@ impl DatabaseAdapter for PostgresAdapter {
         };
 
         let format = entity.format.as_deref().unwrap_or("csv");
-        let copy_sql = match format {
-            "csv" => format!(
-                "COPY \"{}\" FROM STDIN WITH (FORMAT csv, HEADER true)",
-                entity.name.replace('.', "\".\"")
-            ),
-            "tsv" => format!(
-                "COPY \"{}\" FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')",
-                entity.name.replace('.', "\".\"")
-            ),
+        let qualified = entity.name.replace('.', "\".\"");
+        let data = std::fs::read_to_string(file_path)?;
+
+        match format {
+            "csv" | "tsv" => {
+                let delimiter = if format == "tsv" { ", DELIMITER E'\\t'" } else { "" };
+                let copy_sql = format!(
+                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter})"
+                );
+                let mut conn = self.pool.acquire().await
+                    .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
+                let mut copy = conn.copy_in_raw(&copy_sql).await
+                    .map_err(|e| DbdError::Config(format!("COPY failed: {e}")))?;
+                copy.send(data.as_bytes()).await
+                    .map_err(|e| DbdError::Config(format!("COPY send failed: {e}")))?;
+                copy.finish().await
+                    .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
+            }
+            "json" | "jsonl" => {
+                // JSONL: create temp table, load lines, call import procedure
+                let schema = entity.schema.as_deref().unwrap_or("staging");
+                self.execute_script("CREATE TABLE IF NOT EXISTS _temp (data jsonb)").await?;
+                self.execute_script("TRUNCATE _temp").await?;
+
+                // Insert each line as a JSONB row
+                for line in data.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let insert = format!(
+                        "INSERT INTO _temp (data) VALUES ('{}'::jsonb)",
+                        line.replace('\'', "''")
+                    );
+                    self.execute_script(&insert).await?;
+                }
+
+                // Call the import procedure to move data from _temp to the target
+                let proc_call = format!(
+                    "CALL {schema}.import_jsonb_to_table('_temp', '{}')",
+                    entity.name.replace('\'', "''")
+                );
+                self.execute_script(&proc_call).await?;
+                self.execute_script("DROP TABLE IF EXISTS _temp").await?;
+            }
             _ => {
                 return Err(DbdError::Config(format!(
                     "Unsupported import format: {format}"
                 )));
             }
-        };
-
-        let data = std::fs::read_to_string(file_path)?;
-
-        // Use raw COPY protocol via sqlx
-        let mut conn = self.pool.acquire().await
-            .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
-
-        let mut copy = conn
-            .copy_in_raw(&copy_sql)
-            .await
-            .map_err(|e| DbdError::Config(format!("COPY failed: {e}")))?;
-
-        copy.send(data.as_bytes())
-            .await
-            .map_err(|e| DbdError::Config(format!("COPY send failed: {e}")))?;
-
-        copy.finish()
-            .await
-            .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
+        }
 
         Ok(())
     }

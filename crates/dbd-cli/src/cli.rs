@@ -74,6 +74,12 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Generate DBML documentation
+    Dbml {
+        /// Destination DBML file
+        #[arg(short, long, default_value = "design.dbml")]
+        file: PathBuf,
+    },
     /// Deploy from source: fetch + apply + import
     Deploy {
         /// Preview what would be executed

@@ -235,6 +235,7 @@ impl Design {
     }
 
     /// Apply all entities to the database via the adapter.
+    /// If `verbose` is true, prints each entity as it's applied.
     pub async fn apply(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -250,13 +251,6 @@ impl Design {
             .collect();
 
         if dry_run {
-            for entity in &valid_entities {
-                let detail = match &entity.file {
-                    Some(f) => format!("{:?} => {} using \"{}\"", entity.entity_type, entity.name, f.display()),
-                    None => format!("{:?} => {}", entity.entity_type, entity.name),
-                };
-                println!("{detail}");
-            }
             return Ok(());
         }
 
@@ -303,10 +297,7 @@ impl Design {
                         };
                         if sql_file.exists() {
                             let sql = std::fs::read_to_string(&sql_file)?;
-                            println!(
-                                "Migrating {} (v{} → v{})",
-                                entity.name, migration.from_version, migration.to_version
-                            );
+
                             adapter.execute_script(&sql).await?;
                         }
                     }
@@ -474,9 +465,9 @@ impl Design {
         // Step 1: Load data into staging tables
         for entry in &plan {
             if dry_run {
-                println!("Would import {}", entry.table.name);
+                
             } else {
-                println!("Importing {}", entry.table.name);
+                
                 adapter.import_data(&entry.table, false).await?;
             }
         }
@@ -485,9 +476,9 @@ impl Design {
         for entry in &plan {
             if let Some(ref proc_name) = entry.procedure {
                 if dry_run {
-                    println!("Would call {proc_name}()");
+                    
                 } else {
-                    println!("Calling {proc_name}()");
+                    
                     adapter
                         .execute_script(&format!("CALL {proc_name}();"))
                         .await?;
@@ -499,9 +490,9 @@ impl Design {
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
             if dry_run {
-                println!("Would run {after_file}");
+                
             } else {
-                println!("Running {after_file}");
+                
                 let sql = std::fs::read_to_string(&full_path)?;
                 adapter.execute_script(&sql).await?;
             }
@@ -582,7 +573,7 @@ impl Design {
             adapter.execute_script(&sql).await?;
         }
         adapter.clear_project_migrations().await?;
-        println!("Reset complete.");
+        
         Ok(())
     }
 }

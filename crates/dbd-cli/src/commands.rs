@@ -60,6 +60,8 @@ pub async fn run(
             Ok(())
         }
 
+        Commands::Dbml { file } => cmd_dbml(config, env, project_dir, file, verbosity),
+
         Commands::Doctor { fix } => cmd_doctor(config, *fix, verbosity),
     }
 }
@@ -214,14 +216,29 @@ async fn cmd_apply(
         return Ok(());
     }
 
+    let valid: Vec<_> = design
+        .entities()
+        .iter()
+        .filter(|e| e.errors.is_empty() && e.entity_type != dbd_core::EntityType::External)
+        .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+        .collect();
+
+    if verbosity.is_verbose() {
+        output::always("Apply order:");
+        for entity in &valid {
+            let detail = match &entity.file {
+                Some(f) => format!("  {:?} => {} using \"{}\"", entity.entity_type, entity.name, f.display()),
+                None => format!("  {:?} => {}", entity.entity_type, entity.name),
+            };
+            output::always(&detail);
+        }
+        output::always("");
+    }
+
     let adapter = get_adapter(config, database_url).await?;
     output::info(verbosity, "Applying...");
     design.apply(&adapter, name, false).await?;
-
-    let count = design.entities().iter()
-        .filter(|e| e.errors.is_empty() && e.entity_type != dbd_core::EntityType::External)
-        .count();
-    output::info(verbosity, &format!("Applied {count} entities."));
+    output::info(verbosity, &format!("Applied {} entities.", valid.len()));
     Ok(())
 }
 
@@ -339,6 +356,22 @@ fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
     if verbosity.is_silent() {
         output::always(&format!("{} snapshots", snapshots.len()));
     }
+}
+
+fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+
+    let doc = dbd_core::dbml::generate_dbml(&dbd_core::dbml::DbmlParams {
+        entities: design.entities(),
+        project_name: &design.config().project.name,
+        database_type: &design.config().source.dialect,
+        project_note: design.config().project.note.as_deref(),
+    });
+
+    std::fs::write(file, &doc.content)?;
+    output::info(verbosity, &format!("Generated DBML in {}", file.display()));
+    Ok(())
 }
 
 fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
