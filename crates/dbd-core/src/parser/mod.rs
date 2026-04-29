@@ -18,14 +18,26 @@ pub use extractors::extract_search_paths;
 /// - Table structure (columns, constraints, indexes) into TableDef
 /// - Enum values
 /// - Procedure reads/writes
-/// Strip COMMENT ON statements that sqlparser 0.61 doesn't support.
-/// sqlparser handles COMMENT ON TABLE and COMMENT ON COLUMN,
-/// but fails on COMMENT ON VIEW, FUNCTION, PROCEDURE, etc.
+/// Preprocess SQL to work around sqlparser 0.61 limitations:
+///
+/// 1. Strip unsupported COMMENT ON types (VIEW, FUNCTION, PROCEDURE, etc.)
+///    sqlparser only handles COMMENT ON TABLE and COMMENT ON COLUMN.
+///
+/// 2. Rewrite CREATE [OR REPLACE] PROCEDURE → CREATE [OR REPLACE] FUNCTION
+///    sqlparser doesn't support PROCEDURE. Since we only need the body for
+///    reads/writes extraction, FUNCTION parsing produces identical results.
 fn preprocess_sql(sql: &str) -> String {
-    let re = regex::Regex::new(
+    // Strip unsupported COMMENT ON types
+    let comment_re = regex::Regex::new(
         r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
     ).unwrap();
-    re.replace_all(sql, "").to_string()
+    let result = comment_re.replace_all(sql, "");
+
+    // Rewrite PROCEDURE → FUNCTION for sqlparser compatibility
+    let proc_re = regex::Regex::new(
+        r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b"
+    ).unwrap();
+    proc_re.replace_all(&result, "${1}FUNCTION").to_string()
 }
 
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
