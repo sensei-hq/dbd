@@ -122,11 +122,17 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
 
 /// Extract reads and writes from a procedure/function body using pattern matching.
 ///
-/// Why regex instead of sqlparser AST?
-/// - sqlparser 0.61 does not support `CREATE [OR REPLACE] PROCEDURE` (parse fails)
-/// - For functions, sqlparser captures the body as an opaque `DollarQuotedString` —
-///   the PL/pgSQL inside is not parsed into AST nodes
-/// - Both cases require scanning the body text for DML patterns
+/// WORKAROUND: sqlparser-plpgsql-body
+/// Limitation: sqlparser captures function/procedure bodies as opaque
+///             DollarQuotedString values. The PL/pgSQL inside is NOT parsed
+///             into AST nodes — there are no Statement nodes for the body's
+///             INSERT/SELECT/UPDATE/DELETE.
+/// Impact:     Cannot use AST to extract table reads/writes from procedures.
+/// Fix:        Scan the raw body text for DML patterns (FROM, JOIN, INSERT INTO, etc.)
+/// Check:      If sqlparser adds PL/pgSQL body parsing, extract reads/writes from
+///             the body's AST instead. Look for CreateFunction.function_body containing
+///             parsed Statement nodes rather than a DollarQuotedString.
+/// Alternative: pg_query crate has experimental parse_plpgsql() that returns JSON AST.
 ///
 /// Patterns matched:
 /// - SELECT ... FROM schema.table → read

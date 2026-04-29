@@ -18,26 +18,64 @@ pub use extractors::extract_search_paths;
 /// - Table structure (columns, constraints, indexes) into TableDef
 /// - Enum values
 /// - Procedure reads/writes
-/// Preprocess SQL to work around sqlparser 0.61 limitations:
-///
-/// 1. Strip unsupported COMMENT ON types (VIEW, FUNCTION, PROCEDURE, etc.)
-///    sqlparser only handles COMMENT ON TABLE and COMMENT ON COLUMN.
-///
-/// 2. Rewrite CREATE [OR REPLACE] PROCEDURE → CREATE [OR REPLACE] FUNCTION
-///    sqlparser doesn't support PROCEDURE. Since we only need the body for
-///    reads/writes extraction, FUNCTION parsing produces identical results.
-fn preprocess_sql(sql: &str) -> String {
-    // Strip unsupported COMMENT ON types
-    let comment_re = regex::Regex::new(
-        r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
-    ).unwrap();
-    let result = comment_re.replace_all(sql, "");
+// ── sqlparser workarounds ────────────────────────────────────────────
+//
+// WORKAROUND_REGISTRY: sqlparser-rs 0.61 (Apache DataFusion)
+//
+// The workarounds below patch SQL text before feeding it to sqlparser.
+// Each is annotated with the limitation it addresses and what to check
+// when upgrading sqlparser or switching to an alternative parser.
+//
+// To test if a workaround is still needed after a parser upgrade:
+//   1. Comment out the workaround
+//   2. Run: cargo test
+//   3. Run: dbd-rs inspect -s <project-with-procedures-and-views>
+//   4. If no parse errors → remove the workaround
+//
+// Alternative parsers to evaluate:
+//   - pg_query (Rust bindings to libpg_query / PostgreSQL's C parser)
+//     Handles everything but requires C compilation.
+//   - tree-sitter-sql — editor-focused CST, not suitable for DDL analysis.
+// ─────────────────────────────────────────────────────────────────────
 
-    // Rewrite PROCEDURE → FUNCTION for sqlparser compatibility
-    let proc_re = regex::Regex::new(
-        r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b"
-    ).unwrap();
-    proc_re.replace_all(&result, "${1}FUNCTION").to_string()
+/// Preprocess SQL to work around known sqlparser limitations.
+/// See WORKAROUND_REGISTRY above for details.
+fn preprocess_sql(sql: &str) -> String {
+    let mut result = std::borrow::Cow::Borrowed(sql);
+
+    // WORKAROUND: sqlparser-comment-on-object-types
+    // Limitation: sqlparser only supports COMMENT ON TABLE and COMMENT ON COLUMN.
+    //             COMMENT ON VIEW, FUNCTION, PROCEDURE, TRIGGER, INDEX, etc. fail.
+    // Impact:     Parse error on any DDL file with non-table/column comments.
+    // Check:      Parser::parse_sql("COMMENT ON VIEW foo IS 'bar';")
+    // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
+    {
+        let re = regex::Regex::new(
+            r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
+        ).unwrap();
+        if re.is_match(&result) {
+            result = std::borrow::Cow::Owned(re.replace_all(&result, "").to_string());
+        }
+    }
+
+    // WORKAROUND: sqlparser-create-procedure
+    // Limitation: sqlparser does not support CREATE [OR REPLACE] PROCEDURE.
+    //             Only CREATE [OR REPLACE] FUNCTION is recognized.
+    // Impact:     All procedure DDL files fail to parse.
+    // Fix:        Rewrite PROCEDURE → FUNCTION before parsing. The AST structure
+    //             is identical — we only need the body for reads/writes extraction.
+    // Check:      Parser::parse_sql("CREATE PROCEDURE foo() LANGUAGE plpgsql AS $$ BEGIN END; $$")
+    // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
+    {
+        let re = regex::Regex::new(
+            r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b"
+        ).unwrap();
+        if re.is_match(&result) {
+            result = std::borrow::Cow::Owned(re.replace_all(&result, "${1}FUNCTION").to_string());
+        }
+    }
+
+    result.into_owned()
 }
 
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
