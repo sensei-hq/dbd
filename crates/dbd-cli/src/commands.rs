@@ -299,7 +299,13 @@ async fn cmd_reset(
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if dry_run {
-        let schemas = design.config().schema_names();
+        // Show all schemas (config-declared + auto-discovered from DDL paths)
+        let schemas: Vec<&str> = design
+            .entities()
+            .iter()
+            .filter(|e| e.entity_type == dbd_core::EntityType::Schema)
+            .map(|e| e.name.as_str())
+            .collect();
         output::info(verbosity, "[dry-run] Would drop schemas:");
         for schema in &schemas {
             output::info(verbosity, &format!("  {schema}"));

@@ -571,7 +571,13 @@ impl Design {
             .map(|t| &t.roles[..])
             .unwrap_or(&[]);
 
-        let schemas = self.config.schema_names();
+        // Collect ALL schemas — both config-declared and auto-discovered from DDL paths
+        let schemas: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Schema)
+            .map(|e| e.name.clone())
+            .collect();
         if let Some(sql) = script::build_reset_script(&schemas, roles, target) {
             adapter.execute_script(&sql).await?;
         }
