@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod config;
 pub mod dbml;
 pub mod dependency;
+pub mod doctor;
 pub mod design;
 pub mod entity;
 pub mod error;

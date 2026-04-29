@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::adapter::DatabaseAdapter;
 use dbd_core::Design;
 
 use crate::cli::Commands;
@@ -56,10 +55,7 @@ pub async fn run(
             Ok(())
         }
 
-        Commands::Doctor { .. } => {
-            output::info(verbosity, "Doctor not yet implemented in Rust CLI");
-            Ok(())
-        }
+        Commands::Doctor { fix } => cmd_doctor(config, *fix, verbosity),
     }
 }
 
@@ -297,4 +293,53 @@ fn cmd_snapshot_list(config: &Path, verbosity: Verbosity) {
     if verbosity.is_silent() {
         output::always(&format!("{} snapshots", snapshots.len()));
     }
+}
+
+fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
+    if !config.exists() {
+        anyhow::bail!("Config file not found: {}", config.display());
+    }
+
+    let content = std::fs::read_to_string(config)
+        .context("Failed to read config")?;
+
+    let issues = dbd_core::doctor::detect_old_format(&content);
+
+    if issues.is_empty() {
+        output::info(verbosity, "design.yaml is in the current format — no migration needed.");
+        output::summary(0, 0, 0);
+        return Ok(());
+    }
+
+    if !verbosity.is_silent() {
+        output::always(&format!("Found {} config issue{}:", issues.len(), if issues.len() != 1 { "s" } else { "" }));
+        for issue in &issues {
+            output::always(&format!("  - {issue}"));
+        }
+    }
+
+    if fix {
+        let migrated = dbd_core::doctor::migrate_config(&content)
+            .context("Config migration failed")?;
+
+        // Verify the migrated config parses
+        let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
+            .context("Migrated config failed to parse — please report this as a bug")?;
+
+        // Write backup
+        let backup = config.with_extension("yaml.bak");
+        std::fs::copy(config, &backup)?;
+        output::info(verbosity, &format!("Backup saved to {}", backup.display()));
+
+        // Write migrated
+        std::fs::write(config, &migrated)?;
+        output::info(verbosity, &format!("Migrated {}", config.display()));
+
+        output::summary(0, 0, issues.len());
+    } else {
+        output::always("\nRun with --fix to migrate automatically.");
+        output::summary(issues.len(), 0, 0);
+    }
+
+    Ok(())
 }
