@@ -76,8 +76,15 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
 
 /// Extract reads and writes from a procedure/function body using pattern matching.
 ///
-/// Function bodies are opaque strings (dollar-quoted). We scan for DML patterns:
+/// Why regex instead of sqlparser AST?
+/// - sqlparser 0.61 does not support `CREATE [OR REPLACE] PROCEDURE` (parse fails)
+/// - For functions, sqlparser captures the body as an opaque `DollarQuotedString` —
+///   the PL/pgSQL inside is not parsed into AST nodes
+/// - Both cases require scanning the body text for DML patterns
+///
+/// Patterns matched:
 /// - SELECT ... FROM schema.table → read
+/// - JOIN schema.table → read
 /// - INSERT INTO schema.table → write
 /// - UPDATE schema.table → write
 /// - DELETE FROM schema.table → write
