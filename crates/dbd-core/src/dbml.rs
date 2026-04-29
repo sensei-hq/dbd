@@ -62,7 +62,10 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
 fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
     let mut block = format!("Project \"{}\" {{\n  database_type: '{}'", name, db_type);
     if let Some(n) = note {
-        block.push_str(&format!("\n  Note: '{}'", n));
+        let n = n.trim();
+        if !n.is_empty() {
+            block.push_str(&format!("\n  Note: {}", quote_dbml_string(n)));
+        }
     }
     block.push_str("\n}\n");
     block
@@ -117,7 +120,7 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     // Table note
     if let Some(ref note) = table_def.comments.table {
         lines.push(String::new());
-        lines.push(format!("  Note: '{}'", escape_dbml_string(note)));
+        lines.push(format!("  Note: {}", quote_dbml_string(note)));
     }
 
     lines.push("}\n".to_string());
@@ -144,7 +147,9 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
         settings.push(format!("default: {}", quote_default(default)));
     }
     if let Some(ref comment) = col.comment {
-        settings.push(format!("note: '{}'", escape_dbml_string(comment)));
+        // Inline notes must be single-line — collapse newlines
+        let inline = comment.trim().replace('\n', " ").replace('\'', "\\'");
+        settings.push(format!("note: '{}'", inline));
     }
 
     let settings_str = if settings.is_empty() {
@@ -326,8 +331,16 @@ fn quote_type_if_needed(data_type: &str) -> String {
     }
 }
 
-fn escape_dbml_string(s: &str) -> String {
-    s.replace('\'', "\\'").replace('\n', "\\n")
+/// Format a string for DBML.
+/// Single-line → single quotes: 'text'
+/// Multi-line → triple quotes: '''text'''
+fn quote_dbml_string(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.contains('\n') {
+        format!("'''\n{}\n'''", trimmed)
+    } else {
+        format!("'{}'", trimmed.replace('\'', "\\'"))
+    }
 }
 
 #[cfg(test)]
