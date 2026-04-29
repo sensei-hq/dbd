@@ -18,11 +18,22 @@ pub use extractors::extract_search_paths;
 /// - Table structure (columns, constraints, indexes) into TableDef
 /// - Enum values
 /// - Procedure reads/writes
+/// Strip COMMENT ON statements that sqlparser 0.61 doesn't support.
+/// sqlparser handles COMMENT ON TABLE and COMMENT ON COLUMN,
+/// but fails on COMMENT ON VIEW, FUNCTION, PROCEDURE, etc.
+fn preprocess_sql(sql: &str) -> String {
+    let re = regex::Regex::new(
+        r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
+    ).unwrap();
+    re.replace_all(sql, "").to_string()
+}
+
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
 
+    let cleaned = preprocess_sql(sql);
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
-    let statements = match sqlparser::parser::Parser::parse_sql(&dialect, sql) {
+    let statements = match sqlparser::parser::Parser::parse_sql(&dialect, &cleaned) {
         Ok(stmts) => stmts,
         Err(e) => {
             entity.errors.push(format!("Parse error: {e}"));

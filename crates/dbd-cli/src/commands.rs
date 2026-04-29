@@ -11,38 +11,39 @@ pub async fn run(
     config: &Path,
     env: &str,
     database_url: Option<&str>,
+    project_dir: &Path,
     verbosity: Verbosity,
 ) -> Result<()> {
     match command {
-        Commands::Inspect { name } => cmd_inspect(config, env, name.as_deref(), verbosity),
+        Commands::Inspect { name } => cmd_inspect(config, env, project_dir, name.as_deref(), verbosity),
 
-        Commands::Combine { file } => cmd_combine(config, env, file, verbosity),
+        Commands::Combine { file } => cmd_combine(config, env, project_dir, file, verbosity),
 
-        Commands::Graph { name } => cmd_graph(config, env, name.as_deref(), verbosity),
+        Commands::Graph { name } => cmd_graph(config, env, project_dir, name.as_deref(), verbosity),
 
         Commands::Apply { name, dry_run } => {
-            cmd_apply(config, env, database_url, name.as_deref(), *dry_run, verbosity).await
+            cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, verbosity).await
         }
 
         Commands::Import { name, dry_run } => {
-            cmd_import(config, env, database_url, name.as_deref(), *dry_run, verbosity).await
+            cmd_import(config, env, project_dir, database_url, name.as_deref(), *dry_run, verbosity).await
         }
 
         Commands::Reset { target, dry_run, force } => {
-            cmd_reset(config, env, database_url, target, *dry_run, *force, verbosity).await
+            cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, verbosity).await
         }
 
         Commands::Snapshot { list, .. } => {
             if *list {
-                cmd_snapshot_list(config, verbosity);
+                cmd_snapshot_list(project_dir, verbosity);
                 return Ok(());
             }
             output::info(verbosity, "Snapshot creation not yet implemented in Rust CLI");
             Ok(())
         }
 
-        Commands::Migrate { status, apply, to, dry_run } => {
-            if *status || (!apply && !dry_run) {
+        Commands::Migrate { status, apply: _, to: _, dry_run: _ } => {
+            if *status {
                 output::info(verbosity, "Migrate status not yet implemented in Rust CLI");
             } else {
                 output::info(verbosity, "Migrate apply not yet implemented in Rust CLI");
@@ -50,7 +51,7 @@ pub async fn run(
             Ok(())
         }
 
-        Commands::Deploy { dry_run } => {
+        Commands::Deploy { dry_run: _ } => {
             output::info(verbosity, "Deploy not yet implemented in Rust CLI");
             Ok(())
         }
@@ -105,8 +106,8 @@ fn resolve_env_vars(s: &str) -> String {
 
 // ── Command implementations ─────────────────────────────
 
-fn cmd_inspect(config: &Path, env: &str, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
-    let mut design = Design::from_config(config, env).context("Failed to load design")?;
+fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
+    let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let report = design.report(name);
     let total_entities = design.entities().len();
 
@@ -156,15 +157,15 @@ fn cmd_inspect(config: &Path, env: &str, name: Option<&str>, verbosity: Verbosit
     Ok(())
 }
 
-fn cmd_combine(config: &Path, env: &str, file: &Path, verbosity: Verbosity) -> Result<()> {
-    let design = Design::from_config(config, env).context("Failed to load design")?;
+fn cmd_combine(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     design.combine(file)?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }
 
-fn cmd_graph(config: &Path, env: &str, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
-    let design = Design::from_config(config, env).context("Failed to load design")?;
+fn cmd_graph(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let graph = design.graph(name);
 
     let json = serde_json::json!({
@@ -188,12 +189,13 @@ fn cmd_graph(config: &Path, env: &str, name: Option<&str>, verbosity: Verbosity)
 async fn cmd_apply(
     config: &Path,
     env: &str,
+    project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
     dry_run: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config(config, env).context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if dry_run {
         let entities: Vec<_> = design
@@ -229,12 +231,13 @@ async fn cmd_apply(
 async fn cmd_import(
     config: &Path,
     env: &str,
+    project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
     dry_run: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config(config, env).context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if dry_run {
         output::info(verbosity, "Import dry-run:");
@@ -250,13 +253,14 @@ async fn cmd_import(
 async fn cmd_reset(
     config: &Path,
     env: &str,
+    project_dir: &Path,
     database_url: Option<&str>,
     target: &str,
     dry_run: bool,
     force: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config(config, env).context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if dry_run {
         let schemas = design.config().schema_names();
@@ -272,8 +276,8 @@ async fn cmd_reset(
     Ok(())
 }
 
-fn cmd_snapshot_list(config: &Path, verbosity: Verbosity) {
-    let dir = config.parent().unwrap_or(Path::new("."));
+fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
+    let dir = project_dir;
     let snapshots = dbd_core::snapshot::list_snapshots(dir);
 
     if snapshots.is_empty() {

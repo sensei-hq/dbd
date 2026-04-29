@@ -47,14 +47,15 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     let entity_map: HashMap<String, Entity> =
         entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
 
-    // Build in-group dependency map (only track deps that exist in this set)
+    // Build in-group dependency map (only track deps that exist in this set).
+    // Exclude self-references (e.g., folders.parent_id → folders.id).
     let mut remaining: HashMap<String, HashSet<String>> = entities
         .iter()
         .map(|e| {
             let deps: HashSet<String> = e
                 .refers
                 .iter()
-                .filter(|dep| entity_names.contains(*dep))
+                .filter(|dep| entity_names.contains(*dep) && **dep != e.name)
                 .cloned()
                 .collect();
             (e.name.clone(), deps)
@@ -121,7 +122,7 @@ pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
             let deps: HashSet<String> = e
                 .refers
                 .iter()
-                .filter(|dep| entity_names.contains(*dep))
+                .filter(|dep| entity_names.contains(*dep) && **dep != e.name)
                 .cloned()
                 .collect();
             (e.name.clone(), deps)
@@ -319,6 +320,18 @@ mod tests {
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
         assert!(!sorted[1].has_errors());
+    }
+
+    #[test]
+    fn self_reference_is_not_a_cycle() {
+        let entities = vec![
+            entity("a", &[]),
+            entity("b", &["a", "b"]),  // b references itself (self-FK)
+        ];
+        let sorted = sort_by_dependencies(&entities);
+        let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert!(!sorted[1].has_errors()); // Not cyclic
     }
 
     #[test]

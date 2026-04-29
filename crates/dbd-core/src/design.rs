@@ -39,10 +39,24 @@ impl Design {
     /// Reads design.yaml, scans DDL files, parses entities, resolves references,
     /// and sorts by dependencies.
     pub fn from_config(config_path: &Path, env: &str) -> Result<Self> {
-        let project_dir = config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        Self::from_config_with_dir(config_path, env, None)
+    }
+
+    /// Create a Design with an explicit project directory.
+    /// If `project_dir` is None, uses the config file's parent directory.
+    pub fn from_config_with_dir(
+        config_path: &Path,
+        env: &str,
+        project_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let project_dir = project_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                config_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf()
+            });
 
         let design_config = config::read(config_path)?;
 
