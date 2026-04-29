@@ -19,11 +19,14 @@ pub struct Report {
     pub warnings: Vec<Entity>,
 }
 
-/// An entry in the import plan: staging table + matching procedure (if found).
-#[derive(Debug)]
+/// An entry in the import plan: staging table + matched procedure + write targets.
+#[derive(Debug, Clone)]
 pub struct ImportPlanEntry {
     pub table: Entity,
+    /// Procedure that reads from this staging table (matched by reads analysis).
     pub procedure: Option<String>,
+    /// Config tables the procedure writes to.
+    pub writes: Vec<String>,
 }
 
 /// The Design orchestrator — main entry point for all operations.
@@ -335,10 +338,17 @@ impl Design {
         Ok(())
     }
 
-    /// Build the import plan: each staging table paired with its import procedure.
+    /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
-    /// Convention: for staging table `staging.models`, the procedure is
-    /// `staging.import_models()` if it exists in the DDL entities.
+    /// Procedure matching is based on reads/writes analysis, not naming convention:
+    /// - A procedure that *reads from* a staging table is its import procedure
+    /// - Procedures are ordered so that if proc A writes to table X, and proc B
+    ///   reads from table X (via FK), A runs before B
+    ///
+    /// Example: import_lookups reads staging.lookups, writes config.lookups
+    ///          import_lookup_values reads staging.lookup_values, writes config.lookup_values
+    ///          config.lookup_values has FK to config.lookups
+    ///          → import_lookups must run before import_lookup_values
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
         let tables: Vec<&Entity> = self
             .import_tables
@@ -347,37 +357,101 @@ impl Design {
             .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
             .collect();
 
-        tables
+        // Collect all procedures that are candidates for import (in staging schemas)
+        let procedures: Vec<&Entity> = self
+            .entities
+            .iter()
+            .filter(|e| {
+                e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function
+            })
+            .filter(|e| !e.reads.is_empty() || !e.writes.is_empty())
+            .collect();
+
+        // Build entries: match each staging table to the procedure that reads from it
+        let mut entries: Vec<ImportPlanEntry> = tables
             .iter()
             .map(|table| {
-                let procedure = self.find_import_procedure(&table.name);
+                let matched_proc = procedures.iter().find(|proc| {
+                    proc.reads.iter().any(|r| r == &table.name)
+                });
+
                 ImportPlanEntry {
                     table: (*table).clone(),
-                    procedure,
+                    procedure: matched_proc.map(|p| p.name.clone()),
+                    writes: matched_proc
+                        .map(|p| p.writes.clone())
+                        .unwrap_or_default(),
                 }
             })
-            .collect()
+            .collect();
+
+        // Sort by write dependencies:
+        // If entry A writes to a table that entry B's target table references (via FK),
+        // A must come before B.
+        self.sort_import_plan(&mut entries);
+
+        entries
     }
 
-    /// Find the import procedure for a staging table by naming convention.
-    /// staging.models → staging.import_models
-    fn find_import_procedure(&self, table_name: &str) -> Option<String> {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        let (schema, base_name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            return None;
-        };
+    /// Sort import entries so that procedures writing to tables referenced by other
+    /// procedures' targets come first.
+    fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
+        // Build a set of all config tables written by each entry
+        let write_set: std::collections::HashMap<String, Vec<String>> = entries
+            .iter()
+            .filter_map(|e| {
+                e.procedure.as_ref().map(|p| (p.clone(), e.writes.clone()))
+            })
+            .collect();
 
-        let proc_name = format!("{schema}.import_{base_name}");
-        if self.entities.iter().any(|e| {
-            (e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function)
-                && e.name == proc_name
-        }) {
-            Some(proc_name)
-        } else {
-            None
+        // Build dependency: entry depends on another if its writes target has a FK
+        // to a table written by another entry.
+        // For now, use the DDL entity's refers to check FK deps between write targets.
+        let entity_refs: std::collections::HashMap<String, Vec<String>> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Table)
+            .map(|e| (e.name.clone(), e.refers.clone()))
+            .collect();
+
+        // Simple topological sort on entries
+        let n = entries.len();
+        let mut sorted = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+
+        for _ in 0..n {
+            for i in 0..n {
+                if placed[i] {
+                    continue;
+                }
+                // Check if all dependencies are already placed
+                let deps_satisfied = entries[i].writes.iter().all(|write_target| {
+                    // Get FK deps of this write target
+                    let fk_deps = entity_refs.get(write_target).cloned().unwrap_or_default();
+                    // All FK deps that are also write targets of other entries must be placed
+                    fk_deps.iter().all(|dep| {
+                        !entries.iter().enumerate().any(|(j, other)| {
+                            !placed[j] && j != i && other.writes.contains(dep)
+                        })
+                    })
+                });
+
+                if deps_satisfied {
+                    sorted.push(entries[i].clone());
+                    placed[i] = true;
+                    break;
+                }
+            }
         }
+
+        // Append any remaining (cycles or unresolved)
+        for i in 0..n {
+            if !placed[i] {
+                sorted.push(entries[i].clone());
+            }
+        }
+
+        *entries = sorted;
     }
 
     /// Import staging data via the adapter.
