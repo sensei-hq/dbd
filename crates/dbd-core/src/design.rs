@@ -128,12 +128,20 @@ impl Design {
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
         // Sort by type priority then dependencies
-        let (schemas, extensions, roles, enums, others, externals) = partition_entities(entities);
+        // Apply order: schemas → extensions → roles → enums → tables → views → functions/procedures → externals
+        let (schemas, extensions, roles, enums, tables, views, functions, externals) =
+            partition_entities(entities);
         let sorted_roles = dependency::sort_by_dependencies(&roles);
         let sorted_enums = dependency::sort_by_dependencies(&enums);
-        let sorted_others = dependency::sort_by_dependencies(&others);
+        let sorted_tables = dependency::sort_by_dependencies(&tables);
+        let sorted_views = dependency::sort_by_dependencies(&views);
+        let sorted_functions = dependency::sort_by_dependencies(&functions);
 
-        let entities = [schemas, extensions, sorted_roles, sorted_enums, sorted_others, externals].concat();
+        let entities = [
+            schemas, extensions, sorted_roles, sorted_enums,
+            sorted_tables, sorted_views, sorted_functions, externals,
+        ]
+        .concat();
 
         // Scan import tables (data files, not DDL)
         let import_files = scanner::scan_import(&project_dir);
@@ -574,14 +582,27 @@ impl Design {
 }
 
 /// Partition entities by type for ordered apply.
+/// Partition entities by type for ordered apply.
+/// Returns: (schemas, extensions, roles, enums, tables, views, functions/procedures, externals)
 fn partition_entities(
     entities: Vec<Entity>,
-) -> (Vec<Entity>, Vec<Entity>, Vec<Entity>, Vec<Entity>, Vec<Entity>, Vec<Entity>) {
+) -> (
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+    Vec<Entity>,
+) {
     let mut schemas = Vec::new();
     let mut extensions = Vec::new();
     let mut roles = Vec::new();
     let mut enums = Vec::new();
-    let mut others = Vec::new();
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    let mut functions = Vec::new(); // functions + procedures
     let mut externals = Vec::new();
 
     for entity in entities {
@@ -590,12 +611,15 @@ fn partition_entities(
             EntityType::Extension => extensions.push(entity),
             EntityType::Role => roles.push(entity),
             EntityType::Enum => enums.push(entity),
+            EntityType::Table => tables.push(entity),
+            EntityType::View => views.push(entity),
+            EntityType::Function | EntityType::Procedure => functions.push(entity),
             EntityType::External => externals.push(entity),
-            _ => others.push(entity),
+            _ => tables.push(entity), // Default to tables group
         }
     }
 
-    (schemas, extensions, roles, enums, others, externals)
+    (schemas, extensions, roles, enums, tables, views, functions, externals)
 }
 
 #[cfg(test)]

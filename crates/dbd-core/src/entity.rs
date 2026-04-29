@@ -39,12 +39,12 @@ impl EntityType {
     /// Parse a type string from a folder name.
     pub fn from_folder_name(name: &str) -> Option<Self> {
         match name {
-            "table" => Some(Self::Table),
-            "view" => Some(Self::View),
-            "function" => Some(Self::Function),
-            "procedure" => Some(Self::Procedure),
-            "enum" => Some(Self::Enum),
-            "role" => Some(Self::Role),
+            "table" | "tables" => Some(Self::Table),
+            "view" | "views" => Some(Self::View),
+            "function" | "functions" => Some(Self::Function),
+            "procedure" | "procedures" => Some(Self::Procedure),
+            "enum" | "enums" => Some(Self::Enum),
+            "role" | "roles" => Some(Self::Role),
             _ => None,
         }
     }

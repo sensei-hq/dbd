@@ -112,9 +112,31 @@ pub fn migrate_config(content: &str) -> Result<String> {
     // URL placeholder
     target_config.insert(val("url"), val("$DATABASE_URL"));
 
-    // Extensions
-    if let Some(extensions) = doc.get("extensions") {
-        target_config.insert(val("extensions"), extensions.clone());
+    // Extensions — apply extensionSchema to plain string entries
+    let extension_schema = old_project
+        .and_then(|p| p.get(&val("extensionSchema")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("public");
+
+    if let Some(extensions) = doc.get("extensions").and_then(|v| v.as_sequence()) {
+        let migrated_extensions: Vec<serde_yaml::Value> = extensions
+            .iter()
+            .map(|ext| {
+                if ext.is_string() && extension_schema != "public" {
+                    // Convert "uuid-ossp" → { name: "uuid-ossp", schema: "extensions" }
+                    let mut map = serde_yaml::Mapping::new();
+                    map.insert(val("name"), ext.clone());
+                    map.insert(val("schema"), val(extension_schema));
+                    serde_yaml::Value::Mapping(map)
+                } else {
+                    ext.clone()
+                }
+            })
+            .collect();
+        target_config.insert(
+            val("extensions"),
+            serde_yaml::Value::Sequence(migrated_extensions),
+        );
     }
 
     // Roles

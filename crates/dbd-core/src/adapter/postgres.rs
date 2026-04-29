@@ -8,6 +8,24 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
+
+/// Ensure `public` is included in any SET search_path statement.
+/// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
+/// but omit `public`, which hides extensions installed in the public schema.
+fn ensure_public_in_search_path(sql: &str) -> String {
+    let re = regex::Regex::new(r"(?i)(set\s+search_path\s+to\s+)([^;]+)(;)").unwrap();
+    re.replace_all(sql, |caps: &regex::Captures| {
+        let prefix = &caps[1];
+        let schemas = &caps[2];
+        let suffix = &caps[3];
+        if schemas.to_lowercase().contains("public") {
+            format!("{prefix}{schemas}{suffix}")
+        } else {
+            format!("{prefix}{schemas}, public{suffix}")
+        }
+    })
+    .to_string()
+}
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
@@ -48,6 +66,38 @@ impl PostgresAdapter {
             "string_to_", "lo_", "xml_",
         ];
         patterns.iter().any(|p| lower.starts_with(p))
+    }
+
+    /// Apply an enum DDL idempotently.
+    ///
+    /// PostgreSQL's CREATE TYPE fails if the type already exists.
+    /// Wrap in a DO block that checks pg_type first.
+    async fn apply_enum(&self, entity: &Entity, sql: &str) -> Result<()> {
+        let parts: Vec<&str> = entity.name.split('.').collect();
+        let (schema, type_name) = if parts.len() > 1 {
+            (parts[0], parts[1])
+        } else {
+            ("public", parts[0])
+        };
+
+        // Check if the type already exists
+        let exists = sqlx::query(
+            "SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid \
+             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'"
+        )
+        .bind(schema)
+        .bind(type_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("Enum check failed: {e}")))?;
+
+        if exists.is_some() {
+            // Type already exists — skip (idempotent)
+            return Ok(());
+        }
+
+        // Extract the SET search_path and CREATE TYPE from the DDL
+        self.execute_script(sql).await
     }
 
     /// SQL keywords and types that appear as false-positive references.
@@ -91,7 +141,11 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn execute_script(&self, sql: &str) -> Result<()> {
-        sqlx::raw_sql(sql)
+        // Ensure `public` is always in the search_path — extensions may be
+        // installed there and DDL files often SET search_path without including it.
+        let sql = ensure_public_in_search_path(sql);
+
+        sqlx::raw_sql(&sql)
             .execute(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
@@ -104,14 +158,17 @@ impl DatabaseAdapter for PostgresAdapter {
             None => return Ok(()), // External entities, etc.
         };
 
-        // Enums need special idempotent handling
+        // Enums need idempotent wrapping — CREATE TYPE fails on duplicate
         if entity.entity_type == EntityType::Enum {
-            // The ddl_from_entity reads the file directly which contains CREATE TYPE
-            // Wrap in a DO block for idempotency would need entity-specific logic
-            // For now, execute directly (will error on duplicate, which is expected)
+            return self.apply_enum(entity, &sql).await;
         }
 
-        self.execute_script(&sql).await
+        self.execute_script(&sql).await.map_err(|e| {
+            DbdError::Config(format!(
+                "Failed to apply {:?} {}: {}",
+                entity.entity_type, entity.name, e
+            ))
+        })
     }
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
