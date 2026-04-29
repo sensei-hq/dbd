@@ -107,7 +107,6 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn set_project_meta(&self, env: &str, version: u32) -> Result<()>;
 }
 
-#[cfg(test)]
 pub mod mock;
 
 #[cfg(test)]

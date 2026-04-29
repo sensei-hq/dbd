@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use crate::entity::{ColumnDef, IndexDef, TableConstraint};
-use crate::error::{DbdError, Result};
+use crate::error::Result;
 
 const SNAPSHOTS_DIR: &str = "snapshots";
 const MIGRATIONS_DIR: &str = "migrations";

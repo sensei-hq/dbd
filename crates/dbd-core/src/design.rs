@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::adapter::{DatabaseAdapter, ProjectMeta};
+use crate::adapter::DatabaseAdapter;
 use crate::config::{self, DesignConfig};
 use crate::dependency;
 use crate::entity::{Entity, EntityType};
@@ -28,6 +28,7 @@ pub struct Design {
     entities: Vec<Entity>,
     import_tables: Vec<Entity>,
     project_dir: PathBuf,
+    #[allow(dead_code)]
     env: String,
     validated: bool,
 }

@@ -1,4 +1,3 @@
-use std::path::Path;
 
 use crate::config::RoleEntry;
 use crate::entity::{Entity, EntityType};

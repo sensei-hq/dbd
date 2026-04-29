@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 dbd-core = { path = "../dbd-core" }
 clap = { version = "4", features = ["derive", "env"] }
+serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 
