@@ -1,0 +1,61 @@
+project:
+  name: example
+  note: Example project for testing
+
+source:
+  dialect: postgresql
+
+target:
+  postgres:
+    url: $DATABASE_URL
+    extensions:
+      - uuid-ossp
+      - name: postgis
+        schema: extensions
+    roles:
+      - name: advanced
+        refers:
+          - basic
+      - name: basic
+
+schemas:
+  - config
+  - staging
+  - extensions
+
+external:
+  - name: auth.users
+    note: Managed authentication table
+    columns:
+      - id: uuid
+
+import:
+  staging:
+    - staging
+  options:
+    truncate: true
+    null_value: ''
+    format: csv
+  tables:
+    - staging.lookups
+    - staging.lookup_values:
+        truncate: false
+        format: tsv
+  after:
+    - import/loader.sql
+
+export:
+  - config.lookups
+  - config.lookup_values:
+      format: jsonl
+
+dbml:
+  base:
+    exclude:
+      schemas:
+        - staging
+        - extensions
+
+ignore:
+  - bfs
+  - my_company.*

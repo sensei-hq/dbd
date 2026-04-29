@@ -1,0 +1,457 @@
+use indexmap::IndexMap;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::error::{DbdError, Result};
+
+// ── Top-level config ────────────────────────────────────
+
+/// Parsed design.yaml configuration.
+#[derive(Debug, Deserialize)]
+pub struct DesignConfig {
+    pub project: ProjectConfig,
+    #[serde(default)]
+    pub source: SourceConfig,
+    #[serde(default)]
+    pub target: IndexMap<String, TargetConfig>,
+    #[serde(default)]
+    pub schemas: Vec<SchemaEntry>,
+    #[serde(default)]
+    pub external: Vec<ExternalEntry>,
+    #[serde(default)]
+    pub import: ImportConfig,
+    #[serde(default)]
+    pub export: Vec<ExportEntry>,
+    #[serde(default)]
+    pub dbml: HashMap<String, DbmlDocConfig>,
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl DesignConfig {
+    /// The default target name (first listed in the config).
+    pub fn default_target(&self) -> Option<&str> {
+        self.target.keys().next().map(|s| s.as_str())
+    }
+
+    /// Get a target config by name, or the default if None.
+    pub fn get_target(&self, name: Option<&str>) -> Option<&TargetConfig> {
+        match name {
+            Some(n) => self.target.get(n),
+            None => self.target.values().next(),
+        }
+    }
+
+    /// Schema names as a flat list (resolves both string and object forms).
+    pub fn schema_names(&self) -> Vec<String> {
+        self.schemas.iter().map(|s| s.name()).collect()
+    }
+}
+
+// ── Project ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectConfig {
+    pub name: String,
+    pub note: Option<String>,
+}
+
+// ── Source ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SourceConfig {
+    #[serde(default = "default_dialect")]
+    pub dialect: String,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            dialect: default_dialect(),
+        }
+    }
+}
+
+fn default_dialect() -> String {
+    "postgresql".to_string()
+}
+
+// ── Target ──────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TargetConfig {
+    pub url: Option<String>,
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub extensions: Vec<ExtensionEntry>,
+    #[serde(default)]
+    pub roles: Vec<RoleEntry>,
+    pub schemas: Option<Vec<String>>,
+    pub grants: Option<HashMap<String, GrantConfig>>,
+    pub schema_prefix: Option<bool>,
+    pub skip_schemas: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ExtensionEntry {
+    Name(String),
+    WithSchema { name: String, schema: String },
+}
+
+impl ExtensionEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(n) => n,
+            Self::WithSchema { name, .. } => name,
+        }
+    }
+
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::WithSchema { schema, .. } => Some(schema),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RoleEntry {
+    pub name: String,
+    #[serde(default)]
+    pub refers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantConfig {
+    #[serde(flatten)]
+    pub roles: HashMap<String, Vec<String>>,
+}
+
+// ── Schema ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SchemaEntry {
+    Name(String),
+    WithGrants(HashMap<String, SchemaGrantConfig>),
+}
+
+impl SchemaEntry {
+    pub fn name(&self) -> String {
+        match self {
+            Self::Name(n) => n.clone(),
+            Self::WithGrants(map) => map.keys().next().cloned().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SchemaGrantConfig {
+    pub grants: Option<HashMap<String, Vec<String>>>,
+}
+
+// ── External ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ExternalEntry {
+    pub name: String,
+    pub note: Option<String>,
+    #[serde(default)]
+    pub columns: Vec<HashMap<String, String>>,
+}
+
+// ── Import ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ImportConfig {
+    #[serde(default)]
+    pub staging: Vec<String>,
+    #[serde(default)]
+    pub options: ImportOptions,
+    #[serde(default)]
+    pub tables: Vec<ImportTableEntry>,
+    #[serde(default)]
+    pub after: Vec<String>,
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            staging: Vec::new(),
+            options: ImportOptions::default(),
+            tables: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportOptions {
+    #[serde(default = "default_true")]
+    pub truncate: bool,
+    #[serde(default)]
+    pub null_value: String,
+    #[serde(default = "default_csv")]
+    pub format: String,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            truncate: true,
+            null_value: String::new(),
+            format: default_csv(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_csv() -> String {
+    "csv".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ImportTableEntry {
+    Name(String),
+    WithOptions(HashMap<String, ImportTableOptions>),
+}
+
+impl ImportTableEntry {
+    pub fn name(&self) -> String {
+        match self {
+            Self::Name(n) => n.clone(),
+            Self::WithOptions(map) => map.keys().next().cloned().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportTableOptions {
+    pub truncate: Option<bool>,
+    pub format: Option<String>,
+    pub null_value: Option<String>,
+    pub env: Option<EnvValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+// ── Export ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ExportEntry {
+    Name(String),
+    WithOptions(HashMap<String, ExportOptions>),
+}
+
+impl ExportEntry {
+    pub fn name(&self) -> String {
+        match self {
+            Self::Name(n) => n.clone(),
+            Self::WithOptions(map) => map.keys().next().cloned().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExportOptions {
+    pub format: Option<String>,
+}
+
+// ── DBML ────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DbmlDocConfig {
+    pub include: Option<DbmlFilter>,
+    pub exclude: Option<DbmlFilter>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DbmlFilter {
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub tables: Vec<String>,
+}
+
+// ── Environment normalization ───────────────────────────
+
+const ENV_ALIASES: &[(&str, &str)] = &[
+    ("prod", "prod"),
+    ("production", "prod"),
+    ("dev", "dev"),
+    ("development", "dev"),
+];
+
+/// Normalize environment string to "dev" or "prod".
+pub fn normalize_env(value: Option<&str>) -> Result<String> {
+    match value {
+        None => Ok("prod".to_string()),
+        Some(v) => ENV_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == v)
+            .map(|(_, norm)| norm.to_string())
+            .ok_or_else(|| {
+                DbdError::Config(format!(
+                    "Unknown environment: \"{v}\". Use dev, development, prod, or production."
+                ))
+            }),
+    }
+}
+
+// ── File reading ────────────────────────────────────────
+
+/// Read and parse a design.yaml file.
+pub fn read(path: &Path) -> Result<DesignConfig> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        DbdError::Config(format!("Cannot read {}: {}", path.display(), e))
+    })?;
+    let config: DesignConfig = serde_yaml::from_str(&content)?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn normalize_env_defaults_to_prod() {
+        assert_eq!(normalize_env(None).unwrap(), "prod");
+    }
+
+    #[test]
+    fn normalize_env_accepts_aliases() {
+        assert_eq!(normalize_env(Some("prod")).unwrap(), "prod");
+        assert_eq!(normalize_env(Some("production")).unwrap(), "prod");
+        assert_eq!(normalize_env(Some("dev")).unwrap(), "dev");
+        assert_eq!(normalize_env(Some("development")).unwrap(), "dev");
+    }
+
+    #[test]
+    fn normalize_env_rejects_unknown() {
+        assert!(normalize_env(Some("staging")).is_err());
+    }
+
+    #[test]
+    fn read_fixture_design_yaml() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.project.name, "example");
+        assert_eq!(config.project.note, Some("Example project for testing".to_string()));
+    }
+
+    #[test]
+    fn source_defaults_to_postgresql() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.source.dialect, "postgresql");
+    }
+
+    #[test]
+    fn parses_target_config() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.default_target(), Some("postgres"));
+        let target = config.get_target(None).unwrap();
+        assert_eq!(target.url, Some("$DATABASE_URL".to_string()));
+    }
+
+    #[test]
+    fn parses_extensions() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        let target = config.get_target(Some("postgres")).unwrap();
+        assert_eq!(target.extensions.len(), 2);
+        assert_eq!(target.extensions[0].name(), "uuid-ossp");
+        assert_eq!(target.extensions[1].name(), "postgis");
+        assert_eq!(target.extensions[1].schema(), Some("extensions"));
+    }
+
+    #[test]
+    fn parses_roles() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        let target = config.get_target(Some("postgres")).unwrap();
+        assert_eq!(target.roles.len(), 2);
+        assert_eq!(target.roles[0].name, "advanced");
+        assert_eq!(target.roles[0].refers, vec!["basic"]);
+        assert_eq!(target.roles[1].name, "basic");
+        assert!(target.roles[1].refers.is_empty());
+    }
+
+    #[test]
+    fn parses_schemas() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        let names = config.schema_names();
+        assert_eq!(names, vec!["config", "staging", "extensions"]);
+    }
+
+    #[test]
+    fn parses_external_entities() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.external.len(), 1);
+        assert_eq!(config.external[0].name, "auth.users");
+        assert_eq!(
+            config.external[0].note,
+            Some("Managed authentication table".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_import_config() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.import.staging, vec!["staging"]);
+        assert!(config.import.options.truncate);
+        assert_eq!(config.import.options.format, "csv");
+        assert_eq!(config.import.tables.len(), 2);
+        assert_eq!(config.import.tables[0].name(), "staging.lookups");
+        assert_eq!(config.import.tables[1].name(), "staging.lookup_values");
+        assert_eq!(config.import.after, vec!["import/loader.sql"]);
+    }
+
+    #[test]
+    fn parses_export_config() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.export.len(), 2);
+        assert_eq!(config.export[0].name(), "config.lookups");
+        assert_eq!(config.export[1].name(), "config.lookup_values");
+    }
+
+    #[test]
+    fn parses_dbml_config() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert!(config.dbml.contains_key("base"));
+        let base = &config.dbml["base"];
+        let exclude = base.exclude.as_ref().unwrap();
+        assert_eq!(exclude.schemas, vec!["staging", "extensions"]);
+    }
+
+    #[test]
+    fn parses_ignore_list() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert_eq!(config.ignore, vec!["bfs", "my_company.*"]);
+    }
+
+    #[test]
+    fn get_target_returns_none_for_unknown() {
+        let config = read(&fixture("design.yaml")).unwrap();
+        assert!(config.get_target(Some("oracle")).is_none());
+    }
+
+    #[test]
+    fn read_missing_file_returns_error() {
+        let result = read(Path::new("nonexistent.yaml"));
+        assert!(result.is_err());
+    }
+}

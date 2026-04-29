@@ -219,11 +219,13 @@ impl Entity {
             .filter_map(|c| c.as_os_str().to_str())
             .collect();
 
-        // Strip leading "ddl" if present
-        let parts = if parts.first() == Some(&"ddl") {
-            &parts[1..]
-        } else {
-            &parts
+        // Find the "ddl" component and use everything after it.
+        // This supports both relative paths ("ddl/table/...") and
+        // absolute paths ("/path/to/fixtures/ddl/table/...").
+        let ddl_pos = parts.iter().rposition(|&p| p == "ddl");
+        let parts = match ddl_pos {
+            Some(pos) => &parts[pos + 1..],
+            None => &parts,
         };
 
         let entity_type = parts
