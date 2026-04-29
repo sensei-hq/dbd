@@ -27,6 +27,7 @@ async-trait = "0.1"
 # Utilities
 sha2 = "0.10"
 chrono = "0.4"
+dirs = "6"
 indexmap = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
