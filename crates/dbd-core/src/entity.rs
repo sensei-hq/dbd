@@ -298,7 +298,7 @@ impl Entity {
 
         // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
         // vs import/staging/file.csv → env=None, schema=staging
-        let (env, schema_and_rest) = if after_import.len() >= 3
+        let (_env, schema_and_rest) = if after_import.len() >= 3
             && (after_import[0] == "dev" || after_import[0] == "prod")
         {
             (Some(after_import[0].to_string()), &after_import[1..])
@@ -323,7 +323,9 @@ impl Entity {
             (stem.to_string(), None)
         };
 
-        let mut entity = Self {
+        
+
+        Self {
             entity_type: EntityType::Import,
             name,
             schema,
@@ -338,9 +340,7 @@ impl Entity {
             writes: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),
-        };
-
-        entity
+        }
     }
 
     /// Whether this entity has validation errors.

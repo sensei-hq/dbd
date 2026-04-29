@@ -67,7 +67,6 @@ pub async fn run(
 }
 
 /// Get or create a database adapter from the URL.
-
 async fn get_adapter(
     config: &Path,
     database_url: Option<&str>,
@@ -105,6 +104,7 @@ fn resolve_env_vars(s: &str) -> String {
 
 // ── Command implementations ─────────────────────────────
 
+#[allow(clippy::collapsible_if)]
 fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
     let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let report = design.report(name);
@@ -303,6 +303,7 @@ async fn cmd_import(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_reset(
     config: &Path,
     env: &str,

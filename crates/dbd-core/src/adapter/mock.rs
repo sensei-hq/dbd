@@ -17,6 +17,12 @@ pub struct MockAdapter {
     pub connected: bool,
 }
 
+impl Default for MockAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockAdapter {
     pub fn new() -> Self {
         Self {

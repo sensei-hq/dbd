@@ -105,8 +105,8 @@ fn extract_table_ref_from_factor(
 /// Extract enum values from CREATE TYPE ... AS ENUM statements.
 pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     for stmt in statements {
-        if let Statement::CreateType { representation, .. } = stmt {
-            if let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation {
+        if let Statement::CreateType { representation, .. } = stmt
+            && let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation {
                 return labels
                     .iter()
                     .map(|label| EnumValue {
@@ -115,7 +115,6 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
                     })
                     .collect();
             }
-        }
     }
     Vec::new()
 }
@@ -202,64 +201,6 @@ fn regex_table_after(sql: &str, pattern: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract table names from a SQL string by looking at structural positions only.
-///
-/// Only extracts names after FROM, JOIN, INTO, UPDATE — positions where table names appear.
-/// Does NOT scan the entire SQL for schema.table patterns, which would match alias.column.
-fn extract_tables_from_sql(sql: &str, search_paths: &[String]) -> Vec<String> {
-    let lower = sql.to_lowercase();
-    let mut tables = Vec::new();
-    let default_schema = search_paths.first().map(|s| s.as_str()).unwrap_or("public");
-
-    let sql_keywords = [
-        "select", "from", "where", "and", "or", "not", "in", "on", "as", "is",
-        "null", "true", "false", "inner", "outer", "left", "right", "cross",
-        "join", "set", "into", "values", "update", "delete", "insert", "create",
-        "table", "view", "index", "exists", "between", "like", "order", "by",
-        "group", "having", "limit", "offset", "union", "all", "distinct",
-        "case", "when", "then", "else", "end", "cast", "coalesce", "current_user",
-        "now", "trim", "excluded", "conflict", "do", "begin", "replace", "function",
-        "procedure", "lateral",
-    ];
-
-    // System schemas that should never be treated as project references
-    let system_schemas = [
-        "information_schema", "pg_catalog", "pg_toast",
-    ];
-
-    // Only match table names in structural positions: after FROM, JOIN, UPDATE, INTO
-    // Handles both qualified (schema.table) and unqualified (table) names.
-    let table_position_re = regex::Regex::new(
-        r"(?i)\b(?:from|join|update|into)\s+([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)"
-    ).unwrap();
-
-    for cap in table_position_re.captures_iter(&lower) {
-        let name = cap.get(1).unwrap().as_str();
-
-        // Skip SQL keywords
-        if sql_keywords.contains(&name) {
-            continue;
-        }
-
-        let qualified = if name.contains('.') {
-            // Already qualified — check for system schemas
-            let schema = name.split('.').next().unwrap_or("");
-            if system_schemas.contains(&schema) {
-                continue;
-            }
-            name.to_string()
-        } else {
-            // Unqualified — apply search_path
-            format!("{default_schema}.{name}")
-        };
-
-        if !tables.contains(&qualified) {
-            tables.push(qualified);
-        }
-    }
-
-    tables
-}
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Pre-commit hook: run tests before allowing commit
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running cargo test..."
+cargo test --quiet 2>&1
+
+echo "Running cargo clippy..."
+cargo clippy --all-targets --quiet -- -D warnings 2>&1 || {
+    echo ""
+    echo "Clippy warnings found. Fix them before committing."
+    exit 1
+}
+
+echo "All checks passed."

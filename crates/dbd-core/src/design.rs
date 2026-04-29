@@ -282,8 +282,8 @@ impl Design {
 
         for entity in &valid_entities {
             // Run pending migrations for this table before applying DDL
-            if entity.entity_type == EntityType::Table {
-                if let Some(migrations) = table_migrations.get(&entity.name) {
+            if entity.entity_type == EntityType::Table
+                && let Some(migrations) = table_migrations.get(&entity.name) {
                     for migration in migrations {
                         let parts: Vec<&str> = entity.name.split('.').collect();
                         let (schema, table_name) = if parts.len() > 1 {
@@ -302,7 +302,6 @@ impl Design {
                         }
                     }
                 }
-            }
             adapter.apply_entity(entity).await?;
         }
 
@@ -396,7 +395,7 @@ impl Design {
     /// procedures' targets come first.
     fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
         // Build a set of all config tables written by each entry
-        let write_set: std::collections::HashMap<String, Vec<String>> = entries
+        let _write_set: std::collections::HashMap<String, Vec<String>> = entries
             .iter()
             .filter_map(|e| {
                 e.procedure.as_ref().map(|p| (p.clone(), e.writes.clone()))
@@ -508,7 +507,7 @@ impl Design {
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
-            .filter_map(|e| script::ddl_from_entity(e))
+            .filter_map(script::ddl_from_entity)
             .collect();
 
         std::fs::write(file, combined.join("\n"))?;
@@ -537,8 +536,8 @@ impl Design {
         target: &str,
         force: bool,
     ) -> Result<()> {
-        if !force {
-            if let Some(meta) = adapter.get_project_meta().await? {
+        if !force
+            && let Some(meta) = adapter.get_project_meta().await? {
                 if meta.env == "prod" {
                     return Err(DbdError::SafetyGuard(
                         "reset is blocked — database is marked as prod. Use --force to override."
@@ -552,7 +551,6 @@ impl Design {
                     ));
                 }
             }
-        }
 
         let roles = self
             .config
@@ -581,6 +579,7 @@ impl Design {
 /// Partition entities by type for ordered apply.
 /// Partition entities by type for ordered apply.
 /// Returns: (schemas, extensions, roles, enums, tables, views, functions/procedures, externals)
+#[allow(clippy::type_complexity)]
 fn partition_entities(
     entities: Vec<Entity>,
 ) -> (
@@ -685,7 +684,7 @@ mod tests {
 
         // The fixture project should have no major errors
         // (warnings are expected for unresolved references)
-        assert!(report.issues.is_empty() || true); // Relaxed — fixture may have missing files
+        let _report = report; // Fixture may have entities with file-not-found errors
     }
 
     #[test]

@@ -36,15 +36,14 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
 
     // Tables
     for entity in params.entities {
-        if entity.entity_type == EntityType::Table {
-            if let Some(ref table_def) = entity.table_def {
+        if entity.entity_type == EntityType::Table
+            && let Some(ref table_def) = entity.table_def {
                 sections.push(emit_table(
                     &entity.name,
                     entity.schema.as_deref().unwrap_or("public"),
                     table_def,
                 ));
             }
-        }
     }
 
     // Refs (standalone, from all FK constraints)
@@ -73,7 +72,7 @@ fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
 
 fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
-    let base_name = entity.name.split('.').last().unwrap_or(&entity.name);
+    let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
     let mut lines = vec![format!("Enum \"{}\".\"{}\" {{", schema, base_name)];
 
     for value in &entity.enum_values {
@@ -88,7 +87,7 @@ fn emit_enum(entity: &Entity) -> String {
 }
 
 fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
-    let base_name = name.split('.').last().unwrap_or(name);
+    let base_name = name.split('.').next_back().unwrap_or(name);
     let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, base_name)];
 
     // Collect PK columns from table-level constraints
@@ -210,7 +209,7 @@ fn emit_all_refs(entities: &[Entity]) -> String {
         };
 
         let schema = entity.schema.as_deref().unwrap_or("public");
-        let base_name = entity.name.split('.').last().unwrap_or(&entity.name);
+        let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
 
         // Inline FKs from columns
         for col in &table_def.columns {

@@ -165,6 +165,7 @@ pub struct ExternalEntry {
 // ── Import ──────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[derive(Default)]
 pub struct ImportConfig {
     #[serde(default)]
     pub staging: Vec<String>,
@@ -176,16 +177,6 @@ pub struct ImportConfig {
     pub after: Vec<String>,
 }
 
-impl Default for ImportConfig {
-    fn default() -> Self {
-        Self {
-            staging: Vec::new(),
-            options: ImportOptions::default(),
-            tables: Vec::new(),
-            after: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ImportOptions {

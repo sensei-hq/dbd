@@ -8,16 +8,15 @@ use crate::error::Result;
 
 pub use extractors::extract_search_paths;
 
-/// Parse a DDL file and produce an Entity with extracted metadata.
-///
-/// This is the main parser entry point. It reads the SQL, parses it with
-/// sqlparser-rs (PostgreSQL dialect), and extracts:
-/// - Entity identity (type, name, schema) from the file path
-/// - Search paths from SET search_path statements
-/// - References (FK targets, view dependencies)
-/// - Table structure (columns, constraints, indexes) into TableDef
-/// - Enum values
-/// - Procedure reads/writes
+// Parse a DDL file and produce an Entity with extracted metadata.
+//
+// This is the main parser entry point. It reads the SQL, parses it with
+// sqlparser-rs (PostgreSQL dialect), and extracts:
+// - Entity identity (type, name, schema) from the file path
+// - Search paths from SET search_path statements
+// - References (FK targets, view dependencies)
+// - Table structure (columns, constraints, indexes) into TableDef
+// - Enum values
 // ── sqlparser workarounds ────────────────────────────────────────────
 //
 // WORKAROUND_REGISTRY: sqlparser-rs 0.61 (Apache DataFusion)
@@ -39,6 +38,7 @@ pub use extractors::extract_search_paths;
 // ─────────────────────────────────────────────────────────────────────
 
 /// Preprocess SQL to work around known sqlparser limitations.
+///
 /// See WORKAROUND_REGISTRY above for details.
 fn preprocess_sql(sql: &str) -> String {
     let mut result = std::borrow::Cow::Borrowed(sql);

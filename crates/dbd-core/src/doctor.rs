@@ -1,4 +1,3 @@
-use std::path::Path;
 
 use crate::error::{DbdError, Result};
 
@@ -49,13 +48,11 @@ pub fn detect_old_format(content: &str) -> Vec<String> {
     }
 
     // Check for camelCase keys
-    if let Some(import) = doc.get("import") {
-        if let Some(options) = import.get("options") {
-            if options.get("nullValue").is_some() {
+    if let Some(import) = doc.get("import")
+        && let Some(options) = import.get("options")
+            && options.get("nullValue").is_some() {
                 issues.push("import.options.nullValue → rename to null_value".to_string());
             }
-        }
-    }
 
     issues
 }
@@ -74,20 +71,19 @@ pub fn migrate_config(content: &str) -> Result<String> {
     let mut project = serde_yaml::Mapping::new();
 
     if let Some(op) = old_project {
-        if let Some(name) = op.get(&val("name")) {
+        if let Some(name) = op.get(val("name")) {
             project.insert(val("name"), name.clone());
         }
-        if let Some(note) = op.get(&val("note")) {
-            if !note.is_null() {
+        if let Some(note) = op.get(val("note"))
+            && !note.is_null() {
                 project.insert(val("note"), note.clone());
             }
-        }
     }
     new_doc.insert(val("project"), serde_yaml::Value::Mapping(project));
 
     // ── source ─────────────────────────────────────────
     let dialect = old_project
-        .and_then(|p| p.get(&val("database")))
+        .and_then(|p| p.get(val("database")))
         .and_then(|v| v.as_str())
         .unwrap_or("PostgreSQL")
         .to_lowercase();
@@ -114,7 +110,7 @@ pub fn migrate_config(content: &str) -> Result<String> {
 
     // Extensions — apply extensionSchema to plain string entries
     let extension_schema = old_project
-        .and_then(|p| p.get(&val("extensionSchema")))
+        .and_then(|p| p.get(val("extensionSchema")))
         .and_then(|v| v.as_str())
         .unwrap_or("public");
 
@@ -156,11 +152,10 @@ pub fn migrate_config(content: &str) -> Result<String> {
             for entry in schemas {
                 if let Some(map) = entry.as_mapping() {
                     for (key, value) in map {
-                        if let Some(schema_config) = value.as_mapping() {
-                            if let Some(grant_config) = schema_config.get(&val("grants")) {
+                        if let Some(schema_config) = value.as_mapping()
+                            && let Some(grant_config) = schema_config.get(val("grants")) {
                                 grants.insert(key.clone(), grant_config.clone());
                             }
-                        }
                     }
                 }
             }
@@ -204,12 +199,12 @@ pub fn migrate_config(content: &str) -> Result<String> {
         let mut new_import = serde_yaml::Mapping::new();
 
         // Move project.staging to import.staging
-        if let Some(staging) = old_project.and_then(|p| p.get(&val("staging"))) {
+        if let Some(staging) = old_project.and_then(|p| p.get(val("staging"))) {
             new_import.insert(val("staging"), staging.clone());
         }
 
         // Migrate options (rename nullValue → null_value)
-        if let Some(options) = import.get(&val("options")).and_then(|v| v.as_mapping()) {
+        if let Some(options) = import.get(val("options")).and_then(|v| v.as_mapping()) {
             let mut new_options = serde_yaml::Mapping::new();
             for (key, value) in options {
                 let key_str = key.as_str().unwrap_or("");
@@ -223,12 +218,11 @@ pub fn migrate_config(content: &str) -> Result<String> {
         }
 
         // tables, after — pass through (skip nulls, convert to empty sequences)
-        if let Some(tables) = import.get(&val("tables")) {
-            if !tables.is_null() {
+        if let Some(tables) = import.get(val("tables"))
+            && !tables.is_null() {
                 new_import.insert(val("tables"), tables.clone());
             }
-        }
-        if let Some(after) = import.get(&val("after")) {
+        if let Some(after) = import.get(val("after")) {
             if after.is_null() {
                 // Skip null values — the default empty vec handles this
             } else {
@@ -256,7 +250,7 @@ pub fn migrate_config(content: &str) -> Result<String> {
     }
 
     // ── dbml (from project.dbdocs) ─────────────────────
-    if let Some(dbdocs) = old_project.and_then(|p| p.get(&val("dbdocs"))) {
+    if let Some(dbdocs) = old_project.and_then(|p| p.get(val("dbdocs"))) {
         new_doc.insert(val("dbml"), dbdocs.clone());
     }
 

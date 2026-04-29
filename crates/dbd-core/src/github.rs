@@ -85,12 +85,11 @@ pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
     let mut git_ref = "HEAD".to_string();
     let mut path_str = source.to_string();
 
-    if let Some(at_idx) = source.rfind('@') {
-        if at_idx > 0 {
+    if let Some(at_idx) = source.rfind('@')
+        && at_idx > 0 {
             git_ref = source[at_idx + 1..].to_string();
             path_str = source[..at_idx].to_string();
         }
-    }
 
     let parts: Vec<&str> = path_str.split('/').collect();
     if parts.len() < 2 {
@@ -129,13 +128,12 @@ fn validate_segments(owner: &str, repo: &str, git_ref: &str, subpath: Option<&st
     if !is_safe_segment(git_ref) {
         return Err(DbdError::GitHubSource(format!("Invalid ref: \"{git_ref}\"")));
     }
-    if let Some(sp) = subpath {
-        if !is_safe_subpath(sp) {
+    if let Some(sp) = subpath
+        && !is_safe_subpath(sp) {
             return Err(DbdError::GitHubSource(format!(
                 "Invalid subpath: \"{sp}\" — path traversal is not allowed"
             )));
         }
-    }
     Ok(())
 }
 

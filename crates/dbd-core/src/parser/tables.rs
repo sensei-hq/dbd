@@ -53,10 +53,9 @@ pub fn extract_table(
             Statement::Comment {
                 object_type,
                 object_name,
-                comment,
+                comment: Some(comment_text),
                 ..
             } => {
-                if let Some(comment_text) = comment {
                     let parts: Vec<&str> = object_name.0.iter().filter_map(|part| part.as_ident()).map(|i| i.value.as_str()).collect();
                     match object_type {
                         sqlparser::ast::CommentObject::Table => {
@@ -72,7 +71,6 @@ pub fn extract_table(
                         }
                         _ => {}
                     }
-                }
             }
             _ => {}
         }
