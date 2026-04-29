@@ -1,0 +1,90 @@
+# dbd — Database Designer
+
+> A standalone CLI and embeddable Rust library for managing database schemas as code.
+
+dbd parses SQL DDL files, resolves dependencies, generates migrations, loads data, and deploys to PostgreSQL, Supabase, SQLite, or Convex — all from a single binary with zero runtime dependencies.
+
+## Core concept
+
+SQL files are the source of truth. File path determines the entity name:
+- `ddl/table/config/lookups.ddl` → entity `config.lookups` (table)
+- `ddl/view/config/genders.ddl` → entity `config.genders` (view)
+- `ddl/procedure/staging/import_lookups.ddl` → entity `staging.import_lookups` (procedure)
+
+Files are parsed once into a rich internal representation (Entity + TableDef). That same structure drives every feature: dependency graph, apply, migrations, DBML generation, data import.
+
+## design.yaml structure
+
+```yaml
+project:
+  name: MyProject
+
+source:
+  dialect: postgresql
+
+target:
+  postgres:
+    url: $DATABASE_URL
+    extensions: [uuid-ossp]
+    roles:
+      - name: app_user
+
+schemas: [config, staging]
+
+import:
+  staging: [staging]
+  options: { truncate: true, format: csv }
+
+export:
+  - config.lookups
+
+dbml:
+  base:
+    exclude: { schemas: [staging] }
+
+ignore: [bfs, my_company.*]
+```
+
+## Commands
+
+- `dbd init` — scaffold project
+- `dbd inspect` — validate, report errors/warnings
+- `dbd apply` — apply schemas + entities + pending migrations
+- `dbd import` — load staging data (CSV/TSV/JSONL)
+- `dbd export` — export table data
+- `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
+- `dbd combine` — combine DDL into single SQL file
+- `dbd graph` — dependency graph as JSON
+- `dbd dbml` — generate DBML documentation
+- `dbd snapshot` — capture schema version, generate migration SQL
+- `dbd migrate` — apply pending migrations only
+- `dbd doctor` — audit config for stale entries
+- `dbd reset` — drop all schemas (guarded by _dbd_meta env check)
+
+## Architecture
+
+- Parser: sqlparser-rs (pure Rust, multi-dialect)
+- Adapters: PostgreSQL (sqlx), Supabase (sqlx + filtering), SQLite (rusqlite), Convex (TypeScript generation)
+- Classification: adapter-owned — each adapter queries its target catalog for builtins/extensions
+- Parallel parsing: rayon for CPU-bound file parse, tokio for async DB operations
+- Library-first: `dbd-core` crate for embedding, `dbd-cli` for the binary
+
+## Key types
+
+- `Entity` — central type for all DDL objects
+- `TableDef` — parsed table structure (columns, FKs with actions, indexes, constraints, comments)
+- `EntityType` — Schema, Extension, Role, Enum, Table, View, Function, Procedure, External
+- `DatabaseAdapter` trait — connect, apply, import, classify_reference, migration tracking
+- `SqlParser` trait — parse DDL into Entity + TableDef
+
+## Safety
+
+- `_dbd_meta` table records environment (dev/prod) and version in the database
+- `dbd reset` blocked in prod (always) and in dev after v1 snapshot
+- `--force` overrides safety guards
+
+## Documentation
+
+- docs/guide/ — user guide (what is dbd, getting started, config reference)
+- docs/design/architecture.md — full technical design document
+- docs/llms/ — this file

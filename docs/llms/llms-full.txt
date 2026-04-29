@@ -1,0 +1,379 @@
+# dbd — Database Designer (Full Reference)
+
+> A standalone CLI and embeddable Rust library for managing database schemas as code.
+
+## What is dbd?
+
+dbd manages database schemas as code. You write SQL DDL files, organize them in folders, and dbd handles dependency ordering, migrations, data loading, documentation, and deployment.
+
+It is:
+- A single binary with zero runtime dependencies
+- An embeddable library (`dbd-core` crate) for Rust apps
+- Multi-target: PostgreSQL, Supabase, SQLite, Convex from the same source
+- Migration-aware with versioned snapshots and auto-generated ALTER scripts
+- Safe with database-side environment guards
+
+---
+
+## Project structure
+
+```
+myproject/
+  design.yaml          # Project config
+  ddl/                 # SQL files (auto-discovered)
+    table/config/
+      lookups.ddl
+      lookup_values.ddl
+    view/config/
+      genders.ddl
+    enum/config/
+      status.sql
+    procedure/staging/
+      import_lookups.ddl
+    role/
+      admin.ddl
+  import/              # Staging data
+    staging/
+      lookups.csv
+    dev/staging/       # Dev-only data
+      fixtures.csv
+  policies/            # RLS policies
+    config/
+      lookups.sql
+  snapshots/           # Auto-generated
+  migrations/          # Auto-generated
+  export/              # Auto-generated
+```
+
+### File path → entity name
+
+| Path | Entity name | Type |
+|------|-------------|------|
+| `ddl/table/config/lookups.ddl` | `config.lookups` | table |
+| `ddl/view/config/genders.ddl` | `config.genders` | view |
+| `ddl/procedure/staging/import_lookups.ddl` | `staging.import_lookups` | procedure |
+| `ddl/function/config/get_user.ddl` | `config.get_user` | function |
+| `ddl/enum/config/status.sql` | `config.status` | enum |
+| `ddl/role/admin.ddl` | `admin` | role |
+
+Schema-scoped types: `ddl/<type>/<schema>/<name>.<ext>`
+Non-schema types: `ddl/<type>/<name>.<ext>`
+
+---
+
+## design.yaml
+
+### Minimal example
+
+```yaml
+project:
+  name: MyProject
+
+source:
+  dialect: postgresql
+
+target:
+  postgres:
+    url: $DATABASE_URL
+
+schemas: [config, staging]
+```
+
+### Full example
+
+```yaml
+project:
+  name: MyProject
+  note: E-commerce database schema
+
+source:
+  dialect: postgresql
+
+target:
+  postgres:
+    url: $DATABASE_URL
+    extensions:
+      - uuid-ossp
+      - name: postgis
+        schema: extensions
+    roles:
+      - name: advanced
+        refers: [basic]
+      - name: basic
+
+  supabase:
+    url: $SUPABASE_DB_URL
+    schemas: [public, config]
+    extensions: [postgis]
+    grants:
+      config:
+        anon: [usage, select]
+        service_role: [usage, all]
+
+  convex:
+    schema_prefix: true
+    skip_schemas: [public]
+
+  sqlite:
+    path: ./local.db
+
+schemas:
+  - config
+  - staging
+  - extensions
+
+external:
+  - name: auth.users
+    note: Supabase managed auth table
+    columns:
+      - id: uuid
+
+import:
+  staging: [staging]
+  options:
+    truncate: true
+    null_value: ''
+    format: csv
+  tables:
+    - staging.lookups
+    - staging.lookup_values:
+        truncate: false
+  after:
+    - import/loader.sql
+
+export:
+  - config.lookups
+  - config.lookup_values:
+      format: jsonl
+
+dbml:
+  base:
+    exclude:
+      schemas: [staging, extensions]
+  core:
+    include:
+      schemas: [config]
+
+ignore:
+  - bfs
+  - my_company.*
+```
+
+### Section reference
+
+| Section | Purpose | Required |
+|---------|---------|----------|
+| `project` | Name and description | yes |
+| `source` | DDL file dialect (default: postgresql) | no |
+| `target` | Deploy targets with connection + target-specific config | yes |
+| `schemas` | Schema declarations (universal) | yes |
+| `external` | FK stubs for external tables | no |
+| `import` | Data import config (staging schemas, options, tables, after scripts) | no |
+| `export` | Tables to export | no |
+| `dbml` | DBML generation filters | no |
+| `ignore` | Reference classification overrides | no |
+
+### Universal vs target-specific config
+
+| Universal (top-level) | Target-specific |
+|---|---|
+| `schemas` | `extensions` (Postgres/Supabase) |
+| `external` | `roles` (Postgres/Supabase) |
+| `import` / `export` | `grants` (Supabase) |
+| `dbml` | `url` / `path` (connection) |
+| `ignore` | `schema_prefix` (Convex) |
+
+---
+
+## Commands
+
+### Global options
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--config` | `-c` | `design.yaml` | Config file path |
+| `--database` | `-d` | `$DATABASE_URL` | Database URL (overrides config) |
+| `--environment` | `-e` | `prod` | Environment (dev or prod) |
+| `--source` | `-s` | `.` | Source directory or GitHub repo |
+| `--target` | `-t` | first in config | Target name from design.yaml |
+
+### dbd init
+
+```sh
+dbd init -p myproject
+dbd init -p myproject --target supabase
+```
+
+### dbd inspect
+
+```sh
+dbd inspect
+dbd inspect -n config.lookups
+dbd inspect --verbose
+```
+
+### dbd apply
+
+Applies all entities in dependency order. Handles pending migrations automatically.
+
+```sh
+dbd apply
+dbd apply -n config.lookups
+dbd apply --dry-run
+```
+
+Apply order: schemas → extensions → roles → enums → tables (with interleaved migrations) → views → functions → procedures.
+
+### dbd import
+
+```sh
+dbd import
+dbd import -n staging.lookups
+dbd import --dry-run
+dbd import -e dev
+```
+
+Execution: truncate → COPY data → call import procedures → run after scripts.
+
+### dbd deploy
+
+One-shot: fetch source → apply → import → cleanup.
+
+```sh
+dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
+dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
+dbd deploy --dry-run --source owner/repo/path -d $DATABASE_URL
+```
+
+### dbd snapshot
+
+```sh
+dbd snapshot --name "add notes column"
+dbd snapshot --list
+```
+
+### dbd migrate
+
+```sh
+dbd migrate --status
+dbd migrate --apply
+dbd migrate --apply --dry-run
+dbd migrate --apply --to 3
+```
+
+### dbd combine
+
+```sh
+dbd combine -f init.sql
+```
+
+### dbd graph
+
+```sh
+dbd graph
+dbd graph -n config.lookups
+```
+
+### dbd dbml
+
+```sh
+dbd dbml
+dbd dbml -f schema.dbml
+```
+
+### dbd reset
+
+Guarded by `_dbd_meta` environment check.
+
+```sh
+dbd reset                    # Blocked if prod or version >= 1
+dbd reset --force            # Override guard
+dbd reset --dry-run
+```
+
+### dbd doctor
+
+```sh
+dbd doctor
+dbd doctor --fix
+```
+
+---
+
+## GitHub source
+
+```sh
+# Shorthand
+dbd inspect --source sensei-hq/daemon/database
+
+# With branch/tag
+dbd apply --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
+
+# Full URL
+dbd inspect --source https://github.com/owner/repo/tree/main/database
+
+# Individual commands cache downloads (~/.cache/dbd/, 1 hour TTL)
+# dbd deploy downloads to temp and cleans up after
+```
+
+Set `GITHUB_TOKEN` for private repositories.
+
+---
+
+## Library usage
+
+```rust
+use dbd_core::Design;
+use std::path::Path;
+
+// Full deploy
+let design = Design::from_config(
+    Path::new("design.yaml"),
+    Some("postgres://localhost/mydb"),
+    "prod",
+).await?;
+design.apply(None, false).await?;
+design.import_data(None, false).await?;
+
+// Inspection
+let report = design.report(None);
+// report.issues: entities with errors
+// report.warnings: entities with warnings
+
+// Dependency graph (for visualization)
+let graph = design.graph(None);
+// graph.nodes, graph.edges, graph.layers
+```
+
+---
+
+## Targets
+
+| Target | Adapter | Extensions | Roles | SQL exec | Import | Migrations |
+|--------|---------|------------|-------|----------|--------|------------|
+| PostgreSQL | sqlx | yes | yes | yes | COPY streaming | yes |
+| Supabase | sqlx | filtered | yes | yes | COPY streaming | yes |
+| SQLite | rusqlite | no | no | yes | INSERT | yes |
+| Convex | file gen | no | no | no | npx convex import | no |
+
+---
+
+## Safety model
+
+`_dbd_meta` table in the database records project name, environment, and version.
+
+| State | `reset` | `reset --force` |
+|-------|---------|-----------------|
+| dev, version 0 | allowed | allowed |
+| dev, version >= 1 | blocked | allowed |
+| prod, any version | blocked | allowed |
+| fresh (no table) | allowed | allowed |
+
+---
+
+## Environment variables
+
+| Variable | Used by |
+|----------|---------|
+| `DATABASE_URL` | Default database connection |
+| `GITHUB_TOKEN` | Private GitHub repository access |

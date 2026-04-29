@@ -1,0 +1,22 @@
+[package]
+name = "dbd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Database schema management CLI"
+
+[[bin]]
+name = "dbd"
+path = "src/main.rs"
+
+[dependencies]
+dbd-core = { path = "../dbd-core" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
