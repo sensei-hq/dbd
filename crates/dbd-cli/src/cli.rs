@@ -26,6 +26,14 @@ pub struct Cli {
     /// Target name from design.yaml
     #[arg(short, long, global = true)]
     pub target: Option<String>,
+
+    /// Verbose output (show all details)
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+
+    /// Silent mode (only show success/failure counts)
+    #[arg(long, global = true)]
+    pub silent: bool,
 }
 
 #[derive(Subcommand)]
@@ -35,9 +43,6 @@ pub enum Commands {
         /// Inspect a specific entity by name
         #[arg(short, long)]
         name: Option<String>,
-        /// Verbose output
-        #[arg(long)]
-        verbose: bool,
     },
     /// Apply DDL scripts to database
     Apply {
