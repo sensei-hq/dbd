@@ -10,6 +10,192 @@ use crate::references;
 use crate::scanner;
 use crate::script;
 use crate::snapshot;
+use crate::snapshot::PendingMigration;
+
+// ── Execution plan types ──────────────────────────────────
+
+/// Strategy for applying entities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyStrategy {
+    /// Fresh database — no previous version, apply everything.
+    Fresh,
+    /// Pending migrations exist — interleave migrations with applies.
+    Migrate,
+    /// Already current — just re-apply idempotent DDL.
+    Current,
+}
+
+/// A single step in the execution plan.
+#[derive(Debug, Clone)]
+pub enum ExecutionStep {
+    /// Create a brand-new entity (from a migration's `added` list).
+    CreateEntity(String),
+    /// Run a migration SQL file for an altered entity.
+    MigrateEntity {
+        entity_name: String,
+        migration_sql_path: PathBuf,
+        migration_version: u32,
+    },
+    /// Apply (or re-apply) an entity's current DDL idempotently.
+    ApplyEntity(String),
+    /// Drop an entity using a migration SQL file.
+    DropEntity {
+        entity_name: String,
+        drop_sql_path: PathBuf,
+        migration_version: u32,
+    },
+    /// Record that a migration version was applied.
+    RecordMigration {
+        version: u32,
+        checksum: String,
+    },
+    /// Set the project version to the latest.
+    SetVersion(u32),
+}
+
+/// A complete execution plan with strategy and ordered steps.
+#[derive(Debug)]
+pub struct ExecutionPlan {
+    pub strategy: ApplyStrategy,
+    pub steps: Vec<ExecutionStep>,
+}
+
+/// Build an execution plan based on entity state and pending migrations.
+///
+/// Pure logic — no I/O. The caller is responsible for executing the steps.
+pub fn build_execution_plan(
+    entities: &[Entity],
+    db_version: u32,
+    latest_version: u32,
+    pending_migrations: &[PendingMigration],
+) -> ExecutionPlan {
+    // Filter to valid, non-external entities
+    let valid_entities: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| e.errors.is_empty())
+        .filter(|e| e.entity_type != EntityType::External)
+        .collect();
+
+    // Fresh: db_version == 0 → apply everything + set version
+    if db_version == 0 {
+        let mut steps: Vec<ExecutionStep> = valid_entities
+            .iter()
+            .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
+            .collect();
+        steps.push(ExecutionStep::SetVersion(latest_version));
+        return ExecutionPlan {
+            strategy: ApplyStrategy::Fresh,
+            steps,
+        };
+    }
+
+    // Current: no pending migrations or already at latest
+    if db_version >= latest_version || pending_migrations.is_empty() {
+        let steps: Vec<ExecutionStep> = valid_entities
+            .iter()
+            .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
+            .collect();
+        return ExecutionPlan {
+            strategy: ApplyStrategy::Current,
+            steps,
+        };
+    }
+
+    // Migrate: db_version < latest and there are pending migrations
+    // Collect all added/altered/dropped across all pending migrations
+    let all_added: std::collections::HashSet<&str> = pending_migrations
+        .iter()
+        .flat_map(|m| m.added.iter().map(|s| s.as_str()))
+        .collect();
+    let all_altered: std::collections::HashSet<&str> = pending_migrations
+        .iter()
+        .flat_map(|m| m.altered.iter().map(|s| s.as_str()))
+        .collect();
+
+    let mut steps: Vec<ExecutionStep> = Vec::new();
+
+    // For each entity, determine what to do
+    for entity in &valid_entities {
+        if all_added.contains(entity.name.as_str()) {
+            steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
+        }
+
+        if all_altered.contains(entity.name.as_str()) {
+            // Run migration SQL for each pending migration that alters this entity
+            for migration in pending_migrations {
+                if migration.altered.contains(&entity.name) {
+                    let parts: Vec<&str> = entity.name.split('.').collect();
+                    let (schema, table_name) = if parts.len() > 1 {
+                        (Some(parts[0]), parts[1])
+                    } else {
+                        (None, parts[0])
+                    };
+                    let sql_path = match schema {
+                        Some(s) => migration
+                            .migration_dir
+                            .join(s)
+                            .join(format!("{table_name}.sql")),
+                        None => migration.migration_dir.join(format!("{table_name}.sql")),
+                    };
+                    steps.push(ExecutionStep::MigrateEntity {
+                        entity_name: entity.name.clone(),
+                        migration_sql_path: sql_path,
+                        migration_version: migration.to_version,
+                    });
+                }
+            }
+        }
+
+        // Always apply the current DDL (unless it's being dropped — handled below)
+        if !all_added.contains(entity.name.as_str()) || all_altered.contains(entity.name.as_str()) {
+            // Regular entities and altered entities get ApplyEntity
+            steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
+        } else {
+            // Added entities also get ApplyEntity (CreateEntity is just a marker)
+            steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
+        }
+    }
+
+    // Handle dropped entities
+    for migration in pending_migrations {
+        for table_name in &migration.dropped {
+            let parts: Vec<&str> = table_name.split('.').collect();
+            let (schema, tbl) = if parts.len() > 1 {
+                (Some(parts[0]), parts[1])
+            } else {
+                (None, parts[0])
+            };
+            let sql_path = match schema {
+                Some(s) => migration
+                    .migration_dir
+                    .join(s)
+                    .join(format!("{tbl}.drop.sql")),
+                None => migration.migration_dir.join(format!("{tbl}.drop.sql")),
+            };
+            steps.push(ExecutionStep::DropEntity {
+                entity_name: table_name.clone(),
+                drop_sql_path: sql_path,
+                migration_version: migration.to_version,
+            });
+        }
+    }
+
+    // Record each migration
+    for migration in pending_migrations {
+        steps.push(ExecutionStep::RecordMigration {
+            version: migration.to_version,
+            checksum: migration.checksum.clone(),
+        });
+    }
+
+    // Set version to latest
+    steps.push(ExecutionStep::SetVersion(latest_version));
+
+    ExecutionPlan {
+        strategy: ApplyStrategy::Migrate,
+        steps,
+    }
+}
 
 /// Validation report from inspect.
 #[derive(Debug)]
@@ -771,5 +957,185 @@ mod tests {
         assert!(out.exists());
         let content = std::fs::read_to_string(&out).unwrap();
         assert!(content.contains("CREATE SCHEMA"));
+    }
+
+    // ── Execution plan test helpers ───────────────────────
+
+    fn test_entity(name: &str) -> Entity {
+        Entity::new(EntityType::Table, name)
+    }
+
+    fn test_migration(
+        from: u32,
+        to: u32,
+        added: Vec<&str>,
+        altered: Vec<&str>,
+        dropped: Vec<&str>,
+    ) -> crate::snapshot::PendingMigration {
+        crate::snapshot::PendingMigration {
+            from_version: from,
+            to_version: to,
+            migration_dir: PathBuf::from(format!("migrations/{:03}", to)),
+            added: added.into_iter().map(|s| s.to_string()).collect(),
+            altered: altered.into_iter().map(|s| s.to_string()).collect(),
+            dropped: dropped.into_iter().map(|s| s.to_string()).collect(),
+            checksum: format!("checksum_v{to}"),
+        }
+    }
+
+    // ── A1: Fresh environment ─────────────────────────────
+
+    #[test]
+    fn a1_fresh_env_applies_all_and_sets_version() {
+        let entities = vec![
+            test_entity("config.users"),
+            test_entity("config.orders"),
+        ];
+
+        let plan = build_execution_plan(&entities, 0, 2, &[]);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Fresh);
+
+        // Should have ApplyEntity for each entity + SetVersion
+        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(apply_names.contains(&"config.users"));
+        assert!(apply_names.contains(&"config.orders"));
+
+        // Last step should be SetVersion
+        assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(2))));
+    }
+
+    // ── A2: Current (db_version == latest) ────────────────
+
+    #[test]
+    fn a2_current_applies_all_no_set_version() {
+        let entities = vec![
+            test_entity("config.users"),
+            test_entity("config.orders"),
+        ];
+
+        let plan = build_execution_plan(&entities, 2, 2, &[]);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Current);
+
+        // All entities get ApplyEntity
+        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(apply_names.contains(&"config.users"));
+        assert!(apply_names.contains(&"config.orders"));
+
+        // No SetVersion step
+        assert!(!plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))));
+    }
+
+    // ── A3: Behind by one version ─────────────────────────
+
+    #[test]
+    fn a3_behind_by_one_has_migrate_entity() {
+        let entities = vec![
+            test_entity("config.users"),
+            test_entity("config.orders"),
+        ];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["config.users"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Migrate);
+
+        // Should have a MigrateEntity step for config.users
+        let migrate_steps: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::MigrateEntity { entity_name, migration_version, .. } => {
+                Some((entity_name.as_str(), *migration_version))
+            }
+            _ => None,
+        }).collect();
+        assert!(migrate_steps.contains(&("config.users", 2)));
+
+        // Should also have SetVersion
+        assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(2))));
+    }
+
+    // ── A4: Behind by multiple versions ───────────────────
+
+    #[test]
+    fn a4_behind_by_multiple_has_record_per_migration() {
+        let entities = vec![
+            test_entity("config.users"),
+            test_entity("config.orders"),
+        ];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["config.users"], vec![]),
+            test_migration(2, 3, vec![], vec!["config.orders"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Migrate);
+
+        // Should have RecordMigration for both v2 and v3
+        let record_versions: Vec<u32> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::RecordMigration { version, .. } => Some(*version),
+            _ => None,
+        }).collect();
+        assert!(record_versions.contains(&2));
+        assert!(record_versions.contains(&3));
+
+        assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(3))));
+    }
+
+    // ── A5: New table added in migration ──────────────────
+
+    #[test]
+    fn a5_new_table_gets_create_entity() {
+        let entities = vec![
+            test_entity("config.users"),
+            test_entity("config.audit_log"),
+        ];
+        let migrations = vec![
+            test_migration(1, 2, vec!["config.audit_log"], vec![], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Migrate);
+
+        // Should have CreateEntity for the new table
+        let created: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::CreateEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(created.contains(&"config.audit_log"));
+    }
+
+    // ── A6: Table drop ────────────────────────────────────
+
+    #[test]
+    fn a6_dropped_table_gets_drop_entity() {
+        let entities = vec![
+            test_entity("config.users"),
+        ];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec![], vec!["config.legacy"]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Migrate);
+
+        // Should have DropEntity for the dropped table
+        let dropped: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::DropEntity { entity_name, migration_version, .. } => {
+                Some((entity_name.as_str(), *migration_version))
+            }
+            _ => None,
+        }).collect();
+        assert!(dropped.contains(&("config.legacy", 2)));
     }
 }
