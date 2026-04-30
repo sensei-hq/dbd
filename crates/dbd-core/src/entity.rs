@@ -63,7 +63,7 @@ pub struct Reference {
 }
 
 /// Foreign key constraint with full detail.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForeignKey {
     pub name: Option<String>,
     pub columns: Vec<String>,
@@ -85,7 +85,7 @@ pub enum FkAction {
 }
 
 /// Table-level constraint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TableConstraint {
     PrimaryKey {
@@ -104,7 +104,7 @@ pub enum TableConstraint {
 }
 
 /// Parsed column definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: String,
@@ -118,7 +118,7 @@ pub struct ColumnDef {
 }
 
 /// Index definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: Option<String>,
     pub columns: Vec<IndexColumn>,
@@ -126,7 +126,7 @@ pub struct IndexDef {
     pub index_type: Option<IndexType>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexColumn {
     pub name: String,
     pub order: Option<SortOrder>,
@@ -147,14 +147,14 @@ pub enum SortOrder {
 }
 
 /// Table and column comments.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TableComments {
     pub table: Option<String>,
     pub columns: HashMap<String, String>,
 }
 
 /// Full parsed table structure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<TableConstraint>,
