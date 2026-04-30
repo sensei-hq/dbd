@@ -91,20 +91,11 @@ pub enum Commands {
         #[arg(long)]
         list: bool,
     },
-    /// Apply pending migrations
+    /// Show migration status
     Migrate {
-        /// Apply pending migrations
-        #[arg(long)]
-        apply: bool,
         /// Show local vs database version
         #[arg(long)]
         status: bool,
-        /// Apply up to this version
-        #[arg(long)]
-        to: Option<u32>,
-        /// Print SQL without executing
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Drop all schemas (with safety guards)
     Reset {
