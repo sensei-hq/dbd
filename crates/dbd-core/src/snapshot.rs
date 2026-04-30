@@ -30,6 +30,16 @@ pub struct Snapshot {
     pub description: String,
     pub timestamp: String,
     pub tables: Vec<TableSnapshot>,
+    #[serde(default)]
+    pub enums: Vec<EnumSnapshot>,
+}
+
+/// Snapshot of a single enum type's structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnumSnapshot {
+    pub name: String,
+    pub schema: String,
+    pub values: Vec<String>,
 }
 
 /// Snapshot of a single table's structure.
@@ -213,6 +223,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![],
+            enums: vec![],
         };
         fs::write(
             dir.join("001.json"),
@@ -225,6 +236,7 @@ mod tests {
             description: "add notes column".to_string(),
             timestamp: "2026-02-01T00:00:00Z".to_string(),
             tables: vec![],
+            enums: vec![],
         };
         fs::write(
             dir.join("002.json"),

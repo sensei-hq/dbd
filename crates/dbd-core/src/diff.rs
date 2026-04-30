@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::entity::{ColumnDef, EntityType, IndexDef, TableConstraint};
-use crate::snapshot::{Snapshot, TableSnapshot};
+use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
 /// A single entity-level diff between two snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +61,7 @@ pub enum FieldDetail {
 /// Compare two snapshots and return a list of migration diffs.
 pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<MigrationDiff> {
     let mut diffs = diff_tables(&old.tables, &new.tables);
-    diffs.extend(diff_enums());
+    diffs.extend(diff_enums(&old.enums, &new.enums));
     diffs
 }
 
@@ -305,17 +305,99 @@ fn diff_indexes(old: &[IndexDef], new: &[IndexDef]) -> Vec<FieldChange> {
     changes
 }
 
-/// Stub: enum diffs not yet implemented.
-fn diff_enums() -> Vec<MigrationDiff> {
-    Vec::new()
+/// Qualified name for an enum: "schema.name".
+fn enum_qualified_name(e: &EnumSnapshot) -> String {
+    format!("{}.{}", e.schema, e.name)
+}
+
+/// Diff enums between two snapshots by qualified name.
+fn diff_enums(old: &[EnumSnapshot], new: &[EnumSnapshot]) -> Vec<MigrationDiff> {
+    let old_map: HashMap<String, &EnumSnapshot> =
+        old.iter().map(|e| (enum_qualified_name(e), e)).collect();
+    let new_map: HashMap<String, &EnumSnapshot> =
+        new.iter().map(|e| (enum_qualified_name(e), e)).collect();
+
+    let mut diffs = Vec::new();
+
+    // Enums in new but not in old → Add
+    for name in new_map.keys() {
+        if !old_map.contains_key(name) {
+            diffs.push(MigrationDiff {
+                entity_name: name.clone(),
+                entity_type: EntityType::Enum,
+                action: DiffAction::Add,
+            });
+        }
+    }
+
+    // Enums in old but not in new → Drop
+    for name in old_map.keys() {
+        if !new_map.contains_key(name) {
+            diffs.push(MigrationDiff {
+                entity_name: name.clone(),
+                entity_type: EntityType::Enum,
+                action: DiffAction::Drop,
+            });
+        }
+    }
+
+    // Enums in both → check for value-level changes
+    for (name, old_e) in &old_map {
+        if let Some(new_e) = new_map.get(name) {
+            let changes = diff_enum_values(old_e, new_e);
+            if !changes.is_empty() {
+                diffs.push(MigrationDiff {
+                    entity_name: name.clone(),
+                    entity_type: EntityType::Enum,
+                    action: DiffAction::Change(changes),
+                });
+            }
+        }
+    }
+
+    diffs
+}
+
+/// Diff enum values between two versions of the same enum.
+fn diff_enum_values(old: &EnumSnapshot, new: &EnumSnapshot) -> Vec<FieldChange> {
+    let old_set: std::collections::HashSet<&str> =
+        old.values.iter().map(|v| v.as_str()).collect();
+    let new_set: std::collections::HashSet<&str> =
+        new.values.iter().map(|v| v.as_str()).collect();
+
+    let mut changes = Vec::new();
+
+    // Added values
+    for val in &new.values {
+        if !old_set.contains(val.as_str()) {
+            changes.push(FieldChange {
+                field_name: val.clone(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Add(Box::new(FieldDetail::EnumValue(val.clone()))),
+            });
+        }
+    }
+
+    // Dropped values
+    for val in &old.values {
+        if !new_set.contains(val.as_str()) {
+            changes.push(FieldChange {
+                field_name: val.clone(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Drop,
+            });
+        }
+    }
+
+    changes
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, IndexColumn, IndexDef, TableConstraint};
-    use crate::snapshot::{Snapshot, TableSnapshot};
+    use crate::entity::{ColumnDef, IndexColumn, IndexDef, IndexType, TableConstraint};
+    use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
     // ── Helpers ─────────────────────────────────────────────
 
@@ -361,13 +443,14 @@ mod tests {
         }
     }
 
-    /// Build a Snapshot from a list of TableSnapshots.
-    fn snap(tables: Vec<TableSnapshot>) -> Snapshot {
+    /// Build a Snapshot from a list of TableSnapshots and EnumSnapshots.
+    fn snap(tables: Vec<TableSnapshot>, enums: Vec<EnumSnapshot>) -> Snapshot {
         Snapshot {
             version: 1,
             description: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables,
+            enums,
         }
     }
 
@@ -375,8 +458,8 @@ mod tests {
 
     #[test]
     fn d1_identical_snapshots_produce_no_diff() {
-        let a = snap(vec![table("public", "users", vec![col("id", "int")])]);
-        let b = snap(vec![table("public", "users", vec![col("id", "int")])]);
+        let a = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
+        let b = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
         let diffs = diff(&a, &b);
         assert!(diffs.is_empty(), "identical snapshots should produce no diffs");
     }
@@ -385,8 +468,8 @@ mod tests {
 
     #[test]
     fn d2_new_table_detected_as_add() {
-        let a = snap(vec![]);
-        let b = snap(vec![table("public", "users", vec![col("id", "int")])]);
+        let a = snap(vec![], vec![]);
+        let b = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
         let diffs = diff(&a, &b);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].entity_name, "public.users");
@@ -397,8 +480,8 @@ mod tests {
 
     #[test]
     fn d3_removed_table_detected_as_drop() {
-        let a = snap(vec![table("public", "users", vec![col("id", "int")])]);
-        let b = snap(vec![]);
+        let a = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
+        let b = snap(vec![], vec![]);
         let diffs = diff(&a, &b);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].entity_name, "public.users");
@@ -409,12 +492,12 @@ mod tests {
 
     #[test]
     fn d4_added_column_detected() {
-        let a = snap(vec![table("public", "users", vec![col("id", "int")])]);
+        let a = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
         let b = snap(vec![table(
             "public",
             "users",
             vec![col("id", "int"), col("email", "text")],
-        )]);
+        )], vec![]);
         let diffs = diff(&a, &b);
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
@@ -435,8 +518,8 @@ mod tests {
             "public",
             "users",
             vec![col("id", "int"), col("email", "text")],
-        )]);
-        let b = snap(vec![table("public", "users", vec![col("id", "int")])]);
+        )], vec![]);
+        let b = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
         let diffs = diff(&a, &b);
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
@@ -453,8 +536,8 @@ mod tests {
 
     #[test]
     fn d6_altered_column_detected() {
-        let a = snap(vec![table("public", "users", vec![col("id", "int")])]);
-        let b = snap(vec![table("public", "users", vec![col("id", "bigint")])]);
+        let a = snap(vec![table("public", "users", vec![col("id", "int")])], vec![]);
+        let b = snap(vec![table("public", "users", vec![col("id", "bigint")])], vec![]);
         let diffs = diff(&a, &b);
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
@@ -476,7 +559,7 @@ mod tests {
             name: Some("uq_id".to_string()),
             columns: vec!["id".to_string()],
         });
-        let diffs = diff(&snap(vec![t_old]), &snap(vec![t_new]));
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
             assert_eq!(changes.len(), 1);
@@ -502,7 +585,7 @@ mod tests {
             unique: false,
             index_type: None,
         });
-        let diffs = diff(&snap(vec![t_old]), &snap(vec![t_new]));
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
             assert_eq!(changes.len(), 1);
@@ -511,5 +594,457 @@ mod tests {
         } else {
             panic!("expected Change action");
         }
+    }
+
+    // ── D9: constraint dropped ──────────────────────────────
+
+    #[test]
+    fn d9_dropped_constraint_detected() {
+        let mut t_old = table("public", "users", vec![col("id", "int")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("uq_id".to_string()),
+            columns: vec!["id".to_string()],
+        });
+        let t_new = table("public", "users", vec![col("id", "int")]);
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "uq_id");
+            assert_eq!(changes[0].field_type, FieldType::Constraint);
+            assert!(matches!(changes[0].action, ChangeAction::Drop));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D10: index dropped ──────────────────────────────────
+
+    #[test]
+    fn d10_dropped_index_detected() {
+        let mut t_old = table("public", "users", vec![col("id", "int")]);
+        t_old.indexes.push(IndexDef {
+            name: Some("idx_id".to_string()),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: None,
+            }],
+            unique: false,
+            index_type: None,
+        });
+        let t_new = table("public", "users", vec![col("id", "int")]);
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "idx_id");
+            assert_eq!(changes[0].field_type, FieldType::Index);
+            assert!(matches!(changes[0].action, ChangeAction::Drop));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D11: constraint changed (same name, different definition → Drop + Add) ──
+
+    #[test]
+    fn d11_changed_constraint_detected_as_drop_add() {
+        let mut t_old = table("public", "users", vec![col("id", "int"), col("email", "text")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("uq_email".to_string()),
+            columns: vec!["email".to_string()],
+        });
+        let mut t_new = table("public", "users", vec![col("id", "int"), col("email", "text")]);
+        // Same name, but now covers both columns
+        t_new.table_constraints.push(TableConstraint::Unique {
+            name: Some("uq_email".to_string()),
+            columns: vec!["email".to_string(), "id".to_string()],
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            // Changed constraint = Drop old + Add new
+            assert_eq!(changes.len(), 2);
+            let drop_count = changes
+                .iter()
+                .filter(|c| matches!(c.action, ChangeAction::Drop))
+                .count();
+            let add_count = changes
+                .iter()
+                .filter(|c| matches!(c.action, ChangeAction::Add(_)))
+                .count();
+            assert_eq!(drop_count, 1);
+            assert_eq!(add_count, 1);
+            assert!(changes.iter().all(|c| c.field_name == "uq_email"));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D12: index changed (same name, different type → Drop + Add) ──
+
+    #[test]
+    fn d12_changed_index_detected_as_drop_add() {
+        let mut t_old = table("public", "users", vec![col("id", "int")]);
+        t_old.indexes.push(IndexDef {
+            name: Some("idx_id".to_string()),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: None,
+            }],
+            unique: false,
+            index_type: None,
+        });
+        let mut t_new = table("public", "users", vec![col("id", "int")]);
+        t_new.indexes.push(IndexDef {
+            name: Some("idx_id".to_string()),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: None,
+            }],
+            unique: false,
+            index_type: Some(IndexType::Hash),
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 2);
+            let drop_count = changes
+                .iter()
+                .filter(|c| matches!(c.action, ChangeAction::Drop))
+                .count();
+            let add_count = changes
+                .iter()
+                .filter(|c| matches!(c.action, ChangeAction::Add(_)))
+                .count();
+            assert_eq!(drop_count, 1);
+            assert_eq!(add_count, 1);
+            assert!(changes.iter().all(|c| c.field_name == "idx_id"));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D13: column nullable changed ────────────────────────
+
+    #[test]
+    fn d13_column_nullable_change_detected_as_alter() {
+        let a = snap(
+            vec![table("public", "users", vec![col_not_null("id", "int")])],
+            vec![],
+        );
+        let b = snap(
+            vec![table("public", "users", vec![col("id", "int")])],
+            vec![],
+        );
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "id");
+            assert_eq!(changes[0].field_type, FieldType::Column);
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+            if let ChangeAction::Alter { ref old, ref new } = changes[0].action {
+                if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                    (old.as_ref(), new.as_ref())
+                {
+                    assert!(!old_col.nullable);
+                    assert!(new_col.nullable);
+                } else {
+                    panic!("expected Column details");
+                }
+            }
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D14: column default changed ─────────────────────────
+
+    #[test]
+    fn d14_column_default_change_detected_as_alter() {
+        let a = snap(
+            vec![table("public", "users", vec![col("status", "text")])],
+            vec![],
+        );
+        let b = snap(
+            vec![table(
+                "public",
+                "users",
+                vec![col_with_default("status", "text", "'active'")],
+            )],
+            vec![],
+        );
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "status");
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+            if let ChangeAction::Alter { ref old, ref new } = changes[0].action {
+                if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                    (old.as_ref(), new.as_ref())
+                {
+                    assert!(old_col.default_value.is_none());
+                    assert_eq!(new_col.default_value.as_deref(), Some("'active'"));
+                } else {
+                    panic!("expected Column details");
+                }
+            }
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D15: multiple changes on same table ─────────────────
+
+    #[test]
+    fn d15_multiple_changes_on_same_table() {
+        let mut t_old = table("public", "users", vec![col("id", "int"), col("email", "text")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("uq_email".to_string()),
+            columns: vec!["email".to_string()],
+        });
+
+        let mut t_new = table(
+            "public",
+            "users",
+            vec![col("id", "int"), col("email", "text"), col("name", "text")],
+        );
+        // constraint dropped (not added back), index added
+        t_new.indexes.push(IndexDef {
+            name: Some("idx_name".to_string()),
+            columns: vec![IndexColumn {
+                name: "name".to_string(),
+                order: None,
+            }],
+            unique: false,
+            index_type: None,
+        });
+
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            // add col "name" + drop constraint "uq_email" + add index "idx_name"
+            assert_eq!(changes.len(), 3);
+            let col_add = changes
+                .iter()
+                .find(|c| c.field_type == FieldType::Column && c.field_name == "name")
+                .expect("should have column add");
+            assert!(matches!(col_add.action, ChangeAction::Add(_)));
+            let con_drop = changes
+                .iter()
+                .find(|c| c.field_type == FieldType::Constraint && c.field_name == "uq_email")
+                .expect("should have constraint drop");
+            assert!(matches!(con_drop.action, ChangeAction::Drop));
+            let idx_add = changes
+                .iter()
+                .find(|c| c.field_type == FieldType::Index && c.field_name == "idx_name")
+                .expect("should have index add");
+            assert!(matches!(idx_add.action, ChangeAction::Add(_)));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D16: multiple tables changed simultaneously ─────────
+
+    #[test]
+    fn d16_multiple_tables_changed() {
+        let a = snap(
+            vec![
+                table("public", "users", vec![col("id", "int")]),
+                table("public", "orders", vec![col("id", "int")]),
+            ],
+            vec![],
+        );
+        let b = snap(
+            vec![
+                table(
+                    "public",
+                    "users",
+                    vec![col("id", "int"), col("email", "text")],
+                ),
+                table(
+                    "public",
+                    "orders",
+                    vec![col("id", "int"), col("total", "numeric")],
+                ),
+            ],
+            vec![],
+        );
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 2);
+        let names: Vec<&str> = diffs.iter().map(|d| d.entity_name.as_str()).collect();
+        assert!(names.contains(&"public.users"));
+        assert!(names.contains(&"public.orders"));
+        for d in &diffs {
+            assert!(matches!(d.action, DiffAction::Change(_)));
+        }
+    }
+
+    // ── D17: mixed add/alter/drop across entities ───────────
+
+    #[test]
+    fn d17_mixed_add_alter_drop_across_entities() {
+        let a = snap(
+            vec![
+                table("public", "users", vec![col("id", "int")]),
+                table("public", "legacy", vec![col("id", "int")]),
+            ],
+            vec![],
+        );
+        let b = snap(
+            vec![
+                // users modified (column added)
+                table(
+                    "public",
+                    "users",
+                    vec![col("id", "int"), col("name", "text")],
+                ),
+                // legacy dropped (absent in new)
+                // orders added (new table)
+                table("public", "orders", vec![col("id", "int")]),
+            ],
+            vec![],
+        );
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 3);
+
+        let added = diffs
+            .iter()
+            .find(|d| matches!(d.action, DiffAction::Add))
+            .expect("should have an Add");
+        assert_eq!(added.entity_name, "public.orders");
+
+        let dropped = diffs
+            .iter()
+            .find(|d| matches!(d.action, DiffAction::Drop))
+            .expect("should have a Drop");
+        assert_eq!(dropped.entity_name, "public.legacy");
+
+        let changed = diffs
+            .iter()
+            .find(|d| matches!(d.action, DiffAction::Change(_)))
+            .expect("should have a Change");
+        assert_eq!(changed.entity_name, "public.users");
+    }
+
+    // ── D18: unnamed constraint matching ────────────────────
+
+    #[test]
+    fn d18_unnamed_pk_with_same_columns_no_diff() {
+        let mut t_old = table("public", "users", vec![col("id", "int")]);
+        t_old.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_string()],
+        });
+        let mut t_new = table("public", "users", vec![col("id", "int")]);
+        t_new.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_string()],
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert!(diffs.is_empty(), "identical unnamed PKs should produce no diff");
+    }
+
+    // ── D19: enum value added ───────────────────────────────
+
+    #[test]
+    fn d19_enum_value_added() {
+        let old_enum = EnumSnapshot {
+            name: "status".to_string(),
+            schema: "public".to_string(),
+            values: vec!["active".to_string(), "inactive".to_string()],
+        };
+        let new_enum = EnumSnapshot {
+            name: "status".to_string(),
+            schema: "public".to_string(),
+            values: vec![
+                "active".to_string(),
+                "inactive".to_string(),
+                "pending".to_string(),
+            ],
+        };
+        let diffs = diff(
+            &snap(vec![], vec![old_enum]),
+            &snap(vec![], vec![new_enum]),
+        );
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].entity_name, "public.status");
+        assert_eq!(diffs[0].entity_type, EntityType::Enum);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "pending");
+            assert_eq!(changes[0].field_type, FieldType::EnumValue);
+            assert!(matches!(changes[0].action, ChangeAction::Add(_)));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D20: enum value dropped ─────────────────────────────
+
+    #[test]
+    fn d20_enum_value_dropped() {
+        let old_enum = EnumSnapshot {
+            name: "status".to_string(),
+            schema: "public".to_string(),
+            values: vec!["active".to_string(), "inactive".to_string()],
+        };
+        let new_enum = EnumSnapshot {
+            name: "status".to_string(),
+            schema: "public".to_string(),
+            values: vec!["active".to_string()],
+        };
+        let diffs = diff(
+            &snap(vec![], vec![old_enum]),
+            &snap(vec![], vec![new_enum]),
+        );
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].entity_name, "public.status");
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "inactive");
+            assert_eq!(changes[0].field_type, FieldType::EnumValue);
+            assert!(matches!(changes[0].action, ChangeAction::Drop));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // ── D21: new enum added / enum dropped ──────────────────
+
+    #[test]
+    fn d21_enum_added_and_dropped() {
+        let old_enum = EnumSnapshot {
+            name: "old_type".to_string(),
+            schema: "public".to_string(),
+            values: vec!["a".to_string()],
+        };
+        let new_enum = EnumSnapshot {
+            name: "new_type".to_string(),
+            schema: "public".to_string(),
+            values: vec!["x".to_string()],
+        };
+        let diffs = diff(
+            &snap(vec![], vec![old_enum]),
+            &snap(vec![], vec![new_enum]),
+        );
+        assert_eq!(diffs.len(), 2);
+
+        let added = diffs
+            .iter()
+            .find(|d| matches!(d.action, DiffAction::Add))
+            .expect("should have an Add");
+        assert_eq!(added.entity_name, "public.new_type");
+        assert_eq!(added.entity_type, EntityType::Enum);
+
+        let dropped = diffs
+            .iter()
+            .find(|d| matches!(d.action, DiffAction::Drop))
+            .expect("should have a Drop");
+        assert_eq!(dropped.entity_name, "public.old_type");
+        assert_eq!(dropped.entity_type, EntityType::Enum);
     }
 }
