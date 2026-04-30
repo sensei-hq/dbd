@@ -2,7 +2,7 @@
 
 ## Current status (2026-04-30)
 
-**47 commits, 10,126 LOC, 249 tests, verified on sensei/daemon/database (116 entities)**
+**63 commits, 12,564 LOC, 319 tests, verified on sensei/daemon/database (116 entities)**
 
 ### Working commands
 
@@ -17,7 +17,7 @@
 | `dbml` | yes | — | Verified with dbdocs build |
 | `doctor` | yes | — | Config migration from Node.js format |
 | `snapshot` | yes | — | Create versioned snapshots, diff, generate migrations |
-| `migrate` | `--status` | `--apply` | Version-aware migration with `--to N`, `--dry-run` |
+| `migrate` | `--status` | — | Read-only migration status diagnostic |
 
 ### Adapter support
 
@@ -65,7 +65,7 @@
 
 ## P1 — Important features
 
-### Smart multi-snapshot generation — NEXT
+### Smart multi-snapshot generation — DONE
 When `dbd snapshot` detects complex changes (enum value removal, column type change,
 column rename), it automatically splits into multiple snapshots with correct intermediate
 states and generates data.sql files where the correction is derivable.
