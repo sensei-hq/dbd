@@ -701,6 +701,80 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
     }
 }
 
+// ── Type cast heuristic ────────────────────────────────
+
+/// Normalize a Postgres type string: lowercase, strip precision/length info.
+fn normalize_type(t: &str) -> String {
+    let lower = t.to_lowercase().trim().to_string();
+    // Strip parenthesized precision: VARCHAR(100) → varchar, NUMERIC(10,2) → numeric
+    match lower.find('(') {
+        Some(pos) => lower[..pos].trim().to_string(),
+        None => lower,
+    }
+}
+
+/// Categorize a normalized Postgres type into a broad category.
+fn type_category(normalized: &str) -> &'static str {
+    match normalized {
+        "int" | "integer" | "int4" | "bigint" | "int8" | "smallint" | "int2" | "serial"
+        | "bigserial" | "smallserial" => "integer",
+        "numeric" | "decimal" | "real" | "float4" | "double precision" | "float8" | "money" => {
+            "numeric"
+        }
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name" => {
+            "text"
+        }
+        "boolean" | "bool" => "boolean",
+        "timestamp" | "timestamptz" | "timestamp with time zone"
+        | "timestamp without time zone" => "timestamp",
+        "date" => "date",
+        "time" | "timetz" | "time with time zone" | "time without time zone" => "time",
+        "json" | "jsonb" => "json",
+        "uuid" => "uuid",
+        "bytea" => "bytea",
+        _ => "other",
+    }
+}
+
+/// Determine if a Postgres `::` cast from one type to another is safe for
+/// auto-generating data.sql. This is a heuristic — it errs on the side of
+/// caution for types that would lose data.
+pub fn is_castable(from: &str, to: &str) -> bool {
+    let from_norm = normalize_type(from);
+    let to_norm = normalize_type(to);
+
+    // Arrays are never auto-castable
+    if from.contains("[]") || to.contains("[]") {
+        return false;
+    }
+
+    let from_cat = type_category(&from_norm);
+    let to_cat = type_category(&to_norm);
+
+    // JSONB/JSON → scalar is never castable
+    if from_cat == "json" && to_cat != "json" {
+        return false;
+    }
+
+    // Anything → TEXT/VARCHAR is castable
+    if to_cat == "text" {
+        return true;
+    }
+
+    // Same category = castable (INT → BIGINT, TEXT → TEXT, etc.)
+    if from_cat == to_cat {
+        return true;
+    }
+
+    // BOOLEAN → INTEGER is castable
+    if from_cat == "boolean" && to_cat == "integer" {
+        return true;
+    }
+
+    // TIMESTAMP → TEXT already handled above; no other cross-category casts
+    false
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
@@ -2116,5 +2190,61 @@ mod tests {
         }];
         let warnings = migration_warnings(&diffs);
         assert!(warnings.is_empty(), "simple column add should not produce warnings");
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Task 1: is_castable() tests
+    // ════════════════════════════════════════════════════════
+
+    #[test]
+    fn ca1_integer_to_text_castable() {
+        assert!(is_castable("INTEGER", "TEXT"));
+        assert!(is_castable("BIGINT", "TEXT"));
+        assert!(is_castable("SMALLINT", "TEXT"));
+    }
+
+    #[test]
+    fn ca2_varchar_to_text_castable() {
+        assert!(is_castable("VARCHAR(100)", "TEXT"));
+    }
+
+    #[test]
+    fn ca3_text_to_varchar_castable() {
+        assert!(is_castable("TEXT", "VARCHAR(50)"));
+    }
+
+    #[test]
+    fn ca4_jsonb_to_integer_not_castable() {
+        assert!(!is_castable("JSONB", "INTEGER"));
+        assert!(!is_castable("JSON", "INTEGER"));
+    }
+
+    #[test]
+    fn ca5_array_to_scalar_not_castable() {
+        assert!(!is_castable("TEXT[]", "TEXT"));
+    }
+
+    #[test]
+    fn ca_numeric_to_text_castable() {
+        assert!(is_castable("NUMERIC", "TEXT"));
+        assert!(is_castable("DECIMAL", "TEXT"));
+    }
+
+    #[test]
+    fn ca_boolean_castable() {
+        assert!(is_castable("BOOLEAN", "TEXT"));
+        assert!(is_castable("BOOLEAN", "INTEGER"));
+    }
+
+    #[test]
+    fn ca_timestamp_to_text_castable() {
+        assert!(is_castable("TIMESTAMP", "TEXT"));
+        assert!(is_castable("TIMESTAMPTZ", "TEXT"));
+    }
+
+    #[test]
+    fn ca_same_category_castable() {
+        assert!(is_castable("INTEGER", "BIGINT"));
+        assert!(is_castable("TEXT", "TEXT"));
     }
 }
