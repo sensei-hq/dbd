@@ -12,8 +12,7 @@ pub struct MockAdapter {
     pub applied: Arc<Mutex<Vec<String>>>,
     pub scripts: Arc<Mutex<Vec<String>>>,
     pub imported: Arc<Mutex<Vec<String>>>,
-    pub db_version: u32,
-    pub meta: Option<ProjectMeta>,
+    pub meta: Arc<Mutex<Option<ProjectMeta>>>,
     pub connected: bool,
 }
 
@@ -29,22 +28,21 @@ impl MockAdapter {
             applied: Arc::new(Mutex::new(Vec::new())),
             scripts: Arc::new(Mutex::new(Vec::new())),
             imported: Arc::new(Mutex::new(Vec::new())),
-            db_version: 0,
-            meta: None,
+            meta: Arc::new(Mutex::new(None)),
             connected: false,
         }
     }
 
-    pub fn with_version(mut self, version: u32) -> Self {
-        self.db_version = version;
-        self
+    pub fn with_version(self, version: u32) -> Self {
+        self.with_meta("dev", version)
     }
 
-    pub fn with_meta(mut self, env: &str, version: u32) -> Self {
-        self.meta = Some(ProjectMeta {
+    pub fn with_meta(self, env: &str, version: u32) -> Self {
+        *self.meta.lock().unwrap() = Some(ProjectMeta {
             project: "test".to_string(),
             env: env.to_string(),
             version,
+            applied_at: Some("2026-01-01T00:00:00Z".to_string()),
         });
         self
     }
@@ -114,7 +112,7 @@ impl DatabaseAdapter for MockAdapter {
     }
 
     async fn get_db_version(&self) -> Result<u32> {
-        Ok(self.db_version)
+        Ok(self.meta.lock().unwrap().as_ref().map(|m| m.version).unwrap_or(0))
     }
 
     async fn apply_migration(
@@ -136,10 +134,16 @@ impl DatabaseAdapter for MockAdapter {
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        Ok(self.meta.clone())
+        Ok(self.meta.lock().unwrap().clone())
     }
 
-    async fn set_project_meta(&self, _env: &str, _version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+        *self.meta.lock().unwrap() = Some(ProjectMeta {
+            project: "test".to_string(),
+            env: env.to_string(),
+            version,
+            applied_at: Some("2026-01-01T00:00:00Z".to_string()),
+        });
         Ok(())
     }
 }
@@ -180,6 +184,47 @@ mod tests {
         let meta = mock.get_project_meta().await.unwrap().unwrap();
         assert_eq!(meta.env, "prod");
         assert_eq!(meta.version, 2);
+    }
+
+    // ── T1: get_db_version returns 0 when no meta ───────
+
+    #[tokio::test]
+    async fn t1_get_db_version_returns_0_when_no_meta() {
+        let mock = MockAdapter::new();
+        assert_eq!(mock.get_db_version().await.unwrap(), 0);
+    }
+
+    // ── T2: get_db_version returns meta version ────────
+
+    #[tokio::test]
+    async fn t2_get_db_version_returns_meta_version() {
+        let mock = MockAdapter::new().with_meta("dev", 3);
+        assert_eq!(mock.get_db_version().await.unwrap(), 3);
+    }
+
+    // ── T3: set_project_meta updates version and env ───
+
+    #[tokio::test]
+    async fn t3_set_project_meta_updates_state() {
+        let mock = MockAdapter::new();
+        assert_eq!(mock.get_db_version().await.unwrap(), 0);
+
+        mock.set_project_meta("prod", 5).await.unwrap();
+
+        assert_eq!(mock.get_db_version().await.unwrap(), 5);
+        let meta = mock.get_project_meta().await.unwrap().unwrap();
+        assert_eq!(meta.env, "prod");
+        assert_eq!(meta.version, 5);
+        assert!(meta.applied_at.is_some());
+    }
+
+    // ── T6: ProjectMeta includes applied_at ────────────
+
+    #[tokio::test]
+    async fn t6_project_meta_includes_applied_at() {
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let meta = mock.get_project_meta().await.unwrap().unwrap();
+        assert!(meta.applied_at.is_some());
     }
 
     #[tokio::test]
