@@ -36,6 +36,58 @@ dbd migrate:
 
 ---
 
+## Architecture: I/O Boundary Separation
+
+All core logic is implemented as pure functions that take version numbers, snapshots, and
+entity lists as inputs and return data structures (plans, diffs, SQL strings) as outputs.
+No database access, no filesystem reads inside core logic. This enables full unit testing
+without mocks.
+
+**Pure logic functions (no I/O):**
+
+```rust
+// Diff: compare two snapshots
+fn diff(old: &Snapshot, new: &Snapshot) -> Vec<MigrationDiff>
+
+// SQL gen: produce SQL from a diff
+fn generate_migration_sql(entity_name: &str, diff: &MigrationDiff) -> String
+
+// Snapshot: build snapshot + diffs from entities
+fn prepare_snapshot(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+) -> SnapshotResult   // Snapshot, Vec<MigrationDiff>, generated SQL per entity
+
+// Apply: build execution plan from version state
+fn build_execution_plan(
+    entities: &[Entity],
+    db_version: u32,
+    latest_version: u32,
+    pending_migrations: &[PendingMigration],
+) -> ExecutionPlan    // ordered list of steps: Create, Migrate, Drop
+```
+
+**I/O boundary (thin wrappers):**
+
+```rust
+// Reads DB version, calls build_execution_plan, executes steps via adapter
+pub async fn apply(&self, adapter, name, dry_run) -> Result<()>
+
+// Reads previous snapshot from disk, calls prepare_snapshot, writes files
+pub fn create_snapshot(design: &Design, description: &str) -> Result<SnapshotResult>
+
+// Reads DB version via adapter, calls pending_migrations, prints status
+pub async fn migrate_status(adapter, project_dir, latest_version) -> Result<()>
+```
+
+**Testing benefit:** Every test scenario (D1-D21, S1-S14, SC1-SC10, A1-A8) runs as a
+pure unit test. Construct inputs, call the function, assert outputs. No mock adapter needed
+for core logic. Only the thin I/O wrappers need integration tests.
+
+---
+
 ## Module 1: Schema Diff Engine (`diff.rs`)
 
 ### Types
@@ -183,28 +235,55 @@ struct ProjectConfig {
 }
 ```
 
-### Snapshot Create Flow
+### Pure Logic: `prepare_snapshot()`
 
-`create_snapshot(design: &Design, description: &str) -> Result<SnapshotResult>`
+```rust
+/// Builds snapshot and computes diffs. No filesystem I/O.
+fn prepare_snapshot(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+) -> SnapshotResult
 
+struct SnapshotResult {
+    snapshot: Snapshot,
+    diffs: Vec<MigrationDiff>,
+    migration_files: Vec<MigrationFile>,  // path + SQL content pairs
+    graph: Option<MigrationGraph>,        // None for v1 baseline
+    is_baseline: bool,
+    no_changes: bool,                     // true if N>1 and diff is empty
+}
+
+struct MigrationFile {
+    relative_path: PathBuf,               // e.g. "config/users.sql"
+    content: String,                      // ALTER TABLE ...
+}
+```
+
+**Logic:**
 1. Extract table entities with `table_def` -> `Vec<TableSnapshot>`
 2. Extract enum entities -> `Vec<EnumSnapshot>`
-3. Determine next version N via `next_version()`
-4. Build `Snapshot { version: N, tables, enums, timestamp, description }`
-5. **If N == 1** (first snapshot / baseline):
-   - Write `snapshots/001.json`
-   - Update `design.yaml` version to 1
-   - Return with summary: "Baseline snapshot v1 created (X tables, Y enums)"
-6. **If N > 1:**
-   - Read snapshot N-1
-   - `diff(old, new)` -> `Vec<MigrationDiff>`
-   - If empty: print "No changes detected", do not create snapshot
-   - Generate migration SQL for each `Change`/`Drop` diff
-   - Write `migrations/NNN/<schema>/<table>.sql` files
-   - Write `migrations/NNN/graph.json` with added/altered/dropped lists
-   - Write `snapshots/NNN.json`
-   - Update `design.yaml` version to N
-   - Return summary with counts and file list
+3. Build `Snapshot { version: next_version, tables, enums, timestamp, description }`
+4. **If previous is None** (baseline): return with `is_baseline=true`, empty diffs
+5. **If previous is Some**: `diff(previous, &snapshot)` -> diffs
+   - If empty: return with `no_changes=true`
+   - Generate migration SQL + graph from diffs
+
+### I/O Boundary: `create_snapshot()`
+
+```rust
+/// Reads previous snapshot, calls prepare_snapshot, writes output files.
+pub fn create_snapshot(design: &Design, description: &str) -> Result<SnapshotResult> {
+    let prev = latest_snapshot(&design.project_dir)?;
+    let version = next_version(&design.project_dir);
+    let result = prepare_snapshot(&design.entities, prev.as_ref(), version, description);
+    if result.no_changes { return Ok(result); }  // nothing to write
+    write_snapshot_files(&design.project_dir, &result)?;
+    update_design_version(&design.config_path, version)?;
+    Ok(result)
+}
+```
 
 ### File Layout
 
@@ -229,43 +308,88 @@ migrations/
 
 ## Module 3: Apply with Migrations (modify `design.rs`)
 
-### Updated Apply Flow
+### Pure Logic: `build_execution_plan()`
 
 ```rust
-pub async fn apply(&self, adapter, name, dry_run) -> Result<()>
+/// Determines what to do given current state. No I/O.
+fn build_execution_plan(
+    entities: &[Entity],
+    db_version: u32,
+    latest_version: u32,
+    pending_migrations: &[PendingMigration],
+) -> ExecutionPlan
+
+struct ExecutionPlan {
+    strategy: ApplyStrategy,
+    steps: Vec<ExecutionStep>,      // dependency-sorted
+}
+
+enum ApplyStrategy {
+    Fresh,                          // db_version == 0: apply all, mark latest
+    Migrate,                        // db_version < latest: run migrations + apply
+    Current,                        // db_version == latest: idempotent apply only
+}
+
+enum ExecutionStep {
+    CreateEntity(String),           // entity name — new, needs CREATE
+    MigrateEntity {                 // altered — run migration SQL, then re-apply
+        entity_name: String,
+        migration_sql_path: PathBuf,
+        migration_version: u32,
+    },
+    ApplyEntity(String),            // unchanged — idempotent apply
+    DropEntity {                    // removed — run DROP SQL
+        entity_name: String,
+        drop_sql_path: PathBuf,
+        migration_version: u32,
+    },
+    RecordMigration {               // bookkeeping
+        version: u32,
+        checksum: String,
+    },
+    SetVersion(u32),                // update _dbd_meta
+}
 ```
 
-1. Load design, filter valid entities
-2. Connect, ensure `_dbd_meta` table
-3. Read `current_db_version` from `_dbd_meta` (0 if no record)
-4. Read `latest_version` from `design.yaml` project.version (0 if None)
-5. **Fresh env** (`current_db_version == 0`):
-   - Apply all entities via existing logic (CREATE IF NOT EXISTS)
-   - Write `_dbd_meta` with `version = latest_version`
-6. **Behind** (`current_db_version < latest_version`):
-   - Load pending migrations (versions `current+1` through `latest`)
-   - Build combined execution plan:
-     a. Collect `added` entities from migration graphs (need CREATE before ALTER)
-     b. Collect `altered` entities (need migration SQL then re-apply DDL)
-     c. All other entities (unchanged, idempotent apply)
-   - Build dependency graph across all three sets using `entity.refers`
+**Plan logic:**
+
+1. If `db_version == 0` (fresh):
+   - Steps = `ApplyEntity` for all entities + `SetVersion(latest_version)`
+2. If `db_version == latest_version` (current):
+   - Steps = `ApplyEntity` for all entities (idempotent)
+3. If `db_version < latest_version` (behind):
+   - Collect `added` entities from migration graphs → `CreateEntity` steps
+   - Collect `altered` entities → `MigrateEntity` steps
+   - Collect `dropped` entities → `DropEntity` steps
+   - All other entities → `ApplyEntity` steps
+   - Build dependency graph across all sets using `entity.refers`
    - Topological sort
-   - Execute in sorted order:
-     - Added entity: `apply_entity()` (CREATE)
-     - Altered entity: execute migration SQL, then `apply_entity()`
-     - Unchanged entity: `apply_entity()` (idempotent)
-     - Dropped entity: execute drop SQL
-   - Record each migration in `_dbd_migrations`
-   - Update `_dbd_meta` version to `latest_version`
-7. **Current** (`current_db_version == latest_version`):
-   - Apply all entities (idempotent — catches view/function/procedure changes)
+   - Append `RecordMigration` + `SetVersion` steps
+
+### I/O Boundary: `apply()`
+
+```rust
+pub async fn apply(&self, adapter, name, dry_run) -> Result<()> {
+    // I/O: read state
+    let db_version = adapter.get_db_version().await?;
+    let latest_version = self.config.project.version.unwrap_or(0);
+    let pending = snapshot::pending_migrations(db_version, &self.project_dir);
+
+    // Pure: build plan
+    let plan = build_execution_plan(&self.entities, db_version, latest_version, &pending);
+
+    // I/O: execute plan
+    if dry_run { return print_plan(&plan); }
+    execute_plan(adapter, &plan).await?;
+}
+```
 
 ### Migrate Command
 
 `dbd migrate [--status] [--apply] [--to N] [--dry-run]`
 
 - `--status`: Print table showing current DB version, latest version, and pending migration list
-- `--apply`: Run migration pass only (steps 6a-6f above), skip full entity apply
+- `--apply`: Run migration pass only (migration steps from plan, no entity apply)
 - `--to N`: Stop at version N instead of latest
 - `--dry-run`: Print SQL with `-- Version N` headers, highlight `DROP` statements
 
