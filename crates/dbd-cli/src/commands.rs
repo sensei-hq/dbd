@@ -443,6 +443,14 @@ async fn cmd_migrate_apply(
                 output::detail(verbosity, &format!("  Running migration for {table_name}"));
                 adapter.execute_script(&sql).await?;
             }
+            // Run data correction if present (*.data.sql)
+            let data_file = sql_file.with_extension("data.sql");
+            if data_file.exists() {
+                let sql = std::fs::read_to_string(&data_file)
+                    .context(format!("Failed to read data correction: {}", data_file.display()))?;
+                output::detail(verbosity, &format!("  Running data correction for {table_name}"));
+                adapter.execute_script(&sql).await?;
+            }
         }
 
         // Apply current DDL for altered tables
