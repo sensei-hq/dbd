@@ -485,8 +485,15 @@ impl Design {
                     }
                 }
                 ExecutionStep::MigrateEntity { migration_sql_path, .. } => {
+                    // 1. Run schema change (ALTER/DROP)
                     if migration_sql_path.exists() {
                         let sql = std::fs::read_to_string(migration_sql_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                    // 2. Run data correction if present (*.data.sql)
+                    let data_path = migration_sql_path.with_extension("data.sql");
+                    if data_path.exists() {
+                        let sql = std::fs::read_to_string(&data_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                 }
