@@ -68,10 +68,13 @@ enum ComplexChange {
 | Pattern | Detection | Classification |
 |---------|-----------|----------------|
 | Column type change | `FieldChange` with `Alter` where `old.data_type != new.data_type` | `ColumnTypeChange` (2 stages) |
-| Column rename | Same table has `Column Drop` + `Column Add` with same data type | `ColumnRename` (2 stages) |
+| Column rename | Same table has `Column Drop` + `Column Add` with same data type AND same position | `ColumnRename` (2 stages) |
 | Enum value removal | `EnumValue Drop` in a `Change` diff | `EnumValueRemoval` (3 stages) |
+| Enum value rename | `EnumValue Drop` + `EnumValue Add` in same enum (PG17+) | Simple: `ALTER TYPE RENAME VALUE` (1 stage) |
 
-**Rename detection heuristic:** Within a single table's `Change` diff, if there's exactly one dropped column and one added column with the same data type, treat as rename. If there are multiple drops+adds with same types, don't guess — treat each as independent drop/add (simple changes).
+**Rename detection heuristic:** Within a single table's `Change` diff, if there's exactly one dropped column and one added column with the same data type AND the same ordinal position in the column list, treat as rename. If there are multiple drops+adds with same types, don't guess — treat each as independent drop/add (simple changes). Position is determined by the column's index in the old/new snapshot's column vec.
+
+**Enum value rename (Postgres 17+):** If an enum loses one value and gains one value (1:1 swap), treat as a rename. Generate `ALTER TYPE ... RENAME VALUE 'old' TO 'new'` as a simple change (single snapshot). This requires Postgres 14+ which supports `RENAME VALUE`. We assume Postgres 17+ as minimum.
 
 **Affected columns for enum removal:** Scan all table snapshots in the old snapshot for columns whose `data_type` matches the enum name (qualified or unqualified).
 
@@ -83,11 +86,13 @@ enum ComplexChange {
 Max stages = 1 + (has_2_step ? 1 : 0) + (has_3_step ? 1 : 0)
 ```
 
-| Stage | Simple | ColumnTypeChange | ColumnRename | EnumValueRemoval |
-|-------|--------|------------------|--------------|------------------|
-| 1 | All ALTERs | ADD new_col + data.sql (CAST) | ADD new_col + data.sql (copy) | data.sql (TODO: value mapping) |
-| 2 | — | DROP old_col | DROP old_col | ALTER cols to TEXT + DROP TYPE |
-| 3 | — | — | — | CREATE TYPE + ALTER cols back |
+| Stage | Simple | ColumnTypeChange | ColumnRename | EnumValueRemoval | EnumValueRename (PG17+) |
+|-------|--------|------------------|--------------|------------------|------------------------|
+| 1 | All ALTERs | ADD new_col + data.sql (CAST) | ADD new_col + data.sql (copy) | data.sql (TODO: value mapping) | `ALTER TYPE RENAME VALUE` |
+| 2 | — | DROP old_col | DROP old_col | ALTER cols to TEXT + DROP TYPE | — |
+| 3 | — | — | — | CREATE TYPE + ALTER cols back | — |
+
+Enum value rename is a simple change (single stage) thanks to Postgres 17+ support for `ALTER TYPE ... RENAME VALUE`.
 
 If no 3-step changes exist, max 2 snapshots. If no complex changes at all, 1 snapshot (current behavior — backward compatible).
 
@@ -530,8 +535,30 @@ Then:  1 snapshot (same as before)
 | `crates/dbd-core/src/snapshot.rs` | Modify | Replace `prepare_snapshot` with `prepare_multi_snapshot`, update `create_snapshot`, add `MultiSnapshotResult`, synthesis functions |
 | `crates/dbd-cli/src/commands.rs` | Modify | Update `cmd_snapshot_create` for `MultiSnapshotResult`, print stage output + TODO items |
 
+## CLI Changes
+
+### `dbd migrate` simplification
+
+Remove `dbd migrate --apply` and `--to N`. `apply` is the only command that modifies the database.
+
+Keep `dbd migrate --status` as a read-only diagnostic:
+```
+$ dbd migrate --status
+DB: v1, Latest: v4
+Pending: v2, v3, v4
+  v2: 10 simple changes + rename config.users.name
+  v3: drop config.users.name + enum intermediary
+  v4: enum recreation
+```
+
+`--dry-run` stays on `dbd apply` to preview what would execute.
+
+## Assumptions
+
+- **Postgres 17+ minimum** — enables `ALTER TYPE RENAME VALUE` for enum value renames
+- Enum value DROP is not supported by Postgres — TEXT intermediary pattern required
+
 ## Future Considerations
 
-- Column rename detection could use edit distance or position heuristics for better accuracy
-- Enum recreation could be optimized for Postgres 14+ which supports `ALTER TYPE RENAME VALUE`
 - data.sql validation: `dbd inspect` could verify all TODO comments have been resolved before allowing apply
+- Postgres future: if `ALTER TYPE DROP VALUE` is added, enum removal becomes a single-snapshot operation
