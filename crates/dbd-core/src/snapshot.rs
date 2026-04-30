@@ -913,4 +913,130 @@ mod tests {
         assert_eq!(graph.from_version, 1);
         assert_eq!(graph.to_version, 2);
     }
+
+    // ════════════════════════════════════════════════════════
+    // Scenario Tests: Snapshot edge cases
+    // ════════════════════════════════════════════════════════
+
+    // M3.2: External entity excluded from snapshot
+    #[test]
+    fn sc_external_entity_excluded_from_snapshot() {
+        let external = Entity::new(EntityType::External, "pg_catalog.pg_type");
+        let table_entity = make_table_entity("config.users", vec![col("id", "int")]);
+        let entities = vec![external, table_entity];
+
+        let result = prepare_snapshot(&entities, None, 1, "test");
+        assert_eq!(result.snapshot.tables.len(), 1);
+        assert_eq!(result.snapshot.tables[0].name, "users");
+    }
+
+    // M3.3: View entity excluded from snapshot
+    #[test]
+    fn sc_view_entity_excluded_from_snapshot() {
+        let mut view = Entity::new(EntityType::View, "config.active_users");
+        view.table_def = None;
+        let table_entity = make_table_entity("config.users", vec![col("id", "int")]);
+        let entities = vec![view, table_entity];
+
+        let result = prepare_snapshot(&entities, None, 1, "test");
+        // Only Table entities with table_def are included
+        assert_eq!(result.snapshot.tables.len(), 1);
+        assert_eq!(result.snapshot.tables[0].name, "users");
+    }
+
+    // M3.4: Table without table_def excluded
+    #[test]
+    fn sc_table_without_table_def_excluded() {
+        let mut table_no_def = Entity::new(EntityType::Table, "config.broken");
+        table_no_def.table_def = None;
+        let table_with_def = make_table_entity("config.users", vec![col("id", "int")]);
+        let entities = vec![table_no_def, table_with_def];
+
+        let result = prepare_snapshot(&entities, None, 1, "test");
+        assert_eq!(result.snapshot.tables.len(), 1);
+        assert_eq!(result.snapshot.tables[0].name, "users");
+    }
+
+    // M3.5: Empty enum snapshot
+    #[test]
+    fn sc_enum_with_zero_values() {
+        let empty_enum = make_enum_entity("config.empty_type", vec![]);
+        let entities = vec![empty_enum];
+
+        let result = prepare_snapshot(&entities, None, 1, "test");
+        assert_eq!(result.snapshot.enums.len(), 1);
+        assert_eq!(result.snapshot.enums[0].name, "empty_type");
+        assert!(result.snapshot.enums[0].values.is_empty());
+    }
+
+    // M3.6: Tables + enums both changed
+    #[test]
+    fn sc_table_and_enum_both_changed() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![EnumSnapshot {
+                name: "status".to_string(),
+                schema: "config".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string()],
+            }],
+        };
+
+        // New: table gets extra column, enum gets extra value
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int"), col("email", "text")]),
+            make_enum_entity("config.status", vec!["active", "inactive", "pending"]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add email and pending");
+        assert!(!result.no_changes);
+        assert!(!result.diffs.is_empty());
+        // Both table and enum should appear in diffs
+        let table_diff = result.diffs.iter().find(|d| d.entity_type == EntityType::Table);
+        let enum_diff = result.diffs.iter().find(|d| d.entity_type == EntityType::Enum);
+        assert!(table_diff.is_some(), "table diff should be present");
+        assert!(enum_diff.is_some(), "enum diff should be present");
+    }
+
+    // M3.7: Only enum changed, no tables
+    #[test]
+    fn sc_only_enum_changed_no_tables() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![EnumSnapshot {
+                name: "status".to_string(),
+                schema: "config".to_string(),
+                values: vec!["active".to_string()],
+            }],
+        };
+
+        // Same table, different enum values
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int")]),
+            make_enum_entity("config.status", vec!["active", "inactive"]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add inactive");
+        assert!(!result.no_changes);
+        assert!(!result.diffs.is_empty());
+        // All diffs should be enum-related
+        assert!(result.diffs.iter().all(|d| d.entity_type == EntityType::Enum));
+    }
 }

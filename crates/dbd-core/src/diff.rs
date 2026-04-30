@@ -626,7 +626,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, ForeignKey, IndexColumn, IndexDef, IndexType, TableConstraint};
+    use crate::entity::{ColumnDef, FkAction, ForeignKey, IndexColumn, IndexDef, IndexType, SortOrder, TableConstraint};
     use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
     // ── Helpers ─────────────────────────────────────────────
@@ -1662,5 +1662,289 @@ mod tests {
         }];
         let sql = generate_migration_sql(&diffs_drop);
         assert!(sql.is_empty(), "enum value drop should produce no SQL");
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Scenario Tests: Column property change edge cases
+    // ════════════════════════════════════════════════════════
+
+    // M1.1: inline FK change detected
+    #[test]
+    fn d_column_inline_fk_changed() {
+        let old_col = ColumnDef {
+            inline_fk: Some(ForeignKey {
+                name: Some("fk_a".to_string()),
+                columns: vec!["user_id".to_string()],
+                ref_schema: None,
+                ref_table: "table_a".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: None,
+                on_update: None,
+            }),
+            ..col("user_id", "int")
+        };
+        let new_col = ColumnDef {
+            inline_fk: Some(ForeignKey {
+                name: Some("fk_a".to_string()),
+                columns: vec!["user_id".to_string()],
+                ref_schema: None,
+                ref_table: "table_b".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: None,
+                on_update: None,
+            }),
+            ..col("user_id", "int")
+        };
+        let a = snap(vec![table("public", "orders", vec![old_col])], vec![]);
+        let b = snap(vec![table("public", "orders", vec![new_col])], vec![]);
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "user_id");
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // M1.2: is_pk changed
+    #[test]
+    fn d_column_is_pk_changed() {
+        let old_col = ColumnDef {
+            is_pk: false,
+            ..col("id", "int")
+        };
+        let new_col = ColumnDef {
+            is_pk: true,
+            ..col("id", "int")
+        };
+        let a = snap(vec![table("public", "users", vec![old_col])], vec![]);
+        let b = snap(vec![table("public", "users", vec![new_col])], vec![]);
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "id");
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // M1.3: is_identity changed
+    #[test]
+    fn d_column_is_identity_changed() {
+        let old_col = ColumnDef {
+            is_identity: false,
+            ..col("id", "int")
+        };
+        let new_col = ColumnDef {
+            is_identity: true,
+            ..col("id", "int")
+        };
+        let a = snap(vec![table("public", "users", vec![old_col])], vec![]);
+        let b = snap(vec![table("public", "users", vec![new_col])], vec![]);
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "id");
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // M1.4: comment changed
+    #[test]
+    fn d_column_comment_changed() {
+        let old_col = ColumnDef {
+            comment: None,
+            ..col("email", "text")
+        };
+        let new_col = ColumnDef {
+            comment: Some("user email".to_string()),
+            ..col("email", "text")
+        };
+        let a = snap(vec![table("public", "users", vec![old_col])], vec![]);
+        let b = snap(vec![table("public", "users", vec![new_col])], vec![]);
+        let diffs = diff(&a, &b);
+        assert_eq!(diffs.len(), 1);
+        if let DiffAction::Change(ref changes) = diffs[0].action {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].field_name, "email");
+            assert!(matches!(changes[0].action, ChangeAction::Alter { .. }));
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    // M1.7: empty table (zero columns)
+    #[test]
+    fn d_empty_table_no_diff() {
+        let a = snap(vec![table("public", "empty", vec![])], vec![]);
+        let b = snap(vec![table("public", "empty", vec![])], vec![]);
+        let diffs = diff(&a, &b);
+        assert!(diffs.is_empty(), "identical empty tables should produce no diff");
+    }
+
+    // M1.8: enum with zero values
+    #[test]
+    fn d_enum_zero_values_no_diff() {
+        let e1 = EnumSnapshot {
+            name: "empty_enum".to_string(),
+            schema: "public".to_string(),
+            values: vec![],
+        };
+        let e2 = EnumSnapshot {
+            name: "empty_enum".to_string(),
+            schema: "public".to_string(),
+            values: vec![],
+        };
+        let a = snap(vec![], vec![e1]);
+        let b = snap(vec![], vec![e2]);
+        let diffs = diff(&a, &b);
+        assert!(diffs.is_empty(), "identical empty enums should produce no diff");
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Scenario Tests: SQL generation edge cases
+    // ════════════════════════════════════════════════════════
+
+    // M2.1: Column alter with type + nullable + default all changed
+    #[test]
+    fn s_column_alter_multiple_changes_at_once() {
+        let old_col = ColumnDef {
+            nullable: false,
+            default_value: Some("'x'".to_string()),
+            ..col("status", "VARCHAR(50)")
+        };
+        let new_col = ColumnDef {
+            nullable: true,
+            default_value: None,
+            ..col("status", "TEXT")
+        };
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "status".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(old_col)),
+                    new: Box::new(FieldDetail::Column(new_col)),
+                },
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status TYPE TEXT;"));
+        assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status DROP NOT NULL;"));
+        assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT;"));
+        // Should have exactly 3 ALTER statements
+        let line_count = sql.lines().count();
+        assert_eq!(line_count, 3, "expected 3 ALTER statements, got {}", line_count);
+    }
+
+    // M2.2: FK with on_delete and on_update
+    #[test]
+    fn s_fk_constraint_with_on_delete_on_update() {
+        let fk_diff = MigrationDiff {
+            entity_name: "public.orders".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "fk_user".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::ForeignKey(ForeignKey {
+                        name: Some("fk_user".to_string()),
+                        columns: vec!["user_id".to_string()],
+                        ref_schema: Some("public".to_string()),
+                        ref_table: "users".to_string(),
+                        ref_columns: vec!["id".to_string()],
+                        on_delete: Some(FkAction::Cascade),
+                        on_update: Some(FkAction::Restrict),
+                    }),
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[fk_diff]);
+        assert!(
+            sql.contains("ON DELETE CASCADE"),
+            "SQL should include ON DELETE CASCADE, got: {sql}"
+        );
+        assert!(
+            sql.contains("ON UPDATE RESTRICT"),
+            "SQL should include ON UPDATE RESTRICT, got: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE ON UPDATE RESTRICT;"
+        );
+    }
+
+    // M2.6: Index with ASC/DESC
+    #[test]
+    fn s_index_with_column_ordering() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "idx_email_name".to_string(),
+                field_type: FieldType::Index,
+                action: ChangeAction::Add(Box::new(FieldDetail::Index(IndexDef {
+                    name: Some("idx_email_name".to_string()),
+                    columns: vec![
+                        IndexColumn {
+                            name: "email".to_string(),
+                            order: Some(SortOrder::Desc),
+                        },
+                        IndexColumn {
+                            name: "name".to_string(),
+                            order: Some(SortOrder::Asc),
+                        },
+                    ],
+                    unique: false,
+                    index_type: None,
+                }))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "CREATE INDEX idx_email_name ON public.users (email DESC, name ASC);"
+        );
+    }
+
+    // M2.8: Multiple enum values added
+    #[test]
+    fn s_enum_multiple_values_added() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "pending".to_string(),
+                    field_type: FieldType::EnumValue,
+                    action: ChangeAction::Add(Box::new(FieldDetail::EnumValue("pending".to_string()))),
+                },
+                FieldChange {
+                    field_name: "archived".to_string(),
+                    field_type: FieldType::EnumValue,
+                    action: ChangeAction::Add(Box::new(FieldDetail::EnumValue("archived".to_string()))),
+                },
+                FieldChange {
+                    field_name: "deleted".to_string(),
+                    field_type: FieldType::EnumValue,
+                    action: ChangeAction::Add(Box::new(FieldDetail::EnumValue("deleted".to_string()))),
+                },
+            ]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert!(sql.contains("ALTER TYPE public.status ADD VALUE 'pending';"));
+        assert!(sql.contains("ALTER TYPE public.status ADD VALUE 'archived';"));
+        assert!(sql.contains("ALTER TYPE public.status ADD VALUE 'deleted';"));
+        let line_count = sql.lines().count();
+        assert_eq!(line_count, 3, "expected 3 ALTER TYPE statements, got {}", line_count);
     }
 }
