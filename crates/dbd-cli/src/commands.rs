@@ -46,13 +46,11 @@ pub async fn run(
             cmd_snapshot_create(config, env, project_dir, name.as_deref(), verbosity)
         }
 
-        Commands::Migrate { status, apply, to, dry_run } => {
+        Commands::Migrate { status } => {
             if *status {
                 cmd_migrate_status(config, database_url, project_dir, verbosity).await
-            } else if *apply {
-                cmd_migrate_apply(config, env, database_url, project_dir, to.as_ref().copied(), *dry_run, verbosity).await
             } else {
-                output::info(verbosity, "Use --status to check migration state or --apply to run pending migrations.");
+                output::info(verbosity, "Use --status to check migration state. Use 'dbd apply' to run migrations.");
                 Ok(())
             }
         }
@@ -374,138 +372,6 @@ async fn cmd_migrate_status(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn cmd_migrate_apply(
-    config: &Path,
-    env: &str,
-    database_url: Option<&str>,
-    project_dir: &Path,
-    to_version: Option<u32>,
-    dry_run: bool,
-    verbosity: Verbosity,
-) -> Result<()> {
-    let adapter = get_adapter(config, database_url).await?;
-    adapter.ensure_migrations_table().await?;
-    let db_version = adapter.get_db_version().await?;
-
-    let mut pending = dbd_core::snapshot::pending_migrations(db_version, project_dir);
-
-    // Filter to requested version if --to was specified
-    if let Some(target) = to_version {
-        pending.retain(|m| m.to_version <= target);
-    }
-
-    if pending.is_empty() {
-        output::info(verbosity, "No pending migrations to apply.");
-        return Ok(());
-    }
-
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
-
-    for migration in &pending {
-        output::info(
-            verbosity,
-            &format!(
-                "Applying migration v{} -> v{}...",
-                dbd_core::snapshot::pad_version(migration.from_version),
-                dbd_core::snapshot::pad_version(migration.to_version),
-            ),
-        );
-
-        if dry_run {
-            for table_name in &migration.added {
-                output::detail(verbosity, &format!("  [add] {table_name}"));
-            }
-            for table_name in &migration.altered {
-                output::detail(verbosity, &format!("  [alter] {table_name}"));
-            }
-            for table_name in &migration.dropped {
-                output::detail(verbosity, &format!("  [drop] {table_name}"));
-            }
-            continue;
-        }
-
-        // Apply migration SQL files for altered tables
-        for table_name in &migration.altered {
-            let parts: Vec<&str> = table_name.split('.').collect();
-            let (schema, tbl) = if parts.len() > 1 {
-                (Some(parts[0]), parts[1])
-            } else {
-                (None, parts[0])
-            };
-            let sql_file = match schema {
-                Some(s) => migration.migration_dir.join(s).join(format!("{tbl}.sql")),
-                None => migration.migration_dir.join(format!("{tbl}.sql")),
-            };
-            if sql_file.exists() {
-                let sql = std::fs::read_to_string(&sql_file)
-                    .context(format!("Failed to read migration file: {}", sql_file.display()))?;
-                output::detail(verbosity, &format!("  Running migration for {table_name}"));
-                adapter.execute_script(&sql).await?;
-            }
-            // Run data correction if present (*.data.sql)
-            let data_file = sql_file.with_extension("data.sql");
-            if data_file.exists() {
-                let sql = std::fs::read_to_string(&data_file)
-                    .context(format!("Failed to read data correction: {}", data_file.display()))?;
-                output::detail(verbosity, &format!("  Running data correction for {table_name}"));
-                adapter.execute_script(&sql).await?;
-            }
-        }
-
-        // Apply current DDL for altered tables
-        for table_name in &migration.altered {
-            if let Some(entity) = design.entities().iter().find(|e| e.name == *table_name) {
-                adapter.apply_entity(entity).await?;
-            }
-        }
-
-        // Apply current DDL for added tables
-        for table_name in &migration.added {
-            if let Some(entity) = design.entities().iter().find(|e| e.name == *table_name) {
-                adapter.apply_entity(entity).await?;
-            }
-        }
-
-        // Handle dropped tables
-        for table_name in &migration.dropped {
-            let parts: Vec<&str> = table_name.split('.').collect();
-            let (schema, tbl) = if parts.len() > 1 {
-                (Some(parts[0]), parts[1])
-            } else {
-                (None, parts[0])
-            };
-            let sql_file = match schema {
-                Some(s) => migration.migration_dir.join(s).join(format!("{tbl}.drop.sql")),
-                None => migration.migration_dir.join(format!("{tbl}.drop.sql")),
-            };
-            if sql_file.exists() {
-                let sql = std::fs::read_to_string(&sql_file)
-                    .context(format!("Failed to read drop file: {}", sql_file.display()))?;
-                output::detail(verbosity, &format!("  Dropping {table_name}"));
-                adapter.execute_script(&sql).await?;
-            }
-        }
-
-        // Record the migration
-        let desc = format!("migration v{} to v{}", migration.from_version, migration.to_version);
-        adapter
-            .apply_migration(migration.to_version, "", &desc, &migration.checksum)
-            .await?;
-    }
-
-    if dry_run {
-        output::info(verbosity, "[dry-run] No changes applied.");
-    } else {
-        output::info(
-            verbosity,
-            &format!("Applied {} migration(s).", pending.len()),
-        );
-    }
-
-    Ok(())
-}
-
 fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
     let dir = project_dir;
     let snapshots = dbd_core::snapshot::list_snapshots(dir);
