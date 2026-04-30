@@ -1222,4 +1222,114 @@ mod tests {
         }).collect();
         assert!(dropped.contains(&("config.legacy", 2)));
     }
+
+    // ════════════════════════════════════════════════════════
+    // Scenario Tests: Execution plan edge cases
+    // ════════════════════════════════════════════════════════
+
+    // M5.1: Entity with errors filtered
+    #[test]
+    fn a_entity_with_errors_filtered() {
+        let mut broken = Entity::new(EntityType::Table, "config.broken");
+        broken.errors.push("parse error".to_string());
+        let good = test_entity("config.users");
+        let entities = vec![broken, good];
+
+        let plan = build_execution_plan(&entities, 0, 1, &[]);
+
+        // Only the good entity should appear in the plan
+        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(apply_names.contains(&"config.users"));
+        assert!(!apply_names.contains(&"config.broken"), "entity with errors should be filtered out");
+    }
+
+    // M5.2: External entity filtered
+    #[test]
+    fn a_external_entity_filtered() {
+        let external = Entity::new(EntityType::External, "pg_catalog.pg_type");
+        let table = test_entity("config.users");
+        let entities = vec![external, table];
+
+        let plan = build_execution_plan(&entities, 0, 1, &[]);
+
+        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(apply_names.contains(&"config.users"));
+        assert!(!apply_names.contains(&"pg_catalog.pg_type"), "external entity should be filtered out");
+    }
+
+    // M5.3: DB ahead of latest
+    #[test]
+    fn a_db_ahead_of_latest_behaves_as_current() {
+        let entities = vec![test_entity("config.users")];
+
+        let plan = build_execution_plan(&entities, 5, 3, &[]);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Current);
+    }
+
+    // M5.4: Both versions zero
+    #[test]
+    fn a_fresh_db_no_snapshots() {
+        let entities = vec![test_entity("config.users")];
+
+        let plan = build_execution_plan(&entities, 0, 0, &[]);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Fresh);
+        // Should have ApplyEntity + SetVersion(0)
+        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(apply_names.contains(&"config.users"));
+        assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(0))));
+    }
+
+    // M5.5: Same entity altered in multiple versions
+    #[test]
+    fn a_entity_altered_in_multiple_versions() {
+        let entities = vec![test_entity("config.users")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["config.users"], vec![]),
+            test_migration(2, 3, vec![], vec!["config.users"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Migrate);
+
+        // Should have TWO MigrateEntity steps for config.users
+        let migrate_steps: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
+            ExecutionStep::MigrateEntity { entity_name, migration_version, .. } => {
+                Some((entity_name.as_str(), *migration_version))
+            }
+            _ => None,
+        }).collect();
+        assert!(migrate_steps.contains(&("config.users", 2)));
+        assert!(migrate_steps.contains(&("config.users", 3)));
+        assert_eq!(
+            migrate_steps.iter().filter(|(name, _)| *name == "config.users").count(),
+            2,
+            "should have exactly 2 MigrateEntity steps for config.users"
+        );
+    }
+
+    // M5.7: Empty entities list
+    #[test]
+    fn a_empty_entities_empty_plan() {
+        let entities: Vec<Entity> = vec![];
+
+        let plan = build_execution_plan(&entities, 0, 1, &[]);
+
+        assert_eq!(plan.strategy, ApplyStrategy::Fresh);
+        // Should only have SetVersion step (no entities to apply)
+        let apply_count = plan.steps.iter().filter(|s| matches!(s, ExecutionStep::ApplyEntity(_))).count();
+        assert_eq!(apply_count, 0, "no entities means no ApplyEntity steps");
+        assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(1))));
+    }
 }
