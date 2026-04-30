@@ -2,21 +2,22 @@
 
 ## Current status (2026-04-30)
 
-**26 commits, 7,325 LOC, 195 tests, verified on sensei/daemon/database (116 entities)**
+**47 commits, 10,126 LOC, 249 tests, verified on sensei/daemon/database (116 entities)**
 
 ### Working commands
 
 | Command | Offline | With DB | Notes |
 |---------|---------|---------|-------|
 | `inspect` | yes | — | Full validation pipeline |
-| `apply` | `--dry-run` | yes | Entity apply with enum idempotency |
+| `apply` | `--dry-run` | yes | Entity apply with enum idempotency, version-aware migrations |
 | `import` | `--dry-run` | yes | CSV/TSV/JSONL, reads-based procedure matching |
 | `reset` | `--dry-run` | yes | Safety guards (_dbd_meta) |
 | `combine` | yes | — | |
 | `graph` | yes | — | JSON with nodes/edges/layers |
 | `dbml` | yes | — | Verified with dbdocs build |
 | `doctor` | yes | — | Config migration from Node.js format |
-| `snapshot --list` | yes | — | |
+| `snapshot` | yes | — | Create versioned snapshots, diff, generate migrations |
+| `migrate` | `--status` | `--apply` | Version-aware migration with `--to N`, `--dry-run` |
 
 ### Adapter support
 
@@ -31,26 +32,34 @@
 
 ## P0 — Next session
 
-### `dbd snapshot` (create)
-- Parse current table entities into TableSnapshot via adapter
-- Diff against previous snapshot using schema-diff
-- Generate per-table ALTER SQL files in `migrations/NNN/`
-- Write `graph.json` with altered/dropped tables
-- Requires: schema diff implementation
+### `dbd snapshot` (create) — DONE
+- Entity-to-snapshot conversion (tables + enums)
+- Schema diff engine comparing consecutive snapshots
+- ALTER/DROP SQL generation from diffs
+- Migration file output: `migrations/NNN/<schema>/<table>.sql` + `graph.json`
+- `design.yaml` version tracking
+- Pure logic / I/O boundary separation for testability
+- Spec: `docs/superpowers/specs/2026-04-30-snapshot-migration-design.md`
 
-### `dbd migrate --apply`
-- Read pending migrations from `migrations/` folder
-- Execute ALTER SQL in version order
-- Record versions in `_dbd_migrations`
-- `--status` shows local vs DB version
-- `--dry-run` prints SQL without executing
-- `--to N` limits to a specific version
+### `dbd migrate --apply` — DONE
+- `--status`: show DB version vs latest, list pending
+- `--apply`: execute migration SQL in version order
+- `--to N`: limit to specific version
+- `--dry-run`: print SQL without executing
+- Records versions in `_dbd_migrations`
 
-### Schema diff (`migration.rs`)
-- Compare two `TableSnapshot` values
-- Detect: added/dropped/altered columns, indexes, FKs
-- Generate ALTER TABLE SQL from diff
-- Required by snapshot creation
+### Schema diff (`diff.rs`) — DONE
+- Compare two `Snapshot` values (tables + enums)
+- Detect: added/dropped/altered columns, constraints, indexes, enum values
+- Generate ALTER TABLE / DROP TABLE / ALTER TYPE SQL
+- Constraint/index changes = Drop old + regular apply creates new
+- Enum value drops produce warnings only (no SQL)
+
+### `dbd apply` with version awareness — DONE
+- Fresh env (no version): apply all entities, mark latest version
+- Behind (older version): run migrations interleaved with entity apply
+- Current (same version): idempotent apply only
+- Execution plan built as pure function, executed by thin I/O wrapper
 
 ---
 
