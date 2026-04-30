@@ -55,6 +55,7 @@ impl DesignConfig {
 pub struct ProjectConfig {
     pub name: String,
     pub note: Option<String>,
+    pub version: Option<u32>,
 }
 
 // ── Source ───────────────────────────────────────────────
@@ -311,6 +312,18 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
     Ok(config)
 }
 
+/// Update the `project.version` field in a design.yaml file.
+pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
+    })?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    value["project"]["version"] = serde_yaml::Value::Number(serde_yaml::Number::from(version));
+    let output = serde_yaml::to_string(&value)?;
+    std::fs::write(config_path, output)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +457,37 @@ mod tests {
     fn read_missing_file_returns_error() {
         let result = read(Path::new("nonexistent.yaml"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_version_from_config() {
+        let yaml = "project:\n  name: test\n  version: 5\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.project.version, Some(5));
+    }
+
+    #[test]
+    fn parses_missing_version_as_none() {
+        let yaml = "project:\n  name: test\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.project.version, None);
+    }
+
+    #[test]
+    fn update_version_writes_and_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("design.yaml");
+        std::fs::write(&path, "project:\n  name: test\n  note: hello\n").unwrap();
+
+        update_version(&path, 3).unwrap();
+
+        let config = read(&path).unwrap();
+        assert_eq!(config.project.version, Some(3));
+        assert_eq!(config.project.name, "test");
+
+        // Update again to verify overwriting works
+        update_version(&path, 7).unwrap();
+        let config = read(&path).unwrap();
+        assert_eq!(config.project.version, Some(7));
     }
 }
