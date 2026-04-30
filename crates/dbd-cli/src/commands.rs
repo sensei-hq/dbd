@@ -577,6 +577,14 @@ fn cmd_snapshot_create(
         }
     }
 
+    // Print warnings for risky changes
+    if !result.warnings.is_empty() {
+        output::always("\nWarnings:");
+        for warning in &result.warnings {
+            output::always(&format!("  {warning}"));
+        }
+    }
+
     Ok(())
 }
 
