@@ -76,8 +76,12 @@ enum FieldType {
 enum ChangeAction {
     Add(FieldDetail),
     Drop,
-    Alter { old: FieldDetail, new: FieldDetail },
+    Alter { old: FieldDetail, new: FieldDetail },  // Column and EnumValue only
 }
+// Note: Constraints and Indexes do NOT use Alter.
+// A changed constraint/index = Drop (migration) + Add (regular apply).
+// The migration only needs the Drop; the new version is created by
+// CREATE TABLE / CREATE INDEX during the normal entity apply phase.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum FieldDetail {
@@ -97,8 +101,10 @@ enum FieldDetail {
 - Present in old, absent in new -> `DiffAction::Drop`
 - Present in both -> compare fields:
   - **Columns:** Match by name. Added/dropped/altered (type, nullable, default, identity, unique, inline_fk).
-  - **Constraints:** Match by name (or by type+columns if unnamed). Added/dropped.
-  - **Indexes:** Match by name. Added/dropped.
+  - **Constraints:** Match by name (or by type+columns if unnamed). Added/dropped only.
+    Changed constraint (same name, different definition) = Drop old + Add happens via regular apply.
+  - **Indexes:** Match by name. Added/dropped only.
+    Changed index (same name, different columns/type) = Drop old + Add happens via regular apply.
 - If no field changes -> entity excluded from diff output.
 
 **Enums:** Match by qualified name.
@@ -387,14 +393,30 @@ When:  diff(A, B)
 Then:  FieldChange { field: "idx_email", type: Index, action: Drop }
 ```
 
-#### D13: Enum value added
+#### D13: Constraint changed (drop old, apply creates new)
+```
+Given: snapshot A has unique on [email], snapshot B has unique on [email, name] (same constraint name)
+When:  diff(A, B)
+Then:  FieldChange { field: "uq_email", type: Constraint, action: Drop }
+       (new constraint created by regular apply, not in migration)
+```
+
+#### D14: Index changed (drop old, apply creates new)
+```
+Given: snapshot A has btree idx_email on [email], snapshot B has hash idx_email on [email]
+When:  diff(A, B)
+Then:  FieldChange { field: "idx_email", type: Index, action: Drop }
+       (new index created by regular apply)
+```
+
+#### D15: Enum value added
 ```
 Given: snapshot A gender_type has [male, female], snapshot B has [male, female, other]
 When:  diff(A, B)
 Then:  FieldChange { field: "other", type: EnumValue, action: Add(EnumValue("other")) }
 ```
 
-#### D14: Enum value dropped (warning)
+#### D16: Enum value dropped (warning)
 ```
 Given: snapshot A gender_type has [male, female, other], snapshot B has [male, female]
 When:  diff(A, B)
@@ -402,14 +424,14 @@ Then:  FieldChange { field: "other", type: EnumValue, action: Drop }
        AND warning is included
 ```
 
-#### D15: New enum detected
+#### D17: New enum detected
 ```
 Given: snapshot A has no enums, snapshot B has gender_type
 When:  diff(A, B)
 Then:  MigrationDiff { entity: "public.gender_type", action: Add }
 ```
 
-#### D16: Enum dropped (warning)
+#### D18: Enum dropped (warning)
 ```
 Given: snapshot A has gender_type, snapshot B has no enums
 When:  diff(A, B)
@@ -417,21 +439,21 @@ Then:  MigrationDiff { entity: "public.gender_type", action: Drop }
        AND warning is included
 ```
 
-#### D17: Multiple changes on same table
+#### D19: Multiple changes on same table
 ```
 Given: snapshot B adds a column, drops a constraint, adds an index to users
 When:  diff(A, B)
 Then:  single MigrationDiff with Change containing 3 FieldChanges
 ```
 
-#### D18: Multiple tables changed
+#### D20: Multiple tables changed
 ```
 Given: snapshot B modifies users and orders
 When:  diff(A, B)
 Then:  two MigrationDiff entries
 ```
 
-#### D19: Mixed add/alter/drop across entities
+#### D21: Mixed add/alter/drop across entities
 ```
 Given: snapshot A has [users, orders, temp]
        snapshot B has [users(modified), orders, payments(new)] — temp dropped
