@@ -775,6 +775,319 @@ pub fn is_castable(from: &str, to: &str) -> bool {
     false
 }
 
+// ── Complex change classification ──────────────────────
+
+/// A complex schema change that requires special handling beyond simple DDL.
+#[derive(Debug, Clone)]
+pub enum ComplexChange {
+    /// A column's data type was changed.
+    ColumnTypeChange {
+        table_name: String,
+        column_name: String,
+        old_type: String,
+        new_type: String,
+        old_col: Box<ColumnDef>,
+        new_col: Box<ColumnDef>,
+    },
+    /// A column was likely renamed (drop + add with same type).
+    ColumnRename {
+        table_name: String,
+        old_name: String,
+        new_name: String,
+        col_def: Box<ColumnDef>,
+    },
+    /// Enum values were removed (requires data correction).
+    EnumValueRemoval {
+        enum_name: String,
+        removed_values: Vec<String>,
+        remaining_values: Vec<String>,
+        affected_columns: Vec<(String, String)>,
+    },
+}
+
+/// Find columns in the snapshot whose data_type matches the given enum name.
+/// Checks both qualified (public.status_type) and unqualified (status_type) matches.
+fn find_affected_columns(enum_name: &str, snapshot: &Snapshot) -> Vec<(String, String)> {
+    let mut affected = Vec::new();
+    // Extract the unqualified enum name: "public.status_type" → "status_type"
+    let unqualified = match enum_name.split_once('.') {
+        Some((_, name)) => name,
+        None => enum_name,
+    };
+
+    for table in &snapshot.tables {
+        let table_qualified = format!("{}.{}", table.schema, table.name);
+        for col in &table.columns {
+            let col_type_lower = col.data_type.to_lowercase();
+            if col_type_lower == enum_name.to_lowercase()
+                || col_type_lower == unqualified.to_lowercase()
+            {
+                affected.push((table_qualified.clone(), col.name.clone()));
+            }
+        }
+    }
+
+    affected
+}
+
+/// Classify migration diffs into simple and complex changes.
+///
+/// Returns `(simple_diffs, complex_changes)`:
+/// - Simple diffs can be applied with regular DDL.
+/// - Complex changes need data correction scripts.
+pub fn classify_changes(
+    diffs: &[MigrationDiff],
+    old_snapshot: &Snapshot,
+) -> (Vec<MigrationDiff>, Vec<ComplexChange>) {
+    let mut simple_diffs = Vec::new();
+    let mut complex_changes = Vec::new();
+
+    for d in diffs {
+        match &d.action {
+            DiffAction::Add | DiffAction::Drop => {
+                simple_diffs.push(d.clone());
+            }
+            DiffAction::Change(changes) => {
+                if d.entity_type == EntityType::Table {
+                    classify_table_changes(
+                        d,
+                        changes,
+                        old_snapshot,
+                        &mut simple_diffs,
+                        &mut complex_changes,
+                    );
+                } else if d.entity_type == EntityType::Enum {
+                    classify_enum_changes(
+                        d,
+                        changes,
+                        old_snapshot,
+                        &mut simple_diffs,
+                        &mut complex_changes,
+                    );
+                } else {
+                    simple_diffs.push(d.clone());
+                }
+            }
+        }
+    }
+
+    (simple_diffs, complex_changes)
+}
+
+/// Classify field changes within a table diff.
+fn classify_table_changes(
+    diff: &MigrationDiff,
+    changes: &[FieldChange],
+    old_snapshot: &Snapshot,
+    simple_diffs: &mut Vec<MigrationDiff>,
+    complex_changes: &mut Vec<ComplexChange>,
+) {
+    let mut remaining_changes: Vec<FieldChange> = Vec::new();
+
+    // First pass: detect column type changes (Alter where data_type changed)
+    let mut type_change_indices = std::collections::HashSet::new();
+    for (i, change) in changes.iter().enumerate() {
+        if change.field_type == FieldType::Column
+            && let ChangeAction::Alter { ref old, ref new } = change.action
+            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                (old.as_ref(), new.as_ref())
+            && old_col.data_type != new_col.data_type
+        {
+            complex_changes.push(ComplexChange::ColumnTypeChange {
+                table_name: diff.entity_name.clone(),
+                column_name: change.field_name.clone(),
+                old_type: old_col.data_type.clone(),
+                new_type: new_col.data_type.clone(),
+                old_col: Box::new(old_col.clone()),
+                new_col: Box::new(new_col.clone()),
+            });
+            type_change_indices.insert(i);
+        }
+    }
+
+    // Collect drops and adds for rename detection
+    let mut column_drops: Vec<(usize, &FieldChange)> = Vec::new();
+    let mut column_adds: Vec<(usize, &FieldChange)> = Vec::new();
+
+    for (i, change) in changes.iter().enumerate() {
+        if type_change_indices.contains(&i) {
+            continue;
+        }
+        if change.field_type == FieldType::Column {
+            match &change.action {
+                ChangeAction::Drop => column_drops.push((i, change)),
+                ChangeAction::Add(_) => column_adds.push((i, change)),
+                _ => {}
+            }
+        }
+    }
+
+    // Detect column renames: exactly 1 drop + 1 add with same data_type
+    let mut rename_indices = std::collections::HashSet::new();
+    if column_drops.len() == 1 && column_adds.len() == 1 {
+        let (drop_idx, drop_change) = column_drops[0];
+        let (add_idx, add_change) = column_adds[0];
+
+        // Get the old column's type from old_snapshot
+        let old_col_type = find_column_type_in_snapshot(
+            &diff.entity_name,
+            &drop_change.field_name,
+            old_snapshot,
+        );
+
+        // Get the new column's type from the Add detail
+        let new_col_type = if let ChangeAction::Add(ref detail) = add_change.action {
+            if let FieldDetail::Column(ref col_def) = **detail {
+                Some(col_def.data_type.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let (Some(old_type), Some(new_type)) = (old_col_type, new_col_type)
+            && old_type == new_type
+        {
+            let col_def = if let ChangeAction::Add(ref detail) = add_change.action {
+                if let FieldDetail::Column(ref cd) = **detail {
+                    cd.clone()
+                } else {
+                    unreachable!()
+                }
+            } else {
+                unreachable!()
+            };
+
+            complex_changes.push(ComplexChange::ColumnRename {
+                table_name: diff.entity_name.clone(),
+                old_name: drop_change.field_name.clone(),
+                new_name: add_change.field_name.clone(),
+                col_def: Box::new(col_def),
+            });
+            rename_indices.insert(drop_idx);
+            rename_indices.insert(add_idx);
+        }
+    }
+
+    // Collect remaining simple changes
+    for (i, change) in changes.iter().enumerate() {
+        if !type_change_indices.contains(&i) && !rename_indices.contains(&i) {
+            remaining_changes.push(change.clone());
+        }
+    }
+
+    if !remaining_changes.is_empty() {
+        simple_diffs.push(MigrationDiff {
+            entity_name: diff.entity_name.clone(),
+            entity_type: diff.entity_type,
+            action: DiffAction::Change(remaining_changes),
+        });
+    }
+}
+
+/// Find a column's data_type in the old snapshot by table name and column name.
+fn find_column_type_in_snapshot(
+    table_name: &str,
+    column_name: &str,
+    snapshot: &Snapshot,
+) -> Option<String> {
+    for table in &snapshot.tables {
+        let qualified = format!("{}.{}", table.schema, table.name);
+        if qualified == table_name {
+            for col in &table.columns {
+                if col.name == column_name {
+                    return Some(col.data_type.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Classify field changes within an enum diff.
+fn classify_enum_changes(
+    diff: &MigrationDiff,
+    changes: &[FieldChange],
+    old_snapshot: &Snapshot,
+    simple_diffs: &mut Vec<MigrationDiff>,
+    complex_changes: &mut Vec<ComplexChange>,
+) {
+    let enum_drops: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop))
+        .collect();
+    let enum_adds: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| {
+            c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Add(_))
+        })
+        .collect();
+
+    // 1:1 swap (rename) → stays simple (PG17+ ALTER TYPE RENAME VALUE)
+    if enum_drops.len() == 1 && enum_adds.len() == 1 {
+        simple_diffs.push(diff.clone());
+        return;
+    }
+
+    // Enum value removal: drops without matching adds
+    let added_names: std::collections::HashSet<&str> =
+        enum_adds.iter().map(|c| c.field_name.as_str()).collect();
+    let removed: Vec<String> = enum_drops
+        .iter()
+        .filter(|c| !added_names.contains(c.field_name.as_str()))
+        .map(|c| c.field_name.clone())
+        .collect();
+
+    if !removed.is_empty() {
+        // Find remaining values from old_snapshot
+        let old_enum = old_snapshot
+            .enums
+            .iter()
+            .find(|e| format!("{}.{}", e.schema, e.name) == diff.entity_name);
+        let remaining_values = if let Some(old_e) = old_enum {
+            old_e
+                .values
+                .iter()
+                .filter(|v| !removed.contains(v))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let affected_columns = find_affected_columns(&diff.entity_name, old_snapshot);
+
+        complex_changes.push(ComplexChange::EnumValueRemoval {
+            enum_name: diff.entity_name.clone(),
+            removed_values: removed,
+            remaining_values,
+            affected_columns,
+        });
+
+        // Keep any non-removal changes as simple
+        let simple_changes: Vec<FieldChange> = changes
+            .iter()
+            .filter(|c| {
+                !(c.field_type == FieldType::EnumValue
+                    && matches!(c.action, ChangeAction::Drop))
+            })
+            .cloned()
+            .collect();
+
+        if !simple_changes.is_empty() {
+            simple_diffs.push(MigrationDiff {
+                entity_name: diff.entity_name.clone(),
+                entity_type: diff.entity_type,
+                action: DiffAction::Change(simple_changes),
+            });
+        }
+    } else {
+        // No removals — everything is simple
+        simple_diffs.push(diff.clone());
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
@@ -2246,5 +2559,308 @@ mod tests {
     fn ca_same_category_castable() {
         assert!(is_castable("INTEGER", "BIGINT"));
         assert!(is_castable("TEXT", "TEXT"));
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Task 2: classify_changes() tests
+    // ════════════════════════════════════════════════════════
+
+    #[test]
+    fn c1_simple_changes_only() {
+        // Use different types for drop (INTEGER) and add (TEXT) so it's not a rename
+        let old_snap = snap(
+            vec![table("config", "users", vec![col("id", "int"), col("age", "INTEGER")])],
+            vec![],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "email".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("email", "TEXT")))),
+                },
+                FieldChange {
+                    field_name: "age".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "idx_email".to_string(),
+                    field_type: FieldType::Index,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Index(IndexDef {
+                        name: Some("idx_email".to_string()),
+                        columns: vec![IndexColumn { name: "email".to_string(), order: None }],
+                        unique: false,
+                        index_type: None,
+                    }))),
+                },
+            ]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert!(complex.is_empty(), "no complex changes expected");
+        assert_eq!(simple.len(), 1);
+        if let DiffAction::Change(ref changes) = simple[0].action {
+            assert_eq!(changes.len(), 3);
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    #[test]
+    fn c2_column_type_change_detected() {
+        let old_snap = snap(
+            vec![table("config", "users", vec![col("id", "int"), col("email", "VARCHAR(100)")])],
+            vec![],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(col("email", "VARCHAR(100)"))),
+                    new: Box::new(FieldDetail::Column(col("email", "TEXT"))),
+                },
+            }]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert_eq!(complex.len(), 1);
+        if let ComplexChange::ColumnTypeChange { ref old_type, ref new_type, .. } = complex[0] {
+            assert_eq!(old_type, "VARCHAR(100)");
+            assert_eq!(new_type, "TEXT");
+        } else {
+            panic!("expected ColumnTypeChange");
+        }
+        // No remaining simple changes for this table
+        assert!(simple.is_empty() || simple.iter().all(|d| {
+            if let DiffAction::Change(ref c) = d.action { !c.is_empty() } else { true }
+        }));
+    }
+
+    #[test]
+    fn c3_column_rename_detected() {
+        let old_snap = snap(
+            vec![table("config", "users", vec![col("id", "int"), col("name", "TEXT")])],
+            vec![],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "display_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("display_name", "TEXT")))),
+                },
+            ]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert_eq!(complex.len(), 1);
+        if let ComplexChange::ColumnRename { ref old_name, ref new_name, .. } = complex[0] {
+            assert_eq!(old_name, "name");
+            assert_eq!(new_name, "display_name");
+        } else {
+            panic!("expected ColumnRename");
+        }
+        assert!(simple.is_empty());
+    }
+
+    #[test]
+    fn c4_different_types_not_rename() {
+        let old_snap = snap(
+            vec![table("config", "users", vec![col("id", "int"), col("name", "TEXT")])],
+            vec![],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "age".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("age", "INTEGER")))),
+                },
+            ]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert!(complex.is_empty(), "different types should not be detected as rename");
+        assert_eq!(simple.len(), 1);
+        if let DiffAction::Change(ref changes) = simple[0].action {
+            assert_eq!(changes.len(), 2);
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    #[test]
+    fn c5_multiple_drops_adds_not_rename() {
+        let old_snap = snap(
+            vec![table("config", "users", vec![
+                col("id", "int"),
+                col("first_name", "TEXT"),
+                col("last_name", "TEXT"),
+            ])],
+            vec![],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "first_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "last_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "given_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("given_name", "TEXT")))),
+                },
+                FieldChange {
+                    field_name: "family_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("family_name", "TEXT")))),
+                },
+            ]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert!(complex.is_empty(), "multiple drops+adds should not be detected as rename");
+        assert_eq!(simple.len(), 1);
+        if let DiffAction::Change(ref changes) = simple[0].action {
+            assert_eq!(changes.len(), 4);
+        } else {
+            panic!("expected Change action");
+        }
+    }
+
+    #[test]
+    fn c6_enum_value_removal_detected() {
+        let old_snap = snap(
+            vec![],
+            vec![EnumSnapshot {
+                name: "status_type".to_string(),
+                schema: "public".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()],
+            }],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status_type".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "deleted".to_string(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert_eq!(complex.len(), 1);
+        if let ComplexChange::EnumValueRemoval {
+            ref removed_values,
+            ref remaining_values,
+            ..
+        } = complex[0]
+        {
+            assert_eq!(removed_values, &vec!["deleted".to_string()]);
+            assert!(remaining_values.contains(&"active".to_string()));
+            assert!(remaining_values.contains(&"inactive".to_string()));
+            assert!(!remaining_values.contains(&"deleted".to_string()));
+        } else {
+            panic!("expected EnumValueRemoval");
+        }
+        assert!(simple.is_empty());
+    }
+
+    #[test]
+    fn c7_enum_removal_identifies_affected_columns() {
+        let old_snap = snap(
+            vec![table("public", "users", vec![
+                col("id", "int"),
+                col("status", "status_type"),
+            ])],
+            vec![EnumSnapshot {
+                name: "status_type".to_string(),
+                schema: "public".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()],
+            }],
+        );
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status_type".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "deleted".to_string(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+
+        let (_, complex) = classify_changes(&diffs, &old_snap);
+        assert_eq!(complex.len(), 1);
+        if let ComplexChange::EnumValueRemoval {
+            ref affected_columns,
+            ..
+        } = complex[0]
+        {
+            assert!(!affected_columns.is_empty());
+            assert!(affected_columns.contains(&("public.users".to_string(), "status".to_string())));
+        } else {
+            panic!("expected EnumValueRemoval");
+        }
+    }
+
+    #[test]
+    fn c_enum_value_rename_is_simple() {
+        let old_snap = snap(
+            vec![],
+            vec![EnumSnapshot {
+                name: "status_type".to_string(),
+                schema: "public".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()],
+            }],
+        );
+        // 1:1 swap: drop "deleted", add "archived"
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status_type".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "deleted".to_string(),
+                    field_type: FieldType::EnumValue,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "archived".to_string(),
+                    field_type: FieldType::EnumValue,
+                    action: ChangeAction::Add(Box::new(FieldDetail::EnumValue("archived".to_string()))),
+                },
+            ]),
+        }];
+
+        let (simple, complex) = classify_changes(&diffs, &old_snap);
+        assert!(complex.is_empty(), "1:1 enum value swap should be treated as simple");
+        assert_eq!(simple.len(), 1);
     }
 }
