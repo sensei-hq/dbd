@@ -392,11 +392,215 @@ fn diff_enum_values(old: &EnumSnapshot, new: &EnumSnapshot) -> Vec<FieldChange> 
     changes
 }
 
+/// Generate PostgreSQL migration SQL from a list of diffs.
+pub fn generate_migration_sql(diffs: &[MigrationDiff]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    for d in diffs {
+        match &d.action {
+            DiffAction::Add => {
+                // New entities use regular apply — no SQL emitted
+            }
+            DiffAction::Drop => match d.entity_type {
+                EntityType::Table => {
+                    lines.push(format!("DROP TABLE {} CASCADE;", d.entity_name));
+                }
+                EntityType::Enum => {
+                    lines.push(format!(
+                        "-- WARNING: manual migration required for dropped enum {}",
+                        d.entity_name
+                    ));
+                }
+                _ => {}
+            },
+            DiffAction::Change(changes) => {
+                for change in changes {
+                    generate_field_sql(&d.entity_name, &d.entity_type, change, &mut lines);
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Generate SQL for a single field-level change.
+fn generate_field_sql(
+    entity_name: &str,
+    _entity_type: &EntityType,
+    change: &FieldChange,
+    lines: &mut Vec<String>,
+) {
+    match (&change.field_type, &change.action) {
+        // ── Column ──────────────────────────────────────
+        (FieldType::Column, ChangeAction::Add(detail)) => {
+            if let FieldDetail::Column(col) = detail.as_ref() {
+                let mut stmt = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    entity_name, col.name, col.data_type
+                );
+                if !col.nullable {
+                    stmt.push_str(" NOT NULL");
+                }
+                if let Some(ref default) = col.default_value {
+                    stmt.push_str(&format!(" DEFAULT {default}"));
+                }
+                stmt.push(';');
+                lines.push(stmt);
+            }
+        }
+        (FieldType::Column, ChangeAction::Drop) => {
+            lines.push(format!(
+                "ALTER TABLE {} DROP COLUMN {};",
+                entity_name, change.field_name
+            ));
+        }
+        (FieldType::Column, ChangeAction::Alter { old, new }) => {
+            if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                (old.as_ref(), new.as_ref())
+            {
+                if old_col.data_type != new_col.data_type {
+                    lines.push(format!(
+                        "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
+                        entity_name, new_col.name, new_col.data_type
+                    ));
+                }
+                if old_col.nullable != new_col.nullable {
+                    if new_col.nullable {
+                        lines.push(format!(
+                            "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                            entity_name, new_col.name
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                            entity_name, new_col.name
+                        ));
+                    }
+                }
+                if old_col.default_value != new_col.default_value {
+                    match &new_col.default_value {
+                        Some(val) => {
+                            lines.push(format!(
+                                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                                entity_name, new_col.name, val
+                            ));
+                        }
+                        None => {
+                            lines.push(format!(
+                                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                                entity_name, new_col.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Constraint ──────────────────────────────────
+        (FieldType::Constraint, ChangeAction::Add(detail)) => {
+            if let FieldDetail::Constraint(con) = detail.as_ref() {
+                let sql = constraint_add_sql(entity_name, con);
+                lines.push(sql);
+            }
+        }
+        (FieldType::Constraint, ChangeAction::Drop) => {
+            lines.push(format!(
+                "ALTER TABLE {} DROP CONSTRAINT {};",
+                entity_name, change.field_name
+            ));
+        }
+
+        // ── Index ───────────────────────────────────────
+        (FieldType::Index, ChangeAction::Add(detail)) => {
+            if let FieldDetail::Index(idx) = detail.as_ref() {
+                let unique_str = if idx.unique { "UNIQUE " } else { "" };
+                let idx_name = idx.name.as_deref().unwrap_or("unnamed");
+                let cols: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
+                lines.push(format!(
+                    "CREATE {}INDEX {} ON {} ({});",
+                    unique_str,
+                    idx_name,
+                    entity_name,
+                    cols.join(", ")
+                ));
+            }
+        }
+        (FieldType::Index, ChangeAction::Drop) => {
+            lines.push(format!("DROP INDEX {};", change.field_name));
+        }
+
+        // ── EnumValue ───────────────────────────────────
+        (FieldType::EnumValue, ChangeAction::Add(detail)) => {
+            if let FieldDetail::EnumValue(val) = detail.as_ref() {
+                lines.push(format!(
+                    "ALTER TYPE {} ADD VALUE '{}';",
+                    entity_name, val
+                ));
+            }
+        }
+        (FieldType::EnumValue, ChangeAction::Drop) => {
+            // No SQL for enum value drop — warning only
+        }
+
+        // Catch-all for any unexpected combinations
+        _ => {}
+    }
+}
+
+/// Generate ADD CONSTRAINT SQL for a table constraint.
+fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
+    match con {
+        TableConstraint::PrimaryKey { name, columns } => {
+            let con_name = name.as_deref().unwrap_or("unnamed");
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({});",
+                entity_name,
+                con_name,
+                columns.join(", ")
+            )
+        }
+        TableConstraint::Unique { name, columns } => {
+            let con_name = name.as_deref().unwrap_or("unnamed");
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({});",
+                entity_name,
+                con_name,
+                columns.join(", ")
+            )
+        }
+        TableConstraint::ForeignKey(fk) => {
+            let con_name = fk.name.as_deref().unwrap_or("unnamed");
+            let ref_schema = fk
+                .ref_schema
+                .as_deref()
+                .map(|s| format!("{}.", s))
+                .unwrap_or_default();
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{}({});",
+                entity_name,
+                con_name,
+                fk.columns.join(", "),
+                ref_schema,
+                fk.ref_table,
+                fk.ref_columns.join(", ")
+            )
+        }
+        TableConstraint::Check { name, expression } => {
+            let con_name = name.as_deref().unwrap_or("unnamed");
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
+                entity_name, con_name, expression
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, IndexColumn, IndexDef, IndexType, TableConstraint};
+    use crate::entity::{ColumnDef, ForeignKey, IndexColumn, IndexDef, IndexType, TableConstraint};
     use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
     // ── Helpers ─────────────────────────────────────────────
@@ -1046,5 +1250,391 @@ mod tests {
             .expect("should have a Drop");
         assert_eq!(dropped.entity_name, "public.old_type");
         assert_eq!(dropped.entity_type, EntityType::Enum);
+    }
+
+    // ════════════════════════════════════════════════════════
+    // SQL Generation Tests (S1-S14)
+    // ════════════════════════════════════════════════════════
+
+    // ── S1: Add action produces no SQL ──────────────────────
+
+    #[test]
+    fn s1_add_action_produces_no_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Add,
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert!(sql.is_empty(), "Add action should produce no SQL");
+    }
+
+    // ── S2: Drop table produces DROP TABLE CASCADE ──────────
+
+    #[test]
+    fn s2_drop_table_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Drop,
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "DROP TABLE public.users CASCADE;");
+    }
+
+    // ── S3: Drop enum produces warning comment ──────────────
+
+    #[test]
+    fn s3_drop_enum_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Drop,
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "-- WARNING: manual migration required for dropped enum public.status"
+        );
+    }
+
+    // ── S4: Column add SQL ──────────────────────────────────
+
+    #[test]
+    fn s4_column_add_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Add(Box::new(FieldDetail::Column(col("email", "text")))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "ALTER TABLE public.users ADD COLUMN email text;");
+    }
+
+    // ── S5: Column add with NOT NULL and DEFAULT ────────────
+
+    #[test]
+    fn s5_column_add_not_null_with_default_sql() {
+        let c = ColumnDef {
+            nullable: false,
+            default_value: Some("'active'".to_string()),
+            ..col("status", "text")
+        };
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "status".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Add(Box::new(FieldDetail::Column(c))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ADD COLUMN status text NOT NULL DEFAULT 'active';"
+        );
+    }
+
+    // ── S6: Column drop SQL ─────────────────────────────────
+
+    #[test]
+    fn s6_column_drop_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "ALTER TABLE public.users DROP COLUMN email;");
+    }
+
+    // ── S7: Column alter type SQL ───────────────────────────
+
+    #[test]
+    fn s7_column_alter_type_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "id".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(col("id", "int"))),
+                    new: Box::new(FieldDetail::Column(col("id", "bigint"))),
+                },
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN id TYPE bigint;"
+        );
+    }
+
+    // ── S8: Column alter nullable SQL ───────────────────────
+
+    #[test]
+    fn s8_column_alter_nullable_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "name".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(col_not_null("name", "text"))),
+                    new: Box::new(FieldDetail::Column(col("name", "text"))),
+                },
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN name DROP NOT NULL;"
+        );
+    }
+
+    // ── S9: Column alter default SQL ────────────────────────
+
+    #[test]
+    fn s9_column_alter_default_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "status".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(col("status", "text"))),
+                    new: Box::new(FieldDetail::Column(col_with_default(
+                        "status", "text", "'active'",
+                    ))),
+                },
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 'active';"
+        );
+    }
+
+    // ── S10: Constraint add SQL (PK, Unique, FK, Check) ─────
+
+    #[test]
+    fn s10_constraint_add_sql() {
+        // PK
+        let pk_diff = MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "pk_users".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::PrimaryKey {
+                        name: Some("pk_users".to_string()),
+                        columns: vec!["id".to_string()],
+                    },
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[pk_diff]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ADD CONSTRAINT pk_users PRIMARY KEY (id);"
+        );
+
+        // Unique
+        let uq_diff = MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "uq_email".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::Unique {
+                        name: Some("uq_email".to_string()),
+                        columns: vec!["email".to_string()],
+                    },
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[uq_diff]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ADD CONSTRAINT uq_email UNIQUE (email);"
+        );
+
+        // FK
+        let fk_diff = MigrationDiff {
+            entity_name: "public.orders".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "fk_user".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::ForeignKey(ForeignKey {
+                        name: Some("fk_user".to_string()),
+                        columns: vec!["user_id".to_string()],
+                        ref_schema: Some("public".to_string()),
+                        ref_table: "users".to_string(),
+                        ref_columns: vec!["id".to_string()],
+                        on_delete: None,
+                        on_update: None,
+                    }),
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[fk_diff]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES public.users(id);"
+        );
+
+        // Check
+        let ck_diff = MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "ck_age".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::Check {
+                        name: Some("ck_age".to_string()),
+                        expression: "age > 0".to_string(),
+                    },
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[ck_diff]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ADD CONSTRAINT ck_age CHECK (age > 0);"
+        );
+    }
+
+    // ── S11: Constraint drop SQL ────────────────────────────
+
+    #[test]
+    fn s11_constraint_drop_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "uq_email".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "ALTER TABLE public.users DROP CONSTRAINT uq_email;");
+    }
+
+    // ── S12: Index add SQL ──────────────────────────────────
+
+    #[test]
+    fn s12_index_add_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "idx_email".to_string(),
+                field_type: FieldType::Index,
+                action: ChangeAction::Add(Box::new(FieldDetail::Index(IndexDef {
+                    name: Some("idx_email".to_string()),
+                    columns: vec![IndexColumn {
+                        name: "email".to_string(),
+                        order: None,
+                    }],
+                    unique: false,
+                    index_type: None,
+                }))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "CREATE INDEX idx_email ON public.users (email);");
+
+        // Unique index
+        let diffs_unique = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "idx_email_unique".to_string(),
+                field_type: FieldType::Index,
+                action: ChangeAction::Add(Box::new(FieldDetail::Index(IndexDef {
+                    name: Some("idx_email_unique".to_string()),
+                    columns: vec![IndexColumn {
+                        name: "email".to_string(),
+                        order: None,
+                    }],
+                    unique: true,
+                    index_type: None,
+                }))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs_unique);
+        assert_eq!(
+            sql,
+            "CREATE UNIQUE INDEX idx_email_unique ON public.users (email);"
+        );
+    }
+
+    // ── S13: Index drop SQL ─────────────────────────────────
+
+    #[test]
+    fn s13_index_drop_sql() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "idx_email".to_string(),
+                field_type: FieldType::Index,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(sql, "DROP INDEX idx_email;");
+    }
+
+    // ── S14: Enum value add / drop SQL ──────────────────────
+
+    #[test]
+    fn s14_enum_value_add_and_drop_sql() {
+        // Add value
+        let diffs_add = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "pending".to_string(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Add(Box::new(FieldDetail::EnumValue(
+                    "pending".to_string(),
+                ))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs_add);
+        assert_eq!(sql, "ALTER TYPE public.status ADD VALUE 'pending';");
+
+        // Drop value — should produce no SQL
+        let diffs_drop = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "inactive".to_string(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs_drop);
+        assert!(sql.is_empty(), "enum value drop should produce no SQL");
     }
 }
