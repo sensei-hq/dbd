@@ -1088,6 +1088,83 @@ fn classify_enum_changes(
     }
 }
 
+// ── Data SQL generation ────────────────────────────────
+
+/// Generate a data correction SQL script for a complex change.
+pub fn generate_data_sql(change: &ComplexChange) -> String {
+    match change {
+        ComplexChange::ColumnRename {
+            table_name,
+            old_name,
+            new_name,
+            ..
+        } => {
+            format!("UPDATE {table_name} SET {new_name} = {old_name};\n")
+        }
+        ComplexChange::ColumnTypeChange {
+            table_name,
+            old_type,
+            new_type,
+            old_col,
+            new_col,
+            ..
+        } => {
+            if is_castable(old_type, new_type) {
+                let mut sql = String::new();
+                // Truncation warning for TEXT → VARCHAR
+                let to_norm = normalize_type(new_type);
+                if (to_norm == "varchar" || to_norm == "character varying" || to_norm == "char")
+                    && type_category(&normalize_type(old_type)) == "text"
+                {
+                    sql.push_str(&format!(
+                        "-- WARNING: Casting {} to {} may truncate data. Review row lengths before applying.\n",
+                        old_type, new_type
+                    ));
+                }
+                sql.push_str(&format!(
+                    "UPDATE {table_name} SET {} = {}::{};\n",
+                    new_col.name, old_col.name, new_type
+                ));
+                sql
+            } else {
+                format!(
+                    "-- TODO: Data correction required for {table_name}.{}.\n\
+                     -- Column type changed from {old_type} to {new_type}.\n\
+                     -- No safe automatic cast is available. Manual data migration needed.\n",
+                    new_col.name
+                )
+            }
+        }
+        ComplexChange::EnumValueRemoval {
+            enum_name,
+            removed_values,
+            remaining_values,
+            affected_columns,
+        } => {
+            let mut sql = String::new();
+            sql.push_str(&format!("-- TODO: Map removed enum values to remaining values for {enum_name}.\n"));
+            sql.push_str(&format!(
+                "-- Removed: {}\n",
+                removed_values.join(", ")
+            ));
+            sql.push_str(&format!(
+                "-- Remaining: {}\n",
+                remaining_values.join(", ")
+            ));
+
+            for (table, col) in affected_columns {
+                for removed_val in removed_values {
+                    sql.push_str(&format!(
+                        "UPDATE {table} SET {col} = '???' WHERE {col} = '{removed_val}';\n"
+                    ));
+                }
+            }
+
+            sql
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
@@ -2862,5 +2939,78 @@ mod tests {
         let (simple, complex) = classify_changes(&diffs, &old_snap);
         assert!(complex.is_empty(), "1:1 enum value swap should be treated as simple");
         assert_eq!(simple.len(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Task 3: generate_data_sql() tests
+    // ════════════════════════════════════════════════════════
+
+    #[test]
+    fn d_data_column_rename_generates_copy() {
+        let change = ComplexChange::ColumnRename {
+            table_name: "config.users".to_string(),
+            old_name: "name".to_string(),
+            new_name: "display_name".to_string(),
+            col_def: Box::new(col("display_name", "TEXT")),
+        };
+        let sql = generate_data_sql(&change);
+        assert_eq!(sql, "UPDATE config.users SET display_name = name;\n");
+    }
+
+    #[test]
+    fn d_data_castable_type_change() {
+        let change = ComplexChange::ColumnTypeChange {
+            table_name: "config.orders".to_string(),
+            column_name: "total".to_string(),
+            old_type: "INTEGER".to_string(),
+            new_type: "TEXT".to_string(),
+            old_col: Box::new(col("total", "INTEGER")),
+            new_col: Box::new(col("total_text", "TEXT")),
+        };
+        let sql = generate_data_sql(&change);
+        assert!(sql.contains("UPDATE config.orders SET total_text = total::TEXT;"));
+    }
+
+    #[test]
+    fn d_data_non_castable_type_change_generates_todo() {
+        let change = ComplexChange::ColumnTypeChange {
+            table_name: "config.data".to_string(),
+            column_name: "payload".to_string(),
+            old_type: "JSONB".to_string(),
+            new_type: "INTEGER".to_string(),
+            old_col: Box::new(col("payload", "JSONB")),
+            new_col: Box::new(col("payload", "INTEGER")),
+        };
+        let sql = generate_data_sql(&change);
+        assert!(sql.contains("-- TODO:"), "should contain TODO comment: {sql}");
+    }
+
+    #[test]
+    fn d_data_enum_value_removal_generates_todo() {
+        let change = ComplexChange::EnumValueRemoval {
+            enum_name: "public.status_type".to_string(),
+            removed_values: vec!["deleted".to_string()],
+            remaining_values: vec!["active".to_string(), "inactive".to_string()],
+            affected_columns: vec![("public.users".to_string(), "status".to_string())],
+        };
+        let sql = generate_data_sql(&change);
+        assert!(sql.contains("Removed: deleted"), "sql: {sql}");
+        assert!(sql.contains("Remaining: active, inactive"), "sql: {sql}");
+        assert!(sql.contains("UPDATE public.users SET status = '???' WHERE status = 'deleted';"));
+    }
+
+    #[test]
+    fn d_data_text_to_varchar_has_truncation_warning() {
+        let change = ComplexChange::ColumnTypeChange {
+            table_name: "config.users".to_string(),
+            column_name: "name".to_string(),
+            old_type: "TEXT".to_string(),
+            new_type: "VARCHAR(50)".to_string(),
+            old_col: Box::new(col("name", "TEXT")),
+            new_col: Box::new(col("name", "VARCHAR(50)")),
+        };
+        let sql = generate_data_sql(&change);
+        assert!(sql.contains("WARNING"), "should contain WARNING: {sql}");
+        assert!(sql.contains("truncate"), "should mention truncate: {sql}");
     }
 }
