@@ -60,6 +60,8 @@ pub struct MigrationGraph {
     pub from_version: u32,
     #[serde(rename = "toVersion")]
     pub to_version: u32,
+    #[serde(default)]
+    pub added: Vec<String>,
     pub altered: Vec<String>,
     pub dropped: Vec<String>,
 }
@@ -70,6 +72,7 @@ pub struct PendingMigration {
     pub from_version: u32,
     pub to_version: u32,
     pub migration_dir: PathBuf,
+    pub added: Vec<String>,
     pub altered: Vec<String>,
     pub dropped: Vec<String>,
     pub checksum: String,
@@ -197,6 +200,7 @@ pub fn pending_migrations(current_db_version: u32, dir: &Path) -> Vec<PendingMig
                 from_version: graph.from_version,
                 to_version,
                 migration_dir,
+                added: graph.added,
                 altered: graph.altered,
                 dropped: graph.dropped,
                 checksum,
@@ -252,6 +256,7 @@ mod tests {
         let graph = MigrationGraph {
             from_version: 1,
             to_version: 2,
+            added: vec![],
             altered: vec!["config.lookup_values".to_string()],
             dropped: vec![],
         };
@@ -362,5 +367,20 @@ mod tests {
     fn pending_migrations_empty_when_no_dir() {
         let tmp = TempDir::new().unwrap();
         assert!(pending_migrations(0, tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn migration_graph_without_added_field_deserializes_with_empty_vec() {
+        let json = r#"{
+            "fromVersion": 1,
+            "toVersion": 2,
+            "altered": ["config.users"],
+            "dropped": []
+        }"#;
+        let graph: MigrationGraph = serde_json::from_str(json).unwrap();
+        assert!(graph.added.is_empty());
+        assert_eq!(graph.altered, vec!["config.users"]);
+        assert_eq!(graph.from_version, 1);
+        assert_eq!(graph.to_version, 2);
     }
 }
