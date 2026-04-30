@@ -516,7 +516,13 @@ fn generate_field_sql(
             if let FieldDetail::Index(idx) = detail.as_ref() {
                 let unique_str = if idx.unique { "UNIQUE " } else { "" };
                 let idx_name = idx.name.as_deref().unwrap_or("unnamed");
-                let cols: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
+                let cols: Vec<String> = idx.columns.iter().map(|c| {
+                    match c.order {
+                        Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
+                        Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
+                        None => c.name.clone(),
+                    }
+                }).collect();
                 lines.push(format!(
                     "CREATE {}INDEX {} ON {} ({});",
                     unique_str,
@@ -548,6 +554,18 @@ fn generate_field_sql(
     }
 }
 
+/// Convert an FkAction to its SQL keyword.
+fn fk_action_to_sql(action: &crate::entity::FkAction) -> &'static str {
+    use crate::entity::FkAction;
+    match action {
+        FkAction::Cascade => "CASCADE",
+        FkAction::Restrict => "RESTRICT",
+        FkAction::SetNull => "SET NULL",
+        FkAction::SetDefault => "SET DEFAULT",
+        FkAction::NoAction => "NO ACTION",
+    }
+}
+
 /// Generate ADD CONSTRAINT SQL for a table constraint.
 fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
     match con {
@@ -576,15 +594,23 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
                 .as_deref()
                 .map(|s| format!("{}.", s))
                 .unwrap_or_default();
-            format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{}({});",
+            let mut sql = format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{}({})",
                 entity_name,
                 con_name,
                 fk.columns.join(", "),
                 ref_schema,
                 fk.ref_table,
                 fk.ref_columns.join(", ")
-            )
+            );
+            if let Some(ref action) = fk.on_delete {
+                sql.push_str(&format!(" ON DELETE {}", fk_action_to_sql(action)));
+            }
+            if let Some(ref action) = fk.on_update {
+                sql.push_str(&format!(" ON UPDATE {}", fk_action_to_sql(action)));
+            }
+            sql.push(';');
+            sql
         }
         TableConstraint::Check { name, expression } => {
             let con_name = name.as_deref().unwrap_or("unnamed");
