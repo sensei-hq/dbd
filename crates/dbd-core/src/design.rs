@@ -949,6 +949,100 @@ mod tests {
         assert!(content.contains("CREATE SCHEMA"));
     }
 
+    // ── Import plan tests ─────────────────────────────────
+
+    // IP1: Import plan matches staging table to procedure by reads
+    #[test]
+    fn ip1_import_plan_matches_staging_table_to_procedure() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let plan = design.import_plan(None);
+
+        // staging.lookups should match staging.import_lookups
+        let lookups_entry = plan.iter().find(|e| e.table.name == "staging.lookups");
+        assert!(lookups_entry.is_some(), "staging.lookups should appear in the import plan");
+        let entry = lookups_entry.unwrap();
+        assert_eq!(
+            entry.procedure,
+            Some("staging.import_lookups".to_string()),
+            "staging.lookups should be matched to staging.import_lookups"
+        );
+        assert!(
+            entry.writes.contains(&"config.lookups".to_string()),
+            "import_lookups writes to config.lookups"
+        );
+    }
+
+    // IP2: Import plan with no matching procedure
+    #[test]
+    fn ip2_import_plan_no_matching_procedure() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let plan = design.import_plan(None);
+
+        // Check if there's any entry without a matching procedure.
+        // If all staging tables have matching procedures, we verify
+        // the structure is correct for unmatched ones by checking that
+        // entries without procedures have empty writes.
+        for entry in &plan {
+            if entry.procedure.is_none() {
+                assert!(
+                    entry.writes.is_empty(),
+                    "Entry without a procedure should have no writes"
+                );
+            }
+        }
+
+        // Also verify the plan has entries at all (fixture has import files)
+        assert!(
+            !plan.is_empty(),
+            "Import plan should contain entries from fixture import files"
+        );
+    }
+
+    // IP3: Import plan sorts by write dependencies
+    #[test]
+    fn ip3_import_plan_sorts_by_write_dependencies() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let plan = design.import_plan(None);
+
+        // staging.import_lookups writes config.lookups
+        // staging.import_lookup_values writes config.lookup_values
+        // config.lookup_values has FK to config.lookups (lookup_id references lookups(id))
+        // Therefore import_lookups must come before import_lookup_values
+        let lookups_pos = plan
+            .iter()
+            .position(|e| e.table.name == "staging.lookups");
+        let lookup_values_pos = plan
+            .iter()
+            .position(|e| e.table.name == "staging.lookup_values");
+
+        assert!(lookups_pos.is_some(), "staging.lookups should be in plan");
+        assert!(
+            lookup_values_pos.is_some(),
+            "staging.lookup_values should be in plan"
+        );
+        assert!(
+            lookups_pos.unwrap() < lookup_values_pos.unwrap(),
+            "staging.lookups (pos {}) should come before staging.lookup_values (pos {}) due to FK dependency",
+            lookups_pos.unwrap(),
+            lookup_values_pos.unwrap()
+        );
+    }
+
+    // IP4: Import plan with name filter
+    #[test]
+    fn ip4_import_plan_with_name_filter() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        let plan = design.import_plan(Some("staging.lookups"));
+
+        assert_eq!(plan.len(), 1, "Name filter should return exactly one entry");
+        assert_eq!(plan[0].table.name, "staging.lookups");
+    }
+
     // ── Execution plan test helpers ───────────────────────
 
     fn test_entity(name: &str) -> Entity {

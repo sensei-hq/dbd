@@ -1,0 +1,3 @@
+lookup_name	value	sequence	is_active
+Gender	Male	1	true
+Gender	Female	2	true

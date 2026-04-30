@@ -381,4 +381,31 @@ mod tests {
         assert!(names.contains(&"b"));
         assert!(!names.contains(&"c"));
     }
+
+    // ── DG1: Build graph from entities with deps ─────────
+
+    #[test]
+    fn dg1_build_graph_from_entities_with_deps() {
+        let entities = vec![
+            entity("A", &["B"]),
+            entity("B", &["C"]),
+            entity("C", &[]),
+        ];
+        let graph = build_dependency_graph(&entities);
+
+        assert_eq!(graph.len(), 3);
+        assert!(graph["A"].contains("B"));
+        assert_eq!(graph["A"].len(), 1);
+        assert!(graph["B"].contains("C"));
+        assert_eq!(graph["B"].len(), 1);
+        assert!(graph["C"].is_empty());
+    }
+
+    // ── DG2: Empty entities ──────────────────────────────
+
+    #[test]
+    fn dg2_build_graph_empty_entities() {
+        let graph = build_dependency_graph(&[]);
+        assert!(graph.is_empty());
+    }
 }

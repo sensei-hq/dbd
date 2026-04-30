@@ -479,4 +479,35 @@ mod tests {
         assert!(json.contains("cascade"));
         assert!(json.contains("no_action"));
     }
+
+    // ── EX1: External entity constructor ─────────────────
+
+    #[test]
+    fn ex1_external_entity_constructor() {
+        let entity = Entity::external("pg_catalog.pg_type");
+        assert_eq!(entity.entity_type, EntityType::External);
+        assert_eq!(entity.name, "pg_catalog.pg_type");
+        assert_eq!(entity.schema, Some("pg_catalog".to_string()));
+    }
+
+    // ── IF1: Import entity from CSV file ─────────────────
+
+    #[test]
+    fn if1_import_entity_from_csv_file() {
+        let entity = Entity::from_import_file(Path::new("import/staging/lookups.csv"));
+        assert_eq!(entity.entity_type, EntityType::Import);
+        assert_eq!(entity.name, "staging.lookups");
+        assert_eq!(entity.schema, Some("staging".to_string()));
+        assert_eq!(entity.format, Some("csv".to_string()));
+    }
+
+    // ── IF2: Import entity from TSV file ─────────────────
+
+    #[test]
+    fn if2_import_entity_from_tsv_file() {
+        let entity = Entity::from_import_file(Path::new("import/staging/data.tsv"));
+        assert_eq!(entity.entity_type, EntityType::Import);
+        assert_eq!(entity.name, "staging.data");
+        assert_eq!(entity.format, Some("tsv".to_string()));
+    }
 }
