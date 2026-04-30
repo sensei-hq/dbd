@@ -65,6 +65,34 @@
 
 ## P1 — Important features
 
+### Smart multi-snapshot generation — NEXT
+When `dbd snapshot` detects complex changes (enum value removal, column type change,
+column rename), it automatically splits into multiple snapshots with correct intermediate
+states and generates data.sql files where the correction is derivable.
+
+**Patterns:**
+- **Column rename:** v(N) adds new_col, v(N+1) drops old_col. DDL always clean-installable.
+- **Column type change:** v(N) adds new_col (new type), v(N+1) drops old_col. Same pattern.
+- **Enum value removal:** v(N) data.sql updates rows to new value, v(N+1) changes column to TEXT + drops enum, v(N+2) creates new enum + changes column back. Auto-generates data.sql for the UPDATE.
+- **Enum value rename:** Same as removal — update data, recreate enum.
+
+**Behavior:**
+- Derivable corrections (enum merge) → auto-generate data.sql
+- Non-derivable corrections (column type with unknown mapping) → generate data.sql with TODO comments + console instructions
+- `inspect` can detect and report these patterns independently
+- Each intermediate snapshot is a valid, clean-installable state
+
+### `_dbd_meta` integration — DONE
+- `_dbd_meta` is authoritative version source
+- `apply()` writes env + version on every apply
+- `applied_at` timestamp tracked (via `updated_at`)
+- `get_db_version()` reads from `_dbd_meta` not `_dbd_migrations`
+
+### Migration data corrections — DONE
+- `*.data.sql` files in migration folders run after schema ALTERs
+- Pattern: `migrations/002/config/users.sql` (ALTER) then `migrations/002/config/users.data.sql` (UPDATE)
+- Warnings on risky changes: type changes, renames, enum drops
+
 ### `dbd deploy --source`
 - Download GitHub repo via reqwest + flate2 + tar
 - Cache in `~/.cache/dbd/` with TTL
