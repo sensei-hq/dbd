@@ -421,7 +421,9 @@ impl Design {
     }
 
     /// Apply all entities to the database via the adapter.
-    /// If `verbose` is true, prints each entity as it's applied.
+    ///
+    /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
+    /// and executes the plan steps in order.
     pub async fn apply(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -440,83 +442,71 @@ impl Design {
             return Ok(());
         }
 
+        // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {
             let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
             adapter.apply_entities(&owned).await?;
             return Ok(());
         }
 
-        // Interleave migrations with entity apply
+        // Build execution plan
         let db_version = adapter.get_db_version().await?;
+        let latest_version = self.config.project.version.unwrap_or(0);
         let pending = snapshot::pending_migrations(db_version, &self.project_dir);
 
-        if !pending.is_empty() {
+        // Filter entities by name if scoped
+        let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
+        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending);
+
+        // Ensure migrations table exists if we have migration steps
+        let has_migrations = plan.steps.iter().any(|s| matches!(
+            s,
+            ExecutionStep::MigrateEntity { .. }
+                | ExecutionStep::DropEntity { .. }
+                | ExecutionStep::RecordMigration { .. }
+        ));
+        if has_migrations {
             adapter.ensure_migrations_table().await?;
         }
 
-        // Build map: table name → pending migrations
-        let mut table_migrations: std::collections::HashMap<String, Vec<&snapshot::PendingMigration>> =
-            std::collections::HashMap::new();
-        for migration in &pending {
-            for table_name in &migration.altered {
-                table_migrations
-                    .entry(table_name.clone())
-                    .or_default()
-                    .push(migration);
-            }
-        }
+        // Build entity lookup for ApplyEntity / CreateEntity steps
+        let entity_map: std::collections::HashMap<&str, &Entity> = self
+            .entities
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
 
-        for entity in &valid_entities {
-            // Run pending migrations for this table before applying DDL
-            if entity.entity_type == EntityType::Table
-                && let Some(migrations) = table_migrations.get(&entity.name) {
-                    for migration in migrations {
-                        let parts: Vec<&str> = entity.name.split('.').collect();
-                        let (schema, table_name) = if parts.len() > 1 {
-                            (Some(parts[0]), parts[1])
-                        } else {
-                            (None, parts[0])
-                        };
-                        let sql_file = match schema {
-                            Some(s) => migration.migration_dir.join(s).join(format!("{table_name}.sql")),
-                            None => migration.migration_dir.join(format!("{table_name}.sql")),
-                        };
-                        if sql_file.exists() {
-                            let sql = std::fs::read_to_string(&sql_file)?;
-
-                            adapter.execute_script(&sql).await?;
-                        }
+        // Execute plan steps
+        for step in &plan.steps {
+            match step {
+                ExecutionStep::CreateEntity(entity_name) | ExecutionStep::ApplyEntity(entity_name) => {
+                    if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                        adapter.apply_entity(entity).await?;
                     }
                 }
-            adapter.apply_entity(entity).await?;
-        }
-
-        // Handle dropped tables
-        for migration in &pending {
-            for table_name in &migration.dropped {
-                let parts: Vec<&str> = table_name.split('.').collect();
-                let (schema, tbl) = if parts.len() > 1 {
-                    (Some(parts[0]), parts[1])
-                } else {
-                    (None, parts[0])
-                };
-                let sql_file = match schema {
-                    Some(s) => migration.migration_dir.join(s).join(format!("{tbl}.drop.sql")),
-                    None => migration.migration_dir.join(format!("{tbl}.drop.sql")),
-                };
-                if sql_file.exists() {
-                    let sql = std::fs::read_to_string(&sql_file)?;
-                    adapter.execute_script(&sql).await?;
+                ExecutionStep::MigrateEntity { migration_sql_path, .. } => {
+                    if migration_sql_path.exists() {
+                        let sql = std::fs::read_to_string(migration_sql_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                }
+                ExecutionStep::DropEntity { drop_sql_path, .. } => {
+                    if drop_sql_path.exists() {
+                        let sql = std::fs::read_to_string(drop_sql_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                }
+                ExecutionStep::RecordMigration { version, checksum } => {
+                    let desc = format!("migration to v{version}");
+                    adapter
+                        .apply_migration(*version, "", &desc, checksum)
+                        .await?;
+                }
+                ExecutionStep::SetVersion(_version) => {
+                    // Version is tracked via _dbd_migrations; meta update
+                    // is handled by the caller (CLI) if needed.
                 }
             }
-        }
-
-        // Record applied migrations
-        for migration in &pending {
-            let desc = format!("migration v{} to v{}", migration.from_version, migration.to_version);
-            adapter
-                .apply_migration(migration.to_version, "", &desc, &migration.checksum)
-                .await?;
         }
 
         Ok(())
