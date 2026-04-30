@@ -37,13 +37,12 @@ pub async fn run(
             cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, verbosity).await
         }
 
-        Commands::Snapshot { list, .. } => {
+        Commands::Snapshot { list, name } => {
             if *list {
                 cmd_snapshot_list(project_dir, verbosity);
                 return Ok(());
             }
-            output::info(verbosity, "Snapshot creation not yet implemented in Rust CLI");
-            Ok(())
+            cmd_snapshot_create(config, env, project_dir, name.as_deref(), verbosity)
         }
 
         Commands::Migrate { status, apply: _, to: _, dry_run: _ } => {
@@ -353,6 +352,59 @@ fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
     }
 
 
+}
+
+fn cmd_snapshot_create(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    description: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+    let desc = description.unwrap_or("snapshot");
+    let result = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config, desc)
+        .context("Failed to create snapshot")?;
+
+    if result.no_changes {
+        output::info(verbosity, "No schema changes detected — snapshot skipped.");
+        return Ok(());
+    }
+
+    if result.is_baseline {
+        output::info(
+            verbosity,
+            &format!(
+                "Baseline snapshot v{} created.",
+                dbd_core::snapshot::pad_version(result.snapshot.version)
+            ),
+        );
+    } else {
+        let graph = result.graph.as_ref();
+        let added = graph.map(|g| g.added.len()).unwrap_or(0);
+        let altered = graph.map(|g| g.altered.len()).unwrap_or(0);
+        let dropped = graph.map(|g| g.dropped.len()).unwrap_or(0);
+        output::info(
+            verbosity,
+            &format!(
+                "Snapshot v{} created — {} added, {} altered, {} dropped.",
+                dbd_core::snapshot::pad_version(result.snapshot.version),
+                added,
+                altered,
+                dropped,
+            ),
+        );
+
+        if !result.migration_files.is_empty() {
+            output::detail(
+                verbosity,
+                &format!("{} migration file(s) generated.", result.migration_files.len()),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
