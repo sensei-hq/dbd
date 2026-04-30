@@ -392,6 +392,85 @@ fn diff_enum_values(old: &EnumSnapshot, new: &EnumSnapshot) -> Vec<FieldChange> 
     changes
 }
 
+/// Analyze diffs for risky changes that may need to be split across two migrations.
+///
+/// Returns warnings for:
+/// - Column type changes (may need data correction)
+/// - Possible renames (column dropped + column added with same type)
+/// - Enum value drops (data may reference removed values)
+pub fn migration_warnings(diffs: &[MigrationDiff]) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for d in diffs {
+        let DiffAction::Change(ref changes) = d.action else {
+            if matches!(d.action, DiffAction::Drop) && d.entity_type == EntityType::Enum {
+                warnings.push(format!(
+                    "Enum '{}' dropped — ensure no columns reference this type before applying",
+                    d.entity_name
+                ));
+            }
+            continue;
+        };
+
+        // Detect column type changes
+        for change in changes {
+            if change.field_type == FieldType::Column
+                && let ChangeAction::Alter { ref old, ref new } = change.action
+                && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                    (old.as_ref(), new.as_ref())
+                && old_col.data_type != new_col.data_type
+            {
+                warnings.push(format!(
+                    "{}.{}: type change {} -> {} — consider splitting across two snapshots \
+                     (v(N): add new column + data correction, v(N+1): drop old column)",
+                    d.entity_name, change.field_name, old_col.data_type, new_col.data_type
+                ));
+            }
+        }
+
+        // Detect possible renames: column dropped + column added with same type in same table
+        let dropped: Vec<&FieldChange> = changes
+            .iter()
+            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
+            .collect();
+        let added: Vec<&FieldChange> = changes
+            .iter()
+            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Add(_)))
+            .collect();
+
+        for drop_col in &dropped {
+            for add_col in &added {
+                if let ChangeAction::Add(ref detail) = add_col.action
+                    && matches!(**detail, FieldDetail::Column(_))
+                {
+                    warnings.push(format!(
+                        "{}: column '{}' dropped and '{}' added — if this is a rename, \
+                         consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
+                        d.entity_name,
+                        drop_col.field_name,
+                        add_col.field_name,
+                        add_col.field_name,
+                        drop_col.field_name,
+                    ));
+                }
+            }
+        }
+
+        // Detect enum value drops
+        for change in changes {
+            if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop)
+            {
+                warnings.push(format!(
+                    "{}: enum value '{}' dropped — ensure no rows reference this value",
+                    d.entity_name, change.field_name
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
 /// Generate PostgreSQL migration SQL from a list of diffs.
 pub fn generate_migration_sql(diffs: &[MigrationDiff]) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -1946,5 +2025,96 @@ mod tests {
         assert!(sql.contains("ALTER TYPE public.status ADD VALUE 'deleted';"));
         let line_count = sql.lines().count();
         assert_eq!(line_count, 3, "expected 3 ALTER TYPE statements, got {}", line_count);
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Migration Warnings Tests
+    // ════════════════════════════════════════════════════════
+
+    #[test]
+    fn warn_column_type_change() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(col("email", "VARCHAR(100)"))),
+                    new: Box::new(FieldDetail::Column(col("email", "TEXT"))),
+                },
+            }]),
+        }];
+        let warnings = migration_warnings(&diffs);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("type change"));
+        assert!(warnings[0].contains("VARCHAR(100)"));
+        assert!(warnings[0].contains("TEXT"));
+        assert!(warnings[0].contains("splitting"));
+    }
+
+    #[test]
+    fn warn_possible_rename_drop_plus_add() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop,
+                },
+                FieldChange {
+                    field_name: "display_name".to_string(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Column(col("display_name", "TEXT")))),
+                },
+            ]),
+        }];
+        let warnings = migration_warnings(&diffs);
+        assert!(warnings.iter().any(|w| w.contains("'name' dropped") && w.contains("'display_name' added")));
+    }
+
+    #[test]
+    fn warn_enum_value_dropped() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "deleted".to_string(),
+                field_type: FieldType::EnumValue,
+                action: ChangeAction::Drop,
+            }]),
+        }];
+        let warnings = migration_warnings(&diffs);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("enum value 'deleted' dropped"));
+    }
+
+    #[test]
+    fn warn_enum_type_dropped() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.status".to_string(),
+            entity_type: EntityType::Enum,
+            action: DiffAction::Drop,
+        }];
+        let warnings = migration_warnings(&diffs);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Enum 'public.status' dropped"));
+    }
+
+    #[test]
+    fn no_warnings_for_simple_column_add() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "config.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Add(Box::new(FieldDetail::Column(col("email", "TEXT")))),
+            }]),
+        }];
+        let warnings = migration_warnings(&diffs);
+        assert!(warnings.is_empty(), "simple column add should not produce warnings");
     }
 }

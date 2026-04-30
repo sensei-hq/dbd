@@ -248,6 +248,7 @@ pub struct SnapshotResult {
     pub diffs: Vec<MigrationDiff>,
     pub migration_files: Vec<MigrationFile>,
     pub graph: Option<MigrationGraph>,
+    pub warnings: Vec<String>,
     pub is_baseline: bool,
     pub no_changes: bool,
 }
@@ -296,6 +297,7 @@ pub fn prepare_snapshot(
                 diffs: vec![],
                 migration_files: vec![],
                 graph: None,
+                warnings: vec![],
                 is_baseline: true,
                 no_changes: false,
             }
@@ -309,10 +311,14 @@ pub fn prepare_snapshot(
                     diffs: vec![],
                     migration_files: vec![],
                     graph: None,
+                    warnings: vec![],
                     is_baseline: false,
                     no_changes: true,
                 };
             }
+
+            // Check for risky changes
+            let warnings = diff::migration_warnings(&diffs);
 
             // Categorize diffs
             let mut added = Vec::new();
@@ -364,6 +370,7 @@ pub fn prepare_snapshot(
                 diffs,
                 migration_files,
                 graph: Some(graph),
+                warnings,
                 is_baseline: false,
                 no_changes: false,
             }
