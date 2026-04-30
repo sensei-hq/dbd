@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-use crate::entity::{ColumnDef, IndexDef, TableConstraint};
+use crate::diff::{self, DiffAction, MigrationDiff};
+use crate::entity::{ColumnDef, Entity, EntityType, IndexDef, TableConstraint};
 use crate::error::Result;
 
 const SNAPSHOTS_DIR: &str = "snapshots";
@@ -212,6 +213,174 @@ pub fn pending_migrations(current_db_version: u32, dir: &Path) -> Vec<PendingMig
     migrations
 }
 
+// ── Entity → Snapshot conversion ────────────────────────
+
+/// Convert a Table entity to a TableSnapshot, if it has a table_def.
+pub fn entity_to_table_snapshot(entity: &Entity) -> Option<TableSnapshot> {
+    let table_def = entity.table_def.as_ref()?;
+    let schema = entity.schema.clone().unwrap_or_default();
+    let (_, short_name) = crate::entity::split_qualified_name(&entity.name);
+    Some(TableSnapshot {
+        name: short_name,
+        schema,
+        columns: table_def.columns.clone(),
+        indexes: table_def.indexes.clone(),
+        table_constraints: table_def.constraints.clone(),
+    })
+}
+
+/// Convert an Enum entity to an EnumSnapshot.
+pub fn entity_to_enum_snapshot(entity: &Entity) -> EnumSnapshot {
+    let schema = entity.schema.clone().unwrap_or_default();
+    let (_, short_name) = crate::entity::split_qualified_name(&entity.name);
+    EnumSnapshot {
+        name: short_name,
+        schema,
+        values: entity.enum_values.iter().map(|v| v.name.clone()).collect(),
+    }
+}
+
+// ── Snapshot preparation ────────────────────────────────
+
+/// The result of preparing a snapshot.
+pub struct SnapshotResult {
+    pub snapshot: Snapshot,
+    pub diffs: Vec<MigrationDiff>,
+    pub migration_files: Vec<MigrationFile>,
+    pub graph: Option<MigrationGraph>,
+    pub is_baseline: bool,
+    pub no_changes: bool,
+}
+
+/// A file to be written as part of a migration.
+pub struct MigrationFile {
+    pub relative_path: PathBuf,
+    pub content: String,
+}
+
+/// Prepare a snapshot from entities, optionally diffing against a previous snapshot.
+///
+/// This is pure logic — no I/O. The caller is responsible for writing files.
+pub fn prepare_snapshot(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+) -> SnapshotResult {
+    // Extract table and enum snapshots from entities
+    let tables: Vec<TableSnapshot> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
+        .filter_map(entity_to_table_snapshot)
+        .collect();
+
+    let enums: Vec<EnumSnapshot> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Enum)
+        .map(entity_to_enum_snapshot)
+        .collect();
+
+    let snapshot = Snapshot {
+        version: next_version,
+        description: description.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        tables,
+        enums,
+    };
+
+    match previous {
+        None => {
+            // Baseline — no previous snapshot to diff against
+            SnapshotResult {
+                snapshot,
+                diffs: vec![],
+                migration_files: vec![],
+                graph: None,
+                is_baseline: true,
+                no_changes: false,
+            }
+        }
+        Some(prev) => {
+            let diffs = diff::diff(prev, &snapshot);
+
+            if diffs.is_empty() {
+                return SnapshotResult {
+                    snapshot,
+                    diffs: vec![],
+                    migration_files: vec![],
+                    graph: None,
+                    is_baseline: false,
+                    no_changes: true,
+                };
+            }
+
+            // Categorize diffs
+            let mut added = Vec::new();
+            let mut altered = Vec::new();
+            let mut dropped = Vec::new();
+            let mut migration_files = Vec::new();
+
+            for d in &diffs {
+                match &d.action {
+                    DiffAction::Add => {
+                        added.push(d.entity_name.clone());
+                        // New entities use regular apply — no migration SQL file
+                    }
+                    DiffAction::Change(_) => {
+                        altered.push(d.entity_name.clone());
+                        let sql = diff::generate_migration_sql(std::slice::from_ref(d));
+                        if !sql.is_empty() {
+                            let path = entity_migration_path(&d.entity_name);
+                            migration_files.push(MigrationFile {
+                                relative_path: path,
+                                content: sql,
+                            });
+                        }
+                    }
+                    DiffAction::Drop => {
+                        dropped.push(d.entity_name.clone());
+                        let sql = diff::generate_migration_sql(std::slice::from_ref(d));
+                        if !sql.is_empty() {
+                            let path = entity_migration_path(&d.entity_name);
+                            migration_files.push(MigrationFile {
+                                relative_path: path,
+                                content: sql,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let graph = MigrationGraph {
+                from_version: prev.version,
+                to_version: next_version,
+                added,
+                altered,
+                dropped,
+            };
+
+            SnapshotResult {
+                snapshot,
+                diffs,
+                migration_files,
+                graph: Some(graph),
+                is_baseline: false,
+                no_changes: false,
+            }
+        }
+    }
+}
+
+/// Build a relative path for a per-entity migration SQL file.
+/// Entity name "config.users" → "config/users.sql"
+fn entity_migration_path(entity_name: &str) -> PathBuf {
+    let (schema, table) = crate::entity::split_qualified_name(entity_name);
+    match schema {
+        Some(s) => PathBuf::from(s).join(format!("{table}.sql")),
+        None => PathBuf::from(format!("{table}.sql")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +536,284 @@ mod tests {
     fn pending_migrations_empty_when_no_dir() {
         let tmp = TempDir::new().unwrap();
         assert!(pending_migrations(0, tmp.path()).is_empty());
+    }
+
+    // ── Helpers for entity-based tests ─────────────────────
+
+    use crate::entity::{Entity, EntityType, EnumValue, TableDef, TableComments};
+
+    fn col(name: &str, data_type: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            is_identity: false,
+            comment: None,
+            inline_fk: None,
+        }
+    }
+
+    fn make_table_entity(name: &str, columns: Vec<ColumnDef>) -> Entity {
+        let mut entity = Entity::new(EntityType::Table, name);
+        entity.table_def = Some(TableDef {
+            columns,
+            constraints: vec![],
+            indexes: vec![],
+            comments: TableComments::default(),
+        });
+        entity
+    }
+
+    fn make_enum_entity(name: &str, values: Vec<&str>) -> Entity {
+        let mut entity = Entity::new(EntityType::Enum, name);
+        entity.enum_values = values
+            .into_iter()
+            .map(|v| EnumValue {
+                name: v.to_string(),
+                note: None,
+            })
+            .collect();
+        entity
+    }
+
+    // ── SC1: First snapshot baseline ────────────────────────
+
+    #[test]
+    fn sc1_first_snapshot_is_baseline() {
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int"), col("name", "text")]),
+            make_table_entity("config.orders", vec![col("id", "int")]),
+            make_enum_entity("config.status", vec!["active", "inactive"]),
+        ];
+
+        let result = prepare_snapshot(&entities, None, 1, "initial");
+        assert!(result.is_baseline);
+        assert!(!result.no_changes);
+        assert!(result.diffs.is_empty());
+        assert!(result.migration_files.is_empty());
+        assert!(result.graph.is_none());
+        assert_eq!(result.snapshot.version, 1);
+        assert_eq!(result.snapshot.tables.len(), 2);
+        assert_eq!(result.snapshot.enums.len(), 1);
+    }
+
+    // ── SC2: Second snapshot with changes ───────────────────
+
+    #[test]
+    fn sc2_second_snapshot_with_changes() {
+        // Previous snapshot has one table with one column
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+
+        // New entities: same table with an added column
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int"), col("email", "text")]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add email");
+        assert!(!result.is_baseline);
+        assert!(!result.no_changes);
+        assert!(!result.diffs.is_empty());
+        assert!(!result.migration_files.is_empty());
+        let graph = result.graph.as_ref().unwrap();
+        assert_eq!(graph.from_version, 1);
+        assert_eq!(graph.to_version, 2);
+        assert!(graph.altered.contains(&"config.users".to_string()));
+    }
+
+    // ── SC3: No changes ─────────────────────────────────────
+
+    #[test]
+    fn sc3_no_changes_detected() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int")]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "no changes");
+        assert!(result.no_changes);
+        assert!(!result.is_baseline);
+        assert!(result.diffs.is_empty());
+        assert!(result.graph.is_none());
+    }
+
+    // ── SC4: New table added ────────────────────────────────
+
+    #[test]
+    fn sc4_new_table_added() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int")]),
+            make_table_entity("config.orders", vec![col("id", "int")]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add orders");
+        let graph = result.graph.as_ref().unwrap();
+        assert!(graph.added.contains(&"config.orders".to_string()));
+        // Added tables don't generate migration SQL files
+        assert!(
+            result.migration_files.iter().all(|f| {
+                !f.relative_path.to_string_lossy().contains("orders")
+            }),
+            "added tables should not produce migration SQL files"
+        );
+    }
+
+    // ── SC5: Dropped table ──────────────────────────────────
+
+    #[test]
+    fn sc5_dropped_table() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![
+                TableSnapshot {
+                    name: "users".to_string(),
+                    schema: "config".to_string(),
+                    columns: vec![col("id", "int")],
+                    indexes: vec![],
+                    table_constraints: vec![],
+                },
+                TableSnapshot {
+                    name: "legacy".to_string(),
+                    schema: "config".to_string(),
+                    columns: vec![col("id", "int")],
+                    indexes: vec![],
+                    table_constraints: vec![],
+                },
+            ],
+            enums: vec![],
+        };
+
+        // Only users remains
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "int")]),
+        ];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "drop legacy");
+        let graph = result.graph.as_ref().unwrap();
+        assert!(graph.dropped.contains(&"config.legacy".to_string()));
+        // Should have a migration file with DROP TABLE
+        let drop_file = result.migration_files.iter().find(|f| {
+            f.relative_path.to_string_lossy().contains("legacy")
+        });
+        assert!(drop_file.is_some(), "dropped table should have migration SQL");
+        assert!(drop_file.unwrap().content.contains("DROP TABLE"));
+    }
+
+    // ── SC7: Entity to TableSnapshot conversion ─────────────
+
+    #[test]
+    fn sc7_entity_to_table_snapshot_includes_all_fields() {
+        let mut entity = make_table_entity("config.users", vec![col("id", "int")]);
+        entity.table_def.as_mut().unwrap().constraints.push(
+            crate::entity::TableConstraint::PrimaryKey {
+                name: Some("pk_users".to_string()),
+                columns: vec!["id".to_string()],
+            },
+        );
+        entity.table_def.as_mut().unwrap().indexes.push(
+            crate::entity::IndexDef {
+                name: Some("idx_id".to_string()),
+                columns: vec![crate::entity::IndexColumn {
+                    name: "id".to_string(),
+                    order: None,
+                }],
+                unique: false,
+                index_type: None,
+            },
+        );
+
+        let snap = entity_to_table_snapshot(&entity).unwrap();
+        assert_eq!(snap.name, "users");
+        assert_eq!(snap.schema, "config");
+        assert_eq!(snap.columns.len(), 1);
+        assert_eq!(snap.columns[0].name, "id");
+        assert_eq!(snap.table_constraints.len(), 1);
+        assert_eq!(snap.indexes.len(), 1);
+    }
+
+    // ── SC8: Entity to EnumSnapshot conversion ──────────────
+
+    #[test]
+    fn sc8_entity_to_enum_snapshot() {
+        let entity = make_enum_entity("config.status", vec!["active", "inactive", "pending"]);
+        let snap = entity_to_enum_snapshot(&entity);
+        assert_eq!(snap.name, "status");
+        assert_eq!(snap.schema, "config");
+        assert_eq!(snap.values, vec!["active", "inactive", "pending"]);
+    }
+
+    // ── SC9: Snapshot serialization round-trip ───────────────
+
+    #[test]
+    fn sc9_snapshot_serialization_round_trip() {
+        let snapshot = Snapshot {
+            version: 1,
+            description: "test".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![EnumSnapshot {
+                name: "status".to_string(),
+                schema: "config".to_string(),
+                values: vec!["active".to_string()],
+            }],
+        };
+
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        let deserialized: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.version, 1);
+        assert_eq!(deserialized.tables.len(), 1);
+        assert_eq!(deserialized.tables[0].name, "users");
+        assert_eq!(deserialized.enums.len(), 1);
+        assert_eq!(deserialized.enums[0].name, "status");
     }
 
     #[test]
