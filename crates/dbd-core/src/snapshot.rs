@@ -381,6 +381,58 @@ fn entity_migration_path(entity_name: &str) -> PathBuf {
     }
 }
 
+// ── Snapshot I/O: create_snapshot ───────────────────────
+
+/// Create a snapshot from entities, writing all files to disk.
+///
+/// This is the thin I/O wrapper around `prepare_snapshot`.
+pub fn create_snapshot(
+    entities: &[Entity],
+    project_dir: &Path,
+    config_path: &Path,
+    description: &str,
+) -> Result<SnapshotResult> {
+    let previous = latest_snapshot(project_dir)?;
+    let version = next_version(project_dir);
+
+    let result = prepare_snapshot(entities, previous.as_ref(), version, description);
+
+    if result.no_changes {
+        return Ok(result);
+    }
+
+    // Write snapshot file
+    let snapshots_dir = project_dir.join(SNAPSHOTS_DIR);
+    std::fs::create_dir_all(&snapshots_dir)?;
+    let snapshot_file = snapshots_dir.join(format!("{}.json", pad_version(version)));
+    let snapshot_json = serde_json::to_string_pretty(&result.snapshot)?;
+    std::fs::write(&snapshot_file, snapshot_json)?;
+
+    // Write migration graph and SQL files
+    if let Some(ref graph) = result.graph {
+        let migration_dir = project_dir
+            .join(MIGRATIONS_DIR)
+            .join(pad_version(version));
+        std::fs::create_dir_all(&migration_dir)?;
+
+        let graph_json = serde_json::to_string_pretty(graph)?;
+        std::fs::write(migration_dir.join("graph.json"), graph_json)?;
+
+        for file in &result.migration_files {
+            let full_path = migration_dir.join(&file.relative_path);
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&full_path, &file.content)?;
+        }
+    }
+
+    // Update config version
+    crate::config::update_version(config_path, version)?;
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +866,37 @@ mod tests {
         assert_eq!(deserialized.tables[0].name, "users");
         assert_eq!(deserialized.enums.len(), 1);
         assert_eq!(deserialized.enums[0].name, "status");
+    }
+
+    // ── SC10: create_snapshot I/O integration ────────────
+
+    #[test]
+    fn sc10_create_snapshot_writes_files() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("design.yaml");
+        fs::write(&config_path, "project:\n  name: test\ntarget: {}\n").unwrap();
+
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "BIGINT")]),
+        ];
+
+        // First snapshot — baseline
+        let result = create_snapshot(&entities, tmp.path(), &config_path, "initial").unwrap();
+        assert!(result.is_baseline);
+        assert!(tmp.path().join("snapshots/001.json").exists());
+
+        // Verify design.yaml updated
+        let config_content = fs::read_to_string(&config_path).unwrap();
+        assert!(config_content.contains("1"));
+
+        // Second snapshot with changes
+        let entities_v2 = vec![
+            make_table_entity("config.users", vec![col("id", "BIGINT"), col("email", "TEXT")]),
+        ];
+        let result2 = create_snapshot(&entities_v2, tmp.path(), &config_path, "add email").unwrap();
+        assert!(!result2.no_changes);
+        assert!(tmp.path().join("snapshots/002.json").exists());
+        assert!(tmp.path().join("migrations/002/graph.json").exists());
     }
 
     #[test]
