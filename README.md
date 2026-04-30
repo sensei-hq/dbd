@@ -82,12 +82,12 @@ myproject/
 
 ## Targets
 
-| Target | Adapter | How it applies |
-|--------|---------|----------------|
-| PostgreSQL | `sqlx` | Executes SQL, COPY streaming for data |
-| Supabase | `sqlx` | PostgreSQL + filters managed infrastructure |
-| SQLite | `rusqlite` | Subset features, no schemas/extensions/roles |
-| Convex | File generation | Generates `convex/schema.ts` from SQL DDL |
+| Target | Adapter | Status |
+|--------|---------|--------|
+| PostgreSQL | `sqlx` | Working — executes SQL, COPY streaming for data |
+| Supabase | `sqlx` | Planned — PostgreSQL + managed infrastructure filtering |
+| SQLite | `rusqlite` | Planned — subset features |
+| Convex | File generation | Planned — generates TypeScript schema |
 
 ## Deploy from GitHub
 

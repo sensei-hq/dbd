@@ -116,40 +116,38 @@ fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>,
         }
     }
 
-    if !verbosity.is_silent() {
-        if !report.issues.is_empty() {
-            output::always("Errors:");
-            for entity in &report.issues {
-                let label = entity
-                    .file
-                    .as_ref()
-                    .map(|f| f.display().to_string())
-                    .unwrap_or_else(|| entity.name.clone());
-                output::always(&format!("\n{label} =>"));
-                for err in &entity.errors {
-                    output::always(&format!("  {err}"));
-                }
+    if !report.issues.is_empty() {
+        output::always("Errors:");
+        for entity in &report.issues {
+            let label = entity
+                .file
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_else(|| entity.name.clone());
+            output::always(&format!("\n{label} =>"));
+            for err in &entity.errors {
+                output::always(&format!("  {err}"));
             }
         }
+    }
 
-        if !report.warnings.is_empty() {
-            output::always("\nWarnings:");
-            for entity in &report.warnings {
-                let label = entity
-                    .file
-                    .as_ref()
-                    .map(|f| f.display().to_string())
-                    .unwrap_or_else(|| entity.name.clone());
-                output::always(&format!("\n{label} =>"));
-                for warn in &entity.warnings {
-                    output::always(&format!("  {warn}"));
-                }
+    if !report.warnings.is_empty() {
+        output::always("\nWarnings:");
+        for entity in &report.warnings {
+            let label = entity
+                .file
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_else(|| entity.name.clone());
+            output::always(&format!("\n{label} =>"));
+            for warn in &entity.warnings {
+                output::always(&format!("  {warn}"));
             }
         }
+    }
 
-        if report.issues.is_empty() && report.warnings.is_empty() {
-            output::info(verbosity, "Everything looks ok");
-        }
+    if report.issues.is_empty() && report.warnings.is_empty() {
+        output::info(verbosity, "Everything looks ok");
     }
 
     output::summary(report.issues.len(), report.warnings.len(), total_entities);
@@ -354,9 +352,7 @@ fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
         );
     }
 
-    if verbosity.is_silent() {
-        output::always(&format!("{} snapshots", snapshots.len()));
-    }
+
 }
 
 fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
@@ -391,11 +387,9 @@ fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
         return Ok(());
     }
 
-    if !verbosity.is_silent() {
-        output::always(&format!("Found {} config issue{}:", issues.len(), if issues.len() != 1 { "s" } else { "" }));
-        for issue in &issues {
-            output::always(&format!("  - {issue}"));
-        }
+    output::always(&format!("Found {} config issue{}:", issues.len(), if issues.len() != 1 { "s" } else { "" }));
+    for issue in &issues {
+        output::always(&format!("  - {issue}"));
     }
 
     if fix {

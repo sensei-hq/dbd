@@ -30,10 +30,6 @@ pub struct Cli {
     /// Verbose output (show all details)
     #[arg(short, long, global = true)]
     pub verbose: bool,
-
-    /// Silent mode (only show success/failure counts)
-    #[arg(long, global = true)]
-    pub silent: bool,
 }
 
 #[derive(Subcommand)]

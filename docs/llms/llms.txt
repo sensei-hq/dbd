@@ -64,7 +64,7 @@ ignore: [bfs, my_company.*]
 ## Architecture
 
 - Parser: sqlparser-rs (pure Rust, multi-dialect)
-- Adapters: PostgreSQL (sqlx), Supabase (sqlx + filtering), SQLite (rusqlite), Convex (TypeScript generation)
+- Adapters: PostgreSQL (sqlx) — Supabase, SQLite, Convex planned
 - Classification: adapter-owned — each adapter queries its target catalog for builtins/extensions
 - Parallel parsing: rayon for CPU-bound file parse, tokio for async DB operations
 - Library-first: `dbd-core` crate for embedding, `dbd-cli` for the binary

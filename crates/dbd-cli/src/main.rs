@@ -9,10 +9,9 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() {
     let args = cli::Cli::parse();
-    let verbosity = Verbosity::from_flags(args.verbose, args.silent);
+    let verbosity = Verbosity::from_flag(args.verbose);
 
     // --source defines the project root. Everything is relative to it.
-    // Default: current directory.
     let project_dir = PathBuf::from(&args.source);
 
     // Config file is always inside the project directory.

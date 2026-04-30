@@ -3,25 +3,17 @@
 pub enum Verbosity {
     /// Show all details (entity names, SQL, full JSON)
     Verbose,
-    /// Normal output (errors, warnings, progress)
+    /// Normal output (errors, warnings, progress, summary)
     Normal,
-    /// Only show success/failure counts
-    Silent,
 }
 
 impl Verbosity {
-    pub fn from_flags(verbose: bool, silent: bool) -> Self {
-        if silent {
-            Self::Silent
-        } else if verbose {
+    pub fn from_flag(verbose: bool) -> Self {
+        if verbose {
             Self::Verbose
         } else {
             Self::Normal
         }
-    }
-
-    pub fn is_silent(self) -> bool {
-        self == Self::Silent
     }
 
     pub fn is_verbose(self) -> bool {
@@ -29,11 +21,10 @@ impl Verbosity {
     }
 }
 
-/// Print a line unless in silent mode.
+/// Print a line (normal + verbose).
 pub fn info(verbosity: Verbosity, msg: &str) {
-    if !verbosity.is_silent() {
-        println!("{msg}");
-    }
+    let _ = verbosity; // Always print in both modes
+    println!("{msg}");
 }
 
 /// Print detail only in verbose mode.
@@ -43,7 +34,7 @@ pub fn detail(verbosity: Verbosity, msg: &str) {
     }
 }
 
-/// Always print (errors, final counts).
+/// Always print (errors, JSON output, final counts).
 pub fn always(msg: &str) {
     println!("{msg}");
 }
