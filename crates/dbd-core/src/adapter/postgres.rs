@@ -402,18 +402,20 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn get_db_version(&self) -> Result<u32> {
+        // Read from _dbd_meta (authoritative version source)
         let result = sqlx::query(
-            "SELECT COALESCE(MAX(version), 0) as version FROM _dbd_migrations WHERE project = $1"
+            "SELECT version FROM _dbd_meta WHERE project = $1"
         )
         .bind(&self.project)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await;
 
         match result {
-            Ok(row) => {
+            Ok(Some(row)) => {
                 let version: i32 = row.get("version");
                 Ok(version as u32)
             }
+            Ok(None) => Ok(0),
             Err(_) => Ok(0), // Table doesn't exist yet
         }
     }
@@ -467,7 +469,7 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
         let result = sqlx::query(
-            "SELECT project, env, version FROM _dbd_meta WHERE project = $1"
+            "SELECT project, env, version, updated_at::text as applied_at FROM _dbd_meta WHERE project = $1"
         )
         .bind(&self.project)
         .fetch_optional(&self.pool)
@@ -478,6 +480,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 project: row.get("project"),
                 env: row.get("env"),
                 version: row.get::<i32, _>("version") as u32,
+                applied_at: row.try_get("applied_at").ok(),
             })),
             Ok(None) => Ok(None),
             Err(_) => Ok(None), // Table doesn't exist yet

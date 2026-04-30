@@ -22,6 +22,7 @@ pub struct ProjectMeta {
     pub project: String,
     pub env: String,
     pub version: u32,
+    pub applied_at: Option<String>,
 }
 
 /// The database adapter trait — each target implements this.

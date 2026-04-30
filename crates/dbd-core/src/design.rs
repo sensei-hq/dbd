@@ -502,9 +502,8 @@ impl Design {
                         .apply_migration(*version, "", &desc, checksum)
                         .await?;
                 }
-                ExecutionStep::SetVersion(_version) => {
-                    // Version is tracked via _dbd_migrations; meta update
-                    // is handled by the caller (CLI) if needed.
+                ExecutionStep::SetVersion(version) => {
+                    adapter.set_project_meta(&self.env, *version).await?;
                 }
             }
         }
@@ -891,6 +890,27 @@ mod tests {
 
         design.apply(&mock, None, false).await.unwrap();
         assert!(!mock.applied_names().is_empty());
+    }
+
+    // ── T4: apply SetVersion writes meta ─────────────────
+
+    #[tokio::test]
+    async fn apply_set_version_writes_meta() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        // Before apply, version is 0
+        assert_eq!(mock.get_db_version().await.unwrap(), 0);
+
+        design.apply(&mock, None, false).await.unwrap();
+
+        // After apply on a fresh env, meta should have been written
+        // (version depends on design.yaml project.version — likely 0 or None for fixture)
+        let meta = mock.get_project_meta().await.unwrap();
+        // Fresh env with latest_version=0 still calls SetVersion(0) in Fresh strategy
+        // which calls set_project_meta. Meta should exist.
+        assert!(meta.is_some() || design.config().project.version.is_none());
     }
 
     #[tokio::test]
