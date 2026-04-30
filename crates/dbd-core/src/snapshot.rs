@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-use crate::diff::{self, DiffAction, MigrationDiff};
+use crate::diff::{self, ComplexChange, DiffAction, MigrationDiff};
 use crate::entity::{ColumnDef, Entity, EntityType, IndexDef, TableConstraint};
 use crate::error::Result;
 
@@ -259,6 +259,18 @@ pub struct MigrationFile {
     pub content: String,
 }
 
+/// The result of a multi-snapshot preparation that may span multiple versions.
+pub struct MultiSnapshotResult {
+    pub snapshots: Vec<SnapshotResult>,
+    pub todos: Vec<TodoItem>,
+}
+
+/// A TODO item for the developer to address (e.g., data correction).
+pub struct TodoItem {
+    pub file: PathBuf,
+    pub message: String,
+}
+
 /// Prepare a snapshot from entities, optionally diffing against a previous snapshot.
 ///
 /// This is pure logic — no I/O. The caller is responsible for writing files.
@@ -388,55 +400,645 @@ fn entity_migration_path(entity_name: &str) -> PathBuf {
     }
 }
 
+/// Build a relative path for a per-entity data migration SQL file.
+/// Entity name "config.users" → "config/users.data.sql"
+fn entity_data_migration_path(entity_name: &str) -> PathBuf {
+    let (schema, table) = crate::entity::split_qualified_name(entity_name);
+    match schema {
+        Some(s) => PathBuf::from(s).join(format!("{table}.data.sql")),
+        None => PathBuf::from(format!("{table}.data.sql")),
+    }
+}
+
+// ── Multi-snapshot preparation ─────────────────────────
+
+/// Prepare a multi-snapshot result from entities, potentially splitting complex
+/// changes across multiple migration stages.
+///
+/// This is pure logic — no I/O. The caller is responsible for writing files.
+pub fn prepare_multi_snapshot(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+) -> MultiSnapshotResult {
+    // Build the final desired snapshot from entities
+    let final_tables: Vec<TableSnapshot> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
+        .filter_map(entity_to_table_snapshot)
+        .collect();
+
+    let final_enums: Vec<EnumSnapshot> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Enum)
+        .map(entity_to_enum_snapshot)
+        .collect();
+
+    let final_snapshot = Snapshot {
+        version: next_version,
+        description: description.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        tables: final_tables,
+        enums: final_enums,
+    };
+
+    // No previous → baseline
+    let Some(prev) = previous else {
+        return MultiSnapshotResult {
+            snapshots: vec![SnapshotResult {
+                snapshot: final_snapshot,
+                diffs: vec![],
+                migration_files: vec![],
+                graph: None,
+                warnings: vec![],
+                is_baseline: true,
+                no_changes: false,
+            }],
+            todos: vec![],
+        };
+    };
+
+    // Diff previous vs final
+    let diffs = diff::diff(prev, &final_snapshot);
+
+    if diffs.is_empty() {
+        return MultiSnapshotResult {
+            snapshots: vec![SnapshotResult {
+                snapshot: final_snapshot,
+                diffs: vec![],
+                migration_files: vec![],
+                graph: None,
+                warnings: vec![],
+                is_baseline: false,
+                no_changes: true,
+            }],
+            todos: vec![],
+        };
+    }
+
+    // Classify into simple and complex
+    let (simple_diffs, complex_changes) = diff::classify_changes(&diffs, prev);
+
+    // No complex → delegate to existing prepare_snapshot (single stage)
+    if complex_changes.is_empty() {
+        let result = prepare_snapshot(entities, Some(prev), next_version, description);
+        return MultiSnapshotResult {
+            snapshots: vec![result],
+            todos: vec![],
+        };
+    }
+
+    // Determine number of stages
+    let has_enum_removal = complex_changes
+        .iter()
+        .any(|c| matches!(c, ComplexChange::EnumValueRemoval { .. }));
+    let num_stages = if has_enum_removal { 3 } else { 2 };
+
+    let mut snapshots = Vec::new();
+    let mut todos = Vec::new();
+
+    // ── Stage 1 ───────────────────────────────────────────
+    let mut stage1_snap = prev.clone();
+    stage1_snap.version = next_version;
+    stage1_snap.description = format!("{description} (stage 1/{num_stages})");
+    stage1_snap.timestamp = chrono::Utc::now().to_rfc3339();
+
+    let mut stage1_files = Vec::new();
+    let mut stage1_added = Vec::new();
+    let mut stage1_altered = Vec::new();
+    let mut stage1_dropped = Vec::new();
+
+    // Apply simple diffs to stage1 snapshot
+    for d in &simple_diffs {
+        match &d.action {
+            DiffAction::Add => {
+                stage1_added.push(d.entity_name.clone());
+                // Add new tables/enums to snapshot
+                if d.entity_type == EntityType::Table {
+                    if let Some(t) = final_snapshot
+                        .tables
+                        .iter()
+                        .find(|t| format!("{}.{}", t.schema, t.name) == d.entity_name)
+                    {
+                        stage1_snap.tables.push(t.clone());
+                    }
+                } else if d.entity_type == EntityType::Enum
+                    && let Some(e) = final_snapshot
+                        .enums
+                        .iter()
+                        .find(|e| format!("{}.{}", e.schema, e.name) == d.entity_name)
+                {
+                    stage1_snap.enums.push(e.clone());
+                }
+            }
+            DiffAction::Drop => {
+                stage1_dropped.push(d.entity_name.clone());
+                let sql = diff::generate_migration_sql(std::slice::from_ref(d));
+                if !sql.is_empty() {
+                    stage1_files.push(MigrationFile {
+                        relative_path: entity_migration_path(&d.entity_name),
+                        content: sql,
+                    });
+                }
+                // Remove from snapshot
+                if d.entity_type == EntityType::Table {
+                    stage1_snap
+                        .tables
+                        .retain(|t| format!("{}.{}", t.schema, t.name) != d.entity_name);
+                } else if d.entity_type == EntityType::Enum {
+                    stage1_snap
+                        .enums
+                        .retain(|e| format!("{}.{}", e.schema, e.name) != d.entity_name);
+                }
+            }
+            DiffAction::Change(_) => {
+                stage1_altered.push(d.entity_name.clone());
+                let sql = diff::generate_migration_sql(std::slice::from_ref(d));
+                if !sql.is_empty() {
+                    stage1_files.push(MigrationFile {
+                        relative_path: entity_migration_path(&d.entity_name),
+                        content: sql,
+                    });
+                }
+                // Update snapshot table with simple changes from final
+                if d.entity_type == EntityType::Table
+                    && let Some(final_t) = final_snapshot
+                        .tables
+                        .iter()
+                        .find(|t| format!("{}.{}", t.schema, t.name) == d.entity_name)
+                    && let Some(snap_t) = stage1_snap
+                        .tables
+                        .iter_mut()
+                        .find(|t| format!("{}.{}", t.schema, t.name) == d.entity_name)
+                {
+                    // Apply simple column/constraint/index changes from final
+                    *snap_t = final_t.clone();
+                } else if d.entity_type == EntityType::Enum
+                    && let Some(final_e) = final_snapshot
+                        .enums
+                        .iter()
+                        .find(|e| format!("{}.{}", e.schema, e.name) == d.entity_name)
+                    && let Some(snap_e) = stage1_snap
+                        .enums
+                        .iter_mut()
+                        .find(|e| format!("{}.{}", e.schema, e.name) == d.entity_name)
+                {
+                    *snap_e = final_e.clone();
+                }
+            }
+        }
+    }
+
+    // Apply complex step 1
+    for change in &complex_changes {
+        match change {
+            ComplexChange::ColumnRename {
+                table_name,
+                new_name,
+                col_def,
+                ..
+            }
+            | ComplexChange::ColumnTypeChange {
+                table_name,
+                new_col: col_def,
+                column_name: new_name,
+                ..
+            } => {
+                // Add new column to table snapshot
+                if let Some(snap_t) = stage1_snap
+                    .tables
+                    .iter_mut()
+                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                {
+                    // For ColumnTypeChange, new_name is actually column_name and
+                    // col_def is new_col; we need to add the new column definition.
+                    // For ColumnRename, col_def has the new name already.
+                    let mut new_col_def = col_def.as_ref().clone();
+                    if let ComplexChange::ColumnTypeChange { .. } = change {
+                        // The new column gets a temp name: column_name_new
+                        new_col_def.name = format!("{new_name}_new");
+                    }
+                    snap_t.columns.push(new_col_def);
+                }
+
+                if !stage1_altered.contains(table_name) {
+                    stage1_altered.push(table_name.clone());
+                }
+
+                // Generate ADD COLUMN SQL
+                let add_col_sql = match change {
+                    ComplexChange::ColumnRename { col_def, new_name, .. } => {
+                        format!(
+                            "ALTER TABLE {} ADD COLUMN {} {};",
+                            table_name, new_name, col_def.data_type
+                        )
+                    }
+                    ComplexChange::ColumnTypeChange { new_col, column_name, .. } => {
+                        format!(
+                            "ALTER TABLE {} ADD COLUMN {}_new {};",
+                            table_name, column_name, new_col.data_type
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Append or create migration file for this table
+                let path = entity_migration_path(table_name);
+                if let Some(existing) = stage1_files
+                    .iter_mut()
+                    .find(|f| f.relative_path == path)
+                {
+                    existing.content.push('\n');
+                    existing.content.push_str(&add_col_sql);
+                } else {
+                    stage1_files.push(MigrationFile {
+                        relative_path: path,
+                        content: add_col_sql,
+                    });
+                }
+
+                // Generate data.sql
+                let data_sql = diff::generate_data_sql(change);
+                let data_path = entity_data_migration_path(table_name);
+                stage1_files.push(MigrationFile {
+                    relative_path: data_path.clone(),
+                    content: data_sql,
+                });
+
+                todos.push(TodoItem {
+                    file: data_path,
+                    message: format!(
+                        "Review data migration SQL for {}",
+                        table_name
+                    ),
+                });
+            }
+            ComplexChange::EnumValueRemoval {
+                enum_name,
+                affected_columns,
+                ..
+            } => {
+                // No schema change in stage 1 for enum removal
+                // Generate data.sql for affected tables
+                let data_sql = diff::generate_data_sql(change);
+                // Use the first affected table for the data path, or the enum name
+                let data_entity = if let Some((table, _)) = affected_columns.first() {
+                    table.as_str()
+                } else {
+                    enum_name.as_str()
+                };
+                let data_path = entity_data_migration_path(data_entity);
+                stage1_files.push(MigrationFile {
+                    relative_path: data_path.clone(),
+                    content: data_sql,
+                });
+
+                todos.push(TodoItem {
+                    file: data_path,
+                    message: format!(
+                        "Review data migration SQL for enum value removal in {}",
+                        enum_name
+                    ),
+                });
+            }
+        }
+    }
+
+    let stage1_graph = MigrationGraph {
+        from_version: prev.version,
+        to_version: next_version,
+        added: stage1_added,
+        altered: stage1_altered,
+        dropped: stage1_dropped,
+    };
+
+    let stage1_warnings = diff::migration_warnings(&diffs);
+
+    snapshots.push(SnapshotResult {
+        snapshot: stage1_snap.clone(),
+        diffs: diffs.clone(),
+        migration_files: stage1_files,
+        graph: Some(stage1_graph),
+        warnings: stage1_warnings,
+        is_baseline: false,
+        no_changes: false,
+    });
+
+    // ── Stage 2 ───────────────────────────────────────────
+    let mut stage2_snap = stage1_snap;
+    stage2_snap.version = next_version + 1;
+    stage2_snap.description = format!("{description} (stage 2/{num_stages})");
+    stage2_snap.timestamp = chrono::Utc::now().to_rfc3339();
+
+    let mut stage2_files: Vec<MigrationFile> = Vec::new();
+    let mut stage2_altered: Vec<String> = Vec::new();
+    let mut stage2_dropped = Vec::new();
+
+    for change in &complex_changes {
+        match change {
+            ComplexChange::ColumnRename {
+                table_name,
+                old_name,
+                ..
+            } => {
+                // Drop old column from snapshot
+                if let Some(snap_t) = stage2_snap
+                    .tables
+                    .iter_mut()
+                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                {
+                    snap_t.columns.retain(|c| c.name != *old_name);
+                }
+
+                let sql = format!(
+                    "ALTER TABLE {} DROP COLUMN {};",
+                    table_name, old_name
+                );
+                let path = entity_migration_path(table_name);
+                if let Some(existing) = stage2_files
+                    .iter_mut()
+                    .find(|f| f.relative_path == path)
+                {
+                    existing.content.push('\n');
+                    existing.content.push_str(&sql);
+                } else {
+                    stage2_files.push(MigrationFile {
+                        relative_path: path,
+                        content: sql,
+                    });
+                }
+
+                if !stage2_altered.contains(table_name) {
+                    stage2_altered.push(table_name.clone());
+                }
+            }
+            ComplexChange::ColumnTypeChange {
+                table_name,
+                column_name,
+                old_col,
+                new_col,
+                ..
+            } => {
+                // Drop old column and rename new column in snapshot
+                if let Some(snap_t) = stage2_snap
+                    .tables
+                    .iter_mut()
+                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                {
+                    snap_t.columns.retain(|c| c.name != *column_name);
+                    // Rename temp column to original name
+                    let temp_name = format!("{column_name}_new");
+                    if let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == temp_name) {
+                        col.name = new_col.name.clone();
+                    }
+                }
+
+                let sql = format!(
+                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {}_new TO {};",
+                    table_name, old_col.name, table_name, column_name, column_name
+                );
+                let path = entity_migration_path(table_name);
+                if let Some(existing) = stage2_files
+                    .iter_mut()
+                    .find(|f| f.relative_path == path)
+                {
+                    existing.content.push('\n');
+                    existing.content.push_str(&sql);
+                } else {
+                    stage2_files.push(MigrationFile {
+                        relative_path: path,
+                        content: sql,
+                    });
+                }
+
+                if !stage2_altered.contains(table_name) {
+                    stage2_altered.push(table_name.clone());
+                }
+            }
+            ComplexChange::EnumValueRemoval {
+                enum_name,
+                affected_columns,
+                ..
+            } => {
+                // Change affected columns' data_type to TEXT
+                for (table_name, col_name) in affected_columns {
+                    if let Some(snap_t) = stage2_snap
+                        .tables
+                        .iter_mut()
+                        .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                        && let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == *col_name)
+                    {
+                        col.data_type = "TEXT".to_string();
+                    }
+
+                    let sql = format!(
+                        "ALTER TABLE {} ALTER COLUMN {} TYPE TEXT;",
+                        table_name, col_name
+                    );
+                    let path = entity_migration_path(table_name);
+                    if let Some(existing) = stage2_files
+                        .iter_mut()
+                        .find(|f| f.relative_path == path)
+                    {
+                        existing.content.push('\n');
+                        existing.content.push_str(&sql);
+                    } else {
+                        stage2_files.push(MigrationFile {
+                            relative_path: path,
+                            content: sql,
+                        });
+                    }
+
+                    if !stage2_altered.contains(table_name) {
+                        stage2_altered.push(table_name.clone());
+                    }
+                }
+
+                // Remove enum from snapshot
+                stage2_snap
+                    .enums
+                    .retain(|e| format!("{}.{}", e.schema, e.name) != *enum_name);
+
+                // Generate DROP TYPE SQL
+                let drop_sql = format!("DROP TYPE {};", enum_name);
+                let path = entity_migration_path(enum_name);
+                if let Some(existing) = stage2_files
+                    .iter_mut()
+                    .find(|f| f.relative_path == path)
+                {
+                    existing.content.push('\n');
+                    existing.content.push_str(&drop_sql);
+                } else {
+                    stage2_files.push(MigrationFile {
+                        relative_path: path,
+                        content: drop_sql,
+                    });
+                }
+
+                if !stage2_dropped.contains(enum_name) {
+                    stage2_dropped.push(enum_name.clone());
+                }
+            }
+        }
+    }
+
+    let stage2_graph = MigrationGraph {
+        from_version: next_version,
+        to_version: next_version + 1,
+        added: vec![],
+        altered: stage2_altered,
+        dropped: stage2_dropped,
+    };
+
+    snapshots.push(SnapshotResult {
+        snapshot: stage2_snap.clone(),
+        diffs: vec![],
+        migration_files: stage2_files,
+        graph: Some(stage2_graph),
+        warnings: vec![],
+        is_baseline: false,
+        no_changes: false,
+    });
+
+    // ── Stage 3 (only for enum removal) ───────────────────
+    if has_enum_removal {
+        let mut stage3_snap = final_snapshot;
+        stage3_snap.version = next_version + 2;
+        stage3_snap.description = format!("{description} (stage 3/{num_stages})");
+        stage3_snap.timestamp = chrono::Utc::now().to_rfc3339();
+
+        let mut stage3_files = Vec::new();
+        let mut stage3_added = Vec::new();
+        let mut stage3_altered = Vec::new();
+
+        for change in &complex_changes {
+            if let ComplexChange::EnumValueRemoval {
+                enum_name,
+                remaining_values,
+                affected_columns,
+                ..
+            } = change
+            {
+                // Generate CREATE TYPE SQL with remaining values
+                let values_sql: Vec<String> =
+                    remaining_values.iter().map(|v| format!("'{v}'")).collect();
+                let create_sql = format!(
+                    "CREATE TYPE {} AS ENUM ({});",
+                    enum_name,
+                    values_sql.join(", ")
+                );
+                let path = entity_migration_path(enum_name);
+                stage3_files.push(MigrationFile {
+                    relative_path: path,
+                    content: create_sql,
+                });
+
+                stage3_added.push(enum_name.clone());
+
+                // Generate ALTER COLUMN TYPE enum_name USING for affected columns
+                for (table_name, col_name) in affected_columns {
+                    let alter_sql = format!(
+                        "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+                        table_name, col_name, enum_name, col_name, enum_name
+                    );
+                    let tbl_path = entity_migration_path(table_name);
+                    if let Some(existing) = stage3_files
+                        .iter_mut()
+                        .find(|f| f.relative_path == tbl_path)
+                    {
+                        existing.content.push('\n');
+                        existing.content.push_str(&alter_sql);
+                    } else {
+                        stage3_files.push(MigrationFile {
+                            relative_path: tbl_path,
+                            content: alter_sql,
+                        });
+                    }
+
+                    if !stage3_altered.contains(table_name) {
+                        stage3_altered.push(table_name.clone());
+                    }
+                }
+            }
+        }
+
+        let stage3_graph = MigrationGraph {
+            from_version: next_version + 1,
+            to_version: next_version + 2,
+            added: stage3_added,
+            altered: stage3_altered,
+            dropped: vec![],
+        };
+
+        snapshots.push(SnapshotResult {
+            snapshot: stage3_snap,
+            diffs: vec![],
+            migration_files: stage3_files,
+            graph: Some(stage3_graph),
+            warnings: vec![],
+            is_baseline: false,
+            no_changes: false,
+        });
+    }
+
+    MultiSnapshotResult { snapshots, todos }
+}
+
 // ── Snapshot I/O: create_snapshot ───────────────────────
 
 /// Create a snapshot from entities, writing all files to disk.
 ///
-/// This is the thin I/O wrapper around `prepare_snapshot`.
+/// This is the thin I/O wrapper around `prepare_multi_snapshot`.
 pub fn create_snapshot(
     entities: &[Entity],
     project_dir: &Path,
     config_path: &Path,
     description: &str,
-) -> Result<SnapshotResult> {
+) -> Result<MultiSnapshotResult> {
     let previous = latest_snapshot(project_dir)?;
-    let version = next_version(project_dir);
+    let base_version = next_version(project_dir);
+    let result = prepare_multi_snapshot(entities, previous.as_ref(), base_version, description);
 
-    let result = prepare_snapshot(entities, previous.as_ref(), version, description);
-
-    if result.no_changes {
+    // Check for no-changes
+    if result.snapshots.len() == 1 && result.snapshots[0].no_changes {
         return Ok(result);
     }
 
-    // Write snapshot file
     let snapshots_dir = project_dir.join(SNAPSHOTS_DIR);
     std::fs::create_dir_all(&snapshots_dir)?;
-    let snapshot_file = snapshots_dir.join(format!("{}.json", pad_version(version)));
-    let snapshot_json = serde_json::to_string_pretty(&result.snapshot)?;
-    std::fs::write(&snapshot_file, snapshot_json)?;
 
-    // Write migration graph and SQL files
-    if let Some(ref graph) = result.graph {
-        let migration_dir = project_dir
-            .join(MIGRATIONS_DIR)
-            .join(pad_version(version));
-        std::fs::create_dir_all(&migration_dir)?;
+    let mut final_version = base_version;
+    for snap_result in &result.snapshots {
+        if snap_result.no_changes {
+            continue;
+        }
+        let version = snap_result.snapshot.version;
+        final_version = version;
 
-        let graph_json = serde_json::to_string_pretty(graph)?;
-        std::fs::write(migration_dir.join("graph.json"), graph_json)?;
+        // Write snapshot JSON
+        let snap_file = snapshots_dir.join(format!("{}.json", pad_version(version)));
+        std::fs::write(&snap_file, serde_json::to_string_pretty(&snap_result.snapshot)?)?;
 
-        for file in &result.migration_files {
-            let full_path = migration_dir.join(&file.relative_path);
-            if let Some(parent) = full_path.parent() {
-                std::fs::create_dir_all(parent)?;
+        // Write migration files
+        if let Some(ref graph) = snap_result.graph {
+            let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(version));
+            std::fs::create_dir_all(&migration_dir)?;
+            std::fs::write(
+                migration_dir.join("graph.json"),
+                serde_json::to_string_pretty(graph)?,
+            )?;
+            for file in &snap_result.migration_files {
+                let full_path = migration_dir.join(&file.relative_path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&full_path, &file.content)?;
             }
-            std::fs::write(&full_path, &file.content)?;
         }
     }
 
-    // Update config version
-    crate::config::update_version(config_path, version)?;
-
+    crate::config::update_version(config_path, final_version)?;
     Ok(result)
 }
 
@@ -889,7 +1491,7 @@ mod tests {
 
         // First snapshot — baseline
         let result = create_snapshot(&entities, tmp.path(), &config_path, "initial").unwrap();
-        assert!(result.is_baseline);
+        assert!(result.snapshots[0].is_baseline);
         assert!(tmp.path().join("snapshots/001.json").exists());
 
         // Verify design.yaml updated
@@ -901,7 +1503,7 @@ mod tests {
             make_table_entity("config.users", vec![col("id", "BIGINT"), col("email", "TEXT")]),
         ];
         let result2 = create_snapshot(&entities_v2, tmp.path(), &config_path, "add email").unwrap();
-        assert!(!result2.no_changes);
+        assert!(!result2.snapshots[0].no_changes);
         assert!(tmp.path().join("snapshots/002.json").exists());
         assert!(tmp.path().join("migrations/002/graph.json").exists());
     }
@@ -1045,5 +1647,118 @@ mod tests {
         assert!(!result.diffs.is_empty());
         // All diffs should be enum-related
         assert!(result.diffs.iter().all(|d| d.entity_type == EntityType::Enum));
+    }
+
+    // ════════════════════════════════════════════════════════
+    // Multi-Snapshot Tests (B1-B3, S1-S2, baseline, no-changes)
+    // ════════════════════════════════════════════════════════
+
+    #[test]
+    fn b1_simple_only_one_snapshot() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT")], indexes: vec![], table_constraints: vec![] }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("email", "TEXT")])];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "add email");
+        assert_eq!(result.snapshots.len(), 1, "simple change should produce 1 snapshot");
+        assert!(result.todos.is_empty());
+    }
+
+    #[test]
+    fn b2_column_rename_two_snapshots() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
+        assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
+        // Stage 1 should have data.sql file
+        assert!(result.snapshots[0].migration_files.iter().any(|f|
+            f.relative_path.to_string_lossy().contains("data.sql")
+        ), "stage 1 should have data.sql for copy");
+    }
+
+    #[test]
+    fn b3_enum_removal_three_snapshots() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "events".to_string(), schema: "config".to_string(),
+                columns: vec![col("id", "INT"), ColumnDef { data_type: "public.status_type".to_string(), ..col("status", "public.status_type") }],
+                indexes: vec![], table_constraints: vec![],
+            }],
+            // Use short name to match entity_to_enum_snapshot output
+            enums: vec![EnumSnapshot { name: "status_type".to_string(), schema: "public".to_string(), values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()] }],
+        };
+        let entities = vec![
+            make_table_entity("config.events", vec![col("id", "INT"), ColumnDef { data_type: "public.status_type".to_string(), ..col("status", "public.status_type") }]),
+            make_enum_entity("public.status_type", vec!["active", "inactive"]),
+        ];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "remove deleted");
+        assert_eq!(result.snapshots.len(), 3, "enum removal should produce 3 snapshots");
+        assert!(!result.todos.is_empty(), "should have TODO items for enum mapping");
+    }
+
+    #[test]
+    fn s1_stage1_adds_new_column_for_rename() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
+        assert!(result.snapshots.len() >= 2);
+        // Stage 1 should have 3 columns: id, name, display_name
+        let stage1_table = result.snapshots[0].snapshot.tables.iter()
+            .find(|t| t.name == "users").expect("should have users table");
+        let col_names: Vec<&str> = stage1_table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(col_names.contains(&"id"), "should have id");
+        assert!(col_names.contains(&"name"), "should still have old name");
+        assert!(col_names.contains(&"display_name"), "should have new display_name");
+    }
+
+    #[test]
+    fn s2_stage2_drops_old_column_for_rename() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
+        assert!(result.snapshots.len() >= 2);
+        // Stage 2 should have 2 columns: id, display_name (no "name")
+        let stage2_table = result.snapshots[1].snapshot.tables.iter()
+            .find(|t| t.name == "users").expect("should have users table");
+        let col_names: Vec<&str> = stage2_table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(col_names.contains(&"id"));
+        assert!(col_names.contains(&"display_name"));
+        assert!(!col_names.contains(&"name"), "old name should be dropped in stage 2");
+    }
+
+    #[test]
+    fn b_baseline_returns_one_snapshot() {
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT")])];
+        let result = prepare_multi_snapshot(&entities, None, 1, "initial");
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(result.snapshots[0].is_baseline);
+    }
+
+    #[test]
+    fn b_no_changes_returns_one_snapshot() {
+        let prev = Snapshot {
+            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT")], indexes: vec![], table_constraints: vec![] }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT")])];
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "no change");
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(result.snapshots[0].no_changes);
     }
 }

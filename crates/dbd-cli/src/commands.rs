@@ -540,50 +540,53 @@ fn cmd_snapshot_create(
     let result = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config, desc)
         .context("Failed to create snapshot")?;
 
-    if result.no_changes {
+    // Single snapshot, no changes
+    if result.snapshots.len() == 1 && result.snapshots[0].no_changes {
         output::info(verbosity, "No schema changes detected — snapshot skipped.");
         return Ok(());
     }
 
-    if result.is_baseline {
-        output::info(
-            verbosity,
-            &format!(
-                "Baseline snapshot v{} created.",
-                dbd_core::snapshot::pad_version(result.snapshot.version)
-            ),
-        );
-    } else {
-        let graph = result.graph.as_ref();
-        let added = graph.map(|g| g.added.len()).unwrap_or(0);
-        let altered = graph.map(|g| g.altered.len()).unwrap_or(0);
-        let dropped = graph.map(|g| g.dropped.len()).unwrap_or(0);
-        output::info(
-            verbosity,
-            &format!(
-                "Snapshot v{} created — {} added, {} altered, {} dropped.",
-                dbd_core::snapshot::pad_version(result.snapshot.version),
-                added,
-                altered,
-                dropped,
-            ),
-        );
+    let total_stages = result.snapshots.len();
 
-        if !result.migration_files.is_empty() {
-            output::detail(
-                verbosity,
-                &format!("{} migration file(s) generated.", result.migration_files.len()),
-            );
+    for (i, snap) in result.snapshots.iter().enumerate() {
+        let version = dbd_core::snapshot::pad_version(snap.snapshot.version);
+
+        if snap.is_baseline {
+            output::info(verbosity, &format!("Baseline snapshot v{version} created."));
+            continue;
+        }
+
+        if total_stages == 1 {
+            let graph = snap.graph.as_ref();
+            let added = graph.map(|g| g.added.len()).unwrap_or(0);
+            let altered = graph.map(|g| g.altered.len()).unwrap_or(0);
+            let dropped = graph.map(|g| g.dropped.len()).unwrap_or(0);
+            output::info(verbosity, &format!(
+                "Snapshot v{version} created — {added} added, {altered} altered, {dropped} dropped."
+            ));
+        } else {
+            output::info(verbosity, &format!(
+                "\nSnapshot v{version} created (stage {} of {total_stages})", i + 1
+            ));
+        }
+
+        if !snap.migration_files.is_empty() {
+            for mf in &snap.migration_files {
+                output::detail(verbosity, &format!("  {}", mf.relative_path.display()));
+            }
         }
     }
 
-    // Print warnings for risky changes
-    if !result.warnings.is_empty() {
-        output::always("\nWarnings:");
-        for warning in &result.warnings {
-            output::always(&format!("  {warning}"));
+    // Print TODO items
+    if !result.todos.is_empty() {
+        output::always("\nAction required:");
+        for todo in &result.todos {
+            output::always(&format!("  {} — {}", todo.file.display(), todo.message));
         }
     }
+
+    let final_version = result.snapshots.last().map(|s| s.snapshot.version).unwrap_or(0);
+    output::info(verbosity, &format!("\ndesign.yaml version updated to {final_version}"));
 
     Ok(())
 }
