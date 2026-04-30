@@ -1,0 +1,796 @@
+# Snapshot, Schema Diff & Migration Design
+
+**Date:** 2026-04-30
+**Status:** Approved
+**Scope:** `dbd snapshot` (create), schema diff engine, `dbd apply` with migrations, `dbd migrate` command
+
+---
+
+## Overview
+
+Add versioned schema snapshots and incremental migration generation to dbd-rs. Snapshots capture the current DDL state as a versioned JSON file. Comparing consecutive snapshots produces a diff that generates ALTER/DROP SQL migration scripts. The `apply` command consumes these migrations to bring any environment up to date.
+
+## Data Flow
+
+```
+dbd snapshot:
+  DDL files -> parse -> entities -> Snapshot(N)
+  Snapshot(N-1) + Snapshot(N) -> diff -> Vec<MigrationDiff>
+  MigrationDiff -> SQL generation -> migrations/NNN/*.sql + graph.json
+  Update design.yaml version -> N
+
+dbd apply:
+  _dbd_meta version -> current_db_version
+  design.yaml version -> latest_version
+  Fresh env: apply all entities, mark latest_version
+  Behind: load pending migrations + entities ->
+    build combined dependency graph (added + altered + unchanged) ->
+    topological sort -> interleaved execute -> update _dbd_meta
+
+dbd migrate:
+  --status: show current vs latest, list pending
+  --apply: run migration pass only (no full entity apply)
+  --to N: limit to version N
+  --dry-run: print SQL with version headers, highlight drops
+```
+
+---
+
+## Module 1: Schema Diff Engine (`diff.rs`)
+
+### Types
+
+```rust
+/// Top-level diff for a single entity (table or enum).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MigrationDiff {
+    entity_name: String,       // "config.lookups"
+    entity_type: EntityType,   // Table, Enum
+    action: DiffAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum DiffAction {
+    Add,                       // new entity — no migration SQL needed
+    Drop,                      // generate DROP TABLE/TYPE
+    Change(Vec<FieldChange>),  // generate ALTER statements
+}
+
+/// A single field-level change within an entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FieldChange {
+    field_name: String,        // "email", "pk_users", "idx_email"
+    field_type: FieldType,     // Column, Constraint, Index, EnumValue
+    action: ChangeAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum FieldType {
+    Column,
+    Constraint,
+    Index,
+    EnumValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ChangeAction {
+    Add(FieldDetail),
+    Drop,
+    Alter { old: FieldDetail, new: FieldDetail },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum FieldDetail {
+    Column(ColumnDef),
+    Constraint(TableConstraint),
+    Index(IndexDef),
+    EnumValue(String),
+}
+```
+
+### Diff Logic
+
+`diff(old: &Snapshot, new: &Snapshot) -> Vec<MigrationDiff>`
+
+**Tables:** Match by qualified name (`schema.table`).
+- Present in new, absent in old -> `DiffAction::Add`
+- Present in old, absent in new -> `DiffAction::Drop`
+- Present in both -> compare fields:
+  - **Columns:** Match by name. Added/dropped/altered (type, nullable, default, identity, unique, inline_fk).
+  - **Constraints:** Match by name (or by type+columns if unnamed). Added/dropped.
+  - **Indexes:** Match by name. Added/dropped.
+- If no field changes -> entity excluded from diff output.
+
+**Enums:** Match by qualified name.
+- Present in new, absent in old -> `DiffAction::Add`
+- Present in old, absent in new -> `DiffAction::Drop` (warning: manual migration required)
+- Present in both -> compare values list:
+  - New values -> `ChangeAction::Add(FieldDetail::EnumValue(v))`
+  - Removed values -> `ChangeAction::Drop` (warning only, no SQL generated)
+
+### SQL Generation
+
+`generate_migration_sql(diff: &MigrationDiff) -> String`
+
+| FieldChange | SQL |
+|-------------|-----|
+| Column Add | `ALTER TABLE schema.name ADD COLUMN col_name type [NOT NULL] [DEFAULT val]` |
+| Column Drop | `ALTER TABLE schema.name DROP COLUMN col_name` |
+| Column Alter (type) | `ALTER TABLE schema.name ALTER COLUMN col_name TYPE new_type` |
+| Column Alter (nullable) | `ALTER TABLE ... ALTER COLUMN ... SET/DROP NOT NULL` |
+| Column Alter (default) | `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT/DROP DEFAULT` |
+| Constraint Add | `ALTER TABLE ... ADD CONSTRAINT ...` |
+| Constraint Drop | `ALTER TABLE ... DROP CONSTRAINT name` |
+| Index Add | `CREATE [UNIQUE] INDEX name ON schema.table (cols)` |
+| Index Drop | `DROP INDEX name` |
+| Enum Value Add | `ALTER TYPE schema.name ADD VALUE 'val'` |
+| Enum Value Drop | Warning only, no SQL |
+| Table Drop | `DROP TABLE schema.name CASCADE` |
+| Enum Drop | Warning: "manual migration required" |
+
+---
+
+## Module 2: Snapshot Create (extend `snapshot.rs`)
+
+### Updated Types
+
+```rust
+struct Snapshot {
+    version: u32,
+    description: String,
+    timestamp: String,
+    tables: Vec<TableSnapshot>,
+    enums: Vec<EnumSnapshot>,       // NEW
+}
+
+struct EnumSnapshot {
+    name: String,                   // "public.gender_type"
+    schema: String,
+    values: Vec<String>,            // ["male", "female", "other"]
+}
+
+// MigrationGraph updated
+struct MigrationGraph {
+    from_version: u32,
+    to_version: u32,
+    added: Vec<String>,             // NEW — entities created in this version
+    altered: Vec<String>,
+    dropped: Vec<String>,
+}
+```
+
+### Config Update
+
+`ProjectConfig` gets a `version` field:
+
+```yaml
+project:
+  name: daemon
+  version: 3          # updated by `dbd snapshot`
+```
+
+```rust
+struct ProjectConfig {
+    name: String,
+    version: Option<u32>,   // NEW — None means pre-snapshot project
+    // ...existing fields
+}
+```
+
+### Snapshot Create Flow
+
+`create_snapshot(design: &Design, description: &str) -> Result<SnapshotResult>`
+
+1. Extract table entities with `table_def` -> `Vec<TableSnapshot>`
+2. Extract enum entities -> `Vec<EnumSnapshot>`
+3. Determine next version N via `next_version()`
+4. Build `Snapshot { version: N, tables, enums, timestamp, description }`
+5. **If N == 1** (first snapshot / baseline):
+   - Write `snapshots/001.json`
+   - Update `design.yaml` version to 1
+   - Return with summary: "Baseline snapshot v1 created (X tables, Y enums)"
+6. **If N > 1:**
+   - Read snapshot N-1
+   - `diff(old, new)` -> `Vec<MigrationDiff>`
+   - If empty: print "No changes detected", do not create snapshot
+   - Generate migration SQL for each `Change`/`Drop` diff
+   - Write `migrations/NNN/<schema>/<table>.sql` files
+   - Write `migrations/NNN/graph.json` with added/altered/dropped lists
+   - Write `snapshots/NNN.json`
+   - Update `design.yaml` version to N
+   - Return summary with counts and file list
+
+### File Layout
+
+```
+snapshots/
+  001.json              # baseline
+  002.json              # after first change
+  003.json
+
+migrations/
+  002/
+    graph.json          # { fromVersion: 1, toVersion: 2, added: [...], altered: [...], dropped: [...] }
+    config/
+      lookup_values.sql # ALTER TABLE config.lookup_values ADD COLUMN notes TEXT
+  003/
+    graph.json
+    staging/
+      lookups.sql       # DROP TABLE staging.lookups CASCADE
+```
+
+---
+
+## Module 3: Apply with Migrations (modify `design.rs`)
+
+### Updated Apply Flow
+
+```rust
+pub async fn apply(&self, adapter, name, dry_run) -> Result<()>
+```
+
+1. Load design, filter valid entities
+2. Connect, ensure `_dbd_meta` table
+3. Read `current_db_version` from `_dbd_meta` (0 if no record)
+4. Read `latest_version` from `design.yaml` project.version (0 if None)
+5. **Fresh env** (`current_db_version == 0`):
+   - Apply all entities via existing logic (CREATE IF NOT EXISTS)
+   - Write `_dbd_meta` with `version = latest_version`
+6. **Behind** (`current_db_version < latest_version`):
+   - Load pending migrations (versions `current+1` through `latest`)
+   - Build combined execution plan:
+     a. Collect `added` entities from migration graphs (need CREATE before ALTER)
+     b. Collect `altered` entities (need migration SQL then re-apply DDL)
+     c. All other entities (unchanged, idempotent apply)
+   - Build dependency graph across all three sets using `entity.refers`
+   - Topological sort
+   - Execute in sorted order:
+     - Added entity: `apply_entity()` (CREATE)
+     - Altered entity: execute migration SQL, then `apply_entity()`
+     - Unchanged entity: `apply_entity()` (idempotent)
+     - Dropped entity: execute drop SQL
+   - Record each migration in `_dbd_migrations`
+   - Update `_dbd_meta` version to `latest_version`
+7. **Current** (`current_db_version == latest_version`):
+   - Apply all entities (idempotent — catches view/function/procedure changes)
+
+### Migrate Command
+
+`dbd migrate [--status] [--apply] [--to N] [--dry-run]`
+
+- `--status`: Print table showing current DB version, latest version, and pending migration list
+- `--apply`: Run migration pass only (steps 6a-6f above), skip full entity apply
+- `--to N`: Stop at version N instead of latest
+- `--dry-run`: Print SQL with `-- Version N` headers, highlight `DROP` statements
+
+### Dry Run Output Format
+
+```
+-- Migration v1 -> v2
+-- [ALTER] config.lookup_values
+ALTER TABLE config.lookup_values ADD COLUMN notes TEXT;
+
+-- Migration v2 -> v3
+-- [DROP] staging.lookups
+DROP TABLE staging.lookups CASCADE;
+
+-- [ALTER] config.orders
+ALTER TABLE config.orders ADD CONSTRAINT fk_orders_users
+  FOREIGN KEY (user_id) REFERENCES config.users(id);
+```
+
+---
+
+## Enum Handling
+
+**Current scope:** ADD VALUE only.
+
+- New enum values: `ALTER TYPE schema.name ADD VALUE 'val'`
+- Dropped enum values: Warning printed, no SQL generated
+- Renamed enum values: Warning printed, no SQL generated
+
+**Future work:**
+- Full enum recreation: create new type, ALTER columns from old to text, drop old type, create new type, ALTER columns from text to new type
+- Data patches: mechanism for shipping data corrections in a migration (e.g., UPDATE statements to fix values before enum type change)
+
+---
+
+## Test Scenarios
+
+All tests below should be written BEFORE implementation (TDD). Tests use fixture projects with known DDL files and mock/tempdir snapshots.
+
+### Diff Engine Tests (`diff.rs`)
+
+#### D1: Identical snapshots produce empty diff
+```
+Given: snapshot A and snapshot B with same tables/columns/enums
+When:  diff(A, B)
+Then:  Vec<MigrationDiff> is empty
+```
+
+#### D2: New table detected
+```
+Given: snapshot A has [users], snapshot B has [users, orders]
+When:  diff(A, B)
+Then:  one MigrationDiff { entity: "config.orders", action: Add }
+```
+
+#### D3: Dropped table detected
+```
+Given: snapshot A has [users, orders], snapshot B has [users]
+When:  diff(A, B)
+Then:  one MigrationDiff { entity: "config.orders", action: Drop }
+```
+
+#### D4: Column added to existing table
+```
+Given: snapshot A users has [id, name], snapshot B users has [id, name, email]
+When:  diff(A, B)
+Then:  MigrationDiff { entity: "config.users", action: Change([
+         FieldChange { field: "email", type: Column, action: Add(ColumnDef{...}) }
+       ])}
+```
+
+#### D5: Column dropped from existing table
+```
+Given: snapshot A users has [id, name, email], snapshot B users has [id, name]
+When:  diff(A, B)
+Then:  FieldChange { field: "email", type: Column, action: Drop }
+```
+
+#### D6: Column type changed
+```
+Given: snapshot A users.email is VARCHAR(100), snapshot B users.email is TEXT
+When:  diff(A, B)
+Then:  FieldChange { field: "email", type: Column, action: Alter { old: VARCHAR(100), new: TEXT } }
+```
+
+#### D7: Column nullable changed
+```
+Given: snapshot A users.email nullable=false, snapshot B nullable=true
+When:  diff(A, B)
+Then:  FieldChange { field: "email", type: Column, action: Alter { old.nullable=false, new.nullable=true } }
+```
+
+#### D8: Column default changed
+```
+Given: snapshot A users.status default=None, snapshot B default='active'
+When:  diff(A, B)
+Then:  FieldChange with Alter carrying old/new defaults
+```
+
+#### D9: Constraint added
+```
+Given: snapshot A users has no unique constraint, snapshot B adds unique on email
+When:  diff(A, B)
+Then:  FieldChange { field: "uq_email", type: Constraint, action: Add(...) }
+```
+
+#### D10: Constraint dropped
+```
+Given: snapshot A users has unique on email, snapshot B does not
+When:  diff(A, B)
+Then:  FieldChange { field: "uq_email", type: Constraint, action: Drop }
+```
+
+#### D11: Index added
+```
+Given: snapshot A has no index on users.email, snapshot B adds idx_email
+When:  diff(A, B)
+Then:  FieldChange { field: "idx_email", type: Index, action: Add(...) }
+```
+
+#### D12: Index dropped
+```
+Given: snapshot A has idx_email, snapshot B does not
+When:  diff(A, B)
+Then:  FieldChange { field: "idx_email", type: Index, action: Drop }
+```
+
+#### D13: Enum value added
+```
+Given: snapshot A gender_type has [male, female], snapshot B has [male, female, other]
+When:  diff(A, B)
+Then:  FieldChange { field: "other", type: EnumValue, action: Add(EnumValue("other")) }
+```
+
+#### D14: Enum value dropped (warning)
+```
+Given: snapshot A gender_type has [male, female, other], snapshot B has [male, female]
+When:  diff(A, B)
+Then:  FieldChange { field: "other", type: EnumValue, action: Drop }
+       AND warning is included
+```
+
+#### D15: New enum detected
+```
+Given: snapshot A has no enums, snapshot B has gender_type
+When:  diff(A, B)
+Then:  MigrationDiff { entity: "public.gender_type", action: Add }
+```
+
+#### D16: Enum dropped (warning)
+```
+Given: snapshot A has gender_type, snapshot B has no enums
+When:  diff(A, B)
+Then:  MigrationDiff { entity: "public.gender_type", action: Drop }
+       AND warning is included
+```
+
+#### D17: Multiple changes on same table
+```
+Given: snapshot B adds a column, drops a constraint, adds an index to users
+When:  diff(A, B)
+Then:  single MigrationDiff with Change containing 3 FieldChanges
+```
+
+#### D18: Multiple tables changed
+```
+Given: snapshot B modifies users and orders
+When:  diff(A, B)
+Then:  two MigrationDiff entries
+```
+
+#### D19: Mixed add/alter/drop across entities
+```
+Given: snapshot A has [users, orders, temp]
+       snapshot B has [users(modified), orders, payments(new)] — temp dropped
+When:  diff(A, B)
+Then:  3 MigrationDiffs: users=Change, temp=Drop, payments=Add
+```
+
+### SQL Generation Tests (`diff.rs`)
+
+#### S1: Column add generates ALTER TABLE ADD COLUMN
+```
+Given: FieldChange column add with type TEXT, nullable, no default
+Then:  "ALTER TABLE config.users ADD COLUMN email TEXT"
+```
+
+#### S2: Column add with NOT NULL and DEFAULT
+```
+Given: FieldChange column add, nullable=false, default='active'
+Then:  "ALTER TABLE ... ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active'"
+```
+
+#### S3: Column drop generates ALTER TABLE DROP COLUMN
+```
+Given: FieldChange column drop "email"
+Then:  "ALTER TABLE config.users DROP COLUMN email"
+```
+
+#### S4: Column type change generates ALTER COLUMN TYPE
+```
+Given: FieldChange alter from VARCHAR(100) to TEXT
+Then:  "ALTER TABLE config.users ALTER COLUMN email TYPE TEXT"
+```
+
+#### S5: Nullable change generates SET/DROP NOT NULL
+```
+Given: FieldChange alter nullable false->true
+Then:  "ALTER TABLE config.users ALTER COLUMN email DROP NOT NULL"
+
+Given: FieldChange alter nullable true->false
+Then:  "ALTER TABLE config.users ALTER COLUMN email SET NOT NULL"
+```
+
+#### S6: Default change generates SET/DROP DEFAULT
+```
+Given: FieldChange alter default None->'active'
+Then:  "ALTER TABLE ... ALTER COLUMN status SET DEFAULT 'active'"
+
+Given: FieldChange alter default 'active'->None
+Then:  "ALTER TABLE ... ALTER COLUMN status DROP DEFAULT"
+```
+
+#### S7: Constraint add generates ADD CONSTRAINT
+```
+Given: FieldChange constraint add (unique on [email])
+Then:  "ALTER TABLE config.users ADD CONSTRAINT uq_email UNIQUE (email)"
+```
+
+#### S8: Constraint drop generates DROP CONSTRAINT
+```
+Given: FieldChange constraint drop "uq_email"
+Then:  "ALTER TABLE config.users DROP CONSTRAINT uq_email"
+```
+
+#### S9: FK constraint add generates full FK syntax
+```
+Given: FieldChange constraint add FK (user_id -> config.users.id)
+Then:  "ALTER TABLE config.orders ADD CONSTRAINT fk_orders_users
+        FOREIGN KEY (user_id) REFERENCES config.users(id)"
+```
+
+#### S10: Index add generates CREATE INDEX
+```
+Given: FieldChange index add (btree on [email], unique)
+Then:  "CREATE UNIQUE INDEX idx_email ON config.users (email)"
+```
+
+#### S11: Index drop generates DROP INDEX
+```
+Given: FieldChange index drop "idx_email"
+Then:  "DROP INDEX idx_email"
+```
+
+#### S12: Enum value add generates ALTER TYPE ADD VALUE
+```
+Given: FieldChange enum value add "other"
+Then:  "ALTER TYPE public.gender_type ADD VALUE 'other'"
+```
+
+#### S13: Table drop generates DROP TABLE CASCADE
+```
+Given: MigrationDiff action=Drop, entity="staging.lookups"
+Then:  "DROP TABLE staging.lookups CASCADE"
+```
+
+#### S14: Multiple field changes produce multi-statement SQL
+```
+Given: MigrationDiff with 3 FieldChanges (add col, drop col, add index)
+Then:  3 SQL statements joined by newlines
+```
+
+### Snapshot Create Tests (`snapshot.rs`)
+
+#### SC1: First snapshot creates baseline (v1)
+```
+Given: project with 2 tables and 1 enum, no existing snapshots
+When:  create_snapshot(design, "initial")
+Then:  snapshots/001.json exists
+       contains version=1, 2 tables, 1 enum
+       no migrations/ folder created
+       design.yaml version updated to 1
+```
+
+#### SC2: Second snapshot with changes creates v2 + migration
+```
+Given: snapshot v1 exists, DDL now has added column on users table
+When:  create_snapshot(design, "add email")
+Then:  snapshots/002.json exists with updated table structure
+       migrations/002/graph.json exists with altered=["config.users"]
+       migrations/002/config/users.sql contains ALTER TABLE ADD COLUMN
+       design.yaml version updated to 2
+```
+
+#### SC3: Snapshot with no changes is skipped
+```
+Given: snapshot v1 exists, DDL files unchanged
+When:  create_snapshot(design, "no change")
+Then:  no snapshots/002.json created
+       no migrations/002/ created
+       design.yaml version unchanged
+       return message: "No changes detected"
+```
+
+#### SC4: Snapshot with new table
+```
+Given: snapshot v1 has [users], DDL now has [users, orders]
+When:  create_snapshot(design, "add orders")
+Then:  graph.json has added=["config.orders"], altered=[], dropped=[]
+       no migration SQL file for orders (new table uses regular apply)
+```
+
+#### SC5: Snapshot with dropped table
+```
+Given: snapshot v1 has [users, temp], DDL now has [users] only
+When:  create_snapshot(design, "drop temp")
+Then:  graph.json has dropped=["staging.temp"]
+       migrations/002/staging/temp.sql contains DROP TABLE
+```
+
+#### SC6: Snapshot with mixed changes
+```
+Given: snapshot v1, DDL adds orders, modifies users, drops temp
+When:  create_snapshot(design, "restructure")
+Then:  graph.json has added=["config.orders"], altered=["config.users"], dropped=["staging.temp"]
+       migration SQL files for users (ALTER) and temp (DROP) only
+```
+
+#### SC7: Entity to TableSnapshot conversion includes all fields
+```
+Given: entity with columns, constraints (PK, FK, unique, check), indexes, comments
+When:  convert to TableSnapshot
+Then:  all fields preserved in snapshot
+```
+
+#### SC8: Entity to EnumSnapshot conversion
+```
+Given: enum entity with values ["a", "b", "c"]
+When:  convert to EnumSnapshot
+Then:  name, schema, values all captured
+```
+
+#### SC9: Snapshot serialization round-trip
+```
+Given: Snapshot with tables and enums
+When:  serialize to JSON, deserialize back
+Then:  identical structure
+```
+
+#### SC10: Design.yaml version update
+```
+Given: design.yaml with version=2
+When:  create_snapshot produces v3
+Then:  design.yaml now has version=3
+```
+
+### Apply with Migrations Tests (integration, requires mock adapter)
+
+#### A1: Fresh env — apply all, mark latest version
+```
+Given: empty DB (version=0), design.yaml version=3, snapshots v1-v3
+When:  apply()
+Then:  all entities applied via apply_entity()
+       _dbd_meta version set to 3
+       no migration SQL executed
+```
+
+#### A2: Current env — idempotent apply only
+```
+Given: DB version=3, design.yaml version=3
+When:  apply()
+Then:  all entities applied (idempotent)
+       no migration SQL executed
+       _dbd_meta unchanged
+```
+
+#### A3: Behind by one version — single migration
+```
+Given: DB version=1, design.yaml version=2
+       migration v2 alters config.users (adds column)
+When:  apply()
+Then:  migration SQL for config.users runs
+       then all entities applied
+       _dbd_meta updated to 2
+```
+
+#### A4: Behind by multiple versions — sequential migrations
+```
+Given: DB version=1, design.yaml version=3
+       migration v2 alters users, migration v3 alters orders
+When:  apply()
+Then:  v2 migration runs first, then v3
+       all entities applied after
+       _dbd_meta updated to 3
+```
+
+#### A5: Migration with new table dependency — interleaved
+```
+Given: DB version=1, design.yaml version=2
+       migration v2: added=[config.users], altered=[config.orders adds FK to users]
+When:  apply()
+Then:  config.users CREATE runs before config.orders ALTER
+       (dependency ordering respected)
+```
+
+#### A6: Migration with table drop
+```
+Given: DB version=1, migration v2 drops staging.temp
+When:  apply()
+Then:  DROP TABLE staging.temp runs
+       staging.temp not in entity apply list
+```
+
+#### A7: Dry run prints SQL without executing
+```
+Given: DB version=1, pending migrations
+When:  apply(dry_run=true)
+Then:  SQL printed with version headers
+       DROP statements highlighted
+       no DB changes made
+```
+
+#### A8: Apply with --name filter still runs migrations
+```
+Given: DB version=1, pending migrations alter config.users
+When:  apply(name="config.users")
+Then:  migration for config.users runs
+       only config.users entity applied
+```
+
+### Migrate Command Tests
+
+#### M1: Status shows versions and pending list
+```
+Given: DB version=1, latest=3
+When:  migrate --status
+Then:  output shows "DB: v1, Latest: v3, Pending: v2, v3"
+```
+
+#### M2: Apply runs migrations only
+```
+Given: DB version=1, latest=3
+When:  migrate --apply
+Then:  migrations v2 and v3 run
+       _dbd_meta updated to 3
+       entity apply NOT run
+```
+
+#### M3: Apply with --to limits version
+```
+Given: DB version=1, latest=3
+When:  migrate --apply --to 2
+Then:  only migration v2 runs
+       _dbd_meta updated to 2
+```
+
+#### M4: Dry run prints SQL
+```
+Given: DB version=1, pending migration v2
+When:  migrate --apply --dry-run
+Then:  SQL printed, no DB changes
+```
+
+#### M5: No pending migrations
+```
+Given: DB version=3, latest=3
+When:  migrate --status
+Then:  output: "Up to date at v3"
+```
+
+### Edge Cases
+
+#### E1: Snapshot with self-referencing FK table
+```
+Given: table categories with parent_id -> categories.id
+When:  create_snapshot + diff
+Then:  self-ref handled correctly, no circular diff
+```
+
+#### E2: Constraint matching without name
+```
+Given: unnamed PK in v1, unnamed PK in v2 with same columns
+When:  diff
+Then:  matched as same constraint, no change
+```
+
+#### E3: Multiple column changes on same table
+```
+Given: add col A, drop col B, alter col C type on same table
+When:  diff + generate SQL
+Then:  single migration file with 3 ALTER statements
+```
+
+#### E4: Enum with no changes
+```
+Given: identical enum in both snapshots
+When:  diff
+Then:  not included in diff output
+```
+
+#### E5: Empty project (no tables, no enums)
+```
+Given: project with only schemas and extensions
+When:  create_snapshot
+Then:  snapshot created with empty tables/enums arrays
+```
+
+#### E6: Snapshot backwards compatibility (no enums field)
+```
+Given: old snapshot JSON without "enums" field
+When:  read_snapshot
+Then:  deserializes with enums defaulting to empty vec
+```
+
+---
+
+## Files Modified/Created
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `crates/dbd-core/src/diff.rs` | Create | Diff engine: types, diff logic, SQL generation |
+| `crates/dbd-core/src/snapshot.rs` | Modify | Add EnumSnapshot, create_snapshot(), update Snapshot/MigrationGraph |
+| `crates/dbd-core/src/design.rs` | Modify | Updated apply() with interleaved migration logic |
+| `crates/dbd-core/src/config.rs` | Modify | Add version to ProjectConfig |
+| `crates/dbd-core/src/lib.rs` | Modify | Export diff module |
+| `crates/dbd-cli/src/cli.rs` | Modify | Wire snapshot create, migrate subcommands |
+| `crates/dbd-cli/src/commands.rs` | Modify | Implement cmd_snapshot_create, cmd_migrate_* |
+
+## Future Work
+
+- **Enum recreation:** DROP old type, CREATE new type, migrate column data (requires text intermediary)
+- **Data patches:** Mechanism for shipping UPDATE/DELETE corrections in a migration folder (e.g., `migrations/NNN/patches/fix_status_values.sql`)
+- **Column rename detection:** Heuristic matching (same type, adjacent position) to suggest RENAME instead of DROP+ADD
+- **Migration rollback:** Reverse migration generation (undo ALTERs)
