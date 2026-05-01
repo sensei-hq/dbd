@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod design;
 pub mod entity;
 pub mod error;
+pub mod deploy;
 pub mod github;
 pub mod init;
 pub mod parser;
