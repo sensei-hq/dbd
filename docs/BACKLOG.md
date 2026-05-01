@@ -2,7 +2,7 @@
 
 ## Current status (2026-04-30)
 
-**63 commits, 12,564 LOC, 319 tests, verified on sensei/daemon/database (116 entities)**
+**67 commits, 13,000+ LOC, 330 tests, verified on sensei/daemon/database (116 entities)**
 
 ### Working commands
 
@@ -18,6 +18,8 @@
 | `doctor` | yes | — | Config migration from Node.js format |
 | `snapshot` | yes | — | Smart multi-snapshot: rename/type change (2 stages), enum removal (3 stages) |
 | `migrate --status` | — | yes | Read-only version diagnostic |
+| `init` | yes | — | Scaffold new project (postgres/supabase) |
+| `deploy` | `--dry-run` | yes | Deploy from local path or GitHub source |
 
 ### Completed features
 
@@ -42,19 +44,18 @@
 
 ## P1 — Next up
 
-### `dbd init`
-- Scaffold project from bundled template
-- Generate `design.yaml` with project name, target config
-- Create `ddl/` directory structure (table/, view/, function/, procedure/, enum/)
-- `--target supabase` variant with grants config
-- `--target postgres` (default)
+### `dbd init` — DONE
+- `dbd init [--name project] [--target postgres|supabase]`
+- Generates design.yaml, ddl/ directory tree, sample table DDL
+- Supabase variant with ignore patterns for managed schemas
+- Sample DDL follows project conventions (lowercase, leading commas, aligned types)
 
-### `dbd deploy --source`
-- Download GitHub repo via reqwest + flate2 + tar
-- Cache in `~/.cache/dbd/` with TTL
-- Apply + import in one step, cleanup temp
-- GitHub source parsing already implemented in `github.rs`
-- Support local path (`--source ./path/to/project`)
+### `dbd deploy` — DONE
+- `dbd deploy --source ./local/path` or `--source owner/repo/path`
+- GitHub download via reqwest + flate2 + tar (cached in ~/.cache/dbd/)
+- Resolves source → loads design → apply + import in one step
+- `--dry-run` previews without executing
+- Tarball extraction with path traversal protection
 
 ### Export command
 - COPY TO STDOUT streaming via sqlx
