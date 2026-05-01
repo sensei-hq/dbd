@@ -300,6 +300,16 @@ impl Design {
             }
         }
 
+        // Filter out entities in skip_schemas
+        if let Some(target) = design_config.target.values().next()
+            && let Some(ref skip) = target.skip_schemas
+        {
+            entities.retain(|e| match &e.schema {
+                Some(s) => !skip.contains(s),
+                None => true,
+            });
+        }
+
         // Add external entities for reference resolution
         let external_names: Vec<String> = design_config
             .external
@@ -1392,5 +1402,19 @@ mod tests {
         let apply_count = plan.steps.iter().filter(|s| matches!(s, ExecutionStep::ApplyEntity(_))).count();
         assert_eq!(apply_count, 0, "no entities means no ApplyEntity steps");
         assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(1))));
+    }
+
+    // ── skip_schemas filtering ───────────────────────────
+
+    #[test]
+    fn skip_schemas_filters_entities() {
+        let mut entities = vec![
+            Entity::new(EntityType::Table, "config.users"),
+            Entity::new(EntityType::Table, "auth.sessions"),
+        ];
+        let skip = ["auth".to_string()];
+        entities.retain(|e| match &e.schema { Some(s) => !skip.contains(s), None => true });
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "config.users");
     }
 }
