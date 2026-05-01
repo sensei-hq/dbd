@@ -8,6 +8,10 @@ pub struct DbmlParams<'a> {
     pub project_name: &'a str,
     pub database_type: &'a str,
     pub project_note: Option<&'a str>,
+    pub include_schemas: Vec<String>,
+    pub exclude_schemas: Vec<String>,
+    pub include_tables: Vec<String>,
+    pub exclude_tables: Vec<String>,
 }
 
 /// A generated DBML document.
@@ -16,7 +20,7 @@ pub struct DbmlDocument {
     pub content: String,
 }
 
-/// Generate DBML from parsed entities.
+/// Generate DBML from parsed entities, applying include/exclude filters.
 pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
     let mut sections = Vec::new();
 
@@ -27,15 +31,21 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         params.project_note,
     ));
 
+    // Filter entities by include/exclude rules
+    let filtered: Vec<&Entity> = params.entities.iter()
+        .filter(|e| matches!(e.entity_type, EntityType::Table | EntityType::Enum))
+        .filter(|e| is_included(e, params))
+        .collect();
+
     // Enums
-    for entity in params.entities {
+    for entity in &filtered {
         if entity.entity_type == EntityType::Enum && !entity.enum_values.is_empty() {
             sections.push(emit_enum(entity));
         }
     }
 
     // Tables
-    for entity in params.entities {
+    for entity in &filtered {
         if entity.entity_type == EntityType::Table
             && let Some(ref table_def) = entity.table_def {
                 sections.push(emit_table(
@@ -46,8 +56,8 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
             }
     }
 
-    // Refs (standalone, from all FK constraints)
-    let refs = emit_all_refs(params.entities);
+    // Refs (standalone, from all FK constraints — only from filtered tables)
+    let refs = emit_all_refs(&filtered.iter().copied().cloned().collect::<Vec<_>>());
     if !refs.is_empty() {
         sections.push(refs);
     }
@@ -56,6 +66,33 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         file_name: "design.dbml".to_string(),
         content: sections.join("\n"),
     }
+}
+
+/// Check if an entity passes the include/exclude filters.
+fn is_included(entity: &Entity, params: &DbmlParams) -> bool {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+
+    // If include_schemas is set, entity must be in one of them
+    if !params.include_schemas.is_empty() && !params.include_schemas.iter().any(|s| s == schema) {
+        return false;
+    }
+
+    // If include_tables is set, entity must be in the list
+    if !params.include_tables.is_empty() && !params.include_tables.iter().any(|t| t == &entity.name) {
+        return false;
+    }
+
+    // If entity's schema is in exclude list, skip it
+    if params.exclude_schemas.iter().any(|s| s == schema) {
+        return false;
+    }
+
+    // If entity is in exclude tables list, skip it
+    if params.exclude_tables.iter().any(|t| t == &entity.name) {
+        return false;
+    }
+
+    true
 }
 
 fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
@@ -547,6 +584,10 @@ mod tests {
             project_name: "TestProject",
             database_type: "PostgreSQL",
             project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
         });
 
         assert!(doc.content.contains("Project \"TestProject\""));
@@ -574,5 +615,87 @@ mod tests {
             quote_type_if_needed("TIMESTAMP WITH TIME ZONE"),
             "\"TIMESTAMP WITH TIME ZONE\""
         );
+    }
+
+    // ── Filter tests ───────────────────────────────────
+
+    #[test]
+    fn exclude_schema_filters_tables() {
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "INT")], vec![]),
+            make_table_entity("staging.temp", vec![col("id", "INT")], vec![]),
+        ];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec!["staging".to_string()],
+            include_tables: vec![],
+            exclude_tables: vec![],
+        });
+        assert!(doc.content.contains("config"));
+        assert!(!doc.content.contains("staging"), "staging should be excluded");
+    }
+
+    #[test]
+    fn include_schema_filters_to_only_included() {
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "INT")], vec![]),
+            make_table_entity("staging.temp", vec![col("id", "INT")], vec![]),
+        ];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec!["config".to_string()],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+        });
+        assert!(doc.content.contains("config"));
+        assert!(!doc.content.contains("staging"), "staging should not be included");
+    }
+
+    #[test]
+    fn exclude_table_by_name() {
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "INT")], vec![]),
+            make_table_entity("config.secret", vec![col("id", "INT")], vec![]),
+        ];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec!["config.secret".to_string()],
+        });
+        assert!(doc.content.contains("users"));
+        assert!(!doc.content.contains("secret"), "secret table should be excluded");
+    }
+
+    #[test]
+    fn no_filters_includes_everything() {
+        let entities = vec![
+            make_table_entity("config.users", vec![col("id", "INT")], vec![]),
+            make_table_entity("staging.temp", vec![col("id", "INT")], vec![]),
+        ];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+        });
+        assert!(doc.content.contains("config"));
+        assert!(doc.content.contains("staging"));
     }
 }

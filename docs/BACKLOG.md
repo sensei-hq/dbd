@@ -2,7 +2,7 @@
 
 ## Current status (2026-04-30)
 
-**67 commits, 13,000+ LOC, 330 tests, verified on sensei/daemon/database (116 entities)**
+**72 commits, 13,000+ LOC, 335 tests, verified on sensei/daemon/database (116 entities)**
 
 ### Working commands
 
@@ -10,27 +10,29 @@
 |---------|---------|---------|-------|
 | `inspect` | yes | — | Full validation pipeline |
 | `apply` | `--dry-run` | yes | Version-aware: fresh install, migrations, idempotent re-apply |
-| `import` | `--dry-run` | yes | CSV/TSV/JSONL, reads-based procedure matching, dependency ordering |
+| `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching, dependency ordering |
+| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl files |
 | `reset` | `--dry-run` | yes | Safety guards (_dbd_meta env/version) |
 | `combine` | yes | — | Merge all DDL into single SQL file |
 | `graph` | yes | — | JSON with nodes/edges/layers |
-| `dbml` | yes | — | Verified with dbdocs build |
+| `dbml` | yes | — | Include/exclude schema+table filters |
 | `doctor` | yes | — | Config migration from Node.js format |
 | `snapshot` | yes | — | Smart multi-snapshot: rename/type change (2 stages), enum removal (3 stages) |
 | `migrate --status` | — | yes | Read-only version diagnostic |
 | `init` | yes | — | Scaffold new project (postgres/supabase) |
 | `deploy` | `--dry-run` | yes | Deploy from local path or GitHub source |
-| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl files |
 
-### Completed features
+### Core features
 
-- **Schema diff engine** (`diff.rs`) — columns, constraints, indexes, enum values
-- **SQL generation** — ALTER TABLE, DROP TABLE, CREATE INDEX, ALTER TYPE, with FK actions + index ordering
-- **Smart multi-snapshot** — auto-detects complex changes, generates intermediate states + data.sql
+- **Schema diff engine** — columns, constraints, indexes, enum values with SQL generation
+- **Smart multi-snapshot** — auto-detects renames/type changes/enum removal, generates intermediate states + data.sql
 - **`_dbd_meta`** — authoritative version source, env/version/applied_at tracking
-- **Migration data corrections** — `*.data.sql` runs after schema ALTERs, CAST heuristics, TODO for business logic
+- **Migration data corrections** — `*.data.sql` after ALTERs, CAST heuristics, TODO for business logic
 - **Execution plan** — pure function builds plan from version state, thin I/O wrapper executes
 - **Change classification** — `is_castable()`, `classify_changes()`, `generate_data_sql()`
+- **DBML filters** — include/exclude by schema or table name from config
+- **Import truncate** — TRUNCATE staging tables before COPY (default: true)
+- **Deploy** — local path or GitHub source (reqwest + tar, cached)
 
 ### Adapter support
 
@@ -43,35 +45,6 @@
 
 ---
 
-## P1 — Next up
-
-### `dbd init` — DONE
-- `dbd init [--name project] [--target postgres|supabase]`
-- Generates design.yaml, ddl/ directory tree, sample table DDL
-- Supabase variant with ignore patterns for managed schemas
-- Sample DDL follows project conventions (lowercase, leading commas, aligned types)
-
-### `dbd deploy` — DONE
-- `dbd deploy --source ./local/path` or `--source owner/repo/path`
-- GitHub download via reqwest + flate2 + tar (cached in ~/.cache/dbd/)
-- Resolves source → loads design → apply + import in one step
-- `--dry-run` previews without executing
-- Tarball extraction with path traversal protection
-
-### Export command — DONE
-- `dbd export [--name table] [--format csv|tsv|jsonl]`
-- COPY TO STDOUT streaming via sqlx
-- Writes to `export/<schema>/<name>.<format>`
-- Exports from config entries or all tables
-
-### Import truncate — NEXT
-- Truncate staging tables before COPY to prevent duplicate rows on re-import
-- `import.truncate: true` in design.yaml (default: false)
-- Staging tables have no FKs, so TRUNCATE is always safe
-
-
----
-
 ## P2 — Quality & tooling
 
 ### DDL formatter
@@ -81,7 +54,10 @@
 - `dbd inspect --fix` integration (auto-fix formatting issues)
 - Pre-commit hook integration
 
-### Adapter expansion
+### Config gaps to wire
+- `target.skip_schemas` — exclude schemas from reset/apply (useful for Supabase)
+- `target.schema_prefix` — multi-tenant schema prefix
+- Per-table `export.format` — override per table (currently CLI `--format` only)
 
 ### Supabase adapter
 - Extends PostgresAdapter
@@ -121,7 +97,7 @@
 - Benchmark: measure parsing time on large projects (100+ DDL files)
 
 ### DBML enhancements
-- Multi-document support (project.dbml config with include/exclude)
+- Multi-document support (multiple dbml output files)
 - Table group generation
 - Composite FK ref support
 
@@ -142,7 +118,7 @@
 
 ## Test coverage
 
-**319 tests** (281 unit + 38 integration) covering:
+**335 tests** (297 unit + 38 integration) covering:
 - Schema diff engine (45 tests): D1-D21, S1-S14, warnings, edge cases
 - Snapshot create (17 tests): SC1-SC10, entity conversion, backward compat
 - Multi-snapshot (7 tests): B1-B3, S1-S2, baseline, no-changes
@@ -150,11 +126,12 @@
 - Castability (9 tests): CA1-CA5, type categories
 - data.sql generation (5 tests): D1-D5
 - Execution plan (12 tests): A1-A6, edge cases
+- DBML filters (4 tests): include/exclude schema/table
+- Init (7 tests): postgres/supabase targets, directory creation
+- Deploy (4 tests): local resolve, not-found, subpath
 - Config/entity/parser/scanner/dependency/references (221 tests)
 
-### Integration test infrastructure (requires PostgreSQL)
-
-Run with `cargo test --features test-db` or in CI with a Postgres container.
+### CI configuration
 
 ```yaml
 # .github/workflows/test.yml
