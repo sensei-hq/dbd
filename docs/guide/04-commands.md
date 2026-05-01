@@ -29,7 +29,7 @@ Defines the project root. Config file, DDL folder, import folder, snapshots — 
 ```sh
 dbd inspect                               # Current directory
 dbd inspect -s ~/projects/mydb            # Explicit local path
-dbd inspect -s sensei-hq/daemon/database  # GitHub repo (not yet implemented)
+dbd inspect -s sensei-hq/daemon/database  # GitHub repo
 ```
 
 ---
@@ -138,38 +138,78 @@ dbd reset --dry-run                # Show what would be dropped
 
 ## `dbd snapshot`
 
-List versioned schema snapshots.
+Create versioned schema snapshots and generate migration scripts.
 
 ```sh
-dbd snapshot --list                # List existing snapshots
+dbd snapshot --name "add notes column"    # Create a snapshot
+dbd snapshot --list                        # List existing snapshots
 ```
 
-*Snapshot creation not yet implemented in Rust CLI.*
+Smart multi-snapshot: When complex changes are detected (column rename, type change, enum value removal) dbd automatically generates multiple snapshots with correct intermediate states.
+
+- Column rename: 2 snapshots (add new column + data copy, drop old column)
+- Column type change: 2 snapshots (add new column + CAST, drop old column)
+- Enum value removal: 3 snapshots (data correction, TEXT intermediary, enum recreation)
+
+Data corrections (*.data.sql) are generated automatically where possible. Non-derivable corrections (enum value mapping) generate TODO comments.
 
 ---
 
 ## `dbd migrate`
 
-Show migration status.
+Show migration status (read-only).
 
 ```sh
-dbd migrate --status               # Show local vs DB version
+dbd migrate --status     # Show DB version vs latest, list pending
 ```
 
-*Migration apply not yet implemented in Rust CLI.*
+Use `dbd apply` to execute pending migrations. There is no separate migrate --apply.
 
 ---
 
 ## `dbd deploy`
 
-One-shot deployment from a source.
+Deploy from a local path or GitHub source. Runs apply + import in one step.
 
 ```sh
-dbd deploy --source owner/repo/db -d $DATABASE_URL
-dbd deploy --dry-run --source owner/repo/db
+dbd deploy --source owner/repo/path -d $DATABASE_URL    # From GitHub
+dbd deploy --source ./local/project                       # From local path
+dbd deploy --dry-run --source owner/repo/path             # Preview
 ```
 
-*Not yet implemented in Rust CLI.*
+GitHub sources are cached in ~/.cache/dbd/.
+
+---
+
+## `dbd export`
+
+Export table data to files.
+
+```sh
+dbd export                              # Export all tables as CSV
+dbd export --name config.lookups        # Export one table
+dbd export --format tsv                 # TSV format
+dbd export --format jsonl               # JSONL format
+```
+
+Writes to `export/<schema>/<name>.<format>`.
+If export entries are configured in design.yaml, only those tables are exported.
+
+---
+
+## `dbd init`
+
+Scaffold a new dbd project.
+
+```sh
+dbd init                                # Postgres target, name from directory
+dbd init --name myproject               # Custom project name
+dbd init --target supabase              # Supabase target with grants + externals
+```
+
+Creates design.yaml, ddl/ directory structure, and a sample table DDL.
+Supabase target includes default external entities (auth.users, storage.objects)
+and ignore patterns for managed schemas.
 
 ---
 
@@ -196,4 +236,4 @@ Detects and migrates old Node.js config format:
 | Variable | Used by |
 |----------|---------|
 | `DATABASE_URL` | Default database connection |
-| `GITHUB_TOKEN` | Private GitHub repository access (future) |
+| `GITHUB_TOKEN` | Private GitHub repository access |

@@ -32,8 +32,6 @@ schemas:
 external:
   - name: auth.users
     note: Supabase managed authentication table
-    columns:
-      - id: uuid
 
 import:
   staging: [staging]
@@ -45,8 +43,6 @@ import:
     - staging.lookups
     - staging.lookup_values:
         truncate: false
-  after:
-    - import/loader.sql
 
 export:
   - config.lookups
@@ -71,6 +67,7 @@ ignore:
 |--------|--------|----------|-------------|
 | `name` | string | yes | Project display name (used in DBML, migration tracking) |
 | `note` | string | no | Project description |
+| `version` | u32 | no | Schema version (managed by `dbd snapshot`) |
 
 ### `source`
 
@@ -91,19 +88,21 @@ Each key is a target name. The first listed target is the default. Select with `
 | `roles`      | list   | Roles to create (`{name, refers}` objects) |
 | `grants`     | object | Schema grants — Supabase only (`{schema: {role: [perms]}}`) |
 | `schemas`    | list   | PostgREST-exposed schemas — Supabase only |
+| `skip_schemas` | list | Schemas to exclude from entity scanning |
 
-**SQLite:**
+**Grants example (Supabase):**
 
-| Field  | Type   | Description |
-|--------|--------|-------------|
-| `path` | string | Path to SQLite database file |
+```yaml
+target:
+  supabase:
+    url: $DATABASE_URL
+    grants:
+      config:
+        anon: [usage, select]
+        authenticated: [usage, select, insert, update, delete]
+```
 
-**Convex:**
-
-| Field           | Type   | Default   | Description |
-|-----------------|--------|-----------|-------------|
-| `schema_prefix` | bool   | `false`   | Prefix table names with schema name |
-| `skip_schemas`  | list   | `[public]` | Schemas to skip prefix for |
+SQLite and Convex adapters are planned.
 
 ### `schemas`
 
@@ -117,8 +116,6 @@ FK stubs for tables managed outside the project (e.g., Supabase `auth.users`):
 external:
   - name: auth.users
     note: Supabase managed authentication table
-    columns:
-      - id: uuid
 ```
 
 ### `import`
@@ -128,7 +125,6 @@ external:
 | `staging` | list   | Schemas allowed for import (import fails for other schemas) |
 | `options` | object | Default options: `truncate`, `null_value`, `format` |
 | `tables`  | list   | Explicit table list (string or `{name: options}`) |
-| `after`   | list   | SQL files to execute after all imports |
 
 ### `export`
 
