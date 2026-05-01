@@ -76,6 +76,16 @@ schemas:
   - public
   - config
 
+external:
+  - name: auth.users
+    note: Supabase auth users table
+  - name: auth.uid
+    note: Supabase auth function (returns current user ID)
+  - name: storage.objects
+    note: Supabase storage objects table
+  - name: storage.buckets
+    note: Supabase storage buckets table
+
 ignore:
   - auth.*
   - storage.*
@@ -151,6 +161,9 @@ mod tests {
         assert!(config.content.contains("supabase:"));
         assert!(config.content.contains("auth.*"));
         assert!(config.content.contains("storage.*"));
+        // Default external entities for Supabase
+        assert!(config.content.contains("auth.users"), "should include auth.users external");
+        assert!(config.content.contains("storage.objects"), "should include storage.objects external");
     }
 
     #[test]
