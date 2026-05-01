@@ -23,6 +23,7 @@ async fn main() {
         &args.environment,
         args.database.as_deref(),
         &project_dir,
+        &args.source,
         verbosity,
     )
     .await

@@ -28,6 +28,11 @@ async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 futures-lite = "2"
 
+# HTTP & archive (for deploy --source github)
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false, optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+
 # Utilities
 sha2 = "0.10"
 chrono = "0.4"
@@ -41,5 +46,6 @@ pretty_assertions = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
-default = ["postgres"]
+default = ["postgres", "deploy"]
 postgres = ["dep:sqlx"]
+deploy = ["dep:reqwest", "dep:flate2", "dep:tar"]

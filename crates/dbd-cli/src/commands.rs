@@ -13,6 +13,7 @@ pub async fn run(
     env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
+    source: &str,
     verbosity: Verbosity,
 ) -> Result<()> {
     match command {
@@ -55,9 +56,8 @@ pub async fn run(
             }
         }
 
-        Commands::Deploy { dry_run: _ } => {
-            output::info(verbosity, "Deploy not yet implemented in Rust CLI");
-            Ok(())
+        Commands::Deploy { dry_run } => {
+            cmd_deploy(source, config, env, database_url, *dry_run, verbosity).await
         }
 
         Commands::Dbml { file } => cmd_dbml(config, env, project_dir, file, verbosity),
@@ -527,6 +527,60 @@ fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
         output::summary(issues.len(), 0, 0);
     }
 
+    Ok(())
+}
+
+async fn cmd_deploy(
+    source: &str,
+    _config_name: &Path,
+    env: &str,
+    database_url: Option<&str>,
+    dry_run: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
+    output::info(verbosity, &format!("Deploying from source: {source}"));
+
+    // Resolve source to a local directory (downloads from GitHub if needed)
+    let project_dir = dbd_core::deploy::resolve_source(source)
+        .await
+        .context("Failed to resolve source")?;
+
+    let config_path = project_dir.join("design.yaml");
+    if !config_path.exists() {
+        anyhow::bail!("No design.yaml found in {}", project_dir.display());
+    }
+
+    // Load design from resolved source
+    let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
+        .context("Failed to load design from source")?;
+
+    if dry_run {
+        let report = design.report(None);
+        output::info(verbosity, &format!(
+            "{} entities found, {} errors, {} warnings",
+            design.entities().len(),
+            report.issues.len(),
+            report.warnings.len(),
+        ));
+        output::info(verbosity, "[dry-run] No changes applied.");
+        return Ok(());
+    }
+
+    // Apply
+    let adapter = get_adapter(&config_path, database_url).await?;
+    output::info(verbosity, "Applying schema...");
+    design.apply(&adapter, None, false).await
+        .context("Apply failed")?;
+
+    // Import
+    let import_plan = design.import_plan(None);
+    if !import_plan.is_empty() {
+        output::info(verbosity, &format!("Importing {} data file(s)...", import_plan.len()));
+        design.import_data(&adapter, None, false).await
+            .context("Import failed")?;
+    }
+
+    output::info(verbosity, "Deploy complete.");
     Ok(())
 }
 

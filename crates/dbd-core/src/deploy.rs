@@ -1,0 +1,167 @@
+use std::path::{Path, PathBuf};
+
+use crate::error::{DbdError, Result};
+use crate::github;
+
+/// Resolve a source string to a local project directory.
+///
+/// - Local path (starts with `.`, `/`, or exists on disk): return as-is
+/// - GitHub source: download tarball, extract to cache, return cache path
+pub async fn resolve_source(source: &str) -> Result<PathBuf> {
+    if !github::is_github_source(source) {
+        // Local path
+        let path = PathBuf::from(source);
+        if !path.exists() {
+            return Err(DbdError::Config(format!(
+                "Source directory not found: {source}"
+            )));
+        }
+        return Ok(path);
+    }
+
+    // GitHub source
+    let gh = github::parse_github_source(source)?;
+    let cache = github::cache_dir(&gh.owner, &gh.repo, &gh.git_ref);
+
+    // Check if already cached
+    if cache.join("design.yaml").exists() {
+        return Ok(resolve_subpath(&cache, gh.subpath.as_deref()));
+    }
+
+    // Download and extract
+    download_github_source(&gh, &cache).await?;
+    Ok(resolve_subpath(&cache, gh.subpath.as_deref()))
+}
+
+#[cfg(feature = "deploy")]
+async fn download_github_source(gh: &github::GitHubSource, cache: &std::path::Path) -> Result<()> {
+    download_and_extract(gh, cache).await
+}
+
+#[cfg(not(feature = "deploy"))]
+async fn download_github_source(_gh: &github::GitHubSource, _cache: &std::path::Path) -> Result<()> {
+    Err(DbdError::Config(
+        "GitHub deploy requires the 'deploy' feature (reqwest/flate2/tar)".to_string(),
+    ))
+}
+
+fn resolve_subpath(base: &Path, subpath: Option<&str>) -> PathBuf {
+    match subpath {
+        Some(sp) => base.join(sp),
+        None => base.to_path_buf(),
+    }
+}
+
+#[cfg(feature = "deploy")]
+async fn download_and_extract(
+    gh: &github::GitHubSource,
+    cache_dir: &Path,
+) -> Result<()> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/tarball/{}",
+        gh.owner, gh.repo, gh.git_ref
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent("dbd-rs")
+        .build()
+        .map_err(|e| DbdError::GitHubSource(format!("HTTP client error: {e}")))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| DbdError::GitHubSource(format!("Failed to fetch {}: {e}", gh.label())))?;
+
+    if !response.status().is_success() {
+        return Err(DbdError::GitHubSource(format!(
+            "GitHub returned {} for {}",
+            response.status(),
+            gh.label()
+        )));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| DbdError::GitHubSource(format!("Failed to read response: {e}")))?;
+
+    // Extract tarball
+    std::fs::create_dir_all(cache_dir)?;
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut archive = tar::Archive::new(decoder);
+
+    // GitHub tarballs have a top-level directory like "owner-repo-sha/"
+    // We need to strip that prefix when extracting
+    for entry in archive
+        .entries()
+        .map_err(|e| DbdError::GitHubSource(format!("Failed to read tarball: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| DbdError::GitHubSource(format!("Tarball entry error: {e}")))?;
+
+        let path = entry
+            .path()
+            .map_err(|e| DbdError::GitHubSource(format!("Invalid path in tarball: {e}")))?;
+
+        // Strip the first component (github prefix directory)
+        let stripped: PathBuf = path.components().skip(1).collect();
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+
+        // Validate no path traversal
+        let dest = cache_dir.join(&stripped);
+        if !dest.starts_with(cache_dir) {
+            continue; // Skip paths that would escape cache dir
+        }
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut file)
+                .map_err(|e| DbdError::GitHubSource(format!("Failed to extract file: {e}")))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_subpath_without_sub() {
+        let base = PathBuf::from("/cache/owner-repo-HEAD");
+        assert_eq!(resolve_subpath(&base, None), base);
+    }
+
+    #[test]
+    fn resolve_subpath_with_sub() {
+        let base = PathBuf::from("/cache/owner-repo-HEAD");
+        assert_eq!(
+            resolve_subpath(&base, Some("database")),
+            PathBuf::from("/cache/owner-repo-HEAD/database")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_local_path() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_source(tmp.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_path_not_found() {
+        let result = resolve_source("/nonexistent/path/to/project").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+}
