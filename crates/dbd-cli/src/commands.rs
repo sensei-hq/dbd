@@ -63,6 +63,16 @@ pub async fn run(
         Commands::Dbml { file } => cmd_dbml(config, env, project_dir, file, verbosity),
 
         Commands::Doctor { fix } => cmd_doctor(config, *fix, verbosity),
+
+        Commands::Init { name, target } => {
+            let project_name = name.as_deref().unwrap_or_else(|| {
+                project_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("my-project")
+            });
+            cmd_init(project_dir, project_name, target, verbosity)
+        }
     }
 }
 
@@ -516,6 +526,25 @@ fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
         output::always("\nRun with --fix to migrate automatically.");
         output::summary(issues.len(), 0, 0);
     }
+
+    Ok(())
+}
+
+fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosity) -> Result<()> {
+    let files = dbd_core::init::create_project(project_dir, name, target)
+        .context("Failed to initialize project")?;
+
+    output::info(verbosity, &format!("Initialized dbd project '{name}' ({target})"));
+    for file in &files {
+        if !file.content.is_empty() {
+            output::detail(verbosity, &format!("  created {}", file.path.display()));
+        }
+    }
+    output::info(verbosity, "\nNext steps:");
+    output::info(verbosity, "  1. Set DATABASE_URL or edit design.yaml target.url");
+    output::info(verbosity, "  2. Add DDL files to ddl/table/<schema>/<name>.ddl");
+    output::info(verbosity, "  3. Run 'dbd inspect' to validate");
+    output::info(verbosity, "  4. Run 'dbd apply' to create schema in database");
 
     Ok(())
 }
