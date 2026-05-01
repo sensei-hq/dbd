@@ -20,6 +20,7 @@
 | `migrate --status` | — | yes | Read-only version diagnostic |
 | `init` | yes | — | Scaffold new project (postgres/supabase) |
 | `deploy` | `--dry-run` | yes | Deploy from local path or GitHub source |
+| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl files |
 
 ### Completed features
 
@@ -57,10 +58,11 @@
 - `--dry-run` previews without executing
 - Tarball extraction with path traversal protection
 
-### Export command
+### Export command — DONE
+- `dbd export [--name table] [--format csv|tsv|jsonl]`
 - COPY TO STDOUT streaming via sqlx
-- Write to `export/<schema>/<name>.<format>`
-- Format support: csv, tsv, json, jsonl
+- Writes to `export/<schema>/<name>.<format>`
+- Exports from config entries or all tables
 
 ### Import truncate — NEXT
 - Truncate staging tables before COPY to prevent duplicate rows on re-import
