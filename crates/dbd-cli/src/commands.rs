@@ -60,6 +60,10 @@ pub async fn run(
             cmd_deploy(source, config, env, database_url, *dry_run, verbosity).await
         }
 
+        Commands::Export { name, format } => {
+            cmd_export(config, env, project_dir, database_url, name.as_deref(), format, verbosity).await
+        }
+
         Commands::Dbml { file } => cmd_dbml(config, env, project_dir, file, verbosity),
 
         Commands::Doctor { fix } => cmd_doctor(config, *fix, verbosity),
@@ -527,6 +531,55 @@ fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
         output::summary(issues.len(), 0, 0);
     }
 
+    Ok(())
+}
+
+async fn cmd_export(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    format: &str,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+
+    let adapter = get_adapter(config, database_url).await?;
+
+    // Build export list: either from config export entries, or all tables
+    let tables: Vec<&dbd_core::Entity> = if !design.config().export.is_empty() {
+        let export_names: Vec<String> = design.config().export.iter().map(|e| e.name()).collect();
+        design.entities().iter()
+            .filter(|e| e.entity_type == dbd_core::EntityType::Table)
+            .filter(|e| export_names.contains(&e.name))
+            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .collect()
+    } else {
+        design.entities().iter()
+            .filter(|e| e.entity_type == dbd_core::EntityType::Table)
+            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .collect()
+    };
+
+    if tables.is_empty() {
+        output::info(verbosity, "No tables to export.");
+        return Ok(());
+    }
+
+    output::info(verbosity, &format!("Exporting {} table(s) as {format}...", tables.len()));
+
+    for table in &tables {
+        // Set format on a clone for the adapter
+        let mut export_entity = (*table).clone();
+        export_entity.format = Some(format.to_string());
+        adapter.export_data(&export_entity).await
+            .context(format!("Failed to export {}", table.name))?;
+        output::detail(verbosity, &format!("  exported {}", table.name));
+    }
+
+    output::info(verbosity, "Export complete. Files written to export/");
     Ok(())
 }
 
