@@ -62,6 +62,12 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         sections.push(refs);
     }
 
+    // External entity stub tables (for FK targets that are External entities)
+    let external_stubs = emit_external_stubs(params.entities);
+    if !external_stubs.is_empty() {
+        sections.push(external_stubs);
+    }
+
     DbmlDocument {
         file_name: "design.dbml".to_string(),
         content: sections.join("\n"),
@@ -325,6 +331,96 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
     };
 
     format!("Ref: {} > {}{}", source_cols, target_cols, settings_str)
+}
+
+/// Generate stub Table blocks for External entities that are FK targets.
+///
+/// Scans all Table entities for FK constraints (inline + table-level) pointing
+/// to an External entity. For each such external, emits a minimal Table block
+/// containing only the referenced columns plus an "[external]" note.
+/// External entities with no FK references (e.g. functions like auth.uid) are skipped.
+fn emit_external_stubs(entities: &[Entity]) -> String {
+    // Collect external entity names for quick lookup
+    let external_names: std::collections::HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::External)
+        .map(|e| e.name.as_str())
+        .collect();
+
+    if external_names.is_empty() {
+        return String::new();
+    }
+
+    // For each external entity, collect referenced columns from FK constraints
+    let mut external_refs: std::collections::HashMap<&str, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+
+    for entity in entities {
+        if entity.entity_type != EntityType::Table {
+            continue;
+        }
+        let Some(ref table_def) = entity.table_def else {
+            continue;
+        };
+
+        // Inline FKs from columns
+        for col in &table_def.columns {
+            if let Some(ref fk) = col.inline_fk {
+                let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
+                let qualified = format!("{}.{}", ref_schema, fk.ref_table);
+                if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
+                    let entry = external_refs.entry(ext_name).or_default();
+                    for rc in &fk.ref_columns {
+                        entry.insert(rc.clone());
+                    }
+                }
+            }
+        }
+
+        // Table-level FK constraints
+        for constraint in &table_def.constraints {
+            if let TableConstraint::ForeignKey(fk) = constraint {
+                let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
+                let qualified = format!("{}.{}", ref_schema, fk.ref_table);
+                if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
+                    let entry = external_refs.entry(ext_name).or_default();
+                    for rc in &fk.ref_columns {
+                        entry.insert(rc.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if external_refs.is_empty() {
+        return String::new();
+    }
+
+    let mut blocks = Vec::new();
+    let mut sorted_names: Vec<&&str> = external_refs.keys().collect();
+    sorted_names.sort();
+
+    for ext_name in sorted_names {
+        let cols = external_refs.get(ext_name).unwrap();
+        let (schema, table_name) = match ext_name.split_once('.') {
+            Some((s, t)) => (s, t),
+            None => ("public", *ext_name),
+        };
+
+        let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, table_name)];
+        let mut sorted_cols: Vec<&String> = cols.iter().collect();
+        sorted_cols.sort();
+        for col_name in sorted_cols {
+            // Stub columns use a generic type — we don't know the actual type
+            lines.push(format!("  \"{}\" varchar", col_name));
+        }
+        lines.push(String::new());
+        lines.push("  Note: 'External entity — managed outside this project'".to_string());
+        lines.push("}\n".to_string());
+        blocks.push(lines.join("\n"));
+    }
+
+    blocks.join("\n")
 }
 
 fn fk_action_str(action: &FkAction) -> &'static str {
@@ -697,5 +793,71 @@ mod tests {
         });
         assert!(doc.content.contains("config"));
         assert!(doc.content.contains("staging"));
+    }
+
+    // ── External entity stub tests ───────────────────────
+
+    #[test]
+    fn external_entity_renders_as_stub_table() {
+        let table_entity = make_table_entity(
+            "config.profiles",
+            vec![
+                pk_col("id", "UUID"),
+                ColumnDef {
+                    inline_fk: Some(ForeignKey {
+                        columns: vec!["user_id".to_string()],
+                        ref_schema: Some("auth".to_string()),
+                        ref_table: "users".to_string(),
+                        ref_columns: vec!["id".to_string()],
+                        ..Default::default()
+                    }),
+                    ..col("user_id", "UUID")
+                },
+            ],
+            vec![],
+        );
+        let external_entity = Entity::new(EntityType::External, "auth.users");
+
+        let entities = vec![table_entity, external_entity];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+        });
+
+        assert!(doc.content.contains("Table \"auth\".\"users\""), "should have stub table for auth.users");
+        assert!(doc.content.contains("\"id\" varchar"), "stub should contain referenced column");
+        assert!(doc.content.contains("External entity"), "stub should have external note");
+    }
+
+    #[test]
+    fn external_entity_without_fk_refs_skipped() {
+        let table_entity = make_table_entity(
+            "config.profiles",
+            vec![pk_col("id", "UUID")],
+            vec![],
+        );
+        // auth.uid is a function, not a FK target
+        let external_entity = Entity::new(EntityType::External, "auth.uid");
+
+        let entities = vec![table_entity, external_entity];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+        });
+
+        assert!(!doc.content.contains("auth.uid"), "external without FK refs should not appear");
+        assert!(!doc.content.contains("\"auth\".\"uid\""), "external without FK refs should not appear as table");
     }
 }
