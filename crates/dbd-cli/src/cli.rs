@@ -115,4 +115,13 @@ pub enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Initialize a new dbd project
+    Init {
+        /// Project name (defaults to current directory name)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Target platform
+        #[arg(short, long, default_value = "postgres")]
+        target: String,
+    },
 }
