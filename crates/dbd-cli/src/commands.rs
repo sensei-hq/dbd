@@ -251,6 +251,33 @@ async fn cmd_apply(
     output::info(verbosity, "Applying...");
     design.apply(&adapter, name, false).await?;
     output::info(verbosity, &format!("Applied {} entities.", valid.len()));
+
+    // Run grants if target has grants config
+    if let Some((target_name, target_config)) = design.config().target.iter().next()
+        && let Some(ref grants) = target_config.grants
+    {
+            // Build per-schema role→permissions map
+            let schema_grants: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
+                grants.iter().map(|(schema, gc)| {
+                    (schema.clone(), gc.roles.clone())
+                }).collect();
+
+            // Supabase schemas get default anon/authenticated/service_role grants
+            let supabase_schemas = if target_name == "supabase" {
+                design.config().schema_names()
+            } else {
+                vec![]
+            };
+
+            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
+                output::info(verbosity, "Applying grants...");
+                adapter.execute_script(&grants_sql).await
+                    .context("Failed to apply grants")?;
+                output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+            }
+        }
+
+
     Ok(())
 }
 
