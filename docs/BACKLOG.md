@@ -62,14 +62,24 @@
 - Write to `export/<schema>/<name>.<format>`
 - Format support: csv, tsv, json, jsonl
 
-### Import enhancements (deferred)
-- Truncate staging tables before COPY (`truncate: true/false`)
-- Fallback to DELETE FROM on FK constraint failure
-- Environment filtering (`import/dev/`, `import/prod/`)
+### Import truncate — NEXT
+- Truncate staging tables before COPY to prevent duplicate rows on re-import
+- `import.truncate: true` in design.yaml (default: false)
+- Staging tables have no FKs, so TRUNCATE is always safe
+
 
 ---
 
-## P2 — Adapter expansion
+## P2 — Quality & tooling
+
+### DDL formatter
+- `dbd format` — format all DDL files to project conventions
+- Configurable: keyword case, comma style (leading/trailing), type alignment column
+- Default style: lowercase keywords, leading commas, types at column 27
+- `dbd inspect --fix` integration (auto-fix formatting issues)
+- Pre-commit hook integration
+
+### Adapter expansion
 
 ### Supabase adapter
 - Extends PostgresAdapter
@@ -92,6 +102,10 @@
 ---
 
 ## P3 — Advanced features
+
+### Import environment filtering
+- Only load import files matching `--environment` (dev/prod)
+- Path convention: `import/dev/staging/test_data.csv`, `import/prod/staging/seed.csv`
 
 ### Adapter catalog queries
 - Load pg_proc + pg_type + pg_extension on connect

@@ -643,17 +643,25 @@ impl Design {
     ) -> Result<()> {
         let plan = self.import_plan(name);
 
-        // Step 1: Load data into staging tables
+        // Step 1: Truncate staging tables (if configured)
+        let truncate = self.config.import.options.truncate;
+        if truncate && !dry_run {
+            for entry in &plan {
+                let qualified = entry.table.name.replace('.', "\".\"");
+                adapter
+                    .execute_script(&format!("TRUNCATE \"{qualified}\""))
+                    .await?;
+            }
+        }
+
+        // Step 2: Load data into staging tables
         for entry in &plan {
-            if dry_run {
-                
-            } else {
-                
+            if !dry_run {
                 adapter.import_data(&entry.table, false).await?;
             }
         }
 
-        // Step 2: Call import procedures
+        // Step 3: Call import procedures
         for entry in &plan {
             if let Some(ref proc_name) = entry.procedure {
                 if dry_run {
@@ -667,7 +675,7 @@ impl Design {
             }
         }
 
-        // Step 3: Run after scripts
+        // Step 4: Run after scripts
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
             if dry_run {
@@ -1068,6 +1076,31 @@ mod tests {
 
         assert_eq!(plan.len(), 1, "Name filter should return exactly one entry");
         assert_eq!(plan[0].table.name, "staging.lookups");
+    }
+
+    // ── Import truncate test ──────────────────────────────
+
+    #[tokio::test]
+    async fn import_truncates_staging_tables_before_copy() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        // Default config has truncate: true
+        assert!(design.config().import.options.truncate);
+
+        let mock = MockAdapter::new();
+        // import_data will fail on actual COPY (no real file), but truncate should happen first
+        let _ = design.import_data(&mock, None, false).await;
+
+        // Check that TRUNCATE was issued for staging tables
+        let scripts = mock.scripts.lock().unwrap();
+        let truncate_scripts: Vec<&String> = scripts.iter()
+            .filter(|s| s.to_uppercase().contains("TRUNCATE"))
+            .collect();
+        // Should have at least one truncate if there are import tables
+        if !design.import_tables().is_empty() {
+            assert!(!truncate_scripts.is_empty(), "should issue TRUNCATE for staging tables");
+        }
     }
 
     // ── Execution plan test helpers ───────────────────────
