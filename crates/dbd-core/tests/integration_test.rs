@@ -379,6 +379,10 @@ fn dbml_generates_valid_output() {
         project_name: &d.config().project.name,
         database_type: &d.config().source.dialect,
         project_note: d.config().project.note.as_deref(),
+        include_schemas: vec![],
+        exclude_schemas: vec![],
+        include_tables: vec![],
+        exclude_tables: vec![],
     });
 
     assert!(!doc.content.is_empty());
@@ -394,6 +398,10 @@ fn dbml_includes_refs() {
         project_name: "test",
         database_type: "postgresql",
         project_note: None,
+        include_schemas: vec![],
+        exclude_schemas: vec![],
+        include_tables: vec![],
+        exclude_tables: vec![],
     });
 
     assert!(doc.content.contains("Ref:"), "DBML should contain FK refs");

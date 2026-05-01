@@ -475,11 +475,27 @@ fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
+    // Get DBML filters from config (use default doc if available)
+    let dbml_config = design.config().dbml.values().next();
+    let (inc_schemas, exc_schemas, inc_tables, exc_tables) = match dbml_config {
+        Some(cfg) => (
+            cfg.include.as_ref().map(|f| f.schemas.clone()).unwrap_or_default(),
+            cfg.exclude.as_ref().map(|f| f.schemas.clone()).unwrap_or_default(),
+            cfg.include.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
+            cfg.exclude.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
+        ),
+        None => (vec![], vec![], vec![], vec![]),
+    };
+
     let doc = dbd_core::dbml::generate_dbml(&dbd_core::dbml::DbmlParams {
         entities: design.entities(),
         project_name: &design.config().project.name,
         database_type: &design.config().source.dialect,
         project_note: design.config().project.note.as_deref(),
+        include_schemas: inc_schemas,
+        exclude_schemas: exc_schemas,
+        include_tables: inc_tables,
+        exclude_tables: exc_tables,
     });
 
     std::fs::write(file, &doc.content)?;
