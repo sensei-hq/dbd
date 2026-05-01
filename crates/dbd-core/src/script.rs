@@ -2,6 +2,18 @@
 use crate::config::RoleEntry;
 use crate::entity::{Entity, EntityType};
 
+/// Supabase-managed schemas that must never be dropped.
+pub const SUPABASE_PROTECTED: &[&str] = &[
+    "auth", "storage", "realtime", "graphql_public",
+    "supabase_functions", "pgbouncer", "pgsodium", "vault",
+    "extensions", "supabase_migrations",
+];
+
+/// System schemas that must never be dropped.
+pub const SYSTEM_PROTECTED: &[&str] = &[
+    "pg_catalog", "information_schema", "pg_toast", "public",
+];
+
 /// Generate DDL SQL from an entity.
 ///
 /// For schema/extension/role: generates CREATE statements.
@@ -43,32 +55,46 @@ fn generate_role_script(entity: &Entity) -> String {
     script
 }
 
-/// Build a reset script that drops all project schemas.
+/// Build a reset script that drops only declared user schemas.
 ///
-/// For supabase target: skips Supabase-managed schemas.
+/// Returns `Err` if any schema matches a protected list.
+/// Filters out `skip_schemas` before generating DROP statements.
 /// For postgres target: also drops roles in reverse dependency order.
-pub fn build_reset_script(schemas: &[String], roles: &[RoleEntry], target: &str) -> Option<String> {
-    let protected = [
-        "auth", "storage", "realtime", "graphql_public", "supabase_functions",
-        "extensions", "pgbouncer", "pgsodium", "vault",
-    ];
+pub fn build_reset_script(
+    user_schemas: &[String],
+    roles: &[RoleEntry],
+    target: &str,
+    skip_schemas: &[String],
+) -> Result<Option<String>, String> {
+    // Filter out skip_schemas first
+    let candidate_schemas: Vec<&String> = user_schemas
+        .iter()
+        .filter(|s| !skip_schemas.iter().any(|skip| skip == *s))
+        .collect();
 
-    let schemas_to_drop: Vec<&String> = if target == "supabase" {
-        schemas
-            .iter()
-            .filter(|s| !protected.contains(&s.as_str()))
-            .collect()
-    } else {
-        schemas.iter().collect()
-    };
+    // Reject if any candidate matches protected lists
+    for schema in &candidate_schemas {
+        if target == "supabase" && SUPABASE_PROTECTED.contains(&schema.as_str()) {
+            return Err(format!(
+                "Cannot reset Supabase-protected schema: {}",
+                schema
+            ));
+        }
+        if SYSTEM_PROTECTED.contains(&schema.as_str()) {
+            return Err(format!(
+                "Cannot reset system-protected schema: {}",
+                schema
+            ));
+        }
+    }
 
-    if schemas_to_drop.is_empty() && roles.is_empty() {
-        return None;
+    if candidate_schemas.is_empty() && roles.is_empty() {
+        return Ok(None);
     }
 
     let mut lines = Vec::new();
 
-    for schema in &schemas_to_drop {
+    for schema in &candidate_schemas {
         lines.push(format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE;", schema));
     }
 
@@ -79,7 +105,7 @@ pub fn build_reset_script(schemas: &[String], roles: &[RoleEntry], target: &str)
         }
     }
 
-    Some(lines.join("\n"))
+    Ok(Some(lines.join("\n")))
 }
 
 /// Build a grants script for Supabase PostgREST schemas.
@@ -186,7 +212,7 @@ mod tests {
     #[test]
     fn reset_script_drops_schemas() {
         let schemas = vec!["config".to_string(), "staging".to_string()];
-        let script = build_reset_script(&schemas, &[], "postgres").unwrap();
+        let script = build_reset_script(&schemas, &[], "postgres", &[]).unwrap().unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(script.contains("DROP SCHEMA IF EXISTS \"staging\" CASCADE"));
     }
@@ -198,7 +224,7 @@ mod tests {
             RoleEntry { name: "basic".to_string(), refers: vec![] },
             RoleEntry { name: "advanced".to_string(), refers: vec!["basic".to_string()] },
         ];
-        let script = build_reset_script(&schemas, &roles, "postgres").unwrap();
+        let script = build_reset_script(&schemas, &roles, "postgres", &[]).unwrap().unwrap();
         assert!(script.contains("DROP ROLE IF EXISTS \"advanced\""));
         assert!(script.contains("DROP ROLE IF EXISTS \"basic\""));
         // Reverse order: advanced before basic
@@ -208,22 +234,49 @@ mod tests {
     }
 
     #[test]
-    fn reset_script_supabase_skips_managed_schemas() {
-        let schemas = vec![
-            "config".to_string(),
-            "auth".to_string(),
-            "storage".to_string(),
-        ];
-        let script = build_reset_script(&schemas, &[], "supabase").unwrap();
-        assert!(script.contains("config"));
+    fn reset_script_returns_none_when_empty() {
+        let script = build_reset_script(&[], &[], "postgres", &[]).unwrap();
+        assert!(script.is_none());
+    }
+
+    // ── R1: only drops declared schemas ──────────────────
+    #[test]
+    fn r1_only_drops_declared_schemas() {
+        let schemas = vec!["config".to_string(), "staging".to_string()];
+        let script = build_reset_script(&schemas, &[], "supabase", &[]).unwrap().unwrap();
+        assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
+        assert!(script.contains("DROP SCHEMA IF EXISTS \"staging\" CASCADE"));
+        // Should not contain any undeclared schemas
         assert!(!script.contains("auth"));
         assert!(!script.contains("storage"));
     }
 
+    // ── R2: supabase protected rejected ──────────────────
     #[test]
-    fn reset_script_returns_none_when_empty() {
-        let script = build_reset_script(&[], &[], "postgres");
-        assert!(script.is_none());
+    fn r2_supabase_protected_rejected() {
+        let schemas = vec!["config".to_string(), "auth".to_string()];
+        let result = build_reset_script(&schemas, &[], "supabase", &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Supabase-protected"));
+    }
+
+    // ── R3: system protected rejected ────────────────────
+    #[test]
+    fn r3_system_protected_rejected() {
+        let schemas = vec!["config".to_string(), "pg_catalog".to_string()];
+        let result = build_reset_script(&schemas, &[], "postgres", &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("system-protected"));
+    }
+
+    // ── R4: skip_schemas excluded ────────────────────────
+    #[test]
+    fn r4_skip_schemas_excluded() {
+        let schemas = vec!["config".to_string(), "staging".to_string()];
+        let skip = vec!["staging".to_string()];
+        let script = build_reset_script(&schemas, &[], "postgres", &skip).unwrap().unwrap();
+        assert!(script.contains("config"));
+        assert!(!script.contains("staging"));
     }
 
     #[test]

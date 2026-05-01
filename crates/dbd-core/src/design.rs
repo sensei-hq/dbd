@@ -757,7 +757,8 @@ impl Design {
             .filter(|e| e.entity_type == EntityType::Schema)
             .map(|e| e.name.clone())
             .collect();
-        if let Some(sql) = script::build_reset_script(&schemas, roles, target) {
+        if let Some(sql) = script::build_reset_script(&schemas, roles, target, &[])
+            .map_err(DbdError::SafetyGuard)? {
             adapter.execute_script(&sql).await?;
         }
         adapter.clear_project_migrations().await?;
