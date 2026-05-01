@@ -240,10 +240,19 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn export_data(&self, entity: &Entity) -> Result<()> {
         let qualified = entity.name.replace('.', "\".\"");
-        let copy_sql = format!(
-            "COPY (SELECT * FROM \"{}\") TO STDOUT WITH (FORMAT csv, HEADER true)",
-            qualified
-        );
+        let format = entity.format.as_deref().unwrap_or("csv");
+
+        let copy_sql = match format {
+            "tsv" => format!(
+                "COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
+            ),
+            "jsonl" => format!(
+                "COPY (SELECT row_to_json(t) FROM \"{qualified}\" t) TO STDOUT"
+            ),
+            _ => format!(
+                "COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true)"
+            ),
+        };
 
         let mut conn = self.pool.acquire().await
             .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
@@ -270,7 +279,6 @@ impl DatabaseAdapter for PostgresAdapter {
 
         let export_dir = Path::new("export").join(schema);
         std::fs::create_dir_all(&export_dir)?;
-        let format = entity.format.as_deref().unwrap_or("csv");
         std::fs::write(export_dir.join(format!("{name}.{format}")), &data)?;
 
         Ok(())

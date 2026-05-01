@@ -115,6 +115,15 @@ pub enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Export table data to files
+    Export {
+        /// Export a specific table only
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Output format (csv, tsv, jsonl)
+        #[arg(short, long, default_value = "csv")]
+        format: String,
+    },
     /// Initialize a new dbd project
     Init {
         /// Project name (defaults to current directory name)
