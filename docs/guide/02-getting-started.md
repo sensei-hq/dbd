@@ -17,27 +17,21 @@ cargo build --release
 ## Create a project
 
 ```sh
-dbd init -p myproject
-cd myproject
+dbd init --name myproject
 ```
 
 This creates:
 
 ```
-myproject/
-  design.yaml              # Project configuration
-  ddl/                     # DDL files
-    table/config/
-      lookups.ddl
-      lookup_values.ddl
-    view/config/
-      genders.ddl
-    procedure/staging/
-      import_lookups.ddl
-  import/                  # Staging data
-    staging/
-      lookups.csv
-      lookup_values.csv
+design.yaml
+ddl/
+  table/.gitkeep
+  view/.gitkeep
+  function/.gitkeep
+  procedure/.gitkeep
+  enum/.gitkeep
+  table/public/example.ddl
+import/.gitkeep
 ```
 
 ## Configure
@@ -131,6 +125,6 @@ For automated deployments:
 
 ```sh
 dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
+dbd deploy --source ./local/path -d $DATABASE_URL
+dbd deploy --dry-run --source owner/repo/path
 ```
-
-This fetches the repository, applies the schema, imports data, and cleans up.
