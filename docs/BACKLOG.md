@@ -2,7 +2,7 @@
 
 ## Current status (2026-04-30)
 
-**72 commits, 13,000+ LOC, 335 tests, verified on sensei/daemon/database (116 entities)**
+**78 commits, 13,500+ LOC, 341 tests, verified on sensei/daemon/database (116 entities)**
 
 ### Working commands
 
@@ -39,7 +39,7 @@
 | Target | Status |
 |--------|--------|
 | PostgreSQL | Working (sqlx, PG17+ assumed) |
-| Supabase | Planned |
+| Supabase | Working (config-driven: grants, protected reset, externals) |
 | SQLite | Planned |
 | Convex | Planned |
 
@@ -54,16 +54,17 @@
 - `dbd inspect --fix` integration (auto-fix formatting issues)
 - Pre-commit hook integration
 
-### Config gaps to wire
-- `target.skip_schemas` — exclude schemas from reset/apply (useful for Supabase)
+### Supabase support — DONE
+- Whitelist-only reset: only drops schemas declared in config
+- Protected schemas: auth, storage, realtime etc. can never be dropped (even with --force)
+- `target.skip_schemas` wired: excludes entities from apply/scan
+- Grants after apply: GRANT per schema/role + NOTIFY pgrst
+- Default externals in init: auth.users, auth.uid, storage.objects, storage.buckets
+- External entities render as DBML stub tables for FK targets
+
+### Config gaps remaining
 - `target.schema_prefix` — multi-tenant schema prefix
 - Per-table `export.format` — override per table (currently CLI `--format` only)
-
-### Supabase adapter
-- Extends PostgresAdapter
-- Filters 9 managed schemas (auth, storage, realtime, etc.)
-- Filters 10 pre-installed extensions
-- Grants script with PostgREST notification
 
 ### SQLite adapter
 - `rusqlite` integration
