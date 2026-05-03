@@ -700,6 +700,21 @@ impl Design {
         Ok(())
     }
 
+    /// Deploy the full schema: apply DDL then import seed data.
+    ///
+    /// Equivalent to `apply` followed by `import_data`. dbd handles
+    /// fresh / migrate / current strategy automatically — safe to call
+    /// on every bootstrap (idempotent when schema is already current).
+    pub async fn deploy(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+    ) -> Result<()> {
+        self.apply(adapter, None, dry_run).await?;
+        self.import_data(adapter, None, dry_run).await?;
+        Ok(())
+    }
+
     /// Combine all DDL into a single SQL file.
     pub fn combine(&self, file: &Path) -> Result<()> {
         let combined: Vec<String> = self
@@ -1416,5 +1431,41 @@ mod tests {
         entities.retain(|e| match &e.schema { Some(s) => !skip.contains(s), None => true });
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "config.users");
+    }
+
+    // ── deploy() tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn deploy_dry_run_returns_ok_and_applies_nothing() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "prod").unwrap();
+
+        let mock = MockAdapter::new();
+        design.deploy(&mock, true).await.unwrap();
+
+        assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
+        assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
+    }
+
+    #[tokio::test]
+    async fn deploy_non_dry_run_completes_with_no_errors() {
+        // Use a minimal design (no import tables, no after scripts) so
+        // import_data succeeds with a MockAdapter.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\n",
+        )
+        .unwrap();
+
+        let design = Design::from_config_with_dir(
+            &tmp.path().join("design.yaml"),
+            "dev",
+            Some(tmp.path()),
+        )
+        .unwrap();
+
+        let mock = MockAdapter::new();
+        design.deploy(&mock, false).await.unwrap();
     }
 }
