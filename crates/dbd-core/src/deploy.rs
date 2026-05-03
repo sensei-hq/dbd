@@ -23,9 +23,10 @@ pub async fn resolve_source(source: &str) -> Result<PathBuf> {
     let gh = github::parse_github_source(source)?;
     let cache = github::cache_dir(&gh.owner, &gh.repo, &gh.git_ref);
 
-    // Check if already cached
-    if cache.join("design.yaml").exists() {
-        return Ok(resolve_subpath(&cache, gh.subpath.as_deref()));
+    // Check if already cached — resolve subpath first so subpath sources hit correctly
+    let resolved = resolve_subpath(&cache, gh.subpath.as_deref());
+    if resolved.join("design.yaml").exists() {
+        return Ok(resolved);
     }
 
     // Download and extract
@@ -163,5 +164,29 @@ mod tests {
         let result = resolve_source("/nonexistent/path/to/project").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_source_cache_hit_with_subpath() {
+        use crate::github::cache_dir;
+
+        // Simulate a pre-populated cache for sensei-hq/daemon/database@test-cache-hit-v1
+        let cache = cache_dir("sensei-hq", "daemon", "test-cache-hit-v1");
+        let database_dir = cache.join("database");
+        std::fs::create_dir_all(&database_dir).unwrap();
+        std::fs::write(database_dir.join("design.yaml"), "project:\n  name: test\n").unwrap();
+
+        // Should return the database/ subpath without attempting a network download
+        let result = resolve_source("sensei-hq/daemon/database@test-cache-hit-v1").await;
+
+        // Cleanup before assertions so a failure doesn't leave files behind
+        std::fs::remove_dir_all(&cache).ok();
+
+        let path = result.expect("should return cached path without downloading");
+        assert!(
+            path.ends_with("database"),
+            "should resolve to database/ subpath, got: {}",
+            path.display()
+        );
     }
 }
