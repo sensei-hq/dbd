@@ -56,12 +56,30 @@
 - Function/procedure `$$` bodies preserved verbatim
 
 ### DDL formatter v2 — river formatting
-- SELECT query formatting with river-style keyword alignment
-- Right-aligned keywords: select, from, where, and, on, inner join, order by
-- Leading comma alignment in SELECT lists, INSERT column lists
-- Subquery indentation
+- River-style SQL formatting where keywords, commas, and operators form a vertical channel
+- **Right-aligned keywords:** select, from, where, and, on, inner join, left join, order by, group by, having
+- **Leading comma alignment** in SELECT lists, INSERT column lists, UPDATE SET clauses
+- **Alias alignment:** column aliases (AS) and table aliases aligned to a consistent column
+  ```sql
+  select lv.id
+       , lv.value          as display_value
+       , lv.is_active      as active
+    from lookups            lkp
+   inner join lookup_values lv
+      on lv.lookup_id       = lkp.id
+   where lkp.name           = 'Gender'
+     and lv.is_active       = true
+  ```
+- **Right-aligned operators:** `=`, `!=`, `>=`, `<=`, `~*`, `like`, `in` aligned to form the river
+- **Indented parentheses** for nested conditions:
+  ```sql
+   where (lkp.status   = 'active'
+      or  lkp.status   = 'pending')
+     and lkp.is_visible = true
+  ```
+- **Subquery indentation** with consistent nesting
 - VIEW body formatting (currently keyword-case only)
-- Enum CREATE TYPE multi-line value formatting
+- Enum CREATE TYPE multi-line value formatting with leading commas
 - Pre-commit hook integration
 
 ### Supabase support — DONE
