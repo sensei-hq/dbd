@@ -1,13 +1,12 @@
 #![cfg(feature = "postgres")]
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
+use super::{CatalogData, DatabaseAdapter, ProjectMeta, ReferenceClass};
 
 /// Ensure `public` is included in any SET search_path statement.
 /// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
@@ -34,26 +33,31 @@ use crate::script;
 pub struct PostgresAdapter {
     pool: PgPool,
     project: String,
-    builtin_functions: HashSet<String>,
-    builtin_types: HashSet<String>,
-    extension_objects: std::collections::HashMap<String, String>,
+    catalog: CatalogData,
+    /// SHA-256 of the connection URL, used as cache key.
+    url_hash: String,
 }
 
 impl PostgresAdapter {
     /// Create a new adapter from a connection URL.
     pub async fn new(url: &str, project: &str) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(url)
             .await
             .map_err(|e| DbdError::Config(format!("Database connection failed: {e}")))?;
 
+        let mut hasher = Sha256::new();
+        hasher.update(url.as_bytes());
+        let url_hash = format!("{:x}", hasher.finalize());
+
         Ok(Self {
             pool,
             project: project.to_string(),
-            builtin_functions: HashSet::new(),
-            builtin_types: HashSet::new(),
-            extension_objects: std::collections::HashMap::new(),
+            catalog: CatalogData::default(),
+            url_hash,
         })
     }
 
@@ -98,6 +102,60 @@ impl PostgresAdapter {
 
         // Extract the SET search_path and CREATE TYPE from the DDL
         self.execute_script(sql).await
+    }
+
+    fn cache_path(&self) -> std::path::PathBuf {
+        let base = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from(".cache"));
+        base.join("dbd")
+            .join("catalog")
+            .join(format!("{}.json", self.url_hash))
+    }
+
+    fn load_catalog_cache(&self) -> Option<CatalogData> {
+        let path = self.cache_path();
+        let content = std::fs::read_to_string(&path).ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct CacheFile {
+            created_at: String,
+            ttl_hours: u32,
+            data: CatalogData,
+        }
+
+        let cache: CacheFile = serde_json::from_str(&content).ok()?;
+
+        // Check TTL (allow override via env var)
+        let ttl_hours = std::env::var("DBD_CATALOG_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(cache.ttl_hours);
+
+        let created = chrono::DateTime::parse_from_rfc3339(&cache.created_at).ok()?;
+        let age = chrono::Utc::now().signed_duration_since(created);
+        if age.num_hours() >= ttl_hours as i64 {
+            return None; // Stale
+        }
+
+        Some(cache.data)
+    }
+
+    fn save_catalog_cache(&self) {
+        let path = self.cache_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let cache = serde_json::json!({
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "ttl_hours": 24,
+            "data": &self.catalog,
+        });
+
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&cache).unwrap_or_default(),
+        )
+        .ok();
     }
 
     /// SQL keywords and types that appear as false-positive references.
@@ -285,51 +343,75 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn load_catalog(&mut self) -> Result<()> {
-        // Built-in functions
+        // Try loading from cache first
+        if let Some(cached) = self.load_catalog_cache() {
+            self.catalog = cached;
+            return Ok(());
+        }
+
+        // Functions with namespace
         let rows = sqlx::query(
-            "SELECT proname FROM pg_proc p \
-             JOIN pg_namespace n ON p.pronamespace = n.oid \
-             WHERE n.nspname = 'pg_catalog'"
+            "SELECT n.nspname, p.proname FROM pg_proc p \
+             JOIN pg_namespace n ON p.pronamespace = n.oid",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DbdError::Config(format!("Catalog query failed: {e}")))?;
 
         for row in &rows {
+            let schema: String = row.get("nspname");
             let name: String = row.get("proname");
-            self.builtin_functions.insert(name);
+            self.catalog.functions.insert(format!("{schema}.{name}"));
         }
 
-        // Built-in types
+        // Types with namespace
         let rows = sqlx::query(
-            "SELECT typname FROM pg_type \
-             WHERE typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')"
+            "SELECT n.nspname, t.typname FROM pg_type t \
+             JOIN pg_namespace n ON t.typnamespace = n.oid",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DbdError::Config(format!("Type catalog query failed: {e}")))?;
 
         for row in &rows {
+            let schema: String = row.get("nspname");
             let name: String = row.get("typname");
-            self.builtin_types.insert(name);
+            self.catalog.types.insert(format!("{schema}.{name}"));
         }
 
-        // Extension functions
+        // Extension objects (functions + types with extension name)
         let rows = sqlx::query(
-            "SELECT p.proname AS func_name, e.extname AS extension \
-             FROM pg_proc p \
+            "SELECT p.proname AS obj_name, e.extname, n.nspname FROM pg_proc p \
              JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e' \
-             JOIN pg_extension e ON e.oid = d.refobjid"
+             JOIN pg_extension e ON e.oid = d.refobjid \
+             JOIN pg_namespace n ON p.pronamespace = n.oid",
         )
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
 
         for row in &rows {
-            let func: String = row.get("func_name");
-            let ext: String = row.get("extension");
-            self.extension_objects.insert(func, ext);
+            let name: String = row.get("obj_name");
+            let ext: String = row.get("extname");
+            self.catalog.extension_objects.insert(name, ext);
         }
+
+        // Extension schemas
+        let rows = sqlx::query(
+            "SELECT n.nspname FROM pg_extension e \
+             JOIN pg_namespace n ON e.extnamespace = n.oid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &rows {
+            let schema: String = row.get("nspname");
+            self.catalog.extension_schemas.insert(schema);
+        }
+
+        // Save cache
+        self.save_catalog_cache();
 
         Ok(())
     }
@@ -342,15 +424,47 @@ impl DatabaseAdapter for PostgresAdapter {
             return ReferenceClass::Internal;
         }
 
-        // Catalog lookup (if loaded)
-        if self.builtin_functions.contains(&lower) || self.builtin_types.contains(&lower) {
-            return ReferenceClass::Internal;
-        }
-        if let Some(ext) = self.extension_objects.get(&lower) {
+        // Extension objects (bare name lookup)
+        if let Some(ext) = self.catalog.extension_objects.get(&lower) {
             return ReferenceClass::Extension(ext.clone());
         }
 
-        // Static pattern fallback
+        // Qualified name check
+        if lower.contains('.')
+            && (self.catalog.functions.contains(&lower) || self.catalog.types.contains(&lower))
+        {
+            // Check if it's in an extension schema
+            let schema = lower.split('.').next().unwrap_or("");
+            if self.catalog.extension_schemas.contains(schema) {
+                return ReferenceClass::Extension("unknown".to_string());
+            }
+            return ReferenceClass::Internal;
+        }
+
+        // Bare name: check pg_catalog namespace
+        let pg_qualified = format!("pg_catalog.{lower}");
+        if self.catalog.functions.contains(&pg_qualified)
+            || self.catalog.types.contains(&pg_qualified)
+        {
+            return ReferenceClass::Internal;
+        }
+
+        // Check if name is in any extension schema
+        for ext_schema in &self.catalog.extension_schemas {
+            if self
+                .catalog
+                .functions
+                .contains(&format!("{ext_schema}.{lower}"))
+                || self
+                    .catalog
+                    .types
+                    .contains(&format!("{ext_schema}.{lower}"))
+            {
+                return ReferenceClass::Extension("unknown".to_string());
+            }
+        }
+
+        // Static pattern fallback (for offline/no-catalog mode)
         if Self::matches_static_pattern(&lower) {
             return ReferenceClass::Internal;
         }
