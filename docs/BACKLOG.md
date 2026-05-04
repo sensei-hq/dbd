@@ -71,11 +71,11 @@
      and lv.is_active       = true
   ```
 - **Right-aligned operators:** `=`, `!=`, `>=`, `<=`, `~*`, `like`, `in` aligned to form the river
-- **Indented parentheses** for nested conditions:
+- **Parenthesized conditions:** `or`/`and` inside parens indent to the opening paren, outer `and`/`or` stays at clause level:
   ```sql
-   where (lkp.status   = 'active'
-      or  lkp.status   = 'pending')
-     and lkp.is_visible = true
+   where (    lkp.status    = 'active'
+           or lkp.status    = 'pending')
+     and lkp.is_visible     = true
   ```
 - **Subquery indentation** with consistent nesting
 - VIEW body formatting (currently keyword-case only)
