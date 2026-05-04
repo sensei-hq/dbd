@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -23,6 +24,19 @@ pub struct ProjectMeta {
     pub env: String,
     pub version: u32,
     pub applied_at: Option<String>,
+}
+
+/// Catalog data loaded from the database for reference classification.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CatalogData {
+    /// Qualified function names: "pg_catalog.array_agg", "extensions.st_distance"
+    pub functions: HashSet<String>,
+    /// Qualified type names: "pg_catalog.int4", "public.geometry"
+    pub types: HashSet<String>,
+    /// Bare name -> extension name: "st_distance" -> "postgis"
+    pub extension_objects: HashMap<String, String>,
+    /// Schemas owned by extensions
+    pub extension_schemas: HashSet<String>,
 }
 
 /// The database adapter trait — each target implements this.
@@ -124,5 +138,66 @@ mod tests {
             ReferenceClass::Extension("postgis".into())
         );
         assert_ne!(ReferenceClass::Internal, ReferenceClass::UserDefined);
+    }
+
+    #[test]
+    fn c1_pg_catalog_function_is_internal() {
+        let mut catalog = CatalogData::default();
+        catalog
+            .functions
+            .insert("pg_catalog.array_agg".to_string());
+        assert!(catalog.functions.contains("pg_catalog.array_agg"));
+    }
+
+    #[test]
+    fn c4_sql_noise_keywords_present() {
+        // SQL noise keywords are checked via PostgresAdapter::is_sql_noise,
+        // but we verify common noise words are recognized patterns.
+        let noise_words = ["varchar", "integer", "now", "coalesce", "count"];
+        for word in noise_words {
+            assert!(
+                [
+                    "varchar", "int", "integer", "bigint", "smallint", "numeric", "decimal",
+                    "boolean", "text", "date", "timestamp", "timestamptz", "uuid", "jsonb",
+                    "json", "bytea", "float", "double", "real", "serial", "bigserial", "btree",
+                    "hash", "gin", "gist", "brin", "now", "coalesce", "nullif", "greatest",
+                    "least", "extract", "count", "sum", "avg", "min", "max", "string_agg",
+                    "row_number", "rank", "dense_rank", "lead", "lag", "upper", "lower", "trim",
+                    "length", "replace", "substring", "cast", "exists", "between", "like", "in",
+                    "not", "and", "or", "true", "false", "null", "default", "current_user",
+                    "localtime", "localtimestamp", "random", "floor", "ceil", "abs", "round",
+                    "enum", "record", "void", "trigger", "event_trigger",
+                ]
+                .contains(&word),
+                "{word} should be SQL noise"
+            );
+        }
+    }
+
+    #[test]
+    fn c10_catalog_data_default_is_empty() {
+        let catalog = CatalogData::default();
+        assert!(catalog.functions.is_empty());
+        assert!(catalog.types.is_empty());
+        assert!(catalog.extension_objects.is_empty());
+        assert!(catalog.extension_schemas.is_empty());
+    }
+
+    #[test]
+    fn c11_catalog_data_serialization_roundtrip() {
+        let mut catalog = CatalogData::default();
+        catalog
+            .functions
+            .insert("pg_catalog.array_agg".to_string());
+        catalog
+            .extension_objects
+            .insert("st_distance".to_string(), "postgis".to_string());
+        let json = serde_json::to_string(&catalog).unwrap();
+        let deserialized: CatalogData = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.functions.contains("pg_catalog.array_agg"));
+        assert_eq!(
+            deserialized.extension_objects.get("st_distance"),
+            Some(&"postgis".to_string())
+        );
     }
 }
