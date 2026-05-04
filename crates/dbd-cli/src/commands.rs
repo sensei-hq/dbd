@@ -17,7 +17,7 @@ pub async fn run(
     verbosity: Verbosity,
 ) -> Result<()> {
     match command {
-        Commands::Inspect { name } => cmd_inspect(config, env, project_dir, name.as_deref(), verbosity),
+        Commands::Inspect { name, fix } => cmd_inspect(config, env, project_dir, name.as_deref(), *fix, verbosity),
 
         Commands::Combine { file } => cmd_combine(config, env, project_dir, file, verbosity),
 
@@ -77,6 +77,8 @@ pub async fn run(
             });
             cmd_init(project_dir, project_name, target, verbosity)
         }
+
+        Commands::Format { check } => cmd_format(config, project_dir, *check, verbosity),
     }
 }
 
@@ -119,7 +121,7 @@ fn resolve_env_vars(s: &str) -> String {
 // ── Command implementations ─────────────────────────────
 
 #[allow(clippy::collapsible_if)]
-fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
+fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, fix: bool, verbosity: Verbosity) -> Result<()> {
     let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let report = design.report(name);
     let total_entities = design.entities().len();
@@ -162,6 +164,31 @@ fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>,
 
     if report.issues.is_empty() && report.warnings.is_empty() {
         output::info(verbosity, "Everything looks ok");
+    }
+
+    // Auto-format DDL files when --fix is passed
+    if fix {
+        let format_config = if config.exists() {
+            let design_config = dbd_core::config::read(config)?;
+            design_config.format
+        } else {
+            dbd_core::config::FormatConfig::default()
+        };
+
+        let files = dbd_core::scanner::scan_ddl(project_dir);
+        let mut changed = 0;
+        for file in &files {
+            let content = std::fs::read_to_string(file)?;
+            let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
+            if content != formatted {
+                changed += 1;
+                std::fs::write(file, &formatted)?;
+                output::info(verbosity, &format!("  formatted: {}", file.display()));
+            }
+        }
+        if changed > 0 {
+            output::info(verbosity, &format!("Formatted {changed} file(s)."));
+        }
     }
 
     output::summary(report.issues.len(), report.warnings.len(), total_entities);
@@ -677,6 +704,44 @@ async fn cmd_deploy(
     }
 
     output::info(verbosity, "Deploy complete.");
+    Ok(())
+}
+
+fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosity) -> Result<()> {
+    let format_config = if config.exists() {
+        let design_config = dbd_core::config::read(config)?;
+        design_config.format
+    } else {
+        dbd_core::config::FormatConfig::default()
+    };
+
+    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let mut changed = 0;
+
+    for file in &files {
+        let content = std::fs::read_to_string(file)?;
+        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
+
+        if content != formatted {
+            changed += 1;
+            if check {
+                output::info(verbosity, &format!("  would reformat: {}", file.display()));
+            } else {
+                std::fs::write(file, &formatted)?;
+                output::info(verbosity, &format!("  formatted: {}", file.display()));
+            }
+        }
+    }
+
+    if check && changed > 0 {
+        output::info(verbosity, &format!("{changed} file(s) would be reformatted."));
+        std::process::exit(1);
+    } else if changed > 0 {
+        output::info(verbosity, &format!("Formatted {changed} file(s)."));
+    } else {
+        output::info(verbosity, "All files already formatted.");
+    }
+
     Ok(())
 }
 

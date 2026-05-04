@@ -39,6 +39,9 @@ pub enum Commands {
         /// Inspect a specific entity by name
         #[arg(short, long)]
         name: Option<String>,
+        /// Auto-fix formatting issues
+        #[arg(long)]
+        fix: bool,
     },
     /// Apply DDL scripts to database
     Apply {
@@ -132,5 +135,11 @@ pub enum Commands {
         /// Target platform
         #[arg(short, long, default_value = "postgres")]
         target: String,
+    },
+    /// Format DDL files
+    Format {
+        /// Check formatting without modifying files (exit 1 if unformatted)
+        #[arg(long)]
+        check: bool,
     },
 }
