@@ -1,59 +1,56 @@
 # Backlog
 
-## Current status (2026-04-30)
+## Current status (2026-05-04)
 
-**78 commits, 13,500+ LOC, 341 tests, verified on sensei/daemon/database (116 entities)**
+**96 commits, 14,842 LOC, 364 tests (326 unit + 38 integration), v0.3.0**
 
 ### Working commands
 
 | Command | Offline | With DB | Notes |
 |---------|---------|---------|-------|
-| `inspect` | yes | — | Full validation pipeline |
-| `apply` | `--dry-run` | yes | Version-aware: fresh install, migrations, idempotent re-apply |
-| `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching, dependency ordering |
-| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl files |
-| `reset` | `--dry-run` | yes | Safety guards (_dbd_meta env/version) |
+| `inspect` | yes | — | Validation pipeline, `--fix` auto-formats DDL |
+| `apply` | `--dry-run` | yes | Version-aware migrations, `--with-policies` |
+| `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching |
+| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl |
+| `reset` | `--dry-run` | yes | Whitelist-only schema drops, protected schemas |
 | `combine` | yes | — | Merge all DDL into single SQL file |
 | `graph` | yes | — | JSON with nodes/edges/layers |
-| `dbml` | yes | — | Include/exclude schema+table filters |
+| `dbml` | yes | — | Include/exclude filters, external entity stubs |
 | `doctor` | yes | — | Config migration from Node.js format |
-| `snapshot` | yes | — | Smart multi-snapshot: rename/type change (2 stages), enum removal (3 stages) |
+| `snapshot` | yes | — | Smart multi-snapshot (rename, type change, enum removal) |
 | `migrate --status` | — | yes | Read-only version diagnostic |
-| `init` | yes | — | Scaffold new project (postgres/supabase) |
-| `deploy` | `--dry-run` | yes | Deploy from local path or GitHub source |
+| `init` | yes | — | Scaffold project (postgres/supabase) |
+| `deploy` | `--dry-run` | yes | Local path or GitHub source |
+| `format` | yes | — | DDL formatting with `--check` for CI |
+| `policies` | `--dry-run` | yes | RLS policy application |
 
 ### Core features
 
 - **Schema diff engine** — columns, constraints, indexes, enum values with SQL generation
-- **Smart multi-snapshot** — auto-detects renames/type changes/enum removal, generates intermediate states + data.sql
-- **`_dbd_meta`** — authoritative version source, env/version/applied_at tracking
+- **Smart multi-snapshot** — auto-splits renames/type changes/enum removal into safe migration stages
+- **`_dbd_meta`** — authoritative version source, env/version/applied_at
 - **Migration data corrections** — `*.data.sql` after ALTERs, CAST heuristics, TODO for business logic
-- **Execution plan** — pure function builds plan from version state, thin I/O wrapper executes
+- **Execution plan** — pure function builds plan, thin I/O wrapper executes
 - **Change classification** — `is_castable()`, `classify_changes()`, `generate_data_sql()`
-- **DBML filters** — include/exclude by schema or table name from config
-- **Import truncate** — TRUNCATE staging tables before COPY (default: true)
+- **DDL formatter** — keyword case, comma style, type alignment (configurable in design.yaml)
+- **RLS policies** — scan policies/ folder, apply with fail-forward, `--with-policies` on apply
+- **Adapter catalog** — namespace-aware pg_proc/pg_type/pg_extension queries with file cache
+- **Supabase support** — grants after apply, protected reset, default externals, DBML stubs
+- **DBML filters** — include/exclude by schema or table name
 - **Deploy** — local path or GitHub source (reqwest + tar, cached)
 
 ### Adapter support
 
 | Target | Status |
 |--------|--------|
-| PostgreSQL | Working (sqlx, PG17+ assumed) |
-| Supabase | Working (config-driven: grants, protected reset, externals) |
+| PostgreSQL | Working (sqlx, PG17+, namespace-aware catalog) |
+| Supabase | Working (grants, protected reset, externals) |
 | SQLite | Planned |
 | Convex | Planned |
 
 ---
 
-## P2 — Quality & tooling
-
-### DDL formatter — DONE (v1)
-- `dbd format` — format all DDL files in-place
-- `dbd format --check` — CI mode (exit 1 if any file would change)
-- `dbd inspect --fix` — auto-fix formatting during validation
-- Configurable via `format:` section in design.yaml
-- Handles: CREATE TABLE (full), CREATE INDEX, SET, COMMENT ON
-- Function/procedure `$$` bodies preserved verbatim
+## Next up
 
 ### DDL formatter v2 — river formatting
 - River-style SQL formatting where keywords, commas, and operators form a vertical channel
@@ -82,17 +79,34 @@
 - Enum CREATE TYPE multi-line value formatting with leading commas
 - Pre-commit hook integration
 
-### Supabase support — DONE
-- Whitelist-only reset: only drops schemas declared in config
-- Protected schemas: auth, storage, realtime etc. can never be dropped (even with --force)
-- `target.skip_schemas` wired: excludes entities from apply/scan
-- Grants after apply: GRANT per schema/role + NOTIFY pgrst
-- Default externals in init: auth.users, auth.uid, storage.objects, storage.buckets
-- External entities render as DBML stub tables for FK targets
-
-### Config gaps remaining
+### Config gaps
 - `target.schema_prefix` — multi-tenant schema prefix
 - Per-table `export.format` — override per table (currently CLI `--format` only)
+
+### Database inspection
+- `dbd inspect --database` resolves warnings against live DB catalog
+- DB reference cache for offline use
+
+### data.sql validation
+- `dbd inspect` verifies all TODO comments in data.sql have been resolved
+- Block apply if unresolved TODOs exist
+
+---
+
+## Future
+
+### Import environment filtering
+- Only load import files matching `--environment` (dev/prod)
+- Path convention: `import/dev/staging/test_data.csv`, `import/prod/staging/seed.csv`
+
+### Parallel file parsing
+- `rayon::par_iter` for DDL file read + parse
+- Benchmark: measure parsing time on large projects (100+ DDL files)
+
+### DBML enhancements
+- Multi-document support (multiple dbml output files)
+- Table group generation
+- Composite FK ref support
 
 ### SQLite adapter
 - `rusqlite` integration
@@ -108,57 +122,23 @@
 
 ---
 
-## P3 — Advanced features
-
-### Import environment filtering
-- Only load import files matching `--environment` (dev/prod)
-- Path convention: `import/dev/staging/test_data.csv`, `import/prod/staging/seed.csv`
-
-### Adapter catalog queries
-- Load pg_proc + pg_type + pg_extension on connect
-- Replace static pattern matching with live catalog lookup
-- Cache per connection URL in `~/.cache/dbd/`
-- Eliminates false positive reference warnings
-
-### Parallel file parsing
-- `rayon::par_iter` for DDL file read + parse
-- Dependencies: rayon already in Cargo.toml
-- Benchmark: measure parsing time on large projects (100+ DDL files)
-
-### DBML enhancements
-- Multi-document support (multiple dbml output files)
-- Table group generation
-- Composite FK ref support
-
-### Policy application
-- `dbd policies` command
-- Scan `policies/` folder
-- Apply RLS policies via adapter
-
-### Database inspection
-- `dbd inspect` with `--database` resolves warnings against live DB catalog
-- DB reference cache for offline use
-
-### data.sql validation
-- `dbd inspect` verifies all TODO comments in data.sql have been resolved
-- Block apply if unresolved TODOs exist
-
----
-
 ## Test coverage
 
-**335 tests** (297 unit + 38 integration) covering:
-- Schema diff engine (45 tests): D1-D21, S1-S14, warnings, edge cases
-- Snapshot create (17 tests): SC1-SC10, entity conversion, backward compat
-- Multi-snapshot (7 tests): B1-B3, S1-S2, baseline, no-changes
-- Change classification (8 tests): C1-C7, enum rename
-- Castability (9 tests): CA1-CA5, type categories
-- data.sql generation (5 tests): D1-D5
-- Execution plan (12 tests): A1-A6, edge cases
-- DBML filters (4 tests): include/exclude schema/table
-- Init (7 tests): postgres/supabase targets, directory creation
-- Deploy (4 tests): local resolve, not-found, subpath
-- Config/entity/parser/scanner/dependency/references (221 tests)
+**364 tests** (326 unit + 38 integration) covering:
+- Schema diff engine (45): D1-D21, S1-S14, warnings, edge cases
+- Snapshot create (17): SC1-SC10, entity conversion, backward compat
+- Multi-snapshot (7): B1-B3, S1-S2, baseline, no-changes
+- Change classification (8): C1-C7, enum rename
+- Castability (9): CA1-CA5, type categories
+- data.sql generation (5): D1-D5
+- Execution plan (12): A1-A6, edge cases
+- DDL formatter (10): F1-F12
+- RLS policies (6): P1-P8
+- Adapter catalog (4): C1, C4, C10, C11
+- DBML filters (4): include/exclude schema/table
+- Init (7): postgres/supabase targets
+- Deploy (5): local resolve, not-found, subpath, cache hit
+- Config/entity/parser/scanner/dependency/references (225)
 
 ### CI configuration
 

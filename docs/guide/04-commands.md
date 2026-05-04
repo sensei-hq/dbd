@@ -213,6 +213,51 @@ and ignore patterns for managed schemas.
 
 ---
 
+## `dbd format`
+
+Format DDL files to project conventions.
+
+```sh
+dbd format                         # Format all DDL files in-place
+dbd format --check                 # Check formatting (exit 1 if any file would change)
+```
+
+Configurable via `format:` section in design.yaml:
+
+```yaml
+format:
+  keyword_case: lower        # lower | upper | preserve
+  comma_style: leading       # leading | trailing
+  type_alignment: 27         # column for type start, 0 = off
+  indent: 2                  # spaces per level
+```
+
+Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim.
+
+---
+
+## `dbd policies`
+
+Apply RLS (Row-Level Security) policies from the `policies/` directory.
+
+```sh
+dbd policies                       # Apply all policy files
+dbd policies --dry-run             # Show what would be applied
+dbd apply --with-policies          # Apply entities + policies in one step
+```
+
+Policy files in `policies/<schema>/<table>.sql` contain idempotent SQL:
+
+```sql
+alter table config.users enable row level security;
+drop policy if exists "users_select_own" on config.users;
+create policy "users_select_own" on config.users for select using (auth.uid() = id);
+```
+
+Failed policies are logged and skipped (fail-forward). Exit code 1 if any failures.
+
+---
+
 ## `dbd doctor`
 
 Audit and migrate design.yaml configuration.
@@ -237,3 +282,4 @@ Detects and migrates old Node.js config format:
 |----------|---------|
 | `DATABASE_URL` | Default database connection |
 | `GITHUB_TOKEN` | Private GitHub repository access |
+| `DBD_CATALOG_TTL` | Catalog cache TTL in hours (default: 24) |
