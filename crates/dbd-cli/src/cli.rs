@@ -51,6 +51,9 @@ pub enum Commands {
         /// Print apply order without executing
         #[arg(long)]
         dry_run: bool,
+        /// Also apply RLS policies after entities
+        #[arg(long)]
+        with_policies: bool,
     },
     /// Combine all DDL into one file
     Combine {
@@ -141,5 +144,11 @@ pub enum Commands {
         /// Check formatting without modifying files (exit 1 if unformatted)
         #[arg(long)]
         check: bool,
+    },
+    /// Apply RLS policies from policies/ directory
+    Policies {
+        /// Print what would be applied without executing
+        #[arg(long)]
+        dry_run: bool,
     },
 }

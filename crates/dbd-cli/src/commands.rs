@@ -23,8 +23,8 @@ pub async fn run(
 
         Commands::Graph { name } => cmd_graph(config, env, project_dir, name.as_deref(), verbosity),
 
-        Commands::Apply { name, dry_run } => {
-            cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, verbosity).await
+        Commands::Apply { name, dry_run, with_policies } => {
+            cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, verbosity).await
         }
 
         Commands::Import { name, dry_run } => {
@@ -79,6 +79,10 @@ pub async fn run(
         }
 
         Commands::Format { check } => cmd_format(config, project_dir, *check, verbosity),
+
+        Commands::Policies { dry_run } => {
+            cmd_policies(config, project_dir, database_url, *dry_run, verbosity).await
+        }
     }
 }
 
@@ -224,6 +228,7 @@ fn cmd_graph(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, v
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_apply(
     config: &Path,
     env: &str,
@@ -231,6 +236,7 @@ async fn cmd_apply(
     database_url: Option<&str>,
     name: Option<&str>,
     dry_run: bool,
+    with_policies: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
@@ -304,6 +310,16 @@ async fn cmd_apply(
             }
         }
 
+    // Apply RLS policies if requested
+    if with_policies {
+        let report = dbd_core::design::apply_policies(&adapter, project_dir, false).await?;
+        if !report.applied.is_empty() {
+            output::info(verbosity, &format!("Applied {} policy file(s).", report.applied.len()));
+        }
+        for (file, err) in &report.failed {
+            output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
+        }
+    }
 
     Ok(())
 }
@@ -704,6 +720,57 @@ async fn cmd_deploy(
     }
 
     output::info(verbosity, "Deploy complete.");
+    Ok(())
+}
+
+async fn cmd_policies(
+    config: &Path,
+    project_dir: &Path,
+    database_url: Option<&str>,
+    dry_run: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
+    if dry_run {
+        let files = dbd_core::scanner::scan_policies(project_dir);
+        if files.is_empty() {
+            output::info(verbosity, "No policy files found in policies/");
+            return Ok(());
+        }
+        output::info(verbosity, "[dry-run] Would apply policies:");
+        for file in &files {
+            output::info(verbosity, &format!("  {}", file.display()));
+        }
+        return Ok(());
+    }
+
+    let adapter = get_adapter(config, database_url).await?;
+    let report = dbd_core::design::apply_policies(&adapter, project_dir, false).await?;
+
+    if report.applied.is_empty() && report.failed.is_empty() {
+        output::info(verbosity, "No policy files found in policies/");
+        return Ok(());
+    }
+
+    for file in &report.applied {
+        output::detail(verbosity, &format!("  applied: {}", file.display()));
+    }
+    for (file, err) in &report.failed {
+        output::always(&format!("  FAILED: {} — {}", file.display(), err));
+    }
+
+    output::info(
+        verbosity,
+        &format!(
+            "Policies: {} applied, {} failed.",
+            report.applied.len(),
+            report.failed.len()
+        ),
+    );
+
+    if !report.failed.is_empty() {
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 
