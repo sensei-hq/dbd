@@ -215,6 +215,43 @@ pub struct ImportPlanEntry {
     pub writes: Vec<String>,
 }
 
+/// Result of applying RLS policies.
+pub struct PolicyReport {
+    pub applied: Vec<PathBuf>,
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// Apply RLS policy files from the policies/ directory.
+///
+/// Files are executed in alphabetical order. Failed files are logged and skipped.
+pub async fn apply_policies(
+    adapter: &dyn DatabaseAdapter,
+    project_dir: &Path,
+    dry_run: bool,
+) -> Result<PolicyReport> {
+    let files = crate::scanner::scan_policies(project_dir);
+    let mut report = PolicyReport {
+        applied: Vec::new(),
+        failed: Vec::new(),
+    };
+
+    for file in &files {
+        if dry_run {
+            report.applied.push(file.clone());
+            continue;
+        }
+        match std::fs::read_to_string(file) {
+            Ok(sql) => match adapter.execute_script(&sql).await {
+                Ok(()) => report.applied.push(file.clone()),
+                Err(e) => report.failed.push((file.clone(), e.to_string())),
+            },
+            Err(e) => report.failed.push((file.clone(), e.to_string())),
+        }
+    }
+
+    Ok(report)
+}
+
 /// The Design orchestrator — main entry point for all operations.
 ///
 /// Loads configuration, discovers and parses entities, resolves dependencies,
@@ -1445,6 +1482,86 @@ mod tests {
 
         assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
         assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
+    }
+
+    // ── Policy tests ────────────────────────────────────────
+
+    #[test]
+    fn p2_empty_policies_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        let files = crate::scanner::scan_policies(tmp.path());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn p3_missing_policies_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No policies/ dir created
+        let files = crate::scanner::scan_policies(tmp.path());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn p1_scan_finds_sorted_policy_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policies_dir = tmp.path().join("policies/config");
+        std::fs::create_dir_all(&policies_dir).unwrap();
+        std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
+        std::fs::write(policies_dir.join("lookups.sql"), "-- policy").unwrap();
+
+        let files = crate::scanner::scan_policies(tmp.path());
+        assert_eq!(files.len(), 2);
+        // Should be sorted alphabetically
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names[0] <= names[1], "files should be sorted");
+    }
+
+    #[test]
+    fn p8_only_ddl_sql_discovered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policies_dir = tmp.path().join("policies/config");
+        std::fs::create_dir_all(&policies_dir).unwrap();
+        std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
+        std::fs::write(policies_dir.join("readme.md"), "# docs").unwrap();
+        std::fs::write(policies_dir.join("notes.txt"), "notes").unwrap();
+
+        let files = crate::scanner::scan_policies(tmp.path());
+        assert_eq!(files.len(), 1, "only .sql/.ddl files should be discovered");
+    }
+
+    #[tokio::test]
+    async fn p5_policies_applied_via_mock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policies_dir = tmp.path().join("policies/config");
+        std::fs::create_dir_all(&policies_dir).unwrap();
+        std::fs::write(
+            policies_dir.join("users.sql"),
+            "ALTER TABLE config.users ENABLE ROW LEVEL SECURITY;",
+        )
+        .unwrap();
+
+        let mock = MockAdapter::new();
+        let report = apply_policies(&mock, tmp.path(), false).await.unwrap();
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.failed.is_empty());
+        assert_eq!(mock.script_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn p4_dry_run_shows_files_no_execution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policies_dir = tmp.path().join("policies/config");
+        std::fs::create_dir_all(&policies_dir).unwrap();
+        std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
+
+        let mock = MockAdapter::new();
+        let report = apply_policies(&mock, tmp.path(), true).await.unwrap();
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(mock.script_count(), 0, "dry run should not execute");
     }
 
     #[tokio::test]
