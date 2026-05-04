@@ -27,6 +27,8 @@ pub struct DesignConfig {
     pub dbml: HashMap<String, DbmlDocConfig>,
     #[serde(default)]
     pub ignore: Vec<String>,
+    #[serde(default)]
+    pub format: FormatConfig,
 }
 
 impl DesignConfig {
@@ -274,6 +276,55 @@ pub struct DbmlFilter {
     pub schemas: Vec<String>,
     #[serde(default)]
     pub tables: Vec<String>,
+}
+
+// ── Format ─────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeywordCase {
+    #[default]
+    Lower,
+    Upper,
+    Preserve,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommaStyle {
+    #[default]
+    Leading,
+    Trailing,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FormatConfig {
+    #[serde(default)]
+    pub keyword_case: KeywordCase,
+    #[serde(default)]
+    pub comma_style: CommaStyle,
+    #[serde(default = "default_type_alignment")]
+    pub type_alignment: usize,
+    #[serde(default = "default_indent")]
+    pub indent: usize,
+}
+
+fn default_type_alignment() -> usize {
+    27
+}
+fn default_indent() -> usize {
+    2
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self {
+            keyword_case: KeywordCase::Lower,
+            comma_style: CommaStyle::Leading,
+            type_alignment: 27,
+            indent: 2,
+        }
+    }
 }
 
 // ── Environment normalization ───────────────────────────
