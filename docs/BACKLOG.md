@@ -47,11 +47,21 @@
 
 ## P2 — Quality & tooling
 
-### DDL formatter
-- `dbd format` — format all DDL files to project conventions
-- Configurable: keyword case, comma style (leading/trailing), type alignment column
-- Default style: lowercase keywords, leading commas, types at column 27
-- `dbd inspect --fix` integration (auto-fix formatting issues)
+### DDL formatter — DONE (v1)
+- `dbd format` — format all DDL files in-place
+- `dbd format --check` — CI mode (exit 1 if any file would change)
+- `dbd inspect --fix` — auto-fix formatting during validation
+- Configurable via `format:` section in design.yaml
+- Handles: CREATE TABLE (full), CREATE INDEX, SET, COMMENT ON
+- Function/procedure `$$` bodies preserved verbatim
+
+### DDL formatter v2 — river formatting
+- SELECT query formatting with river-style keyword alignment
+- Right-aligned keywords: select, from, where, and, on, inner join, order by
+- Leading comma alignment in SELECT lists, INSERT column lists
+- Subquery indentation
+- VIEW body formatting (currently keyword-case only)
+- Enum CREATE TYPE multi-line value formatting
 - Pre-commit hook integration
 
 ### Supabase support — DONE
