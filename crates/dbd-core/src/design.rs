@@ -704,12 +704,24 @@ impl Design {
     }
 
     /// Import staging data via the adapter.
-    pub async fn import_data(
+    ///
+    /// `on_start(desc)` is called just before each step.
+    /// `on_done(desc, err)` is called after each step — `err` is `None` on success,
+    /// `Some(message)` on failure (called before the error is returned so the caller
+    /// can update UI state before propagation).
+    /// Use `|_| {}` / `|_, _| {}` when progress reporting is not needed.
+    pub async fn import_data<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
-    ) -> Result<()> {
+        mut on_start: S,
+        mut on_done: D,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
         let plan = self.import_plan(name);
 
         // Ensure internal dbd procedures are present before any import runs.
@@ -736,21 +748,41 @@ impl Design {
 
         // Step 2: Load data into staging tables
         for entry in &plan {
+            let fmt = entry.table.format.as_deref().unwrap_or("csv");
+            let desc = format!("import {} ({})", entry.table.name, fmt);
+            on_start(&desc);
             if !dry_run {
-                adapter.import_data(&entry.table, false).await?;
+                let result = adapter.import_data(&entry.table, false).await;
+                match result {
+                    Ok(()) => on_done(&desc, None),
+                    Err(e) => {
+                        let msg = format!("import {} failed: {}", entry.table.name, e);
+                        on_done(&desc, Some(&msg));
+                        return Err(crate::error::DbdError::Config(msg));
+                    }
+                }
+            } else {
+                on_done(&desc, None);
             }
         }
 
         // Step 3: Call import procedures
         for entry in &plan {
             if let Some(ref proc_name) = entry.procedure {
-                if dry_run {
-                    
+                let desc = format!("call {proc_name}()");
+                on_start(&desc);
+                if !dry_run {
+                    let result = adapter.execute_script(&format!("CALL {proc_name}();")).await;
+                    match result {
+                        Ok(()) => on_done(&desc, None),
+                        Err(e) => {
+                            let msg = format!("call {proc_name}() failed: {}", e);
+                            on_done(&desc, Some(&msg));
+                            return Err(crate::error::DbdError::Config(msg));
+                        }
+                    }
                 } else {
-                    
-                    adapter
-                        .execute_script(&format!("CALL {proc_name}();"))
-                        .await?;
+                    on_done(&desc, None);
                 }
             }
         }
@@ -758,12 +790,21 @@ impl Design {
         // Step 4: Run after scripts
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
-            if dry_run {
-                
-            } else {
-                
+            let desc = format!("run {after_file}");
+            on_start(&desc);
+            if !dry_run {
                 let sql = std::fs::read_to_string(&full_path)?;
-                adapter.execute_script(&sql).await?;
+                let result = adapter.execute_script(&sql).await;
+                match result {
+                    Ok(()) => on_done(&desc, None),
+                    Err(e) => {
+                        let msg = format!("run {after_file} failed: {}", e);
+                        on_done(&desc, Some(&msg));
+                        return Err(crate::error::DbdError::Config(msg));
+                    }
+                }
+            } else {
+                on_done(&desc, None);
             }
         }
 
@@ -781,7 +822,7 @@ impl Design {
         dry_run: bool,
     ) -> Result<()> {
         self.apply(adapter, None, dry_run).await?;
-        self.import_data(adapter, None, dry_run).await?;
+        self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}).await?;
         Ok(())
     }
 
@@ -1186,7 +1227,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false).await;
+        let _ = design.import_data(&mock, None, false, |_| {}, |_, _| {}).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
