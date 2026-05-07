@@ -316,21 +316,21 @@ async fn cmd_apply(
         .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
         .collect();
 
-    if verbosity.is_verbose() {
-        output::always("Apply order:");
-        for entity in &valid {
-            let detail = match &entity.file {
-                Some(f) => format!("  {:?} => {} using \"{}\"", entity.entity_type, entity.name, f.display()),
-                None => format!("  {:?} => {}", entity.entity_type, entity.name),
-            };
-            output::always(&detail);
-        }
-        output::always("");
-    }
-
     let adapter = get_adapter(config, database_url).await?;
-    output::info(verbosity, "Applying...");
-    design.apply(&adapter, name, false).await?;
+
+    let spinner = output::StepSpinner::new(verbosity);
+    let result = design
+        .apply(
+            &adapter,
+            name,
+            false,
+            |desc| spinner.start(desc),
+            |desc, err| spinner.done(desc, err),
+        )
+        .await;
+    spinner.finish();
+    result?;
+
     output::info(verbosity, &format!("Applied {} entities.", valid.len()));
 
     // Run grants if target has grants config
@@ -807,8 +807,20 @@ async fn cmd_deploy(
     // Apply
     let adapter = get_adapter(&config_path, database_url).await?;
     output::info(verbosity, "Applying schema...");
-    design.apply(&adapter, None, false).await
-        .context("Apply failed")?;
+    {
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .apply(
+                &adapter,
+                None,
+                false,
+                |desc| spinner.start(desc),
+                |desc, err| spinner.done(desc, err),
+            )
+            .await;
+        spinner.finish();
+        result.context("Apply failed")?;
+    }
 
     // Import
     let import_plan = design.import_plan(None);
