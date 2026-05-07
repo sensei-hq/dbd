@@ -560,13 +560,14 @@ impl Design {
             match step {
                 ExecutionStep::CreateEntity(entity_name) | ExecutionStep::ApplyEntity(entity_name) => {
                     if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                        let desc = format!("apply {entity_name}");
+                        let type_tag = format!("{:?}", entity.entity_type).to_lowercase();
+                        let desc = format!("{type_tag}:{entity_name}");
                         on_start(&desc);
                         let result = adapter.apply_entity(entity).await;
                         match result {
                             Ok(()) => on_done(&desc, None),
                             Err(e) => {
-                                let msg = format!("apply {entity_name} failed: {e}");
+                                let msg = format!("{desc} failed: {e}");
                                 on_done(&desc, Some(&msg));
                                 return Err(DbdError::Config(msg));
                             }
@@ -574,7 +575,10 @@ impl Design {
                     }
                 }
                 ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                    let desc = format!("migrate {entity_name} → v{migration_version}");
+                    let type_tag = entity_map.get(entity_name.as_str())
+                        .map(|e| format!("{:?}", e.entity_type).to_lowercase())
+                        .unwrap_or_else(|| "entity".to_string());
+                    let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
                     on_start(&desc);
                     let result: Result<()> = async {
                         // 1. Run schema change (ALTER/DROP)
@@ -593,14 +597,17 @@ impl Design {
                     match result {
                         Ok(()) => on_done(&desc, None),
                         Err(e) => {
-                            let msg = format!("migrate {entity_name} failed: {e}");
+                            let msg = format!("migrate {type_tag}:{entity_name} failed: {e}");
                             on_done(&desc, Some(&msg));
                             return Err(DbdError::Config(msg));
                         }
                     }
                 }
                 ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                    let desc = format!("drop {entity_name} (v{migration_version})");
+                    let type_tag = entity_map.get(entity_name.as_str())
+                        .map(|e| format!("{:?}", e.entity_type).to_lowercase())
+                        .unwrap_or_else(|| "entity".to_string());
+                    let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
                     on_start(&desc);
                     let result: Result<()> = async {
                         if drop_sql_path.exists() {
@@ -612,7 +619,7 @@ impl Design {
                     match result {
                         Ok(()) => on_done(&desc, None),
                         Err(e) => {
-                            let msg = format!("drop {entity_name} failed: {e}");
+                            let msg = format!("{desc} failed: {e}");
                             on_done(&desc, Some(&msg));
                             return Err(DbdError::Config(msg));
                         }
