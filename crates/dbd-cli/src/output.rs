@@ -78,8 +78,8 @@ fn colorize(desc: &str) -> String {
 
     match key {
         "schema"    => style(desc).cyan().to_string(),
-        "table"     => style(desc).color256(2).to_string(),   // dark green
-        "view"      => style(desc).color256(10).to_string(),  // bright green
+        "table"     => style(desc).green().to_string(),
+        "view"      => style(desc).green().dim().to_string(),
         "enum"      => style(desc).yellow().to_string(),
         "function"  => style(desc).magenta().to_string(),
         "procedure" => style(desc).magenta().to_string(),
@@ -131,7 +131,7 @@ impl StepSpinner {
             pb.println(format!("  {} {colored}", style("✗").red().bold()));
             pb.println(format!("    {}", style(e).red().dim()));
         } else {
-            pb.println(format!("  {} {colored}", style("✓").color256(2)));
+            pb.println(format!("  {} {colored}", style("✓").green()));
         }
     }
 
