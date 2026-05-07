@@ -581,7 +581,14 @@ impl DatabaseAdapter for PostgresAdapter {
         // Embedded at compile time — always up to date with this version of dbd.
         const DDL: &str = include_str!("../internal/import_jsonb_to_table.ddl");
         self.execute_script("CREATE SCHEMA IF NOT EXISTS staging").await?;
-        self.execute_script(DDL).await
+        // Use sqlx::query() instead of execute_script() — sqlx::raw_sql() splits on all
+        // semicolons including those inside $$-quoted PL/pgSQL bodies, which mangles
+        // CREATE PROCEDURE. sqlx::query() sends the statement as a single unit.
+        sqlx::query(DDL)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("ensure staging.import_jsonb_to_table failed: {e}")))?;
+        Ok(())
     }
 
     async fn ensure_meta_table(&self) -> Result<()> {
