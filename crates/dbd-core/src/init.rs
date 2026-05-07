@@ -45,12 +45,6 @@ pub fn generate_init_files(name: &str, target: &str) -> Vec<InitFile> {
         content: generate_sample_table(),
     });
 
-    // import_jsonb_to_table procedure — required for JSONL imports
-    files.push(InitFile {
-        path: PathBuf::from("ddl/procedure/staging/import_jsonb_to_table.ddl"),
-        content: generate_import_jsonb_procedure(),
-    });
-
     files
 }
 
@@ -106,73 +100,6 @@ ignore:
     )
 }
 
-fn generate_import_jsonb_procedure() -> String {
-    r#"-- import_jsonb_to_table: generic JSONL import helper used by `dbd import`
--- called automatically when an import file has format: jsonl
--- args: p_source_table — temp table holding raw jsonb rows (single column: data jsonb)
---       p_target_table — fully-qualified destination table (schema.name)
---
--- Uses pg_catalog to resolve real column types, including enums (USER-DEFINED),
--- so explicit per-column casting works for any table without a custom procedure.
--- Skips GENERATED ALWAYS AS IDENTITY and stored generated columns automatically.
-create or replace procedure staging.import_jsonb_to_table(
-    p_source_table text
-  , p_target_table text
-)
-language plpgsql
-as
-$$
-declare
-  v_target_schema text := split_part(p_target_table, '.', 1);
-  v_target_name   text := split_part(p_target_table, '.', 2);
-  v_col_exprs     text;
-  v_sql           text;
-begin
-  -- Build per-column cast expressions using pg_catalog so that enum types
-  -- (reported as USER-DEFINED by information_schema) are resolved correctly.
-  select string_agg(
-    format(
-      '(data->>%L)::%s'
-    , a.attname
-    , case
-        when t.typtype = 'e'
-          then quote_ident(tn.nspname) || '.' || quote_ident(t.typname)
-        else t.typname
-      end
-    )
-  , ', ' order by a.attnum
-  )
-  into v_col_exprs
-  from pg_catalog.pg_attribute  a
-  join pg_catalog.pg_class       c  on c.oid  = a.attrelid
-  join pg_catalog.pg_namespace   cn on cn.oid = c.relnamespace
-  join pg_catalog.pg_type        t  on t.oid  = a.atttypid
-  join pg_catalog.pg_namespace   tn on tn.oid = t.typnamespace
-  where cn.nspname    = v_target_schema
-    and c.relname     = v_target_name
-    and a.attnum      > 0
-    and not a.attisdropped
-    and a.attidentity <> 'a'   -- exclude GENERATED ALWAYS AS IDENTITY
-    and a.attgenerated = ''    -- exclude stored generated columns;
-
-  if v_col_exprs is null then
-    raise exception 'import_jsonb_to_table: table %.% not found or has no columns',
-      v_target_schema, v_target_name;
-  end if;
-
-  v_sql := format(
-    'insert into %s select %s from %I'
-  , p_target_table
-  , v_col_exprs
-  , p_source_table
-  );
-  execute v_sql;
-end;
-$$
-"#
-    .to_string()
-}
-
 fn generate_sample_table() -> String {
     r#"-- example table — rename or delete this file
 -- path convention: ddl/table/<schema>/<name>.ddl
@@ -219,7 +146,8 @@ mod tests {
 
         assert!(paths.contains(&"design.yaml".to_string()));
         assert!(paths.contains(&"ddl/table/public/example.ddl".to_string()));
-        assert!(paths.contains(&"ddl/procedure/staging/import_jsonb_to_table.ddl".to_string()));
+        // import_jsonb_to_table is managed internally by dbd — not scaffolded
+        assert!(!paths.contains(&"ddl/procedure/staging/import_jsonb_to_table.ddl".to_string()));
 
         // design.yaml has correct content
         let config = files.iter().find(|f| f.path.display().to_string() == "design.yaml").unwrap();
@@ -258,31 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn scaffolds_import_jsonb_procedure() {
-        let files = generate_init_files("test", "postgres");
-        let proc = files
-            .iter()
-            .find(|f| f.path.display().to_string() == "ddl/procedure/staging/import_jsonb_to_table.ddl")
-            .expect("import_jsonb_to_table.ddl should be scaffolded");
-        assert!(proc.content.contains("import_jsonb_to_table"));
-        assert!(proc.content.contains("p_source_table"));
-        assert!(proc.content.contains("p_target_table"));
-        // Uses pg_catalog for type resolution (handles enums correctly)
-        assert!(proc.content.contains("pg_catalog.pg_attribute"));
-        assert!(proc.content.contains("typtype = 'e'"));
-        // Skips generated columns
-        assert!(proc.content.contains("attidentity <> 'a'"));
-        assert!(proc.content.contains("attgenerated = ''"));
-    }
-
-    #[test]
     fn create_project_writes_files() {
         let tmp = TempDir::new().unwrap();
         let files = create_project(tmp.path(), "test", "postgres").unwrap();
         assert!(tmp.path().join("design.yaml").exists());
         assert!(tmp.path().join("ddl/table/public/example.ddl").exists());
         assert!(tmp.path().join("ddl/view/.gitkeep").exists());
-        assert!(tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+        // import_jsonb_to_table is managed internally — must NOT be written to user project
+        assert!(!tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
         assert!(files.len() > 5);
     }
 
