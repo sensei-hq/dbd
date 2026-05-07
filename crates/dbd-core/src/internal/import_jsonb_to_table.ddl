@@ -42,7 +42,7 @@ begin
     and a.attnum       > 0
     and not a.attisdropped
     and a.attidentity  <> 'a'   -- exclude GENERATED ALWAYS AS IDENTITY
-    and a.attgenerated = ''     -- exclude stored generated columns;
+    and a.attgenerated = ''     -- exclude stored generated columns
 
   if v_col_exprs is null then
     raise exception 'import_jsonb_to_table: table %.% not found or has no columns',

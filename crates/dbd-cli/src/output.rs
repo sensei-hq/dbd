@@ -21,13 +21,13 @@ impl Verbosity {
     }
 }
 
-/// Print a line (normal + verbose).
+/// Print a line in normal + verbose mode.
 pub fn info(verbosity: Verbosity, msg: &str) {
-    let _ = verbosity; // Always print in both modes
+    let _ = verbosity;
     println!("{msg}");
 }
 
-/// Print detail only in verbose mode.
+/// Print only in verbose mode.
 pub fn detail(verbosity: Verbosity, msg: &str) {
     if verbosity.is_verbose() {
         println!("{msg}");
@@ -49,5 +49,28 @@ pub fn summary(errors: usize, warnings: usize, entities: usize) {
             if errors != 1 { "s" } else { "" },
             if warnings != 1 { "s" } else { "" },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_from_flag() {
+        assert_eq!(Verbosity::from_flag(true), Verbosity::Verbose);
+        assert_eq!(Verbosity::from_flag(false), Verbosity::Normal);
+    }
+
+    #[test]
+    fn verbose_is_verbose() {
+        assert!(Verbosity::Verbose.is_verbose());
+        assert!(!Verbosity::Normal.is_verbose());
+    }
+
+    #[test]
+    fn detail_only_runs_in_verbose() {
+        assert!(!Verbosity::Normal.is_verbose());
+        assert!(Verbosity::Verbose.is_verbose());
     }
 }

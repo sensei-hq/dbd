@@ -425,6 +425,24 @@ async fn cmd_import(
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
+    // Show import plan in verbose mode (mirrors dry-run output)
+    if verbosity.is_verbose() {
+        let plan = design.import_plan(name);
+        for entry in &plan {
+            let file = entry.table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+            let fmt = entry.table.format.as_deref().unwrap_or("csv");
+            output::detail(verbosity, &format!("  import {} ({}) ← {}", entry.table.name, fmt, file));
+        }
+        for entry in &plan {
+            if let Some(ref proc_name) = entry.procedure {
+                output::detail(verbosity, &format!("  call {proc_name}()"));
+            }
+        }
+        for after_file in &design.config().import.after {
+            output::detail(verbosity, &format!("  run {after_file}"));
+        }
+    }
+
     let adapter = get_adapter(config, database_url).await?;
     design.import_data(&adapter, name, false).await?;
 
