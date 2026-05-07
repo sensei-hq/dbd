@@ -235,12 +235,34 @@ pub async fn apply_policies(
         failed: Vec::new(),
     };
 
+    // Canonicalize the project root once so path-traversal checks are reliable.
+    let canon_root = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
     for file in &files {
         if dry_run {
             report.applied.push(file.clone());
             continue;
         }
-        match std::fs::read_to_string(file) {
+
+        // Guard: every policy file must resolve within the project directory.
+        let canon_file = match file.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                report.failed.push((file.clone(), e.to_string()));
+                continue;
+            }
+        };
+        if !canon_file.starts_with(&canon_root) {
+            report.failed.push((
+                file.clone(),
+                "path traversal rejected: file is outside project directory".to_string(),
+            ));
+            continue;
+        }
+
+        match std::fs::read_to_string(&canon_file) {
             Ok(sql) => match adapter.execute_script(&sql).await {
                 Ok(()) => report.applied.push(file.clone()),
                 Err(e) => report.failed.push((file.clone(), e.to_string())),
@@ -689,6 +711,17 @@ impl Design {
         dry_run: bool,
     ) -> Result<()> {
         let plan = self.import_plan(name);
+
+        // Ensure internal dbd procedures are present before any import runs.
+        // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
+        if !dry_run {
+            let has_jsonl = plan.iter().any(|e| {
+                e.table.format.as_deref().is_some_and(|f| f == "json" || f == "jsonl")
+            });
+            if has_jsonl {
+                adapter.ensure_import_procedure().await?;
+            }
+        }
 
         // Step 1: Truncate staging tables (if configured)
         let truncate = self.config.import.options.truncate;
