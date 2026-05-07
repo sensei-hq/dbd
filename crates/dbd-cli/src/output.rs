@@ -1,3 +1,7 @@
+use std::time::Duration;
+
+use indicatif::{ProgressBar, ProgressStyle};
+
 /// Output verbosity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
@@ -49,6 +53,57 @@ pub fn summary(errors: usize, warnings: usize, entities: usize) {
             if errors != 1 { "s" } else { "" },
             if warnings != 1 { "s" } else { "" },
         );
+    }
+}
+
+/// A spinner that tracks a single step at a time.
+///
+/// In verbose mode it shows an animated spinner while the step runs,
+/// then prints ✓ or ✗ per step when done.
+/// In normal mode all methods are no-ops.
+pub struct StepSpinner {
+    pb: Option<ProgressBar>,
+}
+
+impl StepSpinner {
+    pub fn new(verbosity: Verbosity) -> Self {
+        if !verbosity.is_verbose() {
+            return Self { pb: None };
+        }
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                .template("  {spinner} {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(Duration::from_millis(80));
+        Self { pb: Some(pb) }
+    }
+
+    /// Called just before a step begins.
+    pub fn start(&self, desc: &str) {
+        if let Some(pb) = &self.pb {
+            pb.set_message(desc.to_owned());
+        }
+    }
+
+    /// Called after a step completes. `err` is `None` on success.
+    pub fn done(&self, desc: &str, err: Option<&str>) {
+        let Some(pb) = &self.pb else { return };
+        if let Some(e) = err {
+            pb.println(format!("  ✗ {desc}"));
+            pb.println(format!("    {e}"));
+        } else {
+            pb.println(format!("  ✓ {desc}"));
+        }
+    }
+
+    /// Clears the spinner line when all steps are complete.
+    pub fn finish(&self) {
+        if let Some(pb) = &self.pb {
+            pb.finish_and_clear();
+        }
     }
 }
 
