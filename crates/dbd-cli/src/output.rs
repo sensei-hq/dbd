@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Output verbosity level.
@@ -56,10 +57,44 @@ pub fn summary(errors: usize, warnings: usize, entities: usize) {
     }
 }
 
+/// Apply a color based on the step description prefix (type:name or verb type:name).
+///
+/// - `schema:` cyan       — structural namespaces
+/// - `table:` green       — data entities
+/// - `view:` bright green — derived data
+/// - `enum:` yellow       — type definitions
+/// - `function:` / `procedure:` magenta — executable code
+/// - `extension:` blue    — external add-ons
+/// - `role:` dim magenta  — access control
+/// - `migrate …` yellow   — schema change
+/// - `drop …` red         — removal
+fn colorize(desc: &str) -> String {
+    // The type key is either the first token before ':' (for "type:name")
+    // or the first word (for "migrate type:name → vN", "drop type:name (vN)").
+    let key = desc
+        .split_once(':')
+        .map(|(pre, _)| pre.split_whitespace().last().unwrap_or(pre))
+        .unwrap_or_else(|| desc.split_whitespace().next().unwrap_or(desc));
+
+    match key {
+        "schema"    => style(desc).cyan().to_string(),
+        "table"     => style(desc).green().to_string(),
+        "view"      => style(desc).bright().green().to_string(),
+        "enum"      => style(desc).yellow().to_string(),
+        "function"  => style(desc).magenta().to_string(),
+        "procedure" => style(desc).magenta().to_string(),
+        "extension" => style(desc).blue().to_string(),
+        "role"      => style(desc).magenta().dim().to_string(),
+        "migrate"   => style(desc).yellow().to_string(),
+        "drop"      => style(desc).red().to_string(),
+        _           => desc.to_string(),
+    }
+}
+
 /// A spinner that tracks a single step at a time.
 ///
 /// In verbose mode it shows an animated spinner while the step runs,
-/// then prints ✓ or ✗ per step when done.
+/// then prints ✓ or ✗ per step when done, with color-coded entity types.
 /// In normal mode all methods are no-ops.
 pub struct StepSpinner {
     pb: Option<ProgressBar>,
@@ -84,18 +119,19 @@ impl StepSpinner {
     /// Called just before a step begins.
     pub fn start(&self, desc: &str) {
         if let Some(pb) = &self.pb {
-            pb.set_message(desc.to_owned());
+            pb.set_message(colorize(desc));
         }
     }
 
     /// Called after a step completes. `err` is `None` on success.
     pub fn done(&self, desc: &str, err: Option<&str>) {
         let Some(pb) = &self.pb else { return };
+        let colored = colorize(desc);
         if let Some(e) = err {
-            pb.println(format!("  ✗ {desc}"));
-            pb.println(format!("    {e}"));
+            pb.println(format!("  {} {colored}", style("✗").red().bold()));
+            pb.println(format!("    {}", style(e).red().dim()));
         } else {
-            pb.println(format!("  ✓ {desc}"));
+            pb.println(format!("  {} {colored}", style("✓").green().bold()));
         }
     }
 
