@@ -493,12 +493,22 @@ impl Design {
     ///
     /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
     /// and executes the plan steps in order.
-    pub async fn apply(
+    ///
+    /// `on_start(desc)` is called just before each visible step.
+    /// `on_done(desc, err)` is called after — `err` is `None` on success.
+    /// Use `|_| {}` / `|_, _| {}` when progress reporting is not needed.
+    pub async fn apply<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
-    ) -> Result<()> {
+        mut on_start: S,
+        mut on_done: D,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
         let valid_entities: Vec<&Entity> = self
             .entities
             .iter()
@@ -550,33 +560,67 @@ impl Design {
             match step {
                 ExecutionStep::CreateEntity(entity_name) | ExecutionStep::ApplyEntity(entity_name) => {
                     if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                        adapter.apply_entity(entity).await?;
+                        let desc = format!("apply {entity_name}");
+                        on_start(&desc);
+                        let result = adapter.apply_entity(entity).await;
+                        match result {
+                            Ok(()) => on_done(&desc, None),
+                            Err(e) => {
+                                let msg = format!("apply {entity_name} failed: {e}");
+                                on_done(&desc, Some(&msg));
+                                return Err(DbdError::Config(msg));
+                            }
+                        }
                     }
                 }
-                ExecutionStep::MigrateEntity { migration_sql_path, .. } => {
-                    // 1. Run schema change (ALTER/DROP)
-                    if migration_sql_path.exists() {
-                        let sql = std::fs::read_to_string(migration_sql_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
-                    // 2. Run data correction if present (*.data.sql)
-                    let data_path = migration_sql_path.with_extension("data.sql");
-                    if data_path.exists() {
-                        let sql = std::fs::read_to_string(&data_path)?;
-                        adapter.execute_script(&sql).await?;
+                ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
+                    let desc = format!("migrate {entity_name} → v{migration_version}");
+                    on_start(&desc);
+                    let result: Result<()> = async {
+                        // 1. Run schema change (ALTER/DROP)
+                        if migration_sql_path.exists() {
+                            let sql = std::fs::read_to_string(migration_sql_path)?;
+                            adapter.execute_script(&sql).await?;
+                        }
+                        // 2. Run data correction if present (*.data.sql)
+                        let data_path = migration_sql_path.with_extension("data.sql");
+                        if data_path.exists() {
+                            let sql = std::fs::read_to_string(&data_path)?;
+                            adapter.execute_script(&sql).await?;
+                        }
+                        Ok(())
+                    }.await;
+                    match result {
+                        Ok(()) => on_done(&desc, None),
+                        Err(e) => {
+                            let msg = format!("migrate {entity_name} failed: {e}");
+                            on_done(&desc, Some(&msg));
+                            return Err(DbdError::Config(msg));
+                        }
                     }
                 }
-                ExecutionStep::DropEntity { drop_sql_path, .. } => {
-                    if drop_sql_path.exists() {
-                        let sql = std::fs::read_to_string(drop_sql_path)?;
-                        adapter.execute_script(&sql).await?;
+                ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
+                    let desc = format!("drop {entity_name} (v{migration_version})");
+                    on_start(&desc);
+                    let result: Result<()> = async {
+                        if drop_sql_path.exists() {
+                            let sql = std::fs::read_to_string(drop_sql_path)?;
+                            adapter.execute_script(&sql).await?;
+                        }
+                        Ok(())
+                    }.await;
+                    match result {
+                        Ok(()) => on_done(&desc, None),
+                        Err(e) => {
+                            let msg = format!("drop {entity_name} failed: {e}");
+                            on_done(&desc, Some(&msg));
+                            return Err(DbdError::Config(msg));
+                        }
                     }
                 }
                 ExecutionStep::RecordMigration { version, checksum } => {
                     let desc = format!("migration to v{version}");
-                    adapter
-                        .apply_migration(*version, "", &desc, checksum)
-                        .await?;
+                    adapter.apply_migration(*version, "", &desc, checksum).await?;
                 }
                 ExecutionStep::SetVersion(version) => {
                     adapter.set_project_meta(&self.env, *version).await?;
@@ -821,7 +865,7 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
     ) -> Result<()> {
-        self.apply(adapter, None, dry_run).await?;
+        self.apply(adapter, None, dry_run, |_| {}, |_, _| {}).await?;
         self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}).await?;
         Ok(())
     }
@@ -1030,7 +1074,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true).await.unwrap();
+        design.apply(&mock, None, true, |_| {}, |_, _| {}).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -1040,7 +1084,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false).await.unwrap();
+        design.apply(&mock, None, false, |_| {}, |_, _| {}).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -1055,7 +1099,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false).await.unwrap();
+        design.apply(&mock, None, false, |_| {}, |_, _| {}).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
