@@ -1,5 +1,51 @@
+use std::path::{Path, PathBuf};
 
 use crate::error::{DbdError, Result};
+
+/// A stale file in the project that dbd now manages internally.
+#[derive(Debug, Clone)]
+pub struct StaleFile {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Files that dbd previously scaffolded into user projects but now manages
+/// internally. Old projects may still have these; they should be removed.
+const MANAGED_INTERNALLY: &[(&str, &str)] = &[(
+    "ddl/procedure/staging/import_jsonb_to_table.ddl",
+    "now managed internally by dbd — apply via ensure_import_procedure(), remove from project DDL",
+)];
+
+/// Scan the project directory for files that were once user-scaffolded but are
+/// now managed internally by dbd. Returns one entry per stale file found.
+pub fn detect_stale_files(project_dir: &Path) -> Vec<StaleFile> {
+    MANAGED_INTERNALLY
+        .iter()
+        .filter_map(|(rel_path, reason)| {
+            let full = project_dir.join(rel_path);
+            if full.exists() {
+                Some(StaleFile {
+                    path: full,
+                    reason: reason.to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Remove stale internally-managed files from the project directory.
+/// Returns the list of files that were successfully removed.
+pub fn remove_stale_files(stale: &[StaleFile]) -> Vec<(PathBuf, Option<String>)> {
+    stale
+        .iter()
+        .map(|f| match std::fs::remove_file(&f.path) {
+            Ok(()) => (f.path.clone(), None),
+            Err(e) => (f.path.clone(), Some(e.to_string())),
+        })
+        .collect()
+}
 
 /// Detect whether a design.yaml is in the old (Node.js) format.
 ///

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dbd_core::adapter::DatabaseAdapter;
@@ -122,6 +122,54 @@ fn resolve_env_vars(s: &str) -> String {
     }
 }
 
+/// Canonicalize `root` and verify that `file` resolves within it.
+/// Returns the canonical file path on success, or an error if the file
+/// lies outside the root (path traversal guard).
+fn safe_canonicalize_within(root: &Path, file: &Path) -> Result<PathBuf> {
+    let canon_root = root.canonicalize()
+        .with_context(|| format!("Cannot resolve project root: {}", root.display()))?;
+    let canon_file = file.canonicalize()
+        .with_context(|| format!("Cannot resolve file: {}", file.display()))?;
+    anyhow::ensure!(
+        canon_file.starts_with(&canon_root),
+        "path traversal rejected: {} is outside project root {}",
+        file.display(),
+        root.display()
+    );
+    Ok(canon_file)
+}
+
+/// Read a file that must reside within `root`.
+fn safe_read(root: &Path, file: &Path) -> Result<String> {
+    let canon = safe_canonicalize_within(root, file)?;
+    std::fs::read_to_string(&canon) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to read {}", file.display()))
+}
+
+/// Write a file that must reside within `root`.
+fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {
+    let canon = safe_canonicalize_within(root, file)?;
+    std::fs::write(&canon, contents) // nosemgrep: path validated by safe_canonicalize_within
+        .with_context(|| format!("Failed to write {}", file.display()))
+}
+
+/// Copy src → dst where both must reside within `root`.
+fn safe_copy(root: &Path, src: &Path, dst: &Path) -> Result<()> {
+    let canon_src = safe_canonicalize_within(root, src)?;
+    // dst may not exist yet (backup); verify its parent is within root
+    let parent = dst.parent().unwrap_or(root);
+    let canon_parent = parent.canonicalize()
+        .with_context(|| format!("Cannot resolve backup directory: {}", parent.display()))?;
+    anyhow::ensure!(
+        canon_parent.starts_with(root.canonicalize()?),
+        "path traversal rejected: backup destination {} is outside project root",
+        dst.display()
+    );
+    std::fs::copy(&canon_src, dst) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to copy {} → {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
 // ── Command implementations ─────────────────────────────
 
 #[allow(clippy::collapsible_if)]
@@ -182,11 +230,11 @@ fn cmd_inspect(config: &Path, env: &str, project_dir: &Path, name: Option<&str>,
         let files = dbd_core::scanner::scan_ddl(project_dir);
         let mut changed = 0;
         for file in &files {
-            let content = std::fs::read_to_string(file)?;
+            let content = safe_read(project_dir, file)?;
             let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
             if content != formatted {
                 changed += 1;
-                std::fs::write(file, &formatted)?;
+                safe_write(project_dir, file, &formatted)?;
                 output::info(verbosity, &format!("  formatted: {}", file.display()));
             }
         }
@@ -578,43 +626,82 @@ fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
         anyhow::bail!("Config file not found: {}", config.display());
     }
 
-    let content = std::fs::read_to_string(config)
-        .context("Failed to read config")?;
+    let project_dir = config.parent().unwrap_or(Path::new("."));
+    let content = safe_read(project_dir, config)?;
 
-    let issues = dbd_core::doctor::detect_old_format(&content);
+    let config_issues = dbd_core::doctor::detect_old_format(&content);
+    let stale_files = dbd_core::doctor::detect_stale_files(project_dir);
 
-    if issues.is_empty() {
-        output::info(verbosity, "design.yaml is in the current format — no migration needed.");
+    let total_issues = config_issues.len() + stale_files.len();
+
+    if total_issues == 0 {
+        output::info(verbosity, "No issues found — project is up to date.");
         output::summary(0, 0, 0);
         return Ok(());
     }
 
-    output::always(&format!("Found {} config issue{}:", issues.len(), if issues.len() != 1 { "s" } else { "" }));
-    for issue in &issues {
-        output::always(&format!("  - {issue}"));
+    if !config_issues.is_empty() {
+        output::always(&format!(
+            "Found {} config issue{}:",
+            config_issues.len(),
+            if config_issues.len() != 1 { "s" } else { "" }
+        ));
+        for issue in &config_issues {
+            output::always(&format!("  - {issue}"));
+        }
+    }
+
+    if !stale_files.is_empty() {
+        output::always(&format!(
+            "\nFound {} stale file{} (now managed internally by dbd):",
+            stale_files.len(),
+            if stale_files.len() != 1 { "s" } else { "" }
+        ));
+        for f in &stale_files {
+            output::always(&format!("  - {} — {}", f.path.display(), f.reason));
+        }
     }
 
     if fix {
-        let migrated = dbd_core::doctor::migrate_config(&content)
-            .context("Config migration failed")?;
+        let mut fixed = 0;
 
-        // Verify the migrated config parses
-        let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
-            .context("Migrated config failed to parse — please report this as a bug")?;
+        // Migrate config if needed
+        if !config_issues.is_empty() {
+            let migrated = dbd_core::doctor::migrate_config(&content)
+                .context("Config migration failed")?;
 
-        // Write backup
-        let backup = config.with_extension("yaml.bak");
-        std::fs::copy(config, &backup)?;
-        output::info(verbosity, &format!("Backup saved to {}", backup.display()));
+            let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
+                .context("Migrated config failed to parse — please report this as a bug")?;
 
-        // Write migrated
-        std::fs::write(config, &migrated)?;
-        output::info(verbosity, &format!("Migrated {}", config.display()));
+            let backup = config.with_extension("yaml.bak");
+            safe_copy(project_dir, config, &backup)?;
+            output::info(verbosity, &format!("Backup saved to {}", backup.display()));
 
-        output::summary(0, 0, issues.len());
+            safe_write(project_dir, config, &migrated)?;
+            output::info(verbosity, &format!("Migrated {}", config.display()));
+            fixed += config_issues.len();
+        }
+
+        // Remove stale files
+        if !stale_files.is_empty() {
+            let results = dbd_core::doctor::remove_stale_files(&stale_files);
+            for (path, err) in &results {
+                match err {
+                    None => {
+                        output::info(verbosity, &format!("Removed {}", path.display()));
+                        fixed += 1;
+                    }
+                    Some(e) => {
+                        output::always(&format!("Failed to remove {}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+
+        output::summary(0, 0, fixed);
     } else {
-        output::always("\nRun with --fix to migrate automatically.");
-        output::summary(issues.len(), 0, 0);
+        output::always("\nRun with --fix to resolve automatically.");
+        output::summary(total_issues, 0, 0);
     }
 
     Ok(())
@@ -786,7 +873,7 @@ fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosi
     let mut changed = 0;
 
     for file in &files {
-        let content = std::fs::read_to_string(file)?;
+        let content = safe_read(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
 
         if content != formatted {
@@ -794,7 +881,7 @@ fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosi
             if check {
                 output::info(verbosity, &format!("  would reformat: {}", file.display()));
             } else {
-                std::fs::write(file, &formatted)?;
+                safe_write(project_dir, file, &formatted)?;
                 output::info(verbosity, &format!("  formatted: {}", file.display()));
             }
         }
