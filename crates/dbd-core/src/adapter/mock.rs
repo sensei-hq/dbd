@@ -107,6 +107,10 @@ impl DatabaseAdapter for MockAdapter {
         Ok(None)
     }
 
+    async fn ensure_import_procedure(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn ensure_migrations_table(&self) -> Result<()> {
         Ok(())
     }

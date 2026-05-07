@@ -577,6 +577,13 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
+    async fn ensure_import_procedure(&self) -> Result<()> {
+        // Embedded at compile time — always up to date with this version of dbd.
+        const DDL: &str = include_str!("../internal/import_jsonb_to_table.ddl");
+        self.execute_script("CREATE SCHEMA IF NOT EXISTS staging").await?;
+        self.execute_script(DDL).await
+    }
+
     async fn ensure_meta_table(&self) -> Result<()> {
         self.execute_script(
             "CREATE TABLE IF NOT EXISTS _dbd_meta ( \

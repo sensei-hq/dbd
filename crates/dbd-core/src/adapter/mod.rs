@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use async_trait::async_trait;
 
@@ -59,11 +58,6 @@ pub trait DatabaseAdapter: Send + Sync {
 
     async fn execute_script(&self, sql: &str) -> Result<()>;
 
-    async fn execute_file(&self, path: &Path) -> Result<()> {
-        let sql = std::fs::read_to_string(path)?;
-        self.execute_script(&sql).await
-    }
-
     async fn apply_entity(&self, entity: &Entity) -> Result<()>;
 
     async fn apply_entities(&self, entities: &[Entity]) -> Result<()> {
@@ -114,6 +108,13 @@ pub trait DatabaseAdapter: Send + Sync {
         checksum: &str,
     ) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;
+
+    // ── Internal dbd procedures ────────────────────────
+
+    /// Ensure the internal `staging.import_jsonb_to_table` procedure exists.
+    /// Called automatically before any JSONL import. The procedure is embedded
+    /// in the dbd binary — users do not own or manage it.
+    async fn ensure_import_procedure(&self) -> Result<()>;
 
     // ── Meta tracking (environment, safety guards) ─────
 
