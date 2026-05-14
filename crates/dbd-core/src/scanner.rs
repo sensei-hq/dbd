@@ -40,9 +40,57 @@ pub fn scan_ddl(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Scan the `import/` folder for data files (.csv, .tsv, .json, .jsonl).
-pub fn scan_import(root: &Path) -> Vec<PathBuf> {
+///
+/// When `env` is `None`, all files under `import/` are returned regardless of depth.
+///
+/// When `env` is `Some(name)`, the convention `import/{env}/{schema}/file` applies:
+/// - Files at depth 1 under `import/` (`import/{schema}/file`) are always included.
+/// - Files at depth 2+ under `import/` (`import/{first}/{…}/file`) are included only
+///   when the first path component under `import/` matches `env`.
+///
+/// This lets projects keep shared seed data in `import/staging/` and
+/// environment-specific fixtures in `import/dev/staging/` or `import/prod/staging/`.
+pub fn scan_import(root: &Path, env: Option<&str>) -> Vec<PathBuf> {
     let import_dir = root.join("import");
-    let mut files = scan_with_extensions(&import_dir, IMPORT_EXTENSIONS);
+    if !import_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<PathBuf> = WalkDir::new(&import_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| IMPORT_EXTENSIONS.contains(&x))
+        })
+        .filter(|e| {
+            let relative = match e.path().strip_prefix(&import_dir) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            // Count directories between import/ and the file.
+            let parent_depth = relative.parent().map(|p| p.components().count()).unwrap_or(0);
+            if parent_depth <= 1 {
+                // import/file or import/{schema}/file — always included
+                true
+            } else {
+                // import/{env}/{schema}/file — include only when env matches
+                match env {
+                    None => true,
+                    Some(target) => relative
+                        .iter()
+                        .next()
+                        .and_then(|c| c.to_str())
+                        .is_some_and(|first| first == target),
+                }
+            }
+        })
+        .map(|e| e.into_path())
+        .collect();
+
     files.sort();
     files
 }
@@ -128,7 +176,8 @@ mod tests {
     #[test]
     fn scan_import_finds_data_files() {
         let tmp = create_test_project();
-        let files = scan_import(tmp.path());
+        // No env filter: all data files returned
+        let files = scan_import(tmp.path(), None);
 
         assert_eq!(files.len(), 3);
         let names: Vec<&str> = files
@@ -145,8 +194,42 @@ mod tests {
     #[test]
     fn scan_import_returns_empty_when_no_import_dir() {
         let tmp = TempDir::new().unwrap();
-        let files = scan_import(tmp.path());
+        let files = scan_import(tmp.path(), None);
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn scan_import_env_includes_matching_env() {
+        let tmp = create_test_project();
+        // env="dev": depth-1 files + import/dev/** included; import/prod/** excluded
+        let files = scan_import(tmp.path(), Some("dev"));
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+            .collect();
+        // Depth-1 files always included
+        assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
+        assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
+        // Dev-specific file included
+        assert!(names.contains(&"fixtures.csv"), "fixtures.csv included for dev: {names:?}");
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn scan_import_env_excludes_other_envs() {
+        let tmp = create_test_project();
+        // env="prod": import/dev/** excluded, only depth-1 files returned
+        let files = scan_import(tmp.path(), Some("prod"));
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
+        assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
+        assert!(!names.contains(&"fixtures.csv"), "fixtures.csv excluded for prod: {names:?}");
+        assert_eq!(files.len(), 2);
     }
 
     #[test]

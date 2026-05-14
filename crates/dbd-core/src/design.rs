@@ -60,6 +60,45 @@ pub struct ExecutionPlan {
     pub steps: Vec<ExecutionStep>,
 }
 
+/// Summary passed to the `on_complete` callback of `apply()`.
+#[derive(Debug, Clone)]
+pub struct ApplyComplete {
+    pub strategy: ApplyStrategy,
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Entities whose DDL was applied (created or re-applied idempotently).
+    pub applied: u32,
+    /// Entities that ran a migration SQL file.
+    pub migrated: u32,
+    /// Entities added fresh (subset of applied).
+    pub created: u32,
+    /// Entities dropped via migration.
+    pub dropped: u32,
+}
+
+/// Summary passed to the `on_complete` callback of `import_data()`.
+#[derive(Debug, Clone)]
+pub struct ImportComplete {
+    pub tables: u32,
+    pub procedures: u32,
+    pub after_scripts: u32,
+}
+
+/// Combined summary passed to the `on_complete` callback of `deploy()`.
+#[derive(Debug, Clone)]
+pub struct DeployComplete {
+    pub apply: ApplyComplete,
+    pub import: ImportComplete,
+}
+
+/// Summary returned by `apply()` describing what happened.
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    pub strategy: ApplyStrategy,
+    pub from_version: u32,
+    pub to_version: u32,
+}
+
 /// Build an execution plan based on entity state and pending migrations.
 ///
 /// Pure logic — no I/O. The caller is responsible for executing the steps.
@@ -274,6 +313,28 @@ pub async fn apply_policies(
     Ok(report)
 }
 
+/// Report the result of an execution step to the progress callback.
+///
+/// On success: calls `on_done(desc, None)` and returns `Ok(())`.
+/// On failure: calls `on_done(desc, Some(msg))` and returns `Err(DbdError::Config(msg))`.
+fn report_step_result(
+    desc: &str,
+    on_done: &mut dyn FnMut(&str, Option<&str>),
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => {
+            on_done(desc, None);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("{desc} failed: {e}");
+            on_done(desc, Some(&msg));
+            Err(DbdError::Config(msg))
+        }
+    }
+}
+
 /// The Design orchestrator — main entry point for all operations.
 ///
 /// Loads configuration, discovers and parses entities, resolves dependencies,
@@ -283,7 +344,6 @@ pub struct Design {
     entities: Vec<Entity>,
     import_tables: Vec<Entity>,
     project_dir: PathBuf,
-    #[allow(dead_code)]
     env: String,
     validated: bool,
 }
@@ -321,9 +381,12 @@ impl Design {
             .iter()
             .filter_map(|file| {
                 let sql = std::fs::read_to_string(file).ok()?;
-                // Make path relative for entity naming
+                // Use relative path for entity type/name derivation, but
+                // store the absolute path so the file is readable regardless of CWD.
                 let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-                parser::parse_entity(relative, &sql).ok()
+                let mut entity = parser::parse_entity(relative, &sql).ok()?;
+                entity.file = Some(file.clone());
+                Some(entity)
             })
             .collect();
 
@@ -399,7 +462,8 @@ impl Design {
         .concat();
 
         // Scan import tables (data files, not DDL)
-        let import_files = scanner::scan_import(&project_dir);
+        // Pass env so that import/{env}/ subdirectories are filtered appropriately.
+        let import_files = scanner::scan_import(&project_dir, Some(env));
         let import_tables: Vec<Entity> = import_files
             .iter()
             .map(|file| {
@@ -436,6 +500,60 @@ impl Design {
     /// Project directory path.
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
+    }
+
+    /// Scan all migration directories for unresolved `-- TODO:` comments in
+    /// `*.data.sql` files. Returns one entry per affected file.
+    ///
+    /// Used by `inspect` to surface outstanding data corrections.
+    /// `apply` independently blocks on PENDING migrations with TODOs.
+    pub fn data_sql_todos(&self) -> Vec<snapshot::DataSqlTodo> {
+        snapshot::scan_data_sql_todos(&self.project_dir)
+    }
+
+    /// Drop "Unresolved reference: NAME" warnings whose target NAME exists
+    /// in the live database catalog (tables, views, or enum types).
+    ///
+    /// Returns the number of warnings dropped. Used by `inspect --database`
+    /// to silence warnings that resolve against a real DB but not against
+    /// the project's external entity list.
+    pub async fn resolve_unknown_refs_via_db(
+        &mut self,
+        adapter: &dyn DatabaseAdapter,
+    ) -> Result<usize> {
+        const PREFIX: &str = "Unresolved reference: ";
+
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entity in self.entities.iter().chain(self.import_tables.iter()) {
+            for warning in &entity.warnings {
+                if let Some(name) = warning.strip_prefix(PREFIX) {
+                    candidates.insert(name.to_string());
+                }
+            }
+        }
+
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in &candidates {
+            if adapter.resolve_entity(name).await?.is_some() {
+                resolved.insert(name.clone());
+            }
+        }
+
+        let mut dropped = 0usize;
+        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
+            for entity in entities {
+                entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
+                    Some(name) if resolved.contains(name) => {
+                        *dropped += 1;
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        };
+        drop_in(&mut self.entities, &mut dropped);
+        drop_in(&mut self.import_tables, &mut dropped);
+        Ok(dropped)
     }
 
     /// Validate all entities and return self for chaining.
@@ -496,18 +614,21 @@ impl Design {
     ///
     /// `on_start(desc)` is called just before each visible step.
     /// `on_done(desc, err)` is called after — `err` is `None` on success.
-    /// Use `|_| {}` / `|_, _| {}` when progress reporting is not needed.
-    pub async fn apply<S, D>(
+    /// `on_complete(summary)` is called once after all steps succeed.
+    /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    pub async fn apply<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
         mut on_start: S,
         mut on_done: D,
+        mut on_complete: C,
     ) -> Result<()>
     where
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
+        C: FnMut(ApplyComplete),
     {
         let valid_entities: Vec<&Entity> = self
             .entities
@@ -523,8 +644,18 @@ impl Design {
 
         // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {
+            let count = valid_entities.len() as u32;
             let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
             adapter.apply_entities(&owned).await?;
+            on_complete(ApplyComplete {
+                strategy: ApplyStrategy::Current,
+                from_version: 0,
+                to_version: 0,
+                applied: count,
+                migrated: 0,
+                created: 0,
+                dropped: 0,
+            });
             return Ok(());
         }
 
@@ -532,6 +663,20 @@ impl Design {
         let db_version = adapter.get_db_version().await?;
         let latest_version = self.config.project.version.unwrap_or(0);
         let pending = snapshot::pending_migrations(db_version, &self.project_dir);
+
+        // Block apply if any pending migration has unresolved data.sql TODOs.
+        let todos = snapshot::pending_data_sql_todos(&pending);
+        if !todos.is_empty() {
+            let details: String = todos
+                .iter()
+                .map(|t| format!("  {} (v{})", t.file.display(), t.version))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(DbdError::Config(format!(
+                "Unresolved TODO(s) in data.sql — resolve before applying:\n{details}\n\
+                 Edit the file(s) above and replace each -- TODO comment with working SQL."
+            )));
+        }
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
@@ -548,6 +693,12 @@ impl Design {
             adapter.ensure_migrations_table().await?;
         }
 
+        // Counters for on_complete summary
+        let mut count_applied: u32 = 0;
+        let mut count_migrated: u32 = 0;
+        let mut count_created: u32 = 0;
+        let mut count_dropped: u32 = 0;
+
         // Build entity lookup for ApplyEntity / CreateEntity steps
         let entity_map: std::collections::HashMap<&str, &Entity> = self
             .entities
@@ -558,35 +709,36 @@ impl Design {
         // Execute plan steps
         for step in &plan.steps {
             match step {
-                ExecutionStep::CreateEntity(entity_name) | ExecutionStep::ApplyEntity(entity_name) => {
+                ExecutionStep::CreateEntity(entity_name) => {
                     if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                        let type_tag = format!("{:?}", entity.entity_type).to_lowercase();
-                        let desc = format!("{type_tag}:{entity_name}");
+                        let desc = format!("{}:{entity_name}", entity.entity_type.tag());
                         on_start(&desc);
                         let result = adapter.apply_entity(entity).await;
-                        match result {
-                            Ok(()) => on_done(&desc, None),
-                            Err(e) => {
-                                let msg = format!("{desc} failed: {e}");
-                                on_done(&desc, Some(&msg));
-                                return Err(DbdError::Config(msg));
-                            }
-                        }
+                        report_step_result(&desc, &mut on_done, result)?;
+                        count_created += 1;
+                        count_applied += 1;
+                    }
+                }
+                ExecutionStep::ApplyEntity(entity_name) => {
+                    if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                        let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+                        on_start(&desc);
+                        let result = adapter.apply_entity(entity).await;
+                        report_step_result(&desc, &mut on_done, result)?;
+                        count_applied += 1;
                     }
                 }
                 ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
                     let type_tag = entity_map.get(entity_name.as_str())
-                        .map(|e| format!("{:?}", e.entity_type).to_lowercase())
+                        .map(|e| e.entity_type.tag())
                         .unwrap_or_else(|| "entity".to_string());
                     let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
                     on_start(&desc);
                     let result: Result<()> = async {
-                        // 1. Run schema change (ALTER/DROP)
                         if migration_sql_path.exists() {
                             let sql = std::fs::read_to_string(migration_sql_path)?;
                             adapter.execute_script(&sql).await?;
                         }
-                        // 2. Run data correction if present (*.data.sql)
                         let data_path = migration_sql_path.with_extension("data.sql");
                         if data_path.exists() {
                             let sql = std::fs::read_to_string(&data_path)?;
@@ -594,18 +746,12 @@ impl Design {
                         }
                         Ok(())
                     }.await;
-                    match result {
-                        Ok(()) => on_done(&desc, None),
-                        Err(e) => {
-                            let msg = format!("migrate {type_tag}:{entity_name} failed: {e}");
-                            on_done(&desc, Some(&msg));
-                            return Err(DbdError::Config(msg));
-                        }
-                    }
+                    report_step_result(&desc, &mut on_done, result)?;
+                    count_migrated += 1;
                 }
                 ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
                     let type_tag = entity_map.get(entity_name.as_str())
-                        .map(|e| format!("{:?}", e.entity_type).to_lowercase())
+                        .map(|e| e.entity_type.tag())
                         .unwrap_or_else(|| "entity".to_string());
                     let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
                     on_start(&desc);
@@ -616,14 +762,8 @@ impl Design {
                         }
                         Ok(())
                     }.await;
-                    match result {
-                        Ok(()) => on_done(&desc, None),
-                        Err(e) => {
-                            let msg = format!("{desc} failed: {e}");
-                            on_done(&desc, Some(&msg));
-                            return Err(DbdError::Config(msg));
-                        }
-                    }
+                    report_step_result(&desc, &mut on_done, result)?;
+                    count_dropped += 1;
                 }
                 ExecutionStep::RecordMigration { version, checksum } => {
                     let desc = format!("migration to v{version}");
@@ -635,6 +775,15 @@ impl Design {
             }
         }
 
+        on_complete(ApplyComplete {
+            strategy: plan.strategy,
+            from_version: db_version,
+            to_version: latest_version,
+            applied: count_applied,
+            migrated: count_migrated,
+            created: count_created,
+            dropped: count_dropped,
+        });
         Ok(())
     }
 
@@ -760,20 +909,28 @@ impl Design {
     /// `on_done(desc, err)` is called after each step — `err` is `None` on success,
     /// `Some(message)` on failure (called before the error is returned so the caller
     /// can update UI state before propagation).
-    /// Use `|_| {}` / `|_, _| {}` when progress reporting is not needed.
-    pub async fn import_data<S, D>(
+    /// `on_complete(summary)` is called once after all steps succeed.
+    /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    pub async fn import_data<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
         mut on_start: S,
         mut on_done: D,
+        mut on_complete: C,
     ) -> Result<()>
     where
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
+        C: FnMut(ImportComplete),
     {
         let plan = self.import_plan(name);
+
+        // Counters for on_complete summary
+        let mut count_tables: u32 = 0;
+        let mut count_procedures: u32 = 0;
+        let mut count_after_scripts: u32 = 0;
 
         // Ensure internal dbd procedures are present before any import runs.
         // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
@@ -802,19 +959,9 @@ impl Design {
             let fmt = entry.table.format.as_deref().unwrap_or("csv");
             let desc = format!("import {} ({})", entry.table.name, fmt);
             on_start(&desc);
-            if !dry_run {
-                let result = adapter.import_data(&entry.table, false).await;
-                match result {
-                    Ok(()) => on_done(&desc, None),
-                    Err(e) => {
-                        let msg = format!("import {} failed: {}", entry.table.name, e);
-                        on_done(&desc, Some(&msg));
-                        return Err(crate::error::DbdError::Config(msg));
-                    }
-                }
-            } else {
-                on_done(&desc, None);
-            }
+            let result = if dry_run { Ok(()) } else { adapter.import_data(&entry.table, false).await };
+            report_step_result(&desc, &mut on_done, result)?;
+            count_tables += 1;
         }
 
         // Step 3: Call import procedures
@@ -822,19 +969,9 @@ impl Design {
             if let Some(ref proc_name) = entry.procedure {
                 let desc = format!("call {proc_name}()");
                 on_start(&desc);
-                if !dry_run {
-                    let result = adapter.execute_script(&format!("CALL {proc_name}();")).await;
-                    match result {
-                        Ok(()) => on_done(&desc, None),
-                        Err(e) => {
-                            let msg = format!("call {proc_name}() failed: {}", e);
-                            on_done(&desc, Some(&msg));
-                            return Err(crate::error::DbdError::Config(msg));
-                        }
-                    }
-                } else {
-                    on_done(&desc, None);
-                }
+                let result = if dry_run { Ok(()) } else { adapter.execute_script(&format!("CALL {proc_name}();")).await };
+                report_step_result(&desc, &mut on_done, result)?;
+                count_procedures += 1;
             }
         }
 
@@ -843,22 +980,21 @@ impl Design {
             let full_path = self.project_dir.join(after_file);
             let desc = format!("run {after_file}");
             on_start(&desc);
-            if !dry_run {
-                let sql = std::fs::read_to_string(&full_path)?;
-                let result = adapter.execute_script(&sql).await;
-                match result {
-                    Ok(()) => on_done(&desc, None),
-                    Err(e) => {
-                        let msg = format!("run {after_file} failed: {}", e);
-                        on_done(&desc, Some(&msg));
-                        return Err(crate::error::DbdError::Config(msg));
-                    }
-                }
+            let result = if dry_run {
+                Ok(())
             } else {
-                on_done(&desc, None);
-            }
+                let sql = std::fs::read_to_string(&full_path)?;
+                adapter.execute_script(&sql).await
+            };
+            report_step_result(&desc, &mut on_done, result)?;
+            count_after_scripts += 1;
         }
 
+        on_complete(ImportComplete {
+            tables: count_tables,
+            procedures: count_procedures,
+            after_scripts: count_after_scripts,
+        });
         Ok(())
     }
 
@@ -867,13 +1003,47 @@ impl Design {
     /// Equivalent to `apply` followed by `import_data`. dbd handles
     /// fresh / migrate / current strategy automatically — safe to call
     /// on every bootstrap (idempotent when schema is already current).
-    pub async fn deploy(
+    ///
+    /// `on_complete(summary)` is called once after both phases succeed with
+    /// combined version info and step counts.
+    pub async fn deploy<C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
-    ) -> Result<()> {
-        self.apply(adapter, None, dry_run, |_| {}, |_, _| {}).await?;
-        self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}).await?;
+        mut on_complete: C,
+    ) -> Result<()>
+    where
+        C: FnMut(DeployComplete),
+    {
+        let mut apply_summary: Option<ApplyComplete> = None;
+        let mut import_summary: Option<ImportComplete> = None;
+
+        self.apply(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+            apply_summary = Some(s);
+        })
+        .await?;
+
+        self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+            import_summary = Some(s);
+        })
+        .await?;
+
+        on_complete(DeployComplete {
+            apply: apply_summary.unwrap_or(ApplyComplete {
+                strategy: ApplyStrategy::Current,
+                from_version: 0,
+                to_version: 0,
+                applied: 0,
+                migrated: 0,
+                created: 0,
+                dropped: 0,
+            }),
+            import: import_summary.unwrap_or(ImportComplete {
+                tables: 0,
+                procedures: 0,
+                after_scripts: 0,
+            }),
+        });
         Ok(())
     }
 
@@ -1081,7 +1251,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true, |_| {}, |_, _| {}).await.unwrap();
+        design.apply(&mock, None, true, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -1091,7 +1261,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}).await.unwrap();
+        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -1106,7 +1276,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}).await.unwrap();
+        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
@@ -1278,7 +1448,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false, |_| {}, |_, _| {}).await;
+        let _ = design.import_data(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
@@ -1583,6 +1753,96 @@ mod tests {
 
     // ── skip_schemas filtering ───────────────────────────
 
+    // ── data.sql TODO blocking ────────────────────────────
+
+    #[tokio::test]
+    async fn apply_blocked_when_pending_migration_has_todo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        // Minimal design.yaml at v2 — one pending migration ahead of DB v1
+        std::fs::write(
+            project_dir.join("design.yaml"),
+            "project:\n  name: test\n  version: 2\n",
+        )
+        .unwrap();
+
+        // Create a pending migration v2 with an unresolved data.sql
+        let mig_dir = project_dir.join("migrations/002/config");
+        std::fs::create_dir_all(&mig_dir).unwrap();
+        std::fs::write(
+            mig_dir.join("users.data.sql"),
+            "-- TODO: Data correction required for config.users.score.\n\
+             -- Column type changed from JSONB to INTEGER.\n",
+        )
+        .unwrap();
+        // Write a minimal graph.json so pending_migrations picks it up
+        std::fs::write(
+            project_dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"altered":["config.users"],"added":[],"dropped":[]}"#,
+        )
+        .unwrap();
+
+        let design = Design::from_config_with_dir(
+            &project_dir.join("design.yaml"),
+            "dev",
+            Some(project_dir),
+        )
+        .unwrap();
+
+        // DB is at v1 → migration v2 is pending
+        let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
+        let result = design
+            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .await;
+
+        assert!(result.is_err(), "apply should be blocked by unresolved TODO");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("TODO"), "error should mention TODO: {msg}");
+        assert!(msg.contains("users.data.sql"), "error should name the file: {msg}");
+    }
+
+    #[tokio::test]
+    async fn apply_not_blocked_when_data_sql_todo_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        std::fs::write(
+            project_dir.join("design.yaml"),
+            "project:\n  name: test\n  version: 1\n",
+        )
+        .unwrap();
+
+        // data.sql with no TODO (already resolved)
+        let mig_dir = project_dir.join("migrations/001/config");
+        std::fs::create_dir_all(&mig_dir).unwrap();
+        std::fs::write(
+            mig_dir.join("users.data.sql"),
+            "UPDATE config.users SET score = old_score::INTEGER;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("migrations/001/graph.json"),
+            r#"{"fromVersion":0,"toVersion":1,"altered":["config.users"],"added":[],"dropped":[]}"#,
+        )
+        .unwrap();
+
+        let design = Design::from_config_with_dir(
+            &project_dir.join("design.yaml"),
+            "dev",
+            Some(project_dir),
+        )
+        .unwrap();
+
+        // Fresh DB — v1 migration is pending but data.sql has no TODOs
+        let mock = crate::adapter::mock::MockAdapter::new();
+        let result = design
+            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .await;
+
+        assert!(result.is_ok(), "should not be blocked: {:?}", result);
+    }
+
     #[test]
     fn skip_schemas_filters_entities() {
         let mut entities = vec![
@@ -1603,7 +1863,7 @@ mod tests {
         let design = Design::from_config(&config_path, "prod").unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, true).await.unwrap();
+        design.deploy(&mock, true, |_| {}).await.unwrap();
 
         assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
         assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
@@ -1708,6 +1968,62 @@ mod tests {
         .unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, false).await.unwrap();
+        design.deploy(&mock, false, |_| {}).await.unwrap();
+    }
+
+    // ── resolve_unknown_refs_via_db ──────────────────────
+
+    fn empty_design() -> Design {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
+        Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_via_db_drops_warning_when_entity_exists() {
+        let mut design = empty_design();
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        design.entities.push(entity);
+
+        let mock = MockAdapter::new().with_known_entities(["auth.users"]);
+        let dropped = design.resolve_unknown_refs_via_db(&mock).await.unwrap();
+
+        assert_eq!(dropped, 1);
+        let last = design.entities.last().unwrap();
+        assert!(last.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_via_db_keeps_warning_when_entity_missing() {
+        let mut design = empty_design();
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        design.entities.push(entity);
+
+        let mock = MockAdapter::new();
+        let dropped = design.resolve_unknown_refs_via_db(&mock).await.unwrap();
+
+        assert_eq!(dropped, 0);
+        assert_eq!(design.entities.last().unwrap().warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_via_db_leaves_unrelated_warnings_alone() {
+        let mut design = empty_design();
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        entity.warnings.push("Some other warning".to_string());
+        design.entities.push(entity);
+
+        let mock = MockAdapter::new().with_known_entities(["auth.users"]);
+        let dropped = design.resolve_unknown_refs_via_db(&mock).await.unwrap();
+
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            design.entities.last().unwrap().warnings,
+            vec!["Some other warning"]
+        );
     }
 }

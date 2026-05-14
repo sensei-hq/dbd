@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -14,6 +15,8 @@ pub struct MockAdapter {
     pub imported: Arc<Mutex<Vec<String>>>,
     pub meta: Arc<Mutex<Option<ProjectMeta>>>,
     pub connected: bool,
+    /// Entity names that `resolve_entity` should report as existing.
+    pub known_entities: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for MockAdapter {
@@ -30,7 +33,22 @@ impl MockAdapter {
             imported: Arc::new(Mutex::new(Vec::new())),
             meta: Arc::new(Mutex::new(None)),
             connected: false,
+            known_entities: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Configure `resolve_entity` to report these names as existing in the DB.
+    pub fn with_known_entities<I, S>(self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut set = self.known_entities.lock().unwrap();
+        for n in names {
+            set.insert(n.into());
+        }
+        drop(set);
+        self
     }
 
     pub fn with_version(self, version: u32) -> Self {
@@ -103,8 +121,12 @@ impl DatabaseAdapter for MockAdapter {
         ReferenceClass::UserDefined
     }
 
-    async fn resolve_entity(&self, _name: &str) -> Result<Option<String>> {
-        Ok(None)
+    async fn resolve_entity(&self, name: &str) -> Result<Option<String>> {
+        if self.known_entities.lock().unwrap().contains(name) {
+            Ok(Some(name.to_string()))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn ensure_import_procedure(&self) -> Result<()> {

@@ -505,7 +505,7 @@ async fn reset_force_overrides_guard() {
 async fn apply_dry_run_does_not_execute() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, None, true, |_| {}, |_, _| {}).await.unwrap();
+    d.apply(&mock, None, true, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     assert!(mock.applied_names().is_empty());
 }
 
@@ -513,7 +513,7 @@ async fn apply_dry_run_does_not_execute() {
 async fn apply_executes_all_entities() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, None, false, |_| {}, |_, _| {}).await.unwrap();
+    d.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     assert!(!mock.applied_names().is_empty());
 }
 
@@ -521,7 +521,7 @@ async fn apply_executes_all_entities() {
 async fn apply_single_entity_by_name() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, Some("config.lookups"), false, |_| {}, |_, _| {}).await.unwrap();
+    d.apply(&mock, Some("config.lookups"), false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     let applied = mock.applied_names();
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0], "config.lookups");

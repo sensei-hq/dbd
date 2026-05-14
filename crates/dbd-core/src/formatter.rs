@@ -4,7 +4,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::config::{CommaStyle, FormatConfig, KeywordCase};
+use crate::config::{CommaStyle, FormatConfig, KeywordCase, QueryStyle};
 
 /// Format a DDL file according to the given configuration.
 ///
@@ -107,6 +107,15 @@ fn format_parsed_statements(
             }
             Statement::CreateIndex(ci) => {
                 return format_create_index(ci, config);
+            }
+            Statement::CreateView(cv) => {
+                return format_create_view(&cv.name, cv.or_replace, &cv.query, config);
+            }
+            Statement::CreateType { name, representation: Some(repr) } => {
+                return format_create_type(name, repr, config);
+            }
+            Statement::Query(q) if config.query_style == QueryStyle::River => {
+                return format_river_query(q, config);
             }
             _ => {}
         }
@@ -546,6 +555,579 @@ fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
     result
 }
 
+// ── CREATE VIEW formatter ───────────────────────────────
+
+fn format_create_view(
+    name: &sqlparser::ast::ObjectName,
+    or_replace: bool,
+    query: &sqlparser::ast::Query,
+    config: &FormatConfig,
+) -> String {
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
+    let header = if or_replace {
+        format!("{} {}", kw("create or replace view"), name.to_string().to_lowercase())
+    } else {
+        format!("{} {}", kw("create view"), name.to_string().to_lowercase())
+    };
+
+    let body = if config.query_style == QueryStyle::River {
+        let lines = river_select_lines(query, config);
+        lines.join("\n")
+    } else {
+        apply_keyword_case(&query.to_string(), &config.keyword_case)
+    };
+
+    ensure_semicolon(&format!("{} {}\n{}", header, kw("as"), body))
+}
+
+// ── CREATE TYPE formatter ───────────────────────────────
+
+fn format_create_type(
+    name: &sqlparser::ast::ObjectName,
+    representation: &sqlparser::ast::UserDefinedTypeRepresentation,
+    config: &FormatConfig,
+) -> String {
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
+    match representation {
+        sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels } => {
+            let mut out = format!(
+                "{} {} {} (\n",
+                kw("create type"),
+                name.to_string().to_lowercase(),
+                kw("as enum"),
+            );
+            let indent = " ".repeat(config.indent);
+            for (i, label) in labels.iter().enumerate() {
+                let label_str = label.value.as_str();
+                if i == 0 {
+                    out.push_str(&format!("{indent}'{label_str}'\n"));
+                } else {
+                    let prefix = format!("{}, ", &indent[..indent.len().saturating_sub(2)]);
+                    out.push_str(&format!("{prefix}'{label_str}'\n"));
+                }
+            }
+            out.push_str(");");
+            out
+        }
+        other => {
+            let raw = format!("create type {} {other}", name.to_string().to_lowercase());
+            let result = apply_keyword_case(&raw, &config.keyword_case);
+            ensure_semicolon(&result)
+        }
+    }
+}
+
+// ── River formatter ─────────────────────────────────────
+
+/// Apply keyword case to a single token (not a full SQL string).
+fn kw_case(s: &str, case: &KeywordCase) -> String {
+    match case {
+        KeywordCase::Lower => s.to_lowercase(),
+        KeywordCase::Upper => s.to_uppercase(),
+        KeywordCase::Preserve => s.to_string(),
+    }
+}
+
+/// Emit one river-style line: keyword right-aligned within `gutter`, then
+/// a space, then content.
+fn river_line(gutter: usize, keyword: &str, content: &str) -> String {
+    let pad = gutter.saturating_sub(keyword.chars().count());
+    format!("{}{} {}", " ".repeat(pad), keyword, content)
+}
+
+/// Emit a continuation comma line — comma sits at position `gutter`,
+/// aligning with the right edge of the keyword on the previous clause line.
+fn river_comma_line(gutter: usize, content: &str) -> String {
+    let pad = gutter.saturating_sub(1);
+    format!("{}, {}", " ".repeat(pad), content)
+}
+
+/// Format a SELECT query (or bare SELECT) with river style.
+/// Returns the formatted SQL with a trailing semicolon.
+fn format_river_query(query: &sqlparser::ast::Query, config: &FormatConfig) -> String {
+    let lines = river_select_lines(query, config);
+    ensure_semicolon(&lines.join("\n"))
+}
+
+/// Build river-formatted lines for a Query. Used both for standalone SELECT
+/// and for embedding inside CREATE VIEW.
+fn river_select_lines(query: &sqlparser::ast::Query, config: &FormatConfig) -> Vec<String> {
+    use sqlparser::ast::SetExpr;
+
+    match &*query.body {
+        SetExpr::Select(select) => {
+            river_lines_from_select(select, query, config)
+        }
+        _ => {
+            // UNION / INTERSECT / EXCEPT — fall back to keyword-case only
+            vec![apply_keyword_case(&query.to_string(), &config.keyword_case)]
+        }
+    }
+}
+
+fn river_lines_from_select(
+    select: &sqlparser::ast::Select,
+    query: &sqlparser::ast::Query,
+    config: &FormatConfig,
+) -> Vec<String> {
+    use sqlparser::ast::*;
+
+    let g = config.gutter;
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // ── SELECT list ───────────────────────────────────────
+    let select_kw = if select.distinct.is_some() {
+        kw("select distinct")
+    } else {
+        kw("select")
+    };
+
+    // Collect (rendered_expr, alias) pairs for alias-column alignment.
+    let items: Vec<(String, Option<String>)> = select.projection.iter().map(|item| {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let e = apply_keyword_case(&expr.to_string(), &config.keyword_case);
+                (e, Some(alias.value.to_lowercase()))
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                (apply_keyword_case(&expr.to_string(), &config.keyword_case), None)
+            }
+            SelectItem::Wildcard(_) => ("*".to_string(), None),
+            SelectItem::QualifiedWildcard(name, _) => {
+                (format!("{}.*", name.to_string().to_lowercase()), None)
+            }
+        }
+    }).collect();
+
+    // Max expression width across ALL items (not just aliased) so that
+    // both aliased and non-aliased columns indent consistently.
+    let any_aliased = items.iter().any(|(_, a)| a.is_some());
+    let max_expr_len = if any_aliased {
+        items.iter().map(|(e, _)| e.len()).max().unwrap_or(0)
+    } else {
+        0
+    };
+
+    for (i, (expr, alias)) in items.iter().enumerate() {
+        let content = if any_aliased {
+            let pad = max_expr_len.saturating_sub(expr.len());
+            if let Some(al) = alias {
+                format!("{}{} {} {}", expr, " ".repeat(pad), kw("as"), al)
+            } else {
+                // Non-aliased items still get padding so columns align
+                format!("{}{}", expr, " ".repeat(pad))
+            }
+        } else {
+            expr.clone()
+        };
+        let content = content.trim_end().to_string();
+
+        if i == 0 {
+            lines.push(river_line(g, &select_kw, &content));
+        } else {
+            lines.push(river_comma_line(g, &content));
+        }
+    }
+
+    // ── FROM / JOIN — compute max table-name length for alias alignment ───
+    let max_table_name_len: usize = {
+        let mut max = 0usize;
+        // Only align when at least one table in the clause has an alias
+        let any_alias = select.from.iter().any(|twj| {
+            table_factor_has_alias(&twj.relation)
+                || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
+        });
+        if any_alias {
+            for twj in &select.from {
+                max = max.max(table_factor_name_len(&twj.relation));
+                for join in &twj.joins {
+                    max = max.max(table_factor_name_len(&join.relation));
+                }
+            }
+        }
+        max
+    };
+
+    for (j, twj) in select.from.iter().enumerate() {
+        let from_kw = if j == 0 { kw("from") } else { kw(",") };
+
+        match &twj.relation {
+            TableFactor::Derived { subquery, alias, .. } => {
+                lines.push(river_line(g, &from_kw, "("));
+                let sub_lines = river_select_lines(subquery, config);
+                let sub_indent = " ".repeat(g + 2);
+                for sub_line in sub_lines {
+                    lines.push(format!("{sub_indent}{sub_line}"));
+                }
+                let close = if let Some(a) = alias {
+                    format!("{}) {}", " ".repeat(g + 1), a.name.value.to_lowercase())
+                } else {
+                    format!("{})", " ".repeat(g + 1))
+                };
+                lines.push(close);
+            }
+            _ => {
+                let table_str = render_table_factor_aligned(&twj.relation, max_table_name_len);
+                lines.push(river_line(g, &from_kw, &table_str));
+            }
+        }
+
+        for join in &twj.joins {
+            let (join_kw, on_expr) = extract_join_parts(join, &kw);
+            let join_table = render_table_factor_aligned(&join.relation, max_table_name_len);
+            lines.push(river_line(g, &join_kw, &join_table));
+            if let Some(on) = on_expr {
+                let (on_conds, cont) = split_boolean_conditions(on);
+                emit_aligned_conditions(&on_conds, &kw("on"), &kw(cont), g, config, &mut lines);
+            }
+        }
+    }
+
+    // ── WHERE ─────────────────────────────────────────────
+    if let Some(selection) = &select.selection {
+        let (conds, cont) = split_boolean_conditions(selection);
+        emit_aligned_conditions(&conds, &kw("where"), &kw(cont), g, config, &mut lines);
+    }
+
+    // ── GROUP BY ──────────────────────────────────────────
+    let group_exprs: Vec<String> = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => {
+            exprs.iter().map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case)).collect()
+        }
+        GroupByExpr::All(_) => vec![kw("all")],
+    };
+    if !group_exprs.is_empty() {
+        lines.push(river_line(g, &kw("group by"), &group_exprs.join(", ")));
+    }
+
+    // ── HAVING ────────────────────────────────────────────
+    if let Some(having) = &select.having {
+        let (conds, cont) = split_boolean_conditions(having);
+        emit_aligned_conditions(&conds, &kw("having"), &kw(cont), g, config, &mut lines);
+    }
+
+    // ── ORDER BY ──────────────────────────────────────────
+    if let Some(order_by) = &query.order_by
+        && let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind
+        && !exprs.is_empty()
+    {
+        let order_items: Vec<String> = exprs.iter().map(|o| {
+            let e = apply_keyword_case(&o.expr.to_string(), &config.keyword_case);
+            match o.options.asc {
+                Some(false) => format!("{} {}", e, kw("desc")),
+                _ => e,
+            }
+        }).collect();
+        lines.push(river_line(g, &kw("order by"), &order_items.join(", ")));
+    }
+
+    // ── LIMIT / OFFSET ────────────────────────────────────
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+                if let Some(lim) = limit {
+                    lines.push(river_line(g, &kw("limit"), &lim.to_string()));
+                }
+                if let Some(off) = offset {
+                    lines.push(river_line(g, &kw("offset"), &off.value.to_string()));
+                }
+            }
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                lines.push(river_line(g, &kw("limit"), &limit.to_string()));
+                lines.push(river_line(g, &kw("offset"), &offset.to_string()));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Emit a group of conditions (WHERE / HAVING / ON) with operator alignment.
+///
+/// When every condition in the group is a simple `lhs op rhs` comparison,
+/// the LHS values are right-padded to the same width so operators align.
+///
+/// Nested OR groups `(a OR b)` within an AND chain are expanded inline:
+/// ```text
+///      where x     = 1
+///        and (a    = 2
+///          or b    = 3)
+/// ```
+fn emit_aligned_conditions(
+    conditions: &[&sqlparser::ast::Expr],
+    first_kw: &str,
+    cont_kw: &str,
+    gutter: usize,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    // Try to extract (lhs, op, rhs) from every condition.
+    let parts: Vec<Option<(String, String, String)>> = conditions
+        .iter()
+        .map(|c| extract_comparison_parts(c, &config.keyword_case))
+        .collect();
+
+    let all_comparable = conditions.len() > 1 && parts.iter().all(|p| p.is_some());
+
+    if all_comparable {
+        let max_lhs = parts.iter()
+            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
+            .max()
+            .unwrap_or(0);
+
+        for (i, part) in parts.iter().enumerate() {
+            let (lhs, op, rhs) = part.as_ref().unwrap();
+            let pad = max_lhs.saturating_sub(lhs.len());
+            let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+            let keyword = if i == 0 { first_kw } else { cont_kw };
+            lines.push(river_line(gutter, keyword, &content));
+        }
+    } else {
+        // Mixed: expand OR groups inline, align remaining comparisons
+        let max_lhs = parts.iter()
+            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
+            .max()
+            .unwrap_or(0);
+        let multi_cmp = parts.iter().filter(|p| p.is_some()).count() > 1;
+
+        for (i, cond) in conditions.iter().enumerate() {
+            let keyword = if i == 0 { first_kw } else { cont_kw };
+
+            if let Some(or_parts) = extract_nested_or_parts(cond) {
+                emit_or_group(&or_parts, keyword, gutter, config, lines);
+            } else if multi_cmp && parts[i].is_some() {
+                let (lhs, op, rhs) = parts[i].as_ref().unwrap();
+                let pad = max_lhs.saturating_sub(lhs.len());
+                let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+                lines.push(river_line(gutter, keyword, &content));
+            } else {
+                let content = apply_keyword_case(&cond.to_string(), &config.keyword_case);
+                lines.push(river_line(gutter, keyword, &content));
+            }
+        }
+    }
+}
+
+/// If `expr` is `(a OR b OR ...)`, return the flattened OR parts.
+fn extract_nested_or_parts(expr: &sqlparser::ast::Expr) -> Option<Vec<&sqlparser::ast::Expr>> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::Nested(inner) => match inner.as_ref() {
+            Expr::BinaryOp { op: BinaryOperator::Or, .. } => Some(split_or_conditions(inner)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit a parenthesized OR group with internal operator alignment.
+///
+/// ```text
+///        and (status = 'approved'
+///          or role   = 'admin')
+/// ```
+fn emit_or_group(
+    or_conditions: &[&sqlparser::ast::Expr],
+    keyword: &str,
+    gutter: usize,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    let kw_or = kw_case("or", &config.keyword_case);
+    let inner_gutter = gutter + 1;
+
+    let parts: Vec<Option<(String, String, String)>> = or_conditions
+        .iter()
+        .map(|c| extract_comparison_parts(c, &config.keyword_case))
+        .collect();
+    let all_comparable = or_conditions.len() > 1 && parts.iter().all(|p| p.is_some());
+
+    let render = |j: usize, content: &str, lines: &mut Vec<String>| {
+        if j == 0 {
+            lines.push(river_line(gutter, keyword, &format!("({content}")));
+        } else if j == or_conditions.len() - 1 {
+            lines.push(river_line(inner_gutter, &kw_or, &format!("{content})")));
+        } else {
+            lines.push(river_line(inner_gutter, &kw_or, content));
+        }
+    };
+
+    if all_comparable {
+        let max_lhs = parts.iter()
+            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
+            .max()
+            .unwrap_or(0);
+
+        for (j, part) in parts.iter().enumerate() {
+            let (lhs, op, rhs) = part.as_ref().unwrap();
+            let pad = max_lhs.saturating_sub(lhs.len());
+            let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+            render(j, &content, lines);
+        }
+    } else {
+        for (j, cond) in or_conditions.iter().enumerate() {
+            let content = apply_keyword_case(&cond.to_string(), &config.keyword_case);
+            render(j, &content, lines);
+        }
+    }
+}
+
+/// Try to decompose a condition expression into `(lhs_str, op_str, rhs_str)`
+/// for a simple comparison.  Returns `None` for complex/compound expressions.
+fn extract_comparison_parts(
+    expr: &sqlparser::ast::Expr,
+    case: &KeywordCase,
+) -> Option<(String, String, String)> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::BinaryOp { left, op, right } if is_comparison_op(op) => {
+            let lhs = apply_keyword_case(&left.to_string(), case);
+            let op_str = comparison_op_str(op, case);
+            let rhs = apply_keyword_case(&right.to_string(), case);
+            Some((lhs, op_str, rhs))
+        }
+        Expr::IsNull(e) => Some((
+            apply_keyword_case(&e.to_string(), case),
+            kw_case("is", case),
+            kw_case("null", case),
+        )),
+        Expr::IsNotNull(e) => Some((
+            apply_keyword_case(&e.to_string(), case),
+            kw_case("is not", case),
+            kw_case("null", case),
+        )),
+        _ => None,
+    }
+}
+
+fn is_comparison_op(op: &sqlparser::ast::BinaryOperator) -> bool {
+    use sqlparser::ast::BinaryOperator as B;
+    matches!(
+        op,
+        B::Eq | B::NotEq | B::Gt | B::Lt | B::GtEq | B::LtEq
+            | B::PGRegexMatch | B::PGRegexIMatch
+            | B::PGRegexNotMatch | B::PGRegexNotIMatch
+    )
+}
+
+fn comparison_op_str(op: &sqlparser::ast::BinaryOperator, case: &KeywordCase) -> String {
+    use sqlparser::ast::BinaryOperator as B;
+    match op {
+        B::Eq => "=".to_string(),
+        B::NotEq => "!=".to_string(),
+        B::Gt => ">".to_string(),
+        B::Lt => "<".to_string(),
+        B::GtEq => ">=".to_string(),
+        B::LtEq => "<=".to_string(),
+        B::PGRegexMatch => "~".to_string(),
+        B::PGRegexIMatch => "~*".to_string(),
+        B::PGRegexNotMatch => "!~".to_string(),
+        B::PGRegexNotIMatch => "!~*".to_string(),
+        other => apply_keyword_case(&other.to_string(), case),
+    }
+}
+
+fn table_factor_name_len(tf: &sqlparser::ast::TableFactor) -> usize {
+    match tf {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            name.to_string().to_lowercase().len()
+        }
+        _ => 0,
+    }
+}
+
+fn table_factor_has_alias(tf: &sqlparser::ast::TableFactor) -> bool {
+    match tf {
+        sqlparser::ast::TableFactor::Table { alias, .. } => alias.is_some(),
+        _ => false,
+    }
+}
+
+fn render_table_factor_aligned(
+    tf: &sqlparser::ast::TableFactor,
+    max_name_len: usize,
+) -> String {
+    match tf {
+        sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+            let n = name.to_string().to_lowercase();
+            match alias {
+                Some(a) => {
+                    let pad = max_name_len.saturating_sub(n.len());
+                    format!("{}{} {}", n, " ".repeat(pad), a.name.value.to_lowercase())
+                }
+                None => n,
+            }
+        }
+        other => other.to_string().to_lowercase(),
+    }
+}
+
+fn extract_join_parts<'a>(
+    join: &'a sqlparser::ast::Join,
+    kw: &impl Fn(&str) -> String,
+) -> (String, Option<&'a sqlparser::ast::Expr>) {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+
+    let (keyword, constraint) = match &join.join_operator {
+        JoinOperator::Inner(c) => (kw("inner join"), Some(c)),
+        JoinOperator::LeftOuter(c) => (kw("left join"), Some(c)),
+        JoinOperator::RightOuter(c) => (kw("right join"), Some(c)),
+        JoinOperator::FullOuter(c) => (kw("full join"), Some(c)),
+        JoinOperator::CrossJoin(_) => return (kw("cross join"), None),
+        _ => return (kw("join"), None),
+    };
+
+    let on_expr = constraint.and_then(|c| match c {
+        JoinConstraint::On(expr) => Some(expr),
+        _ => None,
+    });
+
+    (keyword, on_expr)
+}
+
+/// Flatten top-level AND conditions into a vec.
+/// `a AND b AND c` → `[a, b, c]`
+fn split_and_conditions(expr: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            let mut v = split_and_conditions(left);
+            v.extend(split_and_conditions(right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// Flatten top-level OR conditions into a vec.
+/// `a OR b OR c` → `[a, b, c]`
+fn split_or_conditions(expr: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            let mut v = split_or_conditions(left);
+            v.extend(split_or_conditions(right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// Split a boolean expression into flat conditions, returning the continuation keyword.
+/// Top-level AND → (parts, "and"); top-level OR → (parts, "or"); single → (vec![expr], "and").
+fn split_boolean_conditions(expr: &sqlparser::ast::Expr) -> (Vec<&sqlparser::ast::Expr>, &'static str) {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { op: BinaryOperator::And, .. } => (split_and_conditions(expr), "and"),
+        Expr::BinaryOp { op: BinaryOperator::Or, .. } => (split_or_conditions(expr), "or"),
+        other => (vec![other], "and"),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────
 
 fn ensure_semicolon(s: &str) -> String {
@@ -699,5 +1281,201 @@ mod tests {
             result.contains("CREATE TABLE"),
             "Should have uppercase keywords, got: {result}"
         );
+    }
+
+    // ── River formatter tests ─────────────────────────────
+
+    fn river_config() -> FormatConfig {
+        FormatConfig {
+            query_style: crate::config::QueryStyle::River,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn r1_river_select_keywords_right_aligned() {
+        let input = "SELECT id, name FROM users WHERE id = 1;";
+        let result = format_ddl(input, &river_config());
+        // "select" right-aligned at gutter 10: 4 spaces + "select"
+        assert!(result.contains("    select"), "select should be right-aligned: {result}");
+        // "from" right-aligned: 6 spaces + "from"
+        assert!(result.contains("      from"), "from should be right-aligned: {result}");
+        // "where" right-aligned: 5 spaces + "where"
+        assert!(result.contains("     where"), "where should be right-aligned: {result}");
+    }
+
+    #[test]
+    fn r2_river_select_list_leading_commas() {
+        let input = "SELECT id, name, email FROM users;";
+        let result = format_ddl(input, &river_config());
+        // Second item should be a river comma line
+        assert!(result.contains(", name"), "comma before name: {result}");
+        assert!(result.contains(", email"), "comma before email: {result}");
+        // Commas at gutter position (9 spaces + comma)
+        assert!(result.contains("         , "), "comma should be at gutter: {result}");
+    }
+
+    #[test]
+    fn r3_river_alias_alignment() {
+        let input = "SELECT id AS user_id, created_at AS ts FROM users;";
+        let result = format_ddl(input, &river_config());
+        // Both aliases should be present
+        assert!(result.contains("as user_id"), "alias user_id: {result}");
+        assert!(result.contains("as ts"), "alias ts: {result}");
+        // Aliases should be padded to align: "id" padded to "created_at" length
+        assert!(result.contains("id         as"), "id should be padded for alignment: {result}");
+    }
+
+    #[test]
+    fn r4_river_inner_join() {
+        let input = "SELECT u.id, o.amount FROM users u INNER JOIN orders o ON o.user_id = u.id;";
+        let result = format_ddl(input, &river_config());
+        // "inner join" is exactly 10 chars — no leading spaces
+        assert!(result.contains("inner join"), "inner join present: {result}");
+        // "on" right-aligned at gutter 10: 8 spaces + "on"
+        assert!(result.contains("        on"), "on right-aligned: {result}");
+    }
+
+    #[test]
+    fn r5_river_where_and_conditions() {
+        let input = "SELECT id FROM users WHERE status = 'active' AND age > 18;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("     where"), "where right-aligned: {result}");
+        // "and" right-aligned at gutter 10: 7 spaces + "and"
+        assert!(result.contains("       and"), "and right-aligned: {result}");
+    }
+
+    #[test]
+    fn r10_river_operator_alignment() {
+        // Both conditions are simple comparisons — operators should align.
+        let input = "SELECT id FROM users WHERE status = 'active' AND login_count > 5;";
+        let result = format_ddl(input, &river_config());
+        // "status" is 6 chars, "login_count" is 11 chars — "=" on status line
+        // should be padded to align with ">" on login_count line.
+        let lines: Vec<&str> = result.lines().collect();
+        let where_line = lines.iter().find(|l| l.trim_start().starts_with("where")).unwrap();
+        let and_line   = lines.iter().find(|l| l.trim_start().starts_with("and")).unwrap();
+        // The operator column should be the same in both lines
+        let op_col_where = where_line.find('=').expect("= in where line");
+        let op_col_and   = and_line.find('>').expect("> in and line");
+        assert_eq!(op_col_where, op_col_and,
+            "operators must align:\n  where: {where_line}\n  and:   {and_line}");
+    }
+
+    #[test]
+    fn r11_river_table_alias_alignment() {
+        let input = "SELECT u.id, o.id FROM users u INNER JOIN orders o ON o.user_id = u.id;";
+        let result = format_ddl(input, &river_config());
+        // "users" is 5 chars, "orders" is 6 chars → "users" padded by 1
+        // Both aliases should appear after padding
+        assert!(result.contains("users  u") || result.contains("users u"),
+            "users alias present: {result}");
+        assert!(result.contains("orders o"), "orders alias present: {result}");
+        // Check alias positions match
+        let lines: Vec<&str> = result.lines().collect();
+        let from_line = lines.iter().find(|l| l.trim_start().starts_with("from")).unwrap();
+        let join_line = lines.iter().find(|l| l.trim_start().starts_with("inner")).unwrap();
+        let alias_u = from_line.find(" u").expect("alias u");
+        let alias_o = join_line.find(" o").expect("alias o");
+        assert_eq!(alias_u, alias_o,
+            "table aliases must align:\n  from: {from_line}\n  join: {join_line}");
+    }
+
+    #[test]
+    fn r12_river_or_conditions() {
+        let input = "SELECT id FROM users WHERE status = 'active' OR status = 'pending';";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("     where"), "where right-aligned: {result}");
+        // "or" right-aligned at gutter 10: 8 spaces + "or"
+        assert!(result.contains("        or"), "or right-aligned: {result}");
+        let lines: Vec<&str> = result.lines().collect();
+        let or_count = lines.iter().filter(|l| l.trim_start().starts_with("or")).count();
+        assert_eq!(or_count, 1, "exactly one or continuation line: {result}");
+    }
+
+    #[test]
+    fn r14_river_or_within_and() {
+        let input = "SELECT id FROM users WHERE active = true AND (status = 'approved' OR role = 'admin');";
+        let result = format_ddl(input, &river_config());
+        // OR group should be expanded with parens
+        assert!(result.contains("       and ("), "and opens paren: {result}");
+        assert!(result.contains("         or"), "or continuation indented: {result}");
+        assert!(result.contains("'admin')"), "closing paren on last or: {result}");
+        // Inner OR conditions should be on separate lines
+        let lines: Vec<&str> = result.lines().collect();
+        let and_paren = lines.iter().find(|l| l.trim_start().starts_with("and ("));
+        let or_line = lines.iter().find(|l| l.trim_start().starts_with("or"));
+        assert!(and_paren.is_some(), "and ( line present: {result}");
+        assert!(or_line.is_some(), "or line present: {result}");
+    }
+
+    #[test]
+    fn r15_river_or_within_and_alignment() {
+        // Multiple AND conditions with an embedded OR group — operators align per group
+        let input = "SELECT id FROM users WHERE active = true AND (status = 'approved' OR role = 'admin') AND count > 10;";
+        let result = format_ddl(input, &river_config());
+        // Non-OR conditions should be present
+        assert!(result.contains("active"), "active condition: {result}");
+        assert!(result.contains("count"), "count condition: {result}");
+        // OR group should be expanded
+        assert!(result.contains("(status"), "or group first: {result}");
+        assert!(result.contains("'admin')"), "or group last with paren: {result}");
+        // Inner OR operators should align (status=6 chars, role=4 → role padded)
+        let lines: Vec<&str> = result.lines().collect();
+        let or_line = lines.iter().find(|l| l.trim_start().starts_with("or")).unwrap();
+        assert!(or_line.contains("role   =") || or_line.contains("role ="),
+            "role should be padded for alignment: {result}");
+    }
+
+    #[test]
+    fn r13_river_subquery_from() {
+        let input = "SELECT id FROM (SELECT id, name FROM users WHERE active = true) sub WHERE sub.id > 1;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("      from ("), "from opens paren: {result}");
+        assert!(result.contains(") sub"), "closes with alias: {result}");
+        // Inner select must be indented beyond gutter
+        let lines: Vec<&str> = result.lines().collect();
+        let inner_select = lines.iter().find(|l| {
+            let t = l.trim_start();
+            t.starts_with("select") && l.len() > 10 && l.starts_with("            ")
+        });
+        assert!(inner_select.is_some(), "inner select should be indented: {result}");
+    }
+
+    #[test]
+    fn r6_river_order_by() {
+        let input = "SELECT id, name FROM users ORDER BY name DESC, id;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("  order by"), "order by right-aligned: {result}");
+        assert!(result.contains("name desc"), "desc preserved: {result}");
+    }
+
+    #[test]
+    fn r7_river_create_view() {
+        let input = "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = true;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("create view active_users"), "view header: {result}");
+        assert!(result.contains("    select"), "river select inside view: {result}");
+        assert!(result.contains("      from"), "river from inside view: {result}");
+    }
+
+    #[test]
+    fn r8_create_type_enum_multiline() {
+        let input = "CREATE TYPE status AS ENUM ('active', 'inactive', 'pending');";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(result.contains("create type status as enum"), "enum header: {result}");
+        assert!(result.contains("'active'"), "first value: {result}");
+        // Second and third values should have leading commas
+        assert!(result.contains(", 'inactive'"), "leading comma inactive: {result}");
+        assert!(result.contains(", 'pending'"), "leading comma pending: {result}");
+    }
+
+    #[test]
+    fn r9_river_idempotent() {
+        let input = "SELECT u.id AS uid, u.name AS full_name FROM users u INNER JOIN orders o ON o.user_id = u.id WHERE u.active = true AND o.amount > 100 ORDER BY u.name;";
+        let config = river_config();
+        let first = format_ddl(input, &config);
+        let second = format_ddl(&first, &config);
+        assert_eq!(first, second, "river formatting should be idempotent:\nfirst:\n{first}\nsecond:\n{second}");
     }
 }

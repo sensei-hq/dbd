@@ -33,10 +33,7 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
         }
         EntityType::Role => Some(generate_role_script(entity)),
         EntityType::External => None,
-        _ => entity
-            .file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok()),
+        _ => entity.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()),
     }
 }
 
@@ -301,4 +298,5 @@ mod tests {
         let script = build_grants_script(&HashMap::new(), &[]);
         assert!(script.is_none());
     }
+
 }

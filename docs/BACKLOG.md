@@ -1,8 +1,8 @@
 # Backlog
 
-## Current status (2026-05-04)
+## Current status (2026-05-08)
 
-**96 commits, 14,842 LOC, 364 tests (326 unit + 38 integration), v0.3.0**
+**v0.3.6, 393 tests (355 unit + 38 integration)**
 
 ### Working commands
 
@@ -10,7 +10,7 @@
 |---------|---------|---------|-------|
 | `inspect` | yes | — | Validation pipeline, `--fix` auto-formats DDL |
 | `apply` | `--dry-run` | yes | Version-aware migrations, `--with-policies` |
-| `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching |
+| `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching, env filtering |
 | `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl |
 | `reset` | `--dry-run` | yes | Whitelist-only schema drops, protected schemas |
 | `combine` | yes | — | Merge all DDL into single SQL file |
@@ -26,18 +26,51 @@
 
 ### Core features
 
+- **Per-table `export.format`** — override `--format` per table via `ExportEntry::WithOptions`, precedence: config → CLI flag → csv
+- **`inspect --database`** — resolves "Unresolved reference" warnings against live DB catalog (tables/views/enums)
 - **Schema diff engine** — columns, constraints, indexes, enum values with SQL generation
 - **Smart multi-snapshot** — auto-splits renames/type changes/enum removal into safe migration stages
 - **`_dbd_meta`** — authoritative version source, env/version/applied_at
 - **Migration data corrections** — `*.data.sql` after ALTERs, CAST heuristics, TODO for business logic
 - **Execution plan** — pure function builds plan, thin I/O wrapper executes
 - **Change classification** — `is_castable()`, `classify_changes()`, `generate_data_sql()`
-- **DDL formatter** — keyword case, comma style, type alignment (configurable in design.yaml)
+- **DDL formatter v2** — river-style query formatting (see below), keyword case, comma style, type alignment
 - **RLS policies** — scan policies/ folder, apply with fail-forward, `--with-policies` on apply
 - **Adapter catalog** — namespace-aware pg_proc/pg_type/pg_extension queries with file cache
 - **Supabase support** — grants after apply, protected reset, default externals, DBML stubs
 - **DBML filters** — include/exclude by schema or table name
 - **Deploy** — local path or GitHub source (reqwest + tar, cached)
+- **Embedded PostgreSQL tests** — full-cycle integration tests via `postgresql_embedded`
+- **`connect(url, project)`** — public factory for external callers; adapter selection is internal
+- **On-complete callbacks** — `apply`, `import`, `deploy` all call `on_complete(Summary)` with version info and counts
+- **data.sql TODO validation** — `inspect` surfaces unresolved `-- TODO:` in migration files; `apply` blocks on pending TODOs
+- **Import environment filtering** — `import/{env}/{schema}/file` convention; env-specific files only loaded for matching env
+
+### DDL formatter v2 — river style (✓ done)
+
+```sql
+    select lv.id
+         , lv.value     as display_value
+         , lv.is_active as active
+      from lookups       lkp
+inner join lookup_values lv
+        on lv.lookup_id = lkp.id
+     where lkp.name     = 'Gender'
+       and lv.is_active = true;
+```
+
+- Right-aligned keywords at configurable gutter (default 10, fits `inner join`)
+- Leading-comma SELECT lists
+- Column alias alignment (`as` column aligned across all SELECT items)
+- Table alias alignment (table names padded so aliases line up across FROM + JOINs)
+- Operator alignment (`=`, `!=`, `>=`, `<=`, `~`, `~*` etc. aligned in WHERE/HAVING/ON)
+- AND-split and OR-split WHERE / HAVING / ON — each condition on its own line
+- OR-within-AND expansion — `(a OR b)` inside AND chains rendered as parenthesized OR group
+- Subquery indentation — derived tables in FROM rendered with nested river SELECT
+- GROUP BY, ORDER BY, LIMIT, OFFSET river-aligned
+- CREATE VIEW body formatted with river SELECT
+- CREATE TYPE AS ENUM — multi-line with leading commas
+- Config: `query_style: river`, `gutter: 10` in design.yaml
 
 ### Adapter support
 
@@ -52,56 +85,16 @@
 
 ## Next up
 
-### DDL formatter v2 — river formatting
-- River-style SQL formatting where keywords, commas, and operators form a vertical channel
-- **Right-aligned keywords:** select, from, where, and, on, inner join, left join, order by, group by, having
-- **Leading comma alignment** in SELECT lists, INSERT column lists, UPDATE SET clauses
-- **Alias alignment:** column aliases (AS) and table aliases aligned to a consistent column
-  ```sql
-  select lv.id
-       , lv.value          as display_value
-       , lv.is_active      as active
-    from lookups            lkp
-   inner join lookup_values lv
-      on lv.lookup_id       = lkp.id
-   where lkp.name           = 'Gender'
-     and lv.is_active       = true
-  ```
-- **Right-aligned operators:** `=`, `!=`, `>=`, `<=`, `~*`, `like`, `in` aligned to form the river
-- **Parenthesized conditions:** `or`/`and` inside parens indent to the opening paren, outer `and`/`or` stays at clause level:
-  ```sql
-   where (    lkp.status    = 'active'
-           or lkp.status    = 'pending')
-     and lkp.is_visible     = true
-  ```
-- **Subquery indentation** with consistent nesting
-- VIEW body formatting (currently keyword-case only)
-- Enum CREATE TYPE multi-line value formatting with leading commas
-- Pre-commit hook integration
-
-### Config gaps
-- `target.schema_prefix` — multi-tenant schema prefix
-- Per-table `export.format` — override per table (currently CLI `--format` only)
-
 ### Database inspection
-- `dbd inspect --database` resolves warnings against live DB catalog
-- DB reference cache for offline use
-
-### data.sql validation
-- `dbd inspect` verifies all TODO comments in data.sql have been resolved
-- Block apply if unresolved TODOs exist
+- DB reference cache for offline use (persist results of `inspect --database`)
 
 ---
 
 ## Future
 
-### Import environment filtering
-- Only load import files matching `--environment` (dev/prod)
-- Path convention: `import/dev/staging/test_data.csv`, `import/prod/staging/seed.csv`
-
-### Parallel file parsing
-- `rayon::par_iter` for DDL file read + parse
-- Benchmark: measure parsing time on large projects (100+ DDL files)
+### River formatter enhancements
+- Pre-commit hook integration (`dbd format --check` already works, hook wiring is separate)
+- Multi-document DBML output
 
 ### DBML enhancements
 - Multi-document support (multiple dbml output files)
@@ -119,26 +112,30 @@
 - SQL type → Convex validator mapping
 - `prefersBatchApply()` → single-pass generation
 - Optional `npx convex deploy`
+- **Entity naming**: Convex does not allow `.` in table names — use `{schema}_{entity}` (e.g. `config_users`) instead of `{schema}.{entity}`
 
 ---
 
 ## Test coverage
 
-**364 tests** (326 unit + 38 integration) covering:
+**396 tests** (357 unit + 38 integration + 1 doc) covering:
 - Schema diff engine (45): D1-D21, S1-S14, warnings, edge cases
 - Snapshot create (17): SC1-SC10, entity conversion, backward compat
 - Multi-snapshot (7): B1-B3, S1-S2, baseline, no-changes
 - Change classification (8): C1-C7, enum rename
 - Castability (9): CA1-CA5, type categories
 - data.sql generation (5): D1-D5
+- data.sql TODO scan (8): DS1-DS6, apply-blocking (2)
 - Execution plan (12): A1-A6, edge cases
-- DDL formatter (10): F1-F12
+- DDL formatter (25): F1-F12, R1-R15 (river style incl. OR conditions, OR-within-AND, subquery FROM)
 - RLS policies (6): P1-P8
 - Adapter catalog (4): C1, C4, C10, C11
 - DBML filters (4): include/exclude schema/table
 - Init (7): postgres/supabase targets
 - Deploy (5): local resolve, not-found, subpath, cache hit
-- Config/entity/parser/scanner/dependency/references (225)
+- Embedded integration (5): fresh deploy, idempotent redeploy, data acceptance, dry-run, migration cycle
+- Scanner (7): DDL, import (no-env, env-match, env-exclude), policies
+- Config/entity/parser/scanner/dependency/references (225+)
 
 ### CI configuration
 

@@ -504,7 +504,6 @@ target:
   #       service_role: [usage, all]
 
   # convex:
-  #   schema_prefix: true
   #   skip_schemas: [public]
   #   # No extensions, roles, or grants — not applicable
 
@@ -585,7 +584,7 @@ ignore:
 | `external` — FK stubs for any target | `roles` — Postgres/Supabase only |
 | `import` / `export` — data operations | `grants` — Supabase only |
 | `dbml` — documentation generation | `url` / `path` — connection config |
-| `ignore` — classification overrides | `schema_prefix` — Convex only |
+| `ignore` — classification overrides | `skip_schemas` — per-target entity filtering |
 
 #### Key design decisions
 
@@ -596,6 +595,8 @@ ignore:
 **Connection URL in config** — optionally declare the URL per target. Environment variable references (`$DATABASE_URL`) are expanded at runtime. CLI `--database` flag overrides. This means `dbd apply` can work without any CLI flags if the config has the URL.
 
 **Backward compatibility** — the Rust parser can accept both the old and new config format by detecting `project.database` (old) vs `source.dialect` (new). Warn on old format, migrate with `dbd doctor --fix`.
+
+**No schema_prefix** — an earlier spike added a `schema_prefix` config option intended for multi-tenant deployments (turning `app` into `tenant_42_app`). It was removed for two reasons: first, `design.yaml` lives in source control and is shared across all tenants, so a static prefix in the file cannot work — every tenant would overwrite each other's value. Second, the correct multi-tenant pattern is a separate database (or connection string) per tenant, not shared schemas with a prefix. A per-run CLI flag (`--schema-prefix`) was also considered but discarded: with 100 tenants, running `dbd apply --schema-prefix tenant_42` for each tenant in sequence is operationally tedious and error-prone. The right solution is per-tenant connection strings and a single `design.yaml` with no tenant-specific knobs.
 
 #### Rust types
 
@@ -640,8 +641,6 @@ pub struct TargetConfig {
     pub schemas: Option<Vec<String>>,      // PostgREST-exposed schemas
     pub grants: Option<HashMap<String, GrantConfig>>,  // schema → role → perms
 
-    // Convex-specific
-    pub schema_prefix: Option<bool>,
     pub skip_schemas: Option<Vec<String>>,
 }
 
