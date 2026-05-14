@@ -53,6 +53,11 @@ impl EntityType {
     pub fn has_schema(&self) -> bool {
         TYPES_WITH_SCHEMA.contains(self)
     }
+
+    /// Lowercase tag for display, e.g. `EntityType::Table` → `"table"`.
+    pub fn tag(&self) -> String {
+        format!("{self:?}").to_lowercase()
+    }
 }
 
 /// A parsed reference to another entity.

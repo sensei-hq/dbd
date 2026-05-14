@@ -92,7 +92,6 @@ pub struct TargetConfig {
     pub roles: Vec<RoleEntry>,
     pub schemas: Option<Vec<String>>,
     pub grants: Option<HashMap<String, GrantConfig>>,
-    pub schema_prefix: Option<bool>,
     pub skip_schemas: Option<Vec<String>>,
 }
 
@@ -255,6 +254,14 @@ impl ExportEntry {
             Self::WithOptions(map) => map.keys().next().cloned().unwrap_or_default(),
         }
     }
+
+    /// Per-table format override, if set.
+    pub fn format(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::WithOptions(map) => map.values().next()?.format.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +304,17 @@ pub enum CommaStyle {
     Trailing,
 }
 
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryStyle {
+    /// No special query formatting — keyword case only (default).
+    #[default]
+    None,
+    /// River-style formatting: right-aligned keywords, leading-comma SELECT
+    /// lists, alias alignment, and AND/OR conditions aligned per clause.
+    River,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FormatConfig {
     #[serde(default)]
@@ -307,6 +325,13 @@ pub struct FormatConfig {
     pub type_alignment: usize,
     #[serde(default = "default_indent")]
     pub indent: usize,
+    /// Query formatting style for SELECT / VIEW bodies.
+    #[serde(default)]
+    pub query_style: QueryStyle,
+    /// Width of the keyword gutter for river formatting (default: 10,
+    /// which accommodates "inner join").
+    #[serde(default = "default_gutter")]
+    pub gutter: usize,
 }
 
 fn default_type_alignment() -> usize {
@@ -314,6 +339,9 @@ fn default_type_alignment() -> usize {
 }
 fn default_indent() -> usize {
     2
+}
+fn default_gutter() -> usize {
+    10
 }
 
 impl Default for FormatConfig {
@@ -323,6 +351,8 @@ impl Default for FormatConfig {
             comma_style: CommaStyle::Leading,
             type_alignment: 27,
             indent: 2,
+            query_style: QueryStyle::None,
+            gutter: 10,
         }
     }
 }
@@ -522,6 +552,31 @@ mod tests {
         let yaml = "project:\n  name: test\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.project.version, None);
+    }
+
+    // ── ExportEntry::format ───────────────────────────────
+
+    #[test]
+    fn export_entry_name_only_has_no_format() {
+        let entry = ExportEntry::Name("app.users".to_string());
+        assert_eq!(entry.name(), "app.users");
+        assert!(entry.format().is_none());
+    }
+
+    #[test]
+    fn export_entry_with_format_override() {
+        let yaml = "app.logs:\n  format: jsonl\n";
+        let entry: ExportEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "app.logs");
+        assert_eq!(entry.format(), Some("jsonl"));
+    }
+
+    #[test]
+    fn export_entry_with_options_no_format() {
+        let yaml = "app.orders: {}\n";
+        let entry: ExportEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "app.orders");
+        assert!(entry.format().is_none());
     }
 
     #[test]

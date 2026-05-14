@@ -42,6 +42,9 @@ pub enum Commands {
         /// Auto-fix formatting issues
         #[arg(long)]
         fix: bool,
+        /// Resolve "Unresolved reference" warnings against the live database catalog
+        #[arg(long)]
+        database: bool,
     },
     /// Apply DDL scripts to database
     Apply {

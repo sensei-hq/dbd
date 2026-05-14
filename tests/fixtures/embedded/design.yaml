@@ -1,0 +1,9 @@
+project:
+  name: embedded_test
+  version: 2
+
+source:
+  dialect: postgresql
+
+schemas:
+  - app

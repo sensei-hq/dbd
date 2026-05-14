@@ -1,0 +1,7 @@
+{
+  "fromVersion": 1,
+  "toVersion": 2,
+  "added": [],
+  "altered": ["app.items"],
+  "dropped": []
+}
