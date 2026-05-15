@@ -13,6 +13,7 @@ pub mod github;
 pub mod init;
 pub mod parser;
 pub mod references;
+pub mod refcache;
 pub mod scanner;
 pub mod script;
 pub mod snapshot;
@@ -27,6 +28,8 @@ pub use snapshot::DataSqlTodo;
 ///
 /// The URL scheme determines the adapter:
 /// - `postgres://` / `postgresql://` → PostgreSQL adapter
+/// - `sqlite://` / `sqlite::memory:` / `file:` → SQLite adapter
+/// - `convex:` / `convex://<dir>` → Convex codegen adapter (writes `<dir>/schema.ts`)
 ///
 /// ```no_run
 /// # async fn example() -> dbd_core::Result<()> {
@@ -35,6 +38,22 @@ pub use snapshot::DataSqlTodo;
 /// # }
 /// ```
 pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter>> {
-    let adapter = adapter::postgres::PostgresAdapter::new(url, project).await?;
-    Ok(Box::new(adapter))
+    if url.starts_with("convex:") {
+        let adapter = adapter::convex::ConvexAdapter::from_url(url, project)?;
+        return Ok(Box::new(adapter));
+    }
+    #[cfg(feature = "sqlite")]
+    if url.starts_with("sqlite:") || url.starts_with("file:") {
+        let adapter = adapter::sqlite::SqliteAdapter::new(url, project).await?;
+        return Ok(Box::new(adapter));
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let adapter = adapter::postgres::PostgresAdapter::new(url, project).await?;
+        Ok(Box::new(adapter))
+    }
+    #[cfg(not(feature = "postgres"))]
+    Err(DbdError::Config(format!(
+        "No adapter compiled in for URL: {url}"
+    )))
 }

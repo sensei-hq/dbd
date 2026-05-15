@@ -69,12 +69,38 @@ myproject/
 
 ## Targets
 
-| Target | Status |
-|--------|--------|
-| PostgreSQL | Working (sqlx, PG17+) |
-| Supabase | Working (grants, protected reset, external entities) |
-| SQLite | Planned |
-| Convex | Planned |
+| Target | Status | URL form |
+|--------|--------|----------|
+| PostgreSQL | Working (sqlx, PG17+) | `postgres://user:pass@host:5432/db` |
+| Supabase | Working (grants, protected reset, external entities) | `postgres://...` (with `target: supabase`) |
+| SQLite | Working (sqlx-sqlite, CSV/TSV/JSONL import) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
+| Convex | Working (codegen `convex/schema.ts`, sidecar state) | `convex:` (default `./convex`), `convex://./out` |
+
+### Adapter notes
+
+- **SQLite** has no schemas, enums, roles, extensions, or stored procedures.
+  `Schema` entities are a no-op; `Enum` / `Function` / `Procedure` / `Role` /
+  `Extension` entities error on apply. Entity names like `auth.users` are
+  resolved as the bare table `users`. Import/export use plain `INSERT` /
+  `SELECT` — no `COPY`.
+- **Convex** is a codegen target — `apply` writes `convex/schema.ts` from
+  parsed `TableDef`s and tracks migrations in a sidecar `.dbd_state.json`.
+  Names are flattened (`config.users` → `config_users`) because Convex
+  forbids `.` in table names. SQL types map to `v.*` validators
+  (`int*`/`numeric` → `v.number()`, `text`/`uuid` → `v.string()`, `jsonb` →
+  `v.any()`, `bytea` → `v.bytes()`, arrays → `v.array(...)`, nullable →
+  `v.optional(...)`). Import/export are not supported — use
+  `npx convex import` / `export` directly.
+
+## Offline reference cache
+
+After `dbd inspect --database`, dbd writes a snapshot of all user-defined
+tables, views, and enum types to `<project>/.dbd/refcache.json`. Subsequent
+runs of `dbd inspect` consult that snapshot to silence "Unresolved
+reference" warnings even when no `DATABASE_URL` is available — useful in
+CI, on planes, or when the database is temporarily down. Commit the file
+to share the snapshot with the team, or `.gitignore` it for purely local
+use.
 
 ## Schema evolution
 

@@ -129,6 +129,12 @@ impl DatabaseAdapter for MockAdapter {
         }
     }
 
+    async fn list_entities(&self) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self.known_entities.lock().unwrap().iter().cloned().collect();
+        names.sort();
+        Ok(names)
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         Ok(())
     }

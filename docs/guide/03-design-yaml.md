@@ -102,7 +102,26 @@ target:
         authenticated: [usage, select, insert, update, delete]
 ```
 
-SQLite and Convex adapters are planned.
+**SQLite target:**
+
+```yaml
+target:
+  sqlite:
+    url: sqlite://./app.db
+```
+
+URL forms: `sqlite://relative/path.db`, `sqlite::memory:`, or `file:/abs/path.db`. The file is created on first connect. SQLite has no schemas — top-level `schemas:` entries still validate the design, but no `CREATE SCHEMA` is emitted. Enum/role/procedure/function/extension entities are rejected at apply time.
+
+**Convex target:**
+
+```yaml
+target:
+  convex:
+    url: convex:            # writes to ./convex/schema.ts
+    # or: url: convex://./generated  # writes to ./generated/schema.ts
+```
+
+The Convex adapter is a codegen target — it does not connect to a server. `dbd apply` parses each table's `TableDef`, maps SQL types to `v.*` validators (`int*`/`numeric` → `v.number()`, text-like → `v.string()`, `jsonb` → `v.any()`, `bytea` → `v.bytes()`, arrays → `v.array(...)`, nullable columns → `v.optional(...)`), and writes one `defineSchema({ ... })` file. Table names flatten from `schema.entity` to `schema_entity` because Convex forbids `.` in table names. Indexes render as `.index("name", ["col"])`. Migration state lives in `<output>/.dbd_state.json`. Data import/export must be done via the Convex CLI (`npx convex import`).
 
 ### `schemas`
 

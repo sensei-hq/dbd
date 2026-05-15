@@ -7,6 +7,7 @@ use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::parser;
 use crate::references;
+use crate::refcache::RefCache;
 use crate::scanner;
 use crate::script;
 use crate::snapshot;
@@ -554,6 +555,58 @@ impl Design {
         drop_in(&mut self.entities, &mut dropped);
         drop_in(&mut self.import_tables, &mut dropped);
         Ok(dropped)
+    }
+
+    /// Capture the full set of user-defined entities (tables, views, enums)
+    /// from the live database and persist them to
+    /// `<project_dir>/.dbd/refcache.json`.
+    ///
+    /// Subsequent offline `inspect` runs can use this snapshot to silence
+    /// "Unresolved reference" warnings via [`resolve_unknown_refs_via_cache`].
+    ///
+    /// Returns the number of entities written to the cache.
+    pub async fn write_ref_cache(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        source: &str,
+    ) -> Result<usize> {
+        let names = adapter.list_entities().await?;
+        let count = names.len();
+        let cache = RefCache::new(source, names);
+        cache.save(&self.project_dir)?;
+        Ok(count)
+    }
+
+    /// Drop "Unresolved reference: NAME" warnings whose target NAME exists
+    /// in the project's `<project_dir>/.dbd/refcache.json` snapshot.
+    ///
+    /// Returns `Ok((dropped, Some(cache_size)))` when a cache was found
+    /// (regardless of whether any warnings matched), or `Ok((0, None))`
+    /// when no cache file exists.
+    pub fn resolve_unknown_refs_via_cache(&mut self) -> Result<(usize, Option<usize>)> {
+        const PREFIX: &str = "Unresolved reference: ";
+
+        let cache = match RefCache::load(&self.project_dir)? {
+            Some(c) => c,
+            None => return Ok((0, None)),
+        };
+        let size = cache.len();
+
+        let mut dropped = 0usize;
+        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
+            for entity in entities {
+                entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
+                    Some(name) if cache.contains(name) => {
+                        *dropped += 1;
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        };
+        drop_in(&mut self.entities, &mut dropped);
+        drop_in(&mut self.import_tables, &mut dropped);
+        Ok((dropped, Some(size)))
     }
 
     /// Validate all entities and return self for chaining.
@@ -2025,5 +2078,64 @@ mod tests {
             design.entities.last().unwrap().warnings,
             vec!["Some other warning"]
         );
+    }
+
+    // ── refcache (offline reference cache) ───────────────
+
+    #[tokio::test]
+    async fn write_ref_cache_persists_names_from_adapter() {
+        let mut design = empty_design();
+        // Capture project dir before moving design through helpers.
+        let project_dir = design.project_dir().to_path_buf();
+
+        // Add a warning so we can also exercise the resolve path below.
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        design.entities.push(entity);
+
+        let mock = MockAdapter::new().with_known_entities(["auth.users", "public.lookups"]);
+        let count = design.write_ref_cache(&mock, "postgres").await.unwrap();
+        assert_eq!(count, 2);
+
+        let loaded = crate::refcache::RefCache::load(&project_dir).unwrap().unwrap();
+        assert!(loaded.contains("auth.users"));
+        assert!(loaded.contains("public.lookups"));
+        assert_eq!(loaded.source, "postgres");
+    }
+
+    #[test]
+    fn resolve_via_cache_drops_warning_when_present() {
+        let mut design = empty_design();
+        let project_dir = design.project_dir().to_path_buf();
+
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        entity.warnings.push("Unresolved reference: missing.thing".to_string());
+        design.entities.push(entity);
+
+        let cache = crate::refcache::RefCache::new("postgres", ["auth.users"]);
+        cache.save(&project_dir).unwrap();
+
+        let (dropped, size) = design.resolve_unknown_refs_via_cache().unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(size, Some(1));
+        assert_eq!(
+            design.entities.last().unwrap().warnings,
+            vec!["Unresolved reference: missing.thing"]
+        );
+    }
+
+    #[test]
+    fn resolve_via_cache_is_noop_when_cache_missing() {
+        let mut design = empty_design();
+        let mut entity = Entity::new(EntityType::Table, "config.orders");
+        entity.warnings.push("Unresolved reference: auth.users".to_string());
+        design.entities.push(entity);
+
+        let (dropped, size) = design.resolve_unknown_refs_via_cache().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(size, None);
+        // Warning remains untouched.
+        assert_eq!(design.entities.last().unwrap().warnings.len(), 1);
     }
 }
