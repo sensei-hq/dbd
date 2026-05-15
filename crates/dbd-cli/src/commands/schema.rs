@@ -30,6 +30,27 @@ pub async fn cmd_inspect(
         if dropped > 0 {
             output::detail(verbosity, &format!("  resolved {dropped} reference(s) against database catalog"));
         }
+
+        // Persist a project-local snapshot for offline use on subsequent runs.
+        let source = design.config().default_target().unwrap_or("postgres").to_string();
+        match design.write_ref_cache(&*adapter, &source).await {
+            Ok(n) => output::detail(verbosity, &format!("  cached {n} entity name(s) in .dbd/refcache.json")),
+            Err(e) => output::detail(verbosity, &format!("  refcache save skipped: {e}")),
+        }
+    } else {
+        // Offline path: consult the project-local cache if it exists.
+        match design.resolve_unknown_refs_via_cache() {
+            Ok((dropped, Some(size))) => {
+                if dropped > 0 {
+                    output::detail(
+                        verbosity,
+                        &format!("  resolved {dropped} reference(s) via .dbd/refcache.json ({size} cached)"),
+                    );
+                }
+            }
+            Ok((_, None)) => {}
+            Err(e) => output::detail(verbosity, &format!("  refcache read skipped: {e}")),
+        }
     }
 
     let report = design.report(name);

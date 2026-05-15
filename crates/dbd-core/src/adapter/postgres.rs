@@ -510,6 +510,47 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(result.map(|_| name.to_string()))
     }
 
+    async fn list_entities(&self) -> Result<Vec<String>> {
+        let mut names: Vec<String> = Vec::new();
+
+        // Tables + views (information_schema covers BASE TABLE, VIEW, FOREIGN, etc.)
+        let rows = sqlx::query(
+            "SELECT table_schema, table_name FROM information_schema.tables \
+             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+               AND table_schema NOT LIKE 'pg_toast%' \
+               AND table_schema NOT LIKE 'pg_temp_%'"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("list_entities tables query failed: {e}")))?;
+
+        for row in &rows {
+            let schema: String = row.get("table_schema");
+            let name: String = row.get("table_name");
+            names.push(format!("{schema}.{name}"));
+        }
+
+        // Enum types
+        let rows = sqlx::query(
+            "SELECT n.nspname, t.typname FROM pg_type t \
+             JOIN pg_namespace n ON t.typnamespace = n.oid \
+             WHERE t.typtype = 'e' \
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND n.nspname NOT LIKE 'pg_toast%'"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("list_entities enums query failed: {e}")))?;
+
+        for row in &rows {
+            let schema: String = row.get("nspname");
+            let name: String = row.get("typname");
+            names.push(format!("{schema}.{name}"));
+        }
+
+        Ok(names)
+    }
+
     async fn ensure_migrations_table(&self) -> Result<()> {
         self.execute_script(
             "CREATE TABLE IF NOT EXISTS _dbd_migrations ( \

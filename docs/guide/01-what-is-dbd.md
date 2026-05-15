@@ -6,7 +6,7 @@ dbd (Database Designer) is a tool for managing database schemas as code. You wri
 - **Schema migrations** — versioned snapshots with auto-generated ALTER scripts
 - **Data loading** — CSV/TSV/JSONL files loaded into staging tables with automatic procedure calls
 - **Documentation** — DBML generation for dbdocs.io / dbdiagram.io
-- **Multi-target deployment** — PostgreSQL and Supabase (SQLite, Convex planned)
+- **Multi-target deployment** — PostgreSQL, Supabase, SQLite, and Convex (TypeScript codegen)
 
 ## Core concepts
 
@@ -67,10 +67,14 @@ Next time you run `dbd apply`, the migration runs automatically.
 
 The same parsed schema can deploy to different targets:
 
-- **PostgreSQL** — executes SQL directly
-- **Supabase** — PostgreSQL with managed infrastructure filtering
-
-SQLite and Convex adapters are planned.
+- **PostgreSQL** (`postgres://`) — executes SQL directly via `sqlx`
+- **Supabase** — PostgreSQL with managed-infrastructure filtering and grants
+- **SQLite** (`sqlite://`, `sqlite::memory:`, `file:`) — bare-name catalog,
+  `INSERT`-based import; enums/roles/procedures/functions/extensions error
+  out, schemas are silently no-op
+- **Convex** (`convex:`) — codegen target that writes `convex/schema.ts`
+  with `v.*` validators; names flatten from `schema.entity` to
+  `schema_entity`; migration state lives in `.dbd_state.json`
 
 ## Who is this for?
 

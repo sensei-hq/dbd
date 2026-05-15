@@ -111,11 +111,13 @@ target:
         service_role: [usage, all]
 
   convex:
-    schema_prefix: true
-    skip_schemas: [public]
+    url: convex:            # writes ./convex/schema.ts
+    # url: convex://./generated   # custom output dir
 
   sqlite:
-    path: ./local.db
+    url: sqlite://./local.db
+    # url: sqlite::memory:        # ephemeral
+    # url: file:/abs/path.db
 
 schemas:
   - config
@@ -180,8 +182,8 @@ ignore:
 | `schemas` | `extensions` (Postgres/Supabase) |
 | `external` | `roles` (Postgres/Supabase) |
 | `import` / `export` | `grants` (Supabase) |
-| `dbml` | `url` / `path` (connection) |
-| `ignore` | `schema_prefix` (Convex) |
+| `dbml` | `url` (connection / output) |
+| `ignore` | — |
 
 ---
 
@@ -349,12 +351,35 @@ let graph = design.graph(None);
 
 ## Targets
 
-| Target | Adapter | Extensions | Roles | SQL exec | Import | Migrations |
-|--------|---------|------------|-------|----------|--------|------------|
-| PostgreSQL | sqlx | yes | yes | yes | COPY streaming | yes |
-| Supabase | sqlx | filtered | yes | yes | COPY streaming | yes |
-| SQLite | rusqlite | no | no | yes | INSERT | yes |
-| Convex | file gen | no | no | no | npx convex import | no |
+| Target | Adapter | URL form | Extensions | Roles | SQL exec | Import | Migrations |
+|--------|---------|----------|------------|-------|----------|--------|------------|
+| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `_dbd_migrations` |
+| Supabase | sqlx-postgres | `postgres://…` (with `target: supabase`) | filtered (managed) | yes | yes | COPY streaming | `_dbd_migrations` |
+| SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | batched `INSERT` in a single tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
+| Convex | codegen | `convex:` (→ `./convex`), `convex://./out` | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | not supported (use `npx convex import`) | sidecar `<dir>/.dbd_state.json` |
+
+### Adapter quirks
+
+- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension` are rejected at apply time.
+- **Convex**: codegen, not a SQL engine — `execute_script` returns an error; `apply_entities` is the canonical path (`prefers_batch_apply() = true`). Table names flatten `schema.entity` → `schema_entity` (Convex disallows `.`). SQL → Convex validator: `int*`/`numeric` → `v.number()`, text-like (`text`/`varchar`/`uuid`/`citext`) → `v.string()`, `boolean` → `v.boolean()`, timestamps → `v.number()` (epoch ms), `jsonb`/`json` → `v.any()`, `bytea`/`blob` → `v.bytes()`, `T[]` → `v.array(T)`, nullable → `v.optional(T)`. Indexes emit as `.index("name", ["col"])`. Convex platform columns `_id` / `_creationTime` are skipped if present.
+
+---
+
+## Reference cache (offline `inspect`)
+
+`dbd inspect --database` runs `adapter.list_entities()` against the live database — pulling every user-defined table, view, and enum (system schemas excluded) — and writes the snapshot to `<project>/.dbd/refcache.json`:
+
+```json
+{
+  "captured_at": "2026-05-15T12:34:56Z",
+  "source": "postgres",
+  "entities": ["auth.users", "public.lookups", "config.user_role"]
+}
+```
+
+Subsequent runs of `dbd inspect` (no `--database`, no `DATABASE_URL` needed) load this snapshot and drop any "Unresolved reference: NAME" warning whose target is in the set. Useful for CI, offline editing, or when the database is temporarily down. Commit the file to share with the team, or `.gitignore` it for purely local use.
+
+API: `Design::write_ref_cache(adapter, source)` / `Design::resolve_unknown_refs_via_cache()` / `RefCache::{load,save,contains}` in `dbd_core::refcache`.
 
 ---
 

@@ -96,6 +96,16 @@ pub trait DatabaseAdapter: Send + Sync {
     /// Check if an entity exists in the database catalog.
     async fn resolve_entity(&self, name: &str) -> Result<Option<String>>;
 
+    /// List all user-defined entities (tables, views, enum types) in the
+    /// database, returned as schema-qualified names (e.g. `auth.users`).
+    /// System catalogs (pg_catalog, information_schema, pg_toast) are excluded.
+    ///
+    /// Used by `inspect --database` to build a project-local reference cache
+    /// for offline lookups.
+    async fn list_entities(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     // ── Migration tracking ─────────────────────────────
 
     async fn ensure_migrations_table(&self) -> Result<()>;
@@ -123,9 +133,12 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn set_project_meta(&self, env: &str, version: u32) -> Result<()>;
 }
 
+pub mod convex;
 pub mod mock;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 #[cfg(test)]
 mod tests {

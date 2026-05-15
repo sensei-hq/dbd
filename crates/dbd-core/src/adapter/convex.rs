@@ -1,0 +1,639 @@
+//! Convex adapter — generates `convex/schema.ts` from `Entity` + `TableDef`.
+//!
+//! Convex is a TypeScript-first serverless database; it has no SQL execution
+//! surface. `apply_entities` runs a single-pass codegen and writes the schema
+//! file. SQL types are mapped to Convex `v.*` validators; entity names are
+//! flattened from `schema.entity` to `schema_entity` since Convex does not
+//! allow `.` in table names.
+//!
+//! Migration tracking and project meta are persisted in a sidecar JSON file
+//! (`<output_dir>/.dbd_state.json`) since Convex has no built-in concept
+//! equivalent to `_dbd_migrations` / `_dbd_meta`.
+//!
+//! `import_data` / `export_data` are intentionally not supported here:
+//! `npx convex import` is the canonical path and runs outside of `dbd`.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
+use crate::entity::{ColumnDef, Entity, EntityType, TableDef};
+use crate::error::{DbdError, Result};
+
+/// Sidecar state file (migrations + meta) written next to `schema.ts`.
+const STATE_FILE: &str = ".dbd_state.json";
+/// Codegen output file.
+const SCHEMA_FILE: &str = "schema.ts";
+
+/// Convert a Postgres-style entity name (`schema.entity`) into a Convex-safe
+/// table name (`schema_entity`). Unqualified names pass through unchanged.
+pub fn convex_table_name(qualified: &str) -> String {
+    qualified.replace('.', "_")
+}
+
+/// Map a SQL data type string to a Convex validator expression (without
+/// optional/nullable wrapping). Falls back to `v.any()` for unknown types.
+pub fn sql_to_convex_validator(sql_type: &str) -> String {
+    let t = sql_type.trim().to_lowercase();
+    // Strip trailing array marker before matching; we re-wrap below.
+    let (base, is_array) = if let Some(stripped) = t.strip_suffix("[]") {
+        (stripped.trim().to_string(), true)
+    } else {
+        (t.clone(), false)
+    };
+    // Strip precision / length specifiers: `varchar(120)` -> `varchar`.
+    let base_core = base.split('(').next().unwrap_or(&base).trim();
+
+    let validator = match base_core {
+        "int" | "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint"
+        | "serial" | "bigserial" | "smallserial" | "real" | "double precision"
+        | "double" | "float" | "float4" | "float8" | "numeric" | "decimal" => "v.number()",
+        "bool" | "boolean" => "v.boolean()",
+        "varchar" | "char" | "character varying" | "character" | "text"
+        | "citext" | "uuid" | "name" => "v.string()",
+        // Timestamps stored as epoch-ms or ISO string — Convex has no native
+        // date type, so we standardise on a number (epoch ms).
+        "timestamp" | "timestamptz" | "timestamp with time zone"
+        | "timestamp without time zone" | "date" | "time" | "timetz" => "v.number()",
+        "json" | "jsonb" => "v.any()",
+        "bytea" | "blob" => "v.bytes()",
+        _ => "v.any()",
+    }
+    .to_string();
+
+    if is_array {
+        format!("v.array({validator})")
+    } else {
+        validator
+    }
+}
+
+/// Render a single column line for `defineTable({...})`.
+fn render_column(col: &ColumnDef) -> String {
+    let inner = sql_to_convex_validator(&col.data_type);
+    let wrapped = if col.nullable {
+        format!("v.optional({inner})")
+    } else {
+        inner
+    };
+    // Convex expects valid JS identifier keys; `JSON.stringify`-style quoting
+    // covers any odd column names.
+    format!("    {}: {},", json_key(&col.name), wrapped)
+}
+
+/// Quote a column name as a JS object key when it isn't a simple identifier.
+fn json_key(name: &str) -> String {
+    let is_ident = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if is_ident {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\\\""))
+    }
+}
+
+/// Render any `.index(...)` calls for a table.
+fn render_indexes(table: &TableDef) -> String {
+    let mut out = String::new();
+    for (i, idx) in table.indexes.iter().enumerate() {
+        let cols: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.name))
+            .collect();
+        let default_name = format!("by_{}", i + 1);
+        let name = idx.name.clone().unwrap_or(default_name);
+        out.push_str(&format!("    .index(\"{}\", [{}])\n", name, cols.join(", ")));
+    }
+    out
+}
+
+/// Generate the full content of `convex/schema.ts` from a sorted slice of
+/// table entities. Non-table entities are silently ignored (Convex has no
+/// notion of views, functions, etc.).
+pub fn generate_schema_ts(tables: &[&Entity]) -> String {
+    let mut out = String::new();
+    out.push_str("// Generated by dbd — do not edit by hand.\n");
+    out.push_str("import { defineSchema, defineTable } from \"convex/server\";\n");
+    out.push_str("import { v } from \"convex/values\";\n\n");
+    out.push_str("export default defineSchema({\n");
+
+    for entity in tables {
+        if entity.entity_type != EntityType::Table {
+            continue;
+        }
+        let convex_name = convex_table_name(&entity.name);
+        out.push_str(&format!("  {convex_name}: defineTable({{\n"));
+        if let Some(td) = &entity.table_def {
+            for col in &td.columns {
+                // Convex auto-supplies _id and _creationTime; skip a single-
+                // column `id`/`_id` to avoid colliding with the platform.
+                if matches!(col.name.as_str(), "_id" | "_creationTime") {
+                    continue;
+                }
+                out.push_str(&render_column(col));
+                out.push('\n');
+            }
+        }
+        out.push_str("  })");
+        if let Some(td) = &entity.table_def
+            && !td.indexes.is_empty()
+        {
+            out.push('\n');
+            out.push_str(&render_indexes(td));
+            // strip trailing newline before comma
+            if out.ends_with('\n') {
+                out.pop();
+            }
+        }
+        out.push_str(",\n");
+    }
+
+    out.push_str("});\n");
+    out
+}
+
+// ── Sidecar state ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ConvexState {
+    project: String,
+    env: String,
+    version: u32,
+    updated_at: String,
+    migrations: Vec<MigrationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MigrationRecord {
+    version: u32,
+    description: String,
+    checksum: String,
+    applied_at: String,
+}
+
+fn state_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(STATE_FILE)
+}
+
+fn schema_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(SCHEMA_FILE)
+}
+
+fn load_state(output_dir: &Path) -> ConvexState {
+    let path = state_path(output_dir);
+    if !path.exists() {
+        return ConvexState::default();
+    }
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(output_dir: &Path, state: &ConvexState) -> Result<()> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| DbdError::Config(format!("create convex output dir: {e}")))?;
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| DbdError::Config(format!("serialize convex state: {e}")))?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::write(state_path(output_dir), json)
+        .map_err(|e| DbdError::Config(format!("write convex state: {e}")))?;
+    Ok(())
+}
+
+// ── Adapter ───────────────────────────────────────────────────
+
+/// Codegen adapter — writes `convex/schema.ts` and tracks state in a sidecar.
+pub struct ConvexAdapter {
+    project: String,
+    output_dir: PathBuf,
+    /// Buffered tables awaiting batch emit. Convex's schema is holistic, so
+    /// we collect all tables seen during this apply pass and write one file.
+    pending: Arc<Mutex<Vec<Entity>>>,
+}
+
+impl ConvexAdapter {
+    /// Create an adapter that writes to `output_dir/schema.ts`.
+    /// The directory is created on first write.
+    pub fn new(output_dir: impl Into<PathBuf>, project: &str) -> Self {
+        Self {
+            project: project.to_string(),
+            output_dir: output_dir.into(),
+            pending: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Parse a `convex:` URL and pick the output directory.
+    /// Supported forms:
+    /// - `convex:` → `./convex`
+    /// - `convex://./somedir` → `./somedir`
+    /// - `convex:./out` → `./out`
+    pub fn from_url(url: &str, project: &str) -> Result<Self> {
+        let rest = url
+            .strip_prefix("convex://")
+            .or_else(|| url.strip_prefix("convex:"))
+            .ok_or_else(|| DbdError::Config(format!("Invalid convex URL: {url}")))?;
+        // The directory is supplied by the project's own design.yaml — same
+        // trust boundary as any other config string. File operations against
+        // this path are individually annotated below.
+        let dir = if rest.is_empty() {
+            PathBuf::from("convex")
+        } else {
+            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            PathBuf::from(rest)
+        };
+        Ok(Self::new(dir, project))
+    }
+
+    /// Convenience for tests / external callers.
+    pub fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
+    /// Flush pending tables to `schema.ts`. Idempotent — sorting + full
+    /// regeneration keeps the output deterministic.
+    fn write_schema(&self) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.sort_by(|a, b| a.name.cmp(&b.name));
+        let refs: Vec<&Entity> = pending.iter().collect();
+        let content = generate_schema_ts(&refs);
+
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        std::fs::create_dir_all(&self.output_dir)
+            .map_err(|e| DbdError::Config(format!("create convex output dir: {e}")))?;
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        std::fs::write(schema_path(&self.output_dir), content)
+            .map_err(|e| DbdError::Config(format!("write convex schema.ts: {e}")))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DatabaseAdapter for ConvexAdapter {
+    async fn connect(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn test_connection(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn execute_script(&self, _sql: &str) -> Result<()> {
+        Err(DbdError::Config(
+            "Convex adapter does not execute SQL scripts".into(),
+        ))
+    }
+
+    async fn apply_entity(&self, entity: &Entity) -> Result<()> {
+        match entity.entity_type {
+            // Buffer tables and (re)emit schema.ts on every call so that
+            // single-entity applies still produce a valid file.
+            EntityType::Table => {
+                {
+                    let mut pending = self.pending.lock().unwrap();
+                    if let Some(slot) = pending.iter_mut().find(|e| e.name == entity.name) {
+                        *slot = entity.clone();
+                    } else {
+                        pending.push(entity.clone());
+                    }
+                }
+                self.write_schema()
+            }
+            // Convex has no concept of these — silently ignore so that
+            // cross-target projects can still apply.
+            EntityType::Schema
+            | EntityType::View
+            | EntityType::External
+            | EntityType::Import
+            | EntityType::Export => Ok(()),
+            EntityType::Extension
+            | EntityType::Role
+            | EntityType::Enum
+            | EntityType::Function
+            | EntityType::Procedure => Err(DbdError::Config(format!(
+                "Convex adapter does not support {:?} entities ({})",
+                entity.entity_type, entity.name
+            ))),
+        }
+    }
+
+    async fn apply_entities(&self, entities: &[Entity]) -> Result<()> {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.clear();
+            for e in entities {
+                if e.entity_type == EntityType::Table {
+                    pending.push(e.clone());
+                }
+            }
+        }
+        self.write_schema()
+    }
+
+    fn prefers_batch_apply(&self) -> bool {
+        true
+    }
+
+    async fn import_data(&self, _entity: &Entity, _dry_run: bool) -> Result<()> {
+        Err(DbdError::Config(
+            "Convex import is handled by `npx convex import` — not supported in dbd adapter"
+                .into(),
+        ))
+    }
+
+    async fn export_data(&self, _entity: &Entity) -> Result<()> {
+        Err(DbdError::Config(
+            "Convex export is handled by `npx convex export` — not supported in dbd adapter"
+                .into(),
+        ))
+    }
+
+    async fn load_catalog(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn classify_reference(&self, _name: &str, _installed: &[String]) -> ReferenceClass {
+        // Convex has no SQL catalog — everything is user-defined by default.
+        ReferenceClass::UserDefined
+    }
+
+    async fn resolve_entity(&self, name: &str) -> Result<Option<String>> {
+        // Resolve against tables currently emitted in schema.ts (buffered).
+        let pending = self.pending.lock().unwrap();
+        let target = convex_table_name(name);
+        Ok(pending
+            .iter()
+            .find(|e| convex_table_name(&e.name) == target)
+            .map(|_| name.to_string()))
+    }
+
+    async fn list_entities(&self) -> Result<Vec<String>> {
+        let pending = self.pending.lock().unwrap();
+        Ok(pending.iter().map(|e| convex_table_name(&e.name)).collect())
+    }
+
+    async fn ensure_migrations_table(&self) -> Result<()> {
+        // State file is created lazily on first record.
+        Ok(())
+    }
+
+    async fn get_db_version(&self) -> Result<u32> {
+        Ok(load_state(&self.output_dir).version)
+    }
+
+    async fn apply_migration(
+        &self,
+        version: u32,
+        _sql: &str,
+        description: &str,
+        checksum: &str,
+    ) -> Result<()> {
+        let mut state = load_state(&self.output_dir);
+        if state.migrations.iter().any(|m| m.version == version) {
+            return Ok(());
+        }
+        state.migrations.push(MigrationRecord {
+            version,
+            description: description.to_string(),
+            checksum: checksum.to_string(),
+            applied_at: chrono::Utc::now().to_rfc3339(),
+        });
+        save_state(&self.output_dir, &state)
+    }
+
+    async fn clear_project_migrations(&self) -> Result<()> {
+        let mut state = load_state(&self.output_dir);
+        state.migrations.clear();
+        save_state(&self.output_dir, &state)
+    }
+
+    async fn ensure_import_procedure(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_meta_table(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
+        let state = load_state(&self.output_dir);
+        if state.project.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ProjectMeta {
+            project: state.project,
+            env: state.env,
+            version: state.version,
+            applied_at: Some(state.updated_at),
+        }))
+    }
+
+    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+        let mut state = load_state(&self.output_dir);
+        state.project = self.project.clone();
+        state.env = env.to_string();
+        state.version = version;
+        state.updated_at = chrono::Utc::now().to_rfc3339();
+        save_state(&self.output_dir, &state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{ColumnDef, IndexColumn, IndexDef, TableComments, TableDef};
+    use tempfile::tempdir;
+
+    fn col(name: &str, ty: &str, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            is_identity: false,
+            comment: None,
+            inline_fk: None,
+        }
+    }
+
+    fn table(name: &str, columns: Vec<ColumnDef>, indexes: Vec<IndexDef>) -> Entity {
+        let mut e = Entity::new(EntityType::Table, name);
+        e.table_def = Some(TableDef {
+            columns,
+            constraints: vec![],
+            indexes,
+            comments: TableComments::default(),
+        });
+        e
+    }
+
+    #[test]
+    fn cv1_table_name_flattens_schema() {
+        assert_eq!(convex_table_name("config.users"), "config_users");
+        assert_eq!(convex_table_name("plain"), "plain");
+    }
+
+    #[test]
+    fn cv2_sql_type_mapping_covers_common_types() {
+        assert_eq!(sql_to_convex_validator("int4"), "v.number()");
+        assert_eq!(sql_to_convex_validator("bigint"), "v.number()");
+        assert_eq!(sql_to_convex_validator("varchar(120)"), "v.string()");
+        assert_eq!(sql_to_convex_validator("text"), "v.string()");
+        assert_eq!(sql_to_convex_validator("boolean"), "v.boolean()");
+        assert_eq!(sql_to_convex_validator("timestamptz"), "v.number()");
+        assert_eq!(sql_to_convex_validator("jsonb"), "v.any()");
+        assert_eq!(sql_to_convex_validator("uuid"), "v.string()");
+        assert_eq!(sql_to_convex_validator("bytea"), "v.bytes()");
+        assert_eq!(sql_to_convex_validator("text[]"), "v.array(v.string())");
+        assert_eq!(sql_to_convex_validator("unknown_xyz"), "v.any()");
+    }
+
+    #[test]
+    fn cv3_schema_ts_contains_define_calls() {
+        let t = table(
+            "config.users",
+            vec![col("id", "int8", false), col("email", "text", true)],
+            vec![],
+        );
+        let out = generate_schema_ts(&[&t]);
+        assert!(out.contains("import { defineSchema, defineTable } from \"convex/server\";"));
+        assert!(out.contains("config_users: defineTable({"));
+        assert!(out.contains("id: v.number(),"));
+        assert!(out.contains("email: v.optional(v.string()),"));
+        assert!(out.contains("export default defineSchema({"));
+    }
+
+    #[test]
+    fn cv4_indexes_render_via_dot_index() {
+        let t = table(
+            "auth.sessions",
+            vec![col("user_id", "uuid", false)],
+            vec![IndexDef {
+                name: Some("by_user".into()),
+                columns: vec![IndexColumn {
+                    name: "user_id".into(),
+                    order: None,
+                }],
+                unique: false,
+                index_type: None,
+            }],
+        );
+        let out = generate_schema_ts(&[&t]);
+        assert!(out.contains(".index(\"by_user\", [\"user_id\"])"));
+    }
+
+    #[test]
+    fn cv5_internal_columns_are_skipped() {
+        let t = table(
+            "config.thing",
+            vec![
+                col("_id", "uuid", false),
+                col("_creationTime", "timestamptz", false),
+                col("name", "text", false),
+            ],
+            vec![],
+        );
+        let out = generate_schema_ts(&[&t]);
+        assert!(!out.contains("_id: v."));
+        assert!(!out.contains("_creationTime"));
+        assert!(out.contains("name: v.string()"));
+    }
+
+    #[tokio::test]
+    async fn cv6_apply_entities_writes_schema_ts() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let t1 = table("config.users", vec![col("email", "text", false)], vec![]);
+        let t2 = table("auth.sessions", vec![col("token", "text", false)], vec![]);
+        adapter.apply_entities(&[t1, t2]).await.unwrap();
+
+        let schema = std::fs::read_to_string(tmp.path().join("schema.ts")).unwrap();
+        assert!(schema.contains("config_users:"));
+        assert!(schema.contains("auth_sessions:"));
+        // Sorted output: auth_ comes before config_
+        let auth_pos = schema.find("auth_sessions:").unwrap();
+        let cfg_pos = schema.find("config_users:").unwrap();
+        assert!(auth_pos < cfg_pos);
+    }
+
+    #[tokio::test]
+    async fn cv7_unsupported_entity_types_error() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        for t in [
+            EntityType::Extension,
+            EntityType::Role,
+            EntityType::Enum,
+            EntityType::Function,
+            EntityType::Procedure,
+        ] {
+            let e = Entity::new(t, "x");
+            assert!(adapter.apply_entity(&e).await.is_err(), "{t:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cv8_meta_and_migrations_roundtrip_via_sidecar() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        assert_eq!(adapter.get_db_version().await.unwrap(), 0);
+        adapter.set_project_meta("dev", 4).await.unwrap();
+        assert_eq!(adapter.get_db_version().await.unwrap(), 4);
+        let m = adapter.get_project_meta().await.unwrap().unwrap();
+        assert_eq!(m.env, "dev");
+        assert_eq!(m.version, 4);
+
+        adapter.apply_migration(1, "", "init", "sum1").await.unwrap();
+        adapter.apply_migration(2, "", "next", "sum2").await.unwrap();
+        // Idempotent re-apply.
+        adapter.apply_migration(1, "", "init", "sum1").await.unwrap();
+
+        // Sidecar exists and contains both records.
+        let sidecar = std::fs::read_to_string(tmp.path().join(".dbd_state.json")).unwrap();
+        assert!(sidecar.contains("\"version\": 1"));
+        assert!(sidecar.contains("\"version\": 2"));
+
+        adapter.clear_project_migrations().await.unwrap();
+        let sidecar = std::fs::read_to_string(tmp.path().join(".dbd_state.json")).unwrap();
+        assert!(sidecar.contains("\"migrations\": []"));
+    }
+
+    #[tokio::test]
+    async fn cv9_url_picks_default_output_dir() {
+        let a = ConvexAdapter::from_url("convex:", "p").unwrap();
+        assert_eq!(a.output_dir(), Path::new("convex"));
+        let a = ConvexAdapter::from_url("convex://./custom", "p").unwrap();
+        assert_eq!(a.output_dir(), Path::new("./custom"));
+        let a = ConvexAdapter::from_url("convex:./out", "p").unwrap();
+        assert_eq!(a.output_dir(), Path::new("./out"));
+        assert!(ConvexAdapter::from_url("postgres://x", "p").is_err());
+    }
+
+    #[tokio::test]
+    async fn cv10_import_export_unsupported() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let e = Entity::new(EntityType::Import, "x");
+        assert!(adapter.import_data(&e, false).await.is_err());
+        assert!(adapter.export_data(&e).await.is_err());
+    }
+}

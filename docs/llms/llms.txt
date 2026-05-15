@@ -64,24 +64,26 @@ ignore: [bfs, my_company.*]
 ## Architecture
 
 - Parser: sqlparser-rs (pure Rust, multi-dialect)
-- Adapters: PostgreSQL (sqlx) — Supabase, SQLite, Convex planned
-- Classification: adapter-owned — each adapter queries its target catalog for builtins/extensions
+- Adapters (all working): PostgreSQL + Supabase (sqlx, `postgres://`), SQLite (sqlx-sqlite, `sqlite://`/`sqlite::memory:`/`file:`), Convex (codegen, `convex:`/`convex://<dir>`)
+- Classification: adapter-owned — each adapter knows its target's catalog (Postgres queries pg_proc/pg_type, SQLite uses a fixed builtins list, Convex defers everything to user-defined)
 - Parallel parsing: rayon for CPU-bound file parse, tokio for async DB operations
 - Library-first: `dbd-core` crate for embedding, `dbd-cli` for the binary
+- Reference cache: `inspect --database` snapshots all user-defined entities to `.dbd/refcache.json`; subsequent offline runs consult it to silence "Unresolved reference" warnings without a live DB
 
 ## Key types
 
 - `Entity` — central type for all DDL objects
 - `TableDef` — parsed table structure (columns, FKs with actions, indexes, constraints, comments)
-- `EntityType` — Schema, Extension, Role, Enum, Table, View, Function, Procedure, External
-- `DatabaseAdapter` trait — connect, apply, import, classify_reference, migration tracking
-- `SqlParser` trait — parse DDL into Entity + TableDef
+- `EntityType` — Schema, Extension, Role, Enum, Table, View, Function, Procedure, External, Import, Export
+- `DatabaseAdapter` trait — connect, apply (single + batch), import/export, classify_reference, resolve_entity, list_entities, migration + meta tracking
+- `RefCache` — JSON snapshot of remote entity names for offline `inspect`
 
 ## Safety
 
 - `_dbd_meta` table records environment (dev/prod) and version in the database
 - `dbd reset` blocked in prod (always) and in dev after v1 snapshot
 - `--force` overrides safety guards
+- For Convex (codegen target) the equivalent state lives in `<output>/.dbd_state.json`
 
 ## Documentation
 
