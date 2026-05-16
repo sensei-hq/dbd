@@ -468,8 +468,12 @@ impl Design {
         let import_tables: Vec<Entity> = import_files
             .iter()
             .map(|file| {
+                // Use the relative path for entity type/name/schema derivation,
+                // but store the absolute path so the file is readable regardless of CWD.
                 let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-                Entity::from_import_file(relative)
+                let mut entity = Entity::from_import_file(relative);
+                entity.file = Some(file.clone());
+                entity
             })
             .collect();
 
