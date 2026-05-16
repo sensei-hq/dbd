@@ -52,7 +52,7 @@ bump: _check-clean _check-ci
 	@echo "Bumping $(VERSION) → $(NEW) ($(KIND))"
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
 	@cargo build -q 2>&1 | grep -v "^warning" || true
-	@git add Cargo.toml Cargo.lock
+	@git add Cargo.toml
 	@git commit -m "chore: bump version to v$(NEW)"
 	@git tag -a "v$(NEW)" -m "v$(NEW)"
 	@echo "Pushing main and v$(NEW)..."
