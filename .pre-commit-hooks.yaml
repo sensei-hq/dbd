@@ -1,0 +1,19 @@
+- id: dbd-format
+  name: dbd format --check
+  description: >-
+    Verify that DDL files match dbd's river-style formatter.
+    Builds dbd from source via cargo — slow on first install, cached after.
+  entry: dbd format --check
+  language: rust
+  files: '\.ddl$|/design\.yaml$|/design\.yml$'
+  pass_filenames: false
+
+- id: dbd-format-system
+  name: dbd format --check (system)
+  description: >-
+    Same as dbd-format but uses an existing `dbd` on PATH.
+    Use this when contributors install dbd themselves (cargo install / brew / release binary).
+  entry: dbd format --check
+  language: system
+  files: '\.ddl$|/design\.yaml$|/design\.yml$'
+  pass_filenames: false

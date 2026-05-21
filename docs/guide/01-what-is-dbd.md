@@ -70,11 +70,14 @@ The same parsed schema can deploy to different targets:
 - **PostgreSQL** (`postgres://`) — executes SQL directly via `sqlx`
 - **Supabase** — PostgreSQL with managed-infrastructure filtering and grants
 - **SQLite** (`sqlite://`, `sqlite::memory:`, `file:`) — bare-name catalog,
-  `INSERT`-based import; enums/roles/procedures/functions/extensions error
-  out, schemas are silently no-op
-- **Convex** (`convex:`) — codegen target that writes `convex/schema.ts`
-  with `v.*` validators; names flatten from `schema.entity` to
-  `schema_entity`; migration state lives in `.dbd_state.json`
+  batched multi-row `INSERT` import (≤500 rows per batch); enums / roles /
+  procedures / functions / extensions error out, schemas are silently
+  no-op; the DDL formatter keeps `CREATE TRIGGER … BEGIN … END;` atomic
+- **Convex** (`convex:`, optional `?deploy=true`) — codegen target that
+  writes `convex/schema.ts` with `v.*` validators, enum `export const … =
+  v.union(v.literal(…))`, and `v.id("table")` for single-column FKs; names
+  flatten from `schema.entity` to `schema_entity`; migration state lives
+  in `.dbd_state.json`; `dbd import` shells out to `npx convex import`
 
 ## Who is this for?
 

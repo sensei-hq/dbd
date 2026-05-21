@@ -41,6 +41,13 @@ export:
 dbml:
   base:
     exclude: { schemas: [staging] }
+  core:
+    include: { schemas: [config] }
+    output: core.dbml          # filename (default: <key>.dbml)
+    auto_group_by_schema: true # emit `TableGroup <schema>` per schema
+    groups:                    # or explicit groups (precedence over auto)
+      - name: lookups
+        tables: [config.lookups, config.lookup_values]
 
 ignore: [bfs, my_company.*]
 ```
@@ -60,12 +67,16 @@ ignore: [bfs, my_company.*]
 - `dbd migrate` — apply pending migrations only
 - `dbd doctor` — audit config for stale entries
 - `dbd reset` — drop all schemas (guarded by _dbd_meta env check)
+- `dbd format [--check]` — river-style DDL formatter; `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
 ## Architecture
 
 - Parser: sqlparser-rs (pure Rust, multi-dialect)
-- Adapters (all working): PostgreSQL + Supabase (sqlx, `postgres://`), SQLite (sqlx-sqlite, `sqlite://`/`sqlite::memory:`/`file:`), Convex (codegen, `convex:`/`convex://<dir>`)
-- Classification: adapter-owned — each adapter knows its target's catalog (Postgres queries pg_proc/pg_type, SQLite uses a fixed builtins list, Convex defers everything to user-defined)
+- Adapters (all working):
+    - PostgreSQL + Supabase (sqlx, `postgres://`) — COPY streaming import, namespace-aware catalog
+    - SQLite (sqlx-sqlite, `sqlite://`/`sqlite::memory:`/`file:`) — batched multi-row INSERT (≤500 rows or 32k binds per batch), trigger-aware DDL splitter, ~150 builtins + `sqlite_*` prefix recognised offline
+    - Convex (codegen, `convex:`/`convex://<dir>[?deploy=true]`) — flattens names, maps SQL → `v.*` validators, enums emit `export const X = v.union(v.literal(…))` above `defineSchema`, single-column FKs emit `v.id("table")`; opt-in `npx convex deploy` after apply; `import_data` shells out to `npx convex import` per table
+- Classification: adapter-owned — each adapter knows its target's catalog (Postgres queries pg_proc/pg_type, SQLite uses a sorted builtins list + `sqlite_*` prefix rule, Convex defers everything to user-defined)
 - Parallel parsing: rayon for CPU-bound file parse, tokio for async DB operations
 - Library-first: `dbd-core` crate for embedding, `dbd-cli` for the binary
 - Reference cache: `inspect --database` snapshots all user-defined entities to `.dbd/refcache.json`; subsequent offline runs consult it to silence "Unresolved reference" warnings without a live DB
