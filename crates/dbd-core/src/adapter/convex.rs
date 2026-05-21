@@ -13,6 +13,7 @@
 //! `import_data` / `export_data` are intentionally not supported here:
 //! `npx convex import` is the canonical path and runs outside of `dbd`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -71,17 +72,72 @@ pub fn sql_to_convex_validator(sql_type: &str) -> String {
     }
 }
 
-/// Render a single column line for `defineTable({...})`.
-fn render_column(col: &ColumnDef) -> String {
-    let inner = sql_to_convex_validator(&col.data_type);
+/// Resolve a column's data type to a Convex validator, consulting the
+/// enum-name → TS-const-name map first so enum columns reference the
+/// generated `v.union(v.literal(...))` instead of `v.any()`.
+fn validator_for_type(sql_type: &str, enums: &HashMap<String, String>) -> String {
+    let t = sql_type.trim().to_lowercase();
+    let (base, is_array) = if let Some(stripped) = t.strip_suffix("[]") {
+        (stripped.trim().to_string(), true)
+    } else {
+        (t.clone(), false)
+    };
+    let base_core = base.split('(').next().unwrap_or(&base).trim();
+
+    let inner = if let Some(const_name) = enums.get(base_core) {
+        const_name.clone()
+    } else {
+        sql_to_convex_validator(&base)
+    };
+
+    if is_array {
+        format!("v.array({inner})")
+    } else {
+        inner
+    }
+}
+
+/// Render a single column line for `defineTable({...})`. The `fk_override`
+/// map is keyed by column name and supplies the inner validator (without
+/// nullable wrapping) for columns that participate in a table-level FK
+/// constraint. Inline FKs and enum/scalar fallbacks are resolved here.
+fn render_column(
+    col: &ColumnDef,
+    enums: &HashMap<String, String>,
+    tables: &HashMap<String, String>,
+    fk_override: &HashMap<String, String>,
+) -> String {
+    let inner = fk_override
+        .get(col.name.as_str())
+        .cloned()
+        .or_else(|| {
+            col.inline_fk
+                .as_ref()
+                .and_then(|fk| fk_target_const(fk, tables))
+        })
+        .unwrap_or_else(|| validator_for_type(&col.data_type, enums));
     let wrapped = if col.nullable {
         format!("v.optional({inner})")
     } else {
         inner
     };
-    // Convex expects valid JS identifier keys; `JSON.stringify`-style quoting
-    // covers any odd column names.
     format!("    {}: {},", json_key(&col.name), wrapped)
+}
+
+/// Resolve a foreign key into `v.id("convex_table_name")` if its target is
+/// a known table (qualified or bare name), else `None`.
+fn fk_target_const(
+    fk: &crate::entity::ForeignKey,
+    tables: &HashMap<String, String>,
+) -> Option<String> {
+    let qualified = match &fk.ref_schema {
+        Some(s) => format!("{}.{}", s.to_lowercase(), fk.ref_table.to_lowercase()),
+        None => fk.ref_table.to_lowercase(),
+    };
+    tables
+        .get(&qualified)
+        .or_else(|| tables.get(&fk.ref_table.to_lowercase()))
+        .map(|name| format!("v.id(\"{name}\")"))
 }
 
 /// Quote a column name as a JS object key when it isn't a simple identifier.
@@ -118,30 +174,104 @@ fn render_indexes(table: &TableDef) -> String {
     out
 }
 
-/// Generate the full content of `convex/schema.ts` from a sorted slice of
-/// table entities. Non-table entities are silently ignored (Convex has no
-/// notion of views, functions, etc.).
-pub fn generate_schema_ts(tables: &[&Entity]) -> String {
+/// Build a lookup from enum SQL-type names (lowercased) → TS const name.
+/// Registers each enum under both its qualified form (`schema.name`) and
+/// its bare name; the qualified form takes precedence on collision.
+fn enum_lookup(entities: &[&Entity]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for e in entities {
+        if e.entity_type != EntityType::Enum {
+            continue;
+        }
+        let ts_name = convex_table_name(&e.name);
+        let qualified = e.name.to_lowercase();
+        // Insert bare name first so qualified can overwrite on collision.
+        if let Some((_, bare)) = qualified.split_once('.') {
+            map.entry(bare.to_string()).or_insert_with(|| ts_name.clone());
+        }
+        map.insert(qualified, ts_name);
+    }
+    map
+}
+
+/// Build a lookup from table SQL names (lowercased) → Convex TS table name.
+/// Registers both qualified (`schema.name`) and bare forms.
+fn table_lookup(entities: &[&Entity]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for e in entities {
+        if e.entity_type != EntityType::Table {
+            continue;
+        }
+        let ts_name = convex_table_name(&e.name);
+        let qualified = e.name.to_lowercase();
+        if let Some((_, bare)) = qualified.split_once('.') {
+            map.entry(bare.to_string()).or_insert_with(|| ts_name.clone());
+        }
+        map.insert(qualified, ts_name);
+    }
+    map
+}
+
+/// Render an enum entity as `export const <name> = v.union(v.literal(...), ...);`.
+fn render_enum_const(entity: &Entity) -> String {
+    let name = convex_table_name(&entity.name);
+    let literals: Vec<String> = entity
+        .enum_values
+        .iter()
+        .map(|ev| format!("v.literal(\"{}\")", ev.name.replace('"', "\\\"")))
+        .collect();
+    if literals.is_empty() {
+        // Empty enum: emit v.union with no args is invalid TS, so fall back
+        // to v.string() so the file still type-checks.
+        format!("export const {name} = v.string();\n")
+    } else {
+        format!("export const {name} = v.union({});\n", literals.join(", "))
+    }
+}
+
+/// Generate the full content of `convex/schema.ts` from a slice of entities.
+/// Enums are emitted as `export const`s above `defineSchema`; tables are
+/// emitted inside `defineSchema`. Other entity types are ignored (Convex has
+/// no notion of views, functions, etc.).
+pub fn generate_schema_ts(entities: &[&Entity]) -> String {
+    let enums = enum_lookup(entities);
+    let tables = table_lookup(entities);
+
     let mut out = String::new();
     out.push_str("// Generated by dbd — do not edit by hand.\n");
     out.push_str("import { defineSchema, defineTable } from \"convex/server\";\n");
     out.push_str("import { v } from \"convex/values\";\n\n");
+
+    // Emit enum consts in sorted order for deterministic output.
+    let mut enum_entities: Vec<&&Entity> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Enum)
+        .collect();
+    enum_entities.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in &enum_entities {
+        out.push_str(&render_enum_const(e));
+    }
+    if !enum_entities.is_empty() {
+        out.push('\n');
+    }
+
     out.push_str("export default defineSchema({\n");
 
-    for entity in tables {
+    for entity in entities {
         if entity.entity_type != EntityType::Table {
             continue;
         }
         let convex_name = convex_table_name(&entity.name);
         out.push_str(&format!("  {convex_name}: defineTable({{\n"));
         if let Some(td) = &entity.table_def {
+            let fk_targets = fk_columns_for_table(td, &tables);
             for col in &td.columns {
-                // Convex auto-supplies _id and _creationTime; skip a single-
-                // column `id`/`_id` to avoid colliding with the platform.
+                // Convex auto-supplies _id and _creationTime; skip these so
+                // user columns don't collide with the platform.
                 if matches!(col.name.as_str(), "_id" | "_creationTime") {
                     continue;
                 }
-                out.push_str(&render_column(col));
+                out.push_str(&render_column(col, &enums, &tables, &fk_targets));
                 out.push('\n');
             }
         }
@@ -161,6 +291,25 @@ pub fn generate_schema_ts(tables: &[&Entity]) -> String {
 
     out.push_str("});\n");
     out
+}
+
+/// Map column name → `v.id("...")` for any single-column FK constraint at
+/// the table level whose target is in `tables`.
+fn fk_columns_for_table(
+    td: &TableDef,
+    tables: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    use crate::entity::TableConstraint;
+    let mut map = HashMap::new();
+    for c in &td.constraints {
+        if let TableConstraint::ForeignKey(fk) = c
+            && fk.columns.len() == 1
+            && let Some(target) = fk_target_const(fk, tables)
+        {
+            map.insert(fk.columns[0].clone(), target);
+        }
+    }
+    map
 }
 
 // ── Sidecar state ─────────────────────────────────────────────
@@ -223,6 +372,12 @@ pub struct ConvexAdapter {
     /// Buffered tables awaiting batch emit. Convex's schema is holistic, so
     /// we collect all tables seen during this apply pass and write one file.
     pending: Arc<Mutex<Vec<Entity>>>,
+    /// When true, run `npx convex deploy` after `apply_entities` finishes.
+    auto_deploy: bool,
+    /// When true, CLI shell-outs (`npx convex deploy`/`import`) are logged
+    /// to stderr and skipped. Tests use this to verify wiring without
+    /// requiring `npx` or a live Convex deployment.
+    cli_dry_run: bool,
 }
 
 impl ConvexAdapter {
@@ -233,6 +388,8 @@ impl ConvexAdapter {
             project: project.to_string(),
             output_dir: output_dir.into(),
             pending: Arc::new(Mutex::new(Vec::new())),
+            auto_deploy: false,
+            cli_dry_run: false,
         }
     }
 
@@ -241,26 +398,124 @@ impl ConvexAdapter {
     /// - `convex:` → `./convex`
     /// - `convex://./somedir` → `./somedir`
     /// - `convex:./out` → `./out`
+    ///
+    /// Query parameters:
+    /// - `?deploy=true` — run `npx convex deploy` after `apply_entities`.
     pub fn from_url(url: &str, project: &str) -> Result<Self> {
         let rest = url
             .strip_prefix("convex://")
             .or_else(|| url.strip_prefix("convex:"))
             .ok_or_else(|| DbdError::Config(format!("Invalid convex URL: {url}")))?;
+        let (path_part, query_part) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
         // The directory is supplied by the project's own design.yaml — same
         // trust boundary as any other config string. File operations against
         // this path are individually annotated below.
-        let dir = if rest.is_empty() {
+        let dir = if path_part.is_empty() {
             PathBuf::from("convex")
         } else {
             // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            PathBuf::from(rest)
+            PathBuf::from(path_part)
         };
-        Ok(Self::new(dir, project))
+        let mut adapter = Self::new(dir, project);
+        if let Some(q) = query_part {
+            for pair in q.split('&') {
+                if let Some((k, v)) = pair.split_once('=')
+                    && k == "deploy"
+                    && matches!(v, "true" | "1" | "yes")
+                {
+                    adapter.auto_deploy = true;
+                }
+            }
+        }
+        Ok(adapter)
+    }
+
+    /// Toggle auto-deploy on/off (overrides URL-derived setting).
+    pub fn with_auto_deploy(mut self, enabled: bool) -> Self {
+        self.auto_deploy = enabled;
+        self
+    }
+
+    /// Whether auto-deploy is currently enabled.
+    pub fn auto_deploy(&self) -> bool {
+        self.auto_deploy
+    }
+
+    /// When set, all `npx convex …` invocations are logged and skipped.
+    /// Useful in tests and `--dry-run`-style flows that should not touch
+    /// a live deployment.
+    pub fn with_cli_dry_run(mut self, enabled: bool) -> Self {
+        self.cli_dry_run = enabled;
+        self
     }
 
     /// Convenience for tests / external callers.
     pub fn output_dir(&self) -> &Path {
         &self.output_dir
+    }
+
+    /// The directory `npx convex` commands run from — one level above
+    /// `convex/schema.ts` so the CLI finds its own `convex/` folder.
+    fn cli_cwd(&self) -> PathBuf {
+        self.output_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Build the argv (after `npx convex`) for a deploy invocation.
+    fn deploy_args() -> Vec<&'static str> {
+        vec!["convex", "deploy"]
+    }
+
+    /// Build the argv (after `npx convex`) for a per-table import.
+    /// `--replace -y` means: overwrite existing rows and skip the
+    /// interactive confirmation prompt.
+    fn import_args(table: &str, file: &str) -> Vec<String> {
+        vec![
+            "convex".into(),
+            "import".into(),
+            "--table".into(),
+            table.into(),
+            "--replace".into(),
+            "-y".into(),
+            file.into(),
+        ]
+    }
+
+    /// Spawn `npx <args>` from `cli_cwd()` and return the combined output.
+    /// When `cli_dry_run` is set, the command is logged and skipped —
+    /// used by tests to verify wiring without requiring `npx` on the path.
+    async fn run_npx(&self, args: &[String]) -> Result<()> {
+        let cwd = self.cli_cwd();
+        if self.cli_dry_run {
+            eprintln!("[dbd convex dry-run] cwd={} npx {}", cwd.display(), args.join(" "));
+            return Ok(());
+        }
+        // nosemgrep: rust.lang.security.tempfile.tempfile, rust.actix.path-traversal.tainted-path.tainted-path
+        let output = tokio::process::Command::new("npx")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .await
+            .map_err(|e| {
+                DbdError::Config(format!(
+                    "failed to spawn npx {}: {e} (is Node/npm installed?)",
+                    args.join(" ")
+                ))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DbdError::Config(format!(
+                "npx {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+        Ok(())
     }
 
     /// Flush pending tables to `schema.ts`. Idempotent — sorting + full
@@ -303,9 +558,9 @@ impl DatabaseAdapter for ConvexAdapter {
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
         match entity.entity_type {
-            // Buffer tables and (re)emit schema.ts on every call so that
-            // single-entity applies still produce a valid file.
-            EntityType::Table => {
+            // Buffer tables and enums and (re)emit schema.ts on every call
+            // so that single-entity applies still produce a valid file.
+            EntityType::Table | EntityType::Enum => {
                 {
                     let mut pending = self.pending.lock().unwrap();
                     if let Some(slot) = pending.iter_mut().find(|e| e.name == entity.name) {
@@ -325,7 +580,6 @@ impl DatabaseAdapter for ConvexAdapter {
             | EntityType::Export => Ok(()),
             EntityType::Extension
             | EntityType::Role
-            | EntityType::Enum
             | EntityType::Function
             | EntityType::Procedure => Err(DbdError::Config(format!(
                 "Convex adapter does not support {:?} entities ({})",
@@ -335,33 +589,56 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn apply_entities(&self, entities: &[Entity]) -> Result<()> {
-        {
+        let had_entities = {
             let mut pending = self.pending.lock().unwrap();
             pending.clear();
             for e in entities {
-                if e.entity_type == EntityType::Table {
+                if matches!(e.entity_type, EntityType::Table | EntityType::Enum) {
                     pending.push(e.clone());
                 }
             }
+            !pending.is_empty()
+        };
+        self.write_schema()?;
+        if self.auto_deploy && had_entities {
+            let args: Vec<String> = Self::deploy_args().iter().map(|s| s.to_string()).collect();
+            self.run_npx(&args).await?;
         }
-        self.write_schema()
+        Ok(())
     }
 
     fn prefers_batch_apply(&self) -> bool {
         true
     }
 
-    async fn import_data(&self, _entity: &Entity, _dry_run: bool) -> Result<()> {
-        Err(DbdError::Config(
-            "Convex import is handled by `npx convex import` — not supported in dbd adapter"
-                .into(),
-        ))
+    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+        let file_path = entity
+            .file
+            .as_ref()
+            .ok_or_else(|| DbdError::Config(format!("No file for import entity {}", entity.name)))?;
+        let file_str = file_path.to_str().ok_or_else(|| {
+            DbdError::Config(format!("Non-UTF8 import path for {}", entity.name))
+        })?;
+        // Convex CLI accepts JSONL or CSV; we pass through whatever the user
+        // provided and let the CLI surface the error if it's something else.
+        let table = convex_table_name(&entity.name);
+        let args = Self::import_args(&table, file_str);
+        if dry_run {
+            eprintln!(
+                "[dbd convex dry-run] would run: npx {} (from {})",
+                args.join(" "),
+                self.cli_cwd().display()
+            );
+            return Ok(());
+        }
+        self.run_npx(&args).await
     }
 
     async fn export_data(&self, _entity: &Entity) -> Result<()> {
+        // Convex CLI exports the entire deployment as a zip, not per table.
+        // Point the user at the CLI rather than implementing a partial story.
         Err(DbdError::Config(
-            "Convex export is handled by `npx convex export` — not supported in dbd adapter"
-                .into(),
+            "Convex CLI does not support per-table export — run `npx convex export --path <dir>` to dump the whole deployment".into(),
         ))
     }
 
@@ -458,7 +735,10 @@ impl DatabaseAdapter for ConvexAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, IndexColumn, IndexDef, TableComments, TableDef};
+    use crate::entity::{
+        ColumnDef, EnumValue, ForeignKey, IndexColumn, IndexDef, TableComments, TableConstraint,
+        TableDef,
+    };
     use tempfile::tempdir;
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnDef {
@@ -582,7 +862,6 @@ mod tests {
         for t in [
             EntityType::Extension,
             EntityType::Role,
-            EntityType::Enum,
             EntityType::Function,
             EntityType::Procedure,
         ] {
@@ -621,19 +900,202 @@ mod tests {
     async fn cv9_url_picks_default_output_dir() {
         let a = ConvexAdapter::from_url("convex:", "p").unwrap();
         assert_eq!(a.output_dir(), Path::new("convex"));
+        assert!(!a.auto_deploy());
         let a = ConvexAdapter::from_url("convex://./custom", "p").unwrap();
         assert_eq!(a.output_dir(), Path::new("./custom"));
         let a = ConvexAdapter::from_url("convex:./out", "p").unwrap();
         assert_eq!(a.output_dir(), Path::new("./out"));
         assert!(ConvexAdapter::from_url("postgres://x", "p").is_err());
+
+        let a = ConvexAdapter::from_url("convex:./out?deploy=true", "p").unwrap();
+        assert_eq!(a.output_dir(), Path::new("./out"));
+        assert!(a.auto_deploy(), "deploy=true should enable auto-deploy");
+        let a = ConvexAdapter::from_url("convex:?deploy=false", "p").unwrap();
+        assert!(!a.auto_deploy(), "deploy=false should leave it off");
+    }
+
+    fn enum_entity(name: &str, values: &[&str]) -> Entity {
+        let mut e = Entity::new(EntityType::Enum, name);
+        e.enum_values = values
+            .iter()
+            .map(|v| EnumValue {
+                name: v.to_string(),
+                note: None,
+            })
+            .collect();
+        e
+    }
+
+    #[test]
+    fn cv11_enum_emits_top_level_const() {
+        let e = enum_entity("config.user_status", &["active", "inactive"]);
+        let out = generate_schema_ts(&[&e]);
+        assert!(
+            out.contains(
+                "export const config_user_status = v.union(v.literal(\"active\"), v.literal(\"inactive\"));"
+            ),
+            "{out}"
+        );
+        // Const appears before defineSchema.
+        let const_pos = out.find("export const config_user_status").unwrap();
+        let schema_pos = out.find("export default defineSchema").unwrap();
+        assert!(const_pos < schema_pos);
+    }
+
+    #[test]
+    fn cv12_column_references_enum_const() {
+        let en = enum_entity("config.user_status", &["active", "inactive"]);
+        let mut id = col("id", "int8", false);
+        id.is_pk = true;
+        let t = table(
+            "config.users",
+            vec![
+                id,
+                col("status", "user_status", false),
+                col("prev_status", "config.user_status", true),
+                col("history", "user_status[]", false),
+            ],
+            vec![],
+        );
+        let out = generate_schema_ts(&[&en, &t]);
+        assert!(
+            out.contains("status: config_user_status,"),
+            "non-nullable enum column should reference const: {out}"
+        );
+        assert!(
+            out.contains("prev_status: v.optional(config_user_status),"),
+            "nullable qualified enum column: {out}"
+        );
+        assert!(
+            out.contains("history: v.array(config_user_status),"),
+            "enum array column: {out}"
+        );
+    }
+
+    #[test]
+    fn cv13_fk_columns_emit_v_id() {
+        let parent = table("config.users", vec![col("id", "int8", false)], vec![]);
+        let mut fk_col = col("user_id", "int8", false);
+        fk_col.inline_fk = Some(ForeignKey {
+            name: None,
+            columns: vec!["user_id".into()],
+            ref_schema: Some("config".into()),
+            ref_table: "users".into(),
+            ref_columns: vec!["id".into()],
+            on_delete: None,
+            on_update: None,
+        });
+        let child_inline = table(
+            "auth.sessions_inline",
+            vec![col("id", "int8", false), fk_col],
+            vec![],
+        );
+        let mut child_constraint = table(
+            "auth.sessions_constraint",
+            vec![col("id", "int8", false), col("user_id", "int8", true)],
+            vec![],
+        );
+        if let Some(td) = child_constraint.table_def.as_mut() {
+            td.constraints.push(TableConstraint::ForeignKey(ForeignKey {
+                name: Some("sessions_user_fk".into()),
+                columns: vec!["user_id".into()],
+                ref_schema: Some("config".into()),
+                ref_table: "users".into(),
+                ref_columns: vec!["id".into()],
+                on_delete: None,
+                on_update: None,
+            }));
+        }
+        let out = generate_schema_ts(&[&parent, &child_inline, &child_constraint]);
+        assert!(
+            out.contains("user_id: v.id(\"config_users\"),"),
+            "inline FK should map to v.id: {out}"
+        );
+        assert!(
+            out.contains("user_id: v.optional(v.id(\"config_users\")),"),
+            "nullable table-level FK should map to v.optional(v.id(...)): {out}"
+        );
     }
 
     #[tokio::test]
-    async fn cv10_import_export_unsupported() {
+    async fn cv14_apply_entity_accepts_enum() {
         let tmp = tempdir().unwrap();
         let adapter = ConvexAdapter::new(tmp.path(), "test");
-        let e = Entity::new(EntityType::Import, "x");
-        assert!(adapter.import_data(&e, false).await.is_err());
-        assert!(adapter.export_data(&e).await.is_err());
+        let en = enum_entity("config.user_status", &["a", "b"]);
+        adapter.apply_entity(&en).await.unwrap();
+        let schema = std::fs::read_to_string(tmp.path().join("schema.ts")).unwrap();
+        assert!(schema.contains("export const config_user_status = v.union("));
+    }
+
+    #[tokio::test]
+    async fn cv10_export_unsupported_with_helpful_message() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let mut e = Entity::new(EntityType::Table, "config.users");
+        e.file = Some(tmp.path().join("users.jsonl"));
+        let err = adapter.export_data(&e).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("npx convex export"),
+            "error should point to the CLI: {msg}"
+        );
+        // Import without a file path fails fast (no shell-out attempted).
+        let no_file = Entity::new(EntityType::Import, "config.users");
+        assert!(adapter.import_data(&no_file, false).await.is_err());
+    }
+
+    #[test]
+    fn cv15_deploy_and_import_args_are_well_formed() {
+        assert_eq!(ConvexAdapter::deploy_args(), vec!["convex", "deploy"]);
+        let args = ConvexAdapter::import_args("config_users", "import/config/users.jsonl");
+        assert_eq!(
+            args,
+            vec![
+                "convex".to_string(),
+                "import".to_string(),
+                "--table".into(),
+                "config_users".into(),
+                "--replace".into(),
+                "-y".into(),
+                "import/config/users.jsonl".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cv16_import_data_dry_run_skips_shell_out() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let mut e = Entity::new(EntityType::Import, "config.users");
+        let data_path = tmp.path().join("users.jsonl");
+        std::fs::write(&data_path, "{}\n").unwrap();
+        e.file = Some(data_path);
+        // dry_run = true should succeed without spawning npx.
+        adapter.import_data(&e, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cv17_auto_deploy_runs_npx_in_dry_run_mode() {
+        let tmp = tempdir().unwrap();
+        let project_root = tmp.path();
+        let adapter = ConvexAdapter::new(project_root.join("convex"), "test")
+            .with_auto_deploy(true)
+            .with_cli_dry_run(true);
+        assert!(adapter.auto_deploy());
+        let t = table("config.users", vec![col("email", "text", false)], vec![]);
+        // dry-run skips the actual spawn, so the call succeeds without npx.
+        adapter.apply_entities(&[t]).await.unwrap();
+        // schema.ts was still written.
+        assert!(project_root.join("convex/schema.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn cv18_auto_deploy_skipped_when_no_entities() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path().join("convex"), "test")
+            .with_auto_deploy(true)
+            .with_cli_dry_run(true);
+        // Empty input — deploy should not fire (no entities to apply).
+        adapter.apply_entities(&[]).await.unwrap();
     }
 }
