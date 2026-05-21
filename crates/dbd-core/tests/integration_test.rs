@@ -383,6 +383,8 @@ fn dbml_generates_valid_output() {
         exclude_schemas: vec![],
         include_tables: vec![],
         exclude_tables: vec![],
+        groups: vec![],
+        auto_group_by_schema: false,
     });
 
     assert!(!doc.content.is_empty());
@@ -402,6 +404,8 @@ fn dbml_includes_refs() {
         exclude_schemas: vec![],
         include_tables: vec![],
         exclude_tables: vec![],
+        groups: vec![],
+        auto_group_by_schema: false,
     });
 
     assert!(doc.content.contains("Ref:"), "DBML should contain FK refs");

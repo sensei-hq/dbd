@@ -33,30 +33,36 @@ pub fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbo
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
-    let dbml_config = design.config().dbml.values().next();
-    let (inc_schemas, exc_schemas, inc_tables, exc_tables) = match dbml_config {
-        Some(cfg) => (
-            cfg.include.as_ref().map(|f| f.schemas.clone()).unwrap_or_default(),
-            cfg.exclude.as_ref().map(|f| f.schemas.clone()).unwrap_or_default(),
-            cfg.include.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
-            cfg.exclude.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
-        ),
-        None => (vec![], vec![], vec![], vec![]),
-    };
-
-    let doc = dbd_core::dbml::generate_dbml(&dbd_core::dbml::DbmlParams {
+    let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: design.entities(),
         project_name: &design.config().project.name,
         database_type: &design.config().source.dialect,
         project_note: design.config().project.note.as_deref(),
-        include_schemas: inc_schemas,
-        exclude_schemas: exc_schemas,
-        include_tables: inc_tables,
-        exclude_tables: exc_tables,
+        docs: &design.config().dbml,
     });
 
-    std::fs::write(file, &doc.content)?;
-    output::info(verbosity, &format!("Generated DBML in {}", file.display()));
+    // Single document → use the user-supplied path verbatim. Multiple
+    // documents → write each to `<parent_of(file)>/<doc.file_name>`,
+    // preserving the user's directory choice while honoring each doc's
+    // configured filename.
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let written = match docs.len() {
+        0 => 0,
+        1 => {
+            safe_write(project_dir, file, &docs[0].content)?;
+            output::info(verbosity, &format!("Generated DBML in {}", file.display()));
+            1
+        }
+        _ => {
+            for doc in &docs {
+                let path = dir.join(&doc.file_name);
+                safe_write(project_dir, &path, &doc.content)?;
+                output::info(verbosity, &format!("Generated DBML in {}", path.display()));
+            }
+            docs.len()
+        }
+    };
+    output::detail(verbosity, &format!("Wrote {written} DBML document(s)"));
     Ok(())
 }
 
