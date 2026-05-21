@@ -22,6 +22,39 @@ use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
 
+/// Lowercase, alphabetically sorted list of SQLite built-in functions,
+/// aggregates, window functions, date/time helpers, JSON1 functions, math
+/// functions (3.35+), and common type names / reserved tokens. Used by
+/// `classify_reference` for fully offline analysis. `binary_search`
+/// relies on the ordering — `s11_builtins_sorted_for_binary_search` guards it.
+const SQLITE_BUILTINS: &[&str] = &[
+    "abs", "acos", "acosh", "and", "asin", "asinh", "atan", "atan2", "atanh",
+    "avg", "between", "blob", "boolean", "ceil", "ceiling", "changes", "char",
+    "coalesce", "concat", "concat_ws", "cos", "cosh", "count", "cume_dist",
+    "current_date", "current_time", "current_timestamp", "date", "datetime",
+    "degrees", "dense_rank", "exists", "exp", "false", "first_value", "floor",
+    "format", "glob", "group_concat", "hex", "ifnull", "iif", "in", "instr",
+    "int", "integer", "is", "json", "json_array", "json_array_length",
+    "json_each", "json_error_position", "json_extract", "json_group_array",
+    "json_group_object", "json_insert", "json_object", "json_patch",
+    "json_pretty", "json_quote", "json_remove", "json_replace", "json_set",
+    "json_tree", "json_type", "json_valid", "json_valid_b", "jsonb",
+    "jsonb_array", "jsonb_extract", "jsonb_group_array", "jsonb_group_object",
+    "jsonb_insert", "jsonb_object", "jsonb_patch", "jsonb_remove",
+    "jsonb_replace", "jsonb_set", "julianday", "lag", "last_insert_rowid",
+    "last_value", "lead", "length", "like", "likelihood", "likely", "ln",
+    "load_extension", "log", "log10", "log2", "lower", "ltrim", "max", "min",
+    "mod", "not", "nth_value", "ntile", "null", "nullif", "numeric",
+    "octet_length", "or", "percent_rank", "pi", "pow", "power", "printf",
+    "quote", "radians", "random", "randomblob", "rank", "real", "replace",
+    "round", "row_number", "rtrim", "sign", "sin", "sinh", "soundex",
+    "sqlite_compileoption_get", "sqlite_compileoption_used", "sqlite_offset",
+    "sqlite_source_id", "sqlite_version", "sqrt", "strftime", "string_agg",
+    "substr", "substring", "sum", "tan", "tanh", "text", "time", "timediff",
+    "total", "total_changes", "trim", "true", "trunc", "typeof", "unhex",
+    "unicode", "unixepoch", "unlikely", "upper", "varchar", "zeroblob",
+];
+
 /// SQLite adapter using a sqlx connection pool.
 pub struct SqliteAdapter {
     pool: SqlitePool,
@@ -199,24 +232,12 @@ impl DatabaseAdapter for SqliteAdapter {
 
     fn classify_reference(&self, name: &str, _installed: &[String]) -> ReferenceClass {
         let lower = name.to_lowercase();
-        // Common SQLite built-in functions / types.
-        const BUILTINS: &[&str] = &[
-            "abs", "changes", "char", "coalesce", "count", "current_date",
-            "current_time", "current_timestamp", "date", "datetime", "exists",
-            "format", "glob", "group_concat", "hex", "ifnull", "iif", "instr",
-            "json", "json_array", "json_each", "json_extract", "json_group_array",
-            "json_group_object", "json_object", "json_tree", "json_valid",
-            "julianday", "last_insert_rowid", "length", "like", "likely", "lower",
-            "ltrim", "max", "min", "nullif", "printf", "quote", "random",
-            "randomblob", "replace", "round", "rtrim", "sign", "soundex",
-            "sqlite_version", "strftime", "substr", "substring", "sum", "time",
-            "total", "total_changes", "trim", "typeof", "unhex", "unicode",
-            "unlikely", "upper", "zeroblob",
-            // types
-            "integer", "int", "real", "text", "blob", "numeric", "boolean",
-            "true", "false", "null", "and", "or", "not", "in", "between", "is",
-        ];
-        if BUILTINS.contains(&lower.as_str()) {
+        // Anything in the SQLite-reserved namespace (`sqlite_master`,
+        // `sqlite_sequence`, `sqlite_stat1`, `sqlite_version`, …) is internal.
+        if lower.starts_with("sqlite_") {
+            return ReferenceClass::Internal;
+        }
+        if SQLITE_BUILTINS.binary_search(&lower.as_str()).is_ok() {
             return ReferenceClass::Internal;
         }
         ReferenceClass::UserDefined
@@ -379,14 +400,13 @@ impl SqliteAdapter {
         if columns.is_empty() {
             return Ok(());
         }
-
-        let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
-        let quoted_cols: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
-        let insert_sql = format!(
-            "INSERT INTO \"{table}\" ({}) VALUES ({})",
-            quoted_cols.join(","),
-            placeholders.join(",")
-        );
+        let col_count = columns.len();
+        let cols_clause = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
             .pool
@@ -394,30 +414,33 @@ impl SqliteAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
+        let mut batch: Vec<Vec<Option<String>>> = Vec::with_capacity(batch_rows);
         for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
             let values: Vec<&str> = line.split(sep).collect();
-            if values.len() != columns.len() {
+            if values.len() != col_count {
                 return Err(DbdError::Config(format!(
-                    "csv row has {} columns, expected {}",
-                    values.len(),
-                    columns.len()
+                    "csv row has {} columns, expected {col_count}",
+                    values.len()
                 )));
             }
-            let mut q = sqlx::query(&insert_sql);
-            for v in &values {
-                let trimmed = v.trim();
-                if trimmed.is_empty() {
-                    q = q.bind(None::<String>);
-                } else {
-                    q = q.bind(trimmed.to_string());
-                }
+            let row: Vec<Option<String>> = values
+                .iter()
+                .map(|v| {
+                    let t = v.trim();
+                    if t.is_empty() { None } else { Some(t.to_string()) }
+                })
+                .collect();
+            batch.push(row);
+            if batch.len() >= batch_rows {
+                flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+                batch.clear();
             }
-            q.execute(&mut *tx)
-                .await
-                .map_err(|e| DbdError::Config(format!("import insert failed: {e}")))?;
+        }
+        if !batch.is_empty() {
+            flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
         }
 
         tx.commit()
@@ -433,55 +456,158 @@ impl SqliteAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
+        // Group consecutive lines with identical column sets into batches so
+        // we can flush each group as a single multi-row INSERT. When the
+        // column set changes, flush whatever we have and start a new batch.
+        let mut current_cols: Option<Vec<String>> = None;
+        let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
+
         for line in data.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-                DbdError::Config(format!("jsonl parse failed: {e}"))
-            })?;
-            let obj = value.as_object().ok_or_else(|| {
-                DbdError::Config("jsonl line must be a JSON object".into())
-            })?;
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
+            let obj = value
+                .as_object()
+                .ok_or_else(|| DbdError::Config("jsonl line must be a JSON object".into()))?;
 
-            let columns: Vec<&String> = obj.keys().collect();
-            let placeholders: Vec<String> =
-                (1..=columns.len()).map(|i| format!("?{i}")).collect();
-            let quoted_cols: Vec<String> =
-                columns.iter().map(|c| format!("\"{c}\"")).collect();
-            let insert_sql = format!(
-                "INSERT INTO \"{table}\" ({}) VALUES ({})",
-                quoted_cols.join(","),
-                placeholders.join(",")
-            );
+            let cols: Vec<String> = obj.keys().cloned().collect();
+            let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();
 
-            let mut q = sqlx::query(&insert_sql);
-            for c in &columns {
-                let val = &obj[*c];
-                match val {
-                    serde_json::Value::Null => q = q.bind(None::<String>),
-                    serde_json::Value::Bool(b) => q = q.bind(*b as i64),
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            q = q.bind(i);
-                        } else {
-                            q = q.bind(n.as_f64().unwrap_or(0.0));
-                        }
-                    }
-                    serde_json::Value::String(s) => q = q.bind(s.clone()),
-                    other => q = q.bind(other.to_string()),
-                }
+            let cols_changed = current_cols.as_ref().is_some_and(|cur| cur != &cols);
+            if cols_changed {
+                flush_jsonl_batch(&mut tx, table, current_cols.as_ref().unwrap(), &batch).await?;
+                batch.clear();
             }
-            q.execute(&mut *tx)
-                .await
-                .map_err(|e| DbdError::Config(format!("import insert failed: {e}")))?;
+            if current_cols.is_none() || cols_changed {
+                current_cols = Some(cols.clone());
+            }
+
+            batch.push(row);
+            if batch.len() >= batch_row_size(cols.len()) {
+                flush_jsonl_batch(&mut tx, table, current_cols.as_ref().unwrap(), &batch).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty()
+            && let Some(cols) = current_cols.as_ref()
+        {
+            flush_jsonl_batch(&mut tx, table, cols, &batch).await?;
         }
 
         tx.commit()
             .await
             .map_err(|e| DbdError::Config(format!("import commit failed: {e}")))?;
         Ok(())
+    }
+}
+
+/// Conservative rows-per-INSERT batch size. SQLite's
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 32766 since 3.32 (was 999 in older
+/// builds); we cap at 500 rows and divide by `col_count` so any
+/// reasonable column count stays well inside both limits.
+fn batch_row_size(col_count: usize) -> usize {
+    (32000usize / col_count.max(1)).clamp(1, 500)
+}
+
+/// Build a `(?,?,?), (?,?,?), …` placeholder list for `row_count` rows of
+/// `col_count` columns. SQLite uses anonymous `?` rather than `?1`/`?2`
+/// when binds come in argument order (which they do here).
+fn multi_row_placeholders(col_count: usize, row_count: usize) -> String {
+    let row_ph: String = std::iter::repeat_n("?", col_count).collect::<Vec<_>>().join(",");
+    let one = format!("({row_ph})");
+    std::iter::repeat_n(one.as_str(), row_count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn flush_csv_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    cols_clause: &str,
+    col_count: usize,
+    rows: &[Vec<Option<String>>],
+) -> Result<()> {
+    let placeholders = multi_row_placeholders(col_count, rows.len());
+    let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
+    let mut q = sqlx::query(&sql);
+    for row in rows {
+        for cell in row {
+            q = match cell {
+                Some(s) => q.bind(s.clone()),
+                None => q.bind(None::<String>),
+            };
+        }
+    }
+    q.execute(&mut **tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("import insert failed: {e}")))?;
+    Ok(())
+}
+
+async fn flush_jsonl_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    cols: &[String],
+    rows: &[Vec<JsonBindable>],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let cols_clause = cols
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let placeholders = multi_row_placeholders(cols.len(), rows.len());
+    let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
+    let mut q = sqlx::query(&sql);
+    for row in rows {
+        for cell in row {
+            q = match cell {
+                JsonBindable::Null => q.bind(None::<String>),
+                JsonBindable::Bool(b) => q.bind(*b as i64),
+                JsonBindable::Int(i) => q.bind(*i),
+                JsonBindable::Float(f) => q.bind(*f),
+                JsonBindable::String(s) => q.bind(s.clone()),
+                JsonBindable::Other(s) => q.bind(s.clone()),
+            };
+        }
+    }
+    q.execute(&mut **tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("import insert failed: {e}")))?;
+    Ok(())
+}
+
+/// Owned, bindable representation of a JSON cell — avoids cloning the
+/// full `serde_json::Value` enum for each row in a batch.
+enum JsonBindable {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Other(String),
+}
+
+impl JsonBindable {
+    fn from(v: &serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Self::Int(i)
+                } else {
+                    Self::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            other => Self::Other(other.to_string()),
+        }
     }
 }
 
@@ -642,5 +768,165 @@ mod tests {
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
         assert_eq!(SqliteAdapter::bare_name("plain"), "plain");
+    }
+
+    #[test]
+    fn s11_builtins_sorted_for_binary_search() {
+        // binary_search relies on alphabetical order — guard against typos
+        // and accidental insertions in the middle of the array.
+        let mut sorted = SQLITE_BUILTINS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted.as_slice(),
+            SQLITE_BUILTINS,
+            "SQLITE_BUILTINS must stay alphabetically sorted"
+        );
+    }
+
+    #[test]
+    fn s13_batch_row_size_stays_within_sqlite_limits() {
+        // Wide row: 100 columns → still ≥1 row per batch.
+        assert!(batch_row_size(100) >= 1);
+        // Modest row: 5 columns → caps at 500.
+        assert_eq!(batch_row_size(5), 500);
+        // 1 col → also caps at 500 (not 32000).
+        assert_eq!(batch_row_size(1), 500);
+        // Sanity: total bind count never exceeds the conservative 32k cap.
+        for col_count in [1usize, 2, 10, 50, 100, 1000] {
+            let rows = batch_row_size(col_count);
+            assert!(
+                rows * col_count <= 32_000,
+                "{rows} rows × {col_count} cols would exceed SQLite var limit"
+            );
+        }
+    }
+
+    #[test]
+    fn s14_multi_row_placeholders_shape() {
+        assert_eq!(multi_row_placeholders(3, 1), "(?,?,?)");
+        assert_eq!(multi_row_placeholders(2, 3), "(?,?),(?,?),(?,?)");
+    }
+
+    #[tokio::test]
+    async fn s15_import_csv_multi_batch_path() {
+        use tempfile::NamedTempFile;
+        let a = mem().await;
+        a.execute_script("CREATE TABLE big (id INTEGER, v TEXT)")
+            .await
+            .unwrap();
+
+        // 1500 rows exceeds the 500-row batch ceiling, so we exercise the
+        // flush-then-continue path in addition to the trailing-flush path.
+        let mut tmp = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(tmp, "id,v").unwrap();
+        for i in 1..=1500 {
+            writeln!(tmp, "{i},row{i}").unwrap();
+        }
+
+        let mut entity = Entity::new(EntityType::Import, "default.big");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("csv".to_string());
+        a.import_data(&entity, false).await.unwrap();
+
+        let row = sqlx::query("SELECT count(*) AS c FROM big")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let count: i64 = row.try_get("c").unwrap();
+        assert_eq!(count, 1500);
+
+        // Spot-check the boundary rows survived the batch flushes intact.
+        let r = sqlx::query("SELECT v FROM big WHERE id = 500")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let v: String = r.try_get("v").unwrap();
+        assert_eq!(v, "row500");
+        let r = sqlx::query("SELECT v FROM big WHERE id = 1500")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let v: String = r.try_get("v").unwrap();
+        assert_eq!(v, "row1500");
+    }
+
+    #[tokio::test]
+    async fn s16_import_jsonl_batched_with_mixed_types_and_column_sets() {
+        use tempfile::NamedTempFile;
+        let a = mem().await;
+        a.execute_script("CREATE TABLE mixed (id INTEGER, name TEXT, score REAL, active INTEGER)")
+            .await
+            .unwrap();
+
+        // First group has all four columns; second group omits `score`.
+        // The batcher must flush between the two groups.
+        let mut tmp = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(tmp, r#"{{"id":1,"name":"alice","score":9.5,"active":true}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":2,"name":"bob","score":7.0,"active":false}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":3,"name":"carol","active":true}}"#).unwrap();
+
+        let mut entity = Entity::new(EntityType::Import, "default.mixed");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("jsonl".to_string());
+        a.import_data(&entity, false).await.unwrap();
+
+        let row = sqlx::query("SELECT count(*) AS c FROM mixed")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let count: i64 = row.try_get("c").unwrap();
+        assert_eq!(count, 3);
+
+        // active=true was bound as i64=1; verify reverse-cast.
+        let r = sqlx::query("SELECT active FROM mixed WHERE id = 1")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let active: i64 = r.try_get("active").unwrap();
+        assert_eq!(active, 1);
+
+        // Row 3 has no score → should be NULL.
+        let r = sqlx::query("SELECT score FROM mixed WHERE id = 3")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let score: Option<f64> = r.try_get("score").unwrap();
+        assert_eq!(score, None);
+    }
+
+    #[tokio::test]
+    async fn s12_classify_reference_covers_richer_offline_signals() {
+        let adapter = SqliteAdapter::new("sqlite::memory:", "test").await.unwrap();
+        // sqlite_* system tables are always internal.
+        assert!(matches!(
+            adapter.classify_reference("sqlite_master", &[]),
+            ReferenceClass::Internal
+        ));
+        assert!(matches!(
+            adapter.classify_reference("sqlite_sequence", &[]),
+            ReferenceClass::Internal
+        ));
+        // New builtins picked up via the expanded list.
+        for name in &[
+            "json_extract", "row_number", "lag", "lead", "pi", "pow", "ceil",
+            "unixepoch", "concat_ws", "string_agg",
+        ] {
+            assert!(
+                matches!(adapter.classify_reference(name, &[]), ReferenceClass::Internal),
+                "expected {name} to classify as Internal"
+            );
+        }
+        // Case-insensitive match.
+        assert!(matches!(
+            adapter.classify_reference("JSON_EXTRACT", &[]),
+            ReferenceClass::Internal
+        ));
+        // Unknown name remains user-defined.
+        assert!(matches!(
+            adapter.classify_reference("my_helper", &[]),
+            ReferenceClass::UserDefined
+        ));
     }
 }
