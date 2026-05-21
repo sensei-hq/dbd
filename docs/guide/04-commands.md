@@ -103,11 +103,13 @@ dbd combine -f bootstrap.sql       # Custom filename
 Generate DBML documentation for dbdocs.io / dbdiagram.io.
 
 ```sh
-dbd dbml                           # Writes design.dbml
+dbd dbml                           # Writes design.dbml (when no dbml keys configured)
 dbd dbml -f schema.dbml            # Custom filename
 ```
 
-Generated natively — no `@dbml/core` dependency. Includes Project block, enums, tables with columns/indexes/comments, and standalone Ref blocks with FK actions.
+Generated natively — no `@dbml/core` dependency. Includes Project block, enums, tables with columns/indexes/comments, standalone Ref blocks with FK actions (including composite refs as `t.(c1, c2) > o.(c1, c2)`), `TableGroup` blocks, and stub tables for external FK targets.
+
+**Multi-document.** If `design.yaml` declares multiple `dbml.<key>` entries (each with its own `include`/`exclude`, `output`, `auto_group_by_schema`, `groups`), `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`). See [design.yaml reference](03-design-yaml.md#dbml) for the full schema.
 
 ---
 
@@ -232,7 +234,27 @@ format:
   indent: 2                  # spaces per level
 ```
 
-Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim.
+Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted).
+
+### Pre-commit
+
+`dbd format --check` exits 1 when any file would change, so it drops into [pre-commit](https://pre-commit.com) directly. Repo ships `.pre-commit-hooks.yaml` with two hooks:
+
+| Hook id | Language | Use when |
+|---------|----------|----------|
+| `dbd-format` | `rust` (cargo install on first run, cached after) | Contributors don't have `dbd` installed |
+| `dbd-format-system` | `system` (expects `dbd` on PATH) | Contributors already installed dbd locally |
+
+User's `.pre-commit-config.yaml`:
+
+```yaml
+- repo: https://github.com/sensei-hq/dbd
+  rev: v0.4.1
+  hooks:
+    - id: dbd-format
+```
+
+Both set `pass_filenames: false` — the hook scans the project itself, so pre-commit invokes it with no positional args.
 
 ---
 

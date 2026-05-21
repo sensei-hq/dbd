@@ -1,8 +1,8 @@
 # Backlog
 
-## Current status (2026-05-08)
+## Current status (2026-05-19)
 
-**v0.4.0, 423 tests (384 unit + 38 integration + 1 doc)**
+**v0.4.1, 449 tests (410 unit + 38 integration + 1 doc)**
 
 ### Working commands
 
@@ -45,6 +45,12 @@
 - **On-complete callbacks** — `apply`, `import`, `deploy` all call `on_complete(Summary)` with version info and counts
 - **data.sql TODO validation** — `inspect` surfaces unresolved `-- TODO:` in migration files; `apply` blocks on pending TODOs
 - **Import environment filtering** — `import/{env}/{schema}/file` convention; env-specific files only loaded for matching env
+- **Convex enum + FK codegen** — `Entity::Enum` emits `export const X = v.union(v.literal(...))` above `defineSchema`; columns whose type matches an enum reference the const; inline FKs and single-column table-level FKs emit `v.id("table")`
+- **Convex auto-deploy + import** — `convex://./out?deploy=true` (or `ConvexAdapter::with_auto_deploy(true)`) runs `npx convex deploy` from the parent of the schema dir after `apply_entities`; `import_data` shells out to `npx convex import --table <flat_name> --replace -y <file>` (honors `--dry-run`); `with_cli_dry_run(true)` logs commands instead of spawning (for tests and `dbd apply --dry-run`)
+- **SQLite offline ref classification** — `classify_reference` now matches a 150+ entry alphabetical builtin table (aggregates, window/math/date/JSON1/scalar fns) plus a `sqlite_*` prefix rule for system tables; no DB call required for richer `inspect` analysis
+- **SQLite trigger-aware splitter** — `format`'s statement splitter keeps `CREATE TRIGGER … BEGIN <stmts;> END;` as a single block (CASE…END inside the body and bare `BEGIN; … COMMIT;` transactions both behave correctly)
+- **SQLite batched imports** — `import_delimited` + `import_jsonl` now flush rows in `(?,?), (?,?), …` multi-row VALUES batches (≤500 rows or 32k binds per batch, whichever is tighter), still inside a single transaction; JSONL detects column-set changes and flushes between groups
+- **DBML multi-document + groups** — `design.yaml` `dbml.<key>` entries can each declare their own `include`/`exclude`, `output: filename.dbml`, `auto_group_by_schema`, and explicit `groups: [{name, tables}]`; `dbd_core::dbml::generate_all` returns one `DbmlDocument` per key; CLI writes each into the parent directory of the user-supplied output path. Composite FKs (single-column and multi-column constraints) render as `Ref: t.(c1, c2) > o.(c1, c2)`
 
 ### DDL formatter v2 — river style (✓ done)
 
@@ -92,30 +98,22 @@ _(empty)_
 ## Future
 
 ### River formatter enhancements
-- Pre-commit hook integration (`dbd format --check` already works, hook wiring is separate)
-- Multi-document DBML output
+_(empty — `.pre-commit-hooks.yaml` ships at the repo root with `dbd-format` and `dbd-format-system` hooks; see README)_
 
 ### DBML enhancements
-- Multi-document support (multiple dbml output files)
-- Table group generation
-- Composite FK ref support
+_(empty — see Core features for multi-document output, table groups, and composite FKs)_
 
 ### SQLite enhancements
-- Static-pattern reference classification for richer offline analysis
-- Multi-statement DDL splitter aware of SQLite trigger bodies
-- Concurrent batch INSERT for very large CSV imports (currently a single tx)
+_(empty — see Core features for the offline ref classifier, trigger-aware splitter, and batched imports)_
 
 ### Convex enhancements
-- Optional `npx convex deploy` shell-out after codegen
-- Enum entities → `v.union(v.literal(...))` codegen (currently errors as unsupported)
-- Foreign-key columns → typed `v.id("table")` references
-- Round-trip `import_data` / `export_data` via the Convex CLI
+- Per-table `export_data` via the Convex CLI — currently errors with a clear message because `npx convex export` only supports whole-deployment dumps; revisit if the CLI grows a `--table` flag or by extracting from the export zip
 
 ---
 
 ## Test coverage
 
-**423 tests** (384 unit + 38 integration + 1 doc) covering:
+**449 tests** (410 unit + 38 integration + 1 doc) covering:
 - Schema diff engine (45): D1-D21, S1-S14, warnings, edge cases
 - Snapshot create (17): SC1-SC10, entity conversion, backward compat
 - Multi-snapshot (7): B1-B3, S1-S2, baseline, no-changes
@@ -124,13 +122,13 @@ _(empty)_
 - data.sql generation (5): D1-D5
 - data.sql TODO scan (8): DS1-DS6, apply-blocking (2)
 - Execution plan (12): A1-A6, edge cases
-- DDL formatter (25): F1-F12, R1-R15 (river style incl. OR conditions, OR-within-AND, subquery FROM)
+- DDL formatter (29): F1-F12, R1-R15 (river style incl. OR conditions, OR-within-AND, subquery FROM), R16-R19 (SQLite trigger-aware splitter: BEGIN…END preserved, plain BEGIN transactions still split, CASE…END handled, `$$` regression)
 - RLS policies (6): P1-P8
 - Adapter catalog (4): C1, C4, C10, C11
 - RefCache (7): roundtrip, missing, parent-dir, empty, write-via-adapter, resolve-via-cache (hit + noop)
-- SQLite adapter (10): S1–S10 — apply, list, resolve, schema-noop, unsupported types, migrations, meta, classify, CSV import, bare-name
-- Convex adapter (10): CV1–CV10 — name flattening, type mapping, schema.ts emit, indexes, internal-column skip, batch apply, unsupported types, sidecar state, URL parsing, import/export errors
-- DBML filters (4): include/exclude schema/table
+- SQLite adapter (16): S1–S10 — apply, list, resolve, schema-noop, unsupported types, migrations, meta, classify, CSV import, bare-name; S11–S12 — builtin list sortedness invariant, sqlite_* + extended-builtin classification; S13–S16 — `batch_row_size` bounds, placeholder shape, 1500-row CSV multi-batch round-trip, JSONL batching with mixed types and column-set changes
+- Convex adapter (18): CV1–CV10 — name flattening, type mapping, schema.ts emit, indexes, internal-column skip, batch apply, unsupported types, sidecar state, URL parsing (incl. `?deploy=true`), export helpful-error; CV11–CV14 — enum const emit, enum column refs (qualified + array), inline & table-level FK → `v.id`, enum apply_entity buffering; CV15–CV18 — deploy/import argv shape, import dry-run skips shell-out, auto-deploy fires through `with_cli_dry_run`, auto-deploy no-op on empty input
+- DBML filters + groups + multi-doc (12): include/exclude schema/table; composite FK tuple syntax (emit + round-trip); auto-group-by-schema; explicit groups (precedence over auto, drop-filtered, no-op when neither set); `generate_all` empty-config fallback; `generate_all` per-key documents with sorted output
 - Init (7): postgres/supabase targets
 - Deploy (5): local resolve, not-found, subpath, cache hit
 - Embedded integration (5): fresh deploy, idempotent redeploy, data acceptance, dry-run, migration cycle

@@ -73,24 +73,33 @@ myproject/
 |--------|--------|----------|
 | PostgreSQL | Working (sqlx, PG17+) | `postgres://user:pass@host:5432/db` |
 | Supabase | Working (grants, protected reset, external entities) | `postgres://...` (with `target: supabase`) |
-| SQLite | Working (sqlx-sqlite, CSV/TSV/JSONL import) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
-| Convex | Working (codegen `convex/schema.ts`, sidecar state) | `convex:` (default `./convex`), `convex://./out` |
+| SQLite | Working (sqlx-sqlite, batched multi-row CSV/TSV/JSONL import, trigger-aware splitter) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
+| Convex | Working (codegen `schema.ts` with enums + FK `v.id`, sidecar state, `?deploy=true` auto-deploy, per-table `npx convex import`) | `convex:` (default `./convex`), `convex://./out`, `convex://./out?deploy=true` |
 
 ### Adapter notes
 
 - **SQLite** has no schemas, enums, roles, extensions, or stored procedures.
   `Schema` entities are a no-op; `Enum` / `Function` / `Procedure` / `Role` /
   `Extension` entities error on apply. Entity names like `auth.users` are
-  resolved as the bare table `users`. Import/export use plain `INSERT` /
-  `SELECT` — no `COPY`.
+  resolved as the bare table `users`. Imports use multi-row `INSERT … VALUES (?,?), …`
+  batches inside one transaction (≤500 rows or 32k binds per batch). The DDL
+  formatter knows about SQLite `CREATE TRIGGER … BEGIN … END;` blocks and
+  keeps them whole. Offline `inspect` classifies ~150 built-in functions /
+  types plus the `sqlite_*` prefix as Internal without touching the DB.
 - **Convex** is a codegen target — `apply` writes `convex/schema.ts` from
   parsed `TableDef`s and tracks migrations in a sidecar `.dbd_state.json`.
-  Names are flattened (`config.users` → `config_users`) because Convex
-  forbids `.` in table names. SQL types map to `v.*` validators
-  (`int*`/`numeric` → `v.number()`, `text`/`uuid` → `v.string()`, `jsonb` →
-  `v.any()`, `bytea` → `v.bytes()`, arrays → `v.array(...)`, nullable →
-  `v.optional(...)`). Import/export are not supported — use
-  `npx convex import` / `export` directly.
+  Names are flattened (`config.users` → `config_users`). SQL types map to
+  `v.*` validators (`int*`/`numeric` → `v.number()`, `text`/`uuid` →
+  `v.string()`, `jsonb` → `v.any()`, `bytea` → `v.bytes()`, arrays →
+  `v.array(...)`, nullable → `v.optional(...)`). `Entity::Enum` emits
+  `export const <name> = v.union(v.literal(…))` above `defineSchema`, and
+  columns whose type names match are routed to the const. Foreign keys
+  (inline or single-column table-level) emit `v.id("target_table")`.
+  Append `?deploy=true` to the URL (or call `with_auto_deploy(true)`) to
+  run `npx convex deploy` automatically after each apply; `dbd import`
+  shells out to `npx convex import --table <flat_name> --replace -y <file>`.
+  Whole-deployment export remains the Convex CLI's job (`npx convex export`)
+  because the CLI doesn't expose per-table dumps.
 
 ## Offline reference cache
 
@@ -125,6 +134,21 @@ dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
 dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 dbd deploy --source ./local/path -d $DATABASE_URL
 ```
+
+## Pre-commit integration
+
+`dbd format --check` exits non-zero when any DDL file would be reformatted, so it drops into [pre-commit](https://pre-commit.com) directly. Add this to your `.pre-commit-config.yaml`:
+
+```yaml
+- repo: https://github.com/sensei-hq/dbd
+  rev: v0.4.1
+  hooks:
+    - id: dbd-format
+```
+
+The `dbd-format` hook builds dbd from source via cargo on first install (slow once, cached after). For contributors who already have `dbd` on PATH (via `cargo install dbd-cli`, brew, or a release binary), use `dbd-format-system` instead — it skips the build and runs the installed binary.
+
+Both hooks scan the project's `ddl/` tree themselves, so pre-commit invokes them with no positional args (`pass_filenames: false` in the shipped hook spec).
 
 ## Use as a library
 

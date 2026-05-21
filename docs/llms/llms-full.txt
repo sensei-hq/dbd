@@ -111,8 +111,9 @@ target:
         service_role: [usage, all]
 
   convex:
-    url: convex:            # writes ./convex/schema.ts
-    # url: convex://./generated   # custom output dir
+    url: convex:                       # writes ./convex/schema.ts
+    # url: convex://./generated       # custom output dir
+    # url: convex://./generated?deploy=true   # also runs `npx convex deploy` after apply
 
   sqlite:
     url: sqlite://./local.db
@@ -152,9 +153,14 @@ dbml:
   base:
     exclude:
       schemas: [staging, extensions]
+    auto_group_by_schema: true
   core:
     include:
       schemas: [config]
+    output: core.dbml
+    groups:
+      - name: lookups
+        tables: [config.lookups, config.lookup_values]
 
 ignore:
   - bfs
@@ -279,8 +285,75 @@ dbd graph -n config.lookups
 ### dbd dbml
 
 ```sh
-dbd dbml
-dbd dbml -f schema.dbml
+dbd dbml                       # writes design.dbml (when no dbml keys configured)
+dbd dbml -f schema.dbml        # custom path; multi-doc keeps the directory, replaces filename
+```
+
+When `design.yaml` declares multiple `dbml.<key>` entries, `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`).
+
+Per-doc options:
+
+| Field | Type | Effect |
+|-------|------|--------|
+| `include.schemas` / `include.tables` | list | Only matching entities appear in this doc |
+| `exclude.schemas` / `exclude.tables` | list | Removes matching entities |
+| `output` | string | Output filename; default `<key>.dbml` |
+| `auto_group_by_schema` | bool | Emit `TableGroup <schema>` for every schema in the filtered set |
+| `groups` | list of `{name, tables}` | Explicit `TableGroup` blocks; names take precedence over auto-by-schema |
+
+```yaml
+dbml:
+  base:
+    exclude: { schemas: [staging] }
+    auto_group_by_schema: true
+    output: design.dbml
+  core:
+    include: { schemas: [config] }
+    output: core.dbml
+    groups:
+      - name: lookups
+        tables: [config.lookups, config.lookup_values]
+```
+
+Composite foreign keys (multi-column inline or table-level `ForeignKey`) emit DBML tuple syntax: `Ref: "schema"."table".("c1", "c2") > "schema"."other".("c1", "c2") [delete: cascade]`.
+
+### dbd format
+
+River-style DDL formatter. Operates on all `*.ddl` files in the project tree.
+
+```sh
+dbd format                     # rewrite files in place
+dbd format --check             # exit 1 if any file would change (CI / pre-commit)
+```
+
+Driven by the optional `format:` section in `design.yaml` (falls back to defaults when absent):
+
+```yaml
+format:
+  keyword_case: lower          # lower | upper | preserve
+  comma_style: leading         # leading | trailing
+  type_alignment: 27           # column for type start, 0 = off
+  indent: 2
+  query_style: river           # river | classic
+  gutter: 10                   # river: width of right-aligned keyword column
+```
+
+The splitter understands two atomic-body kinds: PG `$$ ... $$` blocks (function bodies) and SQLite `CREATE TRIGGER ... BEGIN ... END;` blocks. CASE expressions inside trigger bodies are handled correctly — only `END;` at a word boundary closes the block.
+
+#### Pre-commit integration
+
+`.pre-commit-hooks.yaml` at the repo root exposes two hooks:
+
+- `dbd-format` — `language: rust`; pre-commit clones the repo, runs `cargo install --path .`, caches afterward.
+- `dbd-format-system` — `language: system`; expects `dbd` already on PATH.
+
+Both set `pass_filenames: false` because `dbd format` scans the project itself. Consumers add to their `.pre-commit-config.yaml`:
+
+```yaml
+- repo: https://github.com/sensei-hq/dbd
+  rev: v0.4.1
+  hooks:
+    - id: dbd-format
 ```
 
 ### dbd reset
@@ -355,13 +428,35 @@ let graph = design.graph(None);
 |--------|---------|----------|------------|-------|----------|--------|------------|
 | PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `_dbd_migrations` |
 | Supabase | sqlx-postgres | `postgres://…` (with `target: supabase`) | filtered (managed) | yes | yes | COPY streaming | `_dbd_migrations` |
-| SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | batched `INSERT` in a single tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
-| Convex | codegen | `convex:` (→ `./convex`), `convex://./out` | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | not supported (use `npx convex import`) | sidecar `<dir>/.dbd_state.json` |
+| SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
+| Convex | codegen | `convex:` (→ `./convex`), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>`; whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
 
 ### Adapter quirks
 
 - **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension` are rejected at apply time.
+    - **Offline ref classifier** — `classify_reference` checks an alphabetically sorted table of ~150 built-ins (aggregates, window/math/date/JSON1/scalar functions, type names) via `binary_search`, plus a `sqlite_*` prefix rule that catches all reserved system tables/views (`sqlite_master`, `sqlite_sequence`, `sqlite_stat1`, …). Everything else falls through to `UserDefined`.
+    - **Trigger-aware DDL splitter** — `dbd format`'s statement splitter recognises SQLite `CREATE TRIGGER … BEGIN <stmts;> END;` blocks and keeps them atomic. `BEGIN` is only treated as trigger-body when the in-flight block already contains the `TRIGGER` keyword, so bare `BEGIN; … COMMIT;` transactions still split correctly. `CASE … END` inside the body doesn't trip the close detector — only `END` immediately followed by `;` at a word boundary closes the block.
+    - **Batched imports** — `import_delimited` and `import_jsonl` flush rows in multi-row `INSERT … VALUES (?,?),(?,?), …` batches sized by `batch_row_size(col_count) = min(500, 32000 / col_count)`. CSV uses a fixed header; JSONL detects per-line column-set changes and flushes the previous group before starting a new one. All inside a single transaction per import.
 - **Convex**: codegen, not a SQL engine — `execute_script` returns an error; `apply_entities` is the canonical path (`prefers_batch_apply() = true`). Table names flatten `schema.entity` → `schema_entity` (Convex disallows `.`). SQL → Convex validator: `int*`/`numeric` → `v.number()`, text-like (`text`/`varchar`/`uuid`/`citext`) → `v.string()`, `boolean` → `v.boolean()`, timestamps → `v.number()` (epoch ms), `jsonb`/`json` → `v.any()`, `bytea`/`blob` → `v.bytes()`, `T[]` → `v.array(T)`, nullable → `v.optional(T)`. Indexes emit as `.index("name", ["col"])`. Convex platform columns `_id` / `_creationTime` are skipped if present.
+    - **Enums** — an `Entity::Enum` named `config.status` with values `[active, inactive]` emits
+      `export const config_status = v.union(v.literal("active"), v.literal("inactive"));` above
+      `defineSchema`. Column whose `data_type` matches either the qualified name (`config.status`)
+      or the bare name (`status`, case-insensitive) routes to that const; arrays become
+      `v.array(config_status)`; nullable columns wrap in `v.optional(...)`.
+    - **Foreign keys** — single-column inline FKs (`ColumnDef.inline_fk`) and single-column
+      table-level `TableConstraint::ForeignKey` whose target is a known table emit
+      `<col>: v.id("target_convex_name")` (with `v.optional(...)` wrapping for nullable
+      columns). Composite/multi-column FKs fall back to the scalar validator since Convex
+      `v.id` only addresses one table.
+    - **Auto-deploy** — `convex://./out?deploy=true` (or `ConvexAdapter::with_auto_deploy(true)`)
+      runs `npx convex deploy` from the parent of the schema directory after `apply_entities`
+      writes the file. Skipped when there were no entities to apply.
+    - **Import** — `import_data(entity, dry_run)` shells out to
+      `npx convex import --table <flat_name> --replace -y <file>`. `dry_run = true` logs
+      the command and returns Ok without spawning.
+    - **CLI dry-run** — `ConvexAdapter::with_cli_dry_run(true)` short-circuits all
+      `npx convex …` invocations (deploy + import) to a stderr log line. Used in tests and by
+      `dbd apply --dry-run` to avoid touching a live deployment.
 
 ---
 
