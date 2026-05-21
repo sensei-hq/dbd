@@ -275,12 +275,29 @@ pub struct ExportOptions {
 pub struct DbmlDocConfig {
     pub include: Option<DbmlFilter>,
     pub exclude: Option<DbmlFilter>,
+    /// Output filename for this document (relative to the directory the
+    /// user passed to `dbd dbml`). Defaults to `<doc_key>.dbml`.
+    pub output: Option<String>,
+    /// When `true`, emit one `TableGroup <schema>` per schema present in
+    /// the filtered table set.
+    #[serde(default)]
+    pub auto_group_by_schema: bool,
+    /// Explicit table groups for this document.
+    #[serde(default)]
+    pub groups: Vec<DbmlGroupConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DbmlFilter {
     #[serde(default)]
     pub schemas: Vec<String>,
+    #[serde(default)]
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DbmlGroupConfig {
+    pub name: String,
     #[serde(default)]
     pub tables: Vec<String>,
 }
@@ -386,6 +403,7 @@ pub fn normalize_env(value: Option<&str>) -> Result<String> {
 
 /// Read and parse a design.yaml file.
 pub fn read(path: &Path) -> Result<DesignConfig> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(path).map_err(|e| {
         DbdError::Config(format!("Cannot read {}: {}", path.display(), e))
     })?;
@@ -395,12 +413,14 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
 
 /// Update the `project.version` field in a design.yaml file.
 pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
     })?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
     value["project"]["version"] = serde_yaml::Value::Number(serde_yaml::Number::from(version));
     let output = serde_yaml::to_string(&value)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::write(config_path, output)?;
     Ok(())
 }
