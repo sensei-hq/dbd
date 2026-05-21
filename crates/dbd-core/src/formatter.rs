@@ -34,30 +34,89 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
 
 /// Split input SQL into statement blocks.
 ///
-/// Respects `$$` delimited function bodies: semicolons inside `$$` blocks
-/// do not split statements.
+/// Respects two kinds of bodies that contain inner semicolons:
+/// - `$$ ... $$` delimited (Postgres function bodies)
+/// - SQLite `CREATE TRIGGER ... BEGIN <stmts;> END;` bodies — detected when
+///   a `BEGIN` keyword appears after `TRIGGER` in the same in-flight block.
 fn split_statements(input: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = String::new();
     let mut in_dollar_quote = false;
-    let mut chars = input.chars().peekable();
+    let mut in_trigger_body = false;
+    let mut seen_trigger = false;
+    let bytes = input.as_bytes();
+    let mut i = 0;
 
-    while let Some(c) = chars.next() {
-        current.push(c);
+    while i < bytes.len() {
+        let c = bytes[i] as char;
 
-        if c == '$' && chars.peek() == Some(&'$') {
-            current.push(chars.next().unwrap());
+        // $$ pair toggles a dollar-quoted region.
+        if c == '$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            current.push_str("$$");
             in_dollar_quote = !in_dollar_quote;
+            i += 2;
+            continue;
+        }
+        if in_dollar_quote {
+            current.push(c);
+            i += 1;
             continue;
         }
 
-        if c == ';' && !in_dollar_quote {
-            blocks.push(current.clone());
-            current.clear();
+        // Identifier-like token: consume atomically so we can spot keywords
+        // at word boundaries without false positives mid-name.
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let word = &input[start..i];
+            current.push_str(word);
+            match word.to_ascii_uppercase().as_str() {
+                "TRIGGER" if !in_trigger_body => seen_trigger = true,
+                "BEGIN" if seen_trigger && !in_trigger_body => in_trigger_body = true,
+                _ => {}
+            }
+            continue;
         }
+
+        current.push(c);
+        i += 1;
+
+        if c != ';' {
+            continue;
+        }
+
+        if in_trigger_body {
+            // Does this `;` close the trigger body? Only if it follows a
+            // standalone `END` token (ignoring whitespace/comments). CASE
+            // expressions also use END, but those are inside expressions
+            // and aren't immediately followed by `;`.
+            let head = current[..current.len() - 1].trim_end();
+            if head.len() >= 3 && head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"END") {
+                let prev_is_boundary = head.len() == 3
+                    || !{
+                        let b = head.as_bytes()[head.len() - 4];
+                        b.is_ascii_alphanumeric() || b == b'_'
+                    };
+                if prev_is_boundary {
+                    in_trigger_body = false;
+                    seen_trigger = false;
+                    blocks.push(std::mem::take(&mut current));
+                    continue;
+                }
+            }
+            // Inner statement separator — keep accumulating.
+            continue;
+        }
+
+        // Normal statement boundary.
+        blocks.push(std::mem::take(&mut current));
+        seen_trigger = false;
     }
 
-    // Remaining text (trailing content without semicolon)
     let remaining = current.trim();
     if !remaining.is_empty() {
         blocks.push(current);
@@ -1477,5 +1536,82 @@ mod tests {
         let first = format_ddl(input, &config);
         let second = format_ddl(&first, &config);
         assert_eq!(first, second, "river formatting should be idempotent:\nfirst:\n{first}\nsecond:\n{second}");
+    }
+
+    // ── SQLite trigger splitter (R16–R19) ──────────────────────────────────
+
+    #[test]
+    fn r16_split_trigger_body_kept_as_single_block() {
+        let input = "\
+CREATE TABLE foo (id INTEGER);
+
+CREATE TRIGGER foo_log AFTER INSERT ON foo
+BEGIN
+  INSERT INTO audit (event, row_id) VALUES ('insert', NEW.id);
+  UPDATE counts SET n = n + 1 WHERE name = 'foo';
+END;
+
+CREATE INDEX foo_x ON foo(id);
+";
+        let blocks = super::split_statements(input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(
+            nonempty.len(),
+            3,
+            "expected 3 statements (table, trigger, index); got {}: {:#?}",
+            nonempty.len(),
+            nonempty
+        );
+        assert!(nonempty[1].contains("CREATE TRIGGER"));
+        assert!(nonempty[1].contains("INSERT INTO audit"));
+        assert!(nonempty[1].contains("UPDATE counts"));
+        assert!(nonempty[1].trim_end().ends_with("END;"));
+    }
+
+    #[test]
+    fn r17_split_plain_begin_transaction_still_splits() {
+        // A bare BEGIN/COMMIT pair (no TRIGGER keyword) must keep splitting
+        // on every `;` — otherwise transaction wrappers in migration files
+        // would silently collapse into one block.
+        let input = "BEGIN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT;";
+        let blocks = super::split_statements(input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(nonempty.len(), 4, "got: {nonempty:#?}");
+    }
+
+    #[test]
+    fn r18_split_trigger_with_case_end_inside() {
+        // CASE ... END inside the trigger body must NOT prematurely close
+        // the trigger block — only `END;` at top level does.
+        let input = "\
+CREATE TRIGGER t1 AFTER UPDATE ON t
+BEGIN
+  UPDATE t2 SET v = CASE WHEN NEW.x > 0 THEN 'pos' ELSE 'neg' END WHERE id = NEW.id;
+  INSERT INTO log VALUES (NEW.id);
+END;
+";
+        let blocks = super::split_statements(input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(nonempty.len(), 1, "got: {nonempty:#?}");
+        assert!(nonempty[0].contains("CASE WHEN"));
+        assert!(nonempty[0].contains("INSERT INTO log"));
+    }
+
+    #[test]
+    fn r19_split_dollar_quote_still_works() {
+        // Regression: the rewritten splitter must still respect $$ bodies.
+        let input = "\
+CREATE FUNCTION f() RETURNS void AS $$
+BEGIN
+  RAISE NOTICE 'hi';
+  PERFORM 1;
+END;
+$$ LANGUAGE plpgsql;
+SELECT 1;
+";
+        let blocks = super::split_statements(input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(nonempty.len(), 2, "got: {nonempty:#?}");
+        assert!(nonempty[0].contains("LANGUAGE plpgsql"));
     }
 }
