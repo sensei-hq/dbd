@@ -290,7 +290,7 @@ async fn migration_upgrades_schema() {
 
     let mut v1_summary = None;
     v1_design
-        .apply(&*adapter, None, false, |_| {}, |_, _| {}, |s| v1_summary = Some(s))
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v1_summary = Some(s))
         .await
         .expect("v1 apply failed");
 
@@ -304,7 +304,7 @@ async fn migration_upgrades_schema() {
     let v2_design = load_design();
     let mut v2_summary = None;
     v2_design
-        .apply(&*adapter, None, false, |_| {}, |_, _| {}, |s| v2_summary = Some(s))
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v2_summary = Some(s))
         .await
         .expect("v2 apply failed");
 
