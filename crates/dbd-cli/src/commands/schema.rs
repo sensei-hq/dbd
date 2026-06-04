@@ -191,7 +191,10 @@ pub async fn cmd_apply(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        let ws = design.working_set(&resolved).unwrap_or_default();
+        // Surface the same gap/closure errors a real apply would (dry-run must
+        // not hide a misconfigured scope).
+        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        let ws = design.working_set(&resolved)?;
         let entities: Vec<_> = design
             .entities()
             .iter()

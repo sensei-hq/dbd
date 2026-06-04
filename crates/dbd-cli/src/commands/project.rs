@@ -196,7 +196,19 @@ pub async fn cmd_deploy(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
+        // Surface the same gap/closure errors a real deploy would.
+        design.check_scope_gaps(&resolved).context("scope check failed")?;
         let report = design.report(None, Some(&resolved));
+        if !resolved.is_all {
+            for gap in &report.gaps {
+                output::always(&format!(
+                    "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
+                    gap.required_by,
+                    gap.missing,
+                    gap.chain.join(" → ")
+                ));
+            }
+        }
         output::info(verbosity, &format!(
             "{} entities found, {} errors, {} warnings",
             design.entities().len(),
@@ -228,7 +240,7 @@ pub async fn cmd_deploy(
     }
 
     let mut import_summary: Option<ImportComplete> = None;
-    let ws = design.working_set(&resolved).unwrap_or_default();
+    let ws = design.working_set(&resolved)?;
     let import_plan: Vec<_> = design
         .import_plan(None)
         .into_iter()

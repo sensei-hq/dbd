@@ -578,3 +578,28 @@ fn no_scope_is_full_set() {
     assert!(scope.entities.iter().any(|n| n.starts_with("staging.")));
     assert!(scope.entities.iter().any(|n| n.starts_with("config.")));
 }
+
+// The CLI dry-run paths (apply/import/deploy --dry-run --scope) call
+// check_scope_gaps so they surface the same error a real run would. Lock in
+// that gate's behavior on the fixture scopes.
+#[test]
+fn check_scope_gaps_gates_report_but_not_include() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+
+    // report policy with a gap → Err
+    let incomplete = design.resolve_scope(Some("incomplete"), None).unwrap();
+    let err = design.check_scope_gaps(&incomplete).unwrap_err();
+    assert!(err.to_string().contains("dependency gap"));
+
+    // include policy → no error (closure auto-resolves)
+    let auto = design.resolve_scope(Some("incomplete_auto"), None).unwrap();
+    assert!(design.check_scope_gaps(&auto).is_ok());
+
+    // complete scope and all-scope → no error
+    let complete = design.resolve_scope(Some("config_only"), None).unwrap();
+    assert!(design.check_scope_gaps(&complete).is_ok());
+    let all = design.resolve_scope(None, None).unwrap();
+    assert!(design.check_scope_gaps(&all).is_ok());
+}

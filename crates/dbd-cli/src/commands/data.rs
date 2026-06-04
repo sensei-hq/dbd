@@ -20,8 +20,11 @@ pub fn cmd_import_dry_run(
         .context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
+    // Surface the same gap/closure errors a real import would (dry-run must
+    // not hide a misconfigured scope).
+    design.check_scope_gaps(&resolved).context("scope check failed")?;
     let plan = design.import_plan(name);
-    let ws = design.working_set(&resolved).unwrap_or_default();
+    let ws = design.working_set(&resolved)?;
     let plan: Vec<_> = plan
         .into_iter()
         .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))

@@ -590,7 +590,7 @@ impl Design {
     /// entity that references a managed entity outside the scope). No-op for the
     /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
     /// `import_data` so both refuse the same way before any write.
-    fn check_scope_gaps(&self, scope: &ResolvedScope) -> Result<()> {
+    pub fn check_scope_gaps(&self, scope: &ResolvedScope) -> Result<()> {
         if scope.is_all || scope.deps != DepsPolicy::Report {
             return Ok(());
         }
