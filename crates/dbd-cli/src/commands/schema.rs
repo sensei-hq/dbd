@@ -186,6 +186,7 @@ pub async fn cmd_apply(
             &*adapter,
             name,
             false,
+            None,
             |desc| spinner.start(desc),
             |desc, err| spinner.done(desc, err),
             |s| apply_summary = Some(s),

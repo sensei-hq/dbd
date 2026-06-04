@@ -549,6 +549,21 @@ impl Design {
         }
     }
 
+    /// Whether an entity is kept under a resolved scope's working set.
+    /// Extensions/roles/externals are always-on infrastructure.
+    fn entity_in_scope(
+        entity: &Entity,
+        scope: &ResolvedScope,
+        working_set: &std::collections::HashSet<String>,
+    ) -> bool {
+        scope.is_all
+            || matches!(
+                entity.entity_type,
+                EntityType::Extension | EntityType::Role | EntityType::External
+            )
+            || working_set.contains(&entity.name)
+    }
+
     /// Scan all migration directories for unresolved `-- TODO:` comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
@@ -722,11 +737,13 @@ impl Design {
     /// `on_done(desc, err)` is called after — `err` is `None` on success.
     /// `on_complete(summary)` is called once after all steps succeed.
     /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_start: S,
         mut on_done: D,
         mut on_complete: C,
@@ -736,12 +753,46 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
+        // Resolve scope → working set, gap-gate under `report` (abort before any write).
+        let working_set: Option<std::collections::HashSet<String>> = match scope {
+            Some(s) if !s.is_all => {
+                if s.deps == DepsPolicy::Report {
+                    let gaps = scope::analyze_gaps(s, &self.entities, &self.external_names());
+                    if !gaps.is_empty() {
+                        let detail: String = gaps
+                            .iter()
+                            .map(|g| {
+                                format!(
+                                    "  {} requires {} ({})",
+                                    g.required_by,
+                                    g.missing,
+                                    g.chain.join(" → ")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(DbdError::Config(format!(
+                            "scope '{}' has {} dependency gap(s) — add them or use --deps include:\n{detail}",
+                            s.name,
+                            gaps.len()
+                        )));
+                    }
+                }
+                Some(self.working_set(s)?)
+            }
+            _ => None,
+        };
+
         let valid_entities: Vec<&Entity> = self
             .entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .filter(|e| match (&working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
             .collect();
 
         if dry_run {
@@ -786,7 +837,7 @@ impl Design {
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, None);
+        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
 
         // Ensure migrations table exists if we have migration steps
         let has_migrations = plan.steps.iter().any(|s| matches!(
@@ -1124,7 +1175,7 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+        self.apply(adapter, None, dry_run, None, |_| {}, |_, _| {}, |s| {
             apply_summary = Some(s);
         })
         .await?;
@@ -1357,7 +1408,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, true, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -1367,7 +1418,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -1382,7 +1433,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
@@ -1929,7 +1980,7 @@ mod tests {
         // DB is at v1 → migration v2 is pending
         let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
         let result = design
-            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
             .await;
 
         assert!(result.is_err(), "apply should be blocked by unresolved TODO");
@@ -1973,10 +2024,68 @@ mod tests {
         // Fresh DB — v1 migration is pending but data.sql has no TODOs
         let mock = crate::adapter::mock::MockAdapter::new();
         let result = design
-            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
             .await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn apply_with_report_gaps_errors_before_writing() {
+        use crate::scope::ResolvedScope;
+        use std::collections::HashSet;
+        use crate::config::DepsPolicy;
+
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        // report-policy scope with config.lookup_values but not its FK target → one gap.
+        let scope = ResolvedScope {
+            name: "test".into(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+
+        let result = design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await;
+        assert!(result.is_err());
+        assert!(mock.applied_names().is_empty()); // no writes
+    }
+
+    #[tokio::test]
+    async fn apply_with_scope_filters_entities() {
+        use crate::scope::ResolvedScope;
+        use std::collections::HashSet;
+        use crate::config::DepsPolicy;
+
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        // Complete config-only scope (config.lookup_values's FK target IS present).
+        let scope = ResolvedScope {
+            name: "config_only".into(),
+            entities: HashSet::from([
+                "config".to_string(),
+                "config.lookups".to_string(),
+                "config.lookup_values".to_string(),
+            ]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+
+        design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+        let applied = mock.applied_names();
+        assert!(applied.iter().any(|n| n == "config.lookups"));
+        assert!(!applied.iter().any(|n| n.starts_with("staging.")));
     }
 
     #[test]
