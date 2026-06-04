@@ -1875,7 +1875,17 @@ mod tests {
         assert!(!plan.steps.iter().any(|s| matches!(
             s, ExecutionStep::DropEntity { entity_name, .. } if entity_name == "c"
         )));
-        // SetVersion still advances
+        // In-scope altered "b" still gets its migrate + apply steps
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::MigrateEntity { entity_name, .. } if entity_name == "b"
+        )));
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::ApplyEntity(name) if name == "b"
+        )));
+        // Migration is recorded and SetVersion still advances
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::RecordMigration { version: 2, .. }
+        )));
         assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
     }
 
