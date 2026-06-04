@@ -251,7 +251,11 @@ pub fn build_execution_plan(
 /// Whether an import plan entry runs under a scope's working set.
 /// An entry with write-targets is kept only if ALL targets are in scope;
 /// a proc-less entry is kept if its staging table is in scope.
-fn import_entry_in_scope(
+///
+/// Public so CLI previews (`import --dry-run`, `deploy`'s non-empty guard) can
+/// filter the plan identically to how `import_data` filters it internally —
+/// one source of truth for the predicate.
+pub fn import_entry_in_scope(
     entry: &ImportPlanEntry,
     working_set: &std::collections::HashSet<String>,
     is_all: bool,
