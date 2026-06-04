@@ -530,3 +530,51 @@ async fn apply_single_entity_by_name() {
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0], "config.lookups");
 }
+
+// ── Scenario: Scope resolution ──────────────────────────
+
+#[test]
+fn scope_complete_has_no_gaps() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+    let report = design.report(None, Some(&scope));
+    assert!(report.gaps.is_empty());
+    assert!(scope.entities.contains("config.lookups"));
+    assert!(scope.entities.contains("config.lookup_values"));
+}
+
+#[test]
+fn scope_incomplete_reports_gap() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("incomplete"), None).unwrap();
+    let report = design.report(None, Some(&scope));
+    assert_eq!(report.gaps.len(), 1);
+    assert_eq!(report.gaps[0].missing, "config.lookups");
+    assert_eq!(report.gaps[0].required_by, "config.lookup_values");
+}
+
+#[test]
+fn scope_include_policy_closes_gap() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("incomplete_auto"), None).unwrap();
+    let ws = design.working_set(&scope).unwrap();
+    assert!(ws.contains("config.lookups")); // pulled in by include policy
+}
+
+#[test]
+fn no_scope_is_full_set() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(None, None).unwrap();
+    assert!(scope.is_all);
+    // resolved set spans config + staging entities (full project)
+    assert!(scope.entities.iter().any(|n| n.starts_with("staging.")));
+    assert!(scope.entities.iter().any(|n| n.starts_with("config.")));
+}
