@@ -24,9 +24,7 @@ pub fn cmd_import_dry_run(
     let ws = design.working_set(&resolved).unwrap_or_default();
     let plan: Vec<_> = plan
         .into_iter()
-        .filter(|e| resolved.is_all
-            || e.writes.iter().all(|w| ws.contains(w))
-            || (e.writes.is_empty() && ws.contains(&e.table.name)))
+        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
         .collect();
 
     // Step 1: Data loading

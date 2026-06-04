@@ -232,9 +232,7 @@ pub async fn cmd_deploy(
     let import_plan: Vec<_> = design
         .import_plan(None)
         .into_iter()
-        .filter(|e| resolved.is_all
-            || e.writes.iter().all(|w| ws.contains(w))
-            || (e.writes.is_empty() && ws.contains(&e.table.name)))
+        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
         .collect();
     if !import_plan.is_empty() {
         output::info(verbosity, &format!("Importing {} data file(s)...", import_plan.len()));
