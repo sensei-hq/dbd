@@ -1167,7 +1167,9 @@ impl Design {
             }
         }
 
-        // Step 4: Run after scripts
+        // Step 4: Run after scripts — intentionally NOT scope-filtered; these are
+        // project-global post-import hooks, not tied to individual import entries.
+        // Scoped callers are responsible for ensuring their after-scripts are safe.
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
             let desc = format!("run {after_file}");
@@ -2468,5 +2470,15 @@ mod tests {
 
         // is_all bypasses
         assert!(import_entry_in_scope(&entry, &ws, true));
+
+        // proc-less entry (no writes): kept iff its staging table is in scope
+        let procless = ImportPlanEntry {
+            table: Entity::new(EntityType::Import, "staging.lookups"),
+            procedure: None,
+            writes: vec![],
+        };
+        let ws_table: HashSet<String> = ["staging.lookups".to_string()].into_iter().collect();
+        assert!(import_entry_in_scope(&procless, &ws_table, false));
+        assert!(!import_entry_in_scope(&procless, &HashSet::new(), false));
     }
 }
