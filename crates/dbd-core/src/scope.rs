@@ -296,13 +296,26 @@ pub fn closure(
     let ext: HashSet<String> = externals.iter().cloned().collect();
     let (mut visited, _parent) = traverse(resolved, all_entities, &ext);
 
-    for n in visited.iter() {
-        if !resolved.entities.contains(n) && resolved.excluded.contains(n) {
-            return Err(DbdError::Config(format!(
-                "scope '{}' excludes '{}' but an in-scope entity requires it",
-                resolved.name, n
-            )));
-        }
+    // A node the closure pulled in but the scope explicitly excluded is a
+    // contradiction. `entities` and `excluded` are disjoint post-resolve, so a
+    // conflict can only be a freshly-traversed node. Collect all of them,
+    // sorted, so the error is deterministic and lists every conflict at once.
+    let mut conflicts: Vec<&str> = visited
+        .iter()
+        .filter(|n| !resolved.entities.contains(*n) && resolved.excluded.contains(*n))
+        .map(String::as_str)
+        .collect();
+    if !conflicts.is_empty() {
+        conflicts.sort_unstable();
+        return Err(DbdError::Config(format!(
+            "scope '{}' excludes {} but an in-scope entity requires it",
+            resolved.name,
+            conflicts
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
 
     add_present_schemas(&mut visited, all_entities);
@@ -503,6 +516,7 @@ mod tests {
         let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
         let err = closure(&s, &world(), &[]).unwrap_err();
         assert!(err.to_string().contains("excludes 'config.lookups'"));
+        assert!(err.to_string().contains("'hub'")); // names the offending scope
     }
 
     #[test]
