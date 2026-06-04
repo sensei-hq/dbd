@@ -109,6 +109,7 @@ pub fn build_execution_plan(
     db_version: u32,
     latest_version: u32,
     pending_migrations: &[PendingMigration],
+    scope_names: Option<&std::collections::HashSet<String>>,
 ) -> ExecutionPlan {
     // Filter to valid, non-external entities
     let valid_entities: Vec<&Entity> = entities
@@ -143,6 +144,8 @@ pub fn build_execution_plan(
     }
 
     // Migrate: db_version < latest and there are pending migrations
+    let in_scope = |n: &str| scope_names.is_none_or(|s| s.contains(n));
+
     // Collect all added/altered/dropped across all pending migrations
     let all_added: std::collections::HashSet<&str> = pending_migrations
         .iter()
@@ -157,6 +160,10 @@ pub fn build_execution_plan(
 
     // For each entity, determine what to do
     for entity in &valid_entities {
+        if !in_scope(entity.name.as_str()) {
+            continue;
+        }
+
         if all_added.contains(entity.name.as_str()) {
             steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
         }
@@ -200,6 +207,9 @@ pub fn build_execution_plan(
     // Handle dropped entities
     for migration in pending_migrations {
         for table_name in &migration.dropped {
+            if !in_scope(table_name) {
+                continue;
+            }
             let parts: Vec<&str> = table_name.split('.').collect();
             let (schema, tbl) = if parts.len() > 1 {
                 (Some(parts[0]), parts[1])
@@ -776,7 +786,7 @@ impl Design {
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending);
+        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, None);
 
         // Ensure migrations table exists if we have migration steps
         let has_migrations = plan.steps.iter().any(|s| matches!(
@@ -1590,7 +1600,7 @@ mod tests {
             test_entity("config.orders"),
         ];
 
-        let plan = build_execution_plan(&entities, 0, 2, &[]);
+        let plan = build_execution_plan(&entities, 0, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
 
@@ -1615,7 +1625,7 @@ mod tests {
             test_entity("config.orders"),
         ];
 
-        let plan = build_execution_plan(&entities, 2, 2, &[]);
+        let plan = build_execution_plan(&entities, 2, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Current);
 
@@ -1643,7 +1653,7 @@ mod tests {
             test_migration(1, 2, vec![], vec!["config.users"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1673,7 +1683,7 @@ mod tests {
             test_migration(2, 3, vec![], vec!["config.orders"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1700,7 +1710,7 @@ mod tests {
             test_migration(1, 2, vec!["config.audit_log"], vec![], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1723,7 +1733,7 @@ mod tests {
             test_migration(1, 2, vec![], vec![], vec!["config.legacy"]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1749,7 +1759,7 @@ mod tests {
         let good = test_entity("config.users");
         let entities = vec![broken, good];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         // Only the good entity should appear in the plan
         let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
@@ -1767,7 +1777,7 @@ mod tests {
         let table = test_entity("config.users");
         let entities = vec![external, table];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
             ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
@@ -1782,7 +1792,7 @@ mod tests {
     fn a_db_ahead_of_latest_behaves_as_current() {
         let entities = vec![test_entity("config.users")];
 
-        let plan = build_execution_plan(&entities, 5, 3, &[]);
+        let plan = build_execution_plan(&entities, 5, 3, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Current);
     }
@@ -1792,7 +1802,7 @@ mod tests {
     fn a_fresh_db_no_snapshots() {
         let entities = vec![test_entity("config.users")];
 
-        let plan = build_execution_plan(&entities, 0, 0, &[]);
+        let plan = build_execution_plan(&entities, 0, 0, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should have ApplyEntity + SetVersion(0)
@@ -1813,7 +1823,7 @@ mod tests {
             test_migration(2, 3, vec![], vec!["config.users"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1838,7 +1848,7 @@ mod tests {
     fn a_empty_entities_empty_plan() {
         let entities: Vec<Entity> = vec![];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should only have SetVersion step (no entities to apply)
@@ -1848,6 +1858,26 @@ mod tests {
     }
 
     // ── skip_schemas filtering ───────────────────────────
+
+    // ── scope_names filtering ─────────────────────────────
+
+    #[test]
+    fn execution_plan_skips_out_of_scope_migration_steps() {
+        use std::collections::HashSet;
+        let entities = vec![test_entity("a"), test_entity("b")];
+        // migration drops "c" (not in scope) and alters "b" (in scope)
+        let migrations = vec![test_migration(1, 2, vec![], vec!["b"], vec!["c"])];
+        let in_scope: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, Some(&in_scope));
+
+        // No DropEntity for "c"
+        assert!(!plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::DropEntity { entity_name, .. } if entity_name == "c"
+        )));
+        // SetVersion still advances
+        assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
+    }
 
     // ── data.sql TODO blocking ────────────────────────────
 
