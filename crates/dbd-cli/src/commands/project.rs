@@ -169,12 +169,15 @@ pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosi
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_deploy(
     source: &str,
     _config_name: &Path,
     env: &str,
     database_url: Option<&str>,
     dry_run: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     output::info(verbosity, &format!("Deploying from source: {source}"));
@@ -190,9 +193,10 @@ pub async fn cmd_deploy(
 
     let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
         .context("Failed to load design from source")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        let report = design.report(None, None);
+        let report = design.report(None, Some(&resolved));
         output::info(verbosity, &format!(
             "{} entities found, {} errors, {} warnings",
             design.entities().len(),
@@ -213,7 +217,7 @@ pub async fn cmd_deploy(
                 &*adapter,
                 None,
                 false,
-                None,
+                Some(&resolved),
                 |desc| spinner.start(desc),
                 |desc, err| spinner.done(desc, err),
                 |s| apply_summary = Some(s),
@@ -224,7 +228,14 @@ pub async fn cmd_deploy(
     }
 
     let mut import_summary: Option<ImportComplete> = None;
-    let import_plan = design.import_plan(None);
+    let ws = design.working_set(&resolved).unwrap_or_default();
+    let import_plan: Vec<_> = design
+        .import_plan(None)
+        .into_iter()
+        .filter(|e| resolved.is_all
+            || e.writes.iter().all(|w| ws.contains(w))
+            || (e.writes.is_empty() && ws.contains(&e.table.name)))
+        .collect();
     if !import_plan.is_empty() {
         output::info(verbosity, &format!("Importing {} data file(s)...", import_plan.len()));
         let spinner = output::StepSpinner::new(verbosity);
@@ -233,7 +244,7 @@ pub async fn cmd_deploy(
                 &*adapter,
                 None,
                 false,
-                None,
+                Some(&resolved),
                 |desc| spinner.start(desc),
                 |desc, err| spinner.done(desc, err),
                 |s| import_summary = Some(s),

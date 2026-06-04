@@ -12,12 +12,22 @@ pub fn cmd_import_dry_run(
     env: &str,
     project_dir: &Path,
     name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     let plan = design.import_plan(name);
+    let ws = design.working_set(&resolved).unwrap_or_default();
+    let plan: Vec<_> = plan
+        .into_iter()
+        .filter(|e| resolved.is_all
+            || e.writes.iter().all(|w| ws.contains(w))
+            || (e.writes.is_empty() && ws.contains(&e.table.name)))
+        .collect();
 
     // Step 1: Data loading
     for entry in &plan {
@@ -49,16 +59,20 @@ pub fn cmd_import_dry_run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_import(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     let adapter = get_adapter(config, database_url).await?;
 
@@ -69,7 +83,7 @@ pub async fn cmd_import(
             &*adapter,
             name,
             false,
-            None,
+            Some(&resolved),
             |desc| spinner.start(desc),
             |desc, err| spinner.done(desc, err),
             |s| import_summary = Some(s),

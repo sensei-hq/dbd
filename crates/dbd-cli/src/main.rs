@@ -24,6 +24,8 @@ async fn main() {
         args.database.as_deref(),
         &project_dir,
         &args.source,
+        args.scope.as_deref(),
+        args.deps.map(Into::into),
         verbosity,
     )
     .await
