@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::DatabaseAdapter;
-use crate::config::{self, DesignConfig};
+use crate::config::{self, DesignConfig, DepsPolicy};
 use crate::dependency;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
@@ -9,6 +9,7 @@ use crate::parser;
 use crate::references;
 use crate::refcache::RefCache;
 use crate::scanner;
+use crate::scope::{self, ResolvedScope};
 use crate::script;
 use crate::snapshot;
 use crate::snapshot::PendingMigration;
@@ -505,6 +506,36 @@ impl Design {
     /// Project directory path.
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
+    }
+
+    /// External entity names from config (for ref resolution / gap analysis).
+    fn external_names(&self) -> Vec<String> {
+        self.config.external.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// Resolve a scope by name. `None` ⇒ `default` scope if defined, else `all`.
+    /// `deps_override` (CLI `--deps`) wins over the scope's own `deps`.
+    pub fn resolve_scope(
+        &self,
+        name: Option<&str>,
+        deps_override: Option<DepsPolicy>,
+    ) -> Result<ResolvedScope> {
+        scope::resolve(
+            &self.config.scopes,
+            name,
+            deps_override,
+            &self.entities,
+            &self.external_names(),
+        )
+    }
+
+    /// The set of entity names an operation should act on under this scope.
+    /// `include` policy expands to the dependency closure.
+    pub fn working_set(&self, scope: &ResolvedScope) -> Result<std::collections::HashSet<String>> {
+        match scope.deps {
+            DepsPolicy::Include => scope::closure(scope, &self.entities, &self.external_names()),
+            DepsPolicy::Report => Ok(scope.entities.clone()),
+        }
     }
 
     /// Scan all migration directories for unresolved `-- TODO:` comments in
@@ -2141,5 +2172,23 @@ mod tests {
         assert_eq!(size, None);
         // Warning remains untouched.
         assert_eq!(design.entities.last().unwrap().warnings.len(), 1);
+    }
+
+    #[test]
+    fn resolve_scope_all_when_none() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(None, None).unwrap();
+        assert!(scope.is_all);
+    }
+
+    #[test]
+    fn working_set_filters_to_scope() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+        // all-scope working set contains config.lookups
+        assert!(ws.contains("config.lookups"));
     }
 }
