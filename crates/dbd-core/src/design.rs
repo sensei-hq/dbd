@@ -564,6 +564,30 @@ impl Design {
             || working_set.contains(&entity.name)
     }
 
+    /// Under `report` policy, error if the scope has dependency gaps (an in-scope
+    /// entity that references a managed entity outside the scope). No-op for the
+    /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
+    /// `import_data` so both refuse the same way before any write.
+    fn check_scope_gaps(&self, scope: &ResolvedScope) -> Result<()> {
+        if scope.is_all || scope.deps != DepsPolicy::Report {
+            return Ok(());
+        }
+        let gaps = scope::analyze_gaps(scope, &self.entities, &self.external_names());
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        let detail: String = gaps
+            .iter()
+            .map(|g| format!("  {} requires {} ({})", g.required_by, g.missing, g.chain.join(" → ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(DbdError::Config(format!(
+            "scope '{}' has {} dependency gap(s) — add them or use --deps include:\n{detail}",
+            scope.name,
+            gaps.len()
+        )))
+    }
+
     /// Scan all migration directories for unresolved `-- TODO:` comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
@@ -754,30 +778,11 @@ impl Design {
         C: FnMut(ApplyComplete),
     {
         // Resolve scope → working set, gap-gate under `report` (abort before any write).
+        // The gate runs even under `dry_run`: a gappy scope is misconfigured
+        // regardless of whether writes would occur.
         let working_set: Option<std::collections::HashSet<String>> = match scope {
             Some(s) if !s.is_all => {
-                if s.deps == DepsPolicy::Report {
-                    let gaps = scope::analyze_gaps(s, &self.entities, &self.external_names());
-                    if !gaps.is_empty() {
-                        let detail: String = gaps
-                            .iter()
-                            .map(|g| {
-                                format!(
-                                    "  {} requires {} ({})",
-                                    g.required_by,
-                                    g.missing,
-                                    g.chain.join(" → ")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        return Err(DbdError::Config(format!(
-                            "scope '{}' has {} dependency gap(s) — add them or use --deps include:\n{detail}",
-                            s.name,
-                            gaps.len()
-                        )));
-                    }
-                }
+                self.check_scope_gaps(s)?;
                 Some(self.working_set(s)?)
             }
             _ => None,
@@ -2052,7 +2057,8 @@ mod tests {
         let result = design
             .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
             .await;
-        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("dependency gap"), "expected gap error, got: {msg}");
         assert!(mock.applied_names().is_empty()); // no writes
     }
 
