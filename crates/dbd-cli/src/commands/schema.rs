@@ -53,7 +53,7 @@ pub async fn cmd_inspect(
         }
     }
 
-    let report = design.report(name);
+    let report = design.report(name, None);
     let total_entities = design.entities().len();
 
     if verbosity.is_verbose() {

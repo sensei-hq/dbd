@@ -192,7 +192,7 @@ pub async fn cmd_deploy(
         .context("Failed to load design from source")?;
 
     if dry_run {
-        let report = design.report(None);
+        let report = design.report(None, None);
         output::info(verbosity, &format!(
             "{} entities found, {} errors, {} warnings",
             design.entities().len(),

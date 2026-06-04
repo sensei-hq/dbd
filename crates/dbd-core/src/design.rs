@@ -244,6 +244,7 @@ pub struct Report {
     pub entity: Option<Entity>,
     pub issues: Vec<Entity>,
     pub warnings: Vec<Entity>,
+    pub gaps: Vec<scope::ScopeGap>,
 }
 
 /// An entry in the import plan: staging table + matched procedure + write targets.
@@ -662,8 +663,8 @@ impl Design {
         self
     }
 
-    /// Generate a validation report, optionally scoped to one entity.
-    pub fn report(&mut self, name: Option<&str>) -> Report {
+    /// Generate a validation report, optionally scoped to one entity and/or a scope.
+    pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report {
         if !self.validated {
             self.validate();
         }
@@ -688,10 +689,16 @@ impl Design {
             .cloned()
             .collect();
 
+        let gaps = match scope {
+            Some(s) => scope::analyze_gaps(s, &self.entities, &self.external_names()),
+            None => Vec::new(),
+        };
+
         Report {
             entity,
             issues,
             warnings,
+            gaps,
         }
     }
 
@@ -1316,7 +1323,7 @@ mod tests {
     fn validate_reports_errors() {
         let config_path = fixture_dir().join("design.yaml");
         let mut design = Design::from_config(&config_path, "dev").unwrap();
-        let report = design.report(None);
+        let report = design.report(None, None);
 
         // The fixture project should have no major errors
         // (warnings are expected for unresolved references)
@@ -2228,5 +2235,14 @@ mod tests {
         let ws = design.working_set(&scope).unwrap();
         assert!(ws.contains("config.lookup_values"));
         assert!(ws.contains("config.lookups")); // pulled in by closure
+    }
+
+    #[test]
+    fn report_surfaces_scope_gaps() {
+        let config_path = fixture_dir().join("design.yaml");
+        let mut design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+        let report = design.report(None, Some(&scope));
+        assert!(report.gaps.is_empty()); // all-scope ⇒ no gaps
     }
 }
