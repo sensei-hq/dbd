@@ -66,7 +66,8 @@ pub enum DepsPolicy {
     Include,
 }
 
-/// A scope entry: either the literal string `all` or an include/exclude spec.
+/// A scope entry: either the bare string `all` (validated at resolve time —
+/// any other bare string is a config error) or an include/exclude spec.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ScopeEntry {
