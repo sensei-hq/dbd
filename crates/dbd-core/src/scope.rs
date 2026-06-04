@@ -46,6 +46,11 @@ fn universe(all_entities: &[Entity]) -> HashSet<String> {
 /// Resolve one scope item (a bare schema token or a qualified entity name)
 /// into the set of scopable entity names it selects. Errors if it matches
 /// nothing — typo protection.
+///
+/// A bare schema token selects every scopable entity under the schema PLUS
+/// the schema entity itself. A declared-but-empty schema therefore resolves
+/// to just its `CREATE SCHEMA` entity rather than an error (the schema is
+/// real, so it is not a typo).
 fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
     if item.contains('.') {
         let exists = all_entities.iter().any(|e| is_scopable(e) && e.name == item);
@@ -56,7 +61,7 @@ fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
         }
         Ok(HashSet::from([item.to_string()]))
     } else {
-        let names: HashSet<String> = all_entities
+        let mut names: HashSet<String> = all_entities
             .iter()
             .filter(|e| is_scopable(e) && e.schema.as_deref() == Some(item))
             .map(|e| e.name.clone())
@@ -68,6 +73,12 @@ fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
             return Err(DbdError::Config(format!(
                 "scope item '{item}' matches no known schema or entity"
             )));
+        }
+        // A bare schema token also selects the schema entity itself, so that
+        // `excludes: [app]` drops `CREATE SCHEMA app` (not just app's tables)
+        // and `includes: [app]` carries the schema explicitly.
+        if schema_exists {
+            names.insert(item.to_string());
         }
         Ok(names)
     }
@@ -213,6 +224,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_none_uses_default_scope() {
+        // name = None with a configured `default` scope uses it (not `all`).
+        let scopes = scopes_yaml("default:\n  includes: [config]\n");
+        let s = resolve(&scopes, None, None, &world(), &[]).unwrap();
+        assert_eq!(s.name, "default");
+        assert!(!s.is_all);
+        assert!(s.entities.contains("config.lookups"));
+        assert!(!s.entities.contains("app.orders"));
+    }
+
+    #[test]
     fn resolve_schema_token_expands() {
         let scopes = scopes_yaml("hub:\n  includes: [config]\n");
         let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
@@ -221,6 +243,7 @@ mod tests {
         assert!(s.entities.contains("config.lookup_values"));
         assert!(s.entities.contains("config")); // schema auto-added
         assert!(!s.entities.contains("app.orders"));
+        assert!(!s.entities.contains("app")); // other schema entity absent
     }
 
     #[test]
@@ -238,6 +261,7 @@ mod tests {
         let s = resolve(&scopes, Some("rep"), None, &world(), &[]).unwrap();
         assert!(s.entities.contains("config.lookups"));
         assert!(!s.entities.contains("app.orders"));
+        assert!(!s.entities.contains("app")); // excluded schema entity not re-added
         assert!(s.excluded.contains("app.orders"));
     }
 
