@@ -144,6 +144,35 @@ external:
     note: Supabase managed authentication table
 ```
 
+### `scopes`
+
+Named subsets of entities, so one design can deploy to multiple databases (e.g. a full primary DB and a smaller embedded-postgres "hub").
+
+```yaml
+scopes:
+  hub:
+    includes: [config, app.users, app.sessions]   # whole schema or specific entity
+    deps: report                                    # report (default) | include
+  reporting:
+    excludes: [staging, app.audit_log]
+```
+
+Each entry in `includes`/`excludes` is a schema name (selects the whole schema plus the schema entity itself) or a qualified entity like `app.users`. `includes` omitted means start from the full set; `excludes` removes from it.
+
+| Field      | Type   | Default  | Description |
+|------------|--------|----------|-------------|
+| `includes` | list   | (all)    | Schema names or qualified entities to include |
+| `excludes` | list   | (none)   | Schema names or qualified entities to remove from the set |
+| `deps`     | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
+
+**`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`deploy` refuse to proceed until gaps are resolved.
+
+**`deps: include`** — `deploy` silently expands the working set to the full transitive dependency closure before applying.
+
+`external:` entries are never considered gaps regardless of `deps` setting.
+
+Omit the `scopes:` block (or don't define `default:`) to deploy the full entity set. Define `default:` only if a bare `dbd deploy` should deploy a subset.
+
 ### `import`
 
 | Field     | Type   | Description |
