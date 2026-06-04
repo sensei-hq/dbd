@@ -16,6 +16,8 @@ pub struct DesignConfig {
     #[serde(default)]
     pub target: IndexMap<String, TargetConfig>,
     #[serde(default)]
+    pub scopes: IndexMap<String, ScopeEntry>,
+    #[serde(default)]
     pub schemas: Vec<SchemaEntry>,
     #[serde(default)]
     pub external: Vec<ExternalEntry>,
@@ -49,6 +51,38 @@ impl DesignConfig {
     pub fn schema_names(&self) -> Vec<String> {
         self.schemas.iter().map(|s| s.name()).collect()
     }
+}
+
+// ── Scopes ──────────────────────────────────────────────
+
+/// Dependency-gap policy for a scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepsPolicy {
+    /// Gaps are errors; deploy refuses (default).
+    #[default]
+    Report,
+    /// Deploy auto-expands to the dependency closure.
+    Include,
+}
+
+/// A scope entry: either the literal string `all` or an include/exclude spec.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ScopeEntry {
+    All(String),
+    Spec(ScopeSpec),
+}
+
+/// Include/exclude selection plus dependency policy for one scope.
+#[derive(Debug, Default, Deserialize)]
+pub struct ScopeSpec {
+    #[serde(default)]
+    pub includes: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub deps: DepsPolicy,
 }
 
 // ── Project ─────────────────────────────────────────────
@@ -615,5 +649,46 @@ mod tests {
         update_version(&path, 7).unwrap();
         let config = read(&path).unwrap();
         assert_eq!(config.project.version, Some(7));
+    }
+
+    #[test]
+    fn parses_scope_object_form() {
+        let yaml = "\
+project:
+  name: t
+scopes:
+  hub:
+    includes: [config, app.users]
+    deps: include
+  reporting:
+    excludes: [staging]
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let hub = match config.scopes.get("hub").unwrap() {
+            ScopeEntry::Spec(s) => s,
+            _ => panic!("expected spec"),
+        };
+        assert_eq!(hub.includes, vec!["config", "app.users"]);
+        assert_eq!(hub.deps, DepsPolicy::Include);
+        let rep = match config.scopes.get("reporting").unwrap() {
+            ScopeEntry::Spec(s) => s,
+            _ => panic!("expected spec"),
+        };
+        assert_eq!(rep.excludes, vec!["staging"]);
+        assert_eq!(rep.deps, DepsPolicy::Report); // default
+    }
+
+    #[test]
+    fn parses_scope_all_string_form() {
+        let yaml = "project:\n  name: t\nscopes:\n  default: all\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.scopes.get("default"), Some(ScopeEntry::All(s)) if s == "all"));
+    }
+
+    #[test]
+    fn scopes_default_empty_when_absent() {
+        let yaml = "project:\n  name: t\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.scopes.is_empty());
     }
 }
