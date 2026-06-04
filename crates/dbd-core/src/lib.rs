@@ -23,7 +23,7 @@ pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
-pub use scope::ResolvedScope;
+pub use scope::{ResolvedScope, ScopeGap};
 pub use snapshot::DataSqlTodo;
 
 /// Connect to a database by URL and return an adapter.

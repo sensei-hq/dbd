@@ -3,7 +3,7 @@
 //! No I/O. Operates over the already-loaded entity list. Policy-neutral:
 //! computes sets and gaps; the error-vs-expand decision lives in the consumer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use indexmap::IndexMap;
 
@@ -20,6 +20,16 @@ pub struct ResolvedScope {
     pub excluded: HashSet<String>,
     pub deps: DepsPolicy,
     pub is_all: bool,
+}
+
+/// One dependency gap surfaced by inspect.
+#[derive(Debug, Clone)]
+pub struct ScopeGap {
+    pub missing: String,
+    /// The in-scope entity at the HEAD of `chain`.
+    pub required_by: String,
+    /// `required_by` → … → `missing`. `chain[0]` is in-scope; `chain.last()` is `missing`.
+    pub chain: Vec<String>,
 }
 
 /// Entity types a scope can select (schemas handled separately via auto-add).
@@ -105,6 +115,44 @@ fn add_present_schemas(set: &mut HashSet<String>, all_entities: &[Entity]) {
     }
 }
 
+/// BFS from the in-scope roots along `refers` edges into managed, non-external
+/// entities. Returns (visited, parent) where `parent` maps node → predecessor.
+/// Self-refs, externals, and unresolved (non-managed) targets are not traversed.
+fn traverse(
+    resolved: &ResolvedScope,
+    all_entities: &[Entity],
+    externals: &HashSet<String>,
+) -> (HashSet<String>, HashMap<String, String>) {
+    let managed: HashSet<&str> = all_entities
+        .iter()
+        .filter(|e| is_scopable(e))
+        .map(|e| e.name.as_str())
+        .collect();
+    let refers: HashMap<&str, &Vec<String>> = all_entities
+        .iter()
+        .map(|e| (e.name.as_str(), &e.refers))
+        .collect();
+
+    let mut visited: HashSet<String> = resolved.entities.clone();
+    let mut parent: HashMap<String, String> = HashMap::new();
+    let mut queue: VecDeque<String> = resolved.entities.iter().cloned().collect();
+
+    while let Some(cur) = queue.pop_front() {
+        if let Some(deps) = refers.get(cur.as_str()) {
+            for dep in deps.iter() {
+                if dep == &cur || externals.contains(dep) || !managed.contains(dep.as_str()) {
+                    continue;
+                }
+                if visited.insert(dep.clone()) {
+                    parent.insert(dep.clone(), cur.clone());
+                    queue.push_back(dep.clone());
+                }
+            }
+        }
+    }
+    (visited, parent)
+}
+
 /// Resolve a scope name against the loaded entities.
 ///
 /// `name = None` → the `default` scope if defined, else `all`.
@@ -187,6 +235,41 @@ pub fn resolve(
         deps: deps_override.unwrap_or(spec.deps),
         is_all: false,
     })
+}
+
+/// Inspect engine: the full set of managed entities reachable from the scope
+/// but not in it. Each missing entity gets one path back to an in-scope root.
+pub fn analyze_gaps(
+    resolved: &ResolvedScope,
+    all_entities: &[Entity],
+    externals: &[String],
+) -> Vec<ScopeGap> {
+    if resolved.is_all {
+        return Vec::new();
+    }
+    let ext: HashSet<String> = externals.iter().cloned().collect();
+    let (visited, parent) = traverse(resolved, all_entities, &ext);
+
+    let mut gaps: Vec<ScopeGap> = visited
+        .iter()
+        .filter(|n| !resolved.entities.contains(*n))
+        .map(|missing| {
+            let mut chain = vec![missing.clone()];
+            let mut cur = missing.clone();
+            while let Some(p) = parent.get(&cur) {
+                chain.push(p.clone());
+                cur = p.clone();
+            }
+            chain.reverse();
+            ScopeGap {
+                required_by: chain.first().cloned().unwrap_or_default(),
+                missing: missing.clone(),
+                chain,
+            }
+        })
+        .collect();
+    gaps.sort_by(|a, b| a.missing.cmp(&b.missing));
+    gaps
 }
 
 #[cfg(test)]
@@ -284,5 +367,70 @@ mod tests {
         let scopes = scopes_yaml("hub:\n  includes: [ghost]\n");
         let err = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap_err();
         assert!(err.to_string().contains("matches no known"));
+    }
+
+    #[test]
+    fn gaps_direct_reference() {
+        // include only the child table; parent is out of scope → gap
+        let scopes = scopes_yaml("hub:\n  includes: [config.lookup_values]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
+        let gaps = analyze_gaps(&s, &world(), &[]);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].missing, "config.lookups");
+        assert_eq!(gaps[0].required_by, "config.lookup_values");
+        assert_eq!(gaps[0].chain, vec!["config.lookup_values", "config.lookups"]);
+    }
+
+    #[test]
+    fn gaps_hierarchical_chain() {
+        // a → b → c; scope has only `a`; b and c both missing, chained.
+        let world = vec![
+            Entity::schema("s"),
+            ent(EntityType::Table, "s.c", &[]),
+            ent(EntityType::Table, "s.b", &["s.c"]),
+            ent(EntityType::Table, "s.a", &["s.b"]),
+        ];
+        let scopes = scopes_yaml("hub:\n  includes: [s.a]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
+        let gaps = analyze_gaps(&s, &world, &[]);
+        let missing: Vec<&str> = gaps.iter().map(|g| g.missing.as_str()).collect();
+        assert_eq!(missing, vec!["s.b", "s.c"]); // sorted
+        let c = gaps.iter().find(|g| g.missing == "s.c").unwrap();
+        assert_eq!(c.chain, vec!["s.a", "s.b", "s.c"]);
+        assert_eq!(c.required_by, "s.a");
+    }
+
+    #[test]
+    fn gaps_external_is_not_a_gap() {
+        let mut world = world();
+        world.push(ent(EntityType::Table, "app.orders2", &["auth.users"]));
+        let scopes = scopes_yaml("hub:\n  includes: [app.orders2]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
+        let gaps = analyze_gaps(&s, &world, &["auth.users".to_string()]);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_self_reference_is_not_a_gap() {
+        let world = vec![
+            Entity::schema("s"),
+            ent(EntityType::Table, "s.tree", &["s.tree"]),
+        ];
+        let scopes = scopes_yaml("hub:\n  includes: [s.tree]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
+        assert!(analyze_gaps(&s, &world, &[]).is_empty());
+    }
+
+    #[test]
+    fn gaps_complete_closure_none() {
+        let scopes = scopes_yaml("hub:\n  includes: [config]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
+        assert!(analyze_gaps(&s, &world(), &[]).is_empty());
+    }
+
+    #[test]
+    fn gaps_all_scope_none() {
+        let s = resolve(&IndexMap::new(), None, None, &world(), &[]).unwrap();
+        assert!(analyze_gaps(&s, &world(), &[]).is_empty());
     }
 }
