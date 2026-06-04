@@ -15,6 +15,7 @@ pub mod parser;
 pub mod references;
 pub mod refcache;
 pub mod scanner;
+pub mod scope;
 pub mod script;
 pub mod snapshot;
 
@@ -22,6 +23,7 @@ pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
+pub use scope::ResolvedScope;
 pub use snapshot::DataSqlTodo;
 
 /// Connect to a database by URL and return an adapter.
