@@ -239,7 +239,7 @@ pub fn build_execution_plan(
 }
 
 /// Validation report from inspect.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Report {
     pub entity: Option<Entity>,
     pub issues: Vec<Entity>,
@@ -663,7 +663,8 @@ impl Design {
         self
     }
 
-    /// Generate a validation report, optionally scoped to one entity and/or a scope.
+    /// Generate a validation report, optionally filtered to one entity by
+    /// `name` and augmented with dependency gaps when a `scope` is supplied.
     pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report {
         if !self.validated {
             self.validate();
@@ -2244,5 +2245,24 @@ mod tests {
         let scope = design.resolve_scope(Some("all"), None).unwrap();
         let report = design.report(None, Some(&scope));
         assert!(report.gaps.is_empty()); // all-scope ⇒ no gaps
+    }
+
+    #[test]
+    fn report_surfaces_real_gaps() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let mut design = Design::from_config(&config_path, "dev").unwrap();
+        // Narrow scope with config.lookup_values but not its FK target config.lookups.
+        let scope = ResolvedScope {
+            name: "narrow".to_string(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+        let report = design.report(None, Some(&scope));
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].missing, "config.lookups");
+        assert_eq!(report.gaps[0].required_by, "config.lookup_values");
     }
 }
