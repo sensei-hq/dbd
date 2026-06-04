@@ -1,0 +1,3 @@
+-- Post-import loader hook (no-op for the test fixture).
+-- Declared by design.yaml `import.after`; real projects put their
+-- post-load SQL (refreshes, derived tables, etc.) here.

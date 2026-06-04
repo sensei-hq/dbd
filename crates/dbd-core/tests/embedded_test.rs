@@ -137,7 +137,7 @@ async fn fresh_deploy_creates_schema() {
 
     let mut summary: Option<DeployComplete> = None;
     design
-        .deploy(&*adapter, false, |s| summary = Some(s))
+        .deploy(&*adapter, false, None, |s| summary = Some(s))
         .await
         .expect("deploy failed");
 
@@ -164,13 +164,13 @@ async fn redeploy_is_idempotent_and_current() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, false, |_| {})
+        .deploy(&*adapter, false, None, |_| {})
         .await
         .expect("first deploy failed");
 
     let mut summary: Option<DeployComplete> = None;
     design
-        .deploy(&*adapter, false, |s| summary = Some(s))
+        .deploy(&*adapter, false, None, |s| summary = Some(s))
         .await
         .expect("second deploy failed");
 
@@ -195,7 +195,7 @@ async fn deployed_tables_accept_data() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, false, |_| {})
+        .deploy(&*adapter, false, None, |_| {})
         .await
         .expect("deploy failed");
 
@@ -233,7 +233,7 @@ async fn dry_run_does_not_create_tables() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, true, |_| {})
+        .deploy(&*adapter, true, None, |_| {})
         .await
         .expect("dry-run failed");
 
