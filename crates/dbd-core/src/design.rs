@@ -248,6 +248,24 @@ pub fn build_execution_plan(
     }
 }
 
+/// Whether an import plan entry runs under a scope's working set.
+/// An entry with write-targets is kept only if ALL targets are in scope;
+/// a proc-less entry is kept if its staging table is in scope.
+fn import_entry_in_scope(
+    entry: &ImportPlanEntry,
+    working_set: &std::collections::HashSet<String>,
+    is_all: bool,
+) -> bool {
+    if is_all {
+        return true;
+    }
+    if !entry.writes.is_empty() {
+        entry.writes.iter().all(|w| working_set.contains(w))
+    } else {
+        working_set.contains(&entry.table.name)
+    }
+}
+
 /// Validation report from inspect.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -1073,11 +1091,13 @@ impl Design {
     /// can update UI state before propagation).
     /// `on_complete(summary)` is called once after all steps succeed.
     /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn import_data<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_start: S,
         mut on_done: D,
         mut on_complete: C,
@@ -1088,6 +1108,16 @@ impl Design {
         C: FnMut(ImportComplete),
     {
         let plan = self.import_plan(name);
+        let plan: Vec<ImportPlanEntry> = match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                let ws = self.working_set(s)?;
+                plan.into_iter()
+                    .filter(|e| import_entry_in_scope(e, &ws, false))
+                    .collect()
+            }
+            _ => plan,
+        };
 
         // Counters for on_complete summary
         let mut count_tables: u32 = 0;
@@ -1185,7 +1215,7 @@ impl Design {
         })
         .await?;
 
-        self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+        self.import_data(adapter, None, dry_run, None, |_| {}, |_, _| {}, |s| {
             import_summary = Some(s);
         })
         .await?;
@@ -1610,7 +1640,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await;
+        let _ = design.import_data(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
@@ -2419,5 +2449,24 @@ mod tests {
         assert_eq!(report.gaps.len(), 1);
         assert_eq!(report.gaps[0].missing, "config.lookups");
         assert_eq!(report.gaps[0].required_by, "config.lookup_values");
+    }
+
+    #[test]
+    fn import_entry_in_scope_predicate() {
+        use std::collections::HashSet;
+        let mut entry = ImportPlanEntry {
+            table: Entity::new(EntityType::Import, "staging.lookups"),
+            procedure: Some("staging.import_lookups".to_string()),
+            writes: vec!["config.lookups".to_string()],
+        };
+        let ws: HashSet<String> = ["config.lookups".to_string()].into_iter().collect();
+        assert!(import_entry_in_scope(&entry, &ws, false));
+
+        // write-target out of scope → excluded
+        entry.writes = vec!["config.other".to_string()];
+        assert!(!import_entry_in_scope(&entry, &ws, false));
+
+        // is_all bypasses
+        assert!(import_entry_in_scope(&entry, &ws, true));
     }
 }

@@ -69,6 +69,7 @@ pub async fn cmd_import(
             &*adapter,
             name,
             false,
+            None,
             |desc| spinner.start(desc),
             |desc, err| spinner.done(desc, err),
             |s| import_summary = Some(s),
