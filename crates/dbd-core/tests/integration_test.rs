@@ -290,7 +290,7 @@ fn procedure_reads_writes_extracted() {
 #[test]
 fn validate_reports_no_errors_on_fixture() {
     let mut d = design();
-    let report = d.report(None);
+    let report = d.report(None, None);
     // Fixture project should be clean (or have only unresolved external refs)
     for entity in &report.issues {
         // Only allow "File not found" for entities with relative paths
@@ -307,7 +307,7 @@ fn validate_reports_no_errors_on_fixture() {
 #[test]
 fn validate_scoped_to_entity() {
     let mut d = design();
-    let report = d.report(Some("config.lookups"));
+    let report = d.report(Some("config.lookups"), None);
     // Should only include the requested entity
     if let Some(entity) = &report.entity {
         assert_eq!(entity.name, "config.lookups");
