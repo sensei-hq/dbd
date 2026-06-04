@@ -2183,12 +2183,50 @@ mod tests {
     }
 
     #[test]
-    fn working_set_filters_to_scope() {
+    fn working_set_all_scope_is_full_set() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
         let scope = design.resolve_scope(Some("all"), None).unwrap();
         let ws = design.working_set(&scope).unwrap();
-        // all-scope working set contains config.lookups
+        // Spans both schemas' DDL entities (config tables + a staging procedure).
         assert!(ws.contains("config.lookups"));
+        assert!(ws.contains("staging.import_lookups"));
+    }
+
+    #[test]
+    fn working_set_report_filters_to_scope() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // A narrow report-policy scope returns exactly its own entities.
+        let scope = ResolvedScope {
+            name: "narrow".to_string(),
+            entities: HashSet::from(["config.lookups".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+        let ws = design.working_set(&scope).unwrap();
+        assert!(ws.contains("config.lookups"));
+        assert!(!ws.contains("config.lookup_values")); // genuinely filtered out
+        assert!(!ws.contains("staging.lookups"));
+    }
+
+    #[test]
+    fn working_set_include_expands_closure() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // config.lookup_values has an FK to config.lookups; include policy pulls it in.
+        let scope = ResolvedScope {
+            name: "auto".to_string(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Include,
+            is_all: false,
+        };
+        let ws = design.working_set(&scope).unwrap();
+        assert!(ws.contains("config.lookup_values"));
+        assert!(ws.contains("config.lookups")); // pulled in by closure
     }
 }
