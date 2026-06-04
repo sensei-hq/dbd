@@ -135,7 +135,12 @@ fn traverse(
 
     let mut visited: HashSet<String> = resolved.entities.clone();
     let mut parent: HashMap<String, String> = HashMap::new();
-    let mut queue: VecDeque<String> = resolved.entities.iter().cloned().collect();
+    // Seed from sorted roots so that when a missing node is reachable from
+    // several in-scope roots, the recorded chain/required_by is deterministic
+    // across runs (HashSet iteration order is not).
+    let mut roots: Vec<String> = resolved.entities.iter().cloned().collect();
+    roots.sort();
+    let mut queue: VecDeque<String> = roots.into_iter().collect();
 
     while let Some(cur) = queue.pop_front() {
         if let Some(deps) = refers.get(cur.as_str()) {
@@ -262,7 +267,12 @@ pub fn analyze_gaps(
             }
             chain.reverse();
             ScopeGap {
-                required_by: chain.first().cloned().unwrap_or_default(),
+                // Every missing node was reached via `parent` from an in-scope
+                // root, so the reversed chain always starts in-scope.
+                required_by: chain
+                    .first()
+                    .cloned()
+                    .expect("gap node always has an in-scope parent"),
                 missing: missing.clone(),
                 chain,
             }
@@ -408,6 +418,19 @@ mod tests {
         let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
         let gaps = analyze_gaps(&s, &world, &["auth.users".to_string()]);
         assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_mixed_external_and_managed_refs() {
+        // One entity references an external (not a gap) AND a missing managed
+        // table (a gap) — only the managed one is reported.
+        let mut world = world();
+        world.push(ent(EntityType::Table, "app.mixed", &["auth.users", "config.lookups"]));
+        let scopes = scopes_yaml("hub:\n  includes: [app.mixed]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
+        let gaps = analyze_gaps(&s, &world, &["auth.users".to_string()]);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].missing, "config.lookups");
     }
 
     #[test]
