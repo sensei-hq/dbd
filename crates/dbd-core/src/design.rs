@@ -1204,6 +1204,7 @@ impl Design {
         &self,
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_complete: C,
     ) -> Result<()>
     where
@@ -1212,12 +1213,12 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, None, |_| {}, |_, _| {}, |s| {
+        self.apply(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
             apply_summary = Some(s);
         })
         .await?;
 
-        self.import_data(adapter, None, dry_run, None, |_| {}, |_, _| {}, |s| {
+        self.import_data(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
             import_summary = Some(s);
         })
         .await?;
@@ -2141,12 +2142,23 @@ mod tests {
     // ── deploy() tests ────────────────────────────────────
 
     #[tokio::test]
+    async fn deploy_with_all_scope_applies_everything() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+
+        design.deploy(&mock, false, Some(&scope), |_| {}).await.unwrap();
+        assert!(!mock.applied_names().is_empty());
+    }
+
+    #[tokio::test]
     async fn deploy_dry_run_returns_ok_and_applies_nothing() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "prod").unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, true, |_| {}).await.unwrap();
+        design.deploy(&mock, true, None, |_| {}).await.unwrap();
 
         assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
         assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
@@ -2251,7 +2263,7 @@ mod tests {
         .unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, false, |_| {}).await.unwrap();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
     }
 
     // ── resolve_unknown_refs_via_db ──────────────────────
