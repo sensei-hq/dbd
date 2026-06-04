@@ -282,6 +282,33 @@ pub fn analyze_gaps(
     gaps
 }
 
+/// `deps: include` expansion: in-scope ∪ all transitively-referenced managed,
+/// non-external entities. Errors if the closure pulls in an explicitly-excluded
+/// entity.
+pub fn closure(
+    resolved: &ResolvedScope,
+    all_entities: &[Entity],
+    externals: &[String],
+) -> Result<HashSet<String>> {
+    if resolved.is_all {
+        return Ok(resolved.entities.clone());
+    }
+    let ext: HashSet<String> = externals.iter().cloned().collect();
+    let (mut visited, _parent) = traverse(resolved, all_entities, &ext);
+
+    for n in visited.iter() {
+        if !resolved.entities.contains(n) && resolved.excluded.contains(n) {
+            return Err(DbdError::Config(format!(
+                "scope '{}' excludes '{}' but an in-scope entity requires it",
+                resolved.name, n
+            )));
+        }
+    }
+
+    add_present_schemas(&mut visited, all_entities);
+    Ok(visited)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +482,33 @@ mod tests {
     fn gaps_all_scope_none() {
         let s = resolve(&IndexMap::new(), None, None, &world(), &[]).unwrap();
         assert!(analyze_gaps(&s, &world(), &[]).is_empty());
+    }
+
+    #[test]
+    fn closure_expands_dependencies() {
+        let scopes = scopes_yaml("hub:\n  includes: [config.lookup_values]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
+        let c = closure(&s, &world(), &[]).unwrap();
+        assert!(c.contains("config.lookup_values"));
+        assert!(c.contains("config.lookups")); // pulled in
+        assert!(c.contains("config")); // schema
+    }
+
+    #[test]
+    fn closure_exclude_conflict_errors() {
+        // include the child but explicitly exclude the parent it needs.
+        let scopes = scopes_yaml(
+            "hub:\n  includes: [config.lookup_values]\n  excludes: [config.lookups]\n",
+        );
+        let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
+        let err = closure(&s, &world(), &[]).unwrap_err();
+        assert!(err.to_string().contains("excludes 'config.lookups'"));
+    }
+
+    #[test]
+    fn closure_all_scope_is_full_set() {
+        let s = resolve(&IndexMap::new(), None, None, &world(), &[]).unwrap();
+        let c = closure(&s, &world(), &[]).unwrap();
+        assert!(c.contains("app.orders"));
     }
 }
