@@ -1,8 +1,8 @@
 # Backlog
 
-## Current status (2026-05-19)
+## Current status (2026-06-05)
 
-**v0.4.1, 449 tests (410 unit + 38 integration + 1 doc)**
+**v0.4.1, 486 tests (442 unit + 43 integration + 1 doc)**
 
 ### Working commands
 
@@ -51,6 +51,7 @@
 - **SQLite trigger-aware splitter** — `format`'s statement splitter keeps `CREATE TRIGGER … BEGIN <stmts;> END;` as a single block (CASE…END inside the body and bare `BEGIN; … COMMIT;` transactions both behave correctly)
 - **SQLite batched imports** — `import_delimited` + `import_jsonl` now flush rows in `(?,?), (?,?), …` multi-row VALUES batches (≤500 rows or 32k binds per batch, whichever is tighter), still inside a single transaction; JSONL detects column-set changes and flushes between groups
 - **DBML multi-document + groups** — `design.yaml` `dbml.<key>` entries can each declare their own `include`/`exclude`, `output: filename.dbml`, `auto_group_by_schema`, and explicit `groups: [{name, tables}]`; `dbd_core::dbml::generate_all` returns one `DbmlDocument` per key; CLI writes each into the parent directory of the user-supplied output path. Composite FKs (single-column and multi-column constraints) render as `Ref: t.(c1, c2) > o.(c1, c2)`
+- **Scopes — multi-target subset deploy** — `design.yaml` `scopes:` declare named entity selections (`includes`/`excludes` of schemas or specific entities) so one design deploys to multiple databases (e.g. full primary DB + smaller embedded-postgres hub). Orthogonal to `target` (DB platform) and connection — paired at run time via global `--scope`/`--deps`. Pure `scope.rs` (`resolve`/`analyze_gaps`/`closure` over the `refers` graph): `deps: report` (default) makes a dependency gap a hard error (`inspect --scope` lists gaps with their chain and exits non-zero; `apply`/`import`/`deploy` refuse, incl. `--dry-run`); `deps: include` auto-expands to the transitive closure; `external:` is the only "satisfied elsewhere" door. Per-scope migrations fall out via `build_execution_plan` intersection (version meta is per-database). Phase 1: `inspect`/`apply`/`import`/`deploy` (others full-set — see Next up)
 
 ### DDL formatter v2 — river style (✓ done)
 
@@ -91,7 +92,17 @@ inner join lookup_values lv
 
 ## Next up
 
-_(empty)_
+### Scopes — Phase 2 (extend scope-awareness to remaining commands)
+
+Phase 1 (shipped) wires scopes into `inspect`/`apply`/`import`/`deploy`. Phase 2
+extends the `scope: Option<&ResolvedScope>` filtering to the remaining
+entity-selecting commands, which currently always operate on the full set:
+
+- `dbml`, `combine`, `graph`, `export`, `reset` — accept `--scope` and filter to
+  the resolved working set (signatures already carry the scope arg where it
+  threads through `Design`; this is behavior, not API churn).
+- Optional `schema.*` wildcard matching in `includes`/`excludes` to align with
+  the `ignore:` list's existing `prefix.*` syntax.
 
 ---
 
@@ -113,7 +124,8 @@ _(empty — see Core features for the offline ref classifier, trigger-aware spli
 
 ## Test coverage
 
-**449 tests** (410 unit + 38 integration + 1 doc) covering:
+**486 tests** (442 unit + 43 integration + 1 doc) covering:
+- Scopes (23): `scope.rs` (18) — resolve include/exclude/all, schema-token expansion, deps override, unknown-name/item errors, gap analysis (direct + hierarchical chains, external/self-ref exemption, deterministic ordering), closure expansion + exclude-conflict; design/config integration (5) — `resolve_scope`/`working_set` (report filter + include closure), scope-aware `report` gaps, `build_execution_plan` migration intersection, scope-aware `apply` (gap gate blocks before writes), `import_entry_in_scope`, `check_scope_gaps` policy gating
 - Schema diff engine (45): D1-D21, S1-S14, warnings, edge cases
 - Snapshot create (17): SC1-SC10, entity conversion, backward compat
 - Multi-snapshot (7): B1-B3, S1-S2, baseline, no-changes
