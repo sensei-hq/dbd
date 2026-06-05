@@ -49,13 +49,20 @@ dbml:
       - name: lookups
         tables: [config.lookups, config.lookup_values]
 
+scopes:                        # named entity subsets — deploy one design to many DBs
+  hub:
+    includes: [config, app.users]   # schema (all its entities) or specific entity
+    deps: report               # report (default, errors on gaps) | include (auto-closure)
+
 ignore: [bfs, my_company.*]
 ```
+
+Scopes are orthogonal to `target` (DB platform) and the connection: pair them at run time with `dbd deploy --scope hub --database $HUB_URL`. A dependency gap (in-scope entity referencing a managed entity outside the scope) is an error under `report`; `external:` entities are never gaps. Omit `default`/the block ⇒ full set.
 
 ## Commands
 
 - `dbd init` — scaffold project
-- `dbd inspect` — validate, report errors/warnings
+- `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`)
 - `dbd apply` — apply schemas + entities + pending migrations
 - `dbd import` — load staging data (CSV/TSV/JSONL)
 - `dbd export` — export table data
@@ -68,6 +75,8 @@ ignore: [bfs, my_company.*]
 - `dbd doctor` — audit config for stale entries
 - `dbd reset` — drop all schemas (guarded by _dbd_meta env check)
 - `dbd format [--check]` — river-style DDL formatter; `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
+
+Global flags: `--scope <name>` selects a `scopes:` entity subset for `inspect`/`apply`/`import`/`deploy`; `--deps report|include` overrides that scope's gap policy for one run.
 
 ## Architecture
 

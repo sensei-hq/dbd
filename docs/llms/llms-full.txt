@@ -162,6 +162,13 @@ dbml:
       - name: lookups
         tables: [config.lookups, config.lookup_values]
 
+scopes:                         # named entity selections (deploy a subset)
+  hub:
+    includes: [config, app.users]   # whole schema OR specific entity
+    deps: report                    # report (default) | include
+  reporting:
+    excludes: [staging, app.audit_log]
+
 ignore:
   - bfs
   - my_company.*
@@ -179,6 +186,7 @@ ignore:
 | `import` | Data import config (staging schemas, options, tables, after scripts) | no |
 | `export` | Tables to export | no |
 | `dbml` | DBML generation filters | no |
+| `scopes` | Named entity selections for subset deploys | no |
 | `ignore` | Reference classification overrides | no |
 
 ### Universal vs target-specific config
@@ -188,8 +196,41 @@ ignore:
 | `schemas` | `extensions` (Postgres/Supabase) |
 | `external` | `roles` (Postgres/Supabase) |
 | `import` / `export` | `grants` (Supabase) |
-| `dbml` | `url` (connection / output) |
+| `dbml` / `scopes` | `url` (connection / output) |
 | `ignore` | — |
+
+### Scopes — subset deploys from one design
+
+A **scope** is a named selection of entities, letting one `design.yaml` deploy
+to more than one database (e.g. a full primary DB and a smaller embedded-Postgres
+hub). Scopes are orthogonal to `target` (the DB platform/dialect) and to the
+connection — you pair a scope with a database at run time:
+
+```sh
+dbd deploy --scope hub --database $HUB_URL
+```
+
+- Each scope has `includes:` and/or `excludes:`, each listing **schemas** (all
+  entities in the schema, plus the schema itself) or **specific entities**
+  (`app.users`). Empty `includes` ⇒ start from the full set; `excludes` removes.
+- `deps: report | include` (default `report`):
+  - `report` — a **dependency gap** (an in-scope entity referencing a managed
+    entity outside the scope) is an error. `dbd inspect --scope X` lists the gaps
+    with their dependency chain and exits non-zero; `apply`/`import`/`deploy`
+    refuse (including `--dry-run`).
+  - `include` — `deploy` auto-expands the scope to the transitive dependency
+    closure.
+- A reference to an `external:` entity is never a gap — `external:` is the only
+  "satisfied elsewhere" mechanism (there is no "ignore gaps" mode).
+- Omit `default` (or the whole `scopes:` block) ⇒ the full set is used. Define a
+  `default:` scope only if a bare `dbd deploy` (no `--scope`) should itself
+  deploy a subset.
+- Per-scope migrations fall out automatically: pending-migration steps for
+  out-of-scope entities are skipped while the per-database version still advances.
+
+Phase 1 wires scopes into `inspect`, `apply`, `import`, and `deploy`. Other
+entity-selecting commands (`dbml`, `combine`, `graph`, `export`, `reset`) remain
+full-set for now.
 
 ---
 
@@ -204,6 +245,8 @@ ignore:
 | `--environment` | `-e` | `prod` | Environment (dev or prod) |
 | `--source` | `-s` | `.` | Source directory or GitHub repo |
 | `--target` | `-t` | first in config | Target name from design.yaml |
+| `--scope` | | full set | Scope name from design.yaml (entity subset) |
+| `--deps` | | scope's own | Gap policy override: `report` or `include` |
 
 ### dbd init
 
@@ -218,6 +261,7 @@ dbd init -p myproject --target supabase
 dbd inspect
 dbd inspect -n config.lookups
 dbd inspect --verbose
+dbd inspect --scope hub        # report dependency gaps for a scope (exit 1 under report policy)
 ```
 
 ### dbd apply
@@ -251,6 +295,8 @@ One-shot: fetch source → apply → import → cleanup.
 dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
 dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 dbd deploy --dry-run --source owner/repo/path -d $DATABASE_URL
+dbd deploy --scope hub -d $HUB_URL          # deploy only the hub subset
+dbd deploy --scope hub --deps include -d $HUB_URL   # auto-include dependencies
 ```
 
 ### dbd snapshot
