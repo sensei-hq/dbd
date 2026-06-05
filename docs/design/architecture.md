@@ -553,6 +553,16 @@ dbml:
     include:
       schemas: [config]
 
+# ── Scopes: named entity subsets (universal) ──────────
+# Deploy one design to multiple databases. Orthogonal to `target` (DB
+# platform) and the connection — pair at run time: `--scope hub -d $URL`.
+scopes:
+  hub:
+    includes: [config, app.users]   # schema (all its entities) or specific entity
+    deps: report                    # report (default) | include
+  reporting:
+    excludes: [staging]
+
 # ── Ignore list (reference classification) ────────────
 ignore:
   - bfs
@@ -584,7 +594,8 @@ ignore:
 | `external` — FK stubs for any target | `roles` — Postgres/Supabase only |
 | `import` / `export` — data operations | `grants` — Supabase only |
 | `dbml` — documentation generation | `url` / `path` — connection config |
-| `ignore` — classification overrides | `skip_schemas` — per-target entity filtering |
+| `scopes` — named entity subsets for deploy | `skip_schemas` — per-target entity filtering |
+| `ignore` — classification overrides | — |
 
 #### Key design decisions
 

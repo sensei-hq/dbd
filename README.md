@@ -159,7 +159,7 @@ dbd inspect --scope hub
 
 - Each entry in `includes`/`excludes` is either a schema name (selects the whole schema) or a qualified entity name like `app.users`.
 - `includes` omitted ⇒ start from the full set; `excludes` removes from it.
-- `deps: report` (default) — if a scoped entity references a managed entity that is **not** in the scope, `dbd inspect --scope X` reports the gaps with their dependency chain and exits non-zero; `apply`/`deploy` refuse to proceed.
+- `deps: report` (default) — if a scoped entity references a managed entity that is **not** in the scope, `dbd inspect --scope X` reports the gaps with their dependency chain and exits non-zero; `apply`/`import`/`deploy` refuse to proceed (including `--dry-run`).
 - `deps: include` — `deploy` auto-expands the scope to the transitive dependency closure instead of erroring.
 - `--deps <report|include>` overrides a scope's own `deps` setting for one run.
 - `external:` is the only sanctioned way to declare a dependency that lives outside the managed scope; references to `external:` entries are never counted as gaps.
@@ -169,9 +169,10 @@ dbd inspect --scope hub
 
 ```
 $ dbd inspect --scope hub
-ERROR dependency gap: app.sessions → app.tenants (not in scope hub)
-  app.sessions.tenant_id → app.tenants.id
-1 gap found — add app.tenants to scope or declare it external:
+scope 'hub': 7 entities
+✗ dependency gap: app.sessions requires app.tenants (out of scope)
+    chain: app.sessions → app.tenants
+Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with --deps include
 ```
 
 ## Pre-commit integration

@@ -165,7 +165,7 @@ Each entry in `includes`/`excludes` is a schema name (selects the whole schema p
 | `excludes` | list   | (none)   | Schema names or qualified entities to remove from the set |
 | `deps`     | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
 
-**`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`deploy` refuse to proceed until gaps are resolved.
+**`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`import`/`deploy` refuse to proceed until gaps are resolved — including their `--dry-run` modes, so a dry-run surfaces the same error a real run would.
 
 **`deps: include`** — `deploy` silently expands the working set to the full transitive dependency closure before applying.
 

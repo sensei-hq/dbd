@@ -7,6 +7,7 @@ dbd (Database Designer) is a tool for managing database schemas as code. You wri
 - **Data loading** — CSV/TSV/JSONL files loaded into staging tables with automatic procedure calls
 - **Documentation** — DBML generation for dbdocs.io / dbdiagram.io
 - **Multi-target deployment** — PostgreSQL, Supabase, SQLite, and Convex (TypeScript codegen)
+- **Scoped deployments** — deploy a subset of the schema (a named "scope") to different databases from one design, with dependency-gap checking
 
 ## Core concepts
 
