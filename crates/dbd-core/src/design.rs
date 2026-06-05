@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::DatabaseAdapter;
-use crate::config::{self, DesignConfig};
+use crate::config::{self, DesignConfig, DepsPolicy};
 use crate::dependency;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
@@ -9,6 +9,7 @@ use crate::parser;
 use crate::references;
 use crate::refcache::RefCache;
 use crate::scanner;
+use crate::scope::{self, ResolvedScope};
 use crate::script;
 use crate::snapshot;
 use crate::snapshot::PendingMigration;
@@ -108,6 +109,7 @@ pub fn build_execution_plan(
     db_version: u32,
     latest_version: u32,
     pending_migrations: &[PendingMigration],
+    scope_names: Option<&std::collections::HashSet<String>>,
 ) -> ExecutionPlan {
     // Filter to valid, non-external entities
     let valid_entities: Vec<&Entity> = entities
@@ -142,6 +144,8 @@ pub fn build_execution_plan(
     }
 
     // Migrate: db_version < latest and there are pending migrations
+    let in_scope = |n: &str| scope_names.is_none_or(|s| s.contains(n));
+
     // Collect all added/altered/dropped across all pending migrations
     let all_added: std::collections::HashSet<&str> = pending_migrations
         .iter()
@@ -156,6 +160,10 @@ pub fn build_execution_plan(
 
     // For each entity, determine what to do
     for entity in &valid_entities {
+        if !in_scope(entity.name.as_str()) {
+            continue;
+        }
+
         if all_added.contains(entity.name.as_str()) {
             steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
         }
@@ -199,6 +207,9 @@ pub fn build_execution_plan(
     // Handle dropped entities
     for migration in pending_migrations {
         for table_name in &migration.dropped {
+            if !in_scope(table_name) {
+                continue;
+            }
             let parts: Vec<&str> = table_name.split('.').collect();
             let (schema, tbl) = if parts.len() > 1 {
                 (Some(parts[0]), parts[1])
@@ -237,12 +248,35 @@ pub fn build_execution_plan(
     }
 }
 
+/// Whether an import plan entry runs under a scope's working set.
+/// An entry with write-targets is kept only if ALL targets are in scope;
+/// a proc-less entry is kept if its staging table is in scope.
+///
+/// Public so CLI previews (`import --dry-run`, `deploy`'s non-empty guard) can
+/// filter the plan identically to how `import_data` filters it internally —
+/// one source of truth for the predicate.
+pub fn import_entry_in_scope(
+    entry: &ImportPlanEntry,
+    working_set: &std::collections::HashSet<String>,
+    is_all: bool,
+) -> bool {
+    if is_all {
+        return true;
+    }
+    if !entry.writes.is_empty() {
+        entry.writes.iter().all(|w| working_set.contains(w))
+    } else {
+        working_set.contains(&entry.table.name)
+    }
+}
+
 /// Validation report from inspect.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Report {
     pub entity: Option<Entity>,
     pub issues: Vec<Entity>,
     pub warnings: Vec<Entity>,
+    pub gaps: Vec<scope::ScopeGap>,
 }
 
 /// An entry in the import plan: staging table + matched procedure + write targets.
@@ -507,6 +541,75 @@ impl Design {
         &self.project_dir
     }
 
+    /// External entity names from config (for ref resolution / gap analysis).
+    fn external_names(&self) -> Vec<String> {
+        self.config.external.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// Resolve a scope by name. `None` ⇒ `default` scope if defined, else `all`.
+    /// `deps_override` (CLI `--deps`) wins over the scope's own `deps`.
+    pub fn resolve_scope(
+        &self,
+        name: Option<&str>,
+        deps_override: Option<DepsPolicy>,
+    ) -> Result<ResolvedScope> {
+        scope::resolve(
+            &self.config.scopes,
+            name,
+            deps_override,
+            &self.entities,
+            &self.external_names(),
+        )
+    }
+
+    /// The set of entity names an operation should act on under this scope.
+    /// `include` policy expands to the dependency closure.
+    pub fn working_set(&self, scope: &ResolvedScope) -> Result<std::collections::HashSet<String>> {
+        match scope.deps {
+            DepsPolicy::Include => scope::closure(scope, &self.entities, &self.external_names()),
+            DepsPolicy::Report => Ok(scope.entities.clone()),
+        }
+    }
+
+    /// Whether an entity is kept under a resolved scope's working set.
+    /// Extensions/roles/externals are always-on infrastructure.
+    fn entity_in_scope(
+        entity: &Entity,
+        scope: &ResolvedScope,
+        working_set: &std::collections::HashSet<String>,
+    ) -> bool {
+        scope.is_all
+            || matches!(
+                entity.entity_type,
+                EntityType::Extension | EntityType::Role | EntityType::External
+            )
+            || working_set.contains(&entity.name)
+    }
+
+    /// Under `report` policy, error if the scope has dependency gaps (an in-scope
+    /// entity that references a managed entity outside the scope). No-op for the
+    /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
+    /// `import_data` so both refuse the same way before any write.
+    pub fn check_scope_gaps(&self, scope: &ResolvedScope) -> Result<()> {
+        if scope.is_all || scope.deps != DepsPolicy::Report {
+            return Ok(());
+        }
+        let gaps = scope::analyze_gaps(scope, &self.entities, &self.external_names());
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        let detail: String = gaps
+            .iter()
+            .map(|g| format!("  {} requires {} ({})", g.required_by, g.missing, g.chain.join(" → ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(DbdError::Config(format!(
+            "scope '{}' has {} dependency gap(s) — add them or use --deps include:\n{detail}",
+            scope.name,
+            gaps.len()
+        )))
+    }
+
     /// Scan all migration directories for unresolved `-- TODO:` comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
@@ -631,8 +734,9 @@ impl Design {
         self
     }
 
-    /// Generate a validation report, optionally scoped to one entity.
-    pub fn report(&mut self, name: Option<&str>) -> Report {
+    /// Generate a validation report, optionally filtered to one entity by
+    /// `name` and augmented with dependency gaps when a `scope` is supplied.
+    pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report {
         if !self.validated {
             self.validate();
         }
@@ -657,10 +761,16 @@ impl Design {
             .cloned()
             .collect();
 
+        let gaps = match scope {
+            Some(s) => scope::analyze_gaps(s, &self.entities, &self.external_names()),
+            None => Vec::new(),
+        };
+
         Report {
             entity,
             issues,
             warnings,
+            gaps,
         }
     }
 
@@ -673,11 +783,13 @@ impl Design {
     /// `on_done(desc, err)` is called after — `err` is `None` on success.
     /// `on_complete(summary)` is called once after all steps succeed.
     /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_start: S,
         mut on_done: D,
         mut on_complete: C,
@@ -687,12 +799,27 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
+        // Resolve scope → working set, gap-gate under `report` (abort before any write).
+        // The gate runs even under `dry_run`: a gappy scope is misconfigured
+        // regardless of whether writes would occur.
+        let working_set: Option<std::collections::HashSet<String>> = match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                Some(self.working_set(s)?)
+            }
+            _ => None,
+        };
+
         let valid_entities: Vec<&Entity> = self
             .entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .filter(|e| match (&working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
             .collect();
 
         if dry_run {
@@ -737,7 +864,7 @@ impl Design {
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending);
+        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
 
         // Ensure migrations table exists if we have migration steps
         let has_migrations = plan.steps.iter().any(|s| matches!(
@@ -968,11 +1095,13 @@ impl Design {
     /// can update UI state before propagation).
     /// `on_complete(summary)` is called once after all steps succeed.
     /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn import_data<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         name: Option<&str>,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_start: S,
         mut on_done: D,
         mut on_complete: C,
@@ -983,6 +1112,16 @@ impl Design {
         C: FnMut(ImportComplete),
     {
         let plan = self.import_plan(name);
+        let plan: Vec<ImportPlanEntry> = match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                let ws = self.working_set(s)?;
+                plan.into_iter()
+                    .filter(|e| import_entry_in_scope(e, &ws, false))
+                    .collect()
+            }
+            _ => plan,
+        };
 
         // Counters for on_complete summary
         let mut count_tables: u32 = 0;
@@ -1032,7 +1171,9 @@ impl Design {
             }
         }
 
-        // Step 4: Run after scripts
+        // Step 4: Run after scripts — intentionally NOT scope-filtered; these are
+        // project-global post-import hooks, not tied to individual import entries.
+        // Scoped callers are responsible for ensuring their after-scripts are safe.
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
             let desc = format!("run {after_file}");
@@ -1067,6 +1208,7 @@ impl Design {
         &self,
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut on_complete: C,
     ) -> Result<()>
     where
@@ -1075,12 +1217,12 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+        self.apply(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
             apply_summary = Some(s);
         })
         .await?;
 
-        self.import_data(adapter, None, dry_run, |_| {}, |_, _| {}, |s| {
+        self.import_data(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
             import_summary = Some(s);
         })
         .await?;
@@ -1285,7 +1427,7 @@ mod tests {
     fn validate_reports_errors() {
         let config_path = fixture_dir().join("design.yaml");
         let mut design = Design::from_config(&config_path, "dev").unwrap();
-        let report = design.report(None);
+        let report = design.report(None, None);
 
         // The fixture project should have no major errors
         // (warnings are expected for unresolved references)
@@ -1308,7 +1450,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, true, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -1318,7 +1460,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -1333,7 +1475,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
@@ -1505,7 +1647,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await;
+        let _ = design.import_data(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
@@ -1551,7 +1693,7 @@ mod tests {
             test_entity("config.orders"),
         ];
 
-        let plan = build_execution_plan(&entities, 0, 2, &[]);
+        let plan = build_execution_plan(&entities, 0, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
 
@@ -1576,7 +1718,7 @@ mod tests {
             test_entity("config.orders"),
         ];
 
-        let plan = build_execution_plan(&entities, 2, 2, &[]);
+        let plan = build_execution_plan(&entities, 2, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Current);
 
@@ -1604,7 +1746,7 @@ mod tests {
             test_migration(1, 2, vec![], vec!["config.users"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1634,7 +1776,7 @@ mod tests {
             test_migration(2, 3, vec![], vec!["config.orders"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1661,7 +1803,7 @@ mod tests {
             test_migration(1, 2, vec!["config.audit_log"], vec![], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1684,7 +1826,7 @@ mod tests {
             test_migration(1, 2, vec![], vec![], vec!["config.legacy"]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 2, &migrations);
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1710,7 +1852,7 @@ mod tests {
         let good = test_entity("config.users");
         let entities = vec![broken, good];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         // Only the good entity should appear in the plan
         let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
@@ -1728,7 +1870,7 @@ mod tests {
         let table = test_entity("config.users");
         let entities = vec![external, table];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
             ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
@@ -1743,7 +1885,7 @@ mod tests {
     fn a_db_ahead_of_latest_behaves_as_current() {
         let entities = vec![test_entity("config.users")];
 
-        let plan = build_execution_plan(&entities, 5, 3, &[]);
+        let plan = build_execution_plan(&entities, 5, 3, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Current);
     }
@@ -1753,7 +1895,7 @@ mod tests {
     fn a_fresh_db_no_snapshots() {
         let entities = vec![test_entity("config.users")];
 
-        let plan = build_execution_plan(&entities, 0, 0, &[]);
+        let plan = build_execution_plan(&entities, 0, 0, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should have ApplyEntity + SetVersion(0)
@@ -1774,7 +1916,7 @@ mod tests {
             test_migration(2, 3, vec![], vec!["config.users"], vec![]),
         ];
 
-        let plan = build_execution_plan(&entities, 1, 3, &migrations);
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
@@ -1799,7 +1941,7 @@ mod tests {
     fn a_empty_entities_empty_plan() {
         let entities: Vec<Entity> = vec![];
 
-        let plan = build_execution_plan(&entities, 0, 1, &[]);
+        let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should only have SetVersion step (no entities to apply)
@@ -1809,6 +1951,36 @@ mod tests {
     }
 
     // ── skip_schemas filtering ───────────────────────────
+
+    // ── scope_names filtering ─────────────────────────────
+
+    #[test]
+    fn execution_plan_skips_out_of_scope_migration_steps() {
+        use std::collections::HashSet;
+        let entities = vec![test_entity("a"), test_entity("b")];
+        // migration drops "c" (not in scope) and alters "b" (in scope)
+        let migrations = vec![test_migration(1, 2, vec![], vec!["b"], vec!["c"])];
+        let in_scope: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, Some(&in_scope));
+
+        // No DropEntity for "c"
+        assert!(!plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::DropEntity { entity_name, .. } if entity_name == "c"
+        )));
+        // In-scope altered "b" still gets its migrate + apply steps
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::MigrateEntity { entity_name, .. } if entity_name == "b"
+        )));
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::ApplyEntity(name) if name == "b"
+        )));
+        // Migration is recorded and SetVersion still advances
+        assert!(plan.steps.iter().any(|s| matches!(
+            s, ExecutionStep::RecordMigration { version: 2, .. }
+        )));
+        assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
+    }
 
     // ── data.sql TODO blocking ────────────────────────────
 
@@ -1850,7 +2022,7 @@ mod tests {
         // DB is at v1 → migration v2 is pending
         let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
         let result = design
-            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
             .await;
 
         assert!(result.is_err(), "apply should be blocked by unresolved TODO");
@@ -1894,10 +2066,69 @@ mod tests {
         // Fresh DB — v1 migration is pending but data.sql has no TODOs
         let mock = crate::adapter::mock::MockAdapter::new();
         let result = design
-            .apply(&mock, None, false, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
             .await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn apply_with_report_gaps_errors_before_writing() {
+        use crate::scope::ResolvedScope;
+        use std::collections::HashSet;
+        use crate::config::DepsPolicy;
+
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        // report-policy scope with config.lookup_values but not its FK target → one gap.
+        let scope = ResolvedScope {
+            name: "test".into(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+
+        let result = design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await;
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("dependency gap"), "expected gap error, got: {msg}");
+        assert!(mock.applied_names().is_empty()); // no writes
+    }
+
+    #[tokio::test]
+    async fn apply_with_scope_filters_entities() {
+        use crate::scope::ResolvedScope;
+        use std::collections::HashSet;
+        use crate::config::DepsPolicy;
+
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        // Complete config-only scope (config.lookup_values's FK target IS present).
+        let scope = ResolvedScope {
+            name: "config_only".into(),
+            entities: HashSet::from([
+                "config".to_string(),
+                "config.lookups".to_string(),
+                "config.lookup_values".to_string(),
+            ]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+
+        design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+        let applied = mock.applied_names();
+        assert!(applied.iter().any(|n| n == "config.lookups"));
+        assert!(!applied.iter().any(|n| n.starts_with("staging.")));
     }
 
     #[test]
@@ -1915,12 +2146,23 @@ mod tests {
     // ── deploy() tests ────────────────────────────────────
 
     #[tokio::test]
+    async fn deploy_with_all_scope_applies_everything() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+
+        design.deploy(&mock, false, Some(&scope), |_| {}).await.unwrap();
+        assert!(!mock.applied_names().is_empty());
+    }
+
+    #[tokio::test]
     async fn deploy_dry_run_returns_ok_and_applies_nothing() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "prod").unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, true, |_| {}).await.unwrap();
+        design.deploy(&mock, true, None, |_| {}).await.unwrap();
 
         assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
         assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
@@ -2025,7 +2267,7 @@ mod tests {
         .unwrap();
 
         let mock = MockAdapter::new();
-        design.deploy(&mock, false, |_| {}).await.unwrap();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
     }
 
     // ── resolve_unknown_refs_via_db ──────────────────────
@@ -2141,5 +2383,118 @@ mod tests {
         assert_eq!(size, None);
         // Warning remains untouched.
         assert_eq!(design.entities.last().unwrap().warnings.len(), 1);
+    }
+
+    #[test]
+    fn resolve_scope_all_when_none() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(None, None).unwrap();
+        assert!(scope.is_all);
+    }
+
+    #[test]
+    fn working_set_all_scope_is_full_set() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+        // Spans both schemas' DDL entities (config tables + a staging procedure).
+        assert!(ws.contains("config.lookups"));
+        assert!(ws.contains("staging.import_lookups"));
+    }
+
+    #[test]
+    fn working_set_report_filters_to_scope() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // A narrow report-policy scope returns exactly its own entities.
+        let scope = ResolvedScope {
+            name: "narrow".to_string(),
+            entities: HashSet::from(["config.lookups".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+        let ws = design.working_set(&scope).unwrap();
+        assert!(ws.contains("config.lookups"));
+        assert!(!ws.contains("config.lookup_values")); // genuinely filtered out
+        assert!(!ws.contains("staging.lookups"));
+    }
+
+    #[test]
+    fn working_set_include_expands_closure() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // config.lookup_values has an FK to config.lookups; include policy pulls it in.
+        let scope = ResolvedScope {
+            name: "auto".to_string(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Include,
+            is_all: false,
+        };
+        let ws = design.working_set(&scope).unwrap();
+        assert!(ws.contains("config.lookup_values"));
+        assert!(ws.contains("config.lookups")); // pulled in by closure
+    }
+
+    #[test]
+    fn report_surfaces_scope_gaps() {
+        let config_path = fixture_dir().join("design.yaml");
+        let mut design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("all"), None).unwrap();
+        let report = design.report(None, Some(&scope));
+        assert!(report.gaps.is_empty()); // all-scope ⇒ no gaps
+    }
+
+    #[test]
+    fn report_surfaces_real_gaps() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let mut design = Design::from_config(&config_path, "dev").unwrap();
+        // Narrow scope with config.lookup_values but not its FK target config.lookups.
+        let scope = ResolvedScope {
+            name: "narrow".to_string(),
+            entities: HashSet::from(["config.lookup_values".to_string(), "config".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+        let report = design.report(None, Some(&scope));
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].missing, "config.lookups");
+        assert_eq!(report.gaps[0].required_by, "config.lookup_values");
+    }
+
+    #[test]
+    fn import_entry_in_scope_predicate() {
+        use std::collections::HashSet;
+        let mut entry = ImportPlanEntry {
+            table: Entity::new(EntityType::Import, "staging.lookups"),
+            procedure: Some("staging.import_lookups".to_string()),
+            writes: vec!["config.lookups".to_string()],
+        };
+        let ws: HashSet<String> = ["config.lookups".to_string()].into_iter().collect();
+        assert!(import_entry_in_scope(&entry, &ws, false));
+
+        // write-target out of scope → excluded
+        entry.writes = vec!["config.other".to_string()];
+        assert!(!import_entry_in_scope(&entry, &ws, false));
+
+        // is_all bypasses
+        assert!(import_entry_in_scope(&entry, &ws, true));
+
+        // proc-less entry (no writes): kept iff its staging table is in scope
+        let procless = ImportPlanEntry {
+            table: Entity::new(EntityType::Import, "staging.lookups"),
+            procedure: None,
+            writes: vec![],
+        };
+        let ws_table: HashSet<String> = ["staging.lookups".to_string()].into_iter().collect();
+        assert!(import_entry_in_scope(&procless, &ws_table, false));
+        assert!(!import_entry_in_scope(&procless, &HashSet::new(), false));
     }
 }

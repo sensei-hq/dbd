@@ -135,6 +135,45 @@ dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 dbd deploy --source ./local/path -d $DATABASE_URL
 ```
 
+## Scopes
+
+One `design.yaml` can deploy different subsets of entities to different databases — for example, a full primary database and a smaller embedded-postgres "hub" that only needs a subset of schemas.
+
+```yaml
+scopes:
+  hub:
+    includes: [config, app.users, app.sessions]   # whole schema or specific entity
+    deps: report                                    # report (default) | include
+  reporting:
+    excludes: [staging, app.audit_log]
+```
+
+Pass a scope at deploy time via `--scope`:
+
+```sh
+dbd deploy --scope hub --database $HUB_URL
+dbd inspect --scope hub
+```
+
+**Rules:**
+
+- Each entry in `includes`/`excludes` is either a schema name (selects the whole schema) or a qualified entity name like `app.users`.
+- `includes` omitted ⇒ start from the full set; `excludes` removes from it.
+- `deps: report` (default) — if a scoped entity references a managed entity that is **not** in the scope, `dbd inspect --scope X` reports the gaps with their dependency chain and exits non-zero; `apply`/`deploy` refuse to proceed.
+- `deps: include` — `deploy` auto-expands the scope to the transitive dependency closure instead of erroring.
+- `--deps <report|include>` overrides a scope's own `deps` setting for one run.
+- `external:` is the only sanctioned way to declare a dependency that lives outside the managed scope; references to `external:` entries are never counted as gaps.
+- Omit `default` (or omit `scopes:` entirely) to deploy the full set. Define `default:` only if a bare `dbd deploy` should itself deploy a subset.
+
+**Gap report example** (`deps: report`):
+
+```
+$ dbd inspect --scope hub
+ERROR dependency gap: app.sessions → app.tenants (not in scope hub)
+  app.sessions.tenant_id → app.tenants.id
+1 gap found — add app.tenants to scope or declare it external:
+```
+
 ## Pre-commit integration
 
 `dbd format --check` exits non-zero when any DDL file would be reformatted, so it drops into [pre-commit](https://pre-commit.com) directly. Add this to your `.pre-commit-config.yaml`:

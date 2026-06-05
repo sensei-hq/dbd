@@ -137,7 +137,7 @@ async fn fresh_deploy_creates_schema() {
 
     let mut summary: Option<DeployComplete> = None;
     design
-        .deploy(&*adapter, false, |s| summary = Some(s))
+        .deploy(&*adapter, false, None, |s| summary = Some(s))
         .await
         .expect("deploy failed");
 
@@ -164,13 +164,13 @@ async fn redeploy_is_idempotent_and_current() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, false, |_| {})
+        .deploy(&*adapter, false, None, |_| {})
         .await
         .expect("first deploy failed");
 
     let mut summary: Option<DeployComplete> = None;
     design
-        .deploy(&*adapter, false, |s| summary = Some(s))
+        .deploy(&*adapter, false, None, |s| summary = Some(s))
         .await
         .expect("second deploy failed");
 
@@ -195,7 +195,7 @@ async fn deployed_tables_accept_data() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, false, |_| {})
+        .deploy(&*adapter, false, None, |_| {})
         .await
         .expect("deploy failed");
 
@@ -233,7 +233,7 @@ async fn dry_run_does_not_create_tables() {
     let design = load_design();
 
     design
-        .deploy(&*adapter, true, |_| {})
+        .deploy(&*adapter, true, None, |_| {})
         .await
         .expect("dry-run failed");
 
@@ -290,7 +290,7 @@ async fn migration_upgrades_schema() {
 
     let mut v1_summary = None;
     v1_design
-        .apply(&*adapter, None, false, |_| {}, |_, _| {}, |s| v1_summary = Some(s))
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v1_summary = Some(s))
         .await
         .expect("v1 apply failed");
 
@@ -304,7 +304,7 @@ async fn migration_upgrades_schema() {
     let v2_design = load_design();
     let mut v2_summary = None;
     v2_design
-        .apply(&*adapter, None, false, |_| {}, |_, _| {}, |s| v2_summary = Some(s))
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v2_summary = Some(s))
         .await
         .expect("v2 apply failed");
 

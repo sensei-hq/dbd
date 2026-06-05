@@ -290,7 +290,7 @@ fn procedure_reads_writes_extracted() {
 #[test]
 fn validate_reports_no_errors_on_fixture() {
     let mut d = design();
-    let report = d.report(None);
+    let report = d.report(None, None);
     // Fixture project should be clean (or have only unresolved external refs)
     for entity in &report.issues {
         // Only allow "File not found" for entities with relative paths
@@ -307,7 +307,7 @@ fn validate_reports_no_errors_on_fixture() {
 #[test]
 fn validate_scoped_to_entity() {
     let mut d = design();
-    let report = d.report(Some("config.lookups"));
+    let report = d.report(Some("config.lookups"), None);
     // Should only include the requested entity
     if let Some(entity) = &report.entity {
         assert_eq!(entity.name, "config.lookups");
@@ -509,7 +509,7 @@ async fn reset_force_overrides_guard() {
 async fn apply_dry_run_does_not_execute() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, None, true, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+    d.apply(&mock, None, true, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     assert!(mock.applied_names().is_empty());
 }
 
@@ -517,7 +517,7 @@ async fn apply_dry_run_does_not_execute() {
 async fn apply_executes_all_entities() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, None, false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+    d.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     assert!(!mock.applied_names().is_empty());
 }
 
@@ -525,8 +525,81 @@ async fn apply_executes_all_entities() {
 async fn apply_single_entity_by_name() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, Some("config.lookups"), false, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+    d.apply(&mock, Some("config.lookups"), false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
     let applied = mock.applied_names();
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0], "config.lookups");
+}
+
+// ── Scenario: Scope resolution ──────────────────────────
+
+#[test]
+fn scope_complete_has_no_gaps() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+    let report = design.report(None, Some(&scope));
+    assert!(report.gaps.is_empty());
+    assert!(scope.entities.contains("config.lookups"));
+    assert!(scope.entities.contains("config.lookup_values"));
+}
+
+#[test]
+fn scope_incomplete_reports_gap() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("incomplete"), None).unwrap();
+    let report = design.report(None, Some(&scope));
+    assert_eq!(report.gaps.len(), 1);
+    assert_eq!(report.gaps[0].missing, "config.lookups");
+    assert_eq!(report.gaps[0].required_by, "config.lookup_values");
+}
+
+#[test]
+fn scope_include_policy_closes_gap() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("incomplete_auto"), None).unwrap();
+    let ws = design.working_set(&scope).unwrap();
+    assert!(ws.contains("config.lookups")); // pulled in by include policy
+}
+
+#[test]
+fn no_scope_is_full_set() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(None, None).unwrap();
+    assert!(scope.is_all);
+    // resolved set spans config + staging entities (full project)
+    assert!(scope.entities.iter().any(|n| n.starts_with("staging.")));
+    assert!(scope.entities.iter().any(|n| n.starts_with("config.")));
+}
+
+// The CLI dry-run paths (apply/import/deploy --dry-run --scope) call
+// check_scope_gaps so they surface the same error a real run would. Lock in
+// that gate's behavior on the fixture scopes.
+#[test]
+fn check_scope_gaps_gates_report_but_not_include() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+
+    // report policy with a gap → Err
+    let incomplete = design.resolve_scope(Some("incomplete"), None).unwrap();
+    let err = design.check_scope_gaps(&incomplete).unwrap_err();
+    assert!(err.to_string().contains("dependency gap"));
+
+    // include policy → no error (closure auto-resolves)
+    let auto = design.resolve_scope(Some("incomplete_auto"), None).unwrap();
+    assert!(design.check_scope_gaps(&auto).is_ok());
+
+    // complete scope and all-scope → no error
+    let complete = design.resolve_scope(Some("config_only"), None).unwrap();
+    assert!(design.check_scope_gaps(&complete).is_ok());
+    let all = design.resolve_scope(None, None).unwrap();
+    assert!(design.check_scope_gaps(&all).is_ok());
 }

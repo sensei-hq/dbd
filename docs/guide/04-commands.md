@@ -11,6 +11,8 @@ All commands accept these options:
 | `--environment` | `-e` | `prod` | Environment (dev or prod) |
 | `--source` | `-s` | `.` | Project directory or GitHub repo |
 | `--target` | `-t` | first in config | Target name from design.yaml |
+| `--scope` | | (all) | Named scope from `scopes:` in design.yaml |
+| `--deps` | | (scope default) | Override scope's `deps` setting: `report` or `include` |
 | `--verbose` | `-v` | | Show all details (entity list, full JSON) |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
@@ -39,10 +41,11 @@ dbd inspect -s sensei-hq/daemon/database  # GitHub repo
 Validate project configuration and report errors/warnings.
 
 ```sh
-dbd inspect                    # Validate all entities
-dbd inspect -n config.lookups  # Inspect one entity
-dbd inspect -v                 # Verbose: show entity JSON
-dbd inspect --silent           # Just the count
+dbd inspect                       # Validate all entities
+dbd inspect -n config.lookups     # Inspect one entity
+dbd inspect -v                    # Verbose: show entity JSON
+dbd inspect --silent              # Just the count
+dbd inspect --scope hub           # Validate scope + report dependency gaps
 ```
 
 ---
@@ -177,6 +180,8 @@ Deploy from a local path or GitHub source. Runs apply + import in one step.
 dbd deploy --source owner/repo/path -d $DATABASE_URL    # From GitHub
 dbd deploy --source ./local/project                       # From local path
 dbd deploy --dry-run --source owner/repo/path             # Preview
+dbd deploy --scope hub --database $HUB_URL               # Deploy a named scope
+dbd deploy --scope hub --deps include -d $HUB_URL        # Auto-expand dependencies
 ```
 
 GitHub sources are cached in ~/.cache/dbd/.

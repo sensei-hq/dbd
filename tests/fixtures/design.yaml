@@ -59,3 +59,15 @@ dbml:
 ignore:
   - bfs
   - my_company.*
+
+scopes:
+  config_only:
+    includes:
+      - config
+  incomplete:
+    includes:
+      - config.lookup_values   # needs config.lookups → dependency gap
+  incomplete_auto:
+    includes:
+      - config.lookup_values
+    deps: include

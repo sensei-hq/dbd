@@ -11,6 +11,7 @@ use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete};
 use crate::cli::Commands;
 use crate::output::{self, Verbosity};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     command: &Commands,
     config: &Path,
@@ -18,11 +19,13 @@ pub async fn run(
     database_url: Option<&str>,
     project_dir: &Path,
     source: &str,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     match command {
         Commands::Inspect { name, fix, database } => {
-            schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *database, verbosity).await
+            schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *database, scope, deps, verbosity).await
         }
 
         Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, verbosity),
@@ -30,14 +33,14 @@ pub async fn run(
         Commands::Graph { name } => project::cmd_graph(config, env, project_dir, name.as_deref(), verbosity),
 
         Commands::Apply { name, dry_run, with_policies } => {
-            schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, verbosity).await
+            schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, scope, deps, verbosity).await
         }
 
         Commands::Import { name, dry_run } => {
             if *dry_run {
-                data::cmd_import_dry_run(config, env, project_dir, name.as_deref(), verbosity)
+                data::cmd_import_dry_run(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
             } else {
-                data::cmd_import(config, env, project_dir, database_url, name.as_deref(), verbosity).await
+                data::cmd_import(config, env, project_dir, database_url, name.as_deref(), scope, deps, verbosity).await
             }
         }
 
@@ -63,7 +66,7 @@ pub async fn run(
         }
 
         Commands::Deploy { dry_run } => {
-            project::cmd_deploy(source, config, env, database_url, *dry_run, verbosity).await
+            project::cmd_deploy(source, config, env, database_url, *dry_run, scope, deps, verbosity).await
         }
 
         Commands::Export { name, format } => {
