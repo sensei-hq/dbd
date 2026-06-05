@@ -1,20 +1,14 @@
 <!doctype html>
-<html lang="en" data-mode="light">
+<html lang="en" data-mode="light" data-style="zen-sumi">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
-		<script>
-			// Apply the stored colour theme before paint to avoid a flash.
-			try {
-				const m = localStorage.getItem('dbd-theme');
-				if (m === 'dark' || m === 'light') document.documentElement.setAttribute('data-mode', m);
-			} catch (e) {}
-		</script>
 		%sveltekit.head%
 	</head>
 	<body
 		data-sveltekit-preload-data="hover"
+		data-mode="light"
 		data-style="zen-sumi"
 		class="bg-surface-z0 text-surface-z9 font-sans antialiased"
 	>

@@ -1,21 +1,10 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { vibe } from '@rokkit/states';
 
-	let mode = $state<'light' | 'dark'>('light');
-
-	onMount(() => {
-		const current = document.documentElement.getAttribute('data-mode');
-		mode = current === 'dark' ? 'dark' : 'light';
-	});
-
+	// vibe.mode is reactive ($state); flipping it drives the $effect in
+	// +layout.svelte that updates [data-mode] and persists to storage.
 	function toggle() {
-		mode = mode === 'dark' ? 'light' : 'dark';
-		document.documentElement.setAttribute('data-mode', mode);
-		try {
-			localStorage.setItem('dbd-theme', mode);
-		} catch {
-			// ignore unavailable storage
-		}
+		vibe.mode = vibe.mode === 'dark' ? 'light' : 'dark';
 	}
 </script>
 
@@ -26,7 +15,7 @@
 	title="Toggle colour theme"
 	class="grid h-9 w-9 place-items-center rounded-lg border border-surface-z3 text-surface-z7 transition-colors hover:border-primary-z4 hover:text-surface-z9"
 >
-	{#if mode === 'dark'}
+	{#if vibe.mode === 'dark'}
 		<svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.8">
 			<circle cx="12" cy="12" r="4" />
 			<path
