@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+body{margin:0;font-family:ui-sans-serif,system-ui;display:flex;flex-wrap:wrap;gap:0}
+.panel{flex:1;min-width:300px;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:32px}
+.dark{background:#10151F}.light{background:#f4f4f2}
+.row{display:flex;align-items:center;gap:24px}
+img{display:block}
+.lbl{font-family:ui-monospace,monospace;font-size:12px;opacity:.5}
+.dark .lbl{color:#fff}.light .lbl{color:#111}
+</style></head>
+<body>
+  <div class="panel dark">
+    <img src="dbd-icon.svg" width="280" height="280"/>
+    <div class="row">
+      <img src="dbd-icon.svg" width="96" height="96"/>
+      <img src="dbd-icon.svg" width="48" height="48"/>
+      <img src="dbd-icon.svg" width="28" height="28"/>
+    </div>
+    <span class="lbl">on dark</span>
+  </div>
+  <div class="panel light">
+    <img src="dbd-icon.svg" width="280" height="280"/>
+    <div class="row">
+      <img src="dbd-icon.svg" width="96" height="96"/>
+      <img src="dbd-icon.svg" width="48" height="48"/>
+    </div>
+    <span class="lbl">on light</span>
+  </div>
+</body></html>
