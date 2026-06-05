@@ -11,13 +11,13 @@ export const brand = {
 
 export const nav = {
 	links: [
-		{ label: 'Overview', href: '#overview' },
-		{ label: 'Concepts', href: '#concepts' },
-		{ label: 'Targets', href: '#targets' },
-		{ label: "Who it's for", href: '#audience' },
+		{ label: 'Overview', href: '/#overview' },
+		{ label: 'Concepts', href: '/#concepts' },
+		{ label: 'Targets', href: '/#targets' },
+		{ label: "Who it's for", href: '/#audience' },
 		{ label: 'Guide', href: '/guide' }
 	],
-	cta: { label: 'Get started', href: '#start' }
+	cta: { label: 'Get started', href: '/#start' }
 };
 
 export type TerminalLine = { type: 'cmd' | 'out' | 'ok'; text: string };
@@ -203,9 +203,9 @@ export const footer = {
 		{
 			title: 'Product',
 			links: [
-				{ label: 'Overview', href: '#overview' },
-				{ label: 'Concepts', href: '#concepts' },
-				{ label: 'Targets', href: '#targets' }
+				{ label: 'Overview', href: '/#overview' },
+				{ label: 'Concepts', href: '/#concepts' },
+				{ label: 'Targets', href: '/#targets' }
 			]
 		},
 		{

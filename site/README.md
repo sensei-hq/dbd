@@ -1,42 +1,51 @@
-# sv
+# dbd website
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Marketing + docs site for **dbd**, built from the design handoff in
+[`../docs/mockup`](../docs/mockup).
 
-## Creating a project
+## Stack
 
-If you're seeing this, you've probably already done this step. Congrats!
+- **SvelteKit** (Svelte 5 runes) + **Vite**, fully prerendered (`adapter-auto`
+  detects Vercel at build time — no explicit adapter config needed).
+- **UnoCSS** via **Rokkit** (`@rokkit/unocss` `presetRokkit`) for the semantic
+  token system. Roles/palettes are configured in [`rokkit.config.js`](./rokkit.config.js);
+  components use the z-scale utilities (`bg-surface-z0`, `text-primary-z5`,
+  `text-on-primary`, …) which flip automatically under `[data-mode="dark"]`.
+  Component styling (the `Button`) uses the `@rokkit/themes` `zen-sumi` skin.
+- Fonts via **Fontsource** (Space Grotesk / IBM Plex Sans / IBM Plex Mono).
+- Package manager: **bun**.
 
-```sh
-# create a new project
-npx sv create my-app
-```
+## Content is synced from `/docs` — single source of truth
 
-To recreate this project with the same configuration:
+`scripts/copy-content.mjs` runs on `predev` and `prebuild`:
 
-```sh
-# recreate this project
-bun x sv@0.15.4 create --template minimal --types ts --install bun site
-```
+- `docs/llms/llms.txt` → `static/llms.txt` (served at `/llms.txt`)
+- `docs/llms/llms-full.txt` → `static/llms-full.txt` (`/llms-full.txt`)
+- `docs/guide/*.md` → `src/lib/content/guide/` → rendered at `/guide/<slug>`
+  (markdown via `marked`)
 
-## Developing
+Synced outputs are gitignored; edit the originals under `/docs`.
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
+## Commands
 
 ```sh
-npm run build
+bun install
+bun run dev          # local dev (syncs content first)
+bun run build        # production build (prerenders every route)
+bun run preview      # preview the production build
+bun run sync:content # re-sync docs → site manually
 ```
 
-You can preview the production build with `npm run preview`.
+## Routes
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+- `/` — landing page (hero, overview, concepts, targets, audience, get-started)
+- `/guide` and `/guide/<slug>` — the user guide (from `docs/guide`)
+- `/llms.txt`, `/llms-full.txt` — LLM reference (from `docs/llms`)
+
+## Note on `bun run check`
+
+`svelte-check` reports type errors inside `node_modules/@rokkit/ui` — that
+package ships source `.ts` that imports the source-only `@rokkit/states`
+(no bundled declarations), which is an upstream packaging gap, not a defect in
+this app's code. `bun run build` is the source of truth for correctness and is
+green.
