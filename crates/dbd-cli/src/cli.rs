@@ -1,6 +1,21 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum DepsArg {
+    Report,
+    Include,
+}
+
+impl From<DepsArg> for dbd_core::config::DepsPolicy {
+    fn from(a: DepsArg) -> Self {
+        match a {
+            DepsArg::Report => dbd_core::config::DepsPolicy::Report,
+            DepsArg::Include => dbd_core::config::DepsPolicy::Include,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "dbd", version, about = "Database schema management as code")]
 pub struct Cli {
@@ -30,6 +45,14 @@ pub struct Cli {
     /// Verbose output (show all details)
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Scope name from design.yaml (default: full set)
+    #[arg(long, global = true)]
+    pub scope: Option<String>,
+
+    /// Dependency policy override: report | include
+    #[arg(long, global = true, value_enum)]
+    pub deps: Option<DepsArg>,
 }
 
 #[derive(Subcommand)]

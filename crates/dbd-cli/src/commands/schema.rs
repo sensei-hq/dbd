@@ -17,6 +17,8 @@ pub async fn cmd_inspect(
     name: Option<&str>,
     fix: bool,
     use_database: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
@@ -53,7 +55,35 @@ pub async fn cmd_inspect(
         }
     }
 
-    let report = design.report(name);
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let report = design.report(name, Some(&resolved));
+
+    if !resolved.is_all {
+        output::info(verbosity, &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()));
+        for gap in &report.gaps {
+            output::always(&format!(
+                "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
+                gap.required_by,
+                gap.missing,
+                gap.chain.join(" → ")
+            ));
+        }
+        if !report.gaps.is_empty() {
+            match resolved.deps {
+                dbd_core::config::DepsPolicy::Report => {
+                    anyhow::bail!(
+                        "{} dependency gap(s) in scope '{}' — add them to the scope, or run with --deps include",
+                        report.gaps.len(),
+                        resolved.name
+                    );
+                }
+                dbd_core::config::DepsPolicy::Include => {
+                    output::info(verbosity, &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()));
+                }
+            }
+        }
+    }
+
     let total_entities = design.entities().len();
 
     if verbosity.is_verbose() {
@@ -153,17 +183,27 @@ pub async fn cmd_apply(
     name: Option<&str>,
     dry_run: bool,
     with_policies: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
+        // Surface the same gap/closure errors a real apply would (dry-run must
+        // not hide a misconfigured scope).
+        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        let ws = design.working_set(&resolved)?;
         let entities: Vec<_> = design
             .entities()
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != dbd_core::EntityType::External)
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .filter(|e| resolved.is_all
+                || ws.contains(&e.name)
+                || matches!(e.entity_type, dbd_core::EntityType::Extension | dbd_core::EntityType::Role))
             .collect();
 
         for entity in &entities {
@@ -186,6 +226,7 @@ pub async fn cmd_apply(
             &*adapter,
             name,
             false,
+            Some(&resolved),
             |desc| spinner.start(desc),
             |desc, err| spinner.done(desc, err),
             |s| apply_summary = Some(s),

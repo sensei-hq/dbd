@@ -169,12 +169,15 @@ pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosi
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_deploy(
     source: &str,
     _config_name: &Path,
     env: &str,
     database_url: Option<&str>,
     dry_run: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     output::info(verbosity, &format!("Deploying from source: {source}"));
@@ -190,9 +193,22 @@ pub async fn cmd_deploy(
 
     let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
         .context("Failed to load design from source")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        let report = design.report(None);
+        // Surface the same gap/closure errors a real deploy would.
+        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        let report = design.report(None, Some(&resolved));
+        if !resolved.is_all {
+            for gap in &report.gaps {
+                output::always(&format!(
+                    "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
+                    gap.required_by,
+                    gap.missing,
+                    gap.chain.join(" → ")
+                ));
+            }
+        }
         output::info(verbosity, &format!(
             "{} entities found, {} errors, {} warnings",
             design.entities().len(),
@@ -213,6 +229,7 @@ pub async fn cmd_deploy(
                 &*adapter,
                 None,
                 false,
+                Some(&resolved),
                 |desc| spinner.start(desc),
                 |desc, err| spinner.done(desc, err),
                 |s| apply_summary = Some(s),
@@ -223,7 +240,12 @@ pub async fn cmd_deploy(
     }
 
     let mut import_summary: Option<ImportComplete> = None;
-    let import_plan = design.import_plan(None);
+    let ws = design.working_set(&resolved)?;
+    let import_plan: Vec<_> = design
+        .import_plan(None)
+        .into_iter()
+        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
+        .collect();
     if !import_plan.is_empty() {
         output::info(verbosity, &format!("Importing {} data file(s)...", import_plan.len()));
         let spinner = output::StepSpinner::new(verbosity);
@@ -232,6 +254,7 @@ pub async fn cmd_deploy(
                 &*adapter,
                 None,
                 false,
+                Some(&resolved),
                 |desc| spinner.start(desc),
                 |desc, err| spinner.done(desc, err),
                 |s| import_summary = Some(s),
