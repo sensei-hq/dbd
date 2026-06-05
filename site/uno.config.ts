@@ -12,7 +12,9 @@ import {
 const ROLES = ['surface', 'primary', 'secondary', 'success', 'info'];
 
 export default defineConfig({
-	presets: [presetWind4()],
+	// Rokkit's z-scale shortcuts emit `dark:` variants; map `dark:` to the same
+	// `[data-mode="dark"]` selector the Rokkit CSS theme flips on.
+	presets: [presetWind4({ dark: { dark: '[data-mode="dark"]', light: '[data-mode="light"]' } })],
 	theme: {
 		colors: themeColors(),
 		fontFamily: {
