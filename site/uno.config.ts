@@ -1,31 +1,18 @@
 import { defineConfig } from 'unocss';
-import presetWind4 from '@unocss/preset-wind4';
-import {
-	themeColors,
-	semanticShortcuts,
-	contrastShortcuts
-} from '@rokkit/themes';
+import { presetRokkit } from '@rokkit/unocss';
+import rokkitConfig from './rokkit.config.js';
 
-// Semantic roles the site uses. Rokkit generates z-scale utilities
-// (bg-surface-z0, text-surface-z9, text-primary-z5, text-on-primary, …)
-// for each, with automatic light/dark flipping via [data-mode].
-const ROLES = ['surface', 'primary', 'secondary', 'success', 'info'];
-
+// presetRokkit bundles presetWind3 + presetIcons + presetTypography + the
+// Svelte extractor, generates the z-scale semantic utilities from
+// rokkit.config.js, and wires dark mode to [data-mode="dark"].
 export default defineConfig({
-	// Rokkit's z-scale shortcuts emit `dark:` variants; map `dark:` to the same
-	// `[data-mode="dark"]` selector the Rokkit CSS theme flips on.
-	presets: [presetWind4({ dark: { dark: '[data-mode="dark"]', light: '[data-mode="light"]' } })],
+	presets: [presetRokkit(rokkitConfig)],
 	theme: {
-		colors: themeColors(),
 		fontFamily: {
 			display: ['"Space Grotesk"', 'system-ui', 'sans-serif'],
 			sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
 			mono: ['"IBM Plex Mono"', 'ui-monospace', 'monospace']
 		},
 		maxWidth: { content: '76rem' }
-	},
-	shortcuts: [
-		...ROLES.flatMap((r) => semanticShortcuts(r)),
-		...ROLES.flatMap((r) => contrastShortcuts(r))
-	]
+	}
 });

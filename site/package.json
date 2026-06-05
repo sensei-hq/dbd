@@ -4,7 +4,10 @@
 	"version": "0.0.1",
 	"type": "module",
 	"scripts": {
+		"sync:content": "node scripts/copy-content.mjs",
+		"predev": "node scripts/copy-content.mjs",
 		"dev": "vite dev",
+		"prebuild": "node scripts/copy-content.mjs",
 		"build": "vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
@@ -15,8 +18,7 @@
 		"@sveltejs/adapter-auto": "^7.0.1",
 		"@sveltejs/kit": "^2.57.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
-		"@unocss/preset-wind4": "^66.7.0",
-		"mdsvex": "^0.12.7",
+		"@types/node": "^25.9.1",
 		"svelte": "^5.55.2",
 		"svelte-check": "^4.4.6",
 		"typescript": "^6.0.2",
@@ -28,7 +30,10 @@
 		"@fontsource/ibm-plex-sans": "^5.2.8",
 		"@fontsource/space-grotesk": "^5.2.10",
 		"@rokkit/core": "^1.1.4",
+		"@rokkit/icons": "^1.1.4",
 		"@rokkit/themes": "^1.1.4",
-		"@rokkit/ui": "^1.1.4"
+		"@rokkit/ui": "^1.1.4",
+		"@rokkit/unocss": "^1.1.4",
+		"marked": "^18.0.5"
 	}
 }
