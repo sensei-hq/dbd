@@ -1,0 +1,129 @@
+/* Rokkit token system: structural base + zen-sumi skin (ink on paper). */
+@import '@rokkit/themes/base.css';
+@import '@rokkit/themes/zen-sumi.css';
+
+:root {
+	scroll-behavior: smooth;
+	--section-y: 7rem;
+	--content: 76rem;
+}
+
+body {
+	font-family: '"IBM Plex Sans"', 'IBM Plex Sans', system-ui, sans-serif;
+	-webkit-font-smoothing: antialiased;
+	background: rgb(var(--color-surface-z0) / 1);
+	color: rgb(var(--color-surface-z9) / 1);
+}
+
+/* Anchor offset for the sticky header */
+section[id],
+[id='top'] {
+	scroll-margin-top: 84px;
+}
+
+::selection {
+	background: rgb(var(--color-primary-z2) / 1);
+}
+
+/* ---- Type scale (mockup's modular ~1.25 scale) ---- */
+.text-display {
+	font-size: clamp(2.6rem, 6vw, 4.6rem);
+	line-height: 0.98;
+	letter-spacing: -0.035em;
+}
+.text-h2 {
+	font-size: clamp(1.9rem, 3.2vw, 2.7rem);
+	line-height: 1.08;
+	letter-spacing: -0.022em;
+}
+.text-h3 {
+	font-size: 1.55rem;
+	line-height: 1.25;
+	letter-spacing: -0.015em;
+}
+.text-step {
+	font-size: 1.4rem;
+	line-height: 1.4;
+	letter-spacing: -0.01em;
+}
+.text-label {
+	font-size: 0.72rem;
+	line-height: 1.1;
+	letter-spacing: 0.14em;
+}
+
+/* ---- Font families (mapped to the Fontsource faces) ---- */
+.font-display {
+	font-family: '"Space Grotesk"', 'Space Grotesk', system-ui, sans-serif;
+}
+.font-mono {
+	font-family: '"IBM Plex Mono"', 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+/* ---- Section rhythm ---- */
+.py-section {
+	padding-top: var(--section-y);
+	padding-bottom: var(--section-y);
+}
+.pb-section {
+	padding-bottom: var(--section-y);
+}
+.max-w-content {
+	max-width: var(--content);
+}
+
+/* ---- Grid backdrop (hero + alternating sections) ---- */
+.grid-section {
+	position: relative;
+	isolation: isolate;
+}
+.grid-section::before {
+	content: '';
+	position: absolute;
+	inset: 0;
+	z-index: 0;
+	pointer-events: none;
+	background-image:
+		linear-gradient(to right, rgb(var(--color-surface-z2) / 0.6) 1px, transparent 1px),
+		linear-gradient(to bottom, rgb(var(--color-surface-z2) / 0.6) 1px, transparent 1px);
+	background-size: 64px 64px;
+	opacity: 0.55;
+}
+.grid-section > * {
+	position: relative;
+	z-index: 1;
+}
+.bg-grid {
+	background-image:
+		linear-gradient(to right, rgb(var(--color-surface-z2) / 0.7) 1px, transparent 1px),
+		linear-gradient(to bottom, rgb(var(--color-surface-z2) / 0.7) 1px, transparent 1px);
+	background-size: 64px 64px;
+}
+.mask-fade-b {
+	-webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
+	mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
+}
+
+/* ---- Entrance animation ---- */
+.anim-rise {
+	animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+@keyframes rise {
+	from {
+		opacity: 0;
+		transform: translateY(14px);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.anim-rise {
+		animation: none;
+	}
+}
+
+pre {
+	font-variant-ligatures: none;
+}
