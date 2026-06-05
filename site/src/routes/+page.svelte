@@ -110,7 +110,7 @@
 		<SectionHead eyebrow={audience.eyebrow} title={audience.title} align="center" />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
 			{#each audience.items as a (a.title)}
-				<div class="flex flex-col gap-2 rounded-xl border border-surface-z3 bg-surface-z1 p-6">
+				<div class="flex flex-col gap-2 rounded-xl border border-surface-z3 bg-surface-z2 p-6">
 					<h3 class="font-display font-medium text-lg text-surface-z9">{a.title}</h3>
 					<p class="text-sm text-surface-z7 text-pretty">{a.body}</p>
 				</div>
