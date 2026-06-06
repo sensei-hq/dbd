@@ -1,14 +1,26 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { vibe } from '@rokkit/states';
 
-	// Explicit $derived so the icon reliably tracks vibe.mode (a member read on
-	// an imported singleton inside an {#if} wasn't re-deriving after hydration).
-	const isDark = $derived(vibe.mode === 'dark');
+	// Self-contained: write [data-mode] directly (no reliance on cross-component
+	// store reactivity), and keep the vibe store in sync so it persists in the
+	// shape the themeHook reads back on next load.
+	let isDark = $state(false);
 
-	// Flipping vibe.mode drives the $effect in +layout.svelte that updates
-	// [data-mode] and persists to storage.
+	onMount(() => {
+		isDark = document.documentElement.dataset.mode === 'dark';
+	});
+
+	function apply(mode: 'light' | 'dark') {
+		document.documentElement.dataset.mode = mode;
+		document.body.dataset.mode = mode;
+		vibe.mode = mode;
+		vibe.save('dbd-theme');
+		isDark = mode === 'dark';
+	}
+
 	function toggle() {
-		vibe.mode = vibe.mode === 'dark' ? 'light' : 'dark';
+		apply(isDark ? 'light' : 'dark');
 	}
 </script>
 
@@ -16,6 +28,7 @@
 	type="button"
 	onclick={toggle}
 	aria-label="Toggle colour theme"
+	aria-pressed={isDark}
 	title="Toggle colour theme"
 	class="grid h-9 w-9 place-items-center rounded-lg border border-paper-edge text-ink-mute transition-colors hover:border-accent hover:text-ink"
 >
