@@ -16,6 +16,12 @@
 	--content: 76rem;
 	--grid-line: oklch(0.45 0.01 80 / 0.09);
 
+	/* Card surface — the mockup's cards are the *lightest* surface (white on
+	   warm paper). Mode-aware so they elevate correctly in both modes
+	   (lightest in light, a step lighter than the page in dark). */
+	--card-bg: oklch(0.998 0.003 85);
+	--card-border: oklch(0.9 0.009 85);
+
 	/* surface — warm paper */
 	--color-surface-50: oklch(0.987 0.006 85);
 	--color-surface-100: oklch(0.967 0.007 85);
@@ -60,6 +66,9 @@
    single scale — Rokkit's z→shade flip already picks brighter shades in dark. */
 [data-mode='dark'] {
 	--grid-line: oklch(0.85 0.02 245 / 0.07);
+
+	--card-bg: oklch(0.25 0.038 245);
+	--card-border: oklch(0.34 0.04 245);
 
 	--color-surface-50: oklch(0.985 0.006 245);
 	--color-surface-100: oklch(0.965 0.006 245);
@@ -125,6 +134,18 @@ section[id],
 }
 .font-mono {
 	font-family: '"IBM Plex Mono"', 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+/* ---- Card surface (mockup: white card on paper, accent border on hover) ---- */
+.card {
+	background: var(--card-bg);
+	border: 1px solid var(--card-border);
+}
+.card-hover {
+	transition: border-color 0.15s ease;
+}
+.card-hover:hover {
+	border-color: var(--color-primary-400);
 }
 
 /* ---- Section rhythm ---- */
