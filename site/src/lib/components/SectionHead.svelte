@@ -15,8 +15,8 @@
 
 <div class="flex flex-col gap-4 {alignCls}">
 	<Eyebrow>{eyebrow}</Eyebrow>
-	<h2 class="font-display font-semibold text-h2 text-surface-z9 max-w-2xl text-balance">{title}</h2>
+	<h2 class="font-display font-semibold text-h2 text-ink max-w-2xl text-balance">{title}</h2>
 	{#if lede}
-		<p class="text-lg text-surface-z7 max-w-2xl text-pretty">{lede}</p>
+		<p class="text-lg text-ink-mute max-w-2xl text-pretty">{lede}</p>
 	{/if}
 </div>

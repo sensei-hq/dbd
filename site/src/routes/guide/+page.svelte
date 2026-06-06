@@ -11,8 +11,8 @@
 <section class="mx-auto max-w-content px-6 py-section">
 	<div class="flex flex-col gap-4">
 		<Eyebrow>Documentation</Eyebrow>
-		<h1 class="font-display font-bold text-display text-surface-z9 text-balance">Guide</h1>
-		<p class="max-w-2xl text-lg text-surface-z7 text-pretty">
+		<h1 class="font-display font-bold text-display text-ink text-balance">Guide</h1>
+		<p class="max-w-2xl text-lg text-ink-mute text-pretty">
 			Everything you need to go from a folder of SQL to a deployed, versioned schema.
 		</p>
 	</div>
@@ -21,13 +21,13 @@
 		{#each pages as p (p.slug)}
 			<a
 				href="/guide/{p.slug}"
-				class="card card-hover group flex items-center justify-between gap-4 rounded-xl p-6"
+				class="group flex items-center justify-between gap-4 rounded-xl border border-paper-edge bg-paper-mute p-6 transition-colors hover:border-accent"
 			>
 				<div class="flex flex-col gap-1">
-					<span class="font-mono text-xs text-surface-z5">{String(p.order).padStart(2, '0')}</span>
-					<span class="font-display font-semibold text-xl text-surface-z9">{p.title}</span>
+					<span class="font-mono text-xs text-ink-soft">{String(p.order).padStart(2, '0')}</span>
+					<span class="font-display font-semibold text-xl text-ink">{p.title}</span>
 				</div>
-				<span class="text-primary-z5 transition-transform group-hover:translate-x-1">→</span>
+				<span class="text-primary transition-transform group-hover:translate-x-1">→</span>
 			</a>
 		{/each}
 	</div>

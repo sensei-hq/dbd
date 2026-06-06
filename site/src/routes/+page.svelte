@@ -26,10 +26,10 @@
 	>
 		<div class="anim-rise flex flex-col items-start gap-6">
 			<Eyebrow>{hero.eyebrow}</Eyebrow>
-			<h1 class="font-display font-bold text-display text-surface-z9 text-balance">
-				{hero.title[0]}<br /><span class="text-primary-z5">{hero.title[1]}</span>
+			<h1 class="font-display font-bold text-display text-ink text-balance">
+				{hero.title[0]}<br /><span class="text-primary">{hero.title[1]}</span>
 			</h1>
-			<p class="max-w-xl text-lg text-surface-z7 text-pretty">{hero.lede}</p>
+			<p class="max-w-xl text-lg text-ink-mute text-pretty">{hero.lede}</p>
 			<div class="flex flex-wrap items-center gap-3 pt-1">
 				<Button href={hero.primaryCta.href} variant="primary" size="lg">
 					{hero.primaryCta.label}
@@ -40,10 +40,10 @@
 				</Button>
 			</div>
 			<div
-				class="mt-2 inline-flex items-center gap-3 rounded-lg border border-surface-z3 bg-surface-z1 px-4 py-2.5 font-mono text-sm"
+				class="mt-2 inline-flex items-center gap-3 rounded-lg border border-paper-edge bg-paper-soft px-4 py-2.5 font-mono text-sm"
 			>
-				<span class="text-primary-z5">$</span>
-				<span class="text-surface-z9">{hero.install}</span>
+				<span class="text-primary">$</span>
+				<span class="text-ink">{hero.install}</span>
 			</div>
 		</div>
 		<div class="anim-rise lg:pl-4" style="animation-delay: 0.12s">
@@ -53,7 +53,7 @@
 </section>
 
 <!-- Overview -->
-<section id="overview" class="grid-section bg-surface-z1">
+<section id="overview" class="grid-section bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={overview.eyebrow} title={overview.title} lede={overview.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -74,14 +74,14 @@
 					<div class="flex flex-col gap-4 {i % 2 === 1 ? 'lg:order-2' : ''}">
 						<div class="flex items-center gap-3">
 							<span
-								class="grid h-7 w-7 place-items-center rounded-md border border-primary-z4 bg-primary-z1 font-mono text-xs text-primary-z5"
+								class="grid h-7 w-7 place-items-center rounded-md border border-accent bg-accent-soft font-mono text-xs text-primary"
 							>
 								{String(i + 1).padStart(2, '0')}
 							</span>
-							<span class="font-mono text-label uppercase text-surface-z5">{item.kicker}</span>
+							<span class="font-mono text-label uppercase text-ink-soft">{item.kicker}</span>
 						</div>
-						<h3 class="font-display font-semibold text-h3 text-surface-z9 text-balance">{item.title}</h3>
-						<p class="text-base text-surface-z7 text-pretty">{item.body}</p>
+						<h3 class="font-display font-semibold text-h3 text-ink text-balance">{item.title}</h3>
+						<p class="text-base text-ink-mute text-pretty">{item.body}</p>
 					</div>
 					<div class={i % 2 === 1 ? 'lg:order-1' : ''}>
 						<CodeBlock code={item.code} />
@@ -93,7 +93,7 @@
 </section>
 
 <!-- Targets -->
-<section id="targets" class="grid-section bg-surface-z1">
+<section id="targets" class="grid-section bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={targets.eyebrow} title={targets.title} lede={targets.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -110,9 +110,9 @@
 		<SectionHead eyebrow={audience.eyebrow} title={audience.title} align="center" />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
 			{#each audience.items as a (a.title)}
-				<div class="card flex flex-col gap-2 rounded-xl p-6">
-					<h3 class="font-display font-medium text-lg text-surface-z9">{a.title}</h3>
-					<p class="text-sm text-surface-z7 text-pretty">{a.body}</p>
+				<div class="flex flex-col gap-2 rounded-xl border border-paper-edge bg-paper-mute p-6">
+					<h3 class="font-display font-medium text-lg text-ink">{a.title}</h3>
+					<p class="text-sm text-ink-mute text-pretty">{a.body}</p>
 				</div>
 			{/each}
 		</div>
@@ -120,9 +120,9 @@
 </section>
 
 <!-- Get started -->
-<section id="start" class="grid-section bg-surface-z1">
+<section id="start" class="grid-section bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
-		<div class="card overflow-hidden rounded-xl" style="border-color: var(--color-primary-400)">
+		<div class="overflow-hidden rounded-xl border border-accent bg-paper-mute">
 			<div class="grid gap-10 p-8 lg:grid-cols-[1fr_1.1fr] lg:p-12">
 				<div class="flex flex-col gap-4">
 					<SectionHead eyebrow={start.eyebrow} title={start.title} lede={start.lede} />
@@ -135,15 +135,15 @@
 				</div>
 				<div class="flex flex-col gap-3">
 					{#each start.steps as s (s.n)}
-						<div class="flex items-center gap-4 rounded-lg border border-surface-z3 bg-surface-z0 px-5 py-4">
+						<div class="flex items-center gap-4 rounded-lg border border-paper-edge bg-paper px-5 py-4">
 							<span
-								class="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-primary-z1 font-mono text-sm text-primary-z5"
+								class="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-accent-soft font-mono text-sm text-primary"
 							>
 								{s.n}
 							</span>
 							<div class="flex flex-col">
-								<span class="text-xs text-surface-z5">{s.text}</span>
-								<code class="font-mono text-sm text-surface-z9"><span class="text-primary-z5">$ </span>{s.code}</code>
+								<span class="text-xs text-ink-soft">{s.text}</span>
+								<code class="font-mono text-sm text-ink"><span class="text-primary">$ </span>{s.code}</code>
 							</div>
 						</div>
 					{/each}
