@@ -35,7 +35,7 @@
 					{hero.primaryCta.label}
 					<ArrowIcon />
 				</Button>
-				<Button href={hero.secondaryCta.href} variant="default" size="lg">
+				<Button href={hero.secondaryCta.href} variant="default" style="outline" size="lg">
 					{hero.secondaryCta.label}
 				</Button>
 			</div>
