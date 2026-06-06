@@ -21,7 +21,7 @@
 		{#each pages as p (p.slug)}
 			<a
 				href="/guide/{p.slug}"
-				class="group flex items-center justify-between gap-4 rounded-xl border border-surface-z3 bg-surface-z1 p-6 transition-colors hover:border-primary-z4"
+				class="card card-hover group flex items-center justify-between gap-4 rounded-xl p-6"
 			>
 				<div class="flex flex-col gap-1">
 					<span class="font-mono text-xs text-surface-z5">{String(p.order).padStart(2, '0')}</span>

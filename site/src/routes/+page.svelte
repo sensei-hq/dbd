@@ -110,7 +110,7 @@
 		<SectionHead eyebrow={audience.eyebrow} title={audience.title} align="center" />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
 			{#each audience.items as a (a.title)}
-				<div class="flex flex-col gap-2 rounded-xl border border-surface-z3 bg-surface-z2 p-6">
+				<div class="card flex flex-col gap-2 rounded-xl p-6">
 					<h3 class="font-display font-medium text-lg text-surface-z9">{a.title}</h3>
 					<p class="text-sm text-surface-z7 text-pretty">{a.body}</p>
 				</div>
@@ -122,7 +122,7 @@
 <!-- Get started -->
 <section id="start" class="grid-section bg-surface-z1">
 	<div class="mx-auto max-w-content px-6 py-section">
-		<div class="overflow-hidden rounded-xl border border-primary-z4 bg-surface-z1">
+		<div class="card overflow-hidden rounded-xl" style="border-color: var(--color-primary-400)">
 			<div class="grid gap-10 p-8 lg:grid-cols-[1fr_1.1fr] lg:p-12">
 				<div class="flex flex-col gap-4">
 					<SectionHead eyebrow={start.eyebrow} title={start.title} lede={start.lede} />
