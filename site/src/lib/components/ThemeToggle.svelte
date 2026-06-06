@@ -17,7 +17,7 @@
 	onclick={toggle}
 	aria-label="Toggle colour theme"
 	title="Toggle colour theme"
-	class="grid h-9 w-9 place-items-center rounded-lg border border-surface-z3 text-surface-z7 transition-colors hover:border-primary-z4 hover:text-surface-z9"
+	class="grid h-9 w-9 place-items-center rounded-lg border border-paper-edge text-ink-mute transition-colors hover:border-accent hover:text-ink"
 >
 	{#if isDark}
 		<svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.8">

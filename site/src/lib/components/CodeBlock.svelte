@@ -6,14 +6,14 @@
 	const lines = $derived(highlight(code.source));
 </script>
 
-<div class="overflow-hidden rounded-xl border border-surface-z3 bg-surface-z1 {className}">
-	<div class="flex items-center justify-between border-b border-surface-z2 px-4 py-2.5">
+<div class="overflow-hidden rounded-xl border border-paper-edge bg-paper-soft {className}">
+	<div class="flex items-center justify-between border-b border-paper-edge px-4 py-2.5">
 		<div class="flex items-center gap-1.5">
-			<span class="h-2.5 w-2.5 rounded-full bg-surface-z3"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-surface-z3"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-surface-z3"></span>
+			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
+			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
+			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
 		</div>
-		<span class="font-mono text-xs text-surface-z5">{code.label}</span>
+		<span class="font-mono text-xs text-ink-soft">{code.label}</span>
 	</div>
 	<pre class="overflow-x-auto px-4 py-4 font-mono text-[0.82rem] leading-relaxed"><code
 			>{#each lines as toks, i (i)}<div class="whitespace-pre">{#each toks as tk, j (j)}<span

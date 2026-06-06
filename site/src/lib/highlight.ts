@@ -3,10 +3,10 @@
 
 export type Tok = { t: string; cls: string };
 
-const COMMENT = 'text-surface-z5';
-const STR = 'text-success-z6';
-const ACCENT = 'text-primary-z5';
-const DEF = 'text-surface-z8';
+const COMMENT = 'text-ink-soft';
+const STR = 'text-success';
+const ACCENT = 'text-primary';
+const DEF = 'text-ink-mute';
 
 export function highlight(source: string): Tok[][] {
 	return source.split('\n').map(tokenizeLine);
