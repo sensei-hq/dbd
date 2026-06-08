@@ -29,14 +29,14 @@
 		"@fontsource/ibm-plex-mono": "^5.2.7",
 		"@fontsource/ibm-plex-sans": "^5.2.8",
 		"@fontsource/space-grotesk": "^5.2.10",
-		"@rokkit/actions": "^1.1.8",
-		"@rokkit/app": "^1.1.8",
-		"@rokkit/core": "^1.1.8",
-		"@rokkit/icons": "^1.1.8",
-		"@rokkit/states": "^1.1.8",
-		"@rokkit/themes": "^1.1.8",
-		"@rokkit/ui": "^1.1.8",
-		"@rokkit/unocss": "^1.1.8",
+		"@rokkit/actions": "^1.1.11",
+		"@rokkit/app": "^1.1.11",
+		"@rokkit/core": "^1.1.11",
+		"@rokkit/icons": "^1.1.11",
+		"@rokkit/states": "^1.1.11",
+		"@rokkit/themes": "^1.1.11",
+		"@rokkit/ui": "^1.1.11",
+		"@rokkit/unocss": "^1.1.11",
 		"marked": "^18.0.5"
 	}
 }
