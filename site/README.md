@@ -19,8 +19,9 @@ Marketing + docs site for **dbd**, built from the design handoff in
 
 `scripts/copy-content.mjs` runs on `predev` and `prebuild`:
 
-- `docs/llms/llms.txt` → `static/llms.txt` (served at `/llms.txt`)
-- `docs/llms/llms-full.txt` → `static/llms-full.txt` (`/llms-full.txt`)
+- `docs/llms/*.txt` → `src/lib/content/llms/` → served by `+server.ts` routes
+  at `/llms.txt` and `/llms-full.txt` with `text/plain; charset=utf-8` (the
+  explicit charset keeps the UTF-8 em-dashes from rendering as mojibake)
 - `docs/guide/*.md` → `src/lib/content/guide/` → rendered at `/guide/<slug>`
   (markdown via `marked`)
 

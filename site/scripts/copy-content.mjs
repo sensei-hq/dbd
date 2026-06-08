@@ -1,8 +1,8 @@
 /**
  * Prebuild step: pull docs from the repo into the site.
  *
- *  - docs/llms/llms.txt       → static/llms.txt        (served at /llms.txt)
- *  - docs/llms/llms-full.txt  → static/llms-full.txt   (served at /llms-full.txt)
+ *  - docs/llms/*.txt          → src/lib/content/llms/  (served by +server.ts routes
+ *                                with an explicit text/plain; charset=utf-8 header)
  *  - docs/guide/*.md          → src/lib/content/guide/ (rendered at /guide/<slug>)
  *
  * Keeps a single source of truth in docs/ — the site never forks the content.
@@ -21,11 +21,12 @@ function copyInto(srcFile, destFile) {
 	console.log(`  copied ${srcFile.replace(repo + '/', '')} → ${destFile.replace(repo + '/', '')}`);
 }
 
-// 1. llms files → static/
-const staticDir = join(here, '..', 'static');
+// 1. llms files → src/lib/content/llms/ (served via routes with charset=utf-8)
+const llmsDest = join(here, '..', 'src', 'lib', 'content', 'llms');
+mkdirSync(llmsDest, { recursive: true });
 for (const name of ['llms.txt', 'llms-full.txt']) {
 	const src = join(docs, 'llms', name);
-	if (existsSync(src)) copyInto(src, join(staticDir, name));
+	if (existsSync(src)) copyInto(src, join(llmsDest, name));
 	else console.warn(`  ! missing ${src}`);
 }
 
