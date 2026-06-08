@@ -5,9 +5,10 @@ import { themeHook } from '@rokkit/unocss/hooks';
 // Shares the 'dbd-theme' storage key with the vibe store (see +layout.svelte).
 export const handle = themeHook({
 	storageKey: 'dbd-theme',
-	// No defaultMode → default to the OS preference (system); the pre-paint script
-	// resolves prefers-color-scheme. ThemeSwitcherToggle's single variant reflects
-	// the resolved light/dark, so its first click always flips.
+	// defaultMode: 'system' → the pre-paint script resolves prefers-color-scheme to
+	// light/dark (≥ @rokkit/unocss 1.1.12). ThemeSwitcherToggle's single variant
+	// reflects the resolved light/dark, so its first click always flips.
+	defaultMode: 'system',
 	defaultStyle: 'zen-sumi',
 	defaultDensity: 'comfortable'
 });
