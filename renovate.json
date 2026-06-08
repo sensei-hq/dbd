@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "First-party Rokkit design system (published in lockstep). Group all @rokkit/* bumps into one PR and auto-merge non-major updates; majors open a PR for manual review/migration.",
+      "matchPackageNames": ["@rokkit/**"],
+      "groupName": "rokkit",
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    }
+  ]
+}
