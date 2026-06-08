@@ -8,14 +8,14 @@
         "@fontsource/ibm-plex-mono": "^5.2.7",
         "@fontsource/ibm-plex-sans": "^5.2.8",
         "@fontsource/space-grotesk": "^5.2.10",
-        "@rokkit/actions": "^1.1.11",
-        "@rokkit/app": "^1.1.11",
-        "@rokkit/core": "^1.1.11",
-        "@rokkit/icons": "^1.1.11",
-        "@rokkit/states": "^1.1.11",
-        "@rokkit/themes": "^1.1.11",
-        "@rokkit/ui": "^1.1.11",
-        "@rokkit/unocss": "^1.1.11",
+        "@rokkit/actions": "^1.1.12",
+        "@rokkit/app": "^1.1.12",
+        "@rokkit/core": "^1.1.12",
+        "@rokkit/icons": "^1.1.12",
+        "@rokkit/states": "^1.1.12",
+        "@rokkit/themes": "^1.1.12",
+        "@rokkit/ui": "^1.1.12",
+        "@rokkit/unocss": "^1.1.12",
         "marked": "^18.0.5",
       },
       "devDependencies": {
@@ -112,23 +112,23 @@
 
     "@quansync/fs": ["@quansync/fs@1.0.0", "", { "dependencies": { "quansync": "^1.0.0" } }, "sha512-4TJ3DFtlf1L5LDMaM6CanJ/0lckGNtJcMjQ1NAV6zDmA0tEHKZtxNKin8EgPaVX1YzljbxckyT2tJrpQKAtngQ=="],
 
-    "@rokkit/actions": ["@rokkit/actions@1.1.11", "", { "dependencies": { "@rokkit/core": "latest", "ramda": "^0.32.0" } }, "sha512-MEpgZ89nOhJnwD6Zm6th1Z2lEIwqK3ORoOUw8QZHgBHCZcB9Njrn4ZXiDB9FEKb6GxwzZHRJxW2CHqx3rQvh6A=="],
+    "@rokkit/actions": ["@rokkit/actions@1.1.12", "", { "dependencies": { "@rokkit/core": "latest", "ramda": "^0.32.0" } }, "sha512-gNZH5QMFlwGYznNYuuflBdAc9fkZThp+lr1MZbaJTi73Lw9640Ln3B0szP1AMsR32iGGBK9dnGwl181gbDqEPg=="],
 
-    "@rokkit/app": ["@rokkit/app@1.1.11", "", { "dependencies": { "@rokkit/actions": "1.1.11", "@rokkit/core": "1.1.11", "@rokkit/states": "1.1.11", "@rokkit/ui": "1.1.11" }, "peerDependencies": { "svelte": "^5.0.0" } }, "sha512-JS/i6rzIE0kUK5fdN2bc5ac7aUSaTPV8v0/2QO6yk28a01tXXPsDpoiIY88V1gbEykZoQjda/bOSUM7WB57bXg=="],
+    "@rokkit/app": ["@rokkit/app@1.1.12", "", { "dependencies": { "@rokkit/actions": "1.1.12", "@rokkit/core": "1.1.12", "@rokkit/states": "1.1.12", "@rokkit/ui": "1.1.12" }, "peerDependencies": { "svelte": "^5.0.0" } }, "sha512-4N9M6uHpYSwSyZVUeWkLStN2bNoDsEoCvgV1r4ter0PgSVZbVezy+OfZyALoQmdlEo5tFkyP3zPmINqLvlYpPA=="],
 
-    "@rokkit/core": ["@rokkit/core@1.1.11", "", { "dependencies": { "@unocss/preset-mini": "^66.6.1", "date-fns": "^4.1.0", "ramda": "^0.32.0" } }, "sha512-I2XGi4sP5+l+xlsUQQw5Y9WIrQjG/LkQrtsRlfL2YKyF2NN/lOzU6ALvGcGb6LJuCFqSp+YpaXK9i8DKX4XTwQ=="],
+    "@rokkit/core": ["@rokkit/core@1.1.12", "", { "dependencies": { "@unocss/preset-mini": "^66.6.1", "date-fns": "^4.1.0", "ramda": "^0.32.0" } }, "sha512-NLtdwNIkRNn0k3tuzjPl51kgRJ2vPZZA38ih9iszZVnvYlWOB3QJecLR3B6AqitWqKeCBJWPaCVMrGO+R3iX5g=="],
 
-    "@rokkit/data": ["@rokkit/data@1.1.11", "", { "dependencies": { "@lukeed/uuid": "^2.0.1", "@rokkit/core": "1.1.11", "d3-array": "^3.2.4", "d3-collection": "^1.0.7", "ramda": "^0.32.0", "svelte": "^5.53.5" } }, "sha512-va8QWhZNzzTuH0Yz1aR5LQNvjKzPYnlGUO/WejX63bdMDxupaRlGaqXbY1M3q5t/OoM/FVbm+wF1oco+4pDvdw=="],
+    "@rokkit/data": ["@rokkit/data@1.1.12", "", { "dependencies": { "@lukeed/uuid": "^2.0.1", "@rokkit/core": "1.1.12", "d3-array": "^3.2.4", "d3-collection": "^1.0.7", "ramda": "^0.32.0", "svelte": "^5.53.5" } }, "sha512-AW7wBQVfwkZeL/ZKzAWjHyvu/vSji9nKnlj96fetJ4pNi5xHq+i4gkXVOyndUUVE3aOdCJBy1SCW0C/G9HAQFg=="],
 
-    "@rokkit/icons": ["@rokkit/icons@1.1.11", "", {}, "sha512-6GgcGnk71lU1kinKudTZJfZKorgODNvZQ1A7UataIAA6HC4Pwy412b6Vxf5z50fNYJeX90D2Ayioi735GyjgLA=="],
+    "@rokkit/icons": ["@rokkit/icons@1.1.12", "", {}, "sha512-okwixnHlEt9h8IOkxvLYm++51wbyirffckufCCB/SnrI5Q+7Id5gVxVenNxi1KrlHwFbd5FKUBkitW4HOUNbwA=="],
 
-    "@rokkit/states": ["@rokkit/states@1.1.11", "", { "dependencies": { "@rokkit/core": "1.1.11", "@rokkit/data": "1.1.11", "d3-array": "^3.2.4", "ramda": "^0.32.0", "svelte": "^5.53.5" } }, "sha512-szYOpEASMlnGJQ9gbpCDJyCBWob/M9ou5iHZKbZo4NfN02rTaRuqjY/39xXg2GfYbvXkvhsN54xtAOvVBAruJw=="],
+    "@rokkit/states": ["@rokkit/states@1.1.12", "", { "dependencies": { "@rokkit/core": "1.1.12", "@rokkit/data": "1.1.12", "d3-array": "^3.2.4", "ramda": "^0.32.0", "svelte": "^5.53.5" } }, "sha512-kqHoYWVZb3jbBaT0T8OUzGR8YWIJ9ElYT1N9qOeJp42DyOYfRiOhgLZ3Fi7FiVVExF2WqGAmw+xuURAXiomdJQ=="],
 
-    "@rokkit/themes": ["@rokkit/themes@1.1.11", "", { "dependencies": { "@rokkit/core": "1.1.11" } }, "sha512-ih8Eb2qYRyMcSI7TB403T2ejNpo/3pDRC9mzUJPmiuMu0wWfCxCkg/mQ8uXNdMXtDWUf5e1FFSBwF2wKJYOt6w=="],
+    "@rokkit/themes": ["@rokkit/themes@1.1.12", "", { "dependencies": { "@rokkit/core": "1.1.12" } }, "sha512-x9f9Qmp9AmYLwfO4CYQCgxNG+nUz47BUpnktjQ/e5E9/aaGoxfYb4764Hs2tzBCae0w4XF58szwXOGIYMQfLSA=="],
 
-    "@rokkit/ui": ["@rokkit/ui@1.1.11", "", { "dependencies": { "@rokkit/actions": "1.1.11", "@rokkit/core": "1.1.11", "@rokkit/data": "1.1.11", "@rokkit/states": "1.1.11", "dompurify": "^3.0.0", "marked": "^15.0.0" }, "peerDependencies": { "shiki": "^3.23.0", "svelte": "^5.0.0" } }, "sha512-arBohTNRcvqyyiRk6I9tqUysHbepGbT/IWrEn8wEVDxeeGy1mnT3vzzXmzhF2QbRnYjEJMANCa8ucj1R7ZPspA=="],
+    "@rokkit/ui": ["@rokkit/ui@1.1.12", "", { "dependencies": { "@rokkit/actions": "1.1.12", "@rokkit/core": "1.1.12", "@rokkit/data": "1.1.12", "@rokkit/states": "1.1.12", "dompurify": "^3.0.0", "marked": "^15.0.0" }, "peerDependencies": { "shiki": "^3.23.0", "svelte": "^5.0.0" } }, "sha512-Hz/vcYBgrdjBs4+YlHKGRMzU2UDOZ+Z9MvODUJNsM/HecuF6VLUFq2q43ltanF3VWYsm2r/TW5ph/t43uJN/cQ=="],
 
-    "@rokkit/unocss": ["@rokkit/unocss@1.1.11", "", { "dependencies": { "@rokkit/core": "1.1.11", "@rokkit/icons": "1.1.11", "@unocss/extractor-svelte": "^66.6.1", "unocss": "^66.6.1" } }, "sha512-BmUnm6Qx4eaT0t72kLr8LueX+n76PI8yNPAeDweDcY4ATAJZn6Si14NorprdV4uNK7uM/zBNWbdJ6VI+8A5LpA=="],
+    "@rokkit/unocss": ["@rokkit/unocss@1.1.12", "", { "dependencies": { "@rokkit/core": "1.1.12", "@rokkit/icons": "1.1.12", "@unocss/extractor-svelte": "^66.6.1", "unocss": "^66.6.1" } }, "sha512-9hh3rHsIvHsu6UM4DS9+Y+PycvwvTTJ2jTBbYu1g7n70bkJAnGOPwNXVxFKDS/kmr6MOikuiFz3MEWSY7E0G9Q=="],
 
     "@rolldown/binding-android-arm64": ["@rolldown/binding-android-arm64@1.0.3", "", { "os": "android", "cpu": "arm64" }, "sha512-454rs7jHngixp/NMxd5srYD57OnzSlZ/eFTETjORQHLwJG1lRtmNOJcBerZlfu4GjKqeq8aCCIQrMdHyhI51Hw=="],
 
