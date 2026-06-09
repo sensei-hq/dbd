@@ -64,19 +64,20 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 ## Commands
 
 - `dbd init` — scaffold project
-- `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`)
-- `dbd apply` — apply schemas + entities + pending migrations
-- `dbd import` — load staging data (CSV/TSV/JSONL)
+- `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`); `--database` resolves references against the live catalog and caches to `.dbd/refcache.json`. Surfaces unresolved migration `-- TODO:`s
+- `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
+- `dbd import` — load staging data (CSV/TSV/JSONL); env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches
 - `dbd export` — export table data (scope-aware)
 - `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
 - `dbd combine` — combine DDL into single SQL file (scope-aware)
 - `dbd graph` — dependency graph as JSON (scope-aware)
 - `dbd dbml` — generate DBML documentation (scope-aware: `--scope` filters to the scope's working set)
-- `dbd snapshot` — capture schema version, generate migration SQL
-- `dbd migrate` — apply pending migrations only
+- `dbd snapshot` — diff vs latest snapshot, generate migration SQL; smart multi-snapshot splits renames/type-changes/enum-removals into safe stages (with `*.data.sql` corrections)
+- `dbd migrate` — show migration status (read-only; `--status`). Pending migrations are run by `dbd apply`, not here
+- `dbd policies` — apply RLS policies from `policies/<schema>/<table>.sql` (idempotent, fail-forward)
 - `dbd doctor` — audit config for stale entries
 - `dbd reset` — drop schemas (guarded by _dbd_meta env check; `--scope` restricts to the scope's schemas)
-- `dbd format [--check]` — river-style DDL formatter; `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
+- `dbd format [--check]` — DDL formatter, optional river-style SELECT/VIEW bodies (`query_style: river`, `gutter`); `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
 Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). `reset` is schema-granular; the others filter to the entity working set.
 

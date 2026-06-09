@@ -300,6 +300,12 @@ dbd import -e dev
 
 Execution: truncate → COPY data → call import procedures → run after scripts.
 
+Environment-specific data: files at `import/<schema>/file` load in every
+environment; files at `import/<env>/<schema>/file` load only when `-e <env>`
+matches. So `import/dev/staging/seed.csv` loads under `-e dev` but not `prod`.
+Import procedures are matched to staging tables by reads/writes analysis, not by
+naming convention.
+
 ### dbd deploy
 
 One-shot: fetch source → apply → import → cleanup.
@@ -319,14 +325,36 @@ dbd snapshot --name "add notes column"
 dbd snapshot --list
 ```
 
+Diffs the current DDL against the latest snapshot and writes a versioned
+migration. **Smart multi-snapshot**: complex changes auto-split into safe stages —
+a column rename → 2 snapshots (add+copy, drop old), a type change → 2 (add+CAST,
+drop old), an enum value removal → 3 (data fix, TEXT intermediary, enum recreate).
+
+`*.data.sql` corrections run after the matching `*.sql` (CAST heuristics auto-fill
+type conversions; non-derivable cases like enum value mapping emit `-- TODO:`
+comments). These are **gated**: `dbd inspect` surfaces unresolved TODOs and
+`dbd apply` refuses to run while any remain.
+
 ### dbd migrate
 
 ```sh
-dbd migrate --status
-dbd migrate --apply
-dbd migrate --apply --dry-run
-dbd migrate --apply --to 3
+dbd migrate --status   # read-only: local snapshot version vs database version
 ```
+
+`migrate` is diagnostic only — there is no `--apply`. Pending migrations are
+executed by `dbd apply` (it runs DDL + pending migrations together).
+
+### dbd policies
+
+```sh
+dbd policies                # apply policies/<schema>/<table>.sql (RLS)
+dbd policies --dry-run
+dbd apply --with-policies   # apply entities + policies in one step
+```
+
+Row-Level Security policy files contain idempotent SQL (`enable row level
+security`, `drop policy if exists`, `create policy`). Failures are logged and
+skipped (fail-forward); exit code 1 if any failed.
 
 ### dbd combine
 
