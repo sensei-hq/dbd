@@ -108,9 +108,13 @@ Generate DBML documentation for dbdocs.io / dbdiagram.io.
 ```sh
 dbd dbml                           # Writes design.dbml (when no dbml keys configured)
 dbd dbml -f schema.dbml            # Custom filename
+dbd dbml --scope hub -f hub.dbml   # Document only the entities in the 'hub' scope
+dbd dbml --scope hub --deps include  # Expand to the dependency closure first
 ```
 
 Generated natively — no `@dbml/core` dependency. Includes Project block, enums, tables with columns/indexes/comments, standalone Ref blocks with FK actions (including composite refs as `t.(c1, c2) > o.(c1, c2)`), `TableGroup` blocks, and stub tables for external FK targets.
+
+**Scope-aware.** `--scope` documents only the entities that deploy under that scope (its working set). `--deps include` (or a scope whose `deps: include`) first expands the selection to its dependency closure, so the diagram is self-contained. Unlike `apply`/`deploy`, `dbml` does not gate on dependency gaps — it is documentation, so it simply emits the filtered set (out-of-scope FK targets still appear as external stub tables).
 
 **Multi-document.** If `design.yaml` declares multiple `dbml.<key>` entries (each with its own `include`/`exclude`, `output`, `auto_group_by_schema`, `groups`), `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`). See [design.yaml reference](03-design-yaml.md#dbml) for the full schema.
 

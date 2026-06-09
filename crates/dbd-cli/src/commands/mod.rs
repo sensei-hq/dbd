@@ -73,7 +73,9 @@ pub async fn run(
             data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, verbosity).await
         }
 
-        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, verbosity),
+        Commands::Dbml { file } => {
+            project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity)
+        }
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 

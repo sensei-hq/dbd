@@ -586,6 +586,24 @@ impl Design {
             || working_set.contains(&entity.name)
     }
 
+    /// The loaded entities filtered to a resolved scope's working set
+    /// (closure under `include`, the plain set under `report`). The all-scope
+    /// returns every entity. Read-only and gap-neutral — for entity-selecting
+    /// commands like `dbml` that document/emit a subset without the write-path
+    /// gap gate.
+    pub fn scoped_entities(&self, scope: &ResolvedScope) -> Result<Vec<Entity>> {
+        if scope.is_all {
+            return Ok(self.entities.clone());
+        }
+        let ws = self.working_set(scope)?;
+        Ok(self
+            .entities
+            .iter()
+            .filter(|e| Self::entity_in_scope(e, scope, &ws))
+            .cloned()
+            .collect())
+    }
+
     /// Under `report` policy, error if the scope has dependency gaps (an in-scope
     /// entity that references a managed entity outside the scope). No-op for the
     /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
@@ -2439,6 +2457,43 @@ mod tests {
         let ws = design.working_set(&scope).unwrap();
         assert!(ws.contains("config.lookup_values"));
         assert!(ws.contains("config.lookups")); // pulled in by closure
+    }
+
+    #[test]
+    fn scoped_entities_all_returns_everything() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let all = design.resolve_scope(Some("all"), None).unwrap();
+        assert_eq!(
+            design.scoped_entities(&all).unwrap().len(),
+            design.entities().len()
+        );
+    }
+
+    #[test]
+    fn scoped_entities_filters_to_working_set() {
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // A config-only selection: keep config.* tables, drop staging.* procedures.
+        let scope = ResolvedScope {
+            name: "config_only".to_string(),
+            entities: HashSet::from([
+                "config".to_string(),
+                "config.lookups".to_string(),
+                "config.lookup_values".to_string(),
+            ]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+        };
+        let scoped = design.scoped_entities(&scope).unwrap();
+        let names: Vec<&str> = scoped.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"config.lookups"));
+        // Out-of-scope managed entities are filtered away.
+        assert!(!names.iter().any(|n| n.starts_with("staging.")));
+        // Fewer than the full set — proves filtering actually happened.
+        assert!(scoped.len() < design.entities().len());
     }
 
     #[test]
