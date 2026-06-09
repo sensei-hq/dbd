@@ -97,7 +97,11 @@ Combine all DDL into a single SQL file.
 ```sh
 dbd combine                        # Writes init.sql
 dbd combine -f bootstrap.sql       # Custom filename
+dbd combine --scope hub -f hub.sql # Only the 'hub' scope's working set
+dbd combine --scope hub --deps include  # Expand to the dependency closure first
 ```
+
+**Scope-aware.** `--scope` filters the combined SQL to that scope's working set; `--deps include` (or a scope with `deps: include`) first expands to the dependency closure so the script is self-contained. Filter-only — `combine` does not gate on dependency gaps (use `inspect --scope` to surface them). Always-on infrastructure (extensions, roles) is kept in every scope.
 
 ---
 
@@ -126,22 +130,28 @@ Output the dependency graph as JSON.
 
 ```sh
 dbd graph                          # Full graph
-dbd graph -n config.lookups        # Scoped to one entity's subgraph
+dbd graph -n config.lookups        # Subgraph reachable from one entity
+dbd graph --scope hub              # Only the 'hub' scope's working set
 ```
 
 Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
+
+`--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose.
 
 ---
 
 ## `dbd reset`
 
-Drop all project schemas. Guarded by `_dbd_meta` environment check.
+Drop project schemas. Guarded by `_dbd_meta` environment check.
 
 ```sh
 dbd reset                          # Blocked if prod or version >= 1
 dbd reset --force                  # Override safety guard
 dbd reset --dry-run                # Show what would be dropped
+dbd reset --scope hub --dry-run    # Only the schemas the 'hub' scope occupies
 ```
+
+**Scope-aware.** `--scope` restricts the drop to the schemas the scope's working set occupies (`reset` is schema-granular — `DROP SCHEMA … CASCADE`). Roles are dropped only on a full reset; a subset scope leaves shared roles intact. The all-scope (no `--scope`) drops every managed schema, as before.
 
 ---
 
@@ -201,10 +211,12 @@ dbd export                              # Export all tables as CSV
 dbd export --name config.lookups        # Export one table
 dbd export --format tsv                 # TSV format
 dbd export --format jsonl               # JSONL format
+dbd export --scope hub                  # Only tables in the 'hub' scope
 ```
 
 Writes to `export/<schema>/<name>.<format>`.
 If export entries are configured in design.yaml, only those tables are exported.
+`--scope`/`--deps` further restrict the export to the scope's working set.
 
 ---
 

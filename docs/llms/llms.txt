@@ -65,18 +65,18 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`)
 - `dbd apply` — apply schemas + entities + pending migrations
 - `dbd import` — load staging data (CSV/TSV/JSONL)
-- `dbd export` — export table data
+- `dbd export` — export table data (scope-aware)
 - `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
-- `dbd combine` — combine DDL into single SQL file
-- `dbd graph` — dependency graph as JSON
+- `dbd combine` — combine DDL into single SQL file (scope-aware)
+- `dbd graph` — dependency graph as JSON (scope-aware)
 - `dbd dbml` — generate DBML documentation (scope-aware: `--scope` filters to the scope's working set)
 - `dbd snapshot` — capture schema version, generate migration SQL
 - `dbd migrate` — apply pending migrations only
 - `dbd doctor` — audit config for stale entries
-- `dbd reset` — drop all schemas (guarded by _dbd_meta env check)
+- `dbd reset` — drop schemas (guarded by _dbd_meta env check; `--scope` restricts to the scope's schemas)
 - `dbd format [--check]` — river-style DDL formatter; `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
-Global flags: `--scope <name>` selects a `scopes:` entity subset for `inspect`/`apply`/`import`/`deploy`/`dbml`; `--deps report|include` overrides that scope's gap policy for one run. `dbml` filters to the scope's working set but never gates on gaps (it documents — out-of-scope FK targets render as external stubs).
+Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). `reset` is schema-granular; the others filter to the entity working set.
 
 ## Architecture
 

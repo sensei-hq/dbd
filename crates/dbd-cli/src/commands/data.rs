@@ -99,6 +99,7 @@ pub async fn cmd_import(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_export(
     config: &Path,
     env: &str,
@@ -106,10 +107,20 @@ pub async fn cmd_export(
     database_url: Option<&str>,
     name: Option<&str>,
     format: &str,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
+
+    // Restrict to the scope's working set (all entities for the all-scope).
+    let resolved = design.resolve_scope(scope, deps)?;
+    let in_scope: std::collections::HashSet<String> = design
+        .scoped_entities(&resolved)?
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
 
     let adapter = get_adapter(config, database_url).await?;
 
@@ -122,16 +133,19 @@ pub async fn cmd_export(
         .collect();
 
     // Build export list: either from config export entries, or all tables.
+    // The scope's working set filters either branch.
     let tables: Vec<&dbd_core::Entity> = if !design.config().export.is_empty() {
         let export_names: Vec<String> = design.config().export.iter().map(|e| e.name()).collect();
         design.entities().iter()
             .filter(|e| e.entity_type == dbd_core::EntityType::Table)
             .filter(|e| export_names.contains(&e.name))
+            .filter(|e| in_scope.contains(&e.name))
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
             .collect()
     } else {
         design.entities().iter()
             .filter(|e| e.entity_type == dbd_core::EntityType::Table)
+            .filter(|e| in_scope.contains(&e.name))
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
             .collect()
     };

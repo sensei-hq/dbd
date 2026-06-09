@@ -167,9 +167,18 @@ pub async fn cmd_inspect(
     Ok(())
 }
 
-pub fn cmd_combine(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_combine(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    file: &Path,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    design.combine(file)?;
+    let resolved = design.resolve_scope(scope, deps)?;
+    design.combine(file, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }

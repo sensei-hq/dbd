@@ -319,7 +319,7 @@ fn validate_scoped_to_entity() {
 #[test]
 fn graph_has_nodes_and_layers() {
     let d = design();
-    let graph = d.graph(None);
+    let graph = d.graph(None, None).unwrap();
     assert!(!graph.nodes.is_empty());
     assert!(!graph.layers.is_empty());
 }
@@ -327,9 +327,18 @@ fn graph_has_nodes_and_layers() {
 #[test]
 fn graph_scoped_to_entity() {
     let d = design();
-    let full = d.graph(None);
-    let scoped = d.graph(Some("config.lookup_values"));
+    let full = d.graph(None, None).unwrap();
+    let scoped = d.graph(Some("config.lookup_values"), None).unwrap();
     assert!(scoped.nodes.len() <= full.nodes.len());
+}
+
+#[test]
+fn graph_filtered_by_design_scope() {
+    let d = design();
+    let scope = d.resolve_scope(Some("config_only"), None).unwrap();
+    let graph = d.graph(None, Some(&scope)).unwrap();
+    assert!(!graph.nodes.is_empty());
+    assert!(graph.nodes.iter().all(|n| !n.name.starts_with("staging.")));
 }
 
 // ── Scenario: Combine ───────────────────────────────────
@@ -339,11 +348,24 @@ fn combine_generates_sql() {
     let d = design();
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("init.sql");
-    d.combine(&out).unwrap();
+    d.combine(&out, None).unwrap();
 
     let content = std::fs::read_to_string(&out).unwrap();
     assert!(content.contains("CREATE SCHEMA"));
     assert!(content.contains("CREATE EXTENSION"));
+}
+
+#[test]
+fn combine_filtered_by_scope() {
+    let d = design();
+    let scope = d.resolve_scope(Some("config_only"), None).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("hub.sql");
+    d.combine(&out, Some(&scope)).unwrap();
+
+    let content = std::fs::read_to_string(&out).unwrap();
+    assert!(content.contains("config"));
+    assert!(!content.contains("staging"));
 }
 
 // ── Scenario: Import plan ───────────────────────────────
@@ -504,7 +526,7 @@ fn snapshot_listing_on_empty_project() {
 async fn reset_blocked_in_prod() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("prod", 0);
-    let result = d.reset(&mock, "postgres", false).await;
+    let result = d.reset(&mock, "postgres", false, None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("prod"));
 }
@@ -513,7 +535,7 @@ async fn reset_blocked_in_prod() {
 async fn reset_blocked_after_v1_in_dev() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 1);
-    let result = d.reset(&mock, "postgres", false).await;
+    let result = d.reset(&mock, "postgres", false, None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("migrations"));
 }
@@ -522,7 +544,7 @@ async fn reset_blocked_after_v1_in_dev() {
 async fn reset_allowed_dev_pre_v1() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 0);
-    let result = d.reset(&mock, "postgres", false).await;
+    let result = d.reset(&mock, "postgres", false, None).await;
     assert!(result.is_ok());
 }
 
@@ -530,7 +552,7 @@ async fn reset_allowed_dev_pre_v1() {
 async fn reset_force_overrides_guard() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("prod", 5);
-    let result = d.reset(&mock, "postgres", true).await;
+    let result = d.reset(&mock, "postgres", true, None).await;
     assert!(result.is_ok());
 }
 

@@ -1265,9 +1265,16 @@ impl Design {
     }
 
     /// Combine all DDL into a single SQL file.
-    pub fn combine(&self, file: &Path) -> Result<()> {
-        let combined: Vec<String> = self
-            .entities
+    /// Combine entity DDL into a single SQL script. `scope` filters to that
+    /// scope's working set (`None` ⇒ the full set). Filter-only — no gap gate;
+    /// use `inspect --scope` to surface dependency gaps, or `deps: include` to
+    /// emit a self-contained closure.
+    pub fn combine(&self, file: &Path, scope: Option<&ResolvedScope>) -> Result<()> {
+        let entities = match scope {
+            Some(s) => self.scoped_entities(s)?,
+            None => self.entities.clone(),
+        };
+        let combined: Vec<String> = entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
@@ -1278,27 +1285,72 @@ impl Design {
         Ok(())
     }
 
-    /// Get the dependency graph for visualization.
-    pub fn graph(&self, name: Option<&str>) -> dependency::GraphResult {
-        let non_meta: Vec<Entity> = self
-            .entities
-            .iter()
-            .filter(|e| matches!(
+    /// Get the dependency graph for visualization. `name` narrows to one entity's
+    /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
+    pub fn graph(
+        &self,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<dependency::GraphResult> {
+        let graphable = |e: &Entity| {
+            matches!(
                 e.entity_type,
-                EntityType::Table | EntityType::View | EntityType::Function
-                    | EntityType::Procedure | EntityType::Enum
-            ))
-            .cloned()
-            .collect();
-        dependency::graph_from_entities(&non_meta, name)
+                EntityType::Table
+                    | EntityType::View
+                    | EntityType::Function
+                    | EntityType::Procedure
+                    | EntityType::Enum
+            )
+        };
+        let non_meta: Vec<Entity> = match scope {
+            Some(s) => {
+                let ws = self.working_set(s)?;
+                self.entities
+                    .iter()
+                    .filter(|e| graphable(e) && Self::entity_in_scope(e, s, &ws))
+                    .cloned()
+                    .collect()
+            }
+            None => self.entities.iter().filter(|e| graphable(e)).cloned().collect(),
+        };
+        Ok(dependency::graph_from_entities(&non_meta, name))
     }
 
-    /// Reset the database (with safety guards).
+    /// Schemas a `reset` would drop under an optional scope. `None`/all-scope ⇒
+    /// every managed schema; a subset scope ⇒ only the schemas its working set
+    /// occupies (reset is schema-granular — `DROP SCHEMA … CASCADE`).
+    pub fn reset_target_schemas(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let all: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Schema)
+            .map(|e| e.name.clone())
+            .collect();
+        match scope {
+            Some(s) if !s.is_all => {
+                let ws = self.working_set(s)?;
+                Ok(all
+                    .into_iter()
+                    .filter(|schema| {
+                        let prefix = format!("{schema}.");
+                        ws.contains(schema) || ws.iter().any(|n| n.starts_with(&prefix))
+                    })
+                    .collect())
+            }
+            _ => Ok(all),
+        }
+    }
+
+    /// Reset the database (with safety guards). `scope` restricts the dropped
+    /// schemas to that scope's working set (`None`/all-scope ⇒ everything). Roles
+    /// are only dropped on a full reset — a subset scope leaves shared roles
+    /// intact since roles are not scope-selectable.
     pub async fn reset(
         &self,
         adapter: &dyn DatabaseAdapter,
         target: &str,
         force: bool,
+        scope: Option<&ResolvedScope>,
     ) -> Result<()> {
         if !force
             && let Some(meta) = adapter.get_project_meta().await? {
@@ -1316,21 +1368,22 @@ impl Design {
                 }
             }
 
-        let roles = self
-            .config
-            .target
-            .values()
-            .next()
-            .map(|t| &t.roles[..])
-            .unwrap_or(&[]);
+        // Roles aren't scope-selectable, so only a full reset drops them; a
+        // subset scope leaves shared roles intact.
+        let is_subset = matches!(scope, Some(s) if !s.is_all);
+        let roles: &[_] = if is_subset {
+            &[]
+        } else {
+            self.config
+                .target
+                .values()
+                .next()
+                .map(|t| &t.roles[..])
+                .unwrap_or(&[])
+        };
 
-        // Collect ALL schemas — both config-declared and auto-discovered from DDL paths
-        let schemas: Vec<String> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::Schema)
-            .map(|e| e.name.clone())
-            .collect();
+        // Schemas to drop — all managed schemas, or just those the scope occupies.
+        let schemas = self.reset_target_schemas(scope)?;
         if let Some(sql) = script::build_reset_script(&schemas, roles, target, &[])
             .map_err(DbdError::SafetyGuard)? {
             adapter.execute_script(&sql).await?;
@@ -1456,10 +1509,23 @@ mod tests {
     fn graph_returns_nodes_and_edges() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
-        let graph = design.graph(None);
+        let graph = design.graph(None, None).unwrap();
 
         assert!(!graph.nodes.is_empty());
         assert!(!graph.layers.is_empty());
+    }
+
+    #[test]
+    fn graph_filters_to_scope() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+        let graph = design.graph(None, Some(&scope)).unwrap();
+
+        // Only config.* nodes survive — no staging entities in the scoped graph.
+        assert!(!graph.nodes.is_empty());
+        assert!(graph.nodes.iter().all(|n| !n.name.starts_with("staging.")));
+        assert!(graph.nodes.iter().any(|n| n.name.starts_with("config.")));
     }
 
     #[tokio::test]
@@ -1509,7 +1575,7 @@ mod tests {
         let design = Design::from_config(&config_path, "prod").unwrap();
         let mock = MockAdapter::new().with_meta("prod", 0);
 
-        let result = design.reset(&mock, "postgres", false).await;
+        let result = design.reset(&mock, "postgres", false, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
@@ -1520,7 +1586,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_meta("dev", 1);
 
-        let result = design.reset(&mock, "postgres", false).await;
+        let result = design.reset(&mock, "postgres", false, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("migrations"));
     }
@@ -1531,7 +1597,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_meta("dev", 0);
 
-        let result = design.reset(&mock, "postgres", false).await;
+        let result = design.reset(&mock, "postgres", false, None).await;
         assert!(result.is_ok());
     }
 
@@ -1541,8 +1607,25 @@ mod tests {
         let design = Design::from_config(&config_path, "prod").unwrap();
         let mock = MockAdapter::new().with_meta("prod", 5);
 
-        let result = design.reset(&mock, "postgres", true).await;
+        let result = design.reset(&mock, "postgres", true, None).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reset_target_schemas_filters_to_scope() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        // Full reset (all-scope / None) drops every managed schema.
+        let all = design.reset_target_schemas(None).unwrap();
+        assert!(all.iter().any(|s| s == "config"));
+        assert!(all.iter().any(|s| s == "staging"));
+
+        // A config-only scope drops only the schemas its working set occupies.
+        let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+        let scoped = design.reset_target_schemas(Some(&scope)).unwrap();
+        assert!(scoped.iter().any(|s| s == "config"));
+        assert!(!scoped.iter().any(|s| s == "staging"));
     }
 
     #[test]
@@ -1552,11 +1635,27 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("init.sql");
-        design.combine(&out).unwrap();
+        design.combine(&out, None).unwrap();
 
         assert!(out.exists());
         let content = std::fs::read_to_string(&out).unwrap();
         assert!(content.contains("CREATE SCHEMA"));
+    }
+
+    #[test]
+    fn combine_filters_to_scope() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("hub.sql");
+        design.combine(&out, Some(&scope)).unwrap();
+
+        let content = std::fs::read_to_string(&out).unwrap();
+        // config.* DDL present, staging.* procedures excluded from the scoped combine.
+        assert!(content.contains("config"));
+        assert!(!content.contains("staging"));
     }
 
     // ── Import plan tests ─────────────────────────────────
