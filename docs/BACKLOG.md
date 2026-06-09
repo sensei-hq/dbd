@@ -92,19 +92,28 @@ inner join lookup_values lv
 
 ## Next up
 
-### Scopes — Phase 2 (extend scope-awareness to remaining commands)
+### Scopes — Phase 2 (extend scope-awareness to remaining commands) — shipped
 
-Phase 1 (shipped) wires scopes into `inspect`/`apply`/`import`/`deploy`. Phase 2
-extends the `scope` filtering to the remaining entity-selecting commands, which
-otherwise always operate on the full set, via a shared, gap-neutral
-`Design::scoped_entities(&ResolvedScope) -> Vec<Entity>` (closure under
-`include`, the plain set under `report`; all-scope returns everything).
+Phase 1 wires scopes into `inspect`/`apply`/`import`/`deploy` (gap-gated writes).
+Phase 2 extended the filtering to every other entity-selecting command via a
+shared, gap-neutral `Design::scoped_entities(&ResolvedScope) -> Vec<Entity>`
+(closure under `include`, the plain set under `report`; all-scope returns
+everything). All shipped:
 
-- `dbml` — **shipped.** `--scope`/`--deps` filter the generated DBML to the
-  scope's working set (`Design::scoped_entities`). Documentation, so no gap gate:
-  out-of-scope FK targets still render as external stub tables.
-- `combine`, `graph`, `export`, `reset` — still operate on the full set; reuse
-  `scoped_entities` the same way.
+- `dbml` — `--scope`/`--deps` filter the generated DBML to the scope's working
+  set; out-of-scope FK targets render as external stub tables.
+- `combine` — `--scope` filters the combined SQL; `--deps include` emits a
+  self-contained closure. Always-on extensions/roles kept in every scope.
+- `graph` — `--scope` filters nodes/edges to the working set; composes with `-n`.
+- `export` — `--scope` restricts the exported table set.
+- `reset` — `--scope` restricts the dropped schemas (schema-granular; roles only
+  dropped on a full reset).
+
+These four filter only — they don't gate on dependency gaps (that stays exclusive
+to the write commands; `inspect --scope` is where gaps surface).
+
+Remaining scope work:
+
 - Optional `schema.*` wildcard matching in `includes`/`excludes` to align with
   the `ignore:` list's existing `prefix.*` syntax.
 

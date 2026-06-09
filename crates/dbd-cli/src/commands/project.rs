@@ -7,9 +7,19 @@ use dbd_core::Design;
 use super::{format_deploy_summary, get_adapter, safe_copy, safe_read, safe_write};
 use crate::output::{self, Verbosity};
 
-pub fn cmd_graph(config: &Path, env: &str, project_dir: &Path, name: Option<&str>, verbosity: Verbosity) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_graph(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let graph = design.graph(name);
+    let resolved = design.resolve_scope(scope, deps)?;
+    let graph = design.graph(name, Some(&resolved))?;
 
     let json = serde_json::json!({
         "nodes": graph.nodes.iter().map(|n| serde_json::json!({

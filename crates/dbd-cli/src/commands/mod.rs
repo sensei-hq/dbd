@@ -28,9 +28,13 @@ pub async fn run(
             schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *database, scope, deps, verbosity).await
         }
 
-        Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, verbosity),
+        Commands::Combine { file } => {
+            schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity)
+        }
 
-        Commands::Graph { name } => project::cmd_graph(config, env, project_dir, name.as_deref(), verbosity),
+        Commands::Graph { name } => {
+            project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
+        }
 
         Commands::Apply { name, dry_run, with_policies } => {
             schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, scope, deps, verbosity).await
@@ -45,7 +49,7 @@ pub async fn run(
         }
 
         Commands::Reset { target, dry_run, force } => {
-            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, verbosity).await
+            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, scope, deps, verbosity).await
         }
 
         Commands::Snapshot { list, name } => {
@@ -70,7 +74,7 @@ pub async fn run(
         }
 
         Commands::Export { name, format } => {
-            data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, verbosity).await
+            data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, scope, deps, verbosity).await
         }
 
         Commands::Dbml { file } => {

@@ -15,17 +15,15 @@ pub async fn cmd_reset(
     target: &str,
     dry_run: bool,
     force: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps)?;
 
     if dry_run {
-        let schemas: Vec<&str> = design
-            .entities()
-            .iter()
-            .filter(|e| e.entity_type == dbd_core::EntityType::Schema)
-            .map(|e| e.name.as_str())
-            .collect();
+        let schemas = design.reset_target_schemas(Some(&resolved))?;
         output::info(verbosity, "[dry-run] Would drop schemas:");
         for schema in &schemas {
             output::info(verbosity, &format!("  {schema}"));
@@ -34,7 +32,7 @@ pub async fn cmd_reset(
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    design.reset(&*adapter, target, force).await?;
+    design.reset(&*adapter, target, force, Some(&resolved)).await?;
     Ok(())
 }
 
