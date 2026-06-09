@@ -46,7 +46,10 @@ dbd inspect -n config.lookups     # Inspect one entity
 dbd inspect -v                    # Verbose: show entity JSON
 dbd inspect --silent              # Just the count
 dbd inspect --scope hub           # Validate scope + report dependency gaps
+dbd inspect --database -d $DATABASE_URL   # Resolve references against the live catalog
 ```
+
+**`--database`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums) — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
 
 ---
 
@@ -87,6 +90,8 @@ dbd import -e dev                  # Load dev-only data
 ```
 
 Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention.
+
+**Environment-specific data.** Files placed under `import/<env>/<schema>/<file>` are loaded only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment. So `import/dev/staging/seed.csv` loads on `dbd import -e dev` but not under `prod`, letting you ship dev seed data without it reaching production.
 
 ---
 
@@ -253,9 +258,22 @@ format:
   comma_style: leading       # leading | trailing
   type_alignment: 27         # column for type start, 0 = off
   indent: 2                  # spaces per level
+  query_style: river         # none (default) | river — align SELECT bodies
+  gutter: 10                 # river keyword-gutter width (fits "inner join")
 ```
 
 Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted).
+
+**River style** (`query_style: river`) right-aligns SQL keywords at the `gutter` column so the clause keywords form a "river" down the left edge, with leading-comma SELECT lists, alias alignment, and one condition per line in WHERE/HAVING/ON. It applies to `CREATE VIEW` bodies and standalone SELECTs:
+
+```sql
+    select lv.id
+         , lv.value     as display_value
+      from lookups       lkp
+inner join lookup_values lv
+        on lv.lookup_id = lkp.id
+     where lkp.name     = 'Gender';
+```
 
 ### Pre-commit
 
@@ -270,7 +288,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.4.1
+  rev: v0.4.4
   hooks:
     - id: dbd-format
 ```
