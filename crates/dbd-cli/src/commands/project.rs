@@ -29,12 +29,25 @@ pub fn cmd_graph(config: &Path, env: &str, project_dir: &Path, name: Option<&str
     Ok(())
 }
 
-pub fn cmd_dbml(config: &Path, env: &str, project_dir: &Path, file: &Path, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_dbml(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    file: &Path,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
+    // Filter to the scope's working set so the generated DBML documents only the
+    // entities that deploy under this scope. The all-scope keeps everything.
+    let resolved = design.resolve_scope(scope, deps)?;
+    let entities = design.scoped_entities(&resolved)?;
+
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
-        entities: design.entities(),
+        entities: &entities,
         project_name: &design.config().project.name,
         database_type: &design.config().source.dialect,
         project_note: design.config().project.note.as_deref(),

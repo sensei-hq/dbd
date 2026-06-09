@@ -411,6 +411,37 @@ fn dbml_includes_refs() {
     assert!(doc.content.contains("Ref:"), "DBML should contain FK refs");
 }
 
+#[test]
+fn dbml_respects_scope_filtering() {
+    use std::collections::HashSet;
+    let d = design();
+    // Select only config.lookups — config.lookup_values must drop out of the
+    // generated DBML, proving `dbml` documents the scope's working set.
+    let scope = dbd_core::ResolvedScope {
+        name: "just_lookups".to_string(),
+        entities: HashSet::from(["config.lookups".to_string()]),
+        excluded: HashSet::new(),
+        deps: dbd_core::config::DepsPolicy::Report,
+        is_all: false,
+    };
+    let entities = d.scoped_entities(&scope).unwrap();
+
+    let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
+        entities: &entities,
+        project_name: &d.config().project.name,
+        database_type: &d.config().source.dialect,
+        project_note: d.config().project.note.as_deref(),
+        docs: &d.config().dbml,
+    });
+    let combined: String = docs.iter().map(|doc| doc.content.as_str()).collect();
+
+    assert!(combined.contains("lookups"), "in-scope table should appear");
+    assert!(
+        !combined.contains("lookup_values"),
+        "out-of-scope table must not appear in DBML"
+    );
+}
+
 // ── Scenario: Doctor / config migration ─────────────────
 
 #[test]

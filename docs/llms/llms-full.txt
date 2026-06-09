@@ -228,9 +228,11 @@ dbd deploy --scope hub --database $HUB_URL
 - Per-scope migrations fall out automatically: pending-migration steps for
   out-of-scope entities are skipped while the per-database version still advances.
 
-Phase 1 wires scopes into `inspect`, `apply`, `import`, and `deploy`. Other
-entity-selecting commands (`dbml`, `combine`, `graph`, `export`, `reset`) remain
-full-set for now.
+Scopes are honored by `inspect`, `apply`, `import`, `deploy`, and `dbml`. The
+write commands gate on dependency gaps; `dbml` documents the scope's working set
+without gating (out-of-scope FK targets render as external stub tables). The
+remaining entity-selecting commands (`combine`, `graph`, `export`, `reset`)
+remain full-set for now.
 
 ---
 
@@ -333,9 +335,13 @@ dbd graph -n config.lookups
 ```sh
 dbd dbml                       # writes design.dbml (when no dbml keys configured)
 dbd dbml -f schema.dbml        # custom path; multi-doc keeps the directory, replaces filename
+dbd dbml --scope hub -f hub.dbml      # document only the 'hub' scope's working set
+dbd dbml --scope hub --deps include   # expand to the dependency closure first
 ```
 
 When `design.yaml` declares multiple `dbml.<key>` entries, `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`).
+
+`--scope`/`--deps` are honored: the generated DBML covers the scope's working set (the closure under `deps: include`, the plain selection under `report`). `dbml` documents rather than deploys, so it does not gate on dependency gaps — out-of-scope FK targets still render as external stub tables.
 
 Per-doc options:
 

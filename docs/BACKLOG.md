@@ -95,12 +95,16 @@ inner join lookup_values lv
 ### Scopes — Phase 2 (extend scope-awareness to remaining commands)
 
 Phase 1 (shipped) wires scopes into `inspect`/`apply`/`import`/`deploy`. Phase 2
-extends the `scope: Option<&ResolvedScope>` filtering to the remaining
-entity-selecting commands, which currently always operate on the full set:
+extends the `scope` filtering to the remaining entity-selecting commands, which
+otherwise always operate on the full set, via a shared, gap-neutral
+`Design::scoped_entities(&ResolvedScope) -> Vec<Entity>` (closure under
+`include`, the plain set under `report`; all-scope returns everything).
 
-- `dbml`, `combine`, `graph`, `export`, `reset` — accept `--scope` and filter to
-  the resolved working set (signatures already carry the scope arg where it
-  threads through `Design`; this is behavior, not API churn).
+- `dbml` — **shipped.** `--scope`/`--deps` filter the generated DBML to the
+  scope's working set (`Design::scoped_entities`). Documentation, so no gap gate:
+  out-of-scope FK targets still render as external stub tables.
+- `combine`, `graph`, `export`, `reset` — still operate on the full set; reuse
+  `scoped_entities` the same way.
 - Optional `schema.*` wildcard matching in `includes`/`excludes` to align with
   the `ignore:` list's existing `prefix.*` syntax.
 
