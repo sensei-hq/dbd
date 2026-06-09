@@ -53,15 +53,44 @@ fn universe(all_entities: &[Entity]) -> HashSet<String> {
         .collect()
 }
 
-/// Resolve one scope item (a bare schema token or a qualified entity name)
-/// into the set of scopable entity names it selects. Errors if it matches
-/// nothing — typo protection.
+/// Resolve one scope item into the set of scopable entity names it selects.
+/// Errors if it matches nothing — typo protection.
 ///
-/// A bare schema token selects every scopable entity under the schema PLUS
-/// the schema entity itself. A declared-but-empty schema therefore resolves
-/// to just its `CREATE SCHEMA` entity rather than an error (the schema is
-/// real, so it is not a typo).
+/// Three forms:
+/// - `schema.*` — wildcard: every scopable entity under `schema` (same `prefix.*`
+///   syntax as the `ignore:` list). Unlike a bare schema token it does NOT carry
+///   the `CREATE SCHEMA` entity itself, so `excludes: [schema.*]` drops the tables
+///   but keeps the schema. (`add_present_schemas` re-adds it for `includes`.)
+/// - `schema.entity` — one qualified entity.
+/// - `schema` — a bare schema token: every scopable entity under the schema PLUS
+///   the schema entity itself. A declared-but-empty schema resolves to just its
+///   `CREATE SCHEMA` entity rather than an error (the schema is real, not a typo).
 fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
+    if let Some(prefix) = item.strip_suffix(".*") {
+        // `prefix.*` — every scopable entity whose name is `prefix.<something>`,
+        // matched the same way the `ignore:` list matches `prefix.*` patterns.
+        let names: HashSet<String> = all_entities
+            .iter()
+            .filter(|e| is_scopable(e))
+            .filter(|e| {
+                e.name.starts_with(prefix)
+                    && e.name.len() > prefix.len()
+                    && e.name.as_bytes()[prefix.len()] == b'.'
+            })
+            .map(|e| e.name.clone())
+            .collect();
+        // A real-but-empty schema is not a typo; an unknown prefix is.
+        let schema_exists = all_entities
+            .iter()
+            .any(|e| e.entity_type == EntityType::Schema && e.name == prefix);
+        if names.is_empty() && !schema_exists {
+            return Err(DbdError::Config(format!(
+                "scope item '{item}' matches no known entity"
+            )));
+        }
+        return Ok(names);
+    }
+
     if item.contains('.') {
         let exists = all_entities.iter().any(|e| is_scopable(e) && e.name == item);
         if !exists {
@@ -377,6 +406,39 @@ mod tests {
         assert!(s.entities.contains("config")); // schema auto-added
         assert!(!s.entities.contains("app.orders"));
         assert!(!s.entities.contains("app")); // other schema entity absent
+    }
+
+    #[test]
+    fn resolve_wildcard_include_selects_schema_entities() {
+        // `config.*` selects every entity under config; add_present_schemas
+        // re-adds the schema entity, so the net effect matches bare `config`.
+        let scopes = scopes_yaml("hub:\n  includes: [config.*]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
+        assert!(s.entities.contains("config.lookups"));
+        assert!(s.entities.contains("config.lookup_values"));
+        assert!(s.entities.contains("config")); // schema re-added
+        assert!(!s.entities.contains("app.orders"));
+        assert!(!s.entities.contains("app"));
+    }
+
+    #[test]
+    fn resolve_wildcard_exclude_keeps_schema_drops_tables() {
+        // `excludes: [config.*]` drops config's tables but leaves the CREATE
+        // SCHEMA entity intact — the distinction from bare `excludes: [config]`.
+        let scopes = scopes_yaml("rep:\n  excludes: [config.*]\n");
+        let s = resolve(&scopes, Some("rep"), None, &world(), &[]).unwrap();
+        assert!(!s.entities.contains("config.lookups"));
+        assert!(!s.entities.contains("config.lookup_values"));
+        assert!(s.entities.contains("config")); // schema entity preserved
+        assert!(s.entities.contains("app.orders")); // other schema untouched
+        assert!(s.excluded.contains("config.lookups"));
+    }
+
+    #[test]
+    fn resolve_wildcard_unknown_prefix_errors() {
+        let scopes = scopes_yaml("hub:\n  includes: [ghost.*]\n");
+        let err = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap_err();
+        assert!(err.to_string().contains("matches no known"));
     }
 
     #[test]

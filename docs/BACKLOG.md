@@ -1,8 +1,8 @@
 # Backlog
 
-## Current status (2026-06-05)
+## Current status (2026-06-09)
 
-**v0.4.1, 486 tests (442 unit + 43 integration + 1 doc)**
+**v0.4.4, 502 tests (450 core + 3 CLI + 48 integration + 1 doc; plus the embedded-Postgres suite behind a feature flag)**
 
 ### Working commands
 
@@ -11,11 +11,11 @@
 | `inspect` | yes | — | Validation pipeline, `--fix` auto-formats DDL |
 | `apply` | `--dry-run` | yes | Version-aware migrations, `--with-policies` |
 | `import` | `--dry-run` | yes | CSV/TSV/JSONL, truncate, procedure matching, env filtering |
-| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl |
-| `reset` | `--dry-run` | yes | Whitelist-only schema drops, protected schemas |
-| `combine` | yes | — | Merge all DDL into single SQL file |
-| `graph` | yes | — | JSON with nodes/edges/layers |
-| `dbml` | yes | — | Include/exclude filters, external entity stubs |
+| `export` | — | yes | COPY TO STDOUT → csv/tsv/jsonl; `--scope` filters tables |
+| `reset` | `--dry-run` | yes | Whitelist-only schema drops, protected schemas; `--scope` restricts schemas |
+| `combine` | yes | — | Merge all DDL into single SQL file; `--scope` filters |
+| `graph` | yes | — | JSON with nodes/edges/layers; `--scope` filters |
+| `dbml` | yes | — | Include/exclude filters, external entity stubs; `--scope` filters |
 | `doctor` | yes | — | Config migration from Node.js format |
 | `snapshot` | yes | — | Smart multi-snapshot (rename, type change, enum removal) |
 | `migrate --status` | — | yes | Read-only version diagnostic |
@@ -51,7 +51,7 @@
 - **SQLite trigger-aware splitter** — `format`'s statement splitter keeps `CREATE TRIGGER … BEGIN <stmts;> END;` as a single block (CASE…END inside the body and bare `BEGIN; … COMMIT;` transactions both behave correctly)
 - **SQLite batched imports** — `import_delimited` + `import_jsonl` now flush rows in `(?,?), (?,?), …` multi-row VALUES batches (≤500 rows or 32k binds per batch, whichever is tighter), still inside a single transaction; JSONL detects column-set changes and flushes between groups
 - **DBML multi-document + groups** — `design.yaml` `dbml.<key>` entries can each declare their own `include`/`exclude`, `output: filename.dbml`, `auto_group_by_schema`, and explicit `groups: [{name, tables}]`; `dbd_core::dbml::generate_all` returns one `DbmlDocument` per key; CLI writes each into the parent directory of the user-supplied output path. Composite FKs (single-column and multi-column constraints) render as `Ref: t.(c1, c2) > o.(c1, c2)`
-- **Scopes — multi-target subset deploy** — `design.yaml` `scopes:` declare named entity selections (`includes`/`excludes` of schemas or specific entities) so one design deploys to multiple databases (e.g. full primary DB + smaller embedded-postgres hub). Orthogonal to `target` (DB platform) and connection — paired at run time via global `--scope`/`--deps`. Pure `scope.rs` (`resolve`/`analyze_gaps`/`closure` over the `refers` graph): `deps: report` (default) makes a dependency gap a hard error (`inspect --scope` lists gaps with their chain and exits non-zero; `apply`/`import`/`deploy` refuse, incl. `--dry-run`); `deps: include` auto-expands to the transitive closure; `external:` is the only "satisfied elsewhere" door. Per-scope migrations fall out via `build_execution_plan` intersection (version meta is per-database). Phase 1: `inspect`/`apply`/`import`/`deploy` (others full-set — see Next up)
+- **Scopes — multi-target subset deploy** — `design.yaml` `scopes:` declare named entity selections (`includes`/`excludes` of schemas or specific entities) so one design deploys to multiple databases (e.g. full primary DB + smaller embedded-postgres hub). Orthogonal to `target` (DB platform) and connection — paired at run time via global `--scope`/`--deps`. Pure `scope.rs` (`resolve`/`analyze_gaps`/`closure` over the `refers` graph): `deps: report` (default) makes a dependency gap a hard error (`inspect --scope` lists gaps with their chain and exits non-zero; `apply`/`import`/`deploy` refuse, incl. `--dry-run`); `deps: include` auto-expands to the transitive closure; `external:` is the only "satisfied elsewhere" door. Per-scope migrations fall out via `build_execution_plan` intersection (version meta is per-database). **All commands are scope-aware**: the write commands (`inspect`/`apply`/`import`/`deploy`) gate on gaps; the documentation/read/destructive commands (`dbml`/`combine`/`graph`/`export`/`reset`) filter to the working set via the shared `Design::scoped_entities` primitive (no gate). `includes`/`excludes` accept a bare schema, a qualified entity, or a `schema.*` wildcard (same `prefix.*` syntax as `ignore:`; the wildcard drops a schema's entities while keeping the schema).
 
 ### DDL formatter v2 — river style (✓ done)
 
@@ -92,30 +92,7 @@ inner join lookup_values lv
 
 ## Next up
 
-### Scopes — Phase 2 (extend scope-awareness to remaining commands) — shipped
-
-Phase 1 wires scopes into `inspect`/`apply`/`import`/`deploy` (gap-gated writes).
-Phase 2 extended the filtering to every other entity-selecting command via a
-shared, gap-neutral `Design::scoped_entities(&ResolvedScope) -> Vec<Entity>`
-(closure under `include`, the plain set under `report`; all-scope returns
-everything). All shipped:
-
-- `dbml` — `--scope`/`--deps` filter the generated DBML to the scope's working
-  set; out-of-scope FK targets render as external stub tables.
-- `combine` — `--scope` filters the combined SQL; `--deps include` emits a
-  self-contained closure. Always-on extensions/roles kept in every scope.
-- `graph` — `--scope` filters nodes/edges to the working set; composes with `-n`.
-- `export` — `--scope` restricts the exported table set.
-- `reset` — `--scope` restricts the dropped schemas (schema-granular; roles only
-  dropped on a full reset).
-
-These four filter only — they don't gate on dependency gaps (that stays exclusive
-to the write commands; `inspect --scope` is where gaps surface).
-
-Remaining scope work:
-
-- Optional `schema.*` wildcard matching in `includes`/`excludes` to align with
-  the `ignore:` list's existing `prefix.*` syntax.
+_(scopes fully shipped — see Core features; nothing queued)_
 
 ---
 

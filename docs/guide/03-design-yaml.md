@@ -154,15 +154,21 @@ scopes:
     includes: [config, app.users, app.sessions]   # whole schema or specific entity
     deps: report                                    # report (default) | include
   reporting:
-    excludes: [staging, app.audit_log]
+    excludes: [staging.*, app.audit_log]           # wildcard drops a schema's entities
 ```
 
-Each entry in `includes`/`excludes` is a schema name (selects the whole schema plus the schema entity itself) or a qualified entity like `app.users`. `includes` omitted means start from the full set; `excludes` removes from it.
+Each entry in `includes`/`excludes` is one of three forms:
+
+- **`schema`** — a bare schema token: every entity in the schema **plus the `CREATE SCHEMA` entity itself**.
+- **`schema.entity`** — one qualified entity (e.g. `app.users`).
+- **`schema.*`** — a wildcard matching every entity under the schema, using the same `prefix.*` syntax as the [`ignore`](#ignore) list. Unlike the bare schema token it does **not** carry the schema entity, so `excludes: [staging.*]` drops staging's tables while keeping the `staging` schema, whereas `excludes: [staging]` drops the schema too. For `includes`, `schema.*` and `schema` are equivalent (the schema entity is re-added because its entities are present).
+
+`includes` omitted means start from the full set; `excludes` removes from it. An unknown name or wildcard prefix that matches nothing is an error (typo protection).
 
 | Field      | Type   | Default  | Description |
 |------------|--------|----------|-------------|
-| `includes` | list   | (all)    | Schema names or qualified entities to include |
-| `excludes` | list   | (none)   | Schema names or qualified entities to remove from the set |
+| `includes` | list   | (all)    | Schema names, qualified entities, or `schema.*` wildcards to include |
+| `excludes` | list   | (none)   | Schema names, qualified entities, or `schema.*` wildcards to remove from the set |
 | `deps`     | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
 
 **`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`import`/`deploy` refuse to proceed until gaps are resolved — including their `--dry-run` modes, so a dry-run surfaces the same error a real run would.
