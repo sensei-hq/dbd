@@ -33,6 +33,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `postgresql_embedded` downloads and runs its own PostgreSQL, so no
-      # service container or DATABASE_URL is required.
+      # service container or DATABASE_URL is required. Run serially: each test
+      # boots its own instance, and concurrent setup() races on the shared
+      # binary-install/cache dir.
       - name: cargo test (embedded-tests)
-        run: cargo test -p dbd-core --features embedded-tests --test embedded_test
+        run: cargo test -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
