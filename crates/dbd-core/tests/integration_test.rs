@@ -599,6 +599,31 @@ fn scope_complete_has_no_gaps() {
 }
 
 #[test]
+fn scope_wildcard_include_matches_schema_token() {
+    // `config.*` (wildcard) resolves to the same working set as bare `config`.
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let wild = design.resolve_scope(Some("config_wild"), None).unwrap();
+    assert!(wild.entities.contains("config.lookups"));
+    assert!(wild.entities.contains("config.lookup_values"));
+    assert!(wild.entities.contains("config")); // schema re-added
+    assert!(!wild.entities.iter().any(|n| n.starts_with("staging.")));
+}
+
+#[test]
+fn scope_wildcard_exclude_keeps_schema() {
+    // `excludes: [staging.*]` drops staging's entities but keeps the schema.
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/design.yaml");
+    let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
+    let scope = design.resolve_scope(Some("drop_staging"), None).unwrap();
+    assert!(!scope.entities.iter().any(|n| n.starts_with("staging.")));
+    assert!(scope.entities.contains("staging")); // CREATE SCHEMA entity preserved
+    assert!(scope.entities.contains("config.lookups")); // other schemas untouched
+}
+
+#[test]
 fn scope_incomplete_reports_gap() {
     let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/design.yaml");

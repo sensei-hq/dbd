@@ -51,13 +51,15 @@ dbml:
 
 scopes:                        # named entity subsets — deploy one design to many DBs
   hub:
-    includes: [config, app.users]   # schema (all its entities) or specific entity
+    includes: [config, app.users]   # schema | schema.entity | schema.* (wildcard)
     deps: report               # report (default, errors on gaps) | include (auto-closure)
+  reporting:
+    excludes: [staging.*]      # wildcard drops a schema's entities but keeps the schema
 
 ignore: [bfs, my_company.*]
 ```
 
-Scopes are orthogonal to `target` (DB platform) and the connection: pair them at run time with `dbd deploy --scope hub --database $HUB_URL`. A dependency gap (in-scope entity referencing a managed entity outside the scope) is an error under `report`; `external:` entities are never gaps. Omit `default`/the block ⇒ full set.
+Scopes are orthogonal to `target` (DB platform) and the connection: pair them at run time with `dbd deploy --scope hub --database $HUB_URL`. `includes`/`excludes` items are a bare schema (its entities + the schema entity), a qualified `schema.entity`, or a `schema.*` wildcard (same `prefix.*` syntax as `ignore:`; drops a schema's entities while keeping the schema — for `includes`, `schema.*` ≡ `schema`). A dependency gap (in-scope entity referencing a managed entity outside the scope) is an error under `report`; `external:` entities are never gaps. Omit `default`/the block ⇒ full set.
 
 ## Commands
 

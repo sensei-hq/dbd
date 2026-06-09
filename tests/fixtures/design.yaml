@@ -71,3 +71,9 @@ scopes:
     includes:
       - config.lookup_values
     deps: include
+  config_wild:
+    includes:
+      - config.*          # wildcard: every entity under the config schema
+  drop_staging:
+    excludes:
+      - staging.*         # wildcard: drop staging's entities, keep the schema

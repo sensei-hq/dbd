@@ -210,9 +210,15 @@ connection — you pair a scope with a database at run time:
 dbd deploy --scope hub --database $HUB_URL
 ```
 
-- Each scope has `includes:` and/or `excludes:`, each listing **schemas** (all
-  entities in the schema, plus the schema itself) or **specific entities**
-  (`app.users`). Empty `includes` ⇒ start from the full set; `excludes` removes.
+- Each scope has `includes:` and/or `excludes:`, each item being one of:
+  **a bare schema** (`config` — all its entities plus the `CREATE SCHEMA` entity),
+  **a qualified entity** (`app.users`), or **a `schema.*` wildcard** (every entity
+  under the schema, same `prefix.*` syntax as the `ignore:` list). The wildcard
+  does NOT carry the schema entity, so `excludes: [staging.*]` drops staging's
+  tables but keeps the `staging` schema, while `excludes: [staging]` drops the
+  schema too; for `includes`, `schema.*` and `schema` are equivalent. An unknown
+  name or wildcard prefix that matches nothing is an error (typo protection).
+  Empty `includes` ⇒ start from the full set; `excludes` removes.
 - `deps: report | include` (default `report`):
   - `report` — a **dependency gap** (an in-scope entity referencing a managed
     entity outside the scope) is an error. `dbd inspect --scope X` lists the gaps
