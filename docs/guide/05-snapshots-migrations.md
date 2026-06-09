@@ -62,7 +62,7 @@ migrations/002/
 
 The apply engine runs *.sql first, then *.data.sql for the same entity.
 
-Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable corrections (enum value mapping) generate TODO comments that the developer must fill in before committing.
+Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable corrections (enum value mapping) generate TODO comments that the developer must fill in before committing. These are enforced: `dbd inspect` surfaces any unresolved `-- TODO:` in migration files, and `dbd apply` refuses to run while pending TODOs remain — so an unfinished migration can't reach the database.
 
 ## Listing snapshots
 
