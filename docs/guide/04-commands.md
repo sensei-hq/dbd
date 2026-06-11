@@ -10,7 +10,6 @@ All commands accept these options:
 | `--database` | `-d` | `$DATABASE_URL` | Database connection URL |
 | `--environment` | `-e` | `prod` | Environment (dev or prod) |
 | `--source` | `-s` | `.` | Project directory or GitHub repo |
-| `--target` | `-t` | first in config | Target name from design.yaml |
 | `--scope` | | (all) | Named scope from `scopes:` in design.yaml |
 | `--deps` | | (scope default) | Override scope's `deps` setting: `report` or `include` |
 | `--verbose` | `-v` | | Show all details (entity list, full JSON) |

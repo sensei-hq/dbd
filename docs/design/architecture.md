@@ -477,8 +477,8 @@ source:
   dialect: postgresql                  # Parser dialect (default: postgresql)
 
 # ── Target: where to deploy ───────────────────────────
-# Multiple targets allowed. CLI selects with --target flag.
-# Default target is the first one listed.
+# The first target listed is used (platform config + default url).
+# Adapter is chosen by the url scheme; override the url per run with -d.
 target:
   postgres:
     url: $DATABASE_URL
@@ -601,7 +601,7 @@ ignore:
 
 **`source.dialect` vs `target`** — the source is the DDL language. The target is where you deploy. They're independent: PostgreSQL DDL can deploy to Convex (TypeScript generation). Default dialect is `postgresql` since that's what existing projects use.
 
-**Multiple targets** — a project can declare multiple targets. The CLI selects one via `--target postgres` (defaults to the first listed). This supports the common pattern of deploying the same schema to Postgres for production and Convex for the frontend.
+**Multiple targets** — the config schema allows several `target.<name>` entries, but **the first one listed is the one used** — there is no run-time target-name selector. The adapter is chosen by the connection URL scheme (`postgres://` / `sqlite://` / `convex:`), and the URL is overridable per run with `--database`/`$DATABASE_URL`. To deploy one design to several databases, pair `--database` with `scopes` rather than relying on multiple target blocks. (A `--target` selector could be wired through `Config::get_target(Some(name))`, which already exists, if per-name selection is wanted later.)
 
 **Connection URL in config** — optionally declare the URL per target. Environment variable references (`$DATABASE_URL`) are expanded at runtime. CLI `--database` flag overrides. This means `dbd apply` can work without any CLI flags if the config has the URL.
 
@@ -1318,10 +1318,7 @@ struct Cli {
     /// Source directory or GitHub repo (owner/repo/path)
     #[arg(short, long, default_value = ".", global = true)]
     source: String,
-
-    /// Target name from design.yaml (defaults to first listed target)
-    #[arg(short, long, global = true)]
-    target: Option<String>,
+    // … plus --scope / --deps / --verbose (all global = true)
 }
 
 #[derive(Subcommand)]
