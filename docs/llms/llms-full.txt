@@ -224,8 +224,9 @@ dbd deploy --scope hub --database $HUB_URL
     entity outside the scope) is an error. `dbd inspect --scope X` lists the gaps
     with their dependency chain and exits non-zero; `apply`/`import`/`deploy`
     refuse (including `--dry-run`).
-  - `include` — `deploy` auto-expands the scope to the transitive dependency
-    closure.
+  - `include` — the working set auto-expands to the transitive dependency
+    closure before the command runs (every scope-aware command, not just
+    `deploy`).
 - A reference to an `external:` entity is never a gap — `external:` is the only
   "satisfied elsewhere" mechanism (there is no "ignore gaps" mode).
 - Omit `default` (or the whole `scopes:` block) ⇒ the full set is used. Define a
