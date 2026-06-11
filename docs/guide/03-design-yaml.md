@@ -179,6 +179,30 @@ Each entry in `includes`/`excludes` is one of three forms:
 
 Omit the `scopes:` block (or don't define `default:`) to deploy the full entity set. Define `default:` only if a bare `dbd deploy` should deploy a subset.
 
+#### Worked example: a schema as an optional add-on
+
+A common pattern is an optional schema (say `hive`) that ships to a dedicated database, while the main database deploys everything *except* it. Define one scope that includes the add-on and a `default` that excludes it:
+
+```yaml
+scopes:
+  hive:
+    includes: [hive]      # only the hive schema (its entities + the CREATE SCHEMA)
+    deps: include         # auto-pull any shared tables hive references
+  default:
+    excludes: [hive]      # the full set minus hive (the schema isn't even created)
+```
+
+```sh
+dbd deploy --scope hive -d $HIVE_URL   # the hive database: only hive
+dbd deploy -d $MAIN_URL                # no --scope ⇒ the `default` scope ⇒ everything except hive
+dbd deploy --scope all -d $MAIN_URL    # the true full set, including hive (bypasses `default`)
+```
+
+Two choices worth understanding:
+
+- **`excludes: [hive]` vs `excludes: [hive.*]`.** The bare token drops hive's entities *and* the `CREATE SCHEMA hive` statement, so the main DB never creates the schema — usually what you want. Use `hive.*` instead if the empty schema should still exist on the main DB.
+- **`deps: include` on `hive`.** If hive tables reference shared tables in other schemas, a `report`-policy `--scope hive` would fail with a dependency gap. `deps: include` expands the working set to pull those dependencies in automatically; alternatively list them in `includes` or declare them under [`external`](#external). Run `dbd inspect --scope hive` to see any gaps before deploying.
+
 ### `import`
 
 | Field     | Type   | Description |
