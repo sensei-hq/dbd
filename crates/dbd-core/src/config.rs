@@ -84,6 +84,17 @@ pub struct ScopeSpec {
     pub excludes: Vec<String>,
     #[serde(default)]
     pub deps: DepsPolicy,
+    /// Per-scope extension allowlist. `None` = all target extensions apply
+    /// (default). `Some(list)` = only these apply (`Some([])` = none) — lets a
+    /// scope target a database that lacks an extension (e.g. an embedded PG
+    /// without pgvector).
+    ///
+    /// List each extension by the same name dbd uses for it: the bare
+    /// extension name (e.g. `vector`, `postgis`, `uuid-ossp`), NOT a
+    /// schema-qualified name — even for extensions declared with a `schema:`,
+    /// the entity name remains the bare extension name.
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
 }
 
 // ── Project ─────────────────────────────────────────────
@@ -677,6 +688,61 @@ scopes:
         };
         assert_eq!(rep.excludes, vec!["staging"]);
         assert_eq!(rep.deps, DepsPolicy::Report); // default
+    }
+
+    #[test]
+    fn scope_extensions_allowlist_parses() {
+        let yaml = "\
+project:
+  name: t
+scopes:
+  hive:
+    includes: [config]
+    extensions: [vector]
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let hive = match config.scopes.get("hive").unwrap() {
+            ScopeEntry::Spec(s) => s,
+            _ => panic!("expected spec"),
+        };
+        assert_eq!(hive.extensions, Some(vec!["vector".to_string()]));
+    }
+
+    #[test]
+    fn scope_extensions_empty_list_parses_to_some_empty() {
+        // `extensions: []` opts out of ALL extensions (distinct from absent).
+        let yaml = "\
+project:
+  name: t
+scopes:
+  hive:
+    includes: [config]
+    extensions: []
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let hive = match config.scopes.get("hive").unwrap() {
+            ScopeEntry::Spec(s) => s,
+            _ => panic!("expected spec"),
+        };
+        assert_eq!(hive.extensions, Some(vec![]));
+    }
+
+    #[test]
+    fn scope_without_extensions_field_parses_to_none() {
+        // Absent field → None → today's always-on behavior preserved.
+        let yaml = "\
+project:
+  name: t
+scopes:
+  hub:
+    includes: [config]
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let hub = match config.scopes.get("hub").unwrap() {
+            ScopeEntry::Spec(s) => s,
+            _ => panic!("expected spec"),
+        };
+        assert_eq!(hub.extensions, None);
     }
 
     #[test]
