@@ -173,7 +173,7 @@ Each entry in `includes`/`excludes` is one of three forms:
 
 **`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`import`/`deploy` refuse to proceed until gaps are resolved — including their `--dry-run` modes, so a dry-run surfaces the same error a real run would.
 
-**`deps: include`** — `deploy` silently expands the working set to the full transitive dependency closure before applying.
+**`deps: include`** — the working set silently expands to the full transitive dependency closure before the command runs. This applies to every scope-aware command (`apply`, `import`, `deploy`, `combine`, `dbml`, `graph`, `export`), not just `deploy`.
 
 `external:` entries are never considered gaps regardless of `deps` setting.
 
