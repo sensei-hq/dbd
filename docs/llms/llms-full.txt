@@ -258,15 +258,18 @@ plain set under `report`, everything for the all-scope).
 | `--database` | `-d` | `$DATABASE_URL` | Database URL (overrides config) |
 | `--environment` | `-e` | `prod` | Environment (dev or prod) |
 | `--source` | `-s` | `.` | Source directory or GitHub repo |
-| `--target` | `-t` | first in config | Target name from design.yaml |
 | `--scope` | | full set | Scope name from design.yaml (entity subset) |
 | `--deps` | | scope's own | Gap policy override: `report` or `include` |
 
+The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL scheme**, not a target name; the first `target.<name>` block in design.yaml supplies the platform config and default `url`. There is no target-name selector — override the connection per run with `-d`/`$DATABASE_URL` (pair with `--scope` for multi-database deploys).
+
 ### dbd init
 
+`-t`/`--target` here is the **platform** to scaffold (`postgres` | `supabase`), not a design.yaml target name.
+
 ```sh
-dbd init -p myproject
-dbd init -p myproject --target supabase
+dbd init -n myproject
+dbd init -n myproject --target supabase
 ```
 
 ### dbd inspect

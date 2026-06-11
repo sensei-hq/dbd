@@ -38,10 +38,6 @@ pub struct Cli {
     #[arg(short, long, default_value = ".", global = true)]
     pub source: String,
 
-    /// Target name from design.yaml
-    #[arg(short, long, global = true)]
-    pub target: Option<String>,
-
     /// Verbose output (show all details)
     #[arg(short, long, global = true)]
     pub verbose: bool,

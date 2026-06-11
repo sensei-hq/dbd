@@ -77,7 +77,14 @@ ignore:
 
 ### `target`
 
-Each key is a target name. The first listed target is the default. Select with `--target` CLI flag.
+Each key is a target name. **The first listed target is used** — it supplies the platform config (extensions, roles, grants, `skip_schemas`) and its `url`, unless the URL is overridden per run by `-d`/`--database` or `$DATABASE_URL`. Additional entries are not selectable at run time (there is no target-name selector), so a second target only documents intent. To deploy one design to several databases, keep a single target and pair `-d`/`--database` with [`scopes`](#scopes):
+
+```sh
+dbd deploy --scope hive -d $HIVE_URL    # the adapter is chosen by the URL scheme
+dbd deploy -d $MAIN_URL
+```
+
+The adapter (PostgreSQL/SQLite/Convex) is selected from the **URL scheme** (`postgres://`, `sqlite://`/`file:`, `convex:`), not the target name — so the target key is just a label.
 
 **PostgreSQL / Supabase:**
 
