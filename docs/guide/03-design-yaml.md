@@ -231,7 +231,8 @@ Two choices worth understanding:
 |-----------|--------|-------------|
 | `staging` | list   | Schemas allowed for import (import fails for other schemas) |
 | `options` | object | Default options: `truncate`, `null_value`, `format` |
-| `tables`  | list   | Explicit table list (string or `{name: options}`) |
+| `tables`  | list   | Explicit table list (string or `{name: options}`); per-table `options` may include `env` (load only under matching `-e`) |
+| `after`   | list   | SQL scripts (project-relative paths) run after data load — e.g. `import/loader.sql` |
 
 ### `export`
 
