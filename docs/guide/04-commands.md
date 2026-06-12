@@ -320,11 +320,11 @@ Failed policies are logged and skipped (fail-forward). Exit code 1 if any failur
 
 ## `dbd doctor`
 
-Audit and migrate design.yaml configuration.
+Audit and migrate project configuration and layout.
 
 ```sh
 dbd doctor                         # Show issues
-dbd doctor --fix                   # Migrate to new format (creates .yaml.bak)
+dbd doctor --fix                   # Apply fixes (config migration creates .yaml.bak)
 ```
 
 Detects and migrates old Node.js config format:
@@ -333,6 +333,8 @@ Detects and migrates old Node.js config format:
 - `nullValue` → `null_value`
 - `project.staging` → `import.staging`
 - `project.dbdocs` → top-level `dbml`
+
+Removes stale files that dbd now manages internally, and migrates **plural DDL type folders to singular** (`ddl/functions/` → `ddl/function/`, etc.). When a singular folder already exists the contents are merged; on a same-name collision the newer file is kept and the older is backed up as `<name>.ddl.bkp` (each backup is reported). See [DDL folder layout](02-getting-started.md#ddl-folder-layout).
 
 ---
 

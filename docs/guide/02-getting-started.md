@@ -34,6 +34,30 @@ ddl/
 import/.gitkeep
 ```
 
+## DDL folder layout
+
+dbd auto-discovers entities from the `ddl/` tree — you never list tables, views, functions, etc. in `design.yaml`. The path encodes the entity's **type** and **schema**:
+
+```
+ddl/<type>/<schema>/<name>.ddl     # schema-qualified types
+ddl/role/<name>.ddl                # roles have no schema
+```
+
+`<type>` is one of `table`, `view`, `function`, `procedure`, `enum`, or `role`. The file name (minus extension) is the entity name and the parent folder is its schema:
+
+```
+ddl/
+  table/config/lookups.ddl         →  table     config.lookups
+  view/config/active_users.ddl     →  view      config.active_users
+  function/billing/charge.ddl      →  function  billing.charge
+  enum/config/status.ddl           →  enum      config.status
+  role/admin.ddl                   →  role      admin
+```
+
+Files use the `.ddl` or `.sql` extension. Schemas are auto-added from these paths, so a `ddl/table/config/…` file implies the `config` schema even if it isn't listed under `schemas:`.
+
+**Use the singular type folder** (`table`, `function`, …) — it's canonical. The plural form (`functions/`, `tables/`, …) is still accepted for backward compatibility, but `dbd doctor` flags it and `dbd doctor --fix` migrates plural folders to singular. If a singular folder already exists, the contents are merged in; on a same-name file collision the **newer** file (by modification time) is kept and the older one is saved alongside as `<name>.ddl.bkp` (reported so you can reconcile).
+
 ## Configure
 
 Edit `design.yaml`:

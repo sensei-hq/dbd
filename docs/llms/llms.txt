@@ -6,7 +6,7 @@ dbd parses SQL DDL files, resolves dependencies, generates migrations, loads dat
 
 ## Core concept
 
-SQL files are the source of truth. File path determines the entity name:
+SQL files are the source of truth. Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema): `<type>` ∈ table|view|function|procedure|enum|role, ext `.ddl`|`.sql`. Folder = type, parent = schema, filename = entity name. Singular type folder is canonical (plural accepted but `dbd doctor --fix` migrates it to singular).
 - `ddl/table/config/lookups.ddl` → entity `config.lookups` (table)
 - `ddl/view/config/genders.ddl` → entity `config.genders` (view)
 - `ddl/procedure/staging/import_lookups.ddl` → entity `staging.import_lookups` (procedure)
@@ -76,7 +76,7 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd snapshot` — diff vs latest snapshot, generate migration SQL; smart multi-snapshot splits renames/type-changes/enum-removals into safe stages (with `*.data.sql` corrections)
 - `dbd migrate` — show migration status (read-only; `--status`). Pending migrations are run by `dbd apply`, not here
 - `dbd policies` — apply RLS policies from `policies/<schema>/<table>.sql` (idempotent, fail-forward)
-- `dbd doctor` — audit config for stale entries
+- `dbd doctor` — audit/migrate config + layout: old-format design.yaml, stale files, and plural DDL folders → singular (`ddl/functions/`→`ddl/function/`; collision keeps newer, backs up older as `.bkp`)
 - `dbd reset` — drop schemas (guarded by _dbd_meta env check; `--scope` restricts to the scope's schemas)
 - `dbd format [--check]` — DDL formatter, optional river-style SELECT/VIEW bodies (`query_style: river`, `gutter`); `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
