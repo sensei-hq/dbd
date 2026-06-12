@@ -172,11 +172,26 @@ Each entry in `includes`/`excludes` is one of three forms:
 
 `includes` omitted means start from the full set; `excludes` removes from it. An unknown name or wildcard prefix that matches nothing is an error (typo protection).
 
-| Field      | Type   | Default  | Description |
-|------------|--------|----------|-------------|
-| `includes` | list   | (all)    | Schema names, qualified entities, or `schema.*` wildcards to include |
-| `excludes` | list   | (none)   | Schema names, qualified entities, or `schema.*` wildcards to remove from the set |
-| `deps`     | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
+| Field        | Type   | Default  | Description |
+|--------------|--------|----------|-------------|
+| `includes`   | list   | (all)    | Schema names, qualified entities, or `schema.*` wildcards to include |
+| `excludes`   | list   | (none)   | Schema names, qualified entities, or `schema.*` wildcards to remove from the set |
+| `deps`       | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
+| `extensions` | list   | (all)    | Per-scope extension allowlist. Omitted ⇒ all target extensions apply; a list ⇒ only those apply; `[]` ⇒ none |
+
+**`extensions`** restricts which of the `target.extensions` apply under this scope. Omit it for today's behavior (every target extension is installed). Set it to deploy a scope to a database that lacks one — e.g. a hub on embedded Postgres without `pgvector`:
+
+```yaml
+scopes:
+  hub:
+    includes: [config]
+    extensions: []          # install no extensions on the hub DB
+  search:
+    includes: [docs]
+    extensions: [vector]    # only pgvector, not the others
+```
+
+List each extension by its **bare name** (`vector`, `postgis`, `uuid-ossp`) — the same name dbd uses for the entity, even for extensions declared with a `schema:`. The allowlist is honored everywhere the scope is (apply/deploy and the read commands); roles and externals remain always-on regardless.
 
 **`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`import`/`deploy` refuse to proceed until gaps are resolved — including their `--dry-run` modes, so a dry-run surfaces the same error a real run would.
 

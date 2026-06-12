@@ -2257,6 +2257,66 @@ mod tests {
         let applied = mock.applied_names();
         assert!(applied.iter().any(|n| n == "config.lookups"));
         assert!(!applied.iter().any(|n| n.starts_with("staging.")));
+        // No allowlist (`extensions: None`) ⇒ target extensions still apply.
+        assert!(applied.iter().any(|n| n == "uuid-ossp"));
+    }
+
+    // Helper: a gap-free config-only scope with a given extension allowlist.
+    #[cfg(test)]
+    fn config_only_scope(extensions: Option<std::collections::HashSet<String>>) -> ResolvedScope {
+        use std::collections::HashSet;
+        ResolvedScope {
+            name: "config_only".into(),
+            entities: HashSet::from([
+                "config".to_string(),
+                "config.lookups".to_string(),
+                "config.lookup_values".to_string(),
+            ]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+            extensions,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_empty_extension_allowlist_skips_extensions() {
+        // `extensions: Some([])` — the embedded-Postgres-without-pgvector case:
+        // apply must skip every extension while still applying in-scope tables.
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        let scope = config_only_scope(Some(HashSet::new()));
+        design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+        let applied = mock.applied_names();
+        assert!(applied.iter().any(|n| n == "config.lookups"), "in-scope tables still apply: {applied:?}");
+        assert!(
+            !applied.iter().any(|n| n == "uuid-ossp" || n == "postgis"),
+            "empty allowlist must skip all extensions, got: {applied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_extension_allowlist_keeps_only_listed() {
+        // `extensions: Some([uuid-ossp])` applies that one, drops the rest.
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+
+        let scope = config_only_scope(Some(HashSet::from(["uuid-ossp".to_string()])));
+        design
+            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+        let applied = mock.applied_names();
+        assert!(applied.iter().any(|n| n == "uuid-ossp"), "listed extension applies: {applied:?}");
+        assert!(!applied.iter().any(|n| n == "postgis"), "unlisted extension dropped: {applied:?}");
     }
 
     #[test]

@@ -105,7 +105,7 @@ dbd combine --scope hub -f hub.sql # Only the 'hub' scope's working set
 dbd combine --scope hub --deps include  # Expand to the dependency closure first
 ```
 
-**Scope-aware.** `--scope` filters the combined SQL to that scope's working set; `--deps include` (or a scope with `deps: include`) first expands to the dependency closure so the script is self-contained. Filter-only — `combine` does not gate on dependency gaps (use `inspect --scope` to surface them). Always-on infrastructure (extensions, roles) is kept in every scope.
+**Scope-aware.** `--scope` filters the combined SQL to that scope's working set; `--deps include` (or a scope with `deps: include`) first expands to the dependency closure so the script is self-contained. Filter-only — `combine` does not gate on dependency gaps (use `inspect --scope` to surface them). Roles are kept in every scope; extensions are too, unless the scope sets an `extensions` allowlist (then only the listed extensions — `[]` for none).
 
 ---
 
