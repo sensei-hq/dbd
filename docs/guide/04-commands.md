@@ -45,10 +45,10 @@ dbd inspect -n config.lookups     # Inspect one entity
 dbd inspect -v                    # Verbose: show entity JSON
 dbd inspect --silent              # Just the count
 dbd inspect --scope hub           # Validate scope + report dependency gaps
-dbd inspect --database -d $DATABASE_URL   # Resolve references against the live catalog
+dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live catalog
 ```
 
-**`--database`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums) — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
+**`--from-db`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums), using the `-d`/`--database` connection — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
 
 ---
 

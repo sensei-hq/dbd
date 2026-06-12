@@ -1,7 +1,7 @@
 //! Project-local cache of database entity names, used to resolve
 //! "Unresolved reference" warnings without a live database connection.
 //!
-//! `inspect --database` writes the cache; subsequent offline `inspect`
+//! `inspect --from-db` writes the cache; subsequent offline `inspect`
 //! runs (or runs in environments without `DATABASE_URL`) consult it to
 //! silence warnings whose targets are known to exist in the captured
 //! catalog snapshot.

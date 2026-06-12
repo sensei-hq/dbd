@@ -65,7 +65,7 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 ## Commands
 
 - `dbd init` — scaffold project
-- `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`); `--database` resolves references against the live catalog and caches to `.dbd/refcache.json`. Surfaces unresolved migration `-- TODO:`s
+- `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`); `--from-db` resolves references against the live catalog (uses `-d`/`--database`) and caches to `.dbd/refcache.json`. Surfaces unresolved migration `-- TODO:`s
 - `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
 - `dbd import` — load staging data (CSV/TSV/JSONL); env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches
 - `dbd export` — export table data (scope-aware)
@@ -92,7 +92,7 @@ Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report
 - Classification: adapter-owned — each adapter knows its target's catalog (Postgres queries pg_proc/pg_type, SQLite uses a sorted builtins list + `sqlite_*` prefix rule, Convex defers everything to user-defined)
 - Parallel parsing: rayon for CPU-bound file parse, tokio for async DB operations
 - Library-first: `dbd-core` crate for embedding, `dbd-cli` for the binary
-- Reference cache: `inspect --database` snapshots all user-defined entities to `.dbd/refcache.json`; subsequent offline runs consult it to silence "Unresolved reference" warnings without a live DB
+- Reference cache: `inspect --from-db` snapshots all user-defined entities to `.dbd/refcache.json`; subsequent offline runs consult it to silence "Unresolved reference" warnings without a live DB
 
 ## Key types
 
