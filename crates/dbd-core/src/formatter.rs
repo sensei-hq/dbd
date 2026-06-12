@@ -630,11 +630,13 @@ fn format_create_view(
         format!("{} {}", kw("create view"), name.to_string().to_lowercase())
     };
 
-    let body = if config.query_style == QueryStyle::River {
-        let lines = river_select_lines(query, config);
-        lines.join("\n")
-    } else {
-        apply_keyword_case(&query.to_string(), &config.keyword_case)
+    let body = match (config.query_style == QueryStyle::River)
+        .then(|| river_query_faithful(query, config))
+        .flatten()
+    {
+        Some(river) => river,
+        // Not river, or river couldn't faithfully render this query → keyword-case only.
+        None => apply_keyword_case(&query.to_string(), &config.keyword_case),
     };
 
     ensure_semicolon(&format!("{} {}\n{}", header, kw("as"), body))
@@ -704,10 +706,13 @@ fn river_comma_line(gutter: usize, content: &str) -> String {
 }
 
 /// Format a SELECT query (or bare SELECT) with river style.
-/// Returns the formatted SQL with a trailing semicolon.
+/// Returns the formatted SQL with a trailing semicolon. Falls back to
+/// keyword-case-only formatting if the river output wouldn't round-trip.
 fn format_river_query(query: &sqlparser::ast::Query, config: &FormatConfig) -> String {
-    let lines = river_select_lines(query, config);
-    ensure_semicolon(&lines.join("\n"))
+    match river_query_faithful(query, config) {
+        Some(river) => ensure_semicolon(&river),
+        None => ensure_semicolon(&apply_keyword_case(&query.to_string(), &config.keyword_case)),
+    }
 }
 
 /// Build river-formatted lines for a Query. Used both for standalone SELECT
@@ -723,6 +728,27 @@ fn river_select_lines(query: &sqlparser::ast::Query, config: &FormatConfig) -> V
             // UNION / INTERSECT / EXCEPT — fall back to keyword-case only
             vec![apply_keyword_case(&query.to_string(), &config.keyword_case)]
         }
+    }
+}
+
+/// River-format a query, but ONLY if the output re-parses to the same AST.
+///
+/// The river renderer is an incomplete SQL pretty-printer — it does not cover
+/// every construct (e.g. CTEs/`WITH`, qualified `t.*` wildcards, set
+/// operations) and would otherwise silently emit different SQL. This guard
+/// re-parses the river output and compares it to the source query; on any
+/// mismatch — or a parse failure — it returns `None` so the caller falls back
+/// to a faithful rendering. Correctness over style: an unsupported query keeps
+/// its (non-river) formatting rather than being silently corrupted.
+fn river_query_faithful(query: &sqlparser::ast::Query, config: &FormatConfig) -> Option<String> {
+    let text = river_select_lines(query, config).join("\n");
+    let dialect = PostgreSqlDialect {};
+    match Parser::parse_sql(&dialect, &text) {
+        Ok(stmts) if stmts.len() == 1 => match &stmts[0] {
+            Statement::Query(reparsed) if **reparsed == *query => Some(text),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -756,8 +782,11 @@ fn river_lines_from_select(
                 (apply_keyword_case(&expr.to_string(), &config.keyword_case), None)
             }
             SelectItem::Wildcard(_) => ("*".to_string(), None),
-            SelectItem::QualifiedWildcard(name, _) => {
-                (format!("{}.*", name.to_string().to_lowercase()), None)
+            SelectItem::QualifiedWildcard(kind, _) => {
+                // `kind` already renders the trailing `.*` (e.g. `l.*`); don't
+                // append another. Keyword-case keeps identifier case like the
+                // expression arms above.
+                (apply_keyword_case(&kind.to_string(), &config.keyword_case), None)
             }
         }
     }).collect();
@@ -1132,11 +1161,25 @@ fn extract_join_parts<'a>(
     use sqlparser::ast::{JoinConstraint, JoinOperator};
 
     let (keyword, constraint) = match &join.join_operator {
+        // Plain `JOIN` and `INNER JOIN` are distinct variants in sqlparser.
+        JoinOperator::Join(c) => (kw("join"), Some(c)),
         JoinOperator::Inner(c) => (kw("inner join"), Some(c)),
-        JoinOperator::LeftOuter(c) => (kw("left join"), Some(c)),
-        JoinOperator::RightOuter(c) => (kw("right join"), Some(c)),
+        // `LEFT JOIN` (Left) and `LEFT OUTER JOIN` (LeftOuter) are distinct too —
+        // both render as "left join". Same for right.
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (kw("left join"), Some(c)),
+        JoinOperator::Right(c) | JoinOperator::RightOuter(c) => (kw("right join"), Some(c)),
         JoinOperator::FullOuter(c) => (kw("full join"), Some(c)),
         JoinOperator::CrossJoin(_) => return (kw("cross join"), None),
+        // Exotic joins (semi/anti/apply/as-of/straight) don't appear in normal
+        // DDL views; keep the bare keyword but still surface any ON below rather
+        // than silently dropping it.
+        JoinOperator::Semi(c) | JoinOperator::LeftSemi(c) | JoinOperator::RightSemi(c) => {
+            (kw("join"), Some(c))
+        }
+        JoinOperator::Anti(c) | JoinOperator::LeftAnti(c) | JoinOperator::RightAnti(c) => {
+            (kw("join"), Some(c))
+        }
+        JoinOperator::StraightJoin(c) => (kw("join"), Some(c)),
         _ => return (kw("join"), None),
     };
 
@@ -1393,6 +1436,55 @@ mod tests {
         assert!(result.contains("inner join"), "inner join present: {result}");
         // "on" right-aligned at gutter 10: 8 spaces + "on"
         assert!(result.contains("        on"), "on right-aligned: {result}");
+    }
+
+    #[test]
+    fn r4b_river_plain_and_left_join_keep_qualifier_and_on() {
+        // Plain `JOIN` (sqlparser JoinOperator::Join) and `LEFT JOIN`
+        // (JoinOperator::Left) must keep their qualifier AND their ON clause —
+        // dropping them silently turns the query into cross joins.
+        let input = "SELECT n.id, f.name, p.name \
+                     FROM nodes n \
+                     JOIN folders f ON f.id = n.folder_id \
+                     LEFT JOIN projects p ON p.id = f.project_id;";
+        let result = format_ddl(input, &river_config());
+
+        assert!(result.contains("left join"), "LEFT qualifier preserved: {result}");
+        // Both ON conditions must survive.
+        assert!(result.contains("on f.id = n.folder_id"), "first join's ON kept: {result}");
+        assert!(result.contains("on p.id = f.project_id"), "left join's ON kept: {result}");
+        // The plain join keyword is present (and the ON is not dropped).
+        assert!(result.contains("join folders"), "plain join present: {result}");
+    }
+
+    #[test]
+    fn river_cte_not_dropped() {
+        // River doesn't render WITH/CTE — the guard must fall back so the CTE
+        // (and its inner join) survive rather than being silently dropped.
+        let input = "CREATE VIEW v AS WITH t AS (SELECT a, b FROM x JOIN y ON y.id = x.id) \
+                     SELECT t.a FROM t;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.to_lowercase().contains("with t as"), "CTE must survive: {result}");
+        assert!(result.contains("y.id = x.id"), "CTE inner join must survive: {result}");
+    }
+
+    #[test]
+    fn river_qualified_wildcard_not_doubled() {
+        // `l.*` was being rendered as `l.*.*`. The guard must fall back so the
+        // wildcard is emitted faithfully.
+        let input = "CREATE VIEW v AS SELECT l.*, p.name FROM libs l JOIN projs p ON p.id = l.pid;";
+        let result = format_ddl(input, &river_config());
+        assert!(!result.contains(".*.*"), "qualified wildcard must not be doubled: {result}");
+        assert!(result.contains("l.*"), "l.* preserved: {result}");
+    }
+
+    #[test]
+    fn river_faithful_view_still_uses_river() {
+        // A query the river renderer DOES handle still gets multi-line river style.
+        let input = "CREATE VIEW v AS SELECT a, b FROM x JOIN y ON y.id = x.id WHERE a > 1;";
+        let result = format_ddl(input, &river_config());
+        assert!(result.contains("    select"), "river applied (multi-line): {result}");
+        assert!(result.contains("on y.id = x.id"), "join ON preserved: {result}");
     }
 
     #[test]
