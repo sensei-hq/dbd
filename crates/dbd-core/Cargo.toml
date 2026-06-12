@@ -49,6 +49,7 @@ tempfile = "3"
 pretty_assertions = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 postgresql_embedded = "0.20"
+filetime = "0.2"
 
 [features]
 default = ["postgres", "sqlite", "deploy"]

@@ -313,6 +313,208 @@ fn val(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
 }
 
+// ── Plural DDL folder migration ────────────────────────────────────────────
+
+/// Plural DDL type folders and their canonical singular form. dbd accepts both
+/// when scanning, but singular is canonical; `dbd doctor --fix` migrates plural
+/// folders to singular.
+const PLURAL_DDL_DIRS: &[(&str, &str)] = &[
+    ("tables", "table"),
+    ("views", "view"),
+    ("functions", "function"),
+    ("procedures", "procedure"),
+    ("enums", "enum"),
+    ("roles", "role"),
+];
+
+/// A `ddl/<plural>/` folder that should use the canonical singular name.
+#[derive(Debug, Clone)]
+pub struct PluralDdlDir {
+    /// e.g. `<project>/ddl/functions`
+    pub plural: PathBuf,
+    /// e.g. `<project>/ddl/function`
+    pub singular: PathBuf,
+}
+
+/// Outcome of migrating one file (or folder) during plural → singular migration.
+#[derive(Debug, Clone)]
+pub enum DdlMoveOutcome {
+    /// The whole folder was renamed (no singular folder existed yet).
+    RenamedDir { from: PathBuf, to: PathBuf },
+    /// A file was moved into the singular tree (no name collision).
+    MovedFile { from: PathBuf, to: PathBuf },
+    /// Same-path collision: the newer file (`winner`) was kept at `final_path`,
+    /// the older file (`loser`) was backed up to `backup`.
+    BackedUp {
+        winner: PathBuf,
+        loser: PathBuf,
+        final_path: PathBuf,
+        backup: PathBuf,
+    },
+    /// A filesystem error while handling a specific path.
+    Error { path: PathBuf, error: String },
+}
+
+/// Detect `ddl/<plural>/` folders (e.g. `ddl/functions`) that should use the
+/// canonical singular form (`ddl/function`).
+pub fn detect_plural_ddl_dirs(project_dir: &Path) -> Vec<PluralDdlDir> {
+    let ddl = project_dir.join("ddl");
+    PLURAL_DDL_DIRS
+        .iter()
+        .filter_map(|(plural, singular)| {
+            let plural_path = ddl.join(plural);
+            plural_path.is_dir().then(|| PluralDdlDir {
+                plural: plural_path,
+                singular: ddl.join(singular),
+            })
+        })
+        .collect()
+}
+
+/// Move a plural DDL folder to its singular form. If the singular folder does
+/// not exist the whole folder is renamed; otherwise files are merged in,
+/// resolving same-path collisions by keeping the newer file (by mtime) at the
+/// singular path and backing the older one up to a `.bkp` sibling.
+pub fn migrate_plural_ddl_dir(dir: &PluralDdlDir) -> Vec<DdlMoveOutcome> {
+    if !dir.singular.exists() {
+        return match std::fs::rename(&dir.plural, &dir.singular) {
+            Ok(()) => vec![DdlMoveOutcome::RenamedDir {
+                from: dir.plural.clone(),
+                to: dir.singular.clone(),
+            }],
+            Err(e) => vec![DdlMoveOutcome::Error {
+                path: dir.plural.clone(),
+                error: e.to_string(),
+            }],
+        };
+    }
+
+    // Both folders exist — merge file by file.
+    let mut outcomes = Vec::new();
+    for src in collect_files(&dir.plural) {
+        let rel = match src.strip_prefix(&dir.plural) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let dst = dir.singular.join(rel);
+        outcomes.push(merge_one(&src, &dst));
+    }
+
+    // Drop now-empty plural directories (bottom-up). Anything left (e.g. a file
+    // that errored) is preserved for the user to reconcile.
+    remove_empty_dirs(&dir.plural);
+    outcomes
+}
+
+/// Merge a single plural-folder file into its singular-tree destination.
+fn merge_one(src: &Path, dst: &Path) -> DdlMoveOutcome {
+    let err = |path: &Path, e: std::io::Error| DdlMoveOutcome::Error {
+        path: path.to_path_buf(),
+        error: e.to_string(),
+    };
+
+    if !dst.exists() {
+        if let Some(parent) = dst.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return err(parent, e);
+        }
+        return match std::fs::rename(src, dst) {
+            Ok(()) => DdlMoveOutcome::MovedFile {
+                from: src.to_path_buf(),
+                to: dst.to_path_buf(),
+            },
+            Err(e) => err(src, e),
+        };
+    }
+
+    // Collision: the newest file (by mtime) is kept at `dst`; the older file is
+    // backed up to `dst.bkp`. We always preserve the loser rather than delete it
+    // — even an identical copy is kept as a backup.
+    let backup = unique_backup_path(dst);
+    let src_newer = match (mtime(src), mtime(dst)) {
+        (Ok(s), Ok(d)) => s > d,
+        // If a timestamp can't be read, prefer keeping the existing singular file.
+        _ => false,
+    };
+
+    if src_newer {
+        // Plural file wins: back up the existing singular file, then move src in.
+        if let Err(e) = std::fs::rename(dst, &backup) {
+            return err(dst, e);
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => DdlMoveOutcome::BackedUp {
+                winner: src.to_path_buf(),
+                loser: dst.to_path_buf(),
+                final_path: dst.to_path_buf(),
+                backup,
+            },
+            Err(e) => err(src, e),
+        }
+    } else {
+        // Singular file wins (or tie): keep it, back up the plural file.
+        match std::fs::rename(src, &backup) {
+            Ok(()) => DdlMoveOutcome::BackedUp {
+                winner: dst.to_path_buf(),
+                loser: src.to_path_buf(),
+                final_path: dst.to_path_buf(),
+                backup,
+            },
+            Err(e) => err(src, e),
+        }
+    }
+}
+
+/// All files (recursively) under `dir`.
+fn collect_files(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect()
+}
+
+/// Remove empty directories under `root` (and `root` itself) bottom-up. Dirs
+/// that still contain files are left in place.
+fn remove_empty_dirs(root: &Path) {
+    let mut dirs: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.into_path())
+        .collect();
+    // Deepest first so children are removed before parents.
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in dirs {
+        let _ = std::fs::remove_dir(&d); // ignores "not empty"
+    }
+}
+
+/// `<dst>.bkp`, bumping a numeric suffix if that already exists.
+fn unique_backup_path(dst: &Path) -> PathBuf {
+    let mut base = dst.as_os_str().to_owned();
+    base.push(".bkp");
+    let first = PathBuf::from(&base);
+    if !first.exists() {
+        return first;
+    }
+    for n in 2.. {
+        let mut candidate = base.clone();
+        candidate.push(format!(".{n}"));
+        let path = PathBuf::from(candidate);
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!("backup path counter exhausted")
+}
+
+fn mtime(p: &Path) -> std::io::Result<std::time::SystemTime> {
+    std::fs::metadata(p)?.modified()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +645,113 @@ schemas:
     fn migrated_config_parses_with_new_structs() {
         let migrated = migrate_config(OLD_CONFIG).unwrap();
         let _config: crate::config::DesignConfig = serde_yaml::from_str(&migrated).unwrap();
+    }
+
+    // ── Plural DDL folder migration ────────────────────────
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn set_mtime(path: &Path, unix_secs: i64) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0)).unwrap();
+    }
+
+    #[test]
+    fn detect_plural_ddl_dirs_finds_plural_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("ddl/functions/config")).unwrap();
+        std::fs::create_dir_all(root.join("ddl/table/config")).unwrap(); // singular — ignored
+        std::fs::create_dir_all(root.join("ddl/misc")).unwrap(); // not a type — ignored
+
+        let found = detect_plural_ddl_dirs(root);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].plural.ends_with("ddl/functions"));
+        assert!(found[0].singular.ends_with("ddl/function"));
+    }
+
+    #[test]
+    fn migrate_renames_when_singular_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("ddl/functions/config/f.ddl"), "CREATE FUNCTION");
+
+        let dir = PluralDdlDir {
+            plural: root.join("ddl/functions"),
+            singular: root.join("ddl/function"),
+        };
+        let outcomes = migrate_plural_ddl_dir(&dir);
+
+        assert!(matches!(outcomes.as_slice(), [DdlMoveOutcome::RenamedDir { .. }]));
+        assert!(root.join("ddl/function/config/f.ddl").exists());
+        assert!(!root.join("ddl/functions").exists());
+    }
+
+    #[test]
+    fn migrate_merges_when_both_present_no_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("ddl/function/config/a.ddl"), "A");
+        write_file(&root.join("ddl/functions/config/b.ddl"), "B");
+
+        let dir = PluralDdlDir {
+            plural: root.join("ddl/functions"),
+            singular: root.join("ddl/function"),
+        };
+        let outcomes = migrate_plural_ddl_dir(&dir);
+
+        assert!(outcomes.iter().any(|o| matches!(o, DdlMoveOutcome::MovedFile { .. })));
+        assert!(root.join("ddl/function/config/a.ddl").exists()); // untouched
+        assert!(root.join("ddl/function/config/b.ddl").exists()); // merged in
+        assert!(!root.join("ddl/functions").exists());
+    }
+
+    #[test]
+    fn migrate_collision_plural_newer_backs_up_singular() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sing = root.join("ddl/function/config/foo.ddl");
+        let plur = root.join("ddl/functions/config/foo.ddl");
+        write_file(&sing, "OLD-SINGULAR");
+        write_file(&plur, "NEW-PLURAL");
+        set_mtime(&sing, 1_000);
+        set_mtime(&plur, 2_000); // plural is newer → it wins
+
+        let dir = PluralDdlDir {
+            plural: root.join("ddl/functions"),
+            singular: root.join("ddl/function"),
+        };
+        let outcomes = migrate_plural_ddl_dir(&dir);
+
+        assert_eq!(std::fs::read_to_string(&sing).unwrap(), "NEW-PLURAL");
+        let bkp = root.join("ddl/function/config/foo.ddl.bkp");
+        assert_eq!(std::fs::read_to_string(&bkp).unwrap(), "OLD-SINGULAR");
+        assert!(outcomes.iter().any(|o| matches!(o, DdlMoveOutcome::BackedUp { .. })));
+        assert!(!root.join("ddl/functions").exists());
+    }
+
+    #[test]
+    fn migrate_collision_singular_newer_backs_up_plural() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sing = root.join("ddl/function/config/foo.ddl");
+        let plur = root.join("ddl/functions/config/foo.ddl");
+        write_file(&sing, "NEW-SINGULAR");
+        write_file(&plur, "OLD-PLURAL");
+        set_mtime(&sing, 2_000); // singular is newer → it wins
+        set_mtime(&plur, 1_000);
+
+        let dir = PluralDdlDir {
+            plural: root.join("ddl/functions"),
+            singular: root.join("ddl/function"),
+        };
+        migrate_plural_ddl_dir(&dir);
+
+        assert_eq!(std::fs::read_to_string(&sing).unwrap(), "NEW-SINGULAR"); // kept
+        let bkp = root.join("ddl/function/config/foo.ddl.bkp");
+        assert_eq!(std::fs::read_to_string(&bkp).unwrap(), "OLD-PLURAL"); // loser backed up
+        assert!(!root.join("ddl/functions").exists());
     }
 }

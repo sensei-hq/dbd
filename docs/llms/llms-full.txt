@@ -59,6 +59,8 @@ myproject/
 Schema-scoped types: `ddl/<type>/<schema>/<name>.<ext>`
 Non-schema types: `ddl/<type>/<name>.<ext>`
 
+`<type>` ∈ `table` | `view` | `function` | `procedure` | `enum` | `role`. Extensions: `.ddl` or `.sql`. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
+
 ---
 
 ## design.yaml
@@ -480,6 +482,8 @@ dbd reset --scope hub --dry-run   # only the schemas the 'hub' scope occupies
 dbd doctor
 dbd doctor --fix
 ```
+
+Audits + migrates: old Node.js `design.yaml` format → new format (`--fix` writes a `.yaml.bak`); removes stale internally-managed files; migrates plural DDL type folders to singular (`ddl/functions/` → `ddl/function/`, merging into an existing singular folder, backing up the older file on a same-name collision as `<name>.ddl.bkp`).
 
 ---
 

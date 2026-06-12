@@ -99,8 +99,9 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
 
     let config_issues = dbd_core::doctor::detect_old_format(&content);
     let stale_files = dbd_core::doctor::detect_stale_files(project_dir);
+    let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
 
-    let total_issues = config_issues.len() + stale_files.len();
+    let total_issues = config_issues.len() + stale_files.len() + plural_dirs.len();
 
     if total_issues == 0 {
         output::info(verbosity, "No issues found — project is up to date.");
@@ -127,6 +128,17 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         ));
         for f in &stale_files {
             output::always(&format!("  - {} — {}", f.path.display(), f.reason));
+        }
+    }
+
+    if !plural_dirs.is_empty() {
+        output::always(&format!(
+            "\nFound {} plural DDL folder{} (singular is canonical):",
+            plural_dirs.len(),
+            if plural_dirs.len() != 1 { "s" } else { "" }
+        ));
+        for d in &plural_dirs {
+            output::always(&format!("  - {} → {}", d.plural.display(), d.singular.display()));
         }
     }
 
@@ -159,6 +171,37 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
                     }
                     Some(e) => {
                         output::always(&format!("Failed to remove {}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+
+        if !plural_dirs.is_empty() {
+            use dbd_core::doctor::DdlMoveOutcome;
+            for d in &plural_dirs {
+                for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
+                    match outcome {
+                        DdlMoveOutcome::RenamedDir { from, to } => {
+                            output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
+                            fixed += 1;
+                        }
+                        DdlMoveOutcome::MovedFile { from, to } => {
+                            output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
+                            fixed += 1;
+                        }
+                        DdlMoveOutcome::BackedUp { winner, loser, final_path, backup } => {
+                            output::always(&format!(
+                                "Collision at {}: kept newer (from {}), backed up older (from {}) → {}",
+                                final_path.display(),
+                                winner.display(),
+                                loser.display(),
+                                backup.display()
+                            ));
+                            fixed += 1;
+                        }
+                        DdlMoveOutcome::Error { path, error } => {
+                            output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                        }
                     }
                 }
             }
