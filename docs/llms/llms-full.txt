@@ -229,6 +229,11 @@ dbd deploy --scope hub --database $HUB_URL
     `deploy`).
 - A reference to an `external:` entity is never a gap — `external:` is the only
   "satisfied elsewhere" mechanism (there is no "ignore gaps" mode).
+- `extensions: [..]` — optional per-scope extension allowlist. Omitted ⇒ all
+  `target.extensions` apply (default); a list ⇒ only those; `[]` ⇒ none. Lets a
+  scope deploy to a DB lacking an extension (e.g. embedded PG without pgvector).
+  Name extensions by bare name (`vector`, `postgis`); roles/externals stay
+  always-on regardless.
 - Omit `default` (or the whole `scopes:` block) ⇒ the full set is used. Define a
   `default:` scope only if a bare `dbd deploy` (no `--scope`) should itself
   deploy a subset.
@@ -240,7 +245,7 @@ Scopes are honored by every entity-selecting command. The write commands
 documentation/read/destructive commands (`dbml`, `combine`, `graph`, `export`,
 `reset`) filter to the scope's working set without gating — `inspect --scope` is
 where gaps surface. `dbml`/`combine` emit external stub tables for out-of-scope FK
-targets (and `combine` keeps always-on extensions/roles); `reset` is
+targets (and `combine` keeps roles + the scope's allowed extensions); `reset` is
 schema-granular (`DROP SCHEMA … CASCADE`, restricted to the schemas the scope
 occupies, roles dropped only on a full reset). The shared primitive is
 `Design::scoped_entities(&ResolvedScope) -> Vec<Entity>` (closure under `include`,
@@ -368,7 +373,7 @@ dbd combine --scope hub -f hub.sql      # only the 'hub' scope's working set
 dbd combine --scope hub --deps include  # self-contained closure
 ```
 
-`--scope`/`--deps` filter the combined SQL to the working set (filter-only, no gap gate). Always-on extensions/roles are kept in every scope.
+`--scope`/`--deps` filter the combined SQL to the working set (filter-only, no gap gate). Roles are kept in every scope; extensions too, unless the scope sets an `extensions` allowlist (`[]` ⇒ none).
 
 ### dbd graph
 
