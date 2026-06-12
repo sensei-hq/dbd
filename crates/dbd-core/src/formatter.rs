@@ -1479,6 +1479,16 @@ mod tests {
     }
 
     #[test]
+    fn river_is_the_default_query_style() {
+        use crate::config::QueryStyle;
+        assert_eq!(QueryStyle::default(), QueryStyle::River);
+        assert_eq!(FormatConfig::default().query_style, QueryStyle::River);
+        // A view formatted with the default config gets river styling.
+        let result = format_ddl("CREATE VIEW v AS SELECT a, b FROM x;", &FormatConfig::default());
+        assert!(result.contains("    select"), "default config should river-style: {result}");
+    }
+
+    #[test]
     fn river_faithful_view_still_uses_river() {
         // A query the river renderer DOES handle still gets multi-line river style.
         let input = "CREATE VIEW v AS SELECT a, b FROM x JOIN y ON y.id = x.id WHERE a > 1;";

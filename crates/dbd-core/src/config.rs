@@ -370,11 +370,13 @@ pub enum CommaStyle {
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryStyle {
-    /// No special query formatting — keyword case only (default).
-    #[default]
+    /// No special query formatting — keyword case only.
     None,
-    /// River-style formatting: right-aligned keywords, leading-comma SELECT
-    /// lists, alias alignment, and AND/OR conditions aligned per clause.
+    /// River-style formatting (default): right-aligned keywords, leading-comma
+    /// SELECT lists, alias alignment, and AND/OR conditions aligned per clause.
+    /// Queries the river renderer can't reproduce faithfully fall back to
+    /// keyword-case-only automatically.
+    #[default]
     River,
 }
 
@@ -414,7 +416,7 @@ impl Default for FormatConfig {
             comma_style: CommaStyle::Leading,
             type_alignment: 27,
             indent: 2,
-            query_style: QueryStyle::None,
+            query_style: QueryStyle::River,
             gutter: 10,
         }
     }

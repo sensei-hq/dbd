@@ -257,13 +257,13 @@ format:
   comma_style: leading       # leading | trailing
   type_alignment: 27         # column for type start, 0 = off
   indent: 2                  # spaces per level
-  query_style: river         # none (default) | river — align SELECT bodies
+  query_style: river         # river (default) | none — align SELECT bodies
   gutter: 10                 # river keyword-gutter width (fits "inner join")
 ```
 
 Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted).
 
-**River style** (`query_style: river`) right-aligns SQL keywords at the `gutter` column so the clause keywords form a "river" down the left edge, with leading-comma SELECT lists, alias alignment, and one condition per line in WHERE/HAVING/ON. It applies to `CREATE VIEW` bodies and standalone SELECTs:
+**River style** is the **default** `query_style` (set `query_style: none` to disable). It right-aligns SQL keywords at the `gutter` column so the clause keywords form a "river" down the left edge, with leading-comma SELECT lists, alias alignment, and one condition per line in WHERE/HAVING/ON. It applies to `CREATE VIEW` bodies and standalone SELECTs. A query the river renderer can't reproduce faithfully (e.g. one using a CTE) is automatically left in plain keyword-cased form rather than risk altering it — so river formatting never changes what your SQL means:
 
 ```sql
     select lv.id
