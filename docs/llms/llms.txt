@@ -78,7 +78,7 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd policies` — apply RLS policies from `policies/<schema>/<table>.sql` (idempotent, fail-forward)
 - `dbd doctor` — audit/migrate config + layout: old-format design.yaml, stale files, and plural DDL folders → singular (`ddl/functions/`→`ddl/function/`; collision keeps newer, backs up older as `.bkp`)
 - `dbd reset` — drop schemas (guarded by _dbd_meta env check; `--scope` restricts to the scope's schemas)
-- `dbd format [--check]` — DDL formatter, optional river-style SELECT/VIEW bodies (`query_style: river`, `gutter`); `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
+- `dbd format [--check]` — DDL formatter; river-style SELECT/VIEW bodies on by default (`query_style: river`/`none`, `gutter`); river output is AST-verified and falls back to keyword-case-only if it can't reproduce a query faithfully (CTEs, etc.). `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
 Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). `reset` is schema-granular; the others filter to the entity working set.
 

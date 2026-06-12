@@ -441,9 +441,11 @@ format:
   comma_style: leading         # leading | trailing
   type_alignment: 27           # column for type start, 0 = off
   indent: 2
-  query_style: river           # river | classic
+  query_style: river           # river (default) | none
   gutter: 10                   # river: width of right-aligned keyword column
 ```
+
+`query_style: river` (the default) right-aligns keywords at `gutter`, leading-comma SELECT lists, alias/operator alignment, one condition per line. It applies to CREATE VIEW bodies + standalone SELECTs. **Safety:** river output is only used if it re-parses to the same AST as the source; any query the renderer can't reproduce faithfully (CTEs, etc.) falls back to keyword-case-only — the formatter never changes SQL semantics. Set `query_style: none` to disable river.
 
 The splitter understands two atomic-body kinds: PG `$$ ... $$` blocks (function bodies) and SQLite `CREATE TRIGGER ... BEGIN ... END;` blocks. CASE expressions inside trigger bodies are handled correctly — only `END;` at a word boundary closes the block.
 
