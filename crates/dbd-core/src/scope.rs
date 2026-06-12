@@ -20,6 +20,8 @@ pub struct ResolvedScope {
     pub excluded: HashSet<String>,
     pub deps: DepsPolicy,
     pub is_all: bool,
+    /// Per-scope extension allowlist resolved from config. None = all extensions.
+    pub extensions: Option<HashSet<String>>,
 }
 
 /// One dependency gap surfaced by inspect.
@@ -224,6 +226,7 @@ pub fn resolve(
         excluded: HashSet::new(),
         deps,
         is_all: true,
+        extensions: None,
     };
 
     let spec = match entry {
@@ -268,6 +271,7 @@ pub fn resolve(
         excluded,
         deps: deps_override.unwrap_or(spec.deps),
         is_all: false,
+        extensions: spec.extensions.as_ref().map(|v| v.iter().cloned().collect()),
     })
 }
 

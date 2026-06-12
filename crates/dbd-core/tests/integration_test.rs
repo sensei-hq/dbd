@@ -445,6 +445,7 @@ fn dbml_respects_scope_filtering() {
         excluded: HashSet::new(),
         deps: dbd_core::config::DepsPolicy::Report,
         is_all: false,
+        extensions: None,
     };
     let entities = d.scoped_entities(&scope).unwrap();
 

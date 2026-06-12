@@ -572,18 +572,27 @@ impl Design {
     }
 
     /// Whether an entity is kept under a resolved scope's working set.
-    /// Extensions/roles/externals are always-on infrastructure.
+    /// Roles/externals are always-on infrastructure. Extensions are too by
+    /// default, unless the scope sets an `extensions` allowlist — then only the
+    /// named extensions apply (an empty list drops them all), letting a scope
+    /// target a database that lacks an extension (e.g. an embedded PG without
+    /// pgvector).
     fn entity_in_scope(
         entity: &Entity,
         scope: &ResolvedScope,
         working_set: &std::collections::HashSet<String>,
     ) -> bool {
-        scope.is_all
-            || matches!(
-                entity.entity_type,
-                EntityType::Extension | EntityType::Role | EntityType::External
-            )
-            || working_set.contains(&entity.name)
+        if scope.is_all {
+            return true;
+        }
+        match entity.entity_type {
+            EntityType::Extension => match &scope.extensions {
+                Some(allow) => allow.contains(&entity.name),
+                None => true,
+            },
+            EntityType::Role | EntityType::External => true,
+            _ => working_set.contains(&entity.name),
+        }
     }
 
     /// The loaded entities filtered to a resolved scope's working set
@@ -2206,6 +2215,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Report,
             is_all: false,
+            extensions: None,
         };
 
         let result = design
@@ -2237,6 +2247,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Report,
             is_all: false,
+            extensions: None,
         };
 
         design
@@ -2533,6 +2544,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Report,
             is_all: false,
+            extensions: None,
         };
         let ws = design.working_set(&scope).unwrap();
         assert!(ws.contains("config.lookups"));
@@ -2552,6 +2564,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Include,
             is_all: false,
+            extensions: None,
         };
         let ws = design.working_set(&scope).unwrap();
         assert!(ws.contains("config.lookup_values"));
@@ -2585,6 +2598,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Report,
             is_all: false,
+            extensions: None,
         };
         let scoped = design.scoped_entities(&scope).unwrap();
         let names: Vec<&str> = scoped.iter().map(|e| e.name.as_str()).collect();
@@ -2593,6 +2607,88 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with("staging.")));
         // Fewer than the full set — proves filtering actually happened.
         assert!(scoped.len() < design.entities().len());
+    }
+
+    #[test]
+    fn scoped_entities_extensions_none_keeps_all_extensions() {
+        // No allowlist (`extensions: None`) preserves today's always-on
+        // behavior: every target extension stays in the scope.
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // Sanity: the fixture declares two extensions, by bare name.
+        let all_exts: Vec<&str> = design
+            .entities()
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Extension)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(all_exts.contains(&"uuid-ossp"));
+        assert!(all_exts.contains(&"postgis"));
+
+        let scope = ResolvedScope {
+            name: "with_exts".to_string(),
+            entities: HashSet::from(["config".to_string(), "config.lookups".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+            extensions: None,
+        };
+        let scoped = design.scoped_entities(&scope).unwrap();
+        let ext_names: Vec<&str> = scoped
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Extension)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(ext_names.contains(&"uuid-ossp"));
+        assert!(ext_names.contains(&"postgis"));
+    }
+
+    #[test]
+    fn scoped_entities_empty_allowlist_drops_all_extensions() {
+        // `extensions: Some([])` opts out of every extension — the use case for
+        // an embedded Postgres that lacks them.
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = ResolvedScope {
+            name: "hive".to_string(),
+            entities: HashSet::from(["config".to_string(), "config.lookups".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+            extensions: Some(HashSet::new()),
+        };
+        let scoped = design.scoped_entities(&scope).unwrap();
+        assert!(
+            !scoped.iter().any(|e| e.entity_type == EntityType::Extension),
+            "empty allowlist must drop every extension"
+        );
+        // Roles are still always-on (the allowlist only governs extensions).
+        assert!(scoped.iter().any(|e| e.entity_type == EntityType::Role));
+    }
+
+    #[test]
+    fn scoped_entities_named_allowlist_keeps_only_listed() {
+        // `extensions: Some([postgis])` keeps exactly postgis, drops uuid-ossp.
+        use std::collections::HashSet;
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let scope = ResolvedScope {
+            name: "only_postgis".to_string(),
+            entities: HashSet::from(["config".to_string(), "config.lookups".to_string()]),
+            excluded: HashSet::new(),
+            deps: DepsPolicy::Report,
+            is_all: false,
+            extensions: Some(HashSet::from(["postgis".to_string()])),
+        };
+        let scoped = design.scoped_entities(&scope).unwrap();
+        let ext_names: Vec<&str> = scoped
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Extension)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(ext_names, vec!["postgis"]);
     }
 
     #[test]
@@ -2616,6 +2712,7 @@ mod tests {
             excluded: HashSet::new(),
             deps: DepsPolicy::Report,
             is_all: false,
+            extensions: None,
         };
         let report = design.report(None, Some(&scope));
         assert_eq!(report.gaps.len(), 1);
