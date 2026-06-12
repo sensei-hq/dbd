@@ -21,7 +21,14 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
             continue;
         }
         let formatted = format_statement_block(trimmed, config);
-        output_parts.push(formatted);
+        // Safety guard: never emit a reformatted statement that changed the SQL.
+        // If the formatted output doesn't re-parse to the same AST, or drops a
+        // comment or a `$$` body, keep the original statement untouched.
+        if block_is_faithful(trimmed, &formatted) {
+            output_parts.push(formatted);
+        } else {
+            output_parts.push(ensure_semicolon(trimmed));
+        }
     }
 
     let mut result = output_parts.join("\n\n");
@@ -30,6 +37,100 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         result.push('\n');
     }
     result
+}
+
+/// Whether a formatted statement faithfully preserves the original: same parsed
+/// AST (so semantics are unchanged), plus every comment and every `$$` body
+/// retained. Statements sqlparser can't parse fall back to the
+/// comment/body-preservation check (the formatter used a conservative
+/// keyword-case/verbatim path for those).
+fn block_is_faithful(original: &str, formatted: &str) -> bool {
+    let dialect = PostgreSqlDialect {};
+    let po = Parser::parse_sql(&dialect, &ensure_semicolon(original));
+    let pf = Parser::parse_sql(&dialect, &ensure_semicolon(formatted));
+    match (po, pf) {
+        (Ok(a), Ok(b)) => {
+            a == b && comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted)
+        }
+        // The formatter turned parseable SQL into something that no longer
+        // parses — definitely not faithful.
+        (Ok(_), Err(_)) => false,
+        // Original wasn't sqlparser-parseable (SET, COMMENT ON, a $$ body, or
+        // PG-specific DDL); trust the conservative path only if comments and
+        // bodies are intact.
+        (Err(_), _) => comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted),
+    }
+}
+
+/// Every comment in `original` (— line and /* */ block) must appear in `formatted`.
+fn comments_preserved(original: &str, formatted: &str) -> bool {
+    extract_comments(original).iter().all(|c| formatted.contains(c.as_str()))
+}
+
+/// Extract trimmed comment text (line `-- …` and block `/* … */`) from SQL,
+/// skipping comment markers inside string literals and `$$` bodies.
+fn extract_comments(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'$' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'$' && bytes[i + 1] == b'$') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                let text = sql[start..i].trim_end().trim_start_matches('-').trim();
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let start = i + 2;
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                let text = sql[start..i.min(sql.len())].trim();
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The `$$ … $$` body segments must be byte-identical between original and
+/// formatted (the formatter preserves function/procedure bodies verbatim).
+fn dollar_bodies_preserved(original: &str, formatted: &str) -> bool {
+    fn bodies(s: &str) -> Vec<&str> {
+        s.split("$$").skip(1).step_by(2).collect()
+    }
+    bodies(original) == bodies(formatted)
 }
 
 /// Split input SQL into statement blocks.
@@ -60,6 +161,53 @@ fn split_statements(input: &str) -> Vec<String> {
         if in_dollar_quote {
             current.push(c);
             i += 1;
+            continue;
+        }
+
+        // Single-quoted string literal — copy verbatim (incl. `''` escapes); a
+        // `;` inside a string is not a statement boundary. Pushed as a slice so
+        // multi-byte UTF-8 is preserved.
+        if c == '\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    // `''` escape stays inside the string; a lone `'` closes it.
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            current.push_str(&input[start..i]);
+            continue;
+        }
+
+        // Line comment `-- … ` to end of line — inner `;` is not a boundary.
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            current.push_str(&input[start..i]);
+            continue;
+        }
+
+        // Block comment `/* … */` — inner `;` is not a boundary.
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            current.push_str(&input[start..i]);
             continue;
         }
 
@@ -1476,6 +1624,44 @@ mod tests {
         let result = format_ddl(input, &river_config());
         assert!(!result.contains(".*.*"), "qualified wildcard must not be doubled: {result}");
         assert!(result.contains("l.*"), "l.* preserved: {result}");
+    }
+
+    fn parses(sql: &str) -> bool {
+        Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok()
+    }
+
+    #[test]
+    fn splitter_keeps_semicolon_inside_line_comment() {
+        // A `;` inside a `-- comment` must NOT split the statement (was breaking
+        // the CREATE TABLE into invalid fragments).
+        let input = "create table t (\n  a int -- id; the value\n, b text\n);";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(parses(&result), "formatted output must be valid SQL: {result}");
+        assert!(result.contains("id; the value"), "inline comment preserved: {result}");
+    }
+
+    #[test]
+    fn index_using_and_partial_where_preserved() {
+        // GIN method and the partial WHERE must survive (was dropped → btree,
+        // all-rows). The guard keeps the original if the renderer can't.
+        let gin = "create index t_tags_idx on t using gin (tags);";
+        let part = "create index t_live_idx on t (x) where enabled = true;";
+        for input in [gin, part] {
+            let result = format_ddl(input, &FormatConfig::default());
+            let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
+            let b = Parser::parse_sql(&PostgreSqlDialect {}, &result).unwrap();
+            assert_eq!(a, b, "index semantics must be preserved: {result}");
+        }
+    }
+
+    #[test]
+    fn table_inline_comments_preserved() {
+        // CREATE TABLE rebuilt from the AST drops comments; the guard must fall
+        // back so column comments survive.
+        let input = "create table t (\n  a int  -- the primary key\n, b text -- a label\n);";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(result.contains("the primary key"), "comment 1 kept: {result}");
+        assert!(result.contains("a label"), "comment 2 kept: {result}");
     }
 
     #[test]
