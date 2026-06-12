@@ -61,9 +61,10 @@ pub enum Commands {
         /// Auto-fix formatting issues
         #[arg(long)]
         fix: bool,
-        /// Resolve "Unresolved reference" warnings against the live database catalog
-        #[arg(long)]
-        database: bool,
+        /// Resolve "Unresolved reference" warnings against the live database
+        /// catalog (uses the -d/--database connection)
+        #[arg(long = "from-db")]
+        from_db: bool,
     },
     /// Apply DDL scripts to database
     Apply {
@@ -173,4 +174,43 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own definition validation (duplicate ids, bad defaults, etc.).
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// Parse every subcommand with no extra args. This exercises the
+    /// matches→struct downcast, which panics if a subcommand arg collides with a
+    /// `global = true` arg of a different type (e.g. an `Inspect` `database: bool`
+    /// vs the global `database: Option<String>`). `debug_assert` does NOT catch
+    /// that — only actually parsing does.
+    #[test]
+    fn every_subcommand_parses() {
+        let cmds = [
+            "inspect", "apply", "combine", "import", "graph", "dbml", "deploy",
+            "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
+            "policies",
+        ];
+        for c in cmds {
+            Cli::try_parse_from(["dbd", c])
+                .unwrap_or_else(|e| panic!("`dbd {c}` failed to parse: {e}"));
+        }
+    }
+
+    /// The global `-d/--database <url>` and `inspect --from-db` must coexist.
+    #[test]
+    fn inspect_db_flags_coexist() {
+        let cli = Cli::try_parse_from(["dbd", "inspect", "--from-db", "-d", "postgres://x"])
+            .expect("inspect --from-db -d <url> should parse");
+        assert!(matches!(cli.command, Commands::Inspect { from_db: true, .. }));
+        assert_eq!(cli.database.as_deref(), Some("postgres://x"));
+    }
 }

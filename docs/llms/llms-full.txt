@@ -574,7 +574,7 @@ let graph = design.graph(None);
 
 ## Reference cache (offline `inspect`)
 
-`dbd inspect --database` runs `adapter.list_entities()` against the live database — pulling every user-defined table, view, and enum (system schemas excluded) — and writes the snapshot to `<project>/.dbd/refcache.json`:
+`dbd inspect --from-db` runs `adapter.list_entities()` against the live database (via the `-d`/`--database` connection) — pulling every user-defined table, view, and enum (system schemas excluded) — and writes the snapshot to `<project>/.dbd/refcache.json`:
 
 ```json
 {
@@ -584,7 +584,7 @@ let graph = design.graph(None);
 }
 ```
 
-Subsequent runs of `dbd inspect` (no `--database`, no `DATABASE_URL` needed) load this snapshot and drop any "Unresolved reference: NAME" warning whose target is in the set. Useful for CI, offline editing, or when the database is temporarily down. Commit the file to share with the team, or `.gitignore` it for purely local use.
+Subsequent runs of `dbd inspect` (no `--from-db`, no `DATABASE_URL` needed) load this snapshot and drop any "Unresolved reference: NAME" warning whose target is in the set. Useful for CI, offline editing, or when the database is temporarily down. Commit the file to share with the team, or `.gitignore` it for purely local use.
 
 API: `Design::write_ref_cache(adapter, source)` / `Design::resolve_unknown_refs_via_cache()` / `RefCache::{load,save,contains}` in `dbd_core::refcache`.
 

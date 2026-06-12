@@ -649,7 +649,7 @@ impl Design {
     /// Drop "Unresolved reference: NAME" warnings whose target NAME exists
     /// in the live database catalog (tables, views, or enum types).
     ///
-    /// Returns the number of warnings dropped. Used by `inspect --database`
+    /// Returns the number of warnings dropped. Used by `inspect --from-db`
     /// to silence warnings that resolve against a real DB but not against
     /// the project's external entity list.
     pub async fn resolve_unknown_refs_via_db(

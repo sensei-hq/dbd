@@ -100,7 +100,7 @@ pub trait DatabaseAdapter: Send + Sync {
     /// database, returned as schema-qualified names (e.g. `auth.users`).
     /// System catalogs (pg_catalog, information_schema, pg_toast) are excluded.
     ///
-    /// Used by `inspect --database` to build a project-local reference cache
+    /// Used by `inspect --from-db` to build a project-local reference cache
     /// for offline lookups.
     async fn list_entities(&self) -> Result<Vec<String>> {
         Ok(Vec::new())

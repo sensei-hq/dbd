@@ -103,7 +103,7 @@ myproject/
 
 ## Offline reference cache
 
-After `dbd inspect --database`, dbd writes a snapshot of all user-defined
+After `dbd inspect --from-db`, dbd writes a snapshot of all user-defined
 tables, views, and enum types to `<project>/.dbd/refcache.json`. Subsequent
 runs of `dbd inspect` consult that snapshot to silence "Unresolved
 reference" warnings even when no `DATABASE_URL` is available — useful in

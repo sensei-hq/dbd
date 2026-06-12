@@ -24,8 +24,8 @@ pub async fn run(
     verbosity: Verbosity,
 ) -> Result<()> {
     match command {
-        Commands::Inspect { name, fix, database } => {
-            schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *database, scope, deps, verbosity).await
+        Commands::Inspect { name, fix, from_db } => {
+            schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *from_db, scope, deps, verbosity).await
         }
 
         Commands::Combine { file } => {
