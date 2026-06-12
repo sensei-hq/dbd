@@ -602,13 +602,48 @@ fn format_create_index(
         ci.table_name.to_string().to_lowercase()
     ));
 
-    // Format columns
+    // Index method, e.g. `USING gin` (was previously dropped → silent btree).
+    if let Some(ref using) = ci.using {
+        out.push_str(&format!(" {} {}", kw("USING"), kw(&using.to_string())));
+    }
+
+    // Indexed columns / expressions.
     let col_strs: Vec<String> = ci
         .columns
         .iter()
         .map(|c| apply_keyword_case(&c.to_string(), &config.keyword_case))
         .collect();
-    out.push_str(&format!("({})", col_strs.join(", ")));
+    out.push_str(&format!(" ({})", col_strs.join(", ")));
+
+    // INCLUDE (covering) columns.
+    if !ci.include.is_empty() {
+        let inc: Vec<String> = ci.include.iter().map(|i| i.value.to_lowercase()).collect();
+        out.push_str(&format!(" {} ({})", kw("INCLUDE"), inc.join(", ")));
+    }
+
+    match ci.nulls_distinct {
+        Some(true) => out.push_str(&format!(" {}", kw("NULLS DISTINCT"))),
+        Some(false) => out.push_str(&format!(" {}", kw("NULLS NOT DISTINCT"))),
+        None => {}
+    }
+
+    if !ci.with.is_empty() {
+        let w: Vec<String> = ci
+            .with
+            .iter()
+            .map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case))
+            .collect();
+        out.push_str(&format!(" {} ({})", kw("WITH"), w.join(", ")));
+    }
+
+    // Partial-index predicate (was previously dropped → indexed all rows).
+    if let Some(ref pred) = ci.predicate {
+        out.push_str(&format!(
+            " {} {}",
+            kw("WHERE"),
+            apply_keyword_case(&pred.to_string(), &config.keyword_case)
+        ));
+    }
 
     out.push(';');
     out
