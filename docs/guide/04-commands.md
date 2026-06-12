@@ -43,7 +43,7 @@ Validate project configuration and report errors/warnings.
 dbd inspect                       # Validate all entities
 dbd inspect -n config.lookups     # Inspect one entity
 dbd inspect -v                    # Verbose: show entity JSON
-dbd inspect --silent              # Just the count
+dbd inspect --fix                 # Auto-fix DDL formatting (runs the formatter in place)
 dbd inspect --scope hub           # Validate scope + report dependency gaps
 dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live catalog
 ```
@@ -287,7 +287,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.4.4
+  rev: v0.4.7
   hooks:
     - id: dbd-format
 ```

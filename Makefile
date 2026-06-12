@@ -52,8 +52,10 @@ bump: _check-clean _check-ci
 	@echo "Bumping $(VERSION) → $(NEW) ($(KIND))"
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
+	# Keep the pre-commit `rev:` examples in sync with the released tag.
+	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
 	@cargo build -q 2>&1 | grep -v "^warning" || true
-	@git add Cargo.toml site/package.json
+	@git add Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt
 	@git commit -m "chore: bump version to v$(NEW)"
 	@git tag -a "v$(NEW)" -m "v$(NEW)"
 	@echo "Pushing main and v$(NEW)..."

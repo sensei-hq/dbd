@@ -460,7 +460,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.4.1
+  rev: v0.4.7
   hooks:
     - id: dbd-format
 ```

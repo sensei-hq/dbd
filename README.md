@@ -64,7 +64,9 @@ myproject/
 | `dbd dbml` | Generate DBML documentation |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
-| `dbd doctor` | Audit design.yaml for stale entries |
+| `dbd format` | Format DDL files (river-style; `--check` for CI/pre-commit) |
+| `dbd policies` | Apply RLS policies from `policies/` |
+| `dbd doctor` | Audit/migrate design.yaml + DDL layout |
 | `dbd reset` | Drop project schemas (with safety guards) |
 
 ## Targets
@@ -181,7 +183,7 @@ Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.4.1
+  rev: v0.4.7
   hooks:
     - id: dbd-format
 ```
