@@ -177,8 +177,25 @@ fn resolve_env_vars(s: &str) -> String {
 pub(super) fn safe_canonicalize_within(root: &Path, file: &Path) -> Result<PathBuf> {
     let canon_root = root.canonicalize()
         .with_context(|| format!("Cannot resolve project root: {}", root.display()))?;
-    let canon_file = file.canonicalize()
-        .with_context(|| format!("Cannot resolve file: {}", file.display()))?;
+    // Resolve the file. If it already exists, canonicalize it directly. If it
+    // doesn't (a new output file like `schema.json`), canonicalize its parent
+    // directory — which must exist — and re-attach the file name, so commands
+    // can create new files rather than erroring on a missing path.
+    let canon_file = match file.canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            let file_name = file
+                .file_name()
+                .with_context(|| format!("Invalid output path (no file name): {}", file.display()))?;
+            let parent = match file.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => root,
+            };
+            let canon_parent = parent.canonicalize()
+                .with_context(|| format!("Cannot resolve directory for: {}", file.display()))?;
+            canon_parent.join(file_name)
+        }
+    };
     anyhow::ensure!(
         canon_file.starts_with(&canon_root),
         "path traversal rejected: {} is outside project root {}",
@@ -213,4 +230,41 @@ pub(super) fn safe_copy(root: &Path, src: &Path, dst: &Path) -> Result<()> {
     std::fs::copy(&canon_src, dst) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("Failed to copy {} → {}", src.display(), dst.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_write_creates_a_new_file() {
+        // A brand-new file (doesn't exist yet) must be writable — `safe_write`
+        // resolves via the parent directory rather than canonicalizing the
+        // (non-existent) file itself.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("schema.json");
+        assert!(!file.exists());
+        safe_write(dir.path(), &file, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}");
+    }
+
+    #[test]
+    fn safe_write_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.sql");
+        std::fs::write(&file, "old").unwrap();
+        safe_write(dir.path(), &file, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+    }
+
+    #[test]
+    fn safe_write_rejects_new_file_outside_root() {
+        // A new file outside the project root is still rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("evil.json"); // sibling of root, doesn't exist
+        let err = safe_write(&root, &outside, "x").unwrap_err();
+        assert!(err.to_string().contains("path traversal"), "got: {err}");
+    }
 }
