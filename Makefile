@@ -49,8 +49,10 @@ install:
 	@cargo install --path crates/dbd-cli --locked --force
 
 ## Rebuild the committed schema-diagram viewer bundle (requires bun).
+# --frozen-lockfile so the build can't silently resolve drifted dep versions,
+# keeping the committed bundle reproducible (and the CI freshness check honest).
 viewer:
-	@cd site && bun install && bun run build:viewer
+	@cd site && bun install --frozen-lockfile && bun run build:viewer
 
 ## Bump version (commits, tags, pushes). Refuses if tree is dirty or CI fails.
 bump: _check-clean _check-ci
