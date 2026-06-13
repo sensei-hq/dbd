@@ -12,6 +12,37 @@
 
 DBML cannot represent views, procedures, or functions. Coupling the viewer to DBML would force a rewrite when those are added. The `SchemaModel` is a dbd-native superset: tables/columns/FKs in v1, with a `kind` discriminator on nodes and edges that extends to views/functions/procedures (already first-class dbd entities with `refers`/`reads`/`writes` edges) without changing the model or the viewer's contract. DBML generation (`dbd dbml`) remains a separate, parallel output.
 
+## Roadmap (phases)
+
+This spec covers **v1 only**. Later phases are recorded here for context so v1's
+boundaries (the `SchemaModel` JSON + the `mount(el, model)` viewer) are drawn to
+support them, but they are out of scope and will each get their own spec.
+
+- **v1 — local HTML (this spec).** `dbd diagram` renders a self-contained
+  single-project HTML schema explorer. No auth, no network, no storage.
+- **v2 — hosted login + storage + published designs.** A Supabase instance with
+  magic-link login (via **kavach**, `~/Developer/kavach`) backs the website. Sketch
+  schema:
+  - `projects (id, user_id, name, target, version, json)` — current published model per project.
+  - `project_history (id, project_id, version, json, created_at)` — prior versions + their models.
+  
+  The website lists the signed-in user's projects and renders each project's
+  diagram with the *same* `viewer` module from v1. A light **daily keep-alive**
+  job pings the DB so a low-traffic free-tier Supabase instance isn't paused.
+- **v3 — CLI auth + publish.** `dbd` authenticates (kavach) and publishes a
+  project's `SchemaModel` JSON to Supabase (insert into `projects`, append to
+  `project_history`), so `dbd diagram --publish` (or similar) pushes a versioned
+  design to the hosted UI.
+- **v4 — sharing designs via the UI.** Share links / visibility controls for
+  published designs.
+
+The **visual language** for v1's local HTML follows the "Project View" design
+mockup (sign-in / magic-link, project list, per-project diagram). v1 renders only
+the *per-project diagram* screen (no auth/list); the mockup's sign-in and
+project-list screens are v2 concepts. (Mockup to be supplied — the shared design
+link was unreachable at spec time; save it under `docs/mockup/` so the viewer can
+match its layout, type, and color tokens.)
+
 ## Non-goals (deferred)
 
 - View / function / procedure nodes (the model is *designed* for them, but v1 emits only tables/schemas/FK edges).
