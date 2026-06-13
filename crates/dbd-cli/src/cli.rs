@@ -105,14 +105,20 @@ pub enum Commands {
         #[arg(short, long, default_value = "design.dbml")]
         file: PathBuf,
     },
-    /// Generate an interactive schema diagram (self-contained HTML)
+    /// Open the hosted schema viewer with the schema encoded in the URL fragment
     Diagram {
-        /// Destination file (default: schema.html)
-        #[arg(short, long, default_value = "schema.html")]
-        file: PathBuf,
-        /// Emit the raw SchemaModel JSON instead of the HTML diagram
+        /// Emit the raw SchemaModel JSON to a file instead of opening the viewer
         #[arg(long)]
         json: bool,
+        /// Destination file for --json (default: schema.json)
+        #[arg(short, long, default_value = "schema.json")]
+        file: PathBuf,
+        /// Print the viewer URL instead of opening a browser
+        #[arg(long)]
+        print_url: bool,
+        /// Base URL of the dbd site (default: https://dbd.sensei-hq.com)
+        #[arg(long, env = "DBD_DIAGRAM_URL")]
+        site: Option<String>,
     },
     /// Deploy from source: fetch + apply + import
     Deploy {

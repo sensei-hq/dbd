@@ -82,9 +82,9 @@ pub async fn run(
             project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity)
         }
 
-        Commands::Diagram { file, json } => {
-            diagram::cmd_diagram(config, env, project_dir, file, *json, scope, deps, verbosity)
-        }
+        Commands::Diagram { json, file, print_url, site } => diagram::cmd_diagram(
+            config, env, project_dir, *json, file, *print_url, site.as_deref(), scope, deps, verbosity,
+        ),
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 
