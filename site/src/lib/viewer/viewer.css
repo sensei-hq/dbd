@@ -1,0 +1,6 @@
+@import '@rokkit/themes/base.css';
+@import '@rokkit/themes/zen-sumi.css';
+/* Dark-mode contrast fix for the constant 'sky' primary (mirrors src/app.css). */
+[data-mode='dark'] {
+	--on-primary: oklch(0.99 0.008 245);
+}
