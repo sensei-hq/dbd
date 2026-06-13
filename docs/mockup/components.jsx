@@ -93,34 +93,22 @@ function CodeBlock({ code, className = "" }) {
 
 /* ---------- Brand / Nav ---------- */
 
+/* dbd logo (uploads/dbd.svg) tinted with the site accent via currentColor */
 function BrandMark({ className = "h-8 w-8" }) {
   return (
-    <svg viewBox="0 0 512 512" className={className} fill="none" aria-hidden="true">
-      <defs>
-        <linearGradient id="wmHex" x1="92" y1="161" x2="420" y2="351" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#38BDF8" /><stop offset="0.5" stopColor="#37B6A6" /><stop offset="1" stopColor="#3FD168" />
-        </linearGradient>
-      </defs>
-      <path d="M256 64 L420 159 L420 353 L256 448 L92 353 L92 159 Z" stroke="url(#wmHex)" strokeWidth="30" strokeLinejoin="round" strokeLinecap="round" />
-      <g transform="translate(122 128) scale(8.9)" color="#38BDF8">
-        <path fill="currentColor" d="M12 10c4.418 0 8-1.79 8-4s-3.582-4-8-4s-8 1.79-8 4s3.582 4 8 4" />
-        <path fill="currentColor" opacity="0.5" d="M4 12v6c0 2.21 3.582 4 8 4s8-1.79 8-4v-6c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
-        <path fill="currentColor" opacity="0.7" d="M4 6v6c0 2.21 3.582 4 8 4s8-1.79 8-4V6c0 2.21-3.582 4-8 4S4 8.21 4 6" />
-      </g>
-      <g transform="translate(214 198) scale(6)" color="#3FD168" stroke="#10151F" strokeWidth="0.9" paintOrder="stroke">
-        <circle cx="21" cy="26" r="2" fill="currentColor" />
-        <circle cx="21" cy="6" r="2" fill="currentColor" />
-        <circle cx="4" cy="16" r="2" fill="currentColor" />
-        <path fill="currentColor" d="M28 12a3.996 3.996 0 0 0-3.858 3h-4.284a3.966 3.966 0 0 0-5.491-2.643l-3.177-3.97A3.96 3.96 0 0 0 12 6a4 4 0 1 0-4 4a4 4 0 0 0 1.634-.357l3.176 3.97a3.924 3.924 0 0 0 0 4.774l-3.176 3.97A4 4 0 0 0 8 22a4 4 0 1 0 4 4a3.96 3.96 0 0 0-.81-2.387l3.176-3.97A3.966 3.966 0 0 0 19.858 17h4.284A3.993 3.993 0 1 0 28 12M6 6a2 2 0 1 1 2 2a2 2 0 0 1-2-2m2 22a2 2 0 1 1 2-2a2 2 0 0 1-2 2m8-10a2 2 0 1 1 2-2a2 2 0 0 1-2 2m12 0a2 2 0 1 1 2-2a2 2 0 0 1-2 2" />
-      </g>
-    </svg>
+    <span
+      className={"inline-flex flex-none " + className}
+      aria-hidden="true"
+      style={{ color: "var(--accent)" }}
+      dangerouslySetInnerHTML={{ __html: window.DBD_LOGO_SVG }}
+    ></span>
   );
 }
 
-function Wordmark({ name }) {
+function Wordmark({ name, markClass = "h-8 w-8" }) {
   return (
     <a href="#top" className="group inline-flex items-center gap-2.5">
-      <BrandMark className="h-8 w-8" />
+      <BrandMark className={markClass} />
       <span className="font-display font-semibold text-lg tracking-tight text-fg">{name}</span>
     </a>
   );
@@ -140,6 +128,9 @@ function Nav({ brand, nav, controls }) {
         </nav>
         <div className="flex items-center gap-3">
           {controls}
+          <a href="designs/Sign In.html" className="hidden whitespace-nowrap text-sm text-muted transition-colors hover:text-fg sm:block">
+            Sign in
+          </a>
           <div className="hidden sm:block">
             <Button href={nav.cta.href} size="md">
               {nav.cta.label} <ArrowIcon />
@@ -382,7 +373,7 @@ function Footer({ brand, footer }) {
     <footer className="bg-bg">
       <div className="mx-auto grid max-w-content gap-10 px-6 py-14 md:grid-cols-[1.4fr_1fr_1fr]">
         <div className="flex flex-col gap-3">
-          <Wordmark name={brand.name} />
+          <Wordmark name={brand.name} markClass="h-16 w-16" />
           <p className="max-w-xs text-sm text-muted">{footer.tagline}</p>
         </div>
         {footer.columns.map((col) => (

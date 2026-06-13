@@ -1,0 +1,2039 @@
+Project "sensei" {
+  database_type: 'postgresql'
+  Note: 'Database structure for sensei the app.'
+}
+
+Enum "sensei"."assistant_family" {
+  "claude"
+  "cursor"
+  "zed"
+  "continue"
+  "codex"
+  "aider"
+  "opencode"
+  "kiro"
+}
+
+Enum "sensei"."auth_type" {
+  "api_key"
+  "none"
+}
+
+Enum "sensei"."dml_operation" {
+  "INSERT"
+  "UPDATE"
+  "DELETE"
+}
+
+Enum "sensei"."drift_status" {
+  "current"
+  "drifted"
+  "broken"
+}
+
+Enum "sensei"."edge_confidence" {
+  "extracted"
+  "inferred"
+  "ambiguous"
+}
+
+Enum "sensei"."edge_kind" {
+  "calls"
+  "implements"
+  "extends"
+  "imports"
+  "depends_on"
+  "traces_to"
+  "references"
+  "covers"
+  "rationale_for"
+  "duplicates"
+  "similar_to"
+}
+
+Enum "sensei"."enforcement" {
+  "advisory"
+  "recommended"
+  "required"
+  "mandatory"
+}
+
+Enum "sensei"."event_type" {
+  "tool_call"
+  "api_request"
+  "correction"
+  "turn"
+  "phase_transition"
+  "checkpoint"
+  "task_start"
+  "task_end"
+  "context_loaded"
+  "edit"
+  "test"
+  "error"
+}
+
+Enum "sensei"."extension_kind" {
+  "plugin"
+  "skill"
+  "command"
+  "agent"
+  "hook"
+}
+
+Enum "sensei"."extension_scope" {
+  "global"
+  "project"
+  "folder"
+}
+
+Enum "sensei"."extension_source" {
+  "builtin"
+  "marketplace"
+  "local"
+}
+
+Enum "sensei"."folder_kind" {
+  "git"
+  "workspace_member"
+  "subtree"
+  "sibling"
+  "standalone"
+  "folder"
+}
+
+Enum "sensei"."folder_role" {
+  "backend"
+  "frontend"
+  "library"
+  "docs"
+  "infra"
+  "website"
+  "desktop"
+  "mobile"
+  "config"
+  "packaging"
+}
+
+Enum "sensei"."folder_status" {
+  "discovered"
+  "queued"
+  "indexing"
+  "indexed"
+  "failed"
+  "deferred"
+}
+
+Enum "sensei"."hyperedge_kind" {
+  "flow"
+  "group"
+  "co_change"
+  "addressed_by"
+}
+
+Enum "sensei"."inference_role" {
+  "inference"
+  "consolidation"
+  "embedding"
+  "voice"
+  "default_fallback"
+}
+
+Enum "sensei"."library_ecosystem" {
+  "npm"
+  "pypi"
+  "cargo"
+  "go"
+  "docs"
+}
+
+Enum "sensei"."library_kind" {
+  "detected"
+  "imported"
+}
+
+Enum "sensei"."library_source_type" {
+  "llms.txt"
+  "http"
+  "local"
+}
+
+Enum "sensei"."memory_outcome" {
+  "applied"
+  "consulted"
+  "violated"
+  "ignored"
+}
+
+Enum "sensei"."memory_scope" {
+  "global"
+  "project"
+  "stack"
+  "task_type"
+  "module"
+}
+
+Enum "sensei"."memory_status" {
+  "proposed"
+  "active"
+  "reinforced"
+  "challenged"
+  "battle_tested"
+  "archived"
+  "rejected"
+}
+
+Enum "sensei"."memory_type" {
+  "decision"
+  "pattern"
+  "convention"
+  "preference"
+  "continuity"
+  "question"
+}
+
+Enum "sensei"."model_capability" {
+  "chat"
+  "reasoning"
+  "embed"
+  "classify"
+  "summarize"
+  "vision"
+  "audio"
+}
+
+Enum "sensei"."node_kind" {
+  "file"
+  "module"
+  "package"
+  "class"
+  "interface"
+  "function"
+  "method"
+  "property"
+  "field"
+  "parameter"
+  "type"
+  "const"
+  "enum"
+  "enum_variant"
+  "section"
+  "rationale"
+}
+
+Enum "sensei"."pattern_lifecycle" {
+  "suggested"
+  "gap"
+  "rule"
+}
+
+Enum "sensei"."pattern_severity" {
+  "low"
+  "medium"
+  "high"
+}
+
+Enum "sensei"."project_maturity" {
+  "discovery"
+  "active"
+  "maintenance"
+  "archived"
+}
+
+Enum "sensei"."recommendation_status" {
+  "pending"
+  "accepted"
+  "dismissed"
+  "superseded"
+}
+
+Enum "sensei"."recommendation_urgency" {
+  "low"
+  "medium"
+  "high"
+}
+
+Enum "sensei"."recommendation_verdict" {
+  "pending"
+  "positive"
+  "negative"
+  "neutral"
+}
+
+Enum "sensei"."router_type" {
+  "direct"
+  "aggregator"
+  "local"
+}
+
+Enum "sensei"."service_kind" {
+  "data"
+  "api"
+  "devtool"
+  "service"
+  "inference"
+}
+
+Enum "sensei"."service_protocol" {
+  "mcp"
+  "ollama"
+  "anthropic"
+  "openai"
+}
+
+Enum "sensei"."session_outcome" {
+  "completed"
+  "corrected"
+  "blocked"
+  "partial"
+  "abandoned"
+}
+
+Enum "sensei"."snapshot_kind" {
+  "manual"
+  "checkpoint"
+}
+
+Enum "sensei"."task_status" {
+  "in_progress"
+  "completed"
+  "abandoned"
+}
+
+Enum "sensei"."task_type_kind" {
+  "feat"
+  "fix"
+  "refactor"
+  "docs"
+  "test"
+  "chore"
+  "unknown"
+}
+
+Enum "sensei"."tool_usage" {
+  "used"
+  "partial"
+  "ignored"
+}
+
+Enum "sensei"."watch_status" {
+  "scanning"
+  "watching"
+  "paused"
+}
+
+Table "activity"."hook_events" {
+  "id" bigserial [pk, increment, not null, note: 'Surrogate primary key (bigserial — high write volume).']
+  "session_id" TEXT [not null, default: '', note: 'Assistant session ID string. Not a FK — not a DB UUID.']
+  "assistant_family" assistant_family [not null, default: 'claude', note: 'Which assistant emitted this event: claude, cursor, zed, codex, aider, etc.']
+  "event_type" TEXT [not null, note: 'hook_event_name from payload: SessionStart, PreToolUse, PostToolUse, Stop, etc.']
+  "tool_name" TEXT [note: 'tool_name from payload. Populated for PreToolUse and PostToolUse events only.']
+  "cwd" TEXT [note: 'Working directory at the time of the hook event.']
+  "ts" BIGINT [not null, note: 'Unix epoch milliseconds when the hook fired (client clock).']
+  "success" BOOLEAN [note: 'For PostToolUse: true if exit_code == 0. Null for all other event types.']
+  "payload" JSONB [not null, default: '{}', note: 'Full JSON payload received from stdin — complete hook event data.']
+  "created_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Server-side timestamp when this row was inserted.']
+
+  indexes {
+    (session_id, created_at) [name: 'hook_events_session_id_idx']
+    (event_type, created_at) [name: 'hook_events_event_type_idx']
+    created_at [name: 'hook_events_created_at_idx']
+    (assistant_family, created_at) [name: 'hook_events_family_idx']
+  }
+
+  Note: '''
+Raw hook event log — one row per hook invocation, from any assistant family.
+Captures event types emitted by hooks from Claude Code, Cursor, Zed, etc.
+session_id is the assistant string session ID, not a DB UUID.
+assistant_family identifies the source assistant (claude, cursor, zed, …).
+payload stores the full JSON payload received from stdin.
+'''
+}
+
+Table "activity"."task_executions" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`]
+  "task_id" BIGINT [not null, note: 'In-memory queue task ID. Unique per daemon session (resets on restart).']
+  "parent_task_id" BIGINT [note: 'Parent task ID for hierarchy. process_file → process_git_folder → scan_root.']
+  "task_kind" TEXT [not null, note: 'TaskKind::to_string() — scan_root, process_file, resolve_edges, etc.']
+  "folder_path" TEXT [not null, default: '', note: 'Git folder abs path — groups all tasks for a repo.']
+  "path" TEXT [not null, default: '', note: 'Specific path this task operates on (file, folder, URL).']
+  "status" TEXT [not null, default: 'running', note: 'running, completed, or failed.']
+  "items_processed" INTEGER [note: 'Count of items handled: symbols parsed, edges resolved, files queued, etc.']
+  "duration_ms" INTEGER [note: 'Wall-clock milliseconds from start to completion.']
+  "retry_number" INTEGER [not null, default: 0, note: '0 for first attempt. Incremented if the same task is retried.']
+  "error_message" TEXT [note: 'Error detail if status = failed.']
+  "started_at" TIMESTAMPTZ [not null, default: `now()`]
+  "completed_at" TIMESTAMPTZ
+
+  indexes {
+    task_kind [name: 'task_executions_task_kind_idx']
+    folder_path [name: 'task_executions_folder_path_idx']
+    parent_task_id [name: 'task_executions_parent_task_id_idx']
+    started_at [name: 'task_executions_started_at_idx']
+    status [name: 'task_executions_status_idx']
+  }
+
+  Note: '''
+Task execution history — one row per task run. Forms a tree via parent_task_id.
+
+status: running → completed | failed
+retry_number: 0 for first attempt, incremented on retry.
+duration_ms and items_processed set on completion.
+started_at vs completed_at shows wall-clock execution time.
+
+Common queries:
+  -- Execution tree for a scan
+  WITH RECURSIVE tree AS (
+    SELECT * FROM task_executions WHERE task_id = $1
+    UNION ALL
+    SELECT e.* FROM task_executions e JOIN tree t ON e.parent_task_id = t.task_id
+  ) SELECT * FROM tree ORDER BY started_at
+  -- Slowest tasks
+  SELECT task_kind, avg(duration_ms), max(duration_ms) FROM task_executions WHERE status = 'completed' GROUP BY task_kind
+  -- Failed tasks in last hour
+  SELECT * FROM task_executions WHERE status = 'failed' AND started_at > now() - interval '1h'
+'''
+}
+
+Table "gateway"."fallback_chains" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "name" TEXT [not null, unique, note: 'Unique chain name (e.g. "reasoning", "embed", "classify", "consensus-proposer").']
+  "capability" model_capability [not null, note: 'Which capability this chain serves: chat, reasoning, embed, classify, summarize, vision, audio.']
+  "description" TEXT [note: 'What this chain is for (e.g. "MOE proposer — strong reasoning models").']
+  "max_fallback_attempts" INTEGER [not null, default: 3, note: 'Maximum number of models to attempt before failing.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether this chain is available for use.']
+  "sequence" INTEGER [not null, default: 0, note: 'Display order — lower values shown first.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: '''
+Ordered model fallback sequences per capability.
+When a model fails (timeout, rate limit, error), the gateway tries the next in sequence.
+- capability: which model_capability this chain handles (chat, reasoning, embed, etc.)
+- max_fallback_attempts: how many models to try before giving up
+Seed data loaded via staging.import_fallback_chains().
+'''
+}
+
+Table "gateway"."providers" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "name" TEXT [not null, unique, note: 'Unique slug identifier (e.g. "anthropic", "meta", "google").']
+  "display_name" TEXT [not null, note: 'Human-readable name (e.g. "Anthropic", "Meta").']
+  "description" TEXT [note: 'Brief description of the provider.']
+  "website_url" TEXT [note: 'Provider homepage URL.']
+  "is_open_source" BOOLEAN [not null, default: false, note: 'Whether the provider primarily offers open-source models.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether models from this provider are available for selection.']
+  "sequence" INTEGER [not null, default: 0, note: 'Display order — lower values shown first.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: '''
+AI model organizations — OpenAI, Anthropic, Meta, Google, Alibaba, etc.
+Seed data loaded via staging.import_providers().
+'''
+}
+
+Table "gateway"."routers" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "name" TEXT [not null, unique, note: 'Unique slug identifier (e.g. "ollama", "anthropic", "openai").']
+  "display_name" TEXT [not null, note: 'Human-readable name (e.g. "Ollama (local)", "Anthropic").']
+  "description" TEXT [note: 'Brief description of this router.']
+  "router_type" router_type [not null, note: 'Router category: direct (single provider), aggregator (multi-provider), local (on-device).']
+  "api_base_url" TEXT [note: 'Base URL for API calls (e.g. "http://localhost:11434", "https://api.anthropic.com").']
+  "api_key_env_var" TEXT [note: 'Environment variable name containing the API key (e.g. "ANTHROPIC_API_KEY"). Null for local routers.']
+  "authentication_type" auth_type [not null, default: 'api_key', note: 'How to authenticate: api_key (header-based) or none (local).']
+  "default_headers" JSONB [not null, default: '{}', note: 'Default HTTP headers for requests to this router.']
+  "rate_limits" JSONB [not null, default: '{}', note: 'Rate limits: {requests_per_minute, tokens_per_minute}.']
+  "config" JSONB [not null, default: '{}', note: 'Connection config: {timeout_ms, retry_limit, retry_delay_ms, circuit_breaker_threshold, circuit_breaker_window_minutes}.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether this router is available for use.']
+  "sequence" INTEGER [not null, default: 0, note: 'Display order — lower values shown first.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: '''
+API access points for LLM gateway.
+- direct: single-provider API (anthropic, openai)
+- aggregator: multi-provider proxy (openrouter)
+- local: on-device runtime (ollama)
+- config: connection settings — {timeout_ms, retry_limit, retry_delay_ms, circuit_breaker_threshold, ...}
+- rate_limits: {requests_per_minute, tokens_per_minute}
+Seed data loaded via staging.import_routers().
+'''
+}
+
+Table "history"."past_extensions" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "extension_id" UUID [not null, note: 'References sensei.extensions.id. No FK — survives hard deletes.']
+  "plugin_id" UUID
+  "kind" TEXT [not null]
+  "name" TEXT [not null]
+  "version" TEXT
+  "description" TEXT
+  "content" TEXT
+  "props" JSONB [not null, default: '{}']
+  "scope" TEXT [not null]
+  "enabled" BOOLEAN [not null]
+  "source" TEXT [not null]
+  "icons" JSONB [not null, default: '{}']
+  "tags" TEXT[] [not null, default: '{}']
+  "operation" dml_operation [not null, note: 'DML that produced this entry: INSERT, UPDATE, or DELETE.']
+  "revision" INTEGER [not null, default: 0, note: 'Revision number of the extension at this snapshot.']
+  "recommendation_id" UUID [note: 'Which recommendation triggered this change. Null for manual edits. Links to inference.recommendations.']
+  "effective_from" TIMESTAMPTZ [not null, note: 'When this revision became the live state.']
+  "effective_to" TIMESTAMPTZ [note: 'When this revision was superseded. Null if still current or if source was deleted.']
+  "changed_at" TIMESTAMPTZ [not null, default: `now()`, note: 'When this history entry was written.']
+  "changed_by" TEXT [note: 'Who triggered the change: user, recommendation:{id}, system.']
+
+  indexes {
+    extension_id [name: 'past_extensions_extension_id_idx']
+    recommendation_id [name: 'past_extensions_recommendation_idx']
+  }
+
+  Note: '''
+History table for sensei.extensions — auto-populated by historize_extensions trigger.
+Captures every INSERT, UPDATE, and DELETE so that skill/persona/rule changes can be
+audited and correlated with FTR impact via recommendation_id.
+
+- extension_id: references sensei.extensions.id with no FK — survives hard deletes
+- recommendation_id: which recommendation triggered this change (null for manual edits)
+- effective_from/to: when this revision was the live state
+- operation: INSERT, UPDATE, or DELETE
+'''
+}
+
+Table "history"."past_memories" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "memory_id" UUID [not null, note: 'References sensei.memories.id. No FK — survives hard deletes.']
+  "project_id" UUID
+  "scope" TEXT [not null]
+  "scope_filter" TEXT
+  "type" TEXT [not null]
+  "title" TEXT [not null]
+  "content" TEXT [not null]
+  "impact" TEXT
+  "strength" REAL [not null]
+  "status" TEXT [not null]
+  "session_id" UUID
+  "operation" dml_operation [not null, note: 'DML that produced this entry: INSERT, UPDATE, or DELETE.']
+  "effective_from" TIMESTAMPTZ [not null, note: 'When this revision became the live state.']
+  "effective_to" TIMESTAMPTZ [note: 'When this revision was superseded. Null if still current or if source was deleted.']
+  "changed_at" TIMESTAMPTZ [not null, default: `now()`, note: 'When this history entry was written.']
+
+  indexes {
+    memory_id [name: 'past_memories_memory_id_idx']
+  }
+
+  Note: '''
+History table for sensei.memories — auto-populated by historize_memories trigger.
+Captures every INSERT, UPDATE, and DELETE so that memory evolution can be audited.
+
+- memory_id: references sensei.memories.id with no FK — survives hard deletes
+- effective_from/to: when this revision was the live state
+- operation: INSERT, UPDATE, or DELETE
+'''
+}
+
+Table "inference"."insight_batches" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "insight_count" INTEGER [not null, default: 0, note: 'Number of insights in this batch.']
+  "target" TEXT [not null, note: 'Where insights were sent: git, posthog.']
+  "reference" TEXT [note: 'External reference: git commit SHA, PostHog batch ID, etc.']
+  "sent_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this batch was sent.']
+
+  Note: '''
+Collective intelligence send batches. Groups insights shared together.
+- target: "git", "posthog" — where insights were sent
+- reference: git commit SHA, PostHog batch ID, etc. — traceable external reference
+'''
+}
+
+Table "public"."logs" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`]
+  "level" VARCHAR [not null]
+  "running_on" VARCHAR [not null]
+  "logged_at" TIMESTAMPTZ [not null]
+  "message" VARCHAR
+  "context" JSONB [not null, default: '{}']
+  "data" JSONB
+  "error" JSONB
+  "written_at" TIMESTAMPTZ [not null, default: `now()`]
+
+  indexes {
+    level [name: 'logs_level_idx']
+    running_on [name: 'logs_running_on_idx']
+    logged_at [name: 'logs_logged_at_idx']
+    (context ->> 'module') [name: 'logs_context_module_idx']
+  }
+
+  Note: '''
+Generic structured log table — shared across daemon, CLI, MCP, and app.
+Follows the kavach logger pattern: level, running_on, context jsonb, data jsonb, error jsonb.
+
+running_on: daemon, cli, mcp, app — identifies which component wrote the log.
+context: flexible jsonb bag — callers inject attributes like module, method, task_id, tool, etc.
+data: structured payload — task metrics (duration_ms, items_processed), API params, etc.
+error: structured error — message, stack, code.
+
+Common queries:
+  -- All task executions sorted by duration
+  SELECT * FROM logs WHERE context->>'module' = 'tasks' ORDER BY (data->>'duration_ms')::int DESC
+  -- Errors in the last hour
+  SELECT * FROM logs WHERE level = 'error' AND logged_at > now() - interval '1h'
+  -- All activity from a specific component
+  SELECT * FROM logs WHERE running_on = 'mcp' ORDER BY logged_at DESC
+'''
+}
+
+Table "sensei"."assistants" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "family" assistant_family [not null, note: 'Assistant product family: claude, cursor, zed, continue, codex, aider, opencode, kiro.']
+  "name" TEXT [not null, note: 'Specific variant or display name (e.g. "Claude Code CLI", "Cursor").']
+  "version" TEXT [note: 'Detected version of the assistant binary/app.']
+  "path" TEXT [note: 'Filesystem path to the assistant binary or config directory.']
+  "transport" TEXT [not null, default: 'stdio', note: 'Communication transport: stdio (pipes) or http (localhost).']
+  "configured" BOOLEAN [not null, default: false, note: 'True once sensei has registered its extensions (skills, commands, hooks, MCP) with this assistant.']
+  "configured_at" TIMESTAMPTZ [note: 'Timestamp of the last configuration/registration run. Null if never configured.']
+  "configured_version" TEXT [note: 'Sensei version string at last configuration. Bootstrap compares this to running version to trigger upgrade reconfiguration.']
+  "props" JSONB [not null, default: '{}', note: 'Extra metadata: {detected_at, install_method, registration_log, capabilities, supported_hooks, last_health_check}.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    family [name: 'assistants_family_idx']
+    configured [name: 'assistants_configured_idx']
+  }
+
+  Note: '''
+Detected AI coding assistants (ACPs) and their configuration state.
+Bootstrap detects installed assistants and upserts rows here.
+Setup wizard (step 3) registers sensei plugins/skills/commands per assistant.
+On upgrade, bootstrap compares configured_version against the running sensei
+version — if stale, the upgrade flow re-pushes skills, agents, hooks, and
+commands to each configured assistant.
+
+- family: groups variants of the same product (e.g. claude covers claude-code CLI and claude-code desktop)
+- transport: stdio or http — how sensei communicates with this assistant
+- configured: true once sensei has registered its extensions with this assistant
+- configured_at: when registration last ran (null = never configured)
+- configured_version: sensei version at last configuration — drives upgrade reconfiguration
+- props: extra metadata — {detected_at, install_method, registration_log, capabilities}
+'''
+}
+
+Table "sensei"."config" {
+  "key" TEXT [pk, not null, note: 'Preference key.']
+  "value" TEXT [not null, note: 'Preference value stored as text (JSON-encoded for complex values).']
+
+  Note: '''
+Key-value user preferences.
+setup_complete, active_project, sidebar_max_items, etc.
+'''
+}
+
+Table "sensei"."consolidated_rulesets" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`]
+  "scope" TEXT [not null, note: 'What was merged: \'global\' (always-on user/general rules) in v1; later a repo abs_path or namespace key.']
+  "version" INTEGER [not null, note: 'Monotonic per scope. New consolidation = max(version)+1.']
+  "content" TEXT [not null, note: 'The merged markdown ruleset produced by the model.']
+  "conflicts" JSONB [not null, default: '[]', note: 'Conflicts the model surfaced during the merge (JSON array). Empty when none/unextracted.']
+  "model" TEXT [note: 'Model that produced this merge (e.g. gemma4).']
+  "source_hash" TEXT [not null, note: 'Hash of the Tier-1 input rules. A consolidate is skipped when the latest version already has this hash (no change to merge).']
+  "status" TEXT [not null, default: 'proposed', note: 'proposed (awaiting approval) | approved (active, feeds rules.md) | superseded (an older approved version).']
+  "created_at" TIMESTAMPTZ [not null, default: `now()`, note: 'When this version was produced.']
+
+  indexes {
+    (scope, status) [name: 'consolidated_rulesets_scope_status_idx']
+  }
+
+  Note: '''
+Governance Tier-2 output: an LLM-merged, human-approved ruleset for a scope.
+Tier-1 resolution (resolve_rules_raw / resolve_global_rules) gathers + orders the
+raw rules; Tier-2 asks a model to merge them into one coherent, deduped,
+conflict-flagged markdown ruleset. Each consolidation is a kept version; the row
+with status=approved for a scope is the active merged ruleset (it feeds
+~/.sensei/rules.md). Versioning IS the history — no separate history table.
+'''
+}
+
+Table "sensei"."extensions" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "plugin_id" UUID [note: 'Self-referencing FK: null = standalone, set = belongs to a plugin extension.']
+  "kind" extension_kind [not null, note: 'Extension type: plugin (container), skill, command, agent, or hook.']
+  "name" TEXT [not null, unique, note: 'Unique identifier (e.g. "zero-errors-policy", "sensei:build").']
+  "version" TEXT [note: 'Semantic version string.']
+  "description" TEXT [note: 'Triggering conditions or purpose description (starts with "Use when..." for skills).']
+  "content" TEXT [note: 'Markdown body — the actual skill protocol, command instructions, or agent definition.']
+  "props" JSONB [not null, default: '{}', note: 'Parsed frontmatter + config: {triggers, inputs, tool_access, hook_event, ...}.']
+  "scope" extension_scope [not null, default: 'global', note: 'Visibility: global (all projects), project (one project), folder (one repository).']
+  "enabled" BOOLEAN [not null, default: true, note: 'Whether this extension is currently active.']
+  "source" extension_source [not null, default: 'local', note: 'Origin: builtin (ships with sensei), marketplace (installed from registry), local (user-created).']
+  "icons" JSONB [not null, default: '{}', note: 'Display icons: {emoji, devicon, kanji, custom}.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for filtering. Vocabulary controlled by sensei.tags table.']
+  "revision" INTEGER [not null, default: 0]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+  "modified_by" TEXT
+
+  indexes {
+    plugin_id [name: 'extensions_plugin_id_idx']
+    kind [name: 'extensions_kind_idx']
+    tags [name: 'extensions_tags_idx']
+  }
+
+  Note: '''
+Skills, commands, agents, hooks, and plugins.
+Plugins are containers — other extensions reference them via plugin_id (self-ref).
+- content: markdown body — the actual skill/command text, editable and round-trippable to .md files
+- props: parsed frontmatter + additional config (triggers, inputs, tool_access, etc.)
+- scope: global (all projects), project (specific project), folder (specific repository)
+- source: builtin (ships with sensei), marketplace (installed), local (user-created)
+- plugin_id: null = standalone extension; set = belongs to a plugin
+'''
+}
+
+Table "sensei"."folders_to_watch" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "path" TEXT [not null, unique, note: 'Absolute filesystem path to the watched root directory.']
+  "name" TEXT [not null, note: 'Display name for the root (e.g. "Developer", "Work Projects").']
+  "note" TEXT [note: 'Optional user note about this root (e.g. "monorepo root, 3 packages").']
+  "status" watch_status [not null, default: 'scanning', note: 'Lifecycle: scanning (initial scan in progress), watching (watchers active), paused (content retained, watchers stopped).']
+  "excluded" JSONB [not null, default: '[]', note: 'JSON array of relative folder names/paths excluded from scanning, e.g. ["node_modules","dist",".git"].']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: '''
+Configuration: directories the user has pointed sensei at.
+Initial status is scanning; transitions to watching after first scan completes.
+Exclusions are user configuration — adding an entry deletes matching folders + children;
+removing an entry triggers a re-scan of that subtree.
+'''
+}
+
+Table "sensei"."libraries" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "kind" library_kind [not null, default: 'detected', note: 'Library classification: detected (from package manifests) or imported (manually registered).']
+  "name" TEXT [not null, note: 'Package name within the ecosystem (e.g. "react", "tokio", "@lumen/icons").']
+  "ecosystem" library_ecosystem [not null, note: 'Package registry: npm, pypi, cargo, go, or docs (pure documentation source).']
+  "version" TEXT [note: 'Pinned or latest-known version string.']
+  "description" TEXT [note: 'Human-readable description of the library.']
+  "source_type" library_source_type [note: 'How documentation pages are sourced: llms.txt, http, or local.']
+  "base_url" TEXT [note: 'Root URL for fetching documentation when source_type is http or llms.txt.']
+  "local_path" TEXT [note: 'Local filesystem path for reading documentation when source_type is local.']
+  "homepage_url" TEXT [note: 'URL of the library homepage or repository.']
+  "docs_url" TEXT [note: 'URL of the library primary documentation site.']
+  "page_count" INTEGER [not null, default: 0, note: 'Denormalized count of library_pages rows for this library.']
+  "embedding" vector(384) [note: '384-dimensional vector embedding on description for similarity search.']
+  "icons" JSONB [not null, default: '{}', note: 'Display icons: {emoji, devicon, kanji, custom}.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible metadata: {llms_txt, llms_txt_fetched_at, skill_path, skill_generated_at, ...}.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for filtering. Vocabulary controlled by sensei.tags table.']
+  "indexed_at" TIMESTAMPTZ [note: 'Timestamp of the last successful index run for this library.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    kind [name: 'libraries_kind_idx']
+    embedding [name: 'libraries_embedding_hnsw']
+    tags [name: 'libraries_tags_idx']
+  }
+
+  Note: '''
+Libraries — known packages and documentation sources.
+Consolidates the former libraries, lib_meta, and shared_libs tables.
+- kind: detected (from Cargo.toml, package.json) or imported (manual, internal SDKs, llms.txt)
+- ecosystem: npm, pypi, cargo, go, or docs (for pure documentation sources)
+- source_type: how pages are fetched — llms.txt, http, or local
+- page_count: denormalized count of library_pages rows
+- props: extensible — {llms_txt, llms_txt_fetched_at, skill_path, skill_generated_at, ...}
+- embedding: 384-dim vector on description for similarity search
+'''
+}
+
+Table "sensei"."projects" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "name" TEXT [not null, note: 'Project display name — initially derived from parent folder name or git remote.']
+  "description" TEXT [note: 'Optional project description.']
+  "client" TEXT [note: 'Optional client or owner name.']
+  "maturity" project_maturity [not null, default: 'discovery', note: 'Lifecycle stage: discovery (just scanned), active (in development), maintenance, or archived.']
+  "goal" TEXT [note: 'What this project is for — populated from README, sensei.json, or user input.']
+  "icon" JSONB [not null, default: '{}', note: 'Display icon: {kind:"kanji"|"emoji"|"custom", value:"工", bg:"color", fg:"color"}.']
+  "stack" JSONB [not null, default: '{}', note: 'Detected technology stack: {languages:[], frameworks:[], runtimes:[], services:[]}. Derived from member folders.']
+  "commands" JSONB [not null, default: '{}', note: 'JSON object of common commands: {dev, test, build, lint, ...}. Derived from config files.']
+  "links" JSONB [not null, default: '[]', note: 'External references: [{id, kind, label, url}]. Kinds: docs, dashboard, issues, runbook, design, wiki.']
+  "guidelines" JSONB [not null, default: '[]', note: 'Project rules: [{id, rule, source}]. Source can be "house-style", a session id, or "manual".']
+  "preferred_acp" TEXT [note: 'Default AI coding tool for sessions in this project: claude-code, cursor, zed, etc.']
+  "backlog" JSONB [not null, default: '[]', note: 'Task backlog items: [{id, task, added}]. Surfaced in project settings.']
+  "privacy" JSONB [not null, default: '{}', note: 'Per-project privacy settings: {logPrompts:bool, logFileContents:bool, redactSecrets:bool, shareWithCloud:bool}. Defaults to empty = inherit global config.']
+  "excluded_globs" JSONB [not null, default: '[]', note: 'Glob patterns to exclude from indexing for this project: ["dist/**", "*.generated.*"]. Layered on top of folders_to_watch.excluded.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for quick filtering. Vocabulary controlled by sensei.tags table.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    maturity [name: 'projects_maturity_idx']
+    tags [name: 'projects_tags_idx']
+  }
+
+  Note: '''
+Projects — independent grouping entity for 1+ folders.
+One project per git/subtree folder by default, but users can merge or split.
+- maturity: discovery → active → maintenance → archived
+- stack: {languages, frameworks, runtimes, services} — derived from member folders
+- icon: {kind, value, bg, fg} — e.g. {kind:"kanji", value:"工", bg:"var(--shu-soft)", fg:"var(--shu)"}
+- links: external references [{id, kind, label, url}] — docs, dashboards, issue trackers
+- guidelines: project rules [{id, rule, source}]
+- preferred_acp: default AI coding tool for this project (claude-code, cursor, etc.)
+- backlog: task items [{id, task, added}]
+- privacy: per-project privacy settings {logPrompts, logFileContents, redactSecrets, shareWithCloud}
+- excluded_globs: file/folder patterns to exclude from indexing ["dist/**", "*.generated.*"]
+'''
+}
+
+Table "sensei"."scopes" {
+  "key" TEXT [pk, not null, note: 'Stable identifier (e.g. general, user, organization, client, technology, team, project, repository).']
+  "name" TEXT [not null, note: 'Human-readable label.']
+  "level" INTEGER [not null, note: 'Precedence rank. Higher = more specific = wins. general=0 … repository=70.']
+  "shareable" BOOLEAN [not null, default: false, note: 'Whether knowledge at this scope federates to a shared hive-mind (organization/client/team = true).']
+  "description" TEXT [note: 'What this scope is for.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: '''
+The governance scope ladder. Each row is one level at which rules/knowledge
+and identity can apply. Precedence is the integer `level` — higher = more
+specific = wins on conflict (most-specific-scope-wins), with enforcement as a
+separate override axis (see governance concept doc). A repo is a member of a
+SET of namespaces across these scopes (no single-parent tree); resolution
+orders by level. Seeded via staging.import_scopes().
+'''
+}
+
+Table "sensei"."services" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "name" TEXT [not null, unique, note: 'Unique identifier for the service (e.g. "postgres-mcp").']
+  "display_name" TEXT [not null, note: 'Human-readable name (e.g. "PostgreSQL MCP").']
+  "publisher" TEXT [note: 'Who publishes this service (e.g. "supabase", "stripe").']
+  "protocol" service_protocol [not null, default: 'mcp', note: 'Communication protocol: mcp (tools via http/stdio), ollama (local inference), anthropic/openai (external LLM providers).']
+  "kind" service_kind [not null, note: 'Service category: data (databases), api (external APIs), devtool (dev tools), service (monitoring etc.), inference (local/external LLM providers).']
+  "summary" TEXT [note: 'Short description of what this service provides.']
+  "trigger_stacks" TEXT[] [not null, default: '{}', note: 'Stack names that trigger recommendation of this service (e.g. ["PostgreSQL","Redis"]).']
+  "tools_count" INTEGER [not null, default: 0, note: 'Number of tools exposed by this service.']
+  "verified" BOOLEAN [not null, default: false, note: 'Whether the service is verified/official.']
+  "installed" BOOLEAN [not null, default: false, note: 'Whether the service is currently installed and configured.']
+  "config" JSONB [not null, default: '{}', note: 'Connection config: MCP: {transport, command, args, url, env}. Ollama: {url, models, default_model}. External: {api_key_env, default_model}.']
+  "icons" JSONB [not null, default: '{}', note: 'Display icons: {emoji, devicon, kanji, custom}.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for filtering. Vocabulary controlled by sensei.tags table.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    kind [name: 'services_kind_idx']
+    installed [name: 'services_installed_idx']
+    tags [name: 'services_tags_idx']
+  }
+
+  Note: '''
+External service registry for MCP servers and inference providers.
+- kind: data (databases), api (stripe, github), devtool (playwright, figma), service (sentry, etc.), inference (Ollama, external LLM providers)
+- protocol: mcp (tools via http/stdio), ollama (local inference), anthropic/openai (external inference)
+- trigger_stacks: which detected stacks recommend this service (e.g. ["PostgreSQL"])
+- config: connection config, env vars, transport settings, model preferences
+'''
+}
+
+Table "sensei"."tags" {
+  "tag" TEXT [pk, not null, note: 'Tag text value — the controlled vocabulary entry.']
+  "category" TEXT [note: 'Optional category for grouping tags (e.g. "stack", "domain", "status").']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this tag was first created.']
+
+  Note: '''
+Controlled vocabulary for tags used across the system.
+Tables that need tags carry a tags text[] column for quick access.
+This table provides autocomplete and validation.
+- category: optional grouping (e.g. "stack", "domain", "status")
+'''
+}
+
+Table "sensei"."workflow_state" {
+  "project" TEXT [pk, not null, note: 'Project identifier.']
+  "active_phase" TEXT [note: 'Current phase name.']
+  "active_plan" TEXT [note: 'Current plan or goal.']
+  "active_task" TEXT [note: 'Current task description.']
+  "active_issue" INTEGER [note: 'Current issue number being addressed.']
+  "last_checkpoint" TEXT [note: 'Timestamp of last checkpoint command.']
+  "rules_hash" TEXT [note: 'Hash of active rules for this project.']
+  "updated_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of last update.']
+
+  Note: '''
+Workflow state — current phase/task/issue per project.
+Updated by checkpoint and phase commands.
+'''
+}
+
+Table "staging"."benchmark_reports" {
+  "id" UUID
+  "folder_id" UUID
+  "run_name" TEXT
+  "strategy" TEXT
+  "score" NUMERIC
+  "tokens" INTEGER
+  "elapsed_ms" INTEGER
+  "payload" JSONB
+  "promoted" BOOLEAN
+  "modified_at" TIMESTAMPTZ
+
+  indexes {
+    id [unique, name: 'benchmark_reports_id_ukey']
+  }
+
+  Note: 'Staging buffer for sensei.benchmark_reports.'
+}
+
+Table "staging"."fallback_chain_models" {
+  "chain_name" TEXT
+  "router_name" TEXT
+  "model_full_name" TEXT
+  "sequence_order" INTEGER
+  "max_retries" INTEGER [default: 1]
+  "is_active" BOOLEAN [default: true]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."fallback_chains" {
+  "name" TEXT
+  "capability" TEXT
+  "description" TEXT
+  "max_fallback_attempts" INTEGER [default: 3]
+  "is_active" BOOLEAN [default: true]
+  "sequence" INTEGER [default: 0]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."hook_events" {
+  "session_id" TEXT
+  "assistant_family" TEXT [default: 'claude']
+  "event_type" TEXT
+  "tool_name" TEXT
+  "cwd" TEXT
+  "ts" BIGINT
+  "success" BOOLEAN
+  "payload" JSONB
+  "created_at" TIMESTAMPTZ
+
+  Note: '''
+Staging buffer for activity.hook_events.
+assistant_family is text here (cast to enum during import).
+Load via dbd import or CALL staging.import_jsonb_to_table('_temp', 'staging.hook_events').
+The hook script enriches payload with event_type (mapped from hook_event_name)
+so that import_jsonb_to_table can map field names directly.
+Then call: CALL staging.import_hook_events() to move into activity.hook_events.
+'''
+}
+
+Table "staging"."libraries" {
+  "name" TEXT
+  "ecosystem" TEXT
+  "kind" TEXT
+  "version" TEXT
+  "description" TEXT
+  "source_type" TEXT
+  "base_url" TEXT
+  "local_path" TEXT
+  "homepage_url" TEXT
+  "docs_url" TEXT
+  "icons" JSONB [default: '{}']
+  "props" JSONB [default: '{}']
+  "tags" TEXT[] [default: '{}']
+  "modified_at" TIMESTAMPTZ
+
+  indexes {
+    (ecosystem, name) [unique, name: 'libraries_ukey']
+  }
+
+  Note: 'Staging buffer for sensei.libraries. Natural key: (ecosystem, name).'
+}
+
+Table "staging"."models" {
+  "provider_name" TEXT
+  "name" TEXT
+  "version" TEXT
+  "variant" TEXT
+  "full_name" TEXT
+  "display_name" TEXT
+  "description" TEXT
+  "capabilities" TEXT[]
+  "context_window" INTEGER
+  "max_output_tokens" INTEGER
+  "parameters_count" BIGINT
+  "memory_gb" NUMERIC(5,1)
+  "license_type" TEXT
+  "released_on" DATE
+  "deprecated_on" DATE
+  "props" JSONB [default: '{}']
+  "is_active" BOOLEAN [default: true]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."models_in_router" {
+  "router_name" TEXT
+  "model_full_name" TEXT
+  "router_model_id" TEXT
+  "cost_per_input_token" NUMERIC(12,10) [default: 0]
+  "cost_per_output_token" NUMERIC(12,10) [default: 0]
+  "cost_per_request" NUMERIC(10,6) [default: 0]
+  "is_active" BOOLEAN [default: true]
+  "is_default" BOOLEAN [default: false]
+  "props" JSONB [default: '{}']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."providers" {
+  "name" TEXT
+  "display_name" TEXT
+  "description" TEXT
+  "website_url" TEXT
+  "is_open_source" BOOLEAN
+  "is_active" BOOLEAN [default: true]
+  "sequence" INTEGER [default: 0]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."routers" {
+  "name" TEXT
+  "display_name" TEXT
+  "description" TEXT
+  "router_type" TEXT
+  "api_base_url" TEXT
+  "api_key_env_var" TEXT
+  "authentication_type" TEXT [default: 'api_key']
+  "default_headers" JSONB [default: '{}']
+  "rate_limits" JSONB [default: '{}']
+  "config" JSONB [default: '{}']
+  "is_active" BOOLEAN [default: true]
+  "sequence" INTEGER [default: 0]
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "staging"."scopes" {
+  "key" TEXT
+  "name" TEXT
+  "level" INTEGER
+  "shareable" BOOLEAN [default: false]
+  "description" TEXT
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+}
+
+Table "gateway"."inference_assignments" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "role" inference_role [not null, note: 'Inference role: inference (insights/recommendations), consolidation (memory merge/conflict), embedding (index/retrieval), voice (observatory speech), default_fallback (catch-all).']
+  "chain_id" UUID [not null, note: 'Foreign key to fallback_chains — the ordered model sequence that serves this role.']
+  "is_default_fallback" BOOLEAN [not null, default: false, note: 'When true, this chain is the last-resort fallback for the role. Exactly one per role.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    role [name: 'inference_assignments_role_idx']
+  }
+
+  Note: '''
+Maps sensei inference roles to gateway fallback chains.
+Each role (inference, consolidation, embedding, voice) is served by one or more
+fallback chains. The default_fallback role is a catch-all chain used when a
+role-specific chain is exhausted or missing.
+
+- role: which reasoning purpose this chain serves
+- chain_id: FK to fallback_chains — the ordered model sequence
+- is_default_fallback: true on exactly one row per role — marks which chain
+  to use as the last-resort fallback before giving up
+
+Setup wizard (step 9) writes these rows. Users can later reconfigure from
+Settings → Inference.
+'''
+}
+
+Table "gateway"."models" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "provider_id" UUID [not null, note: 'Foreign key to providers — who created this model.']
+  "name" TEXT [not null, note: 'Model family name (e.g. "gemma3", "claude", "gpt").']
+  "version" TEXT [note: 'Version string (e.g. "3", "4o", "4.5").']
+  "variant" TEXT [note: 'Variant within version (e.g. "27b", "haiku", "mini"). Nullable.']
+  "full_name" TEXT [not null, note: 'Complete model identifier (e.g. "gemma3:27b", "claude-haiku-4-5", "gpt-4o-mini").']
+  "display_name" TEXT [not null, note: 'Human-readable display name.']
+  "description" TEXT [note: 'Brief description of model strengths and intended use.']
+  "capabilities" model_capability[] [not null, default: '{}', note: 'Array of capabilities this model supports: chat, reasoning, embed, classify, summarize, vision, audio.']
+  "context_window" INTEGER [note: 'Maximum input context in tokens.']
+  "max_output_tokens" INTEGER [note: 'Maximum output tokens per request.']
+  "parameters_count" BIGINT [note: 'Model parameter count (e.g. 27000000000 for 27B).']
+  "memory_gb" NUMERIC(5,1) [note: 'RAM required to run locally via Ollama. Null for external-only models.']
+  "license_type" TEXT [note: 'License type: commercial, apache-2.0, llama-3, gemma, etc.']
+  "released_on" DATE [note: 'Model release date.']
+  "deprecated_on" DATE [note: 'Deprecation date. Null if active.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible config: {temperature_range, top_p_range, training_cutoff, ...}.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether this model is available for selection.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    provider_id [name: 'models_provider_id_idx']
+    capabilities [name: 'models_capabilities_idx']
+  }
+
+  Note: '''
+AI model definitions with capabilities, sizing, and memory requirements.
+- capabilities: array of model_capability enum — chat, reasoning, embed, classify, summarize, vision, audio
+- memory_gb: RAM required to run locally via Ollama (null for external-only models)
+- parameters_count: model parameter count in raw number (e.g. 27000000000 for 27B)
+- props: extensible — {temperature_range, top_p_range, training_cutoff, ...}
+Seed data loaded via staging.import_models().
+'''
+}
+
+Table "inference"."insights" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "batch_id" UUID [note: 'Foreign key to insight_batches — which send batch included this insight. Null until shared.']
+  "source_table" TEXT [not null, note: 'Source table name: recommendation_outcomes, detected_patterns, sessions, etc.']
+  "source_id" UUID [not null, note: 'Primary key of the source record in source_table.']
+  "category" TEXT [not null, note: 'Insight category: pattern, model, skill, correction, ftr, anti_pattern, tool, stack.']
+  "payload" JSONB [not null, default: '{}', note: 'Anonymized snapshot of the insight at share time. No code, paths, or identifiable info.']
+
+  indexes {
+    batch_id [name: 'insights_batch_id_idx']
+    category [name: 'insights_category_idx']
+  }
+
+  Note: '''
+Collective intelligence — references to local insights shared with the network.
+Points to source records in recommendation_outcomes, detected_patterns, sessions, etc.
+- source_table: which table the original insight lives in
+- source_id: PK of the source record
+- payload: anonymized snapshot of the insight at time of sharing
+- batch_id: null until shared; links to the batch it was sent in
+'''
+}
+
+Table "inference"."reasoning_traces" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "project_id" UUID [note: 'Foreign key to projects — which project this reasoning was about. Nullable for system-level.']
+  "trigger_event" TEXT [not null, note: 'What triggered this reasoning: ftr_drop, recurring_correction, pattern_emerging, negative_impact, etc.']
+  "trigger_detail" JSONB [not null, default: '{}', note: 'Context for the trigger: {ftr_delta, sessions, module, ...}.']
+  "models_used" TEXT[] [not null, default: '{}', note: 'Array of model identifiers used in the reasoning panel.']
+  "exchanges" JSONB [not null, default: '[]', note: 'Full debate: [{model, role, content, tokens}] in order.']
+  "consensus" JSONB [not null, default: '{}', note: 'Final consensus: {conclusion, confidence:0.0-1.0, disagreements:[]}.']
+  "action_proposed" JSONB [note: 'Recommendation generated from this reasoning, if any.']
+
+  indexes {
+    project_id [name: 'reasoning_traces_project_id_idx']
+  }
+
+  Note: '''
+MOE consensus panel reasoning traces. Stores the full debate between local models.
+- trigger_event: what initiated the reasoning (ftr_drop, recurring_correction, pattern_emerging, etc.)
+- models_used: ["gemma3:27b", "qwen3:14b", ...]
+- exchanges: [{model, role:"proposer"|"challenger"|"synthesizer", content, tokens}]
+- consensus: {conclusion, confidence, disagreements:[]}
+- action_proposed: the recommendation generated, if any
+'''
+}
+
+Table "sensei"."extension_projects" {
+  "extension_id" UUID [not null]
+  "project_id" UUID
+  "enabled" BOOLEAN [not null, default: true]
+  "props" JSONB [not null, default: '{}']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+
+  indexes {
+    extension_id [unique, name: 'extension_projects_global_uniq']
+    (extension_id, project_id) [unique, name: 'extension_projects_scoped_uniq']
+    project_id [name: 'extension_projects_project_id_idx']
+  }
+
+  Note: '''
+Many-to-many: extensions (skills/commands/agents/hooks) associated with projects or global.
+project_id NULL = global (active in every project).
+project_id = X  = active only in that project.
+extensions.scope column is a seeding hint only; this table is authoritative at runtime.
+'''
+}
+
+Table "sensei"."folders" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "root_id" UUID [not null, note: 'Foreign key to folders_to_watch — which watched root this folder was discovered under.']
+  "parent_id" UUID [note: 'Self-referencing FK for folder hierarchy. Null means direct child of the watch root.']
+  "project_id" UUID [note: 'Foreign key to projects — groups this folder into a project. Nullable.']
+  "kind" folder_kind [not null, default: 'git', note: 'Folder classification: git (repository), workspace_member (monorepo member), subtree (nested git repo), sibling (non-git sibling), standalone (non-git, no git siblings).']
+  "status" folder_status [not null, default: 'discovered', note: 'Indexing lifecycle: discovered → queued → indexing → indexed. Or deferred (not indexed — sibling/standalone). Or failed.']
+  "role" folder_role [note: 'Project role assigned during setup: backend, frontend, library, docs, infra. Null until assigned.']
+  "name" TEXT [not null, note: 'Display name — typically the directory basename.']
+  "path" TEXT [not null, note: 'Path relative to the watch root (e.g. "clients/acme/api").']
+  "abs_path" TEXT [not null, unique, note: 'Absolute filesystem path for watcher setup and deduplication.']
+  "stack" JSONB [not null, default: '[]', note: 'Detected technology stack as JSON array: ["rust", "typescript"]. Set by ProcessGitFolder from config files (Cargo.toml, package.json, etc.).']
+  "remote_urls" JSONB [not null, default: '[]', note: 'JSON array of git remotes: [{name: "origin", url: "git@..."}]. Empty for non-git folders.']
+  "icons" JSONB [not null, default: '{}', note: 'JSON object for display icons: {emoji, devicon, custom}.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible JSON metadata. For git/subtree: {role, lang, files, loc, stack:{languages,frameworks,runtimes}, libs, indexed_at, last_error, duplicate_of, label}.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for quick filtering. Vocabulary controlled by sensei.tags table.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    root_id [name: 'folders_root_id_idx']
+    parent_id [name: 'folders_parent_id_idx']
+    kind [name: 'folders_kind_idx']
+    status [name: 'folders_status_idx']
+    project_id [name: 'folders_project_id_idx']
+    tags [name: 'folders_tags_idx']
+  }
+
+  Note: '''
+Content: discovered filesystem tree. Every entry was found by scanning a watched root.
+- kind: git (repository), workspace_member (monorepo member), subtree (nested git repo), sibling (non-git sibling of git folders), standalone (non-git, no git siblings)
+- status: discovered (found), queued (files counted), indexing (in progress), indexed (complete), failed, deferred (not indexed — sibling/standalone)
+- stack: detected technology stack ["rust", "typescript", "svelte"] — set by ProcessGitFolder
+- path: relative to the watch root
+- abs_path: absolute path on disk (unique across all roots)
+- parent_id: null = direct child of watch root; set = child of another folder
+- project_id: FK to projects — auto-created 1:1 for git/subtree, user can merge/split
+'''
+}
+
+Table "sensei"."library_pages" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "library_id" UUID [not null, note: 'Foreign key to libraries — which library this page belongs to.']
+  "title" TEXT [not null, note: 'Title of this documentation page/section.']
+  "url" TEXT [note: 'Remote URL this page was fetched from, if sourced over HTTP or llms.txt.']
+  "local_path" TEXT [note: 'Local filesystem path this page was read from, if sourced locally.']
+  "description" TEXT [note: 'Short summary of this page content.']
+  "content" TEXT [note: 'Full text content of this documentation page.']
+  "source_type" library_source_type [not null, note: 'How this page was obtained: llms.txt, http, or local.']
+  "component" TEXT [note: 'Optional sub-component or topic label within the library.']
+  "embedding" vector(768) [note: '768-dimensional vector embedding for semantic search.']
+  "fetched_at" TIMESTAMPTZ [note: 'Timestamp when this page content was last fetched or refreshed.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    (library_id, title) [unique, name: 'library_pages_library_title_uq']
+    library_id [name: 'library_pages_library_id_idx']
+    embedding [name: 'library_pages_embedding_hnsw']
+  }
+
+  Note: '''
+Documentation pages/sections for libraries.
+Consolidates the former lib_doc_sections, shared_lib_sections, and lib_docs tables.
+- One row per content page fetched from a library source (llms.txt, HTTP, or local)
+- url: the remote URL if fetched over HTTP (absolute URL or path from llms.txt)
+- local_path: filesystem path if sourced locally
+- component: sub-topic within the library (e.g. "routing", "middleware")
+- embedding: 768-dim vector for semantic search
+'''
+}
+
+Table "sensei"."namespaces" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "scope_key" TEXT [not null, note: 'Which scope this namespace instantiates (FK to scopes.key).']
+  "name" TEXT [not null, note: 'Display name (e.g. "Sensei HQ").']
+  "slug" TEXT [not null, note: 'Normalized identifier, unique within a scope (e.g. "sensei-hq").']
+  "level" INTEGER [note: 'Optional per-namespace override of scopes.level. Null = inherit from scope.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible metadata (icons, source, etc.).']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    scope_key [name: 'namespaces_scope_key_idx']
+  }
+
+  Note: '''
+Concrete instances of a scope — e.g. (organization, "Sensei HQ"),
+(project, "sensei"), (technology, "rust"). A repo belongs to a SET of these
+(via folder_namespaces); there is no parent_id tree — precedence comes from the
+scope level (optionally overridden per namespace). Created at scan time from
+README frontmatter (organization/project/team) and detected stack.
+'''
+}
+
+Table "sensei"."project_libraries" {
+  "library_id" UUID [not null]
+  "project_id" UUID
+  "enabled" BOOLEAN [not null, default: true]
+  "props" JSONB [not null, default: '{}']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`]
+
+  indexes {
+    library_id [unique, name: 'project_libraries_global_uniq']
+    (library_id, project_id) [unique, name: 'project_libraries_scoped_uniq']
+    project_id [name: 'project_libraries_project_id_idx']
+  }
+
+  Note: '''
+Many-to-many: libraries associated with projects or marked global.
+project_id NULL = global (available in every project).
+project_id = X  = scoped to that project only.
+Populated by daemon indexer from referenced_libraries; editable by user.
+'''
+}
+
+Table "activity"."sessions" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder this session ran in.']
+  "project_id" UUID [note: 'Foreign key to projects — derived from folder.']
+  "task" TEXT [not null, default: '', note: 'Task description passed at get_session_context.']
+  "acp_id" TEXT [note: 'Assistant family name (matches sensei.assistants.family): claude, cursor, codex, aider, etc.']
+  "outcome" session_outcome [note: 'Session outcome: completed, corrected, blocked, partial, abandoned.']
+  "ftr" BOOLEAN [note: 'First-Try Rate: true if zero corrections.']
+  "turns" INTEGER [not null, default: 0, note: 'Number of user turns.']
+  "corrections" INTEGER [not null, default: 0, note: 'Number of user corrections (FTR detractor).']
+  "tokens_in" INTEGER [note: 'Total input tokens consumed.']
+  "tokens_out" INTEGER [note: 'Total output tokens generated.']
+  "duration_ms" INTEGER [note: 'Session duration in milliseconds.']
+  "module" TEXT [note: 'Primary code module touched. For per-module FTR.']
+  "summary" TEXT [note: 'Brief summary of what happened in this session. Populated at checkpoint time by the assistant.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible: {patterns_matched, personas_applied, workflow_phase, ...}.']
+  "started_at" TIMESTAMPTZ [not null, default: `now()`, note: 'When this session started.']
+  "completed_at" TIMESTAMPTZ [note: 'When this session ended.']
+
+  indexes {
+    (folder_id, started_at) [name: 'sessions_folder_id_idx']
+    (project_id, started_at) [name: 'sessions_project_id_idx']
+    ftr [name: 'sessions_ftr_idx']
+  }
+
+  Note: '''
+AI coding sessions captured by hooks.
+- outcome: completed (no corrections), corrected, blocked, partial (crash), abandoned
+- ftr: true if corrections == 0 (First-Try Rate)
+- module: primary code module touched (for per-module FTR tracking)
+- props: {patterns_matched, personas_applied, workflow_phase, ...}
+'''
+}
+
+Table "gateway"."fallback_chain_models" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "chain_id" UUID [not null, note: 'Foreign key to fallback_chains — which chain this entry belongs to.']
+  "router_id" UUID [not null, note: 'Foreign key to routers — which API endpoint to use for this attempt.']
+  "model_id" UUID [not null, note: 'Foreign key to models — which model to try at this position.']
+  "sequence_order" INTEGER [not null, note: 'Position in the chain: 1 = primary, 2 = first fallback, etc.']
+  "max_retries" INTEGER [not null, default: 1, note: 'How many times to retry this specific model before moving to next in chain.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether this chain entry is currently active.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    chain_id [name: 'fallback_chain_models_chain_id_idx']
+  }
+
+  Note: '''
+Ordered model entries within a fallback chain.
+sequence_order defines the try-order: 1 = first attempt, 2 = first fallback, etc.
+Seed data loaded via staging.import_fallback_chain_models().
+'''
+}
+
+Table "gateway"."models_in_router" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "router_id" UUID [not null, note: 'Foreign key to routers — which API endpoint serves this model.']
+  "model_id" UUID [not null, note: 'Foreign key to models — which model is available.']
+  "router_model_id" TEXT [not null, note: 'The model identifier used by this router (e.g. "gemma3:27b", "claude-haiku-4-5-20251001").']
+  "cost_per_input_token" NUMERIC(12,10) [not null, default: 0, note: 'Cost per input token in USD. 0 for local models.']
+  "cost_per_output_token" NUMERIC(12,10) [not null, default: 0, note: 'Cost per output token in USD. 0 for local models.']
+  "cost_per_request" NUMERIC(10,6) [not null, default: 0, note: 'Fixed cost per request in USD. 0 for most models.']
+  "is_active" BOOLEAN [not null, default: true, note: 'Whether this model-router combination is currently usable.']
+  "is_default" BOOLEAN [not null, default: false, note: 'Whether this is the primary endpoint for this model.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible: {max_concurrent, supports_streaming, supports_tools, ...}.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    router_id [name: 'models_in_router_router_id_idx']
+    model_id [name: 'models_in_router_model_id_idx']
+  }
+
+  Note: '''
+Junction: which models are available on which router, with pricing.
+- router_model_id: the identifier the router uses for this model (e.g. "gemma3:27b" for Ollama, "claude-haiku-4-5-20251001" for Anthropic)
+- cost_per_input/output_token: 0 for local routers (Ollama), per-token pricing for external
+- is_default: primary endpoint for this model (if available on multiple routers)
+- props: extensible — {max_concurrent, supports_streaming, supports_tools, ...}
+Seed data loaded via staging.import_models_in_router().
+'''
+}
+
+Table "inference"."communities" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which repo this community was detected in.']
+  "community_id" INTEGER [not null, note: 'Leiden-assigned cluster integer. Matches nodes.community_id.']
+  "label" TEXT [note: 'Human-readable label for this community (e.g. "auth module", "CRDT sync").']
+  "description" TEXT [note: 'One-paragraph summary of what this community does.']
+  "node_count" INTEGER [not null, default: 0, note: 'Number of nodes assigned to this community.']
+  "god_node_ids" UUID[] [not null, default: '{}', note: 'UUIDs of top-5 highest-degree nodes in this community.']
+  "computed_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when Leiden algorithm last ran for this cluster.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'communities_folder_id_idx']
+  }
+
+  Note: '''
+Leiden algorithm community clusters. Computed offline as a batch job.
+- community_id: integer cluster ID (referenced by nodes.community_id)
+- god_node_ids: top-5 highest-degree nodes in this community
+- node_count: denormalized count of nodes in this cluster
+'''
+}
+
+Table "inference"."detected_patterns" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder this pattern was detected in.']
+  "name" TEXT [not null, note: 'Pattern name (e.g. "Adapter", "Duplicated auth guard", "God node · router.ts").']
+  "family" TEXT [note: 'Pattern family: GoF · structural, GoF · behavioral, resilience, data-access, etc.']
+  "lifecycle" pattern_lifecycle [not null, default: 'suggested', note: 'Pattern state: suggested (emerging), gap (recommended but absent), rule (enforced in sessions).']
+  "is_anti_pattern" BOOLEAN [not null, default: false, note: 'True for anti-patterns (duplication, god-node, monolith, dead-code, copy-paste).']
+  "severity" pattern_severity [note: 'Anti-pattern severity: low, medium, high. Null for positive patterns.']
+  "confidence" NUMERIC(3,2) [note: 'Detection confidence score 0.00-1.00.']
+  "instance_count" INTEGER [not null, default: 0, note: 'Number of code locations where this pattern is detected.']
+  "instances" JSONB [not null, default: '[]', note: 'JSON array: [{file, line, snippet}] — specific code locations.']
+  "evidence" JSONB [not null, default: '[]', note: 'JSON array: [{session_id, file, description}] — sessions/files that confirmed this pattern.']
+  "fix_pattern_id" UUID [note: 'For anti-patterns: self-ref FK to the constructive pattern that would fix this issue.']
+  "description" TEXT [note: 'Human-readable description of the pattern and why it matters.']
+  "example" TEXT [note: 'Code example showing the pattern in use (or the anti-pattern to avoid).']
+  "enforcement" TEXT [note: 'How this pattern is enforced when lifecycle = rule (e.g. "new auth integrations must adapt, not inline").']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for filtering.']
+  "detected_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this pattern was first detected.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'detected_patterns_folder_id_idx']
+    lifecycle [name: 'detected_patterns_lifecycle_idx']
+    is_anti_pattern [name: 'detected_patterns_anti_pattern_idx']
+    tags [name: 'detected_patterns_tags_idx']
+  }
+
+  Note: '''
+Code patterns detected during indexing and analysis.
+- lifecycle: suggested (emerging, 2+ places) → gap (recommended but absent) → rule (enforced)
+- is_anti_pattern: true for duplication, god-nodes, monoliths, dead code, copy-paste
+- fix_pattern_id: for anti-patterns, self-ref to the constructive pattern that would fix it
+- evidence: [{session_id, file, line, description}] — sessions/files where pattern was observed
+- instances: [{file, line, snippet}] — specific code locations
+- family: GoF category (structural, behavioral, creational), resilience, data-access, etc.
+'''
+}
+
+Table "inference"."hyperedges" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which repo this hyperedge belongs to.']
+  "kind" hyperedge_kind [not null, note: 'Hyperedge category: flow, group, co_change, addressed_by.']
+  "label" TEXT [note: 'Human-readable label (e.g. "auth refresh flow", "CRDTOp implementations").']
+  "description" TEXT [note: 'Description of what this group of nodes represents.']
+  "confidence" edge_confidence [not null, default: 'extracted', note: 'How this hyperedge was detected: extracted, inferred, ambiguous.']
+  "member_count" INTEGER [not null, default: 0, note: 'Denormalized count of members.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'hyperedges_folder_id_idx']
+    kind [name: 'hyperedges_kind_idx']
+  }
+
+  Note: '''
+Multi-node relationships (3+ nodes simultaneously).
+- flow: all functions in an auth flow or request pipeline
+- group: all implementations of an interface, all files in a module
+- co_change: files that always change together (from git history)
+- addressed_by: all requirements addressed by a single session
+Members stored in hyperedge_members.
+'''
+}
+
+Table "inference"."recommendations" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "project_id" UUID [not null, note: 'Foreign key to projects — which project this targets.']
+  "reasoning_trace_id" UUID [note: 'Foreign key to reasoning_traces — the MOE debate that produced this. Nullable for heuristic.']
+  "urgency" recommendation_urgency [not null, default: 'medium', note: 'Priority: high (recurring failures), medium (emerging patterns), low (housekeeping).']
+  "status" recommendation_status [not null, default: 'pending', note: 'Lifecycle: pending → accepted, dismissed, or superseded.']
+  "title" TEXT [not null, note: 'Short title (e.g. "Write an auth integration-test persona").']
+  "why" TEXT [not null, note: 'Why this matters, with evidence summary.']
+  "impact" TEXT [note: 'Projected impact (e.g. "Projected FTR +14%").']
+  "evidence" JSONB [not null, default: '[]', note: 'JSON array: [{session_id, file, description}] — what triggered this.']
+  "action_type" TEXT [not null, note: 'What to do: create_persona, promote_pattern, enable_skill, fix_anti_pattern, audit_stale, revise_rule.']
+  "action_detail" JSONB [not null, default: '{}', note: 'Specifics: {persona_name, pattern_id, skill_id, cwd, ...}.']
+  "prompt" TEXT [note: 'Ready-to-send prompt for the ACP. Shown in the action drawer.']
+  "default_acp" TEXT [note: 'Suggested ACP: claude-code, cursor, codex, etc.']
+  "baseline_ftr" NUMERIC(4,3) [note: 'Project FTR snapshot at time of acceptance (acted_at). Null until accepted.']
+  "current_ftr" NUMERIC(4,3) [note: 'Rolling project FTR after the change. Updated during measurement.']
+  "verdict" recommendation_verdict [not null, default: 'pending', note: 'Impact: positive (FTR improved), negative (FTR dropped), neutral, pending.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible: {baseline_corrections_avg, current_corrections_avg, tool_usage_delta, ...}.']
+  "acted_at" TIMESTAMPTZ [note: 'Timestamp when the user accepted — the point-in-time marker for before/after FTR comparison.']
+  "measured_at" TIMESTAMPTZ [note: 'Timestamp when verdict was last computed.']
+
+  indexes {
+    (project_id, status) [name: 'recommendations_project_id_idx']
+    urgency [name: 'recommendations_urgency_idx']
+    verdict [name: 'recommendations_verdict_idx']
+  }
+
+  Note: '''
+The full lifecycle: insight → recommendation → action → measurement.
+
+A recommendation is a point-in-time event. When accepted, it marks the moment
+something changed in the system (persona added, pattern promoted, skill enabled).
+FTR trend before vs after that point tells us if it helped.
+
+Lifecycle: pending → accepted (user acts) → measured (verdict assigned)
+                   → dismissed (user skips)
+                   → superseded (newer recommendation replaces)
+
+- baseline_ftr: project FTR at the time recommendation was accepted (acted_at)
+- current_ftr: rolling FTR after the change
+- verdict: positive (FTR improved), negative (FTR dropped), neutral, pending
+- measured_at: when verdict was last computed
+'''
+}
+
+Table "sensei"."benchmark_reports" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [note: 'Foreign key to folders — which folder this report covers. Nullable.']
+  "run_name" TEXT [not null, note: 'Human-readable label for this benchmark report.']
+  "strategy" TEXT [not null, note: 'Strategy evaluated in this report.']
+  "score" NUMERIC [note: 'Benchmark score achieved.']
+  "tokens" INTEGER [note: 'Total token count consumed.']
+  "elapsed_ms" INTEGER [note: 'Wall-clock duration in milliseconds.']
+  "payload" JSONB [note: 'Detailed results as JSON.']
+  "promoted" BOOLEAN [not null, default: false, note: 'Whether this strategy has been promoted as active.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  Note: 'Benchmark reports — results from strategy comparison runs.'
+}
+
+Table "sensei"."benchmark_runs" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder this benchmark ran against.']
+  "task_description" TEXT [not null, note: 'Coding task given to the AI during this run.']
+  "branch" TEXT [not null, note: 'Git branch the benchmark was executed against.']
+  "sensei_enabled" BOOLEAN [not null, note: 'Whether sensei MCP tools were available (false = baseline, true = assisted).']
+  "started_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when the run began.']
+  "ended_at" TIMESTAMPTZ [note: 'Timestamp when the run finished. Null if in progress.']
+  "total_cost_usd" NUMERIC(10,6) [note: 'Total API cost in USD aggregated from api_requests.']
+  "total_input_tokens" INTEGER [note: 'Total input tokens across all API calls.']
+  "total_output_tokens" INTEGER [note: 'Total output tokens across all API calls.']
+  "total_cache_read_tokens" INTEGER
+  "total_cache_creation_tokens" INTEGER
+  "worktree_path" TEXT [note: 'Path of the temporary git worktree used. Deleted after completion.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    (folder_id, task_description, branch) [name: 'benchmark_runs_folder_idx']
+  }
+
+  Note: 'One row per benchmark execution (paired: same task + branch, sensei_enabled true/false).'
+}
+
+Table "sensei"."folder_namespaces" {
+  "folder_id" UUID [pk, not null, note: 'FK to sensei.folders — the repo.']
+  "namespace_id" UUID [pk, not null, note: 'FK to sensei.namespaces — a scope instance the repo belongs to.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    namespace_id [name: 'folder_namespaces_namespace_id_idx']
+  }
+
+  Note: '''
+Set membership: which namespaces a repo (folder) belongs to. A repo typically
+joins one namespace per applicable scope — organization, project, team, plus a
+technology namespace per detected language. Resolution gathers rules/identity
+across every member namespace + the implicit user/general scopes, ordered by
+scope level. Populated at scan time from README frontmatter + detected stack.
+'''
+}
+
+Table "sensei"."index_errors" {
+  "id" serial [pk, increment, not null, note: 'Surrogate primary key (serial).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder this error occurred in.']
+  "file_path" TEXT [not null, note: 'Path to the file that failed to index.']
+  "error" TEXT [not null, note: 'Error message or stack trace.']
+  "adapter" TEXT [note: 'Language adapter that produced the error.']
+  "phase" TEXT [note: 'Indexing phase when the error occurred.']
+  "created_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this error was recorded.']
+
+  indexes {
+    folder_id [name: 'idx_index_errors_folder']
+  }
+
+  Note: 'Files that failed during indexing. Persisted for debugging.'
+}
+
+Table "sensei"."knowledge_sources" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`]
+  "kind" TEXT [not null]
+  "name" TEXT [not null]
+  "url" TEXT [not null]
+  "namespace_id" UUID
+  "credential_ref" TEXT [not null]
+  "direction" TEXT [not null, default: 'both']
+  "last_seq" BIGINT [not null, default: 0]
+  "enabled" BOOLEAN [not null, default: true]
+  "created_at" TIMESTAMPTZ [not null, default: `now()`]
+
+  Note: '''
+Registered federation endpoints (governance P4). Mirrors gateway-router
+registration: the row holds connection metadata; the API key is in the OS
+Keychain referenced by credential_ref. direction gates push vs pull; last_seq
+is the per-source monotonic pull cursor.
+'''
+}
+
+Table "sensei"."memories" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "project_id" UUID [note: 'Foreign key to projects. Null = global memory (applies to all projects).']
+  "scope" memory_scope [not null, default: 'project', note: 'When to surface: global (always), project (this project), stack (matching tech), task_type (matching task), module (matching code area). Legacy axis — superseded by namespace_id for governance resolution.']
+  "scope_filter" TEXT [note: 'Qualifier for scope: stack name (e.g. "rust"), task type (e.g. "fix"), module path (e.g. "src/api"). Null for global/project scope.']
+  "namespace_id" UUID [note: 'Governance scope instance this rule applies to (organization/project/technology/...). Null = unscoped (general). Resolution gathers rules across a repo\'s member namespaces + always-on general/user.']
+  "enforcement" enforcement [not null, default: 'recommended', note: 'Authority axis: advisory < recommended < required < mandatory. mandatory = non-overridable constitution tier (a more specific scope cannot weaken it).']
+  "origin" TEXT [not null, default: 'learned', note: 'Provenance: learned (knowledge plane), authored (written directly), promoted (elevated from a narrower scope), federated (pulled from a hive-mind).']
+  "source_id" UUID [note: 'When origin=promoted/federated, the id of the source memory (or remote record) this was derived from. Null otherwise.']
+  "type" memory_type [not null, note: 'Knowledge category: decision (architectural), pattern (code convention), convention (team norm), preference (style rule), continuity (session handoff), question (open issue).']
+  "title" TEXT [not null, note: 'Short label used as heading in context output.']
+  "content" TEXT [not null, note: 'The rule or learning — full body text surfaced to the agent.']
+  "impact" TEXT [note: 'Consequence of ignoring this memory. Answers "what breaks if you skip this?"']
+  "strength" REAL [not null, default: 1.0, note: 'Confidence score 0–5. Created at 1.0, reinforced +1.0, confirmed = 5.0, decayed over time. Below 1.0 = auto-archived.']
+  "status" memory_status [not null, default: 'active', note: 'Lifecycle: active (newly learned), reinforced (evidence accumulated), challenged (violated recently), battle_tested (high strength + zero violations over time), archived (retained for history, not surfaced).']
+  "reinforced_count" INTEGER [not null, default: 0, note: 'Number of times evidence has confirmed this memory.']
+  "violated_count" INTEGER [not null, default: 0, note: 'Number of times this memory was violated (assistant acted contrary to it).']
+  "last_relevant_at" TIMESTAMPTZ [note: 'Timestamp of last reinforcement or violation. Used for recency-based surfacing.']
+  "session_id" UUID [note: 'Session that created this memory. Null for imported or collective memories.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Free-form tags (e.g. security, performance, compliance). GIN-indexed for &&/@> filters.']
+  "triage_signal" TEXT [note: 'Which capture heuristic surfaced this memory (revert/correction/actually/repeat_pattern/override/test_failure). Null for explicit /save.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    (project_id, scope, status) [name: 'memories_project_id_idx']
+    (scope, scope_filter) [name: 'memories_scope_idx']
+    (namespace_id, enforcement, status) [name: 'memories_namespace_idx']
+    strength [name: 'memories_strength_idx']
+    tags [name: 'memories_tags_idx']
+  }
+
+  Note: '''
+Multi-level, reasoned, evolving knowledge system.
+Replaces memory_items (project-scoped only) and inference.preferences (style rules).
+- scope: determines when this memory is surfaced — global, project, stack, task_type, module
+- scope_filter: qualifier for non-global scopes (stack name, task type, module path)
+- impact: consequence of ignoring this memory — the "why"
+- strength: 0–5 score, reinforced by evidence, decayed by time
+- session_id: session that created this memory (provenance)
+
+Context assembly: SELECT active memories matching scope hierarchy for current session.
+'''
+}
+
+Table "sensei"."nodes" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which repo this node belongs to.']
+  "parent_id" UUID [note: 'Self-referencing FK for containment hierarchy. Null = top-level in file.']
+  "kind" node_kind [not null, note: 'Node classification. See table comment for full list.']
+  "name" TEXT [not null, note: 'Identifier name or heading text.']
+  "file_path" TEXT [not null, note: 'Folder-relative path of the source file. Denormalized for query performance.']
+  "signature" TEXT [note: 'Abbreviated type signature (L0 level). For code symbols.']
+  "description" TEXT [note: 'Human-readable description (L1 level). For code symbols or doc summary.']
+  "content" TEXT [note: 'Full content text (L2/L3). For doc sections: markdown body. For rationale: comment text.']
+  "docstring" TEXT [note: 'Extracted JSDoc/TSDoc/rustdoc comment. For code symbols.']
+  "line_start" INTEGER [note: 'One-based line number where this node begins in the source file.']
+  "line_end" INTEGER [note: 'One-based line number where this node ends.']
+  "is_exported" BOOLEAN [not null, default: false, note: 'True when the symbol is exported from its file. Only meaningful for code symbols.']
+  "community_id" INTEGER [note: 'Leiden community cluster ID. Batch-computed. Null until computed.']
+  "degree" INTEGER [note: 'Precomputed in+out edge count. Used for god-node detection.']
+  "embedding" vector(384) [note: '384-dim vector embedding for semantic search. Computed by local model during indexing. HNSW indexed.']
+  "tags" TEXT[] [not null, default: '{}', note: 'Array of tag strings for filtering.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible metadata. For sections: {level:2}. For rationale: {tag:"WHY"}. For files: {language:"rust"}.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'nodes_folder_id_idx']
+    parent_id [name: 'nodes_parent_id_idx']
+    kind [name: 'nodes_kind_idx']
+    (folder_id, file_path) [name: 'nodes_file_path_idx']
+    (folder_id, name) [name: 'nodes_name_idx']
+    (folder_id, is_exported) [name: 'nodes_exported_idx']
+    community_id [name: 'nodes_community_id_idx']
+    embedding [name: 'nodes_embedding_hnsw']
+    tags [name: 'nodes_tags_idx']
+  }
+
+  Note: '''
+Unified node table for the code graph. Every structural element is a node:
+files, code symbols, doc sections, rationale comments.
+
+Hierarchy via parent_id:
+  file → class → method → parameter
+  file → section (H1) → section (H2) → section (H3)
+  file → function
+  function → rationale (from comments)
+
+Node kinds:
+  file — source or doc file within a repo
+  module, package — structural containers
+  class, interface — type definitions
+  function, method — callable code
+  property, field, parameter — members
+  type, const, enum, enum_variant — value definitions
+  section — documentation heading (level stored in props)
+  rationale — extracted from NOTE/WHY/HACK/TODO/IMPORTANT comments
+
+file_path is denormalized on every node for fast file-scoped queries.
+Relationships between nodes are stored in the edges table.
+'''
+}
+
+Table "sensei"."referenced_libraries" {
+  "folder_id" UUID [pk, not null, note: 'Foreign key to folders — the folder that uses this library.']
+  "library_id" UUID [pk, not null, note: 'Foreign key to libraries — the library dependency.']
+  "version_used" TEXT [note: 'Version of the library pinned in this folder, as observed from the package manifest.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible metadata: {source, usage_count, skill_path, skill_generated_at, ...}.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    library_id [name: 'referenced_libraries_library_id_idx']
+  }
+
+  Note: '''
+Junction table linking folders (git/subtree folders) to their library dependencies.
+- version_used: the pinned version observed in the folder (from package.json, Cargo.toml, etc.)
+- props: extensible — {source:"Cargo.toml", usage_count, skill_path, skill_generated_at, ...}
+'''
+}
+
+Table "sensei"."scan_state" {
+  "folder_id" UUID [pk, not null, note: 'Foreign key to folders — which folder this file belongs to.']
+  "file_path" TEXT [pk, not null, note: 'Folder-relative path of the source file being tracked.']
+  "mtime" BIGINT [not null, note: 'File modification time as Unix epoch milliseconds, used for quick change detection.']
+  "content_hash" TEXT [not null, note: 'SHA-256 hash of the file content used to confirm whether it has changed since last index.']
+  "indexed_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this file was last successfully indexed.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'scan_state_folder_id_idx']
+    (folder_id, indexed_at) [name: 'scan_state_indexed_at_idx']
+  }
+
+  Note: '''
+Per-file scan fingerprint used by the indexer to skip unchanged files.
+- mtime: file modification time as unix ms
+- content_hash: sha256 of file content for change detection
+- indexed_at: when this file was last successfully indexed
+'''
+}
+
+Table "activity"."events" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "session_id" UUID [not null, note: 'Foreign key to sessions — which session this event occurred in.']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder context. Denormalized for fast queries.']
+  "event_type" event_type [not null, note: 'Event category. Determines the shape of the data payload.']
+  "turn_number" INTEGER [note: 'Which turn in the session this event occurred at. Null for non-turn events.']
+  "data" JSONB [not null, default: '{}', note: 'Event payload as JSON. Shape determined by event_type — see table comment.']
+  "created_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this event occurred.']
+
+  indexes {
+    (session_id, created_at) [name: 'events_session_id_idx']
+    (folder_id, created_at) [name: 'events_folder_id_idx']
+    event_type [name: 'events_type_idx']
+  }
+
+  Note: '''
+Unified activity log for everything that happens during sessions.
+Consolidates the former api_requests, task_turns, tool_calls, and events tables.
+
+Event types and their data payloads:
+  tool_call:        {tool_name, service_name, input_params, response, duration_ms, used_in_response}
+  api_request:      {prompt_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd, duration_ms}
+  correction:       {description, module}
+  turn:             {role:"user"|"assistant", token_count}
+  phase_transition: {from_phase, to_phase}
+  checkpoint:       {summary, next_step}
+  task_start:       {task_description, task_type}
+  task_end:         {status, ftr_score, ftr_signals}
+  context_loaded:   {files_loaded, token_count}
+  edit:             {file_path, lines_changed}
+  test:             {passed, failed, total}
+  error:            {message, adapter, phase}
+'''
+}
+
+Table "activity"."snapshots" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "session_id" UUID [not null, note: 'Foreign key to sessions.']
+  "folder_id" UUID [not null, note: 'Foreign key to folders.']
+  "kind" snapshot_kind [not null, note: 'Snapshot type: manual or checkpoint.']
+  "progress_summary" TEXT [not null, note: 'Summary of work completed, used for recovery.']
+  "next_step_hint" TEXT [note: 'Optional hint for next action when resuming.']
+  "completed_steps" TEXT[] [not null, default: '{}', note: 'Ordered list of completed step descriptions.']
+  "in_flight_files" TEXT[] [not null, default: '{}', note: 'Paths of files being actively modified at snapshot time.']
+  "worktree_refs" JSONB [not null, default: '[]', note: 'JSON array of active git worktrees [{branch, path, status}].']
+  "diff_stat_summary" TEXT [note: 'Human-readable diff-stat summary at snapshot time.']
+  "created_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when snapshot was taken.']
+
+  indexes {
+    (session_id, created_at) [name: 'snapshots_session_id_idx']
+    (folder_id, created_at) [name: 'snapshots_folder_id_idx']
+  }
+
+  Note: '''
+Point-in-time session state for crash recovery and history.
+- kind=manual: take_snapshot at a step boundary
+- kind=checkpoint: task complete marker
+- in_flight_files: flagged for consistency check on recovery
+- worktree_refs: [{branch, path, status}] active git worktrees
+'''
+}
+
+Table "activity"."task_sessions" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "session_id" UUID [note: 'Foreign key to sessions.']
+  "folder_id" UUID [not null, note: 'Foreign key to folders.']
+  "task_description" TEXT [note: 'Task description passed at get_session_context.']
+  "task_type" task_type_kind [note: 'Auto-detected: feat, fix, refactor, docs, test, chore, unknown.']
+  "status" task_status [not null, default: 'in_progress', note: 'Lifecycle: in_progress → completed or abandoned.']
+  "ftr_score" NUMERIC(4,3) [note: 'First-Try-Right score 0.000–1.000. Null until checkpoint.']
+  "ftr_signals" JSONB [note: 'Raw signal values used to compute ftr_score.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of last modification.']
+  "completed_at" TIMESTAMPTZ [note: 'Timestamp when task reached terminal state.']
+
+  indexes {
+    (folder_id, modified_at) [name: 'task_sessions_folder_id_idx']
+    session_id [name: 'task_sessions_session_id_idx']
+  }
+
+  Note: '''
+Task boundaries within sessions. One row per checkpoint boundary.
+- ftr_score: 0.000–1.000, null until checkpoint
+- status: in_progress → completed or abandoned
+Task-level events (task_start, task_end) are in the events table.
+'''
+}
+
+Table "inference"."drift_items" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which folder this drift was detected in.']
+  "doc_node_id" UUID [not null, note: 'Foreign key to nodes — the doc section that references the code.']
+  "code_node_id" UUID [note: 'Foreign key to nodes — the code symbol being referenced. Null if broken (deleted).']
+  "status" drift_status [not null, default: 'current', note: 'Drift status: current (valid), drifted (signature changed), broken (target deleted).']
+  "expected_signature" TEXT [note: 'What the documentation says the symbol looks like.']
+  "actual_signature" TEXT [note: 'What the code actually has. Null if the target no longer exists.']
+  "detail" TEXT [note: 'Human-readable description of the drift.']
+  "detected_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp when this drift was first detected.']
+  "resolved_at" TIMESTAMPTZ [note: 'Timestamp when the drift was resolved (doc updated or code reverted). Null if unresolved.']
+
+  indexes {
+    folder_id [name: 'drift_items_folder_id_idx']
+    status [name: 'drift_items_status_idx']
+  }
+
+  Note: '''
+Doc-to-code drift tracking. One row per reference from a doc node to a code node.
+- current: reference is valid, signatures match
+- drifted: target exists but signature changed
+- broken: target was deleted or renamed
+- expected_signature: what the doc says the symbol looks like
+- actual_signature: what the code actually has (null if broken)
+'''
+}
+
+Table "inference"."hyperedge_members" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "hyperedge_id" UUID [not null, note: 'Foreign key to hyperedges — which hyperedge this member belongs to.']
+  "node_id" UUID [not null, note: 'Foreign key to nodes — which node is a member of this hyperedge.']
+  "position" INTEGER [note: 'Order position for flow-type hyperedges. Null for unordered groups.']
+
+  indexes {
+    hyperedge_id [name: 'hyperedge_members_hyperedge_id_idx']
+    node_id [name: 'hyperedge_members_node_id_idx']
+  }
+
+  Note: '''
+Members of a hyperedge. Links nodes to their hyperedge with optional ordering.
+- position: sequence order for flow-type hyperedges (null for unordered groups)
+'''
+}
+
+Table "sensei"."edges" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "folder_id" UUID [not null, note: 'Foreign key to folders — which repo this edge belongs to.']
+  "source_id" UUID [not null, note: 'Foreign key to nodes — the source node of this relationship.']
+  "target_id" UUID [note: 'Foreign key to nodes — the target node. Null if unresolved.']
+  "target_name" TEXT [note: 'Name of the target for unresolved edges. Allows lookup without a node.']
+  "target_file" TEXT [note: 'File path of the target for unresolved edges.']
+  "kind" edge_kind [not null, note: 'Relationship type. See table comment for full list.']
+  "confidence" edge_confidence [not null, default: 'extracted', note: 'Edge confidence: extracted (AST-certain), inferred (embedding/BM25), ambiguous (drift/gap).']
+  "confidence_score" NUMERIC(3,2) [note: 'Numeric confidence 0.00-1.00. Used for similarity/duplicate edges.']
+  "props" JSONB [not null, default: '{}', note: 'Extensible metadata. For imports: {names:["a","b"]}. For duplicates: {similarity:0.86}.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    folder_id [name: 'edges_folder_id_idx']
+    source_id [name: 'edges_source_id_idx']
+    target_id [name: 'edges_target_id_idx']
+    kind [name: 'edges_kind_idx']
+    confidence [name: 'edges_confidence_idx']
+  }
+
+  Note: '''
+Typed relationships between nodes in the code graph.
+
+Edge kinds:
+  calls — function/method calls another function/method
+  implements — class implements interface
+  extends — class/interface extends another
+  imports — file imports from file/module (props: {names:["useState","useEffect"]})
+  depends_on — module-level dependency
+  traces_to — documentation traces to code symbol
+  references — doc section references a symbol or file
+  covers — doc file covers source file
+  rationale_for — comment explains a symbol
+  duplicates — structurally identical code (confidence_score = similarity)
+  similar_to — semantically similar (inferred from embeddings)
+
+target_id is nullable — null when the target node is unresolved (external symbol, unindexed file).
+target_name and target_file provide lookup info for unresolved edges.
+'''
+}
+
+Table "sensei"."federated_memories" {
+  "knowledge_source_id" UUID [pk, not null]
+  "remote_rule_id" UUID [pk, not null]
+  "content_hash" TEXT [not null]
+  "memory_id" UUID
+  "remote_seq" BIGINT [not null]
+  "synced_at" TIMESTAMPTZ [not null, default: `now()`]
+
+  Note: '''
+Local↔remote rule mapping + per-rule cursor (federation sync bookkeeping — NOT
+a parallel rules table). Pull upserts by (knowledge_source_id, remote_rule_id),
+making ingestion idempotent; it is also the echo-guard — a rule this daemon
+pushed is recorded here, so pulling it back links to the existing memory instead
+of creating a federated duplicate. memory_id is the local memory; null after the
+linked memory is hard-deleted.
+'''
+}
+
+Table "sensei"."memory_evidence" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "memory_id" UUID [not null, note: 'Foreign key to memories — which memory this evidence supports.']
+  "session_id" UUID [not null, note: 'References activity.sessions.id. No FK — cross-schema reference.']
+  "note" TEXT [note: 'What happened: correction, reinforcement, or contradiction.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    memory_id [name: 'memory_evidence_memory_id_idx']
+  }
+
+  Note: '''
+Sessions that prove or reinforce a memory.
+Each row is one piece of evidence — a session where the memory was learned,
+confirmed, or contradicted. Used for strength scoring.
+
+- session_id: references activity.sessions.id. No FK — sessions may be in a separate schema/DB.
+- note: what happened in this session (e.g. "user corrected indentation twice")
+'''
+}
+
+Table "sensei"."memory_examples" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`, note: 'Surrogate primary key (UUID).']
+  "memory_id" UUID [not null, note: 'Foreign key to memories — which memory this example supports.']
+  "node_id" TEXT [not null, note: 'References hierarchy_nodes.id. No FK — survives node deletion.']
+  "is_good" BOOLEAN [not null, note: 'True = good example (follow this), false = bad example (avoid this).']
+  "note" TEXT [note: 'Why this code is a good or bad example for this memory.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    memory_id [name: 'memory_examples_memory_id_idx']
+  }
+
+  Note: '''
+Code examples grounding a memory in real code.
+- node_id: references a hierarchy node (file, function, class, etc.)
+- is_good: true = canonical implementation to follow, false = divergence to avoid
+- note: why this example matters for this memory
+
+No FK on node_id — nodes may be deleted when code changes, but the example record
+stays as historical evidence. The note should describe the example independently.
+'''
+}
+
+Table "sensei"."memory_links" {
+  "parent_id" UUID [pk, not null, note: 'The consolidated memory that replaced the children.']
+  "child_id" UUID [pk, not null, note: 'An original memory that was merged into the parent.']
+  "modified_at" TIMESTAMPTZ [not null, default: `now()`, note: 'Timestamp of the last modification to this row.']
+
+  indexes {
+    child_id [name: 'memory_links_child_id_idx']
+  }
+
+  Note: '''
+Memory-to-memory relationships for consolidation.
+When multiple memories are combined into one, the combined memory becomes the parent
+and the originals become children. Children are then historized into past_memories.
+
+- parent_id: the consolidated/surviving memory
+- child_id: the original memory that was merged in
+'''
+}
+
+Table "sensei"."memory_outcomes" {
+  "id" UUID [pk, not null, default: `gen_random_uuid()`]
+  "memory_id" UUID [not null, note: 'Foreign key to memories — which memory this event is about.']
+  "session_id" UUID [note: 'Foreign key to activity.sessions. Null when unknown or after the session is deleted.']
+  "outcome" memory_outcome [not null, note: 'What happened: applied (used in output), consulted (loaded but not used), violated (user overruled), ignored (loaded but discarded).']
+  "context" TEXT [note: 'Optional free-form note (e.g. file path, brief reason).']
+  "recorded_at" TIMESTAMPTZ [not null, default: `now()`, note: 'When the event was recorded (server clock).']
+
+  indexes {
+    (memory_id, recorded_at) [name: 'memory_outcomes_memory_id_idx']
+  }
+
+  Note: '''
+Per-memory event log: applied/consulted/violated/ignored.
+Insert triggers update memories.reinforced_count / violated_count / strength / status.
+'''
+}
+
+Ref: "sensei"."extensions"."plugin_id" > "sensei"."extensions"."id" [delete: cascade]
+Ref: "gateway"."inference_assignments"."chain_id" > "gateway"."fallback_chains"."id" [delete: cascade]
+Ref: "gateway"."models"."provider_id" > "gateway"."providers"."id" [delete: cascade]
+Ref: "inference"."insights"."batch_id" > "inference"."insight_batches"."id" [delete: set null]
+Ref: "inference"."reasoning_traces"."project_id" > "sensei"."projects"."id" [delete: set null]
+Ref: "sensei"."extension_projects"."extension_id" > "sensei"."extensions"."id" [delete: cascade]
+Ref: "sensei"."extension_projects"."project_id" > "sensei"."projects"."id" [delete: cascade]
+Ref: "sensei"."folders"."root_id" > "sensei"."folders_to_watch"."id" [delete: cascade]
+Ref: "sensei"."folders"."parent_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."folders"."project_id" > "sensei"."projects"."id" [delete: set null]
+Ref: "sensei"."library_pages"."library_id" > "sensei"."libraries"."id" [delete: cascade]
+Ref: "sensei"."namespaces"."scope_key" > "sensei"."scopes"."key"
+Ref: "sensei"."project_libraries"."library_id" > "sensei"."libraries"."id" [delete: cascade]
+Ref: "sensei"."project_libraries"."project_id" > "sensei"."projects"."id" [delete: cascade]
+Ref: "activity"."sessions"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "activity"."sessions"."project_id" > "sensei"."projects"."id" [delete: set null]
+Ref: "gateway"."fallback_chain_models"."chain_id" > "gateway"."fallback_chains"."id" [delete: cascade]
+Ref: "gateway"."fallback_chain_models"."router_id" > "gateway"."routers"."id" [delete: cascade]
+Ref: "gateway"."fallback_chain_models"."model_id" > "gateway"."models"."id" [delete: cascade]
+Ref: "gateway"."models_in_router"."router_id" > "gateway"."routers"."id" [delete: cascade]
+Ref: "gateway"."models_in_router"."model_id" > "gateway"."models"."id" [delete: cascade]
+Ref: "inference"."communities"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "inference"."detected_patterns"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "inference"."detected_patterns"."fix_pattern_id" > "inference"."detected_patterns"."id" [delete: set null]
+Ref: "inference"."hyperedges"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "inference"."recommendations"."project_id" > "sensei"."projects"."id" [delete: cascade]
+Ref: "inference"."recommendations"."reasoning_trace_id" > "inference"."reasoning_traces"."id" [delete: set null]
+Ref: "sensei"."benchmark_reports"."folder_id" > "sensei"."folders"."id" [delete: set null]
+Ref: "sensei"."benchmark_runs"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."folder_namespaces"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."folder_namespaces"."namespace_id" > "sensei"."namespaces"."id" [delete: cascade]
+Ref: "sensei"."index_errors"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."knowledge_sources"."namespace_id" > "sensei"."namespaces"."id" [delete: set null]
+Ref: "sensei"."memories"."project_id" > "sensei"."projects"."id" [delete: cascade]
+Ref: "sensei"."memories"."namespace_id" > "sensei"."namespaces"."id" [delete: set null]
+Ref: "sensei"."nodes"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."nodes"."parent_id" > "sensei"."nodes"."id" [delete: cascade]
+Ref: "sensei"."referenced_libraries"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."referenced_libraries"."library_id" > "sensei"."libraries"."id" [delete: cascade]
+Ref: "sensei"."scan_state"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "activity"."events"."session_id" > "activity"."sessions"."id" [delete: cascade]
+Ref: "activity"."events"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "activity"."snapshots"."session_id" > "activity"."sessions"."id" [delete: cascade]
+Ref: "activity"."snapshots"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "activity"."task_sessions"."session_id" > "activity"."sessions"."id" [delete: set null]
+Ref: "activity"."task_sessions"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "inference"."drift_items"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "inference"."drift_items"."doc_node_id" > "sensei"."nodes"."id" [delete: cascade]
+Ref: "inference"."drift_items"."code_node_id" > "sensei"."nodes"."id" [delete: set null]
+Ref: "inference"."hyperedge_members"."hyperedge_id" > "inference"."hyperedges"."id" [delete: cascade]
+Ref: "inference"."hyperedge_members"."node_id" > "sensei"."nodes"."id" [delete: cascade]
+Ref: "sensei"."edges"."folder_id" > "sensei"."folders"."id" [delete: cascade]
+Ref: "sensei"."edges"."source_id" > "sensei"."nodes"."id" [delete: cascade]
+Ref: "sensei"."edges"."target_id" > "sensei"."nodes"."id" [delete: cascade]
+Ref: "sensei"."federated_memories"."knowledge_source_id" > "sensei"."knowledge_sources"."id" [delete: cascade]
+Ref: "sensei"."federated_memories"."memory_id" > "sensei"."memories"."id" [delete: set null]
+Ref: "sensei"."memory_evidence"."memory_id" > "sensei"."memories"."id" [delete: cascade]
+Ref: "sensei"."memory_examples"."memory_id" > "sensei"."memories"."id" [delete: cascade]
+Ref: "sensei"."memory_links"."parent_id" > "sensei"."memories"."id" [delete: cascade]
+Ref: "sensei"."memory_links"."child_id" > "sensei"."memories"."id" [delete: cascade]
+Ref: "sensei"."memory_outcomes"."memory_id" > "sensei"."memories"."id" [delete: cascade]
+Ref: "sensei"."memory_outcomes"."session_id" > "activity"."sessions"."id" [delete: set null]
