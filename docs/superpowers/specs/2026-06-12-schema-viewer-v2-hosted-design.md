@@ -6,7 +6,7 @@
 
 ## Goal
 
-`dbd diagram` builds the schema model and **opens the hosted dbd site** (`https://dbd-sigma.vercel.app/diagram`) with the model embedded in the URL fragment, rendering the same interactive viewer — but always on the latest, consistently-tokened Rokkit build, with no 652 KB bundle to embed or keep fresh. A `/diagram` route on the site renders a model from either the URL fragment (CLI deep-link / shareable link) or a manually uploaded `schema.json`. Everything is client-side; the site stays static.
+`dbd diagram` builds the schema model and **opens the hosted dbd site** (`https://dbd.sensei-hq.com/diagram`) with the model embedded in the URL fragment, rendering the same interactive viewer — but always on the latest, consistently-tokened Rokkit build, with no 652 KB bundle to embed or keep fresh. A `/diagram` route on the site renders a model from either the URL fragment (CLI deep-link / shareable link) or a manually uploaded `schema.json`. Everything is client-side; the site stays static.
 
 ## Non-goals (deferred)
 
@@ -23,7 +23,7 @@ The v1 self-contained HTML embedded the whole Svelte+Rokkit viewer (with base64 
 ## Architecture
 
 ```
-dbd diagram ──build SchemaModel──▶ gzip + base64url ──▶ https://dbd-sigma.vercel.app/diagram#1.<payload>
+dbd diagram ──build SchemaModel──▶ gzip + base64url ──▶ https://dbd.sensei-hq.com/diagram#1.<payload>
                                                               │ (fragment is client-only,
                                                               │  never sent to the server)
                                                               ▼
@@ -56,7 +56,7 @@ The single interface between the two units. **Stable, versioned:**
 | `dbd diagram --site <url>` | Override the base URL for this run. |
 | env `DBD_DIAGRAM_URL` | Override the base URL (flag wins over env wins over default). |
 
-- Default base URL constant: `https://dbd-sigma.vercel.app` (one place to change; documented as provisional).
+- Default base URL constant: `https://dbd.sensei-hq.com` (one place to change; documented as provisional).
 - Scope-aware (`--scope` / `--deps`) exactly as today.
 - **Headless fallback:** if opening the browser fails (no display / `open` errors), print the URL with a short note and exit `0`.
 - **Oversized warning:** if the encoded payload exceeds ~1.5 MB (pathologically large schema), print a warning suggesting `--json` + manual upload, but still emit the URL.
@@ -120,4 +120,4 @@ Delete:
 
 ## Done when
 
-`dbd diagram` opens `https://dbd-sigma.vercel.app/diagram#1.…` showing the interactive viewer for the current project (browser opened + URL printed); `--print-url` prints it without opening; `--json` still writes the model file; the `/diagram` route renders from a fragment, an uploaded file, or the bundled example, with friendly errors on bad input; the local-HTML path, lib-bundle build, and CI freshness check are removed; `cargo test --workspace` + clippy green; `bun run test:viewer` green. Then release.
+`dbd diagram` opens `https://dbd.sensei-hq.com/diagram#1.…` showing the interactive viewer for the current project (browser opened + URL printed); `--print-url` prints it without opening; `--json` still writes the model file; the `/diagram` route renders from a fragment, an uploaded file, or the bundled example, with friendly errors on bad input; the local-HTML path, lib-bundle build, and CI freshness check are removed; `cargo test --workspace` + clippy green; `bun run test:viewer` green. Then release.
