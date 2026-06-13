@@ -22,7 +22,7 @@ else
   NEW := $(MAJOR).$(MINOR).$(shell echo $$(($(PATCH)+1)))
 endif
 
-.PHONY: help bump patch minor major install viewer _check-clean _check-ci
+.PHONY: help bump patch minor major install _check-clean _check-ci
 
 ## Show this help.
 help:
@@ -32,7 +32,6 @@ help:
 	@echo "  make bump minor    Bump minor, commit, tag, push"
 	@echo "  make bump major    Bump major, commit, tag, push"
 	@echo "  make install       Install dbd into ~/.cargo/bin from working tree"
-	@echo "  make viewer        Rebuild the committed schema-diagram viewer bundle"
 	@echo ""
 	@echo "All bump targets refuse to run if the working tree has uncommitted"
 	@echo "changes or local HEAD differs from origin/main, and require tests"
@@ -47,12 +46,6 @@ patch minor major:
 ## Install the dbd binary into ~/.cargo/bin from the current working tree.
 install:
 	@cargo install --path crates/dbd-cli --locked --force
-
-## Rebuild the committed schema-diagram viewer bundle (requires bun).
-# --frozen-lockfile so the build can't silently resolve drifted dep versions,
-# keeping the committed bundle reproducible (and the CI freshness check honest).
-viewer:
-	@cd site && bun install --frozen-lockfile && bun run build:viewer
 
 ## Bump version (commits, tags, pushes). Refuses if tree is dirty or CI fails.
 bump: _check-clean _check-ci
