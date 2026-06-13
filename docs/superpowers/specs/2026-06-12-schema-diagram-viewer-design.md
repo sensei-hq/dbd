@@ -68,8 +68,8 @@ The viewer's single input is a `SchemaModel`. It never parses DBML or SQL. The s
       "schema": "config", "name": "lookup_values", "kind": "table",   // kind extends: view|function|procedure
       "note": "short note", "noteMd": "markdown note\nmultiple lines",
       "columns": [
-        { "name": "id",        "type": "uuid", "pk": 1, "nn": 1, "def": "gen_random_uuid()" },
-        { "name": "lookup_id", "type": "uuid", "nn": 1 }
+        { "name": "id",        "type": "uuid", "pk": true, "nn": true, "def": "gen_random_uuid()" },
+        { "name": "lookup_id", "type": "uuid", "nn": true }
       ]
     }
   ],
@@ -80,7 +80,7 @@ The viewer's single input is a `SchemaModel`. It never parses DBML or SQL. The s
 }
 ```
 
-Rust types in `crates/dbd-core/src/schema_model.rs` (serde, field names/casing matching the JSON above; booleans emitted as `1`/omitted to match the mockup contract via `skip_serializing_if`). Column flags: `pk`, `nn` (not null), `en` (enum type), `def` (default), `note`. FK relationships live in `refs` (column-level `{s,t,c}` + `action`). `kind` defaults to `"table"`; future view/function/procedure entries reuse the same `tables`/`refs` arrays with other `kind`s (or a future `nodes` alias).
+Rust types in `crates/dbd-core/src/schema_model.rs` (serde, field names/casing matching the JSON above; the boolean column flags `pk`/`nn`/`en` are emitted as JSON `true` when set and **omitted when false** via `skip_serializing_if` — the viewer reads them truthily, so `true`/absent is the contract. The mockup data uses `1`, which is equivalent under truthy checks; Plan 2's viewer TS types should treat these as optional booleans). Column flags: `pk`, `nn` (not null), `en` (enum type), `def` (default), `note`. FK relationships live in `refs` (column-level `{s,t,c}` + `action`). `kind` defaults to `"table"`; future view/function/procedure entries reuse the same `tables`/`refs` arrays with other `kind`s (or a future `nodes` alias).
 
 **Builder** — `schema_model::build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel`:
 - `tables`: each scoped `EntityType::Table` with a `TableDef` → columns (name/type/pk/nn/en/def/note) + table `note`/`noteMd` (from the entity's comment).
