@@ -105,12 +105,12 @@ pub enum Commands {
         #[arg(short, long, default_value = "design.dbml")]
         file: PathBuf,
     },
-    /// Generate an interactive schema diagram (JSON model in v1; HTML in v2)
+    /// Generate an interactive schema diagram (self-contained HTML)
     Diagram {
-        /// Destination file (default: schema.json)
-        #[arg(short, long, default_value = "schema.json")]
+        /// Destination file (default: schema.html)
+        #[arg(short, long, default_value = "schema.html")]
         file: PathBuf,
-        /// Emit the raw SchemaModel JSON (the only mode in v1)
+        /// Emit the raw SchemaModel JSON instead of the HTML diagram
         #[arg(long)]
         json: bool,
     },

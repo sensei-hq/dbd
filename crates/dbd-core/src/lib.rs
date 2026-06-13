@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod config;
 pub mod dbml;
 pub mod dependency;
+pub mod diagram;
 pub mod diff;
 pub mod doctor;
 pub mod design;

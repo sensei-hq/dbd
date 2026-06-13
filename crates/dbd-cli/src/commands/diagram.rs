@@ -12,7 +12,7 @@ pub fn cmd_diagram(
     env: &str,
     project_dir: &Path,
     file: &Path,
-    _json: bool, // v1: always JSON; flag reserved for v2 when HTML becomes the default
+    json: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -21,9 +21,16 @@ pub fn cmd_diagram(
         .context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let model = dbd_core::schema_model::build(&design, Some(&resolved));
-    let json = serde_json::to_string_pretty(&model)
-        .context("Failed to serialize schema model")?;
-    safe_write(project_dir, file, &json)?;
-    output::info(verbosity, &format!("Wrote schema model to {}", file.display()));
+    if json {
+        let s = serde_json::to_string_pretty(&model)
+            .context("Failed to serialize schema model")?;
+        safe_write(project_dir, file, &s)?;
+        output::info(verbosity, &format!("Wrote schema model to {}", file.display()));
+    } else {
+        let html = dbd_core::diagram::render_html(&model)
+            .context("Failed to render HTML diagram")?;
+        safe_write(project_dir, file, &html)?;
+        output::info(verbosity, &format!("Wrote schema diagram to {}", file.display()));
+    }
     Ok(())
 }
