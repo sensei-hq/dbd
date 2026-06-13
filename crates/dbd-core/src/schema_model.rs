@@ -92,6 +92,9 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         None => design.entities().to_vec(),
     };
 
+    // NOTE: matches c.data_type against the enum entity's name (file-stem, e.g.
+    // "config.status" / "status"), not necessarily the CREATE TYPE identifier
+    // ("status_type"). Works when they coincide; a stricter match is future work.
     let enum_names: std::collections::HashSet<String> = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::Enum)
@@ -171,12 +174,11 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
     let mut schema_set: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     for e in &entities {
         let Some(s) = &e.schema else { continue };
-        let entry = schema_set.entry(s.clone()).or_insert((0, 0));
         match e.entity_type {
-            EntityType::Table => entry.0 += 1,
-            EntityType::Enum => entry.1 += 1,
-            _ => {}
-        }
+            EntityType::Table => schema_set.entry(s.clone()).or_insert((0, 0)).0 += 1,
+            EntityType::Enum => schema_set.entry(s.clone()).or_insert((0, 0)).1 += 1,
+            _ => continue,
+        };
     }
     let schemas = schema_set
         .into_iter()
@@ -197,9 +199,12 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
     }
 }
 
-/// First line of a table comment → the short `note`.
+/// First non-empty first line of a table comment → the short `note` (or None).
 fn note_first_line(def: &crate::entity::TableDef) -> Option<String> {
-    def.comments.table.as_ref().map(|t| t.lines().next().unwrap_or("").to_string())
+    def.comments.table.as_ref().and_then(|t| {
+        let first = t.lines().next().unwrap_or("").trim();
+        if first.is_empty() { None } else { Some(first.to_string()) }
+    })
 }
 
 /// All foreign keys on a table: inline column FKs + table-level FK constraints.
@@ -217,6 +222,7 @@ fn collect_fks(def: &crate::entity::TableDef) -> Vec<crate::entity::ForeignKey> 
     out
 }
 
+/// Map an `FkAction` to the lowercase string used in the `action` field.
 fn fk_action_str(a: FkAction) -> String {
     match a {
         FkAction::Cascade => "cascade",
@@ -245,6 +251,7 @@ mod tests {
         let m = build(&d, None);
         assert_eq!(m.project.name, "example");
         assert_eq!(m.project.db, "postgresql");
+        assert!(m.schemas.iter().all(|s| s.name != "auth"), "external-only auth schema must not appear");
         let config = m.schemas.iter().find(|s| s.name == "config").expect("config schema");
         assert!(config.tables >= 2, "config has lookups + lookup_values");
         let lookups = m.tables.iter().find(|t| t.schema == "config" && t.name == "lookups").expect("lookups");
@@ -266,6 +273,10 @@ mod tests {
         let m = build(&d, Some(&scope));
         assert!(m.tables.iter().all(|t| t.schema != "staging"), "staging dropped");
         assert!(m.tables.iter().any(|t| t.schema == "config"));
+        assert!(
+            m.refs.iter().all(|r| r.to.s != "staging" && r.from.s != "staging"),
+            "no refs cross into the dropped schema"
+        );
     }
 
     #[test]
