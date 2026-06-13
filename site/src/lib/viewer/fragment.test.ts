@@ -19,3 +19,8 @@ it('rejects malformed or unknown-version fragments', async () => {
   await expect(decodeFragment('#nope')).rejects.toThrow();
   await expect(decodeFragment('#9.AAAA')).rejects.toThrow();
 });
+
+it('rejects a valid-version fragment whose payload is not gzip', async () => {
+  // version ok, base64 decodes, but the bytes aren't gzip → gunzip must throw
+  await expect(decodeFragment('#1.AAAA')).rejects.toThrow();
+});
