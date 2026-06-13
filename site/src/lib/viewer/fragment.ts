@@ -1,3 +1,5 @@
+import { gzipSync, gunzipSync } from 'fflate';
+
 const VERSION = '1';
 
 function b64urlToBytes(s: string): Uint8Array {
@@ -15,35 +17,11 @@ function bytesToB64url(bytes: Uint8Array): string {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
-  if (typeof DecompressionStream !== 'undefined' && typeof Blob !== 'undefined') {
-    try {
-      // Slice to guarantee a plain ArrayBuffer (cast avoids SharedArrayBuffer TS error)
-      const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-      const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
-      return new Uint8Array(await new Response(stream).arrayBuffer());
-    } catch {
-      // fall through to fflate
-    }
-  }
-  const { gunzipSync } = await import('fflate');
-  return gunzipSync(bytes);
-}
-
-async function gzip(bytes: Uint8Array): Promise<Uint8Array> {
-  if (typeof CompressionStream !== 'undefined' && typeof Blob !== 'undefined') {
-    try {
-      // Slice to guarantee a plain ArrayBuffer (cast avoids SharedArrayBuffer TS error)
-      const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-      const stream = new Blob([buf]).stream().pipeThrough(new CompressionStream('gzip'));
-      return new Uint8Array(await new Response(stream).arrayBuffer());
-    } catch {
-      // fall through to fflate
-    }
-  }
-  const { gzipSync } = await import('fflate');
-  return gzipSync(bytes);
-}
+// gzip via fflate (pure JS) — identical in browsers, Node, and jsdom. We avoid
+// the native CompressionStream/DecompressionStream + Blob.stream() path: it's
+// inconsistent across environments (jsdom's Blob.stream() is broken; some
+// browsers threw "ArrayBuffer allocation failed" on the slice→Blob form), and
+// keeping one code path means the tests exercise exactly what ships.
 
 /** Decode `#1.<base64url-gzip-json>` into a parsed (unvalidated) value. Throws on bad input. */
 export async function decodeFragment(hash: string): Promise<unknown> {
@@ -53,12 +31,12 @@ export async function decodeFragment(hash: string): Promise<unknown> {
   const version = frag.slice(0, dot);
   if (version !== VERSION) throw new Error(`unsupported diagram link version "${version}"`);
   const gz = b64urlToBytes(frag.slice(dot + 1));
-  const json = new TextDecoder().decode(await gunzip(gz));
+  const json = new TextDecoder().decode(gunzipSync(gz));
   return JSON.parse(json);
 }
 
 /** Encode a value into a `1.<base64url-gzip-json>` payload (no leading `#`). */
 export async function encodeFragment(model: unknown): Promise<string> {
   const json = new TextEncoder().encode(JSON.stringify(model));
-  return `${VERSION}.${bytesToB64url(await gzip(json))}`;
+  return `${VERSION}.${bytesToB64url(gzipSync(json))}`;
 }
