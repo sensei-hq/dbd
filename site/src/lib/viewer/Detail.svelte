@@ -81,27 +81,31 @@
         <table class="vw-cols mt-3 w-full border-collapse text-left">
           <thead>
             <tr class="font-mono uppercase text-ink-faint text-xs">
-              <th class="py-2 pr-4 font-medium">Column</th>
-              <th class="py-2 pr-4 font-medium">Props</th>
-              <th class="py-2 pr-4 font-medium">Type</th>
-              <th class="py-2 pr-4 font-medium">Default</th>
-              <th class="py-2 font-medium">Note</th>
+              <th class="py-2.5 pr-4 font-medium">Column</th>
+              <th class="py-2.5 pr-4 font-medium">Props</th>
+              <th class="py-2.5 font-medium">Type</th>
             </tr>
           </thead>
           <tbody data-cols>
             {#each current.columns as c (c.name)}
               <tr data-col-row={c.name} class="border-t border-paper-edge align-top">
-                <td class="py-2 pr-4 font-mono text-ink">{c.name}</td>
-                <td class="py-2 pr-4">
+                <td class="py-2.5 pr-4">
+                  <div class="font-mono text-ink">{c.name}</div>
+                  {#if c.note}
+                    <div class="text-ink-mute text-xs mt-0.5">{c.note}</div>
+                  {/if}
+                  {#if c.def}
+                    <div class="vw-col-def font-mono text-ink-faint mt-0.5">default: {c.def}</div>
+                  {/if}
+                </td>
+                <td class="py-2.5 pr-4">
                   <span class="flex flex-wrap gap-1">
                     {#each badgesFor(c.name, c.pk, c.nn, c.en) as b (b.label)}
                       <span class="vw-badge {b.cls}">{b.label}</span>
                     {/each}
                   </span>
                 </td>
-                <td class="py-2 pr-4 font-mono text-ink-mute">{c.type}</td>
-                <td class="py-2 pr-4 font-mono text-ink-faint text-xs">{c.def ?? '—'}</td>
-                <td class="py-2 text-ink-mute text-xs">{c.note ?? ''}</td>
+                <td class="vw-col-type py-2.5 font-mono text-ink-mute">{c.type}</td>
               </tr>
             {/each}
           </tbody>
@@ -135,6 +139,14 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+  }
+  /* fold the old default cell under the column name (mockup uses text-[0.66rem]) */
+  .vw-col-def {
+    font-size: 0.66rem;
+  }
+  /* long types like TIMESTAMP WITH TIME ZONE wrap cleanly instead of overflowing */
+  .vw-col-type {
+    overflow-wrap: anywhere;
   }
   .vw-md :global(strong) {
     font-weight: 600;
