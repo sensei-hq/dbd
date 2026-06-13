@@ -1,0 +1,167 @@
+---
+source: crates/dbd-core/src/schema_model.rs
+expression: json
+---
+{
+  "project": {
+    "name": "example",
+    "db": "postgresql",
+    "note": "Example project for testing"
+  },
+  "schemas": [
+    {
+      "name": "config",
+      "tables": 2,
+      "enums": 1
+    }
+  ],
+  "tables": [
+    {
+      "schema": "config",
+      "name": "lookup_values",
+      "kind": "table",
+      "note": "Different values associated with various lookups.",
+      "noteMd": "Different values associated with various lookups.\n- Used to store predefined values for different lookup categories.\n- Each value is associated with a specific lookup.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "pk": true,
+          "nn": true,
+          "def": "uuid_generate_v4()",
+          "note": "Unique identifier for the lookup value. Ensures each value can be uniquely identified."
+        },
+        {
+          "name": "lookup_id",
+          "type": "UUID",
+          "note": "Identifier for the lookup category. References the lookups table to specify the category."
+        },
+        {
+          "name": "value",
+          "type": "VARCHAR(255)",
+          "note": "The actual value associated with the lookup."
+        },
+        {
+          "name": "sequence",
+          "type": "INTEGER",
+          "note": "Order of the value within the lookup category. Used for sorting purposes."
+        },
+        {
+          "name": "is_active",
+          "type": "BOOLEAN",
+          "def": "true",
+          "note": "Flag indicating if the lookup value is active. Used to determine if the value is currently in use."
+        },
+        {
+          "name": "is_hidden",
+          "type": "BOOLEAN",
+          "def": "false",
+          "note": "Flag indicating if the lookup value should be hidden. Used to exclude the value from display."
+        },
+        {
+          "name": "details",
+          "type": "JSONB",
+          "note": "Additional details associated with the lookup value. Stored as a JSONB field to accommodate various attributes."
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "note": "Description of the lookup value. Provides additional context about the value."
+        },
+        {
+          "name": "modified_at",
+          "type": "TIMESTAMP WITH TIME ZONE",
+          "nn": true,
+          "def": "now()",
+          "note": "The date the lookup value was last modified. Provides a history of when changes were made."
+        },
+        {
+          "name": "modified_by",
+          "type": "VARCHAR",
+          "note": "The user who last modified the lookup value. Tracks who made the changes for auditing purposes."
+        },
+        {
+          "name": "category_id",
+          "type": "UUID"
+        },
+        {
+          "name": "notes",
+          "type": "TEXT"
+        }
+      ]
+    },
+    {
+      "schema": "config",
+      "name": "lookups",
+      "kind": "table",
+      "note": "Generic lookup table for various lookups.",
+      "noteMd": "Generic lookup table for various lookups.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "pk": true,
+          "nn": true,
+          "def": "uuid_generate_v4()",
+          "note": "Unique identifier for the lookup. Ensures each lookup can be uniquely identified."
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(30)",
+          "note": "Name of the lookup. Used to identify the lookup."
+        },
+        {
+          "name": "is_editable",
+          "type": "BOOLEAN",
+          "def": "true",
+          "note": "Flag indicating whether this lookup is editable."
+        },
+        {
+          "name": "icon",
+          "type": "VARCHAR",
+          "note": "Icon to be used for the lookup."
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "note": "Description of the lookup. Provides additional details about the lookup."
+        },
+        {
+          "name": "modified_at",
+          "type": "TIMESTAMP WITH TIME ZONE",
+          "nn": true,
+          "def": "now()",
+          "note": "Date and time the lookup entry was last modified. Provides a history of when changes were made."
+        },
+        {
+          "name": "modified_by",
+          "type": "VARCHAR",
+          "note": "User that last modified the lookup entry. Tracks who made the changes for auditing purposes."
+        },
+        {
+          "name": "tags",
+          "type": "TEXT[]"
+        },
+        {
+          "name": "display_order",
+          "type": "INTEGER",
+          "def": "0"
+        }
+      ]
+    }
+  ],
+  "refs": [
+    {
+      "from": {
+        "s": "config",
+        "t": "lookup_values",
+        "c": "lookup_id"
+      },
+      "to": {
+        "s": "config",
+        "t": "lookups",
+        "c": "id"
+      }
+    }
+  ]
+}
