@@ -280,6 +280,14 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_fixture_model_json() {
+        let d = fixture_design();
+        let m = build(&d, None);
+        let json = serde_json::to_string_pretty(&m).unwrap();
+        insta::assert_snapshot!(json);
+    }
+
+    #[test]
     fn serializes_to_dbd_schema_shape() {
         let model = SchemaModel {
             project: ProjectInfo { name: "p".into(), db: "postgresql".into(), note: None },
