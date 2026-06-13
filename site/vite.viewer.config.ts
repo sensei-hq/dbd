@@ -11,6 +11,10 @@ export default defineConfig({
 		outDir: fileURLToPath(new URL('../crates/dbd-core/assets', import.meta.url)),
 		emptyOutDir: false, // don't wipe diagram.html (added in the next task)
 		cssCodeSplit: false,
+		// Inline every asset (the embedded woff2 fonts) as a base64 data: URI so
+		// the bundle stays fully self-contained — no emitted font files, no
+		// network requests. 100 MB ceiling is well above the ~70 KB of fonts.
+		assetsInlineLimit: 100_000_000,
 		lib: {
 			entry: fileURLToPath(new URL('./src/lib/viewer/standalone.ts', import.meta.url)),
 			formats: ['iife'],

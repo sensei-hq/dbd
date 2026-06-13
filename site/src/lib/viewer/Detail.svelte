@@ -59,7 +59,7 @@
     <div class="px-6 py-6">
       <!-- header -->
       <header class="mb-6">
-        <div class="font-mono text-xs text-ink-faint">{current.schema}.</div>
+        <div class="font-mono text-xs text-ink-soft">{current.schema}.</div>
         <div class="flex items-center gap-3">
           <h2 class="font-display text-lg font-semibold text-ink">{current.name}</h2>
           <span class="vw-badge bg-accent-soft text-primary">{current.columns.length} columns</span>
@@ -69,7 +69,7 @@
       <!-- note (only when present) -->
       {#if noteHtml}
         <section class="mb-8">
-          <h3 class="font-mono uppercase text-ink-faint text-xs">Comment</h3>
+          <h3 class="font-mono uppercase text-ink-soft text-xs">Comment</h3>
           <!-- trusted local DDL comment, see noteHtml above -->
           <div class="vw-md text-ink-mute text-sm mt-2">{@html noteHtml}</div>
         </section>
@@ -77,10 +77,10 @@
 
       <!-- columns -->
       <section class="mb-8">
-        <h3 class="font-mono uppercase text-ink-faint text-xs">Columns</h3>
+        <h3 class="font-mono uppercase text-ink-soft text-xs">Columns</h3>
         <table class="vw-cols mt-3 w-full border-collapse text-left">
           <thead>
-            <tr class="font-mono uppercase text-ink-faint text-xs">
+            <tr class="font-mono uppercase text-ink-soft text-xs">
               <th class="py-2.5 pr-4 font-medium">Column</th>
               <th class="py-2.5 pr-4 font-medium">Props</th>
               <th class="py-2.5 font-medium">Type</th>
@@ -95,7 +95,7 @@
                     <div class="text-ink-mute text-xs mt-0.5">{c.note}</div>
                   {/if}
                   {#if c.def}
-                    <div class="vw-col-def font-mono text-ink-faint mt-0.5">default: {c.def}</div>
+                    <div class="vw-col-def font-mono text-ink-soft mt-0.5">default: {c.def}</div>
                   {/if}
                 </td>
                 <td class="py-2.5 pr-4">
@@ -114,7 +114,7 @@
 
       <!-- mini focused ERD -->
       <section>
-        <h3 class="font-mono uppercase text-ink-faint text-xs mb-2">Relationships</h3>
+        <h3 class="font-mono uppercase text-ink-soft text-xs mb-2">Relationships</h3>
         <div class="vw-mini-erd relative h-64 rounded-md border border-paper-edge overflow-hidden">
           <Diagram {model} state={mini} />
         </div>
@@ -122,7 +122,7 @@
     </div>
   </section>
 {:else}
-  <section class="vw-detail h-full bg-paper text-ink-faint">
+  <section class="vw-detail h-full bg-paper text-ink-mute">
     <div class="px-6 py-6 text-sm">Select a table</div>
   </section>
 {/if}

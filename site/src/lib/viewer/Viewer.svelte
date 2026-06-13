@@ -48,14 +48,14 @@
     <span class="vw-logo flex-none" aria-hidden="true">{@html dbdLogo}</span>
     <span class="font-display font-semibold">{model.project.name}</span>
     <span class="rounded-full bg-accent-soft px-2 text-xs text-primary">{model.project.db}</span>
-    <span class="font-mono text-xs text-ink-faint">
+    <span class="font-mono text-xs text-ink-soft">
       {tableCount} tables · {enumCount} enums · {refCount} refs
     </span>
 
     <div class="ml-auto flex items-center gap-4">
       <!-- density -->
       <div class="flex items-center gap-2">
-        <span class="font-mono text-[0.62rem] uppercase tracking-wide text-ink-faint">density</span>
+        <span class="font-mono text-[0.62rem] uppercase tracking-wide text-ink-soft">density</span>
         <div class="vw-seg flex overflow-hidden rounded-md border border-paper-edge">
           {#each DENSITIES as d (d)}
             <button
@@ -75,7 +75,7 @@
 
       <!-- arrange -->
       <div class="flex items-center gap-2">
-        <span class="font-mono text-[0.62rem] uppercase tracking-wide text-ink-faint">arrange</span>
+        <span class="font-mono text-[0.62rem] uppercase tracking-wide text-ink-soft">arrange</span>
         <div class="vw-seg flex overflow-hidden rounded-md border border-paper-edge">
           {#each ARRANGES as a (a)}
             <button
