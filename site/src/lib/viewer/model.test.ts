@@ -1,5 +1,6 @@
 import { it, expect } from 'vitest';
 import { toLayoutData, neighborsOf, type SchemaModel } from './model';
+import { validateModel } from './model';
 
 const model: SchemaModel = {
   project: { name: 'p', db: 'postgresql' },
@@ -24,4 +25,12 @@ it('neighborsOf returns from+to connected tables', () => {
   // forward (FK origin → target) and reverse (target → FK origin)
   expect(neighborsOf(model, 'config.lookup_values').has('config.lookups')).toBe(true);
   expect(neighborsOf(model, 'config.lookups').has('config.lookup_values')).toBe(true);
+});
+
+it('accepts a well-formed model and rejects malformed ones', () => {
+  const good = { project: { name: 'p', db: 'pg' }, schemas: [], tables: [], refs: [] };
+  expect(validateModel(good).ok).toBe(true);
+  expect(validateModel(null).ok).toBe(false);
+  expect(validateModel({ project: {} }).ok).toBe(false);
+  expect(validateModel({ project: { name: 'p' }, schemas: [], tables: [{ name: 'x' }], refs: [] }).ok).toBe(false);
 });
