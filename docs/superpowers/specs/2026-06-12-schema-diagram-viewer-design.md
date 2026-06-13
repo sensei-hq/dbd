@@ -1,54 +1,38 @@
 # Schema Diagram Viewer (`dbd diagram`) — Design
 
-**Goal:** `dbd diagram` produces a single self-contained HTML file that interactively explores a project's schema — a sidebar schema→table tree, markdown-style column detail per table, and an SVG ER diagram with a full overview and a per-entity focus view (references from/to). No external services, no `dbdocs.io` publish step, no runtime network dependencies.
+**Goal:** `dbd diagram` produces a single self-contained HTML file that interactively explores a project's schema — a sidebar schema→table hierarchy, markdown-style column/entity detail, and an SVG ER diagram with a full overview and a per-entity focus view (references from/to). No external services, no `dbdocs.io` publish step, no runtime network dependencies.
 
-**Architecture:** dbd emits a **dbd-native `SchemaModel` JSON** (built from its entities + dependency graph, *not* from DBML), and a framework-agnostic JS **viewer** renders that JSON. The CLI inlines the model JSON + an embedded viewer bundle into an HTML template. The same viewer module is reusable by the website later (Phase 1) and by versioned-storage hosting (Phase 2).
+**Architecture:** dbd emits a **dbd-native `SchemaModel` JSON** (built from its entities + dependency graph, *not* from DBML). A **Svelte 5 + Rokkit viewer** renders that JSON; it is compiled to a single self-contained bundle the CLI embeds into an HTML template. The same Svelte components are imported directly by the marketing site for Phase 1, and back the versioned-storage product in Phase 2.
 
-**Tech stack:** Rust (`dbd-core` + `dbd-cli`); a standalone `viewer/` TypeScript package built with esbuild/bun to one minified bundle (CSS inlined); SVG rendering with `d3-zoom` for pan/zoom (no other D3, no layout library); tests via Rust unit/snapshot + vitest/jsdom for the viewer.
+**Tech stack:** Rust (`dbd-core` + `dbd-cli`); the viewer is **Svelte 5** components in `site/src/lib/viewer/` styled with the **Rokkit** token + component system (reusing the site's `rokkit.config.js`); SVG diagram with `d3-zoom` for pan/zoom; the ER layout reuses the mockup's deterministic `diagram-layout.js` (ported to TS). The viewer is built to an embeddable bundle via a dedicated Vite/UnoCSS build. Tests: Rust unit/snapshot + Svelte component tests (vitest + @testing-library/svelte).
+
+**Visual reference:** `docs/mockup/designs/` (the "Project View" handoff). The layout algorithm (`diagram-layout.js`), screen structure (`project-view.jsx`, `diagram.jsx`, `entity-page.jsx`), and data shape (`schema-data.js` → `window.DBD_SCHEMA`) are reused/recreated; the mockup's hand-rolled tokens are **replaced by Rokkit named tokens**, and its hand-rolled components by **Rokkit components** where they exist (the sidebar uses Rokkit `List`).
 
 ---
 
 ## Why a JSON model, not DBML
 
-DBML cannot represent views, procedures, or functions. Coupling the viewer to DBML would force a rewrite when those are added. The `SchemaModel` is a dbd-native superset: tables/columns/FKs in v1, with a `kind` discriminator on nodes and edges that extends to views/functions/procedures (already first-class dbd entities with `refers`/`reads`/`writes` edges) without changing the model or the viewer's contract. DBML generation (`dbd dbml`) remains a separate, parallel output.
+DBML cannot represent views, procedures, or functions. Coupling the viewer to DBML would force a rewrite when those are added. The `SchemaModel` is a dbd-native superset: tables/columns/refs in v1, extending to views/functions/procedures (already first-class dbd entities with `refers`/`reads`/`writes`) by adding node kinds — no model or viewer-contract rewrite. DBML generation (`dbd dbml`) remains a separate, parallel output.
 
 ## Roadmap (phases)
 
-This spec covers **v1 only**. Later phases are recorded here for context so v1's
-boundaries (the `SchemaModel` JSON + the `mount(el, model)` viewer) are drawn to
-support them, but they are out of scope and will each get their own spec.
+This spec covers **v1 only**. Later phases are recorded so v1's boundaries (the `SchemaModel` JSON + the Svelte+Rokkit viewer components) are drawn to support them; each later phase gets its own spec.
 
-- **v1 — local HTML (this spec).** `dbd diagram` renders a self-contained
-  single-project HTML schema explorer. No auth, no network, no storage.
-- **v2 — hosted login + storage + published designs.** A Supabase instance with
-  magic-link login (via **kavach**, `~/Developer/kavach`) backs the website. Sketch
-  schema:
+- **v1 — local HTML (this spec).** `dbd diagram` renders a self-contained single-project HTML schema explorer. No auth, no network, no storage.
+- **v2 — hosted login + storage + published designs.** A Supabase instance with magic-link login (via **kavach**, `~/Developer/kavach`) backs the website. Sketch schema:
   - `projects (id, user_id, name, target, version, json)` — current published model per project.
-  - `project_history (id, project_id, version, json, created_at)` — prior versions + their models.
-  
-  The website lists the signed-in user's projects and renders each project's
-  diagram with the *same* `viewer` module from v1. A light **daily keep-alive**
-  job pings the DB so a low-traffic free-tier Supabase instance isn't paused.
-- **v3 — CLI auth + publish.** `dbd` authenticates (kavach) and publishes a
-  project's `SchemaModel` JSON to Supabase (insert into `projects`, append to
-  `project_history`), so `dbd diagram --publish` (or similar) pushes a versioned
-  design to the hosted UI.
-- **v4 — sharing designs via the UI.** Share links / visibility controls for
-  published designs.
+  - `project_history (id, project_id, version, json, created_at)` — prior versions + models.
 
-The **visual language** for v1's local HTML follows the "Project View" design
-mockup (sign-in / magic-link, project list, per-project diagram). v1 renders only
-the *per-project diagram* screen (no auth/list); the mockup's sign-in and
-project-list screens are v2 concepts. (Mockup to be supplied — the shared design
-link was unreachable at spec time; save it under `docs/mockup/` so the viewer can
-match its layout, type, and color tokens.)
+  The website lists the signed-in user's projects and renders each project's diagram with the *same* Svelte viewer from v1. A light **daily keep-alive** job pings the DB so a low-traffic Supabase instance isn't paused.
+- **v3 — CLI auth + publish.** `dbd` authenticates (kavach) and publishes a project's `SchemaModel` JSON to Supabase (`projects` + append `project_history`) — e.g. `dbd diagram --publish`.
+- **v4 — sharing designs via the UI.** Share links / visibility controls for published designs.
 
 ## Non-goals (deferred)
 
-- View / function / procedure nodes (the model is *designed* for them, but v1 emits only tables/schemas/FK edges).
-- Website embedding of the viewer (Phase 1) and versioned per-project/user DBML storage + history (Phase 2).
+- View / function / procedure node kinds (model + viewer are *designed* for them; v1 emits tables/schemas/refs only).
+- Website embedding (Phase 1), versioned storage/history (Phase 2), CLI publish (v3), sharing (v4).
 - PNG/SVG image export.
-- Any layout library (elk/dagre) — kept out to keep the embedded bundle small.
+- Embedding the mockup's display/mono web fonts in the self-contained HTML (v1 uses a system-font stack via Rokkit typography to stay offline; font embedding is later polish).
 
 ---
 
@@ -56,125 +40,113 @@ match its layout, type, and color tokens.)
 
 ```
 Design (entities + TableDefs + dependency graph)
-   └─ schema_model::build(&Design, scope) ──> SchemaModel  (serde)
+   └─ schema_model::build(&Design, scope) ──> SchemaModel  (serde → the DBD_SCHEMA JSON shape)
                                                   │
    dbd diagram ───────────────────────────────────┤
      --json   → <out>.json   (raw SchemaModel, for the site / tooling)
      (default)→ <out>.html   (self-contained):
                   diagram.html template (include_str!)
-                  + <script id="dbd-model">…model JSON…</script>
-                  + <script>…embedded viewer bundle (include_str!)…</script>
+                  + <script type="application/json" id="dbd-model">…model…</script>
+                  + <script>…embedded viewer bundle (include_str!)…</script>  // Svelte+Rokkit, CSS inlined
 
-viewer/ (vanilla TS) ── build (bun/esbuild) ──> viewer bundle (JS + inlined CSS)
-   ├─ committed to crates/dbd-core/assets/diagram_viewer.js  (embedded in the binary)
-   └─ imported by the SvelteKit site later (Phase 1) — same source
+site/src/lib/viewer/  (Svelte 5 + Rokkit components)
+   ├─ vite build (lib entry + presetRokkit) → self-contained bundle (JS w/ inlined CSS)
+   │     → committed to crates/dbd-core/assets/diagram_viewer.js → embedded in the dbd binary
+   └─ imported directly by the SvelteKit site (Phase 1) — same components, native Rokkit
 ```
 
-The viewer's single input is a `SchemaModel`. It never parses DBML or SQL.
+The viewer's single input is a `SchemaModel`. It never parses DBML or SQL. The self-contained HTML mounts the viewer with Svelte 5 `mount(Viewer, { target, props: { model } })`, reading the model from the inert `<script id="dbd-model">` tag.
 
----
-
-## `SchemaModel` JSON (v1)
+## `SchemaModel` JSON (v1) — serializes to the mockup's `DBD_SCHEMA` contract
 
 ```jsonc
 {
-  "project": "MyProject",
-  "schemas": [{ "name": "config" }, { "name": "app" }],
-  "nodes": [
+  "project": { "name": "sensei", "db": "postgresql", "note": "…" },
+  "schemas": [ { "name": "config", "tables": 3, "enums": 1 } ],
+  "tables": [
     {
-      "id": "config.lookups",
-      "schema": "config",
-      "name": "lookups",
-      "kind": "table",                 // extension point: view | function | procedure | enum
-      "note": "optional comment text or null",
+      "schema": "config", "name": "lookup_values", "kind": "table",   // kind extends: view|function|procedure
+      "note": "short note", "noteMd": "markdown note\nmultiple lines",
       "columns": [
-        { "name": "id",        "type": "uuid", "pk": true,  "nullable": false, "fk": null },
-        { "name": "parent_id", "type": "uuid", "pk": false, "nullable": true,
-          "fk": { "to": "config.lookups", "column": "id" } }
+        { "name": "id",        "type": "uuid", "pk": 1, "nn": 1, "def": "gen_random_uuid()" },
+        { "name": "lookup_id", "type": "uuid", "nn": 1 }
       ]
     }
   ],
-  "edges": [
-    { "from": "config.lookup_values", "to": "config.lookups",
-      "kind": "fk", "columns": [["lookup_id", "id"]] }
+  "refs": [
+    { "from": { "s": "config", "t": "lookup_values", "c": "lookup_id" },
+      "to":   { "s": "config", "t": "lookups",       "c": "id" }, "action": "cascade" }
   ]
 }
 ```
 
-Rust types (in `crates/dbd-core/src/schema_model.rs`), all `#[derive(Serialize, Deserialize, PartialEq, Debug)]`:
-
-```rust
-pub struct SchemaModel { pub project: String, pub schemas: Vec<SchemaRef>, pub nodes: Vec<Node>, pub edges: Vec<Edge> }
-pub struct SchemaRef { pub name: String }
-pub struct Node { pub id: String, pub schema: Option<String>, pub name: String, pub kind: NodeKind, pub note: Option<String>, pub columns: Vec<Column> }
-pub enum NodeKind { Table /* future: View, Function, Procedure, Enum */ }   // serde rename_all = "snake_case"
-pub struct Column { pub name: String, #[serde(rename="type")] pub ty: String, pub pk: bool, pub nullable: bool, pub fk: Option<Fk> }
-pub struct Fk { pub to: String, pub column: String }
-pub enum EdgeKind { Fk }                                                    // future: Depends, Reads, Writes
-pub struct Edge { pub from: String, pub to: String, pub kind: EdgeKind, pub columns: Vec<(String, String)> }
-```
+Rust types in `crates/dbd-core/src/schema_model.rs` (serde, field names/casing matching the JSON above; booleans emitted as `1`/omitted to match the mockup contract via `skip_serializing_if`). Column flags: `pk`, `nn` (not null), `en` (enum type), `def` (default), `note`. FK relationships live in `refs` (column-level `{s,t,c}` + `action`). `kind` defaults to `"table"`; future view/function/procedure entries reuse the same `tables`/`refs` arrays with other `kind`s (or a future `nodes` alias).
 
 **Builder** — `schema_model::build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel`:
-- Nodes: each scoped `EntityType::Table` with a `TableDef` → a `Node` with `columns` from `TableDef.columns` (name, type, `is_pk`, `nullable`) and per-column `fk` from the table's foreign keys (single-column FKs map to `Fk { to, column }`; composite FKs populate the column pairs on the corresponding `Edge`).
-- Schemas: the distinct schemas of the included nodes.
-- Edges: derived from each `TableDef`'s foreign-key constraints (column-level — the viewer needs the local↔remote column pairs, which the node-level dependency graph does not carry). One `Edge { kind: Fk, columns: [(local, remote), …] }` per FK constraint between two in-scope tables. FKs whose target is out of scope or external are omitted from `edges` (the originating column still carries its `fk` marker in the node). The node-level dependency graph is not used in v1; the focus view computes a node's neighbors directly from `edges`.
-- Scope-aware: uses `Design::scoped_entities` so `--scope` filters the model exactly like the other commands.
+- `tables`: each scoped `EntityType::Table` with a `TableDef` → columns (name/type/pk/nn/en/def/note) + table `note`/`noteMd` (from the entity's comment).
+- `schemas`: distinct schemas of the included tables, with table/enum counts.
+- `refs`: one entry per FK constraint between two in-scope tables, column-level (`from`/`to` `{s,t,c}` + `action`). FKs to out-of-scope/external targets are omitted from `refs`.
+- Scope-aware via `Design::scoped_entities`, exactly like the other commands.
 
 ## CLI: `dbd diagram`
 
-New subcommand in `crates/dbd-cli/src/cli.rs` + `crates/dbd-cli/src/commands/`:
+New subcommand (`cli.rs` `Commands::Diagram` + `commands/`):
 
 ```sh
 dbd diagram                  # writes schema.html (self-contained, default)
 dbd diagram -f db.html        # custom output path
-dbd diagram --json -f m.json  # raw SchemaModel JSON instead of HTML
+dbd diagram --json -f m.json  # raw SchemaModel JSON (for the site / tooling)
 dbd diagram --scope hub       # scope-aware (Design::scoped_entities)
 ```
 
-Flags: `-f/--file` (default `schema.html`), `--json` (emit raw model JSON; default output name `schema.json` if `-f` omitted), plus the global `--scope`/`--deps`. Writing uses the existing `safe_write` within the project root. HTML build: `diagram::render_html(&model) -> String` = `include_str!("../assets/diagram.html")` template with two placeholders replaced — the model JSON (`__DBD_MODEL__`) and the viewer bundle (`include_str!("../assets/diagram_viewer.js")`). The model JSON is injected inside a `<script type="application/json" id="dbd-model">` tag (not interpolated into JS) to avoid escaping issues.
+Flags: `-f/--file` (default `schema.html`; `schema.json` when `--json`), `--json`, plus global `--scope`/`--deps`. `diagram::render_html(&model) -> String` = `include_str!("../assets/diagram.html")` with two placeholders replaced: the model JSON (inside `<script type="application/json" id="dbd-model">`) and the viewer bundle (`include_str!("../assets/diagram_viewer.js")`). Output via `safe_write` within the project root.
 
-## Viewer package
-
-Location: top-level `viewer/` (standalone, framework-agnostic, no dependency on SvelteKit).
+## Viewer (Svelte 5 + Rokkit) — `site/src/lib/viewer/`
 
 ```
-viewer/
-  package.json          # build script (bun/esbuild), vitest
-  src/
-    index.ts            # export mount(el: HTMLElement, model: SchemaModel): void
-    model.ts            # SchemaModel TS types (mirror of the Rust JSON)
-    layout/
-      overview.ts       # schema-grouped grid layout → positioned cards + edge paths
-      focus.ts          # centered selected node + referencers/referenced neighbors (1 hop)
-    render/
-      diagram.ts        # SVG: cards, columns, FK edge paths; d3-zoom pan/zoom
-      sidebar.ts        # schema→table tree + filter box
-      detail.ts         # markdown-style column table + note + mini focused ERD
-    state.ts            # selection / mode (overview|focus) / filter state
-    styles.css          # inlined into the bundle at build
-  dist/                 # build output (committed mirror lives in crates/dbd-core/assets/)
+site/src/lib/viewer/
+  index.ts             # export Viewer (Svelte component) + a mount(target, model) helper
+  Viewer.svelte        # shell: header (logo + ThemeSwitcherToggle + density/arrange controls), sidebar, canvas, detail
+  Sidebar.svelte       # Rokkit `List` (from @rokkit/ui): schema = group header, tables = leaf items; + filter input
+  Diagram.svelte       # SVG: schema-cluster cards, columns, FK edge paths; d3-zoom pan/zoom; selection highlight
+  Detail.svelte        # selected entity: markdown-style column table (name·type·PK·null·FK) + noteMd + mini focused ERD
+  layout.ts            # ported from docs/mockup/designs/diagram-layout.js (pure: model+density+arrange → geometry)
+  model.ts             # SchemaModel TS types (mirror the Rust JSON)
+  state.svelte.ts      # selection / mode (overview|focus) / density / arrange / filter (Svelte 5 runes)
 ```
 
-- **Entry contract:** `mount(el, model)` renders the whole UI into `el`. The self-contained HTML calls `mount(document.body, JSON.parse(document.getElementById('dbd-model').textContent))`. The website (Phase 1) calls the same `mount` with a model fetched/decoded however it likes.
-- **Build:** `bun build src/index.ts --minify --bundle` → a single self-contained `viewer.js`. `styles.css` is imported as text (esbuild `loader: { '.css': 'text' }`) and injected into a `<style>` element by `mount()` on first render. `d3-zoom` is bundled (tree-shaken). No other runtime dependencies.
-- **No layout library.** Overview = schema regions (labeled boxes) with cards grid-packed inside; FK edges are SVG `<path>` (orthogonal or cubic-bezier) between card column anchors. Focus = selected node centered, referencers left, referenced-by right (1 hop, click a neighbor to re-focus). Pan/zoom via `d3-zoom` on the SVG root `<g>`.
+- **Sidebar**: Rokkit `List` with `groupContent` (schema header, table/enum counts) + `itemContent` (table name); the filter input narrows it. Selecting an item selects the entity.
+- **Diagram**: bespoke SVG (Rokkit has no ERD component). Uses `layout.ts` (the mockup's algorithm: schema clusters with per-schema tint, density `names|keys|full`, `untangle` connectivity ordering + barycenter crossing reduction, column-anchored edge routing — orthogonal/curved/self-loop). `d3-zoom` drives pan/zoom on the SVG root `<g>`. Cards/edges styled with Rokkit tokens (`bg-paper-soft`, `border-paper-edge`, `text-ink`, edges `stroke` from `--primary`/`--ink-faint`). Per-schema tints derived in OKLCH from the accent hue.
+- **Focus view**: selecting an entity (sidebar or card) switches to focus — the node centered with its `refs` neighbors (from/to), computed directly from `refs`; click a neighbor to re-focus. Same view powers the **mini ERD** in the detail panel.
+- **Theme**: `ThemeSwitcherToggle` (`@rokkit/app`) + `themable` on the root → dark/light via the site's dual-palette skin; persisted to `localStorage` (works in the static file).
 
-## UX
+## Tokens — Rokkit, not the mockup's hand-rolled vars
 
-- **Left sidebar:** collapsible tree grouped schema → tables; a filter input narrows the tree (and the diagram highlight). 
-- **Main canvas:** SVG diagram; overview ⇄ focus toggle; pan/zoom; click a card (or sidebar item) to select.
-- **Detail panel:** on selection — a markdown-style column table (columns: name · type · PK · null · FK→target) + the node `note`, plus the mini focused ERD (the table + its direct FK neighbors).
-- **Selection semantics:** selecting an entity highlights it and its FK edges and switches the diagram to its focus view (refs from/to).
+The mockup's `:root` vars and `tw-config.js` are **dropped**; the viewer uses Rokkit named tokens via the site's `rokkit.config.js`. Mapping:
+
+| Mockup token | Rokkit token |
+|---|---|
+| `--bg` / `--bg-deep` | `paper` / `paper` (canvas) |
+| `--surface` / `--surface-2` | `paper-soft` / `paper-mute` |
+| `--line` / `--line-soft` | `paper-edge` |
+| `--fg` / `--muted` / `--faint` | `ink` / `ink-mute` / `ink-faint` |
+| `--accent` / `--on-accent` / `--accent-soft` | `primary` / `on-primary` / `accent-soft` |
+| `--font-display` / sans / mono | Rokkit `typography` (`font-heading` / `font-body` / `font-mono`) |
+| `--radius*` | Rokkit `shape.radius` (`rounded-md/-lg/-sm`) |
+
+Per-schema cluster tints (mockup's 8 hue angles) are kept as a visual affordance, derived in OKLCH so they read in both light/dark — not raw mockup hexes.
 
 ## Self-contained guarantee
 
-The output HTML references no external URLs (no CDN, no `<link>`/`<script src=…>` to remote, no web-font fetches — system font stack). A test asserts the rendered HTML contains no `src="http`, `href="http`, or `@import url(http` and embeds both the model and the viewer inline.
+Output HTML references no external URLs (no CDN/`<script src=…>`/`<link>` to remote, no remote web fonts — system font stack via Rokkit typography for v1). A test asserts the HTML embeds the model + viewer inline and contains no `src="http`, `href="http`, or `@import url(http`.
 
 ## Build & maintenance
 
-- `cargo build`/`cargo install` must NOT require a JS toolchain. Therefore the viewer bundle is **pre-built and committed** to `crates/dbd-core/assets/diagram_viewer.js` and embedded with `include_str!`.
-- A `make viewer` target builds `viewer/` and copies the bundle to `crates/dbd-core/assets/diagram_viewer.js`.
-- CI adds a **bundle-freshness check**: rebuild the viewer and `git diff --exit-code` the committed bundle, so the embedded artifact can't silently drift from source. (Runs in the `test + clippy` job with bun available, or a dedicated job.)
+- `cargo build`/`cargo install` must NOT require a JS toolchain → the viewer bundle is **pre-built and committed** to `crates/dbd-core/assets/diagram_viewer.js` and embedded via `include_str!`.
+- A dedicated Vite build in `site/` (`vite.viewer.config.ts`, `build.lib` entry = `src/lib/viewer/index.ts`, `presetRokkit`, CSS inlined into the JS, IIFE/ESM exposing the mount) → `site/dist-viewer/` → copied to `crates/dbd-core/assets/diagram_viewer.js`. `make viewer` runs it (bun). The HTML template + a `bun run build:viewer` script live in `site/`.
+- CI **bundle-freshness check**: rebuild the viewer and `git diff --exit-code` the committed bundle so it can't drift from source.
+- The marketing site imports the viewer components directly (no embed step) for Phase 1.
+- Implementation uses the **Svelte MCP / svelte skills** (the `svelte-file-editor` agent) for all `.svelte` work, and the **semantic-styles-rokkit** skill for tokens.
 
 ## File structure
 
@@ -182,24 +154,25 @@ The output HTML references no external URLs (no CDN, no `<link>`/`<script src=�
 - `crates/dbd-core/src/schema_model.rs` — `SchemaModel` types + `build()`; unit/snapshot tests.
 - `crates/dbd-core/assets/diagram.html` — HTML template with `__DBD_MODEL__` / `__DBD_VIEWER__` placeholders.
 - `crates/dbd-core/assets/diagram_viewer.js` — committed pre-built viewer bundle.
-- `crates/dbd-cli/src/commands/` — `cmd_diagram` (wire into `cli.rs` `Commands::Diagram` + `commands/mod.rs` dispatch).
-- `viewer/` — the TypeScript viewer package (src, build, vitest).
+- `crates/dbd-cli/src/commands/` — `cmd_diagram` (+ `cli.rs` `Commands::Diagram` + `commands/mod.rs` dispatch).
+- `site/src/lib/viewer/` — Svelte 5 + Rokkit viewer components + `layout.ts` + tests.
+- `site/vite.viewer.config.ts` + `package.json` `build:viewer` script.
 
 **Modify:**
 - `crates/dbd-core/src/lib.rs` — `pub mod schema_model;` + re-exports.
-- `crates/dbd-cli/src/cli.rs`, `crates/dbd-cli/src/commands/mod.rs` — add the `Diagram` command + dispatch (scope/deps already threaded through `run`).
+- `crates/dbd-cli/src/cli.rs`, `commands/mod.rs` — add `Diagram` (scope/deps already threaded).
 - `Makefile` — `viewer` target.
-- Docs: `docs/guide/04-commands.md` (new `dbd diagram` section), `docs/guide/03-design-yaml.md` (none needed), `docs/llms/llms.txt` + `llms-full.txt` (command entry), README command table. Mark `dbd diagram` in the landing page later.
+- Docs: `docs/guide/04-commands.md` (new `dbd diagram` section), `docs/llms/llms*.txt` + README command table (entry). Landing page mention later.
 
 ## Testing
 
-- **Rust (`schema_model`)**: from fixture entities, `build()` produces expected schemas, nodes with correct columns + PK/nullable/FK flags, and FK edges with column pairs; composite FK; scope filtering drops out-of-scope nodes/edges; snapshot of the JSON via `insta`.
-- **CLI (`dbd diagram`)**: emits a non-empty self-contained HTML containing the model `<script>` and the viewer; `--json` emits parseable `SchemaModel`; self-contained assertion (no remote URLs); `--scope` reflected in the model.
-- **Viewer (vitest + jsdom)**: `mount(el, model)` renders N table cards + M edge paths; sidebar tree lists schemas/tables; selecting a node enters focus mode and shows only neighbors; filter narrows the tree. Pure `model → DOM`, no network.
+- **Rust (`schema_model`)**: fixture entities → expected schemas (+counts), tables with correct columns + pk/nn/en/def/note, table `noteMd`, refs with `{s,t,c}` + action, composite FK; scope filtering drops out-of-scope tables/refs; `insta` JSON snapshot.
+- **CLI (`dbd diagram`)**: emits non-empty self-contained HTML containing the model `<script>` + viewer; `--json` emits parseable `SchemaModel`; no-remote-URL assertion; `--scope` reflected.
+- **Viewer (vitest + @testing-library/svelte, jsdom)**: `mount` renders N cards + M edges from a model; Rokkit `List` shows schema groups + table items; selecting a node enters focus and shows only neighbors; filter narrows the sidebar; `layout.ts` is unit-tested as a pure function (deterministic geometry, edge anchors).
 - **Bundle freshness** (CI): committed bundle equals a fresh build.
 
 ## Scope (v1)
 
-**In:** tables + schemas + FK relationships; overview + focus + sidebar + detail; `dbd diagram` (HTML + `--json`), scope-aware; viewer module structured for site reuse (`mount(el, model)`).
+**In:** tables + schemas + FK refs; overview + focus + sidebar (Rokkit `List`) + markdown detail; `dbd diagram` (HTML + `--json`), scope-aware; Svelte+Rokkit viewer in `site/src/lib/viewer/` built to an embeddable bundle and importable by the site.
 
-**Deferred:** view/function/procedure node kinds (model + viewer extension points in place); website embedding (Phase 1); versioned storage/history (Phase 2); image export.
+**Deferred:** view/function/procedure kinds (extension points in place); website embedding (Phase 1); versioned storage (Phase 2); CLI publish (v3); sharing (v4); image export; embedded web fonts.
