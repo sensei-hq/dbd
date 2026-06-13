@@ -585,6 +585,20 @@ async fn apply_single_entity_by_name() {
     assert_eq!(applied[0], "config.lookups");
 }
 
+// ── Scenario: SchemaModel ───────────────────────────────
+
+#[test]
+fn diagram_model_json_round_trips() {
+    let d = design(); // existing helper in this file
+    let model = dbd_core::schema_model::build(&d, None);
+    let json = serde_json::to_string(&model).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v["project"]["name"].is_string());
+    assert!(v["schemas"].as_array().unwrap().iter().any(|s| s["name"] == "config"));
+    assert!(v["tables"].as_array().unwrap().iter().any(|t| t["schema"] == "config" && t["name"] == "lookups"));
+    assert!(v["refs"].is_array());
+}
+
 // ── Scenario: Scope resolution ──────────────────────────
 
 #[test]
