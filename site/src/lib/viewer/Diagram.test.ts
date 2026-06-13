@@ -32,3 +32,15 @@ it('renders cards and an edge, and clicking a card enters focus', async () => {
   expect(state.selected).toBe('config.lookup_values');
   expect(state.mode).toBe('focus');
 });
+
+it('focus mode shows only the selected card plus its neighbors and re-fits without crashing', async () => {
+  const state = createViewerState();
+  const { container } = render(Diagram, { props: { model: MODEL, state } });
+  const card = container.querySelector('[data-card="config.lookup_values"]') as HTMLElement;
+  // Clicking enters focus and triggers the focus-fit $effect (which runs fit()
+  // against jsdom's zero-size viewport — it must not throw / loop).
+  await fireEvent.click(card);
+  expect(state.mode).toBe('focus');
+  // lookup_values + its single neighbor lookups = 2 visible cards.
+  expect(container.querySelectorAll('[data-card]').length).toBe(2);
+});

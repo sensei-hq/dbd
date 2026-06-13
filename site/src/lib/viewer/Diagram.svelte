@@ -65,16 +65,40 @@
   let t = $state({ x: 0, y: 0, k: 0.5 });
   let zb: ZoomBehavior<SVGSVGElement, unknown> | null = null;
 
+  // Bounding box of the cards we should fit to. In focus mode with a selection
+  // this is just the selected card + its neighbors (so the mini ERD and the
+  // main canvas zoom into the focused neighborhood); otherwise the whole graph.
+  function fitBox(): { bx: number; by: number; bw: number; bh: number } {
+    if (viewer.mode === 'focus' && viewer.selected) {
+      const PAD = 60;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const key of visibleKeys) {
+        const card = layout.cards[key];
+        if (!card) continue;
+        minX = Math.min(minX, card.x);
+        minY = Math.min(minY, card.y);
+        maxX = Math.max(maxX, card.x + card.w);
+        maxY = Math.max(maxY, card.y + card.h);
+      }
+      if (Number.isFinite(minX) && maxX > minX && maxY > minY) {
+        return { bx: minX - PAD, by: minY - PAD, bw: maxX - minX + PAD * 2, bh: maxY - minY + PAD * 2 };
+      }
+    }
+    // Fall back to the whole-graph box.
+    return { bx: 0, by: 0, bw: layout.size.w, bh: layout.size.h };
+  }
+
   function fit() {
     if (!svgEl || !zb) return;
-    const { w, h } = layout.size;
+    const { bx, by, bw, bh } = fitBox();
     const cw = svgEl.clientWidth;
     const ch = svgEl.clientHeight;
     // jsdom (and an unmeasured viewport) report 0 — avoid NaN / divide-by-zero.
-    const hasSize = cw > 0 && ch > 0 && w > 0 && h > 0;
-    const scale = hasSize ? Math.max(0.12, Math.min(cw / w, ch / h, 1)) : 0.5;
-    const tx = hasSize ? (cw - w * scale) / 2 : 0;
-    const ty = hasSize ? (ch - h * scale) / 2 : 0;
+    const hasSize = cw > 0 && ch > 0 && bw > 0 && bh > 0;
+    // Allow a touch more zoom-in for the focused neighborhood (cap ~1.4).
+    const scale = hasSize ? Math.max(0.12, Math.min(cw / bw, ch / bh, 1.4)) : 0.5;
+    const tx = hasSize ? (cw - bw * scale) / 2 - bx * scale : 0;
+    const ty = hasSize ? (ch - bh * scale) / 2 - by * scale : 0;
     // Pin a static extent from the measured client box before applying the
     // transform. d3-zoom's default extent reads the SVG's `viewBox`/`width`
     // `baseVal`, which jsdom does not implement (it would throw).
@@ -106,14 +130,19 @@
   });
 
   // Re-fit whenever the computed layout's dimensions change (e.g. toggling
-  // density/arrange). Reads layout.size.{w,h} so it re-runs on layout changes,
-  // but never reads `t` — fit() writes `t` via the zoom handler, so reading
-  // size (not t) here means there is no self-triggering loop. Guarded until the
-  // zoom behavior and SVG element are initialized by onMount.
+  // density/arrange) OR when focus changes (entering/leaving focus, or focusing
+  // a different node) so the viewport re-frames the focused neighborhood. Reads
+  // layout.size.{w,h}, viewer.selected and viewer.mode so it re-runs on those,
+  // but never reads `t` — fit() writes `t` only via the zoom handler, so reading
+  // size/selection (not t) here means there is no self-triggering loop. Guarded
+  // until the zoom behavior and SVG element are initialized by onMount.
   $effect(() => {
-    // Track the layout dimensions so the effect re-runs when they change.
+    // Track the layout dimensions and focus state so the effect re-runs when
+    // they change.
     void layout.size.w;
     void layout.size.h;
+    void viewer.selected;
+    void viewer.mode;
     if (!zb || !svgEl) return;
     fit();
   });
