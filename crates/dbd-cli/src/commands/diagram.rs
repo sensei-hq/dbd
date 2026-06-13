@@ -19,7 +19,7 @@ pub fn cmd_diagram(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let model = dbd_core::schema_model::build(&design, Some(&resolved));
     let json = serde_json::to_string_pretty(&model)
         .context("Failed to serialize schema model")?;
