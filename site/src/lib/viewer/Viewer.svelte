@@ -7,8 +7,8 @@
   import type { SchemaModel } from './model';
   import type { Density, Arrange } from './layout';
   import './styles.css';
-  // Inline the logo so the standalone HTML bundle stays self-contained (no
-  // external URL); Vite resolves `?raw` to the file's text content.
+  // Inline the logo's SVG markup (Vite resolves `?raw` to the file's text),
+  // so it renders inline rather than via an <img src> request.
   import dbdLogo from '../../../static/dbd.svg?raw';
 
   let { model }: { model: SchemaModel } = $props();

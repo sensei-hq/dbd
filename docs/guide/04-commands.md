@@ -146,16 +146,17 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
 
 ## `dbd diagram`
 
-Render a **self-contained, interactive HTML schema explorer** — sidebar schema→table navigation, a pannable/zoomable ER diagram with per-schema clusters, and a per-table detail panel (markdown comment, columns with PK/FK/NN/ENUM, focused mini-ERD). The whole viewer + model are inlined into one file with **zero network requests**, so it opens straight from disk and replaces the external dbdocs.io publish step.
+Open the schema in the **hosted interactive viewer** — sidebar schema→table navigation, a pannable/zoomable ER diagram, and a per-table detail panel. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained.
 
 ```sh
-dbd diagram                        # writes schema.html (self-contained)
-dbd diagram -f docs/schema.html    # custom path
+dbd diagram                        # build the model and open it in your browser
+dbd diagram --print-url            # print the viewer URL instead of opening a browser
+dbd diagram --site http://localhost:5173   # point at a different site (or set $DBD_DIAGRAM_URL)
+dbd diagram --json -f schema.json  # write the raw SchemaModel JSON (upload it at <site>/diagram)
 dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
-dbd diagram --json -f schema.json  # emit the raw SchemaModel JSON instead of HTML
 ```
 
-The HTML embeds a dbd-native **schema model** describing schemas, tables, columns, and FK relationships. `--json` emits that model on its own (for tooling or the website) instead of the HTML diagram — pair it with `-f schema.json`, since the default output name is `schema.html`. The model is dbd-native JSON (not DBML), so it extends to views/functions/procedures in a later release.
+`dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model (schemas, tables, columns, FK refs); upload it on the site's `/diagram` page, or feed it to other tooling. The model is JSON (not DBML), so it extends to views/functions/procedures later.
 
 ---
 

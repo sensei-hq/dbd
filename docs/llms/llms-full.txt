@@ -388,13 +388,14 @@ dbd graph --scope hub                    # filter to the 'hub' scope (composes w
 ### dbd diagram
 
 ```sh
-dbd diagram                        # writes schema.html (self-contained interactive viewer)
-dbd diagram -f docs/schema.html    # custom path
+dbd diagram                        # build the model and open the hosted interactive viewer
+dbd diagram --print-url            # print the viewer URL instead of opening a browser
+dbd diagram --site http://localhost:5173   # point at a different site (or set $DBD_DIAGRAM_URL)
 dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
-dbd diagram --json -f schema.json  # raw SchemaModel JSON instead of HTML
+dbd diagram --json -f schema.json  # write the raw SchemaModel JSON for upload/tooling
 ```
 
-Default output is a self-contained interactive HTML schema explorer (sidebar schema→table nav, pan/zoom ER diagram with per-schema clusters, per-table detail panel with markdown comment + columns + focused mini-ERD, dark/light toggle) — the viewer bundle + model are inlined into one file with zero network requests, replacing the dbdocs.io step. `--json` emits the dbd-native model on its own (`project`/`schemas`/`tables`/`refs`, column-level FK refs as `{s,t,c}`; not DBML, so it extends to views/functions/procedures); pair `--json` with `-f schema.json` since the default name is `schema.html`.
+Opens the hosted interactive viewer at `https://dbd.sensei-hq.com/diagram` (sidebar schema→table nav, pan/zoom ER diagram, per-table detail panel). The dbd-native schema model (schemas/tables/columns/FK refs) is gzip-compressed into the URL fragment — client-side only, never sent to a server, so the link is private and self-contained. `--print-url` prints the link without opening a browser (useful on headless machines). `--site`/`$DBD_DIAGRAM_URL` overrides the base URL. `--json -f schema.json` writes the raw SchemaModel JSON (`project`/`schemas`/`tables`/`refs`, column-level FK refs as `{s,t,c}`; not DBML, so it extends to views/functions/procedures); upload it on the site's `/diagram` page or feed it to other tooling.
 
 ### dbd dbml
 
