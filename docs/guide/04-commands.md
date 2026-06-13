@@ -146,15 +146,16 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
 
 ## `dbd diagram`
 
-Emit a dbd-native **schema model** (JSON) describing schemas, tables, columns, and FK relationships — the input to the interactive schema diagram viewer.
+Render a **self-contained, interactive HTML schema explorer** — sidebar schema→table navigation, a pannable/zoomable ER diagram with per-schema clusters, and a per-table detail panel (markdown comment, columns with PK/FK/NN/ENUM, focused mini-ERD). The whole viewer + model are inlined into one file with **zero network requests**, so it opens straight from disk and replaces the external dbdocs.io publish step.
 
 ```sh
-dbd diagram --json                 # writes schema.json
-dbd diagram --json -f model.json   # custom path
-dbd diagram --json --scope hub     # scope-aware (only the scope's tables/refs)
+dbd diagram                        # writes schema.html (self-contained)
+dbd diagram -f docs/schema.html    # custom path
+dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
+dbd diagram --json -f schema.json  # emit the raw SchemaModel JSON instead of HTML
 ```
 
-In v1 the command emits JSON only (`--json`). A later release renders this model into a self-contained interactive HTML diagram (the default output) — replacing the external dbdocs.io step.
+The HTML embeds a dbd-native **schema model** describing schemas, tables, columns, and FK relationships. `--json` emits that model on its own (for tooling or the website) instead of the HTML diagram — pair it with `-f schema.json`, since the default output name is `schema.html`. The model is dbd-native JSON (not DBML), so it extends to views/functions/procedures in a later release.
 
 ---
 
