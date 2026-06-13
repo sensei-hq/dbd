@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { vibe } from '@rokkit/states';
-  import { themable } from '@rokkit/actions';
   import { ThemeSwitcherToggle } from '@rokkit/app';
   import Sidebar from './Sidebar.svelte';
   import Diagram from './Diagram.svelte';
@@ -16,13 +14,6 @@
   let { model }: { model: SchemaModel } = $props();
   const state = createViewerState();
 
-  // The site ships only the zen-sumi style; lock vibe to it so the named tokens
-  // resolve in the standalone HTML (mirrors site/src/routes/+layout.svelte).
-  if (typeof window !== 'undefined') {
-    vibe.allowedStyles = ['zen-sumi'];
-    vibe.style = 'zen-sumi';
-  }
-
   const tableCount = $derived(model.tables.length);
   const enumCount = $derived(model.schemas.reduce((a, s) => a + s.enums, 0));
   const refCount = $derived(model.refs.length);
@@ -35,8 +26,6 @@
     state.mode = 'overview';
   }
 </script>
-
-<svelte:body use:themable={{ theme: vibe, storageKey: 'dbd-diagram-theme' }} />
 
 <div class="vw-app flex h-screen flex-col overflow-hidden bg-paper text-ink">
   <!-- header -->
