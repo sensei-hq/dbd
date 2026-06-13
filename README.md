@@ -61,7 +61,7 @@ myproject/
 | `dbd deploy` | Fetch from GitHub or local path + apply + import |
 | `dbd combine` | Combine all DDL into a single SQL file |
 | `dbd graph` | Output dependency graph as JSON |
-| `dbd diagram` | Render a self-contained interactive HTML schema explorer (`--json` emits the raw model instead) |
+| `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
