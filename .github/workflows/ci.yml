@@ -45,6 +45,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+        with:
+          # Pin Bun so the bundle is rebuilt with the same toolchain that
+          # produced the committed copy (keeps the freshness diff stable).
+          bun-version: 1.3.14
       # The CLI embeds a pre-built, committed viewer bundle
       # (crates/dbd-core/assets/diagram_viewer.js) via include_str! so `cargo
       # build`/`install` needs no JS toolchain. Rebuild it from source and fail
