@@ -9,6 +9,25 @@ export type SchemaModel = {
   refs: Ref[];
 };
 
+export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
+
+/** Shape-check arbitrary JSON before handing it to the viewer. */
+export function validateModel(value: unknown): ValidationResult {
+  if (typeof value !== 'object' || value === null) return { ok: false, error: 'not a JSON object' };
+  const v = value as Record<string, unknown>;
+  const project = v.project as Record<string, unknown> | undefined;
+  if (!project || typeof project.name !== 'string') return { ok: false, error: 'missing project.name' };
+  if (!Array.isArray(v.schemas)) return { ok: false, error: 'missing schemas[]' };
+  if (!Array.isArray(v.tables)) return { ok: false, error: 'missing tables[]' };
+  if (!Array.isArray(v.refs)) return { ok: false, error: 'missing refs[]' };
+  for (const t of v.tables) {
+    const tt = t as Record<string, unknown>;
+    if (typeof tt.schema !== 'string' || typeof tt.name !== 'string' || !Array.isArray(tt.columns))
+      return { ok: false, error: 'malformed table entry' };
+  }
+  return { ok: true, model: value as SchemaModel };
+}
+
 export const nodeId = (schema: string, name: string) => `${schema}.${name}`;
 
 export type LayoutColumn = Column & { fk: boolean };
