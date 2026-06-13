@@ -13,10 +13,15 @@
 	import { vibe } from '@rokkit/states';
 	import { themable } from '@rokkit/actions';
 	import { browser } from '$app/environment';
+	import { page } from '$app/state';
 	import Nav from '$lib/components/Nav.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 
 	let { children } = $props();
+
+	// The /diagram route is a full-bleed app shell; hide the marketing-site
+	// Nav/Footer there (the Viewer owns the entire viewport).
+	const isApp = $derived(page.url.pathname.startsWith('/diagram'));
 
 	// Seed vibe from the mode the pre-paint themeHook resolved so first visit
 	// (no stored pref) honours the light default rather than vibe's 'dark'.
@@ -48,10 +53,10 @@
 <svelte:body use:themable={{ theme: vibe, storageKey: 'dbd-theme' }} />
 
 <div class="flex min-h-screen flex-col">
-	<Nav />
+	{#if !isApp}<Nav />{/if}
 	<main class="flex-1">
 		{@render children()}
 	</main>
-	<Footer />
+	{#if !isApp}<Footer />{/if}
 </div>
 
