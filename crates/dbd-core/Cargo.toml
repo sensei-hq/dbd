@@ -34,7 +34,8 @@ futures-lite = "2"
 
 # HTTP & archive (for deploy --source github)
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false, optional = true }
-flate2 = { version = "1", optional = true }
+flate2 = "1"
+base64 = "0.22"
 tar = { version = "0.4", optional = true }
 
 # Utilities
@@ -55,7 +56,7 @@ filetime = "0.2"
 default = ["postgres", "sqlite", "deploy"]
 postgres = ["dep:sqlx", "sqlx/postgres"]
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
-deploy = ["dep:reqwest", "dep:flate2", "dep:tar"]
+deploy = ["dep:reqwest", "dep:tar"]
 # Enable embedded PostgreSQL integration tests.
 # cargo test --features embedded-tests --test embedded_test
 embedded-tests = []

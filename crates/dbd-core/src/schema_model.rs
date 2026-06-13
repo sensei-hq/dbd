@@ -3,13 +3,13 @@
 //! docs/mockup/designs/schema-data.js). Boolean column flags (`pk`/`nn`/`en`)
 //! are emitted only when true; the viewer reads them truthily.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::design::Design;
 use crate::entity::{EntityType, FkAction, TableConstraint};
 use crate::scope::ResolvedScope;
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaModel {
     pub project: ProjectInfo,
     pub schemas: Vec<SchemaInfo>,
@@ -17,7 +17,7 @@ pub struct SchemaModel {
     pub refs: Vec<Ref>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectInfo {
     pub name: String,
     pub db: String,
@@ -25,14 +25,14 @@ pub struct ProjectInfo {
     pub note: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaInfo {
     pub name: String,
     pub tables: usize,
     pub enums: usize,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct TableNode {
     pub schema: String,
     pub name: String,
@@ -45,19 +45,19 @@ pub struct TableNode {
     pub columns: Vec<Column>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
     /// primary key
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pk: bool,
     /// not null
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nn: bool,
     /// column type is an enum
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub en: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub def: Option<String>,
@@ -65,7 +65,7 @@ pub struct Column {
     pub note: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Ref {
     pub from: RefEnd,
     pub to: RefEnd,
@@ -74,7 +74,7 @@ pub struct Ref {
     pub action: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct RefEnd {
     /// Schema name
     pub s: String,
