@@ -21,5 +21,7 @@ it('derives per-column fk flags from refs', () => {
 });
 
 it('neighborsOf returns from+to connected tables', () => {
+  // forward (FK origin → target) and reverse (target → FK origin)
   expect(neighborsOf(model, 'config.lookup_values').has('config.lookups')).toBe(true);
+  expect(neighborsOf(model, 'config.lookups').has('config.lookup_values')).toBe(true);
 });
