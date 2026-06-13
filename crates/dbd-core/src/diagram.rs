@@ -66,7 +66,7 @@ mod tests {
         let back = decode_payload(&payload);
         assert_eq!(back.project.name, "Acme");
         assert_eq!(back.tables[0].name, "users");
-        assert_eq!(back.tables[0].columns[0].pk, true);
+        assert!(back.tables[0].columns[0].pk);
     }
 
     #[test]
