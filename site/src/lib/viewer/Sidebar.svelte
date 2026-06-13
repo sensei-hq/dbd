@@ -39,6 +39,7 @@
     <input
       data-filter
       type="text"
+      aria-label="Filter tables"
       placeholder="Filter tables…"
       bind:value={viewer.filter}
       class="w-full rounded-md bg-paper border border-paper-edge px-2 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:border-primary focus:outline-none"
