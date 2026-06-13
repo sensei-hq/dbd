@@ -144,6 +144,20 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
 
 ---
 
+## `dbd diagram`
+
+Emit a dbd-native **schema model** (JSON) describing schemas, tables, columns, and FK relationships — the input to the interactive schema diagram viewer.
+
+```sh
+dbd diagram --json                 # writes schema.json
+dbd diagram --json -f model.json   # custom path
+dbd diagram --json --scope hub     # scope-aware (only the scope's tables/refs)
+```
+
+In v1 the command emits JSON only (`--json`). A later release renders this model into a self-contained interactive HTML diagram (the default output) — replacing the external dbdocs.io step.
+
+---
+
 ## `dbd reset`
 
 Drop project schemas. Guarded by `_dbd_meta` environment check.

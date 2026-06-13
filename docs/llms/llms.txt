@@ -72,6 +72,7 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
 - `dbd combine` — combine DDL into single SQL file (scope-aware)
 - `dbd graph` — dependency graph as JSON (scope-aware)
+- `dbd diagram --json` — emit the schema model JSON (schemas/tables/columns/FK refs) for the interactive diagram viewer (HTML render lands in a later release)
 - `dbd dbml` — generate DBML documentation (scope-aware: `--scope` filters to the scope's working set)
 - `dbd snapshot` — diff vs latest snapshot, generate migration SQL; smart multi-snapshot splits renames/type-changes/enum-removals into safe stages (with `*.data.sql` corrections)
 - `dbd migrate` — show migration status (read-only; `--status`). Pending migrations are run by `dbd apply`, not here

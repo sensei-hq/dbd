@@ -385,6 +385,14 @@ dbd graph -n config.lookups             # subgraph from one entity
 dbd graph --scope hub                    # filter to the 'hub' scope (composes with -n)
 ```
 
+### dbd diagram
+
+```sh
+dbd diagram --json -f model.json   # SchemaModel JSON (scope-aware)
+```
+
+dbd-native JSON model (`project`/`schemas`/`tables`/`refs`, column-level FK refs as `{s,t,c}`) — the input to the schema diagram viewer. Not DBML (so it extends to views/functions/procedures). v1 is JSON-only; a later release renders a self-contained interactive HTML diagram.
+
 ### dbd dbml
 
 ```sh
