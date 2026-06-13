@@ -38,3 +38,23 @@ jobs:
       # binary-install/cache dir.
       - name: cargo test (embedded-tests)
         run: cargo test -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
+
+  viewer-bundle:
+    name: viewer bundle freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      # The CLI embeds a pre-built, committed viewer bundle
+      # (crates/dbd-core/assets/diagram_viewer.js) via include_str! so `cargo
+      # build`/`install` needs no JS toolchain. Rebuild it from source and fail
+      # if the committed copy drifts — it can never be stale relative to
+      # site/src/lib/viewer/**. The Vite lib build is deterministic.
+      - name: rebuild viewer bundle
+        run: make viewer
+      - name: verify committed bundle is up to date
+        run: |
+          if ! git diff --exit-code crates/dbd-core/assets/diagram_viewer.js; then
+            echo "::error::diagram_viewer.js is stale — run 'make viewer' and commit the result."
+            exit 1
+          fi
