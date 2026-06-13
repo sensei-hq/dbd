@@ -105,6 +105,15 @@ pub enum Commands {
         #[arg(short, long, default_value = "design.dbml")]
         file: PathBuf,
     },
+    /// Generate an interactive schema diagram (JSON model in v1; HTML in v2)
+    Diagram {
+        /// Destination file (default: schema.json)
+        #[arg(short, long, default_value = "schema.json")]
+        file: PathBuf,
+        /// Emit the raw SchemaModel JSON (the only mode in v1)
+        #[arg(long)]
+        json: bool,
+    },
     /// Deploy from source: fetch + apply + import
     Deploy {
         /// Preview what would be executed
@@ -195,7 +204,7 @@ mod tests {
     #[test]
     fn every_subcommand_parses() {
         let cmds = [
-            "inspect", "apply", "combine", "import", "graph", "dbml", "deploy",
+            "inspect", "apply", "combine", "import", "graph", "dbml", "diagram", "deploy",
             "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
             "policies",
         ];

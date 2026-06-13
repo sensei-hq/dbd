@@ -1,4 +1,5 @@
 mod data;
+mod diagram;
 mod migration;
 mod project;
 mod schema;
@@ -79,6 +80,10 @@ pub async fn run(
 
         Commands::Dbml { file } => {
             project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity)
+        }
+
+        Commands::Diagram { file, json } => {
+            diagram::cmd_diagram(config, env, project_dir, file, *json, scope, deps, verbosity)
         }
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
