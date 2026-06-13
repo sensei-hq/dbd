@@ -1,17 +1,73 @@
 <!doctype html>
 <html lang="en" data-mode="light" data-style="zen-sumi">
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
-		%sveltekit.head%
-	</head>
-	<body
-		data-sveltekit-preload-data="hover"
-		data-mode="light"
-		data-style="zen-sumi"
-		class="bg-paper text-ink font-sans antialiased"
-	>
-		<div style="display: contents">%sveltekit.body%</div>
-	</body>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link
+            rel="apple-touch-icon"
+            sizes="180x180"
+            href="%sveltekit.assets%/favicon/apple-touch-icon.png"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="32x32"
+            href="%sveltekit.assets%/favicon/favicon-32x32.png"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="16x16"
+            href="%sveltekit.assets%/favicon/favicon-16x16.png"
+        />
+        <link
+            rel="manifest"
+            href="%sveltekit.assets%/favicon/site.webmanifest"
+        />
+        <link rel="icon" href="%sveltekit.assets%/dbd.svg" />
+
+        <!-- SEO: site-wide defaults (per-page <svelte:head> sets title + description) -->
+        <meta
+            name="keywords"
+            content="database designer, database schema as code, schema as code, schema management, DDL, SQL DDL, SQL migrations, database migrations, schema migrations, schema versioning, schema snapshots, schema diff, ER diagram, entity relationship diagram, DBML, schema diagram, schema viewer, PostgreSQL, Postgres, Supabase, SQLite, Convex, multi-database, schema deployment, data import, database documentation, dependency ordering, database CLI, embeddable database library, Rust"
+        />
+        <meta name="author" content="dbd" />
+        <meta name="theme-color" content="#1777B8" />
+
+        <!-- Open Graph -->
+        <meta property="og:type" content="website" />
+        <meta property="og:site_name" content="dbd" />
+        <meta property="og:title" content="dbd — Database Designer" />
+        <meta
+            property="og:description"
+            content="A standalone CLI and embeddable library for managing database schemas as code — dependency ordering, migrations, data loading, documentation, and deployment for PostgreSQL, Supabase, SQLite, and Convex."
+        />
+        <meta property="og:url" content="https://dbd.sensei-hq.com/" />
+        <meta
+            property="og:image"
+            content="https://dbd.sensei-hq.com/favicon/android-chrome-512x512.png"
+        />
+
+        <!-- Twitter -->
+        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:title" content="dbd — Database Designer" />
+        <meta
+            name="twitter:description"
+            content="Manage database schemas as code: dependency ordering, migrations, data loading, docs, and deploy to PostgreSQL, Supabase, SQLite, and Convex."
+        />
+        <meta
+            name="twitter:image"
+            content="https://dbd.sensei-hq.com/favicon/android-chrome-512x512.png"
+        />
+
+        %sveltekit.head%
+    </head>
+    <body
+        data-sveltekit-preload-data="hover"
+        data-mode="light"
+        data-style="zen-sumi"
+        class="bg-paper text-ink font-sans antialiased"
+    >
+        <div style="display: contents">%sveltekit.body%</div>
+    </body>
 </html>
