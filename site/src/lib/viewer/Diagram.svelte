@@ -99,6 +99,23 @@
       });
     select(svgEl).call(zb);
     fit();
+    // Detach d3-zoom's event listeners on unmount so they don't leak.
+    return () => {
+      if (svgEl) select(svgEl).on('.zoom', null);
+    };
+  });
+
+  // Re-fit whenever the computed layout's dimensions change (e.g. toggling
+  // density/arrange). Reads layout.size.{w,h} so it re-runs on layout changes,
+  // but never reads `t` — fit() writes `t` via the zoom handler, so reading
+  // size (not t) here means there is no self-triggering loop. Guarded until the
+  // zoom behavior and SVG element are initialized by onMount.
+  $effect(() => {
+    // Track the layout dimensions so the effect re-runs when they change.
+    void layout.size.w;
+    void layout.size.h;
+    if (!zb || !svgEl) return;
+    fit();
   });
 </script>
 
