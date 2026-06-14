@@ -1,75 +1,126 @@
 /* ============================================================
    dbd viewer — DIAGRAM (structural CSS)
-   Ported from docs/mockup/designs/app-styles.css, with the
-   mockup's hand-rolled CSS vars swapped for Rokkit named tokens:
-     --bg        -> var(--paper)
-     --surface   -> var(--paper-soft)
-     --surface-2 -> var(--paper-mute)
-     --line / --line-soft -> var(--paper-edge)
-     --fg        -> var(--ink)
-     --muted     -> var(--ink-mute)
-     --faint     -> var(--ink-soft)    (mockup --faint is L≈0.58 == ink-soft;
-                                         ink-faint L≈0.32 is too dark on dark paper)
-     --accent / --accent-2 / --accent-line -> var(--primary)
-     --accent-soft -> var(--accent-soft)
-     --edge      -> var(--paper-edge)  (highlighted -> var(--primary))
-     --edge-dim  -> var(--paper-edge) + opacity
-   The per-schema tint keeps the mockup's two-mode OKLCH (the one
-   sanctioned raw-OKLCH use), keyed off Rokkit's [data-mode="dark"].
+   Faithful port of docs/mockup/designs/app-styles.css.
+
+   CONTRACT A — type scale lives in markup, NOT here.
+     No `font-size` / `font-family` declarations in this file (the
+     sole exception is the SVG cluster-label, which cannot take a
+     Tailwind class). Text sizing is done in component markup with
+     ONLY: text-lg / text-sm / text-xs (+ font-mono / font-display).
+     This file keeps GEOMETRY (heights, padding, widths, radii,
+     borders, position, transitions) + COLOR (Rokkit tokens) + tint.
+
+   CONTRACT B — colors are Rokkit named tokens only (no raw hex/oklch),
+     except the per-schema tint. Mockup var -> Rokkit token map:
+       --bg             -> var(--paper)
+       --surface        -> var(--paper-soft)
+       --surface-2      -> var(--paper-mute)
+       --line/--line-soft -> var(--paper-edge)
+       --fg             -> var(--ink)
+       --muted          -> var(--ink-mute)
+       --faint          -> var(--ink-soft)
+       --accent/--accent-2/--accent-line -> var(--primary)
+       --on-accent      -> var(--on-primary)
+       --accent-soft    -> var(--accent-soft)
+       --edge           -> var(--paper-edge)  (highlighted -> var(--primary))
+
+     SOLE raw-OKLCH exception: the `.tinted` per-schema tint formulas
+     keyed off the inline `--cl-h` (per-schema hue) custom prop — kept
+     verbatim from the mockup (light + a [data-mode='dark'] block).
+     These generate per-schema hues and cannot be tokens. Rokkit sets
+     light/dark via [data-mode], so the dark blocks key off
+     [data-mode='dark'] (not the mockup's [data-theme]).
    ============================================================ */
 
-/* ---- viewport / world ---- */
+/* ---- local geometry tokens (mockup's "tool" look) ---- */
+.dg-viewport,
+.dg-tools,
+.tree-group-head,
+.tree-item {
+  --radius-lg: 14px;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --row-pad: 0.55rem;
+}
+
+/* ============================================================
+   VIEWPORT / WORLD
+   ============================================================ */
 .dg-viewport {
   position: absolute;
   inset: 0;
   /* An <svg> is a replaced element: `inset:0` alone does NOT stretch it (it
-     keeps its intrinsic 300x150 size in the corner). Explicit 100%/100% makes
-     it fill the positioned <main>, so d3-zoom measures the real viewport. */
+     keeps its intrinsic 300x150 size). Explicit 100%/100% makes it fill the
+     positioned container so d3-zoom measures the real viewport. */
   width: 100%;
   height: 100%;
   overflow: hidden;
   cursor: grab;
   user-select: none;
   touch-action: none;
-  background-image: radial-gradient(var(--paper-edge) 1.1px, transparent 1.1px);
-  background-size: 26px 26px;
 }
 .dg-viewport.panning {
   cursor: grabbing;
 }
 
-/* ---- cluster regions (SVG <rect> + <text>) ---- */
+/* dotted backdrop for the canvas */
+.dg-dots {
+  background-image: radial-gradient(var(--paper-edge) 1.1px, transparent 1.1px);
+  background-size: 26px 26px;
+}
+
+.dg-world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+
+/* ============================================================
+   CLUSTER REGIONS
+   ============================================================ */
+.dg-cluster {
+  position: absolute;
+  border: 1.5px dashed var(--paper-edge);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklch, var(--paper-soft) 38%, transparent);
+}
+.dg-cluster-label {
+  position: absolute;
+  top: -13px;
+  left: 18px;
+  padding: 2px 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-mute);
+  background: var(--paper);
+  border: 1px solid var(--paper-edge);
+  border-radius: 999px;
+}
+
+/* SVG variants (cluster region drawn as <rect> + <text> inside the world) */
 rect.dg-cluster {
-  fill: oklch(0.975 0.02 var(--cl-h, 245) / 0.5);
-  stroke: oklch(0.85 0.045 var(--cl-h, 245));
+  fill: color-mix(in oklch, var(--paper-soft) 38%, transparent);
+  stroke: var(--paper-edge);
   stroke-width: 1.5;
   stroke-dasharray: 4 4;
   rx: var(--radius-lg);
   ry: var(--radius-lg);
 }
-[data-mode='dark'] rect.dg-cluster {
-  fill: oklch(0.225 0.03 var(--cl-h, 245) / 0.5);
-  stroke: oklch(0.37 0.05 var(--cl-h, 245));
-}
-.dg-cluster-label {
-  fill: oklch(0.43 0.085 var(--cl-h, 245));
-  font-family: 'IBM Plex Mono', ui-monospace, monospace;
-  font-size: 13px;
-  font-weight: 600;
+text.dg-cluster-label {
+  fill: var(--ink-mute);
   letter-spacing: 0.08em;
 }
-[data-mode='dark'] .dg-cluster-label {
-  fill: oklch(0.78 0.07 var(--cl-h, 245));
-}
 
-/* ---- table cards (HTML inside <foreignObject>) ---- */
+/* ============================================================
+   TABLE CARDS
+   ============================================================ */
 .dg-card {
   position: static;
   width: 100%;
   height: 100%;
   background: var(--paper-soft);
   border: 1px solid var(--paper-edge);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius);
   box-shadow:
     0 1px 2px oklch(0 0 0 / 0.07),
     0 6px 20px oklch(0 0 0 / 0.06);
@@ -85,7 +136,10 @@ rect.dg-cluster {
 }
 .dg-card.sel {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow:
+    0 0 0 3px var(--accent-soft),
+    0 1px 2px oklch(0 0 0 / 0.07),
+    0 6px 20px oklch(0 0 0 / 0.06);
 }
 .dg-card.rel {
   border-color: var(--primary);
@@ -101,10 +155,7 @@ rect.dg-cluster {
   height: 40px;
   padding: 0 12px;
   border-bottom: 1px solid var(--paper-edge);
-  background: oklch(0.967 0.015 var(--cl-h, 245));
-}
-[data-mode='dark'] .dg-card-head {
-  background: oklch(0.265 0.025 var(--cl-h, 245));
+  background: var(--paper-mute);
 }
 .dg-card.headonly .dg-card-head {
   border-bottom: none;
@@ -112,13 +163,10 @@ rect.dg-cluster {
 .dg-card-tableicon {
   width: 13px;
   flex: none;
-  color: var(--ink-soft);
-  font-size: 11px;
   line-height: 1;
+  color: var(--ink-soft);
 }
 .dg-card-title {
-  font-size: 0.86rem;
-  font-weight: 600;
   color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
@@ -127,7 +175,6 @@ rect.dg-cluster {
 .dg-card-count {
   margin-left: auto;
   color: var(--ink-soft);
-  font-size: 0.62rem;
 }
 
 .dg-row {
@@ -136,7 +183,6 @@ rect.dg-cluster {
   gap: 8px;
   height: 24px;
   padding: 0 12px;
-  font-size: 0.72rem;
 }
 .dg-row .cname {
   color: var(--ink);
@@ -147,7 +193,6 @@ rect.dg-cluster {
 .dg-row .ctype {
   margin-left: auto;
   color: var(--ink-soft);
-  font-size: 0.66rem;
   white-space: nowrap;
 }
 .dg-row.iskey .cname {
@@ -158,31 +203,30 @@ rect.dg-cluster {
   display: flex;
   align-items: center;
   padding: 0 12px;
-  font-size: 0.64rem;
   color: var(--ink-soft);
 }
 .dg-keyicon {
   width: 11px;
   flex: none;
-  color: var(--primary);
-  font-size: 9px;
   line-height: 1;
   text-align: center;
+  color: var(--primary);
 }
 .dg-fkicon {
   width: 11px;
   flex: none;
-  color: var(--ink-soft);
-  font-size: 9px;
   line-height: 1;
   text-align: center;
+  color: var(--ink-soft);
 }
 .dg-rowspacer {
   width: 11px;
   flex: none;
 }
 
-/* ---- relationship edges ---- */
+/* ============================================================
+   RELATIONSHIP EDGES
+   ============================================================ */
 g.dg-edge path {
   stroke: var(--paper-edge);
   stroke-width: 1.3;
@@ -210,11 +254,142 @@ g.dg-edge.hl .dot-to {
 }
 g.dg-edge.dim path {
   stroke: var(--paper-edge);
-  opacity: 0.3;
+  opacity: 0.55;
 }
 g.dg-edge.dim .dot-from {
   fill: var(--paper-edge);
 }
 g.dg-edge.dim .dot-to {
   stroke: var(--paper-edge);
+}
+
+/* ============================================================
+   ZOOM TOOLBAR
+   ============================================================ */
+.dg-tools {
+  position: absolute;
+  bottom: 18px;
+  right: 18px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  background: var(--paper-soft);
+  border: 1px solid var(--paper-edge);
+  border-radius: var(--radius);
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.07),
+    0 6px 20px oklch(0 0 0 / 0.06);
+}
+
+/* ============================================================
+   SIDEBAR TREE
+   ============================================================ */
+.tree-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: var(--row-pad) 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.tree-group-head:hover {
+  background: var(--paper-mute);
+}
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: calc(var(--row-pad) * 0.82) 10px 0.32rem 26px;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--ink-mute);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.tree-item:hover {
+  background: var(--paper-mute);
+  color: var(--ink);
+}
+.tree-item.sel {
+  background: var(--accent-soft);
+  color: var(--primary);
+  font-weight: 500;
+}
+.tree-item .ti-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ============================================================
+   COLUMN BADGES
+   ============================================================ */
+.col-badge {
+  letter-spacing: 0.04em;
+  line-height: 1;
+  padding: 0.18rem 0.32rem;
+  border: 1px solid var(--paper-edge);
+  border-radius: 4px;
+  color: var(--ink-soft);
+}
+.col-badge.pk {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--accent-soft);
+}
+.col-badge.fk {
+  color: var(--ink-mute);
+  background: var(--paper-mute);
+}
+
+/* ============================================================
+   PER-SCHEMA TINT  (hue arrives via inline --cl-h custom prop)
+   SOLE sanctioned raw-OKLCH block. Light + [data-mode='dark'].
+   ============================================================ */
+.tinted .dg-cluster {
+  background: oklch(0.975 0.02 var(--cl-h, 245) / 0.7);
+  border-color: oklch(0.85 0.045 var(--cl-h, 245));
+}
+[data-mode='dark'] .tinted .dg-cluster {
+  background: oklch(0.225 0.03 var(--cl-h, 245) / 0.55);
+  border-color: oklch(0.37 0.05 var(--cl-h, 245));
+}
+.tinted .dg-cluster-label {
+  color: oklch(0.43 0.085 var(--cl-h, 245));
+  border-color: oklch(0.85 0.045 var(--cl-h, 245));
+}
+[data-mode='dark'] .tinted .dg-cluster-label {
+  color: oklch(0.78 0.07 var(--cl-h, 245));
+  border-color: oklch(0.37 0.05 var(--cl-h, 245));
+}
+.tinted .dg-card-head {
+  background: oklch(0.967 0.015 var(--cl-h, 245));
+}
+[data-mode='dark'] .tinted .dg-card-head {
+  background: oklch(0.265 0.025 var(--cl-h, 245));
+}
+
+/* SVG tint variants (cluster drawn inside the world as <rect>/<text>) */
+.tinted rect.dg-cluster {
+  fill: oklch(0.975 0.02 var(--cl-h, 245) / 0.5);
+  stroke: oklch(0.85 0.045 var(--cl-h, 245));
+}
+[data-mode='dark'] .tinted rect.dg-cluster {
+  fill: oklch(0.225 0.03 var(--cl-h, 245) / 0.5);
+  stroke: oklch(0.37 0.05 var(--cl-h, 245));
+}
+.tinted text.dg-cluster-label {
+  fill: oklch(0.43 0.085 var(--cl-h, 245));
+}
+[data-mode='dark'] .tinted text.dg-cluster-label {
+  fill: oklch(0.78 0.07 var(--cl-h, 245));
 }
