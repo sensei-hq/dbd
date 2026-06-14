@@ -350,6 +350,39 @@ g.dg-edge.dim .dot-to {
 }
 
 /* ============================================================
+   STICKY TABLE HEADER  (entities list + columns table)
+   Keeps the header row pinned while the body scrolls. Type sizing
+   (text-xs / font-mono) stays in markup per Contract A.
+   ============================================================ */
+.ds-th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--paper);
+  box-shadow: inset 0 -1px 0 var(--paper-edge);
+}
+
+/* ============================================================
+   PILL BADGES  (entity header meta: "{N} columns", "{out} out · {in} in")
+   Geometry + Rokkit tokens only; text-xs / font-mono live in markup.
+   ============================================================ */
+.ds-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border: 1px solid var(--paper-edge);
+  border-radius: 9999px;
+  background: var(--paper-mute);
+  padding: 0.25rem 0.5rem;
+  color: var(--ink-mute);
+}
+.ds-badge-accent {
+  border-color: var(--primary);
+  background: var(--accent-soft);
+  color: var(--primary);
+}
+
+/* ============================================================
    PER-SCHEMA TINT  (hue arrives via inline --cl-h custom prop)
    SOLE sanctioned raw-OKLCH block. Light + [data-mode='dark'].
    ============================================================ */
