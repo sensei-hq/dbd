@@ -1,4 +1,4 @@
-import type { Density, Arrange } from './layout';
+import type { Density, Arrange, EdgeStyle } from './layout';
 
 export type ViewerState = {
   selected: string | null;
@@ -6,6 +6,10 @@ export type ViewerState = {
   density: Density;
   arrange: Arrange;
   filter: string;
+  /** Per-schema hue tint on clusters/cards (mockup `tint`, default on). */
+  tint: boolean;
+  /** Relationship edge routing (mockup `lineStyle`, default curved). */
+  lines: EdgeStyle;
 };
 
 export const createViewerState = (): ViewerState => {
@@ -15,6 +19,8 @@ export const createViewerState = (): ViewerState => {
     density: 'keys',
     arrange: 'untangle',
     filter: '',
+    tint: true,
+    lines: 'curved',
   });
   return state;
 };
