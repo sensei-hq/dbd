@@ -49,9 +49,8 @@
 .dg-viewport {
   position: absolute;
   inset: 0;
-  /* An <svg> is a replaced element: `inset:0` alone does NOT stretch it (it
-     keeps its intrinsic 300x150 size). Explicit 100%/100% makes it fill the
-     positioned container so d3-zoom measures the real viewport. */
+  /* Explicit 100%/100% so the viewport div fills its positioned container and
+     reports the real client size to fit() / zoomAt(). */
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -115,9 +114,8 @@ text.dg-cluster-label {
    TABLE CARDS
    ============================================================ */
 .dg-card {
-  position: static;
-  width: 100%;
-  height: 100%;
+  /* div-world layout: inline left/top/width position the card in the world. */
+  position: absolute;
   background: var(--paper-soft);
   border: 1px solid var(--paper-edge);
   border-radius: var(--radius);

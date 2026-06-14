@@ -44,3 +44,16 @@ it('focus mode shows only the selected card plus its neighbors and re-fits witho
   // lookup_values + its single neighbor lookups = 2 visible cards.
   expect(container.querySelectorAll('[data-card]').length).toBe(2);
 });
+
+it('calls onSelect (and does not mutate state) when the callback prop is provided', async () => {
+  const state = createViewerState();
+  const calls: (string | null)[] = [];
+  const { container } = render(Diagram, {
+    props: { model: MODEL, state, onSelect: (k: string | null) => calls.push(k) },
+  });
+  const card = container.querySelector('[data-card="config.lookup_values"]') as HTMLElement;
+  await fireEvent.click(card);
+  expect(calls).toEqual(['config.lookup_values']);
+  // With onSelect provided, the diagram delegates instead of mutating state.
+  expect(state.selected).toBe(null);
+});
