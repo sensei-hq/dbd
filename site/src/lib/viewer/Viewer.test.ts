@@ -46,10 +46,10 @@ it('renders header (name + counts), sidebar, diagram; selecting a table opens de
   const header = container.querySelector('[data-viewer-header]')!;
   expect(header.textContent).toContain('TestProj');
   expect(header.textContent).toContain('2 tables');
-  expect(container.querySelector('[data-list-group]')).toBeTruthy(); // sidebar
+  expect(container.querySelector('[data-tree-group]')).toBeTruthy(); // sidebar
   expect(container.querySelectorAll('[data-card]').length).toBe(2); // diagram cards
   expect(container.querySelector('[data-detail]')).toBeNull(); // closed initially
-  const item = [...container.querySelectorAll('[data-list-item]')].find((el) =>
+  const item = [...container.querySelectorAll('[data-tree-item]')].find((el) =>
     el.textContent?.includes('lookup_values')
   )!;
   await fireEvent.click(item);
