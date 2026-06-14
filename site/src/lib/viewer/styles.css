@@ -68,6 +68,16 @@
   background-size: 26px 26px;
 }
 
+/* Diagram canvas depth (mockup --bg-deep): a touch deeper than the page surface
+   so the per-schema tinted regions read as distinct lighter areas instead of
+   blending into muddy washes. Sanctioned raw values, like the tint below. */
+.dg-viewport {
+  background-color: oklch(0.967 0.008 85);
+}
+[data-mode='dark'] .dg-viewport {
+  background-color: oklch(0.15 0.035 245);
+}
+
 .dg-world {
   position: absolute;
   top: 0;
