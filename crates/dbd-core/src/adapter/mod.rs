@@ -106,6 +106,18 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Introspect the live database and return a complete `Vec<Entity>` covering
+    /// schemas, extensions, enums, tables (with columns, constraints, indexes,
+    /// and comments), and views — in that order.
+    ///
+    /// The default implementation returns an unsupported error. Adapters that
+    /// support full introspection (currently only `PostgresAdapter`) override this.
+    async fn introspect(&self) -> Result<Vec<Entity>> {
+        Err(crate::error::DbdError::Config(
+            "introspect() is not supported for this adapter".to_string(),
+        ))
+    }
+
     // ── Migration tracking ─────────────────────────────
 
     async fn ensure_migrations_table(&self) -> Result<()>;

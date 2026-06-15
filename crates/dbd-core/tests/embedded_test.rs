@@ -320,3 +320,145 @@ async fn migration_upgrades_schema() {
 
     assert_column_exists(&*adapter, "app", "items", "notes").await;
 }
+
+// ── Test 6: Postgres introspection ───────────────────────────────────────────
+
+#[tokio::test]
+async fn introspect_returns_fixture_entities() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_test").await.unwrap();
+
+    // Create a known fixture in the ephemeral DB
+    let fixture_sql = "
+        CREATE SCHEMA revtest;
+
+        CREATE TYPE revtest.color AS ENUM ('red', 'green');
+
+        CREATE TABLE revtest.owner (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+        );
+
+        CREATE TABLE revtest.widget (
+            id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            owner_id uuid NOT NULL REFERENCES revtest.owner(id) ON DELETE CASCADE,
+            name     text NOT NULL,
+            qty      int DEFAULT 0
+        );
+
+        ALTER TABLE revtest.widget ADD CONSTRAINT widget_name_key UNIQUE (name);
+
+        CREATE INDEX widget_owner_idx ON revtest.widget (owner_id);
+
+        COMMENT ON TABLE revtest.widget IS 'Widget objects';
+        COMMENT ON COLUMN revtest.widget.name IS 'Display name';
+
+        CREATE VIEW revtest.active AS SELECT id, name FROM revtest.widget;
+    ";
+    adapter.execute_script(fixture_sql).await.expect("fixture DDL failed");
+
+    // Run introspect
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // ── Assert: schema revtest present ───────────────────────────────────────
+    let has_revtest_schema = entities.iter().any(|e| {
+        e.entity_type == dbd_core::EntityType::Schema && e.name == "revtest"
+    });
+    assert!(has_revtest_schema, "schema 'revtest' not found in introspect output");
+
+    // ── Assert: enum revtest.color present with values [red, green] ──────────
+    let color_enum = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.color"
+    });
+    let color_enum = color_enum.expect("enum 'revtest.color' not found in introspect output");
+    let enum_value_names: Vec<&str> = color_enum.enum_values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(enum_value_names, vec!["red", "green"], "enum values should be [red, green]");
+
+    // ── Assert: table revtest.widget present ──────────────────────────────────
+    let widget = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::Table && e.name == "revtest.widget"
+    });
+    let widget = widget.expect("table 'revtest.widget' not found in introspect output");
+    let td = widget.table_def.as_ref().expect("widget should have a table_def");
+
+    // Columns: id, owner_id, name, qty
+    let col_names: Vec<&str> = td.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"id"), "widget must have column 'id'");
+    assert!(col_names.contains(&"owner_id"), "widget must have column 'owner_id'");
+    assert!(col_names.contains(&"name"), "widget must have column 'name'");
+    assert!(col_names.contains(&"qty"), "widget must have column 'qty'");
+
+    // id: not nullable
+    let id_col = td.columns.iter().find(|c| c.name == "id").unwrap();
+    assert!(!id_col.nullable, "id should be NOT NULL");
+
+    // owner_id: not nullable
+    let owner_col = td.columns.iter().find(|c| c.name == "owner_id").unwrap();
+    assert!(!owner_col.nullable, "owner_id should be NOT NULL");
+
+    // name: not nullable
+    let name_col = td.columns.iter().find(|c| c.name == "name").unwrap();
+    assert!(!name_col.nullable, "name should be NOT NULL");
+
+    // qty: has a default value
+    let qty_col = td.columns.iter().find(|c| c.name == "qty").unwrap();
+    assert!(qty_col.default_value.is_some(), "qty should have a default value");
+
+    // PRIMARY KEY constraint on [id]
+    let pk = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::PrimaryKey { columns, .. } => Some(columns),
+        _ => None,
+    });
+    let pk_cols = pk.expect("widget should have a PRIMARY KEY constraint");
+    assert_eq!(pk_cols, &vec!["id".to_string()], "PK should be on column 'id'");
+
+    // FOREIGN KEY to revtest.owner on CASCADE delete
+    let fk = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::ForeignKey(fk) => Some(fk),
+        _ => None,
+    });
+    let fk = fk.expect("widget should have a FOREIGN KEY constraint");
+    assert_eq!(fk.ref_table, "owner", "FK should reference 'owner'");
+    assert_eq!(fk.ref_schema.as_deref(), Some("revtest"), "FK ref_schema should be 'revtest'");
+    assert_eq!(
+        fk.on_delete,
+        Some(dbd_core::entity::FkAction::Cascade),
+        "FK on_delete should be CASCADE"
+    );
+
+    // UNIQUE constraint on [name]
+    let unique = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::Unique { columns, .. } => Some(columns),
+        _ => None,
+    });
+    let unique_cols = unique.expect("widget should have a UNIQUE constraint");
+    assert!(unique_cols.contains(&"name".to_string()), "UNIQUE should be on 'name'");
+
+    // Non-constraint index widget_owner_idx
+    let idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_owner_idx"));
+    assert!(idx.is_some(), "index 'widget_owner_idx' should be present");
+
+    // Table comment
+    assert_eq!(
+        td.comments.table.as_deref(),
+        Some("Widget objects"),
+        "table comment should be 'Widget objects'"
+    );
+
+    // Column comment on name
+    assert_eq!(
+        td.comments.columns.get("name").map(String::as_str),
+        Some("Display name"),
+        "column comment on 'name' should be 'Display name'"
+    );
+
+    // ── Assert: view revtest.active present with SELECT body ──────────────────
+    let view = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::View && e.name == "revtest.active"
+    });
+    let view = view.expect("view 'revtest.active' not found in introspect output");
+    let body = view.writes.first().expect("view should have a body in writes[0]");
+    assert!(
+        body.to_uppercase().contains("SELECT"),
+        "view body should contain SELECT, got: {body}"
+    );
+}

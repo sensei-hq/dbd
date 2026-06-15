@@ -29,6 +29,20 @@ use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
 
+/// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
+/// 'a' = NO ACTION, 'r' = RESTRICT, 'c' = CASCADE, 'n' = SET NULL, 'd' = SET DEFAULT
+fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
+    use crate::entity::FkAction;
+    match code {
+        "a" => Some(FkAction::NoAction),
+        "r" => Some(FkAction::Restrict),
+        "c" => Some(FkAction::Cascade),
+        "n" => Some(FkAction::SetNull),
+        "d" => Some(FkAction::SetDefault),
+        _ => None,
+    }
+}
+
 /// PostgreSQL adapter using sqlx connection pool.
 pub struct PostgresAdapter {
     pool: PgPool,
@@ -156,6 +170,429 @@ impl PostgresAdapter {
             serde_json::to_string_pretty(&cache).unwrap_or_default(),
         )
         .ok();
+    }
+
+    // ── Schema filter shared by all introspect_* helpers ──────────────────────
+
+    /// Returns the SQL WHERE clause fragment that filters out system schemas.
+    fn schema_filter_column(col: &str) -> String {
+        format!(
+            "{col} NOT IN ('pg_catalog', 'information_schema') \
+             AND {col} NOT LIKE 'pg_toast%' \
+             AND {col} NOT LIKE 'pg_temp_%'"
+        )
+    }
+
+    // ── Private introspection helpers ──────────────────────────────────────────
+
+    async fn introspect_schemas(&self) -> crate::error::Result<Vec<Entity>> {
+        let filter = Self::schema_filter_column("nspname");
+        let sql = format!(
+            "SELECT nspname FROM pg_namespace WHERE {filter} ORDER BY nspname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_schemas failed: {e}")))?;
+
+        let entities = rows
+            .iter()
+            .map(|row| {
+                let nspname: String = row.get("nspname");
+                Entity::new(EntityType::Schema, &nspname)
+            })
+            .collect();
+        Ok(entities)
+    }
+
+    async fn introspect_extensions(&self) -> crate::error::Result<Vec<Entity>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
+            "SELECT e.extname, n.nspname \
+             FROM pg_extension e \
+             JOIN pg_namespace n ON e.extnamespace = n.oid \
+             WHERE {ns_filter} \
+             ORDER BY n.nspname, e.extname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_extensions failed: {e}")))?;
+
+        let entities = rows
+            .iter()
+            .map(|row| {
+                let extname: String = row.get("extname");
+                let nspname: String = row.get("nspname");
+                let mut e = Entity::new(EntityType::Extension, &extname);
+                e.schema = Some(nspname);
+                e
+            })
+            .collect();
+        Ok(entities)
+    }
+
+    async fn introspect_enums(&self) -> crate::error::Result<Vec<Entity>> {
+        use crate::entity::EnumValue;
+
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        // Fetch enums and their ordered values in one query
+        let sql = format!(
+            "SELECT n.nspname, t.typname, e.enumlabel \
+             FROM pg_type t \
+             JOIN pg_namespace n ON t.typnamespace = n.oid \
+             JOIN pg_enum e ON e.enumtypid = t.oid \
+             WHERE t.typtype = 'e' AND {ns_filter} \
+             ORDER BY n.nspname, t.typname, e.enumsortorder"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_enums failed: {e}")))?;
+
+        // Group by (schema, typname)
+        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> =
+            indexmap::IndexMap::new();
+        for row in &rows {
+            let schema: String = row.get("nspname");
+            let typname: String = row.get("typname");
+            let label: String = row.get("enumlabel");
+            map.entry((schema, typname))
+                .or_default()
+                .push(EnumValue { name: label, note: None });
+        }
+
+        let entities = map
+            .into_iter()
+            .map(|((schema, typname), values)| {
+                let mut e = Entity::new(EntityType::Enum, &format!("{schema}.{typname}"));
+                e.enum_values = values;
+                e
+            })
+            .collect();
+        Ok(entities)
+    }
+
+    async fn introspect_tables(&self) -> crate::error::Result<Vec<Entity>> {
+        use crate::entity::{
+            ColumnDef, ForeignKey, IndexColumn, IndexDef, TableComments, TableConstraint,
+            TableDef,
+        };
+
+        let ns_filter = Self::schema_filter_column("c.table_schema");
+
+        // 1. Fetch all base tables in user schemas
+        let tables_sql = format!(
+            "SELECT c.table_schema, c.table_name \
+             FROM information_schema.tables c \
+             WHERE c.table_type = 'BASE TABLE' AND {ns_filter} \
+             ORDER BY c.table_schema, c.table_name"
+        );
+        let table_rows = sqlx::query(&tables_sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_tables list failed: {e}")))?;
+
+        let mut entities: Vec<Entity> = Vec::new();
+
+        for trow in &table_rows {
+            let schema: String = trow.get("table_schema");
+            let table: String = trow.get("table_name");
+
+            // ── Columns ──────────────────────────────────────────────────────
+            let cols_sql =
+                "SELECT c.column_name, \
+                        c.is_nullable, \
+                        c.column_default, \
+                        c.is_identity, \
+                        format_type(a.atttypid, a.atttypmod) AS col_type, \
+                        col_description(a.attrelid, a.attnum) AS col_comment \
+                 FROM information_schema.columns c \
+                 JOIN pg_attribute a \
+                   ON a.attrelid = (SELECT oid FROM pg_class \
+                                    WHERE relname = $2 \
+                                    AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
+                   AND a.attname = c.column_name \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 WHERE c.table_schema = $1 AND c.table_name = $2 \
+                 ORDER BY c.ordinal_position";
+
+            let col_rows = sqlx::query(cols_sql)
+                .bind(&schema)
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!("introspect_tables columns {schema}.{table}: {e}"))
+                })?;
+
+            let columns: Vec<ColumnDef> = col_rows
+                .iter()
+                .map(|row| {
+                    let name: String = row.get("column_name");
+                    let col_type: String = row.get("col_type");
+                    let is_nullable: String = row.get("is_nullable");
+                    let default_value: Option<String> = row.get("column_default");
+                    let is_identity_str: String = row.get("is_identity");
+                    let comment: Option<String> = row.get("col_comment");
+                    ColumnDef {
+                        name,
+                        data_type: col_type,
+                        nullable: is_nullable == "YES",
+                        default_value,
+                        is_pk: false,        // filled from constraints
+                        is_unique: false,    // filled from constraints
+                        is_identity: is_identity_str == "YES",
+                        comment,
+                        inline_fk: None,
+                    }
+                })
+                .collect();
+
+            // ── Constraints ───────────────────────────────────────────────────
+            let cons_sql =
+                "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
+                        c.conindid::int8 AS conindid, \
+                        pg_get_constraintdef(c.oid, true) AS condef, \
+                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                         FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
+                         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = pos.attnum \
+                        ) AS col_names, \
+                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                         FROM unnest(c.confkey) WITH ORDINALITY AS pos(attnum, ord) \
+                         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = pos.attnum \
+                        ) AS ref_col_names, \
+                        ref_ns.nspname AS ref_schema, \
+                        ref_cls.relname AS ref_table \
+                 FROM pg_constraint c \
+                 JOIN pg_class cls ON cls.oid = c.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+                 LEFT JOIN pg_class ref_cls ON ref_cls.oid = c.confrelid \
+                 LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
+                 WHERE ns.nspname = $1 AND cls.relname = $2 \
+                   AND c.contype IN ('p', 'u', 'f', 'c') \
+                 ORDER BY c.contype, c.conname";
+
+            let con_rows = sqlx::query(cons_sql)
+                .bind(&schema)
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!(
+                        "introspect_tables constraints {schema}.{table}: {e}"
+                    ))
+                })?;
+
+            let mut constraints: Vec<TableConstraint> = Vec::new();
+            let mut constraint_index_oids: std::collections::HashSet<i64> =
+                std::collections::HashSet::new();
+
+            for con in &con_rows {
+                let conname: String = con.get("conname");
+                let contype: String = con.get("contype");
+                let col_names: Vec<String> = con
+                    .try_get::<Vec<String>, _>("col_names")
+                    .unwrap_or_default();
+                let conindid: Option<i64> = con.try_get("conindid").ok();
+
+                match contype.as_str() {
+                    "p" => {
+                        if let Some(oid) = conindid
+                            && oid != 0 {
+                                constraint_index_oids.insert(oid);
+                            }
+                        constraints.push(TableConstraint::PrimaryKey {
+                            name: Some(conname),
+                            columns: col_names,
+                        });
+                    }
+                    "u" => {
+                        if let Some(oid) = conindid
+                            && oid != 0 {
+                                constraint_index_oids.insert(oid);
+                            }
+                        constraints.push(TableConstraint::Unique {
+                            name: Some(conname),
+                            columns: col_names,
+                        });
+                    }
+                    "f" => {
+                        let ref_col_names: Vec<String> = con
+                            .try_get::<Vec<String>, _>("ref_col_names")
+                            .unwrap_or_default();
+                        let ref_schema: Option<String> = con.try_get("ref_schema").ok();
+                        let ref_table: String =
+                            con.try_get("ref_table").unwrap_or_default();
+                        let confdeltype: Option<String> =
+                            con.try_get("confdeltype").ok();
+                        let confupdtype: Option<String> =
+                            con.try_get("confupdtype").ok();
+
+                        let on_delete = confdeltype.as_deref().and_then(pg_conf_action);
+                        let on_update = confupdtype.as_deref().and_then(pg_conf_action);
+
+                        constraints.push(TableConstraint::ForeignKey(ForeignKey {
+                            name: Some(conname),
+                            columns: col_names,
+                            ref_schema,
+                            ref_table,
+                            ref_columns: ref_col_names,
+                            on_delete,
+                            on_update,
+                        }));
+                    }
+                    "c" => {
+                        let condef: String = con.get("condef");
+                        // pg_get_constraintdef returns "CHECK (expr)"
+                        let expression = condef
+                            .strip_prefix("CHECK (")
+                            .and_then(|s| s.strip_suffix(')'))
+                            .unwrap_or(&condef)
+                            .to_string();
+                        constraints.push(TableConstraint::Check {
+                            name: Some(conname),
+                            expression,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            // ── Indexes ───────────────────────────────────────────────────────
+            // Exclude indexes that back a PK or UNIQUE constraint.
+            let idx_sql =
+                "SELECT i.relname AS index_name, \
+                        ix.indexrelid::int8 AS index_oid, \
+                        ix.indisunique, \
+                        ix.indisprimary, \
+                        am.amname AS index_type, \
+                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                         FROM unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, ord) \
+                         JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = pos.attnum \
+                         WHERE pos.attnum > 0 \
+                        ) AS col_names \
+                 FROM pg_index ix \
+                 JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_class i ON i.oid = ix.indexrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 JOIN pg_am am ON am.oid = i.relam \
+                 WHERE ns.nspname = $1 AND t.relname = $2 \
+                 ORDER BY i.relname";
+
+            let idx_rows = sqlx::query(idx_sql)
+                .bind(&schema)
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!(
+                        "introspect_tables indexes {schema}.{table}: {e}"
+                    ))
+                })?;
+
+            let mut indexes: Vec<IndexDef> = Vec::new();
+            for ix in &idx_rows {
+                let index_oid: i64 = ix.get("index_oid");
+                let indisprimary: bool = ix.get("indisprimary");
+                // Skip if it backs a PK/UNIQUE constraint
+                if indisprimary || constraint_index_oids.contains(&index_oid) {
+                    continue;
+                }
+
+                let index_name: String = ix.get("index_name");
+                let indisunique: bool = ix.get("indisunique");
+                let index_type_str: String = ix.get("index_type");
+                let col_names: Vec<String> = ix
+                    .try_get::<Vec<String>, _>("col_names")
+                    .unwrap_or_default();
+
+                let index_type = match index_type_str.as_str() {
+                    "hash" => Some(crate::entity::IndexType::Hash),
+                    _ => None, // btree is default, represent as None
+                };
+
+                indexes.push(IndexDef {
+                    name: Some(index_name),
+                    columns: col_names
+                        .into_iter()
+                        .map(|c| IndexColumn { name: c, order: None })
+                        .collect(),
+                    unique: indisunique,
+                    index_type,
+                });
+            }
+
+            // ── Table comment ─────────────────────────────────────────────────
+            let tc_sql = "SELECT obj_description((SELECT oid FROM pg_class \
+                           WHERE relname = $2 \
+                           AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
+                          , 'pg_class') AS tbl_comment";
+            let tc_row = sqlx::query(tc_sql)
+                .bind(&schema)
+                .bind(&table)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!(
+                        "introspect_tables table_comment {schema}.{table}: {e}"
+                    ))
+                })?;
+            let table_comment: Option<String> = tc_row.try_get("tbl_comment").ok().flatten();
+
+            // Assemble TableComments: table-level + per-column (already in ColumnDef.comment)
+            let mut col_comments = std::collections::HashMap::new();
+            for c in &columns {
+                if let Some(cm) = &c.comment {
+                    col_comments.insert(c.name.clone(), cm.clone());
+                }
+            }
+            let comments = TableComments {
+                table: table_comment,
+                columns: col_comments,
+            };
+
+            let table_def = TableDef {
+                columns,
+                constraints,
+                indexes,
+                comments,
+            };
+
+            let mut entity = Entity::new(EntityType::Table, &format!("{schema}.{table}"));
+            entity.table_def = Some(table_def);
+            entities.push(entity);
+        }
+
+        Ok(entities)
+    }
+
+    async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
+        let ns_filter = Self::schema_filter_column("schemaname");
+        let sql = format!(
+            "SELECT schemaname, viewname, definition \
+             FROM pg_views \
+             WHERE {ns_filter} \
+             ORDER BY schemaname, viewname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_views failed: {e}")))?;
+
+        let entities = rows
+            .iter()
+            .map(|row| {
+                let schema: String = row.get("schemaname");
+                let viewname: String = row.get("viewname");
+                let definition: String = row.get("definition");
+                let mut e = Entity::new(EntityType::View, &format!("{schema}.{viewname}"));
+                e.writes = vec![definition];
+                e
+            })
+            .collect();
+        Ok(entities)
     }
 
     /// SQL keywords and types that appear as false-positive references.
@@ -549,6 +986,16 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         Ok(names)
+    }
+
+    async fn introspect(&self) -> Result<Vec<Entity>> {
+        let mut out: Vec<Entity> = Vec::new();
+        out.extend(self.introspect_schemas().await?);
+        out.extend(self.introspect_extensions().await?);
+        out.extend(self.introspect_enums().await?);
+        out.extend(self.introspect_tables().await?);
+        out.extend(self.introspect_views().await?);
+        Ok(out)
     }
 
     async fn ensure_migrations_table(&self) -> Result<()> {
