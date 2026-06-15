@@ -199,6 +199,17 @@ pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> 
     Ok(report)
 }
 
+/// Emit DDL for each entity and build a write-plan against `root`.
+/// Entities whose kind has no emitter (External, Function/Procedure) are skipped.
+pub fn plan_from_entities(root: &Path, entities: &[Entity], selected_schemas: &[String]) -> WritePlan {
+    let generated: Vec<(PathBuf, String)> = entities
+        .iter()
+        .filter(|e| MANAGED_KINDS.contains(&e.entity_type))
+        .filter_map(|e| crate::emit::emit_entity(e).map(|sql| (entity_path(e), format!("{}\n", sql.trim_end()))))
+        .collect();
+    build_plan(root, generated, selected_schemas)
+}
+
 /// Render a `design.yaml` for a reverse-engineered project. The target URL is
 /// always the env reference `$DATABASE_URL` — never the literal connection string.
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
@@ -333,6 +344,23 @@ mod tests {
         };
         apply_plan(dir.path(), &plan, false, true).unwrap();
         assert!(!dir.path().join("ddl/table/s/b.sql").exists());
+    }
+
+    #[test]
+    fn plan_from_entities_emits_and_classifies() {
+        use crate::entity::{EnumValue};
+        let dir = tempfile::tempdir().unwrap();
+        let mut en = Entity::new(EntityType::Enum, "shop.status");
+        en.enum_values = vec![EnumValue { name: "a".into(), note: None }];
+        let entities = vec![Entity::new(EntityType::Schema, "shop"), en];
+
+        let plan = plan_from_entities(dir.path(), &entities, &["shop".into()]);
+        let paths: Vec<String> = plan.items.iter().map(|i| i.path.display().to_string()).collect();
+        assert!(paths.contains(&"ddl/schema/shop.sql".to_string()));
+        assert!(paths.contains(&"ddl/enum/shop/status.sql".to_string()));
+        // content was emitted
+        let enum_item = plan.items.iter().find(|i| i.path.ends_with("status.sql")).unwrap();
+        assert!(enum_item.content.contains("CREATE TYPE"));
     }
 
     #[test]
