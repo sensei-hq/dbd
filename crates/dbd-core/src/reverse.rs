@@ -199,6 +199,19 @@ pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> 
     Ok(report)
 }
 
+/// Render a `design.yaml` for a reverse-engineered project. The target URL is
+/// always the env reference `$DATABASE_URL` — never the literal connection string.
+pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
+    let target_key = if dialect == "sqlite" { "sqlite" } else { "postgres" };
+    let schema_lines = schemas.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n");
+    format!(
+        "project:\n  name: {project}\n  version: {version}\n\n\
+         source:\n  dialect: {dialect}\n\n\
+         target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
+         schemas:\n{schema_lines}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +333,16 @@ mod tests {
         };
         apply_plan(dir.path(), &plan, false, true).unwrap();
         assert!(!dir.path().join("ddl/table/s/b.sql").exists());
+    }
+
+    #[test]
+    fn generates_design_yaml() {
+        let yaml = design_yaml("shopdb", "postgresql", &["public".into(), "app".into()], 1);
+        assert!(yaml.contains("name: shopdb"));
+        assert!(yaml.contains("version: 1"));
+        assert!(yaml.contains("dialect: postgresql"));
+        assert!(yaml.contains("url: $DATABASE_URL")); // never the literal connection string
+        assert!(yaml.contains("- public"));
+        assert!(yaml.contains("- app"));
     }
 }
