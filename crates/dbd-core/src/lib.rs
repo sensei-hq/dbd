@@ -19,6 +19,7 @@ pub mod refcache;
 pub mod scanner;
 pub mod schema_model;
 pub mod scope;
+pub mod reverse;
 pub mod script;
 pub mod snapshot;
 
