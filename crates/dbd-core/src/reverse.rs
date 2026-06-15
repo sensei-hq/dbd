@@ -42,6 +42,26 @@ pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String>
         .collect()
 }
 
+/// Returns `true` iff `s` is safe to use as a path segment on disk.
+///
+/// A segment is considered unsafe if it is:
+/// - empty,
+/// - the current-directory alias `.`,
+/// - the parent-directory alias `..`,
+/// - or contains any of `/`, `\`, or a NUL byte.
+///
+/// Entity names and schema names are written verbatim into file-system paths
+/// (`ddl/<kind>/<schema>/<name>.sql`).  Without this check a pathological but
+/// technically-legal SQL identifier could escape the project root.
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+}
+
 use crate::entity::{Entity, EntityType};
 use std::path::PathBuf;
 
@@ -83,6 +103,10 @@ pub struct WritePlan {
     pub items: Vec<PlanItem>,
     /// Existing managed-kind files under a selected schema with no generated counterpart.
     pub orphans: Vec<PathBuf>,
+    /// Entities skipped because their schema or name failed the path-safety check.
+    /// Each entry is `"<schema>.<name>"` (or just `"<name>"` for un-schema'd kinds).
+    /// Callers should surface these as warnings so the user is aware.
+    pub skipped_unsafe: Vec<String>,
 }
 
 /// Classify each generated file vs disk, and detect orphans within `selected_schemas`
@@ -128,7 +152,7 @@ pub fn build_plan(
         }
     }
     orphans.sort();
-    WritePlan { items, orphans }
+    WritePlan { items, orphans, skipped_unsafe: vec![] }
 }
 
 use crate::error::{DbdError, Result};
@@ -153,7 +177,19 @@ fn backup_path(file: &Path) -> PathBuf {
     p
 }
 
-/// Apply a write-plan. Aborts (no writes) if there are conflicts and `!force`.
+/// Apply a write-plan to disk.
+///
+/// # Conflict gate (atomic)
+/// If any item has [`FileAction::Conflict`] and `force` is `false`, the function returns
+/// `Err` **before performing any write**.  This gate is atomic: either all writes proceed
+/// or none do (subject to the caveat below).
+///
+/// # Non-transactionality (accepted v1 limitation)
+/// Once past the conflict gate, items are written one by one.  If a write or rename fails
+/// mid-loop (e.g. disk full, permission error), earlier items remain applied with their
+/// `.bak` backups intact and the function returns `Err`.  There is no rollback.  Callers
+/// should treat a mid-loop error as a partial apply and inspect the project directory.
+///
 /// `dry_run` performs no writes. Orphans are counted, never touched.
 pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> Result<Report> {
     let conflicts: Vec<&PlanItem> =
@@ -200,24 +236,59 @@ pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> 
 }
 
 /// Emit DDL for each entity and build a write-plan against `root`.
-/// Entities whose kind has no emitter (External, Function/Procedure) are skipped.
+///
+/// Entities whose kind has no emitter (External, Function/Procedure) are silently skipped.
+/// Entities whose schema or bare name fails [`is_safe_segment`] are excluded from the plan
+/// and reported in [`WritePlan::skipped_unsafe`] so the caller can surface a warning.
 pub fn plan_from_entities(root: &Path, entities: &[Entity], selected_schemas: &[String]) -> WritePlan {
-    let generated: Vec<(PathBuf, String)> = entities
-        .iter()
-        .filter(|e| MANAGED_KINDS.contains(&e.entity_type))
-        .filter_map(|e| crate::emit::emit_entity(e).map(|sql| (entity_path(e), format!("{}\n", sql.trim_end()))))
-        .collect();
-    build_plan(root, generated, selected_schemas)
+    let mut skipped_unsafe: Vec<String> = Vec::new();
+    let mut generated: Vec<(PathBuf, String)> = Vec::new();
+
+    for e in entities {
+        if !MANAGED_KINDS.contains(&e.entity_type) {
+            continue;
+        }
+        // Derive the bare name (strip any schema prefix that was embedded in the name field).
+        let bare_name = e.name.rsplit('.').next().unwrap_or(&e.name);
+
+        // Check schema segment (when present).
+        let schema_ok = e.schema.as_deref().is_none_or(is_safe_segment);
+        // Check name segment.
+        let name_ok = is_safe_segment(bare_name);
+
+        if !schema_ok || !name_ok {
+            let label = match &e.schema {
+                Some(sc) => format!("{sc}.{}", e.name),
+                None => e.name.clone(),
+            };
+            skipped_unsafe.push(label);
+            continue;
+        }
+
+        if let Some(sql) = crate::emit::emit_entity(e) {
+            generated.push((entity_path(e), format!("{}\n", sql.trim_end())));
+        }
+    }
+
+    let mut plan = build_plan(root, generated, selected_schemas);
+    plan.skipped_unsafe = skipped_unsafe;
+    plan
 }
 
-/// Render a `design.yaml` for a reverse-engineered project. The target URL is
-/// always the env reference `$DATABASE_URL` — never the literal connection string.
+/// Render a `design.yaml` for a reverse-engineered project.
+///
+/// The output matches the structure produced by `dbd init` (see [`crate::init`]):
+/// - `project.name` + `project.version`
+/// - `target.<dialect-key>.url` — always `$DATABASE_URL`, never a literal connection string
+/// - `schemas` list populated from the discovered schema set
+///
+/// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`;
+/// `"sqlite"` maps to the `sqlite` target key, everything else maps to `"postgres"`.
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
     let target_key = if dialect == "sqlite" { "sqlite" } else { "postgres" };
     let schema_lines = schemas.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n");
     format!(
         "project:\n  name: {project}\n  version: {version}\n\n\
-         source:\n  dialect: {dialect}\n\n\
          target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
          schemas:\n{schema_lines}\n"
     )
@@ -308,6 +379,7 @@ mod tests {
         let plan = WritePlan {
             items: vec![item("ddl/table/s/a.sql", "NEW", FileAction::Conflict)],
             orphans: vec![],
+            skipped_unsafe: vec![],
         };
         let err = apply_plan(dir.path(), &plan, /*force*/ false, /*dry_run*/ false).unwrap_err();
         assert!(err.to_string().contains("conflict"));
@@ -325,6 +397,7 @@ mod tests {
                 item("ddl/table/s/b.sql", "B", FileAction::Create),
             ],
             orphans: vec![PathBuf::from("ddl/table/s/legacy.sql")],
+            skipped_unsafe: vec![],
         };
         let report = apply_plan(dir.path(), &plan, true, false).unwrap();
         assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.sql")).unwrap(), "NEW");
@@ -341,6 +414,7 @@ mod tests {
         let plan = WritePlan {
             items: vec![item("ddl/table/s/b.sql", "B", FileAction::Create)],
             orphans: vec![],
+            skipped_unsafe: vec![],
         };
         apply_plan(dir.path(), &plan, false, true).unwrap();
         assert!(!dir.path().join("ddl/table/s/b.sql").exists());
@@ -366,11 +440,66 @@ mod tests {
     #[test]
     fn generates_design_yaml() {
         let yaml = design_yaml("shopdb", "postgresql", &["public".into(), "app".into()], 1);
+        // project block
         assert!(yaml.contains("name: shopdb"));
         assert!(yaml.contains("version: 1"));
-        assert!(yaml.contains("dialect: postgresql"));
+        // target block — same structure as `dbd init` scaffold (no separate `source:` block)
+        assert!(yaml.contains("target:"));
+        assert!(yaml.contains("postgres:"));
         assert!(yaml.contains("url: $DATABASE_URL")); // never the literal connection string
+        // schemas
         assert!(yaml.contains("- public"));
         assert!(yaml.contains("- app"));
+        // must NOT contain the old `source: / dialect:` keys
+        assert!(!yaml.contains("source:"));
+        assert!(!yaml.contains("dialect:"));
+    }
+
+    #[test]
+    fn design_yaml_sqlite_uses_sqlite_key() {
+        let yaml = design_yaml("localdb", "sqlite", &["main".into()], 2);
+        assert!(yaml.contains("sqlite:"));
+        assert!(!yaml.contains("postgres:"));
+        assert!(yaml.contains("url: $DATABASE_URL"));
+        assert!(yaml.contains("version: 2"));
+    }
+
+    #[test]
+    fn unsafe_path_segments_are_rejected() {
+        use crate::entity::EnumValue;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Entity with a path-traversal schema
+        let mut evil_schema = Entity::new(EntityType::Enum, "status");
+        evil_schema.schema = Some("../etc".to_string());
+        evil_schema.enum_values = vec![EnumValue { name: "x".into(), note: None }];
+
+        // Entity with a slash in the name
+        let mut evil_name = Entity::new(EntityType::Table, "public/evil");
+        evil_name.schema = Some("public".to_string());
+
+        // A normal entity that must still be emitted
+        let mut good = Entity::new(EntityType::Enum, "shop.status");
+        good.schema = Some("shop".to_string());
+        good.enum_values = vec![EnumValue { name: "a".into(), note: None }];
+
+        let entities = vec![evil_schema, evil_name, good];
+        let plan = plan_from_entities(dir.path(), &entities, &["shop".into()]);
+
+        // The two unsafe entities must NOT appear in plan.items
+        for item in &plan.items {
+            let p = item.path.display().to_string();
+            assert!(!p.contains(".."), "unsafe path escaped: {p}");
+            assert!(!p.contains("evil"), "unsafe name in path: {p}");
+        }
+
+        // They must be reported in skipped_unsafe
+        assert_eq!(plan.skipped_unsafe.len(), 2,
+            "expected 2 skipped, got {:?}", plan.skipped_unsafe);
+
+        // The good entity must be present
+        let paths: Vec<String> = plan.items.iter().map(|i| i.path.display().to_string()).collect();
+        assert!(paths.iter().any(|p| p.contains("status")),
+            "good entity missing from plan: {:?}", paths);
     }
 }
