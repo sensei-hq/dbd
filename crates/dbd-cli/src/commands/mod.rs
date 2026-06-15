@@ -2,6 +2,7 @@ mod data;
 mod diagram;
 mod migration;
 mod project;
+mod reverse;
 mod schema;
 
 use std::path::{Path, PathBuf};
@@ -88,14 +89,32 @@ pub async fn run(
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 
-        Commands::Init { name, target } => {
-            let project_name = name.as_deref().unwrap_or_else(|| {
-                project_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("my-project")
-            });
-            project::cmd_init(project_dir, project_name, target, verbosity)
+        Commands::Init { name, target, from_db, version, schemas, exclude_schemas, all_schemas, force_overwrite, dry_run } => {
+            if let Some(conn) = from_db {
+                let sel = dbd_core::reverse::SchemaSelect {
+                    only: schemas.clone(),
+                    exclude: exclude_schemas.clone(),
+                    all: *all_schemas,
+                };
+                reverse::cmd_init_from_db(project_dir, conn, name.as_deref(), *version, sel, *force_overwrite, *dry_run).await
+            } else {
+                let project_name = name.as_deref().unwrap_or_else(|| {
+                    project_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("my-project")
+                });
+                project::cmd_init(project_dir, project_name, target, verbosity)
+            }
+        }
+
+        Commands::Merge { conn, schemas, exclude_schemas, all_schemas, force_overwrite, dry_run } => {
+            let sel = dbd_core::reverse::SchemaSelect {
+                only: schemas.clone(),
+                exclude: exclude_schemas.clone(),
+                all: *all_schemas,
+            };
+            reverse::cmd_merge(project_dir, conn.as_deref(), sel, *force_overwrite, *dry_run).await
         }
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
