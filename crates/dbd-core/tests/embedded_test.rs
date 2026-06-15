@@ -342,13 +342,15 @@ async fn introspect_returns_fixture_entities() {
             id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
             owner_id uuid NOT NULL REFERENCES revtest.owner(id) ON DELETE CASCADE,
             name     text NOT NULL,
-            qty      int DEFAULT 0
+            qty      int DEFAULT 0,
+            tags     text[] NOT NULL DEFAULT '{}'
         );
 
         ALTER TABLE revtest.widget ADD CONSTRAINT widget_name_key UNIQUE (name);
 
         CREATE INDEX widget_owner_idx ON revtest.widget (owner_id);
         CREATE INDEX widget_lower_name_idx ON revtest.widget (lower(name));
+        CREATE INDEX widget_tags_idx ON revtest.widget USING gin (tags);
 
         COMMENT ON TABLE revtest.widget IS 'Widget objects';
         COMMENT ON COLUMN revtest.widget.name IS 'Display name';
@@ -437,6 +439,19 @@ async fn introspect_returns_fixture_entities() {
     // Non-constraint index widget_owner_idx (plain column — must be captured)
     let idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_owner_idx"));
     assert!(idx.is_some(), "index 'widget_owner_idx' should be present");
+
+    // GIN index widget_tags_idx — access method must be captured (a GIN index on a
+    // text[] column would be invalid as a plain btree, so the method must round-trip).
+    let gin_idx = td
+        .indexes
+        .iter()
+        .find(|i| i.name.as_deref() == Some("widget_tags_idx"))
+        .expect("GIN index 'widget_tags_idx' should be present");
+    assert_eq!(
+        gin_idx.index_type,
+        Some(dbd_core::entity::IndexType::Gin),
+        "widget_tags_idx should be captured as a GIN index"
+    );
 
     // Expression index widget_lower_name_idx — must be skipped (IndexDef cannot represent it)
     let expr_idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_lower_name_idx"));

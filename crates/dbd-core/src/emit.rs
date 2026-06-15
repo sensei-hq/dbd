@@ -111,8 +111,14 @@ pub fn emit_table(entity: &Entity) -> String {
             .join(", ");
         let unique = if ix.unique { "UNIQUE " } else { "" };
         let idx_name = ix.name.clone().unwrap_or_else(|| format!("{name}_idx"));
+        use crate::entity::IndexType;
         let using = match ix.index_type {
-            Some(crate::entity::IndexType::Hash) => " USING hash",
+            Some(IndexType::Hash) => " USING hash",
+            Some(IndexType::Gin) => " USING gin",
+            Some(IndexType::Gist) => " USING gist",
+            Some(IndexType::Brin) => " USING brin",
+            Some(IndexType::SpGist) => " USING spgist",
+            // btree (Some(Btree) or None) is the default — no USING clause.
             _ => "",
         };
         out.push_str(&format!(
@@ -337,5 +343,45 @@ mod tests {
         assert_eq!(emit_entity(&s).unwrap(), "CREATE SCHEMA IF NOT EXISTS \"shop\";");
         let ext_none = Entity::new(EntityType::External, "auth.users");
         assert!(emit_entity(&ext_none).is_none());
+    }
+
+    #[test]
+    fn emit_table_renders_index_access_methods() {
+        use crate::entity::{ColumnDef, IndexColumn, IndexDef, IndexType, TableDef};
+
+        let col = |n: &str, ty: &str| ColumnDef {
+            name: n.into(), data_type: ty.into(), nullable: true, default_value: None,
+            is_pk: false, is_unique: false, is_identity: false, comment: None, inline_fk: None,
+        };
+        let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
+            name: Some(name.into()),
+            columns: vec![IndexColumn { name: col.into(), order: None }],
+            unique: false,
+            index_type: ty,
+        };
+        let mut e = Entity::new(EntityType::Table, "app.docs");
+        e.table_def = Some(TableDef {
+            columns: vec![col("tags", "text[]"), col("body", "tsvector"), col("n", "integer")],
+            constraints: vec![],
+            indexes: vec![
+                idx("docs_tags_idx", "tags", Some(IndexType::Gin)),
+                idx("docs_body_idx", "body", Some(IndexType::Gist)),
+                idx("docs_n_brin_idx", "n", Some(IndexType::Brin)),
+                idx("docs_n_hash_idx", "n", Some(IndexType::Hash)),
+                idx("docs_n_btree_idx", "n", None),
+            ],
+            comments: Default::default(),
+        });
+
+        let sql = emit_table(&e);
+        // Non-btree methods are emitted faithfully — a GIN/GiST index on an array /
+        // tsvector column would be invalid as a plain btree, so the access method
+        // must survive reverse-engineering.
+        assert!(sql.contains("CREATE INDEX \"docs_tags_idx\" USING gin ON \"app\".\"docs\" (\"tags\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_body_idx\" USING gist ON \"app\".\"docs\" (\"body\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_n_brin_idx\" USING brin ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_n_hash_idx\" USING hash ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
+        // btree (None) emits no USING clause.
+        assert!(sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
     }
 }

@@ -142,6 +142,12 @@ pub struct IndexColumn {
 pub enum IndexType {
     Btree,
     Hash,
+    Gin,
+    Gist,
+    Brin,
+    /// SP-GiST. Serializes as `spgist` (Postgres's `pg_am.amname`).
+    #[serde(rename = "spgist")]
+    SpGist,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
