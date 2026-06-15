@@ -485,3 +485,103 @@ async fn introspect_returns_fixture_entities() {
         "view body should contain SELECT, got: {body}"
     );
 }
+
+// ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
+
+/// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
+/// GIN index on it, and a HASH index on a plain column, emit DDL via
+/// `emit_table`, and execute it against an embedded Postgres. This guards the
+/// `CREATE INDEX ... USING <method>` grammar — a prior bug emitted `USING gin`
+/// BEFORE `ON table` (invalid Postgres), which only a real apply catches
+/// (sqlparser happily parses the invalid ordering). Postgres accepting the DDL
+/// proves the emitted output is valid, not merely parseable.
+#[tokio::test]
+async fn emitted_index_ddl_applies_to_postgres() {
+    use dbd_core::entity::{
+        ColumnDef, Entity, EntityType, IndexColumn, IndexDef, IndexType, TableConstraint, TableDef,
+    };
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "emit_index_test").await.unwrap();
+
+    // Fresh schema to apply into.
+    adapter
+        .execute_script("CREATE SCHEMA emit_test;")
+        .await
+        .expect("failed to create schema emit_test");
+
+    // Minimal standalone table: a plain column + a text[] column, no FKs.
+    let mut entity = Entity::new(EntityType::Table, "emit_test.doc");
+    entity.schema = Some("emit_test".into());
+    entity.table_def = Some(TableDef {
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "uuid".into(),
+                nullable: false,
+                default_value: Some("gen_random_uuid()".into()),
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+            ColumnDef {
+                name: "title".into(),
+                data_type: "text".into(),
+                nullable: false,
+                default_value: None,
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+            ColumnDef {
+                name: "tags".into(),
+                data_type: "text[]".into(),
+                nullable: false,
+                default_value: Some("'{}'".into()),
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+        ],
+        constraints: vec![TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        }],
+        indexes: vec![
+            // GIN index on the array column — invalid as a btree, so the access
+            // method (and its position after `ON table`) must be correct.
+            IndexDef {
+                name: Some("doc_tags_gin".into()),
+                columns: vec![IndexColumn { name: "tags".into(), order: None }],
+                unique: false,
+                index_type: Some(IndexType::Gin),
+            },
+            // HASH index on a plain column.
+            IndexDef {
+                name: Some("doc_title_hash".into()),
+                columns: vec![IndexColumn { name: "title".into(), order: None }],
+                unique: false,
+                index_type: Some(IndexType::Hash),
+            },
+        ],
+        comments: Default::default(),
+    });
+
+    let sql = dbd_core::emit::emit_table(&entity);
+    assert!(
+        sql.contains("USING gin"),
+        "emitted DDL should carry the GIN access method, got:\n{sql}"
+    );
+
+    // The real test: Postgres must accept the emitted DDL verbatim.
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
+}
