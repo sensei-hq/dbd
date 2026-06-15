@@ -42,6 +42,29 @@ pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String>
         .collect()
 }
 
+use crate::entity::{Entity, EntityType};
+use std::path::PathBuf;
+
+/// Map an entity to its DDL file path: `ddl/<kind>/<schema>/<name>.sql` for
+/// schema-qualified kinds, `ddl/<kind>/<name>.sql` otherwise.
+pub fn entity_path(entity: &Entity) -> PathBuf {
+    let kind = entity.entity_type.tag(); // "table", "enum", "view", "schema", "extension"
+    let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
+    let mut p = PathBuf::from("ddl");
+    p.push(&kind);
+    if entity.entity_type.has_schema() && let Some(schema) = &entity.schema {
+        p.push(schema);
+    }
+    p.push(format!("{name}.sql"));
+    p
+}
+
+/// The entity kinds this command generates (used to scope orphan detection).
+pub const MANAGED_KINDS: &[EntityType] = &[
+    EntityType::Schema, EntityType::Extension, EntityType::Enum,
+    EntityType::Table, EntityType::View,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +96,16 @@ mod tests {
         let db = v(&["public", "app"]);
         let got = select_schemas(&db, &SchemaSelect { exclude: v(&["app"]), ..Default::default() });
         assert_eq!(got, v(&["public"]));
+    }
+
+    #[test]
+    fn entity_paths_follow_ddl_convention() {
+        use std::path::PathBuf;
+        let t = Entity::new(EntityType::Table, "shop.orders");
+        assert_eq!(entity_path(&t), PathBuf::from("ddl/table/shop/orders.sql"));
+        let e = Entity::new(EntityType::Enum, "shop.order_status");
+        assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.sql"));
+        let s = Entity::new(EntityType::Schema, "shop");
+        assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.sql"));
     }
 }
