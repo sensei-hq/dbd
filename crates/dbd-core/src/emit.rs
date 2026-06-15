@@ -28,6 +28,13 @@ pub fn emit_enum(entity: &Entity) -> String {
 }
 
 /// `CREATE TABLE "schema"."name" ( … );` + `CREATE INDEX …;` + `COMMENT ON …;`
+///
+/// # What is intentionally NOT re-emitted
+///
+/// v1 does not re-emit column-level `is_identity`, column-only `is_pk`/`is_unique`,
+/// or `inline_fk`. The Postgres introspector decomposes these into table-level
+/// constraints, so those flags are not on the reverse-engineer path and would
+/// produce duplicate DDL if re-emitted here.
 pub fn emit_table(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -71,6 +78,9 @@ pub fn emit_table(entity: &Entity) -> String {
                 if let Some(a) = fk.on_delete {
                     s.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
                 }
+                if let Some(a) = fk.on_update {
+                    s.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
+                }
                 lines.push(s);
             }
             crate::entity::TableConstraint::Check { expression, .. } => {
@@ -79,9 +89,16 @@ pub fn emit_table(entity: &Entity) -> String {
         }
     }
 
-    let mut out = format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"));
+    let body = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", lines.join(",\n"))
+    };
+    let mut out = format!("CREATE TABLE {qname} ({body});");
 
-    // Indexes (skip ones that merely back a PK/UNIQUE — emit explicit indexes only)
+    // Indexes — every entry in def.indexes is emitted as-is. Filtering of
+    // implicit PK/UNIQUE-backing indexes happens upstream in the introspector,
+    // not here.
     for ix in &def.indexes {
         let cols = ix
             .columns
@@ -94,8 +111,12 @@ pub fn emit_table(entity: &Entity) -> String {
             .join(", ");
         let unique = if ix.unique { "UNIQUE " } else { "" };
         let idx_name = ix.name.clone().unwrap_or_else(|| format!("{name}_idx"));
+        let using = match ix.index_type {
+            Some(crate::entity::IndexType::Hash) => " USING hash",
+            _ => "",
+        };
         out.push_str(&format!(
-            "\nCREATE {unique}INDEX {} ON {qname} ({cols});",
+            "\nCREATE {unique}INDEX {}{using} ON {qname} ({cols});",
             q(&idx_name)
         ));
     }
@@ -251,14 +272,50 @@ mod tests {
         assert!(sql.contains("CREATE INDEX \"orders_customer_id_idx\" ON \"shop\".\"orders\" (\"customer_id\");"));
         assert!(sql.contains("COMMENT ON COLUMN \"shop\".\"orders\".\"id\" IS 'Order PK';"));
 
-        // Round-trip: emitted DDL re-parses to a TableDef with the same column set.
+        // Round-trip: emitted DDL re-parses to a TableDef with the same structure.
         // Use the public parse_entity entry point with a fake table file path.
         let fake_path = std::path::Path::new("ddl/table/shop/orders.sql");
         let parsed_entity = crate::parser::parse_entity(fake_path, &sql)
             .expect("emitted table DDL should parse");
         let parsed = parsed_entity.table_def.expect("parsed entity should have a table_def");
+
+        // Columns survive the round trip.
         let cols: Vec<&str> = parsed.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(cols, vec!["id", "customer_id", "total_cents"]);
+
+        // Primary key survives the round trip.
+        // Note: sqlparser preserves double-quoting from the emitted DDL in
+        // column name strings (e.g. `"id"` not `id`); the constraint itself
+        // does survive — we assert its presence and column count.
+        let pk = parsed.constraints.iter().find_map(|c| match c {
+            crate::entity::TableConstraint::PrimaryKey { columns, .. } => Some(columns),
+            _ => None,
+        });
+        let pk_cols = pk.expect("PrimaryKey constraint must survive the round trip");
+        assert_eq!(pk_cols.len(), 1, "PK must have exactly one column");
+        assert!(
+            pk_cols[0].contains("id"),
+            "PK column must reference 'id', got: {:?}",
+            pk_cols[0]
+        );
+
+        // Foreign key survives the round trip (references shop.customers).
+        let fk = parsed.constraints.iter().find_map(|c| match c {
+            crate::entity::TableConstraint::ForeignKey(fk) => Some(fk),
+            _ => None,
+        });
+        let fk = fk.expect("ForeignKey constraint must survive the round trip");
+        assert_eq!(fk.ref_table, "customers");
+        assert_eq!(fk.ref_schema.as_deref(), Some("shop"));
+
+        // Index name survives the round trip.
+        let idx = parsed.indexes.iter().find(|i| {
+            i.name.as_deref() == Some("orders_customer_id_idx")
+        });
+        assert!(
+            idx.is_some(),
+            "index 'orders_customer_id_idx' must survive the round trip"
+        );
     }
 
     #[test]
