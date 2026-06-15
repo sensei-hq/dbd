@@ -30,11 +30,12 @@ use crate::error::{DbdError, Result};
 use crate::script;
 
 /// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
-/// 'a' = NO ACTION, 'r' = RESTRICT, 'c' = CASCADE, 'n' = SET NULL, 'd' = SET DEFAULT
+/// 'a' = NO ACTION (unspecified — return None so the emitter omits the clause),
+/// 'r' = RESTRICT, 'c' = CASCADE, 'n' = SET NULL, 'd' = SET DEFAULT
 fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
     use crate::entity::FkAction;
     match code {
-        "a" => Some(FkAction::NoAction),
+        "a" => None, // NO ACTION is the default; omit to avoid spurious diffs
         "r" => Some(FkAction::Restrict),
         "c" => Some(FkAction::Cascade),
         "n" => Some(FkAction::SetNull),
@@ -176,10 +177,11 @@ impl PostgresAdapter {
 
     /// Returns the SQL WHERE clause fragment that filters out system schemas.
     fn schema_filter_column(col: &str) -> String {
+        // Keep in sync with `reverse::ALWAYS_EXCLUDED` / `reverse::is_internal`.
         format!(
             "{col} NOT IN ('pg_catalog', 'information_schema') \
              AND {col} NOT LIKE 'pg_toast%' \
-             AND {col} NOT LIKE 'pg_temp_%'"
+             AND {col} NOT LIKE 'pg_temp%'"
         )
     }
 
@@ -462,6 +464,10 @@ impl PostgresAdapter {
 
             // ── Indexes ───────────────────────────────────────────────────────
             // Exclude indexes that back a PK or UNIQUE constraint.
+            // Also skip expression indexes (indexprs IS NOT NULL), partial indexes
+            // (indpred IS NOT NULL), and any index whose indkey contains a 0
+            // (expression column) — IndexDef cannot represent these, and emitting
+            // an empty column list would produce invalid DDL.
             let idx_sql =
                 "SELECT i.relname AS index_name, \
                         ix.indexrelid::int8 AS index_oid, \
@@ -479,6 +485,9 @@ impl PostgresAdapter {
                  JOIN pg_namespace ns ON ns.oid = t.relnamespace \
                  JOIN pg_am am ON am.oid = i.relam \
                  WHERE ns.nspname = $1 AND t.relname = $2 \
+                   AND ix.indexprs IS NULL \
+                   AND ix.indpred IS NULL \
+                   AND NOT (0 = ANY(ix.indkey::int2[])) \
                  ORDER BY i.relname";
 
             let idx_rows = sqlx::query(idx_sql)
@@ -955,7 +964,7 @@ impl DatabaseAdapter for PostgresAdapter {
             "SELECT table_schema, table_name FROM information_schema.tables \
              WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
                AND table_schema NOT LIKE 'pg_toast%' \
-               AND table_schema NOT LIKE 'pg_temp_%'"
+               AND table_schema NOT LIKE 'pg_temp%'"
         )
         .fetch_all(&self.pool)
         .await
