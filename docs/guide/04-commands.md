@@ -294,6 +294,20 @@ literal `$DATABASE_URL` env reference — never the connection string you passed
 `merge` to sync into an existing project). Reverse-engineering supports Postgres/Supabase
 connections only; `--target sqlite` with `--from-db` is rejected.
 
+**What v1 captures (and what it doesn't).** This release reverse-engineers the **data
+model**: schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
+constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments) and
+views. Not yet captured:
+
+- **Functions, procedures, roles, sequences** — coming in later patches.
+- **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
+  are skipped, since they can't be represented losslessly yet.
+- dbd's own bookkeeping tables (`_dbd_meta`, `_dbd_migrations`) are always excluded.
+
+Column order reflects the database's **physical** order (which can differ from a
+hand-authored file after `ALTER TABLE ADD COLUMN`). Run `dbd format` on the result to
+normalize the output to your project's conventions.
+
 ---
 
 ## `dbd merge`

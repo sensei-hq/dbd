@@ -122,10 +122,21 @@ async fn run(
         return Ok(vec![]);
     }
 
-    // Keep only entities whose schema is in the selected set (or schema-less entities).
+    // Keep only entities whose owning schema is in the selected set. A schema entity
+    // "belongs to" itself (its own name), so it must be filtered by name — otherwise a
+    // denylisted/excluded schema (e.g. Supabase `extensions`) would still get a stray
+    // ddl/schema/<name>.ddl file even though it's left out of design.yaml. Truly
+    // schema-less entities (e.g. roles) have no owning schema and are always kept.
     let kept: Vec<_> = entities
         .into_iter()
-        .filter(|e| e.schema.as_ref().is_none_or(|s| selected.contains(s)))
+        .filter(|e| {
+            let owning = if e.entity_type == dbd_core::EntityType::Schema {
+                Some(e.name.as_str())
+            } else {
+                e.schema.as_deref()
+            };
+            owning.is_none_or(|s| selected.iter().any(|sel| sel == s))
+        })
         .collect();
 
     // 3. build write-plan
