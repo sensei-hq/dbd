@@ -348,6 +348,7 @@ async fn introspect_returns_fixture_entities() {
         ALTER TABLE revtest.widget ADD CONSTRAINT widget_name_key UNIQUE (name);
 
         CREATE INDEX widget_owner_idx ON revtest.widget (owner_id);
+        CREATE INDEX widget_lower_name_idx ON revtest.widget (lower(name));
 
         COMMENT ON TABLE revtest.widget IS 'Widget objects';
         COMMENT ON COLUMN revtest.widget.name IS 'Display name';
@@ -433,9 +434,16 @@ async fn introspect_returns_fixture_entities() {
     let unique_cols = unique.expect("widget should have a UNIQUE constraint");
     assert!(unique_cols.contains(&"name".to_string()), "UNIQUE should be on 'name'");
 
-    // Non-constraint index widget_owner_idx
+    // Non-constraint index widget_owner_idx (plain column — must be captured)
     let idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_owner_idx"));
     assert!(idx.is_some(), "index 'widget_owner_idx' should be present");
+
+    // Expression index widget_lower_name_idx — must be skipped (IndexDef cannot represent it)
+    let expr_idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_lower_name_idx"));
+    assert!(
+        expr_idx.is_none(),
+        "expression index 'widget_lower_name_idx' should NOT appear in introspect output"
+    );
 
     // Table comment
     assert_eq!(
