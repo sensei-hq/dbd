@@ -90,12 +90,15 @@ pub async fn run(
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 
         Commands::Init { name, target, from_db, version, schemas, exclude_schemas, all_schemas, force_overwrite, dry_run } => {
-            if let Some(conn) = from_db {
+            if let Some(s) = from_db {
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
                     all: *all_schemas,
                 };
+                // Resolve: empty string (--from-db with no value) → env fallback (None);
+                // non-empty string → explicit URL (Some(s)).
+                let conn = if s.is_empty() { None } else { Some(s.as_str()) };
                 reverse::cmd_init_from_db(project_dir, conn, name.as_deref(), *version, sel, *force_overwrite, *dry_run).await
             } else {
                 let project_name = name.as_deref().unwrap_or_else(|| {

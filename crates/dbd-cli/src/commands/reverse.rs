@@ -3,8 +3,21 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use dbd_core::reverse::{self, SchemaSelect};
 
+/// Returns schemas that appear in `written` but not in `declared`, sorted and deduped.
+fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
+    let declared_set: std::collections::HashSet<&String> = declared.iter().collect();
+    let mut result: Vec<String> = written
+        .iter()
+        .filter(|s| !declared_set.contains(s))
+        .cloned()
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+
 /// Resolve the connection string: explicit arg, else $DATABASE_URL.
-fn resolve_conn(arg: Option<&str>) -> Result<String> {
+pub(crate) fn resolve_conn(arg: Option<&str>) -> Result<String> {
     if let Some(c) = arg {
         return Ok(c.to_string());
     }
@@ -15,7 +28,7 @@ fn resolve_conn(arg: Option<&str>) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_init_from_db(
     project_dir: &Path,
-    conn: &str,
+    conn: Option<&str>,
     name: Option<&str>,
     version: u32,
     sel: SchemaSelect,
@@ -25,7 +38,10 @@ pub async fn cmd_init_from_db(
     if project_dir.join("design.yaml").exists() {
         bail!("design.yaml already exists here — use `dbd merge` to sync a DB into an existing project");
     }
-    run(project_dir, conn, name, Some(version), sel, force, dry_run, true).await
+    let conn = resolve_conn(conn)?;
+    run(project_dir, &conn, name, Some(version), sel, force, dry_run, true)
+        .await
+        .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,11 +52,24 @@ pub async fn cmd_merge(
     force: bool,
     dry_run: bool,
 ) -> Result<()> {
-    if !project_dir.join("design.yaml").exists() {
+    let design_yaml_path = project_dir.join("design.yaml");
+    if !design_yaml_path.exists() {
         bail!("no design.yaml here — use `dbd init --from-db <conn>` to start a new project");
     }
     let conn = resolve_conn(conn)?;
-    run(project_dir, &conn, None, None, sel, force, dry_run, false).await
+    let covered = run(project_dir, &conn, None, None, sel, force, dry_run, false).await?;
+
+    // Warn about schemas written but not declared in design.yaml (spec line 67).
+    let config = dbd_core::config::read(&design_yaml_path)
+        .context("failed to re-read design.yaml for schema validation")?;
+    let declared = config.schema_names();
+    for schema in undeclared_schemas(&covered, &declared) {
+        eprintln!(
+            "  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files"
+        );
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,7 +82,7 @@ async fn run(
     force: bool,
     dry_run: bool,
     write_config: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // 1. connect + introspect
     let adapter = dbd_core::connect(conn, "reverse")
         .await
@@ -70,7 +99,7 @@ async fn run(
     let selected = reverse::select_schemas(&db_schemas, &sel);
     if selected.is_empty() {
         println!("No user schemas to reverse-engineer (after filtering). Nothing to do.");
-        return Ok(());
+        return Ok(vec![]);
     }
 
     // Keep only entities whose schema is in the selected set (or schema-less entities).
@@ -105,7 +134,7 @@ async fn run(
     for label in &plan.skipped_unsafe {
         eprintln!("  warning: skipped unsafe path segment: {label}");
     }
-    Ok(())
+    Ok(selected)
 }
 
 /// Parse the database name out of a connection string for the default project name.
@@ -116,5 +145,54 @@ fn db_name_from_conn(conn: &str) -> Option<String> {
         None
     } else {
         Some(db.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// All written schemas are declared — no warnings.
+    #[test]
+    fn undeclared_schemas_all_declared_returns_empty() {
+        let written = strs(&["app", "config"]);
+        let declared = strs(&["app", "config", "staging"]);
+        assert_eq!(undeclared_schemas(&written, &declared), Vec::<String>::new());
+    }
+
+    /// One written schema is missing from declared — returned.
+    #[test]
+    fn undeclared_schemas_one_missing() {
+        let written = strs(&["app", "new_schema"]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["new_schema"]));
+    }
+
+    /// Duplicates in `written` are deduped in the result.
+    #[test]
+    fn undeclared_schemas_deduplicates() {
+        let written = strs(&["app", "app", "new_schema", "new_schema"]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["new_schema"]));
+    }
+
+    /// Result is sorted alphabetically.
+    #[test]
+    fn undeclared_schemas_sorted() {
+        let written = strs(&["zzz", "aaa", "mmm"]);
+        let declared = strs(&[]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["aaa", "mmm", "zzz"]));
+    }
+
+    /// Empty written — empty result regardless of declared.
+    #[test]
+    fn undeclared_schemas_empty_written() {
+        let written = strs(&[]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), Vec::<String>::new());
     }
 }

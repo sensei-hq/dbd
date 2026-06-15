@@ -177,7 +177,7 @@ pub enum Commands {
         #[arg(short, long, default_value = "postgres")]
         target: String,
         /// Reverse-engineer the project from a database connection string (or $DATABASE_URL)
-        #[arg(long, value_name = "CONN")]
+        #[arg(long, value_name = "CONN", num_args = 0..=1, default_missing_value = "")]
         from_db: Option<String>,
         /// Base project version written to design.yaml
         #[arg(long, default_value_t = 1)]
@@ -270,6 +270,39 @@ mod tests {
         assert!(init.is_ok(), "init --from-db failed");
         let merge = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--dry-run", "--all-schemas"]);
         assert!(merge.is_ok(), "merge failed");
+    }
+
+    /// `dbd init --from-db` (no value) must parse to `from_db == Some("")` (env-fallback sentinel).
+    #[test]
+    fn init_from_db_no_value_uses_env_fallback_sentinel() {
+        let cli = Cli::try_parse_from(["dbd", "init", "--from-db"])
+            .expect("init --from-db (no value) should parse");
+        assert!(
+            matches!(&cli.command, Commands::Init { from_db: Some(s), .. } if s.is_empty()),
+            "expected from_db == Some(\"\")"
+        );
+    }
+
+    /// `dbd init --from-db postgres://h/db` must parse to that URL.
+    #[test]
+    fn init_from_db_with_value_captures_url() {
+        let cli = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://h/db"])
+            .expect("init --from-db <url> should parse");
+        assert!(
+            matches!(&cli.command, Commands::Init { from_db: Some(s), .. } if s == "postgres://h/db"),
+            "expected from_db == Some(\"postgres://h/db\")"
+        );
+    }
+
+    /// `dbd init` (no --from-db flag at all) must parse to `from_db == None`.
+    #[test]
+    fn init_without_from_db_parses_to_none() {
+        let cli = Cli::try_parse_from(["dbd", "init"])
+            .expect("init with no flags should parse");
+        assert!(
+            matches!(&cli.command, Commands::Init { from_db: None, .. }),
+            "expected from_db == None"
+        );
     }
 
     /// The global `-d/--database <url>` and `inspect --from-db` must coexist.
