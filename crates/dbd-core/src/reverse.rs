@@ -65,6 +65,72 @@ pub const MANAGED_KINDS: &[EntityType] = &[
     EntityType::Table, EntityType::View,
 ];
 
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAction { Create, Skip, Conflict }
+
+#[derive(Debug, Clone)]
+pub struct PlanItem {
+    /// Path relative to the project root.
+    pub path: PathBuf,
+    pub content: String,
+    pub action: FileAction,
+}
+
+#[derive(Debug, Default)]
+pub struct WritePlan {
+    pub items: Vec<PlanItem>,
+    /// Existing managed-kind files under a selected schema with no generated counterpart.
+    pub orphans: Vec<PathBuf>,
+}
+
+/// Classify each generated file vs disk, and detect orphans within `selected_schemas`
+/// for the managed kinds only.
+pub fn build_plan(
+    root: &Path,
+    generated: Vec<(PathBuf, String)>,
+    selected_schemas: &[String],
+) -> WritePlan {
+    let mut items = Vec::new();
+    let generated_paths: std::collections::HashSet<PathBuf> =
+        generated.iter().map(|(p, _)| p.clone()).collect();
+
+    for (rel, content) in generated {
+        let abs = root.join(&rel);
+        let action = match std::fs::read_to_string(&abs) {
+            Ok(existing) if existing == content => FileAction::Skip,
+            Ok(_) => FileAction::Conflict,
+            Err(_) => FileAction::Create,
+        };
+        items.push(PlanItem { path: rel, content, action });
+    }
+
+    // Orphans: walk ddl/<managed-kind>/<selected-schema>/*.sql not in generated.
+    let mut orphans = Vec::new();
+    for kind in MANAGED_KINDS {
+        if !kind.has_schema() {
+            continue; // schema/extension live flat; skip orphan scan for them in v1
+        }
+        for schema in selected_schemas {
+            let dir = root.join("ddl").join(kind.tag()).join(schema);
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                    continue;
+                }
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                if !generated_paths.contains(&rel) {
+                    orphans.push(rel);
+                }
+            }
+        }
+    }
+    orphans.sort();
+    WritePlan { items, orphans }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +173,36 @@ mod tests {
         assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.sql"));
         let s = Entity::new(EntityType::Schema, "shop");
         assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.sql"));
+    }
+
+    #[test]
+    fn build_plan_classifies_files() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // existing files: one identical, one differing, one orphan
+        fs::create_dir_all(root.join("ddl/table/shop")).unwrap();
+        fs::write(root.join("ddl/table/shop/orders.sql"), "SAME").unwrap();
+        fs::write(root.join("ddl/table/shop/customers.sql"), "OLD").unwrap();
+        fs::write(root.join("ddl/table/shop/legacy.sql"), "ORPHAN").unwrap();
+        // an unmanaged kind that must NOT be flagged as orphan:
+        fs::create_dir_all(root.join("ddl/function/shop")).unwrap();
+        fs::write(root.join("ddl/function/shop/f.sql"), "FN").unwrap();
+
+        let generated = vec![
+            (PathBuf::from("ddl/table/shop/orders.sql"), "SAME".to_string()),     // skip
+            (PathBuf::from("ddl/table/shop/customers.sql"), "NEW".to_string()),   // conflict
+            (PathBuf::from("ddl/table/shop/products.sql"), "NEW".to_string()),    // create
+        ];
+        let plan = build_plan(root, generated, &["shop".to_string()]);
+
+        let by = |a: FileAction| plan.items.iter().filter(|i| i.action == a)
+            .map(|i| i.path.clone()).collect::<Vec<_>>();
+        assert_eq!(by(FileAction::Skip), vec![PathBuf::from("ddl/table/shop/orders.sql")]);
+        assert_eq!(by(FileAction::Conflict), vec![PathBuf::from("ddl/table/shop/customers.sql")]);
+        assert_eq!(by(FileAction::Create), vec![PathBuf::from("ddl/table/shop/products.sql")]);
+        assert_eq!(plan.orphans, vec![PathBuf::from("ddl/table/shop/legacy.sql")]);
+        // function file is unmanaged → never an orphan
+        assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("function")));
     }
 }
