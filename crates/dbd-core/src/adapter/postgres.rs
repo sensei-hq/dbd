@@ -283,11 +283,15 @@ impl PostgresAdapter {
 
         let ns_filter = Self::schema_filter_column("c.table_schema");
 
-        // 1. Fetch all base tables in user schemas
+        // 1. Fetch all base tables in user schemas. Skip dbd's own bookkeeping
+        //    tables (`_dbd_meta`, `_dbd_migrations`) — they are created/managed by
+        //    `dbd apply`, not authored DDL, so they must never be reverse-engineered
+        //    into the project (mirrors the sqlite adapter's exclusion).
         let tables_sql = format!(
             "SELECT c.table_schema, c.table_name \
              FROM information_schema.tables c \
              WHERE c.table_type = 'BASE TABLE' AND {ns_filter} \
+             AND c.table_name NOT IN ('_dbd_meta', '_dbd_migrations') \
              ORDER BY c.table_schema, c.table_name"
         );
         let table_rows = sqlx::query(&tables_sql)
@@ -517,9 +521,14 @@ impl PostgresAdapter {
                     .try_get::<Vec<String>, _>("col_names")
                     .unwrap_or_default();
 
+                use crate::entity::IndexType;
                 let index_type = match index_type_str.as_str() {
-                    "hash" => Some(crate::entity::IndexType::Hash),
-                    _ => None, // btree is default, represent as None
+                    "hash" => Some(IndexType::Hash),
+                    "gin" => Some(IndexType::Gin),
+                    "gist" => Some(IndexType::Gist),
+                    "brin" => Some(IndexType::Brin),
+                    "spgist" => Some(IndexType::SpGist),
+                    _ => None, // btree is the default — represent as None (no USING clause)
                 };
 
                 indexes.push(IndexDef {
