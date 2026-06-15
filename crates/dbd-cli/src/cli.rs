@@ -176,6 +176,47 @@ pub enum Commands {
         /// Target platform
         #[arg(short, long, default_value = "postgres")]
         target: String,
+        /// Reverse-engineer the project from a database connection string (or $DATABASE_URL)
+        #[arg(long, value_name = "CONN")]
+        from_db: Option<String>,
+        /// Base project version written to design.yaml
+        #[arg(long, default_value_t = 1)]
+        version: u32,
+        /// Limit to these schemas (repeatable)
+        #[arg(long = "schema", value_name = "SCHEMA")]
+        schemas: Vec<String>,
+        /// Exclude these schemas (repeatable)
+        #[arg(long = "exclude-schema", value_name = "SCHEMA")]
+        exclude_schemas: Vec<String>,
+        /// Include Supabase platform schemas (bypass the denylist)
+        #[arg(long)]
+        all_schemas: bool,
+        /// On conflict, back up existing files to .bak and overwrite
+        #[arg(long)]
+        force_overwrite: bool,
+        /// Print the plan without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Sync a database into the current dbd project (reverse-engineer + merge)
+    Merge {
+        /// Database connection string (or $DATABASE_URL)
+        conn: Option<String>,
+        /// Limit to these schemas (repeatable)
+        #[arg(long = "schema", value_name = "SCHEMA")]
+        schemas: Vec<String>,
+        /// Exclude these schemas (repeatable)
+        #[arg(long = "exclude-schema", value_name = "SCHEMA")]
+        exclude_schemas: Vec<String>,
+        /// Include Supabase platform schemas (bypass the denylist)
+        #[arg(long)]
+        all_schemas: bool,
+        /// On conflict, back up existing files to .bak and overwrite
+        #[arg(long)]
+        force_overwrite: bool,
+        /// Print the plan without writing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Format DDL files
     Format {
@@ -218,6 +259,17 @@ mod tests {
             Cli::try_parse_from(["dbd", c])
                 .unwrap_or_else(|e| panic!("`dbd {c}` failed to parse: {e}"));
         }
+        // merge requires a positional conn argument
+        Cli::try_parse_from(["dbd", "merge", "postgres://x"])
+            .unwrap_or_else(|e| panic!("`dbd merge postgres://x` failed to parse: {e}"));
+    }
+
+    #[test]
+    fn init_from_db_and_merge_parse() {
+        let init = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x", "--version", "2"]);
+        assert!(init.is_ok(), "init --from-db failed");
+        let merge = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--dry-run", "--all-schemas"]);
+        assert!(merge.is_ok(), "merge failed");
     }
 
     /// The global `-d/--database <url>` and `inspect --from-db` must coexist.
