@@ -135,6 +135,31 @@ fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
     }
 }
 
+/// `CREATE VIEW "schema"."name" AS <definition>;`
+/// The view body is carried in `entity.writes[0]` (set by the introspector).
+pub fn emit_view(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+    let name = bare(&entity.name);
+    let body = entity.writes.first().map(String::as_str).unwrap_or("SELECT 1");
+    let body = body.trim().trim_end_matches(';');
+    format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
+}
+
+/// Emit DDL text for any reverse-engineerable entity, or `None` for kinds we
+/// don't generate (External, file-based Function/Procedure in this cut).
+pub fn emit_entity(entity: &Entity) -> Option<String> {
+    use crate::entity::EntityType;
+    match entity.entity_type {
+        EntityType::Schema | EntityType::Extension | EntityType::Role => {
+            crate::script::ddl_from_entity(entity)
+        }
+        EntityType::Enum => Some(emit_enum(entity)),
+        EntityType::Table => Some(emit_table(entity)),
+        EntityType::View => Some(emit_view(entity)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +259,26 @@ mod tests {
         let parsed = parsed_entity.table_def.expect("parsed entity should have a table_def");
         let cols: Vec<&str> = parsed.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(cols, vec!["id", "customer_id", "total_cents"]);
+    }
+
+    #[test]
+    fn emits_view() {
+        let mut e = Entity::new(EntityType::View, "shop.active_orders");
+        e.references = vec![];
+        // We store the view body in entity.writes[0] per the introspector contract:
+        e.writes = vec!["SELECT * FROM shop.orders WHERE status = 'paid'".into()];
+        let sql = emit_view(&e);
+        assert_eq!(
+            sql,
+            "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
+        );
+    }
+
+    #[test]
+    fn emit_entity_dispatches_by_type() {
+        let s = Entity::new(EntityType::Schema, "shop");
+        assert_eq!(emit_entity(&s).unwrap(), "CREATE SCHEMA IF NOT EXISTS \"shop\";");
+        let ext_none = Entity::new(EntityType::External, "auth.users");
+        assert!(emit_entity(&ext_none).is_none());
     }
 }
