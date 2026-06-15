@@ -1,5 +1,14 @@
 export type Column = { name: string; type: string; pk?: boolean; nn?: boolean; en?: boolean; def?: string; note?: string };
-export type Table = { schema: string; name: string; kind: string; note?: string; noteMd?: string; columns: Column[] };
+export type Index = { def: string; unique?: boolean; name?: string };
+export type Table = {
+  schema: string;
+  name: string;
+  kind: string;
+  note?: string;
+  noteMd?: string;
+  columns: Column[];
+  indexes?: Index[];
+};
 export type RefEnd = { s: string; t: string; c: string };
 export type Ref = { from: RefEnd; to: RefEnd; action?: string };
 export type SchemaModel = {

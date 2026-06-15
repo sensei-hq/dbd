@@ -83,5 +83,37 @@ export default {
 		error: 'sky',
 		info: 'sky'
 	},
-	shape: { radius: 'soft' }
+	shape: { radius: 'soft' },
+	// Design-tool token set (docs/mockup/designs/app-styles.css), applied
+	// site-wide. Reserved names (paper / accent / accent-soft) override the
+	// skin-derived defaults; the rest emit as new custom tokens with
+	// bg-/text-/border- utilities. Every entry is { light, dark } so the
+	// values flip under [data-mode="dark"]. Surface→paper rename preserved.
+	overrides: {
+		// surfaces
+		bg: { light: 'oklch(0.987 0.006 85)', dark: 'oklch(0.185 0.035 245)' },
+		'bg-deep': { light: 'oklch(0.967 0.008 85)', dark: 'oklch(0.15 0.035 245)' },
+		paper: { light: 'oklch(0.996 0.004 85)', dark: 'oklch(0.225 0.037 245)' },
+		'paper-2': { light: 'oklch(0.978 0.006 85)', dark: 'oklch(0.27 0.038 245)' },
+		line: { light: 'oklch(0.905 0.009 85)', dark: 'oklch(0.325 0.04 245)' },
+		'line-soft': { light: 'oklch(0.942 0.007 85)', dark: 'oklch(0.27 0.035 245)' },
+		edge: { light: 'oklch(0.78 0.02 250)', dark: 'oklch(0.42 0.035 245)' },
+		'edge-dim': { light: 'oklch(0.885 0.012 250)', dark: 'oklch(0.32 0.035 245)' },
+		'code-bg': { light: 'oklch(0.97 0.008 85)', dark: 'oklch(0.16 0.035 245)' },
+		// text
+		fg: { light: 'oklch(0.25 0.012 80)', dark: 'oklch(0.965 0.006 240)' },
+		muted: { light: 'oklch(0.48 0.014 80)', dark: 'oklch(0.74 0.014 245)' },
+		faint: { light: 'oklch(0.62 0.014 80)', dark: 'oklch(0.58 0.016 245)' },
+		// accent (two shades + supports)
+		accent: { light: 'oklch(0.55 0.13 245)', dark: 'oklch(0.78 0.12 245)' },
+		'accent-2': { light: 'oklch(0.49 0.135 245)', dark: 'oklch(0.7 0.12 245)' },
+		'on-accent': { light: 'oklch(0.99 0.012 245)', dark: 'oklch(0.17 0.02 245)' },
+		'accent-soft': { light: 'oklch(0.93 0.035 245)', dark: 'oklch(0.3 0.05 245)' },
+		'accent-line': { light: 'oklch(0.83 0.06 245)', dark: 'oklch(0.42 0.07 245)' },
+		// elevation
+		'shadow-card': {
+			light: '0 1px 2px oklch(0.2 0.02 250 / 0.07), 0 6px 20px oklch(0.2 0.02 250 / 0.06)',
+			dark: '0 1px 2px oklch(0 0 0 / 0.35), 0 8px 24px oklch(0 0 0 / 0.25)'
+		}
+	}
 };

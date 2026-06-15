@@ -20,6 +20,10 @@
 }
 
 body {
+	/* The global UnoCSS preflight isn't resetting the UA body margin here, so the
+	   default 8px margin leaked in — pushing the full-bleed h-screen /diagram
+	   shell 16px past the viewport (a stray scrollbar). Reset it. */
+	margin: 0;
 	font-family: '"IBM Plex Sans"', 'IBM Plex Sans', system-ui, sans-serif;
 	-webkit-font-smoothing: antialiased;
 }

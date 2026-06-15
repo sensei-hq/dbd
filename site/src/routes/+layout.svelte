@@ -19,9 +19,11 @@
 
 	let { children } = $props();
 
-	// The /diagram route is a full-bleed app shell; hide the marketing-site
-	// Nav/Footer there (the Viewer owns the entire viewport).
-	const isApp = $derived(page.url.pathname.startsWith('/diagram'));
+	// The /diagram + /projects routes are the full-bleed app shell; hide the
+	// marketing-site Nav/Footer there (the design app owns the viewport).
+	const isApp = $derived(
+		page.url.pathname.startsWith('/diagram') || page.url.pathname.startsWith('/projects')
+	);
 
 	// Seed vibe from the mode the pre-paint themeHook resolved so first visit
 	// (no stored pref) honours the light default rather than vibe's 'dark'.

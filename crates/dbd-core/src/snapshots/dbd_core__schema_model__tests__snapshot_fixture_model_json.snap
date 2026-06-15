@@ -1,5 +1,6 @@
 ---
 source: crates/dbd-core/src/schema_model.rs
+assertion_line: 328
 expression: json
 ---
 {
@@ -88,6 +89,13 @@ expression: json
           "name": "notes",
           "type": "TEXT"
         }
+      ],
+      "indexes": [
+        {
+          "def": "(lookup_id, value)",
+          "unique": true,
+          "name": "lookup_values_ukey"
+        }
       ]
     },
     {
@@ -146,6 +154,13 @@ expression: json
           "name": "display_order",
           "type": "INTEGER",
           "def": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "def": "(name)",
+          "unique": true,
+          "name": "lookup_ukey"
         }
       ]
     }

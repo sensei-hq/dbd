@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::design::Design;
-use crate::entity::{EntityType, FkAction, TableConstraint};
+use crate::entity::{EntityType, FkAction, SortOrder, TableConstraint};
 use crate::scope::ResolvedScope;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -43,6 +43,20 @@ pub struct TableNode {
     #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
     pub note_md: Option<String>,
     pub columns: Vec<Column>,
+    /// Table-level UNIQUE constraints + explicit indexes. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<Index>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Index {
+    /// Column spec, e.g. "(email)" or "(status, placed_at DESC)".
+    pub def: String,
+    /// unique index / constraint
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unique: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -149,6 +163,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
             note: note_first_line(def),
             note_md: def.comments.table.clone(),
             columns,
+            indexes: collect_indexes(def),
         });
 
         for fk in collect_fks(def) {
@@ -205,6 +220,32 @@ fn note_first_line(def: &crate::entity::TableDef) -> Option<String> {
         let first = t.lines().next().unwrap_or("").trim();
         if first.is_empty() { None } else { Some(first.to_string()) }
     })
+}
+
+/// Table-level UNIQUE constraints + explicit indexes, formatted for the viewer's
+/// Indexes section. `def` is the column spec ("(a, b DESC)"); `unique` drives the
+/// UNIQUE badge; `name` is the constraint/index name when known.
+fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
+    let cols = |columns: &[String]| format!("({})", columns.join(", "));
+    let mut out = Vec::new();
+    for c in &def.constraints {
+        if let TableConstraint::Unique { name, columns } = c {
+            out.push(Index { def: cols(columns), unique: true, name: name.clone() });
+        }
+    }
+    for ix in &def.indexes {
+        let spec = ix
+            .columns
+            .iter()
+            .map(|c| match c.order {
+                Some(SortOrder::Desc) => format!("{} DESC", c.name),
+                _ => c.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(Index { def: format!("({spec})"), unique: ix.unique, name: ix.name.clone() });
+    }
+    out
 }
 
 /// All foreign keys on a table: inline column FKs + table-level FK constraints.
@@ -307,6 +348,7 @@ mod tests {
                     def: Some("gen_random_uuid()".into()),
                     note: None,
                 }],
+                indexes: vec![],
             }],
             refs: vec![],
         };

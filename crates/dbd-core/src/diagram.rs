@@ -47,6 +47,7 @@ mod tests {
                     name: "id".to_string(), ty: "uuid".to_string(),
                     pk: true, nn: true, en: false, def: None, note: None,
                 }],
+                indexes: vec![],
             }],
             refs: vec![],
         }
