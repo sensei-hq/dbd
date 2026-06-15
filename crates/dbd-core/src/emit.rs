@@ -121,8 +121,10 @@ pub fn emit_table(entity: &Entity) -> String {
             // btree (Some(Btree) or None) is the default — no USING clause.
             _ => "",
         };
+        // Postgres grammar: CREATE [UNIQUE] INDEX name ON table [USING method] (cols)
+        // — the access method goes AFTER the table, before the column list.
         out.push_str(&format!(
-            "\nCREATE {unique}INDEX {}{using} ON {qname} ({cols});",
+            "\nCREATE {unique}INDEX {} ON {qname}{using} ({cols});",
             q(&idx_name)
         ));
     }
@@ -377,10 +379,10 @@ mod tests {
         // Non-btree methods are emitted faithfully — a GIN/GiST index on an array /
         // tsvector column would be invalid as a plain btree, so the access method
         // must survive reverse-engineering.
-        assert!(sql.contains("CREATE INDEX \"docs_tags_idx\" USING gin ON \"app\".\"docs\" (\"tags\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_body_idx\" USING gist ON \"app\".\"docs\" (\"body\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_n_brin_idx\" USING brin ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_n_hash_idx\" USING hash ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"), "got:\n{sql}");
+        assert!(sql.contains("CREATE INDEX \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"), "got:\n{sql}");
         // btree (None) emits no USING clause.
         assert!(sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
     }
