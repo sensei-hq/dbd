@@ -51,7 +51,7 @@ pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String>
 /// - or contains any of `/`, `\`, or a NUL byte.
 ///
 /// Entity names and schema names are written verbatim into file-system paths
-/// (`ddl/<kind>/<schema>/<name>.sql`).  Without this check a pathological but
+/// (`ddl/<kind>/<schema>/<name>.ddl`).  Without this check a pathological but
 /// technically-legal SQL identifier could escape the project root.
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
@@ -65,8 +65,13 @@ fn is_safe_segment(s: &str) -> bool {
 use crate::entity::{Entity, EntityType};
 use std::path::PathBuf;
 
-/// Map an entity to its DDL file path: `ddl/<kind>/<schema>/<name>.sql` for
-/// schema-qualified kinds, `ddl/<kind>/<name>.sql` otherwise.
+/// Map an entity to its DDL file path: `ddl/<kind>/<schema>/<name>.ddl` for
+/// schema-qualified kinds, `ddl/<kind>/<name>.ddl` otherwise.
+///
+/// `.ddl` is dbd's canonical extension — it is what `dbd init` scaffolds and what
+/// existing projects use — so reverse-engineered files line up with (and `merge`
+/// reconciles against) the files already on disk rather than creating `.sql`
+/// duplicates. The scanner accepts both `.ddl` and `.sql`.
 pub fn entity_path(entity: &Entity) -> PathBuf {
     let kind = entity.entity_type.tag(); // "table", "enum", "view", "schema", "extension"
     let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
@@ -75,7 +80,7 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
     if entity.entity_type.has_schema() && let Some(schema) = &entity.schema {
         p.push(schema);
     }
-    p.push(format!("{name}.sql"));
+    p.push(format!("{name}.ddl"));
     p
 }
 
@@ -130,7 +135,7 @@ pub fn build_plan(
         items.push(PlanItem { path: rel, content, action });
     }
 
-    // Orphans: walk ddl/<managed-kind>/<selected-schema>/*.sql not in generated.
+    // Orphans: walk ddl/<managed-kind>/<selected-schema>/*.{ddl,sql} not in generated.
     let mut orphans = Vec::new();
     for kind in MANAGED_KINDS {
         if !kind.has_schema() {
@@ -141,7 +146,13 @@ pub fn build_plan(
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                // Accept both dbd DDL extensions so a stale file is flagged
+                // regardless of which one the project uses.
+                let is_ddl = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "ddl" || e == "sql");
+                if !is_ddl {
                     continue;
                 }
                 let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
@@ -165,7 +176,7 @@ pub struct Report {
     pub orphans: usize,
 }
 
-/// Pick a non-colliding `.bak` path: `a.sql.bak`, `a.sql.bak.1`, …
+/// Pick a non-colliding `.bak` path: `a.ddl.bak`, `a.ddl.bak.1`, …
 fn backup_path(file: &Path) -> PathBuf {
     let base = format!("{}.bak", file.display());
     let mut p = PathBuf::from(&base);
@@ -331,11 +342,11 @@ mod tests {
     fn entity_paths_follow_ddl_convention() {
         use std::path::PathBuf;
         let t = Entity::new(EntityType::Table, "shop.orders");
-        assert_eq!(entity_path(&t), PathBuf::from("ddl/table/shop/orders.sql"));
+        assert_eq!(entity_path(&t), PathBuf::from("ddl/table/shop/orders.ddl"));
         let e = Entity::new(EntityType::Enum, "shop.order_status");
-        assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.sql"));
+        assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.ddl"));
         let s = Entity::new(EntityType::Schema, "shop");
-        assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.sql"));
+        assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.ddl"));
     }
 
     #[test]
@@ -343,28 +354,33 @@ mod tests {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // existing files: one identical, one differing, one orphan
+        // existing files: one identical, one differing, two orphans (one .ddl,
+        // one .sql — orphan detection must catch both dbd extensions)
         fs::create_dir_all(root.join("ddl/table/shop")).unwrap();
-        fs::write(root.join("ddl/table/shop/orders.sql"), "SAME").unwrap();
-        fs::write(root.join("ddl/table/shop/customers.sql"), "OLD").unwrap();
-        fs::write(root.join("ddl/table/shop/legacy.sql"), "ORPHAN").unwrap();
+        fs::write(root.join("ddl/table/shop/orders.ddl"), "SAME").unwrap();
+        fs::write(root.join("ddl/table/shop/customers.ddl"), "OLD").unwrap();
+        fs::write(root.join("ddl/table/shop/legacy.ddl"), "ORPHAN").unwrap();
+        fs::write(root.join("ddl/table/shop/old.sql"), "ORPHAN").unwrap();
         // an unmanaged kind that must NOT be flagged as orphan:
         fs::create_dir_all(root.join("ddl/function/shop")).unwrap();
-        fs::write(root.join("ddl/function/shop/f.sql"), "FN").unwrap();
+        fs::write(root.join("ddl/function/shop/f.ddl"), "FN").unwrap();
 
         let generated = vec![
-            (PathBuf::from("ddl/table/shop/orders.sql"), "SAME".to_string()),     // skip
-            (PathBuf::from("ddl/table/shop/customers.sql"), "NEW".to_string()),   // conflict
-            (PathBuf::from("ddl/table/shop/products.sql"), "NEW".to_string()),    // create
+            (PathBuf::from("ddl/table/shop/orders.ddl"), "SAME".to_string()),     // skip
+            (PathBuf::from("ddl/table/shop/customers.ddl"), "NEW".to_string()),   // conflict
+            (PathBuf::from("ddl/table/shop/products.ddl"), "NEW".to_string()),    // create
         ];
         let plan = build_plan(root, generated, &["shop".to_string()]);
 
         let by = |a: FileAction| plan.items.iter().filter(|i| i.action == a)
             .map(|i| i.path.clone()).collect::<Vec<_>>();
-        assert_eq!(by(FileAction::Skip), vec![PathBuf::from("ddl/table/shop/orders.sql")]);
-        assert_eq!(by(FileAction::Conflict), vec![PathBuf::from("ddl/table/shop/customers.sql")]);
-        assert_eq!(by(FileAction::Create), vec![PathBuf::from("ddl/table/shop/products.sql")]);
-        assert_eq!(plan.orphans, vec![PathBuf::from("ddl/table/shop/legacy.sql")]);
+        assert_eq!(by(FileAction::Skip), vec![PathBuf::from("ddl/table/shop/orders.ddl")]);
+        assert_eq!(by(FileAction::Conflict), vec![PathBuf::from("ddl/table/shop/customers.ddl")]);
+        assert_eq!(by(FileAction::Create), vec![PathBuf::from("ddl/table/shop/products.ddl")]);
+        assert_eq!(plan.orphans, vec![
+            PathBuf::from("ddl/table/shop/legacy.ddl"),
+            PathBuf::from("ddl/table/shop/old.sql"),
+        ]);
         // function file is unmanaged → never an orphan
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("function")));
     }
@@ -377,7 +393,7 @@ mod tests {
     fn apply_without_force_aborts_on_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let plan = WritePlan {
-            items: vec![item("ddl/table/s/a.sql", "NEW", FileAction::Conflict)],
+            items: vec![item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict)],
             orphans: vec![],
             skipped_unsafe: vec![],
         };
@@ -390,19 +406,19 @@ mod tests {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("ddl/table/s")).unwrap();
-        fs::write(dir.path().join("ddl/table/s/a.sql"), "OLD").unwrap();
+        fs::write(dir.path().join("ddl/table/s/a.ddl"), "OLD").unwrap();
         let plan = WritePlan {
             items: vec![
-                item("ddl/table/s/a.sql", "NEW", FileAction::Conflict),
-                item("ddl/table/s/b.sql", "B", FileAction::Create),
+                item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict),
+                item("ddl/table/s/b.ddl", "B", FileAction::Create),
             ],
-            orphans: vec![PathBuf::from("ddl/table/s/legacy.sql")],
+            orphans: vec![PathBuf::from("ddl/table/s/legacy.ddl")],
             skipped_unsafe: vec![],
         };
         let report = apply_plan(dir.path(), &plan, true, false).unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.sql")).unwrap(), "NEW");
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.sql.bak")).unwrap(), "OLD");
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/b.sql")).unwrap(), "B");
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.ddl")).unwrap(), "NEW");
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.ddl.bak")).unwrap(), "OLD");
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/b.ddl")).unwrap(), "B");
         assert_eq!(report.created, 1);
         assert_eq!(report.overwritten, 1);
         assert_eq!(report.orphans, 1);
@@ -412,12 +428,12 @@ mod tests {
     fn dry_run_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let plan = WritePlan {
-            items: vec![item("ddl/table/s/b.sql", "B", FileAction::Create)],
+            items: vec![item("ddl/table/s/b.ddl", "B", FileAction::Create)],
             orphans: vec![],
             skipped_unsafe: vec![],
         };
         apply_plan(dir.path(), &plan, false, true).unwrap();
-        assert!(!dir.path().join("ddl/table/s/b.sql").exists());
+        assert!(!dir.path().join("ddl/table/s/b.ddl").exists());
     }
 
     #[test]
@@ -430,10 +446,10 @@ mod tests {
 
         let plan = plan_from_entities(dir.path(), &entities, &["shop".into()]);
         let paths: Vec<String> = plan.items.iter().map(|i| i.path.display().to_string()).collect();
-        assert!(paths.contains(&"ddl/schema/shop.sql".to_string()));
-        assert!(paths.contains(&"ddl/enum/shop/status.sql".to_string()));
+        assert!(paths.contains(&"ddl/schema/shop.ddl".to_string()));
+        assert!(paths.contains(&"ddl/enum/shop/status.ddl".to_string()));
         // content was emitted
-        let enum_item = plan.items.iter().find(|i| i.path.ends_with("status.sql")).unwrap();
+        let enum_item = plan.items.iter().find(|i| i.path.ends_with("status.ddl")).unwrap();
         assert!(enum_item.content.contains("CREATE TYPE"));
     }
 
