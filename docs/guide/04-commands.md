@@ -254,6 +254,78 @@ Creates design.yaml, ddl/ directory structure, and a sample table DDL.
 Supabase target includes default external entities (auth.users, storage.objects)
 and ignore patterns for managed schemas.
 
+### Reverse-engineer from a database — `--from-db`
+
+Generate a whole project from an existing database instead of the sample scaffold. dbd
+introspects the catalog (schemas, extensions, enums, tables — columns, defaults,
+PK/FK/unique/check constraints, indexes, comments — and views), reconstructs canonical
+`CREATE …` DDL, and writes the usual `design.yaml` + `ddl/<kind>/<schema>/<name>.sql` tree.
+
+```sh
+dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
+dbd init --from-db                                # connection from $DATABASE_URL (or -d)
+dbd init --from-db $DATABASE_URL --version 3      # base project.version (default 1)
+dbd init --from-db ... --schema config --schema staging   # only these schemas
+dbd init --from-db ... --exclude-schema audit             # drop a schema
+dbd init --from-db ... --all-schemas              # include Supabase platform schemas
+dbd init --from-db ... --dry-run                  # print the plan, write nothing
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from-db [CONN]` | Reverse-engineer instead of scaffolding. With no value, the connection resolves from `-d`/`--database` then `$DATABASE_URL`. |
+| `--name NAME` | `project.name` (default: the database name from the connection). |
+| `--version N` | Base `project.version` written to `design.yaml` (default `1`). |
+| `--schema S` | Limit to exactly these schemas (repeatable). |
+| `--exclude-schema S` | Add to the exclusion set (repeatable). |
+| `--all-schemas` | Bypass the Supabase platform denylist (Postgres internals — `pg_catalog`, `information_schema`, `pg_temp*`, `pg_toast*` — are still always excluded). |
+| `--force-overwrite` | On conflict, back up the existing file to `.bak` and write the new one. |
+| `--dry-run` | Print the plan and exit; touch nothing. |
+
+**Schema selection.** Postgres internals are always excluded. On Supabase, platform schemas
+(`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`,
+`supabase_*`, `cron`, `net`, …) are excluded by default; `--all-schemas` includes them.
+`--schema` (allowlist) and `--exclude-schema` compose with these.
+
+**Secrets stay out of the repo.** The generated `design.yaml` target URL is written as the
+literal `$DATABASE_URL` env reference — never the connection string you passed.
+
+`init --from-db` refuses to run in a directory that already has a `design.yaml` (use
+`merge` to sync into an existing project). Reverse-engineering supports Postgres/Supabase
+connections only; `--target sqlite` with `--from-db` is rejected.
+
+---
+
+## `dbd merge`
+
+Sync a database into the **current** project — reverse-engineer, then reconcile against the
+files already on disk. Same introspection and emitter as `init --from-db`, but it never
+creates or edits `design.yaml`.
+
+```sh
+dbd merge postgres://user:pass@host/db   # sync into the current project
+dbd merge                                # connection from -d / $DATABASE_URL
+dbd merge --dry-run                      # preview the plan (create/conflict/orphan)
+dbd merge --force-overwrite              # back up conflicts to .bak, then overwrite
+dbd merge --schema config --exclude-schema audit   # same selection flags as init
+```
+
+Each generated file is classified before anything is written:
+
+- **create** — no file at the path → written.
+- **skip** — file exists and is byte-identical → left as-is (re-runs are idempotent).
+- **conflict** — file exists and differs. Without `--force-overwrite` the run **aborts**
+  and lists the conflicts (nothing is written). With `--force-overwrite`, the existing
+  file is renamed to `<name>.sql.bak` (`.bak.1`, `.bak.2`, … on collision) and the new
+  file is written.
+- **orphan** — an existing `.sql` of a managed kind under a selected schema with no
+  matching DB entity. **Orphans are reported, never deleted** — you handle removals.
+
+`merge` requires an existing project (it refuses if there's no `design.yaml`; use
+`init --from-db`). Because it never edits config, if it writes files for a schema not
+listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself. The
+report summarises `created · unchanged · overwritten · orphans`, listing the orphan paths.
+
 ---
 
 ## `dbd format`
