@@ -6,10 +6,10 @@ export default defineConfig({
   plugins: [svelte()],
   test: {
     environment: 'jsdom',
-    include: ['src/lib/viewer/**/*.test.ts'],
+    include: ['src/lib/**/*.test.ts'],
     // Polyfill jsdom gaps (matchMedia/scrollIntoView) Rokkit touches when the
     // Viewer mounts, so page tests that render it don't crash.
-    setupFiles: ['src/lib/viewer/test-setup.ts'],
+    setupFiles: ['src/lib/design/test-setup.ts'],
   },
   resolve: {
     // Use the `browser` package entry points so component mounting resolves the

@@ -1,0 +1,275 @@
+/* ============================================================
+   dbd designs — app-shell component styles
+
+   The design tokens (--paper, --fg, --accent, --accent-2 …) now live in
+   rokkit.config.js `overrides`, so they're global CSS vars + utilities
+   that flip under [data-mode="dark"]. This file no longer defines colors;
+   it carries the app-shell layout constants + the component classes
+   (.ds-*, .dg-*, .tree-*, col-badge) + a scoped preflight, all under `.dbd-app`
+   so the box-model/button reset doesn't leak to the rest of the site.
+   ============================================================ */
+
+/* ---- app-shell scope: layout constants + base ---- */
+.dbd-app {
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --radius-lg: 14px;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --header-h: 60px;
+  --sb-w: 272px;
+  --row-pad: 0.55rem;
+
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+
+/* ============================================================
+   SCOPED PREFLIGHT
+   The app's global reset doesn't set border-box on this subtree, so
+   `width:100%` inputs overflow and bare <button>s show native UA chrome
+   (the boxed tabs). Re-apply the Tailwind-style reset, scoped to `.dbd-app`
+   and wrapped in :where() so it's zero-specificity — utility classes
+   (border-b-2, .ds-btn …) always win over this baseline.
+   ============================================================ */
+:where(.dbd-app) *,
+:where(.dbd-app) *::before,
+:where(.dbd-app) *::after {
+  box-sizing: border-box;
+  border-width: 0;
+  border-style: solid;
+  border-color: var(--line);
+}
+:where(.dbd-app) button {
+  appearance: none;
+  background-color: transparent;
+  background-image: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+/* Block-element margins: UA defaults (margin: 1em on p/ul/h*) compound with
+   flex `gap-*` and inflate the entities comment cell. Zero them like the
+   Tailwind preflight; spacing comes from `gap-*` utilities instead. */
+:where(.dbd-app) h1,
+:where(.dbd-app) h2,
+:where(.dbd-app) h3,
+:where(.dbd-app) h4,
+:where(.dbd-app) p,
+:where(.dbd-app) figure,
+:where(.dbd-app) blockquote,
+:where(.dbd-app) pre,
+:where(.dbd-app) ul,
+:where(.dbd-app) ol {
+  margin: 0;
+}
+:where(.dbd-app) ul,
+:where(.dbd-app) ol {
+  padding: 0;
+  list-style: none;
+}
+
+/* Color utilities (bg-paper, text-fg, border-accent-line, …) are emitted
+   globally by the rokkit overrides — no scoped definitions needed here. */
+
+/* ---- custom sizes / radii (not in UnoCSS theme) ---- */
+.dbd-app .text-h3 { font-size: 1.55rem; line-height: 1.25; letter-spacing: -0.015em; }
+.dbd-app .text-label { font-size: 0.72rem; line-height: 1.1; letter-spacing: 0.14em; }
+.dbd-app .rounded-app { border-radius: var(--radius); }
+.dbd-app .rounded-app-lg { border-radius: var(--radius-lg); }
+.dbd-app .rounded-app-sm { border-radius: var(--radius-sm); }
+.dbd-app .font-display { font-family: var(--font-display); }
+
+/* ============================================================
+   BUTTONS / INPUTS / BADGES
+   ============================================================ */
+.dbd-app .ds-btn {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  font-size: 0.875rem; font-weight: 500; line-height: 1;
+  padding: 0.62rem 1rem; border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--paper); color: var(--fg);
+  cursor: pointer; transition: border-color 0.15s, background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.dbd-app .ds-btn:hover { border-color: var(--accent-line); color: var(--accent-2); }
+.dbd-app .ds-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.dbd-app .ds-btn-primary:hover { background: var(--accent-2); border-color: var(--accent-2); color: var(--on-accent); }
+
+.dbd-app .ds-iconbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border-radius: var(--radius-sm);
+  border: 1px solid transparent; background: transparent; color: var(--muted);
+  cursor: pointer; transition: background 0.15s, color 0.15s;
+}
+.dbd-app .ds-iconbtn:hover { background: var(--paper-2); color: var(--fg); }
+
+.dbd-app .ds-input {
+  width: 100%; font-size: 0.9rem; color: var(--fg);
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 0.62rem 0.85rem;
+  outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.dbd-app .ds-input::placeholder { color: var(--faint); }
+.dbd-app .ds-input:focus { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.dbd-app .ds-badge {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem; line-height: 1;
+  padding: 0.28rem 0.5rem; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted); background: var(--paper-2);
+}
+.dbd-app .ds-badge-accent { border-color: var(--accent-line); color: var(--accent-2); background: var(--accent-soft); }
+
+.dbd-app .col-badge {
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.6rem; font-weight: 600;
+  letter-spacing: 0.04em; line-height: 1; padding: 0.18rem 0.32rem;
+  border-radius: 4px; border: 1px solid var(--line); color: var(--faint);
+}
+.dbd-app .col-badge.pk { color: var(--accent-2); border-color: var(--accent-line); background: var(--accent-soft); }
+.dbd-app .col-badge.fk { color: var(--muted); background: var(--paper-2); }
+
+/* ---- cards ---- */
+.dbd-app .ds-card {
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-card);
+}
+.dbd-app a.ds-card,
+.dbd-app button.ds-card {
+  display: block; text-align: left;
+  transition: border-color 0.15s, transform 0.15s;
+}
+.dbd-app a.ds-card:hover,
+.dbd-app button.ds-card:hover { border-color: var(--accent-line); transform: translateY(-2px); }
+
+/* ============================================================
+   DIAGRAM
+   ============================================================ */
+.dbd-app .dg-dots {
+  background-image: radial-gradient(var(--line-soft) 1.1px, transparent 1.1px);
+  background-size: 26px 26px;
+}
+.dbd-app .dg-viewport { position: absolute; inset: 0; overflow: hidden; user-select: none; }
+.dbd-app .dg-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+
+.dbd-app .dg-cluster {
+  position: absolute; border: 1.5px dashed var(--line);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklch, var(--paper) 38%, transparent);
+}
+.dbd-app .dg-cluster-label {
+  position: absolute; top: -13px; left: 18px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; font-weight: 600;
+  letter-spacing: 0.08em; color: var(--muted);
+  background: var(--bg); padding: 2px 10px;
+  border: 1px solid var(--line); border-radius: 999px;
+}
+
+.dbd-app .dg-card {
+  position: absolute; background: var(--paper);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow-card); overflow: hidden; cursor: pointer;
+  transition: opacity 0.18s, border-color 0.15s, box-shadow 0.15s;
+}
+.dbd-app .dg-card:hover { border-color: var(--accent-line); }
+.dbd-app .dg-card.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-card); }
+.dbd-app .dg-card.rel { border-color: var(--accent-line); }
+.dbd-app .dg-card.dim { opacity: 0.35; }
+
+.dbd-app .dg-card-head {
+  display: flex; align-items: center; gap: 7px;
+  height: 40px; padding: 0 12px;
+  border-bottom: 1px solid var(--line-soft); background: var(--paper-2);
+}
+.dbd-app .dg-card.headonly .dg-card-head { border-bottom: none; }
+.dbd-app .dg-card-title {
+  font-family: var(--font-display); font-size: 0.86rem; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dbd-app .dg-row {
+  display: flex; align-items: center; gap: 8px;
+  height: 24px; padding: 0 12px; font-size: 0.72rem;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.dbd-app .dg-row .cname { color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dbd-app .dg-row .ctype { margin-left: auto; color: var(--faint); font-size: 0.66rem; white-space: nowrap; }
+.dbd-app .dg-row.iskey .cname { font-weight: 600; }
+.dbd-app .dg-more {
+  height: 22px; display: flex; align-items: center; padding: 0 12px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.64rem; color: var(--faint);
+}
+.dbd-app .dg-keyicon { width: 11px; flex: none; color: var(--accent-2); }
+.dbd-app .dg-fkicon { width: 11px; flex: none; color: var(--faint); }
+
+.dbd-app g.dg-edge path { stroke: var(--edge); stroke-width: 1.3; fill: none; transition: opacity 0.18s; }
+.dbd-app g.dg-edge .dot-from { fill: var(--edge); stroke: none; }
+.dbd-app g.dg-edge .dot-to { fill: var(--bg); stroke: var(--edge); stroke-width: 1.4; }
+.dbd-app g.dg-edge.hl path { stroke: var(--accent); stroke-width: 2.2; }
+.dbd-app g.dg-edge.hl .dot-from { fill: var(--accent); }
+.dbd-app g.dg-edge.hl .dot-to { stroke: var(--accent); }
+.dbd-app g.dg-edge.dim path { stroke: var(--edge-dim); opacity: 0.55; }
+.dbd-app g.dg-edge.dim .dot-from { fill: var(--edge-dim); }
+.dbd-app g.dg-edge.dim .dot-to { stroke: var(--edge-dim); }
+
+.dbd-app .dg-tools {
+  position: absolute; bottom: 18px; right: 18px; z-index: 30;
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 4px; box-shadow: var(--shadow-card);
+}
+
+/* per-schema tint (hue arrives via inline --cl-h) */
+.dbd-app .tinted .dg-cluster {
+  background: oklch(0.975 0.02 var(--cl-h, 245) / 0.7);
+  border-color: oklch(0.85 0.045 var(--cl-h, 245));
+}
+[data-mode='dark'] .dbd-app .tinted .dg-cluster {
+  background: oklch(0.225 0.03 var(--cl-h, 245) / 0.55);
+  border-color: oklch(0.37 0.05 var(--cl-h, 245));
+}
+.dbd-app .tinted .dg-cluster-label { color: oklch(0.43 0.085 var(--cl-h, 245)); border-color: oklch(0.85 0.045 var(--cl-h, 245)); }
+[data-mode='dark'] .dbd-app .tinted .dg-cluster-label { color: oklch(0.78 0.07 var(--cl-h, 245)); border-color: oklch(0.37 0.05 var(--cl-h, 245)); }
+.dbd-app .tinted .dg-card-head { background: oklch(0.967 0.015 var(--cl-h, 245)); }
+[data-mode='dark'] .dbd-app .tinted .dg-card-head { background: oklch(0.265 0.025 var(--cl-h, 245)); }
+
+/* ============================================================
+   SIDEBAR TREE
+   ============================================================ */
+.dbd-app .tree-group-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: var(--row-pad) 10px; border-radius: var(--radius-sm);
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.76rem; font-weight: 600;
+  color: var(--fg); cursor: pointer; background: transparent; border: none; text-align: left;
+}
+.dbd-app .tree-group-head:hover { background: var(--paper-2); }
+.dbd-app .tree-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: calc(var(--row-pad) * 0.82) 10px 0.32rem 26px;
+  border-radius: var(--radius-sm); border: none; background: transparent;
+  font-size: 0.82rem; color: var(--muted); cursor: pointer; text-align: left;
+}
+.dbd-app .tree-item:hover { background: var(--paper-2); color: var(--fg); }
+.dbd-app .tree-item.sel { background: var(--accent-soft); color: var(--accent-2); font-weight: 500; }
+.dbd-app .tree-item .ti-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ============================================================
+   TABLES / SCROLL
+   ============================================================ */
+.dbd-app .ds-th { position: sticky; top: 0; z-index: 10; background: var(--bg); box-shadow: inset 0 -1px 0 var(--line); }
+.dbd-app .ds-scroll { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.dbd-app .ds-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.dbd-app .ds-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.dbd-app .ds-scroll::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   SCHEMA SNAPSHOT THUMBNAIL (gallery cards) — hue via inline --cl-h
+   ============================================================ */
+.dbd-app .sn-tile { fill: oklch(0.975 0.02 var(--cl-h, 245) / 0.75); stroke: oklch(0.86 0.04 var(--cl-h, 245)); }
+[data-mode='dark'] .dbd-app .sn-tile { fill: oklch(0.225 0.03 var(--cl-h, 245) / 0.6); stroke: oklch(0.37 0.05 var(--cl-h, 245)); }
+.dbd-app .sn-label {
+  fill: oklch(0.43 0.075 var(--cl-h, 245));
+  font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing: 0.05em;
+}
+[data-mode='dark'] .dbd-app .sn-label { fill: oklch(0.76 0.06 var(--cl-h, 245)); }
+.dbd-app .sn-cell { fill: var(--paper); stroke: var(--line); }
+.dbd-app .sn-bar { fill: oklch(0.9 0.05 var(--cl-h, 245)); }
+[data-mode='dark'] .dbd-app .sn-bar { fill: oklch(0.42 0.06 var(--cl-h, 245)); }

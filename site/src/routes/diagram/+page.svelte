@@ -1,33 +1,50 @@
 <script lang="ts">
+  import '$lib/design/styles.css';
   import { onMount } from 'svelte';
-  import Viewer from '$lib/viewer/Viewer.svelte';
-  import { decodeFragment } from '$lib/viewer/fragment';
-  import { validateModel } from '$lib/viewer/model';
-  import { SAMPLE_MODEL } from '$lib/viewer/sample';
-  import type { SchemaModel } from '$lib/viewer/model';
+  import { vibe } from '@rokkit/states';
+  import Header from '$lib/design/Header.svelte';
+  import Sidebar from '$lib/design/Sidebar.svelte';
+  import ContentHeader from '$lib/design/ContentHeader.svelte';
+  import DiagramView from '$lib/design/DiagramView.svelte';
+  import EntitiesView from '$lib/design/EntitiesView.svelte';
+  import EntityView from '$lib/design/EntityView.svelte';
+  import { buildHeaderData, buildContentHeaderData, sampleModel } from '$lib/design/data';
+  import { saveDiagram } from '$lib/design/store';
+  import { decodeFragment } from '$lib/design/fragment';
+  import { validateModel, type SchemaModel } from '$lib/design/model';
 
-  let model = $state<SchemaModel | null>(null);
+  // Dark mode is the site-wide rokkit [data-mode]; drive the shared store.
+  const theme = $derived<'light' | 'dark'>(vibe.mode === 'dark' ? 'dark' : 'light');
+  const toggleTheme = () => (vibe.mode = vibe.mode === 'dark' ? 'light' : 'dark');
+
+  // The model arrives via the `#1.<payload>` share link (decoded client-side) or
+  // an uploaded .json (the large-schema fallback). The bundled sample is the
+  // empty-state shown when neither is present.
+  let model = $state<SchemaModel>(sampleModel);
   let error = $state<string | null>(null);
   let dragging = $state(false);
+  let selected = $state<string | null>(null);
+  let rootTab = $state('diagram');
 
-  function accept(value: unknown) {
+  function accept(value: unknown): SchemaModel | null {
     const res = validateModel(value);
     if (res.ok) {
       model = res.model;
+      selected = null;
       error = null;
-    } else {
-      error = `Not a valid schema model: ${res.error}`;
+      return res.model;
     }
+    error = `Not a valid schema model: ${res.error}`;
+    return null;
   }
-
   async function loadFile(file: File) {
     try {
-      accept(JSON.parse(await file.text()));
+      const m = accept(JSON.parse(await file.text()));
+      if (m) await saveDiagram(m); // persist uploaded design to the local projects list
     } catch {
       error = 'Could not parse that file as JSON.';
     }
   }
-
   function onDrop(e: DragEvent) {
     e.preventDefault();
     dragging = false;
@@ -35,61 +52,88 @@
     if (file) loadFile(file);
   }
 
-  function onPick(e: Event) {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (file) loadFile(file);
-  }
-
   onMount(async () => {
     const hash = window.location.hash;
     if (hash.length > 1) {
       try {
-        accept(await decodeFragment(hash));
+        const payload = hash.slice(1);
+        const m = accept(await decodeFragment(hash));
+        if (m) await saveDiagram(m, payload); // a visited share link joins the local projects list
       } catch (e) {
         error = `Could not read the diagram link: ${(e as Error).message}`;
       }
     }
   });
+
+  const entityName = $derived(selected ? selected.split('.')[1] : undefined);
+  const headerData = $derived(buildHeaderData(model.project.name, entityName));
+  const contentHeaderData = $derived(buildContentHeaderData(model, rootTab));
+  const sidebarData = $derived({ project: { name: model.project.name }, model, enums: [] });
+
+  // string → select a table/entity; '' (sidebar project button) / null → root.
+  const pick = (key: string | null) => (selected = key || null);
 </script>
 
-<svelte:head><title>dbd — diagram viewer</title></svelte:head>
+<svelte:head><title>{model.project.name} — dbd</title></svelte:head>
 
-{#if model}
-  <div class="h-screen w-screen">
-    <Viewer {model} />
-  </div>
-{:else}
-  <main class="grid min-h-screen place-items-center bg-paper p-6 text-ink">
-    <div
-      role="region"
-      aria-label="Upload schema"
-      class="w-full max-w-lg rounded-lg border border-dashed p-10 text-center {dragging
-        ? 'border-primary bg-accent-soft'
-        : 'border-paper-edge'}"
-      ondragover={(e) => {
-        e.preventDefault();
-        dragging = true;
-      }}
-      ondragleave={() => (dragging = false)}
-      ondrop={onDrop}
-    >
-      <h1 class="font-display text-xl font-semibold">Open a schema diagram</h1>
-      <p class="mt-2 text-sm text-ink-soft">
-        Drop a <code class="font-mono">schema.json</code> here (from
-        <code class="font-mono">dbd diagram --json</code>), or
-      </p>
-      <div class="mt-4 flex items-center justify-center gap-3">
-        <label class="cursor-pointer rounded-md bg-primary px-3 py-2 text-sm text-on-primary">
-          Choose file
-          <input type="file" accept="application/json,.json" class="hidden" onchange={onPick} />
-        </label>
-        <button
-          type="button"
-          class="rounded-md border border-paper-edge px-3 py-2 text-sm"
-          onclick={() => accept(SAMPLE_MODEL)}
-        >Load example</button>
+<div
+  class="dbd-app relative flex h-screen flex-col overflow-hidden"
+  role="application"
+  aria-label="dbd schema diagram"
+  ondragover={(e) => {
+    e.preventDefault();
+    dragging = true;
+  }}
+  ondragleave={() => (dragging = false)}
+  ondrop={onDrop}
+>
+  <Header
+    data={headerData}
+    {theme}
+    brandHref="/projects"
+    showUser={false}
+    onCrumb={() => (selected = null)}
+    onToggleTheme={toggleTheme}
+  />
+
+  <div class="flex min-h-0 flex-1">
+    <Sidebar data={sidebarData} selectedKey={selected} onPick={pick} />
+
+    {#if selected}
+      <EntityView {model} entityKey={selected} onNav={pick} />
+    {:else}
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+        <ContentHeader data={contentHeaderData} bind:activeTab={rootTab} />
+        {#if rootTab === 'entities'}
+          <EntitiesView {model} onNav={pick} />
+        {:else}
+          <div class="relative min-h-0 min-w-0 flex-1 bg-bg-deep">
+            <DiagramView {model} {selected} onSelect={pick} />
+            <div
+              class="pointer-events-none absolute bottom-5 left-1/2 z-20 -translate-x-1/2 whitespace-nowrap rounded-full border border-line bg-paper px-4 py-2 text-xs text-faint"
+            >
+              click a table to open it · drop a schema .json to load your own
+            </div>
+          </div>
+        {/if}
       </div>
-      {#if error}<p class="mt-4 text-sm text-danger" data-error>{error}</p>{/if}
+    {/if}
+  </div>
+
+  {#if dragging}
+    <div
+      class="pointer-events-none absolute inset-3 z-40 flex items-center justify-center rounded-app-lg border-2 border-dashed border-accent text-sm font-medium text-accent-2"
+      style="background: color-mix(in oklch, var(--accent-soft) 55%, transparent);"
+    >
+      Drop a schema .json to load it
     </div>
-  </main>
-{/if}
+  {/if}
+  {#if error}
+    <div
+      data-error
+      class="absolute bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-app border border-line bg-paper px-4 py-2 text-sm text-fg shadow-sm"
+    >
+      {error}
+    </div>
+  {/if}
+</div>
