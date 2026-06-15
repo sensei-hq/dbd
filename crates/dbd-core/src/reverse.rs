@@ -131,6 +131,74 @@ pub fn build_plan(
     WritePlan { items, orphans }
 }
 
+use crate::error::{DbdError, Result};
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Report {
+    pub created: usize,
+    pub unchanged: usize,
+    pub overwritten: usize,
+    pub orphans: usize,
+}
+
+/// Pick a non-colliding `.bak` path: `a.sql.bak`, `a.sql.bak.1`, …
+fn backup_path(file: &Path) -> PathBuf {
+    let base = format!("{}.bak", file.display());
+    let mut p = PathBuf::from(&base);
+    let mut n = 1;
+    while p.exists() {
+        p = PathBuf::from(format!("{base}.{n}"));
+        n += 1;
+    }
+    p
+}
+
+/// Apply a write-plan. Aborts (no writes) if there are conflicts and `!force`.
+/// `dry_run` performs no writes. Orphans are counted, never touched.
+pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> Result<Report> {
+    let conflicts: Vec<&PlanItem> =
+        plan.items.iter().filter(|i| i.action == FileAction::Conflict).collect();
+    if !conflicts.is_empty() && !force {
+        let list = conflicts.iter().map(|i| i.path.display().to_string())
+            .collect::<Vec<_>>().join(", ");
+        return Err(DbdError::Config(format!(
+            "{} file conflict(s) — re-run with --force-overwrite to back up and replace: {list}",
+            conflicts.len()
+        )));
+    }
+
+    let mut report = Report { orphans: plan.orphans.len(), ..Default::default() };
+    for it in &plan.items {
+        match it.action {
+            FileAction::Skip => report.unchanged += 1,
+            FileAction::Create => {
+                report.created += 1;
+                if !dry_run {
+                    let abs = root.join(&it.path);
+                    if let Some(parent) = abs.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| DbdError::Config(format!("mkdir {}: {e}", parent.display())))?;
+                    }
+                    std::fs::write(&abs, &it.content)
+                        .map_err(|e| DbdError::Config(format!("write {}: {e}", abs.display())))?;
+                }
+            }
+            FileAction::Conflict => {
+                report.overwritten += 1;
+                if !dry_run {
+                    let abs = root.join(&it.path);
+                    let bak = backup_path(&abs);
+                    std::fs::rename(&abs, &bak)
+                        .map_err(|e| DbdError::Config(format!("backup {}: {e}", abs.display())))?;
+                    std::fs::write(&abs, &it.content)
+                        .map_err(|e| DbdError::Config(format!("write {}: {e}", abs.display())))?;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +272,53 @@ mod tests {
         assert_eq!(plan.orphans, vec![PathBuf::from("ddl/table/shop/legacy.sql")]);
         // function file is unmanaged → never an orphan
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("function")));
+    }
+
+    fn item(p: &str, c: &str, a: FileAction) -> PlanItem {
+        PlanItem { path: PathBuf::from(p), content: c.into(), action: a }
+    }
+
+    #[test]
+    fn apply_without_force_aborts_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = WritePlan {
+            items: vec![item("ddl/table/s/a.sql", "NEW", FileAction::Conflict)],
+            orphans: vec![],
+        };
+        let err = apply_plan(dir.path(), &plan, /*force*/ false, /*dry_run*/ false).unwrap_err();
+        assert!(err.to_string().contains("conflict"));
+    }
+
+    #[test]
+    fn apply_with_force_backs_up_and_writes() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("ddl/table/s")).unwrap();
+        fs::write(dir.path().join("ddl/table/s/a.sql"), "OLD").unwrap();
+        let plan = WritePlan {
+            items: vec![
+                item("ddl/table/s/a.sql", "NEW", FileAction::Conflict),
+                item("ddl/table/s/b.sql", "B", FileAction::Create),
+            ],
+            orphans: vec![PathBuf::from("ddl/table/s/legacy.sql")],
+        };
+        let report = apply_plan(dir.path(), &plan, true, false).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.sql")).unwrap(), "NEW");
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.sql.bak")).unwrap(), "OLD");
+        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/b.sql")).unwrap(), "B");
+        assert_eq!(report.created, 1);
+        assert_eq!(report.overwritten, 1);
+        assert_eq!(report.orphans, 1);
+    }
+
+    #[test]
+    fn dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = WritePlan {
+            items: vec![item("ddl/table/s/b.sql", "B", FileAction::Create)],
+            orphans: vec![],
+        };
+        apply_plan(dir.path(), &plan, false, true).unwrap();
+        assert!(!dir.path().join("ddl/table/s/b.sql").exists());
     }
 }
