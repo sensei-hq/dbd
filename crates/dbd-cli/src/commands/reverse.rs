@@ -16,19 +16,29 @@ fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
     result
 }
 
-/// Resolve the connection string: explicit arg, else $DATABASE_URL.
-pub(crate) fn resolve_conn(arg: Option<&str>) -> Result<String> {
-    if let Some(c) = arg {
-        return Ok(c.to_string());
+/// Resolve the connection string from the single pre-resolved candidate.
+///
+/// The caller is responsible for combining explicit flag values with the
+/// global `-d`/`$DATABASE_URL` value (which clap already reads from the
+/// environment). This function simply bails with an actionable error when
+/// nothing was resolved.
+pub(crate) fn resolve_conn(candidate: Option<&str>) -> Result<String> {
+    match candidate {
+        Some(c) if !c.is_empty() => Ok(c.to_string()),
+        _ => anyhow::bail!(
+            "no connection given — pass a connection URL via the positional argument, \
+             --from-db <url>, -d <url>, or $DATABASE_URL"
+        ),
     }
-    std::env::var("DATABASE_URL")
-        .context("no connection given: pass it as an argument or set $DATABASE_URL")
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_init_from_db(
     project_dir: &Path,
-    conn: Option<&str>,
+    // Explicit --from-db value (None = flag absent; Some("") = bare flag → fall back).
+    from_db: Option<&str>,
+    // Global -d / $DATABASE_URL, already resolved by clap.
+    database_url: Option<&str>,
     name: Option<&str>,
     version: u32,
     sel: SchemaSelect,
@@ -38,7 +48,12 @@ pub async fn cmd_init_from_db(
     if project_dir.join("design.yaml").exists() {
         bail!("design.yaml already exists here — use `dbd merge` to sync a DB into an existing project");
     }
-    let conn = resolve_conn(conn)?;
+    // Precedence: explicit --from-db URL > global -d/$DATABASE_URL.
+    let candidate = match from_db {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => database_url,
+    };
+    let conn = resolve_conn(candidate)?;
     run(project_dir, &conn, name, Some(version), sel, force, dry_run, true)
         .await
         .map(|_| ())
@@ -47,7 +62,10 @@ pub async fn cmd_init_from_db(
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_merge(
     project_dir: &Path,
+    // Explicit positional connection argument.
     conn: Option<&str>,
+    // Global -d / $DATABASE_URL, already resolved by clap.
+    database_url: Option<&str>,
     sel: SchemaSelect,
     force: bool,
     dry_run: bool,
@@ -56,7 +74,9 @@ pub async fn cmd_merge(
     if !design_yaml_path.exists() {
         bail!("no design.yaml here — use `dbd init --from-db <conn>` to start a new project");
     }
-    let conn = resolve_conn(conn)?;
+    // Precedence: explicit positional conn > global -d/$DATABASE_URL.
+    let candidate = conn.or(database_url);
+    let conn = resolve_conn(candidate)?;
     let covered = run(project_dir, &conn, None, None, sel, force, dry_run, false).await?;
 
     // Warn about schemas written but not declared in design.yaml (spec line 67).
@@ -116,7 +136,7 @@ async fn run(
         let project = name
             .map(String::from)
             .unwrap_or_else(|| db_name_from_conn(conn).unwrap_or_else(|| "project".into()));
-        let yaml = reverse::design_yaml(&project, "postgresql", &selected, version.unwrap_or(1));
+        let yaml = reverse::design_yaml(&project, "postgres", &selected, version.unwrap_or(1));
         std::fs::write(project_dir.join("design.yaml"), yaml)
             .context("failed to write design.yaml")?;
     }
@@ -138,6 +158,8 @@ async fn run(
 }
 
 /// Parse the database name out of a connection string for the default project name.
+/// Best-effort heuristic: a URL with a trailing slash and no db name (e.g. `postgres://host/`)
+/// yields `None` and falls back to `"project"`; `--name` always overrides this entirely.
 fn db_name_from_conn(conn: &str) -> Option<String> {
     let after = conn.rsplit('/').next()?;
     let db = after.split(['?', '#']).next()?;
@@ -194,5 +216,50 @@ mod tests {
         let written = strs(&[]);
         let declared = strs(&["app"]);
         assert_eq!(undeclared_schemas(&written, &declared), Vec::<String>::new());
+    }
+
+    // ── resolve_conn ──────────────────────────────────────────────────────────
+
+    /// Explicit non-empty value is returned as-is.
+    #[test]
+    fn resolve_conn_explicit_wins() {
+        let got = resolve_conn(Some("postgres://explicit/db")).unwrap();
+        assert_eq!(got, "postgres://explicit/db");
+    }
+
+    /// None candidate bails with an actionable message.
+    #[test]
+    fn resolve_conn_none_bails() {
+        let err = resolve_conn(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+    }
+
+    /// Empty string candidate bails (same as None — sentinel for bare --from-db with no fallback).
+    #[test]
+    fn resolve_conn_empty_bails() {
+        let err = resolve_conn(Some("")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+    }
+
+    // ── db_name_from_conn ─────────────────────────────────────────────────────
+
+    /// Standard postgres URL → database name extracted.
+    #[test]
+    fn db_name_from_conn_standard_url() {
+        assert_eq!(db_name_from_conn("postgres://user:pass@host/mydb"), Some("mydb".into()));
+    }
+
+    /// URL with query string → query stripped.
+    #[test]
+    fn db_name_from_conn_strips_query() {
+        assert_eq!(db_name_from_conn("postgres://host/mydb?sslmode=require"), Some("mydb".into()));
+    }
+
+    /// URL with trailing slash and no db name → None (falls back to "project" at call site).
+    #[test]
+    fn db_name_from_conn_trailing_slash_returns_none() {
+        assert_eq!(db_name_from_conn("postgres://host/"), None);
     }
 }
