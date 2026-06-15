@@ -259,7 +259,7 @@ and ignore patterns for managed schemas.
 Generate a whole project from an existing database instead of the sample scaffold. dbd
 introspects the catalog (schemas, extensions, enums, tables — columns, defaults,
 PK/FK/unique/check constraints, indexes, comments — and views), reconstructs canonical
-`CREATE …` DDL, and writes the usual `design.yaml` + `ddl/<kind>/<schema>/<name>.sql` tree.
+`CREATE …` DDL, and writes the usual `design.yaml` + `ddl/<kind>/<schema>/<name>.ddl` tree.
 
 ```sh
 dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
@@ -329,11 +329,15 @@ Each generated file is classified before anything is written:
 - **create** — no file at the path → written.
 - **skip** — file exists and is byte-identical → left as-is (re-runs are idempotent).
 - **conflict** — file exists and differs. Without `--force-overwrite` the run **aborts**
-  and lists the conflicts (nothing is written). With `--force-overwrite`, the existing
-  file is renamed to `<name>.sql.bak` (`.bak.1`, `.bak.2`, … on collision) and the new
-  file is written.
-- **orphan** — an existing `.sql` of a managed kind under a selected schema with no
-  matching DB entity. **Orphans are reported, never deleted** — you handle removals.
+  and lists the conflicts (nothing is written) — except under `--dry-run`, which always
+  prints the plan (conflicts included) and exits cleanly. With `--force-overwrite`, the
+  existing file is renamed to `<name>.ddl.bak` (`.bak.1`, `.bak.2`, … on collision) and the
+  new file is written. Because generated DDL is run through the same formatter as
+  `dbd format`, a file you generate, then `dbd format`, then re-generate stays a **skip**
+  (no spurious conflicts/`.bak` churn).
+- **orphan** — an existing `.ddl`/`.sql` file of a managed kind (table/enum/view) under a
+  selected schema with no matching DB entity. **Orphans are reported, never deleted** — you
+  handle removals. (Orphaned *schema* and *extension* files aren't flagged in v1.)
 
 `merge` requires an existing project (it refuses if there's no `design.yaml`; use
 `init --from-db`). Because it never edits config, if it writes files for a schema not
