@@ -6,6 +6,7 @@ pub mod diagram;
 pub mod diff;
 pub mod doctor;
 pub mod design;
+pub mod emit;
 pub mod entity;
 pub mod error;
 pub mod deploy;
