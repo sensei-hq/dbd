@@ -226,7 +226,7 @@ pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
 
 /// Emit DDL for each entity and build a write-plan against `root`.
 ///
-/// Entities whose kind has no emitter (External, Function/Procedure) are silently skipped.
+/// Entities whose kind has no emitter (External, Import/Export) are silently skipped.
 /// Entities whose schema or bare name fails [`is_safe_segment`] are excluded from the plan
 /// and reported in [`WritePlan::skipped_unsafe`] so the caller can surface a warning.
 ///

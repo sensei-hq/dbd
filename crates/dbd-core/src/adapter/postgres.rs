@@ -637,7 +637,7 @@ impl PostgresAdapter {
                    SELECT 1 FROM pg_depend d \
                    WHERE d.objid = p.oid AND d.deptype = 'e' \
                ) \
-             ORDER BY n.nspname, p.proname, p.oid"
+             ORDER BY n.nspname, p.proname, p.prokind, p.oid"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
