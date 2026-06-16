@@ -294,6 +294,11 @@ literal `$DATABASE_URL` env reference — never the connection string you passed
 `merge` to sync into an existing project). Reverse-engineering supports Postgres/Supabase
 connections only; `--target sqlite` with `--from-db` is rejected.
 
+**Managed databases & version safety.** `init --from-db` is for databases **not** managed by
+dbd. If it detects a `_dbd_meta` table (in any schema — dbd tracks the applied version there),
+it **refuses** and points you at `merge`, which knows how to reconcile a managed database into
+its own project safely.
+
 **What v1 captures (and what it doesn't).** This release reverse-engineers the **data
 model**: schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
 constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments) and
@@ -343,6 +348,23 @@ Each generated file is classified before anything is written:
 `init --from-db`). Because it never edits config, if it writes files for a schema not
 listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself. The
 report summarises `created · unchanged · overwritten · orphans`, listing the orphan paths.
+
+**Managed databases & version safety.** When the target is a **dbd-managed** database (a
+`_dbd_meta` table exists in any schema), `merge` compares the database's applied version
+**D** against the project's `design.yaml` `project.version` **Y** (treated as `0` when
+unset):
+
+- **D < Y → refuse.** The project is ahead of a stale database; overwriting project DDL from
+  it would discard newer work. Bring the database up to date with `dbd apply`, or revert the
+  project to v`D` via version control if you really mean to discard those changes. (There is
+  no override flag.)
+- **D ≥ Y → auto-snapshot.** The introspected DDL is written into the project (**overwriting
+  drift in place — no `.bak`**, since the new snapshot plus version control are the record),
+  then `dbd` captures the delta as a **new snapshot version**. `--dry-run` previews the plan
+  and the snapshot version that would be created, writing nothing.
+
+These checks apply only to managed databases. A **foreign** database (no `_dbd_meta`) takes
+the normal create/skip/conflict/orphan path described above — the primary use of `merge`.
 
 ---
 
