@@ -279,6 +279,7 @@ dbd init --from-db ... --dry-run                  # print the plan, write nothin
 | `--schema S` | Limit to exactly these schemas (repeatable). |
 | `--exclude-schema S` | Add to the exclusion set (repeatable). |
 | `--all-schemas` | Bypass the Supabase platform denylist (Postgres internals — `pg_catalog`, `information_schema`, `pg_temp*`, `pg_toast*` — are still always excluded). |
+| `--roles` | Also reverse-engineer roles (off by default; cluster-global, platform roles filtered — see "What's captured"). |
 | `--dry-run` | Print the plan and exit; touch nothing. |
 
 **Version-tracked from the start.** After writing the `ddl/` tree and `design.yaml`,
@@ -308,10 +309,19 @@ its own project safely.
 schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
 constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments), views,
 and **functions & procedures** (full bodies, captured verbatim via `pg_get_functiondef`;
-overloads of the same name share one file; extension-provided routines are excluded). Not
-yet captured:
+overloads of the same name share one file; extension-provided routines are excluded).
 
-- **Roles and sequences** — coming in later patches.
+**Roles** are captured only with the opt-in **`--roles`** flag (they are cluster-global, not
+owned by the database). System/platform roles are always filtered out — superusers, `pg_*`,
+cloud roles (`rds_*`/`azure_*`/`cloudsql*`), and Supabase platform roles (`anon`,
+`authenticated`, `service_role`, `authenticator`, `supabase_*`, `pgsodium*`, `dashboard_user`,
+`pgbouncer`, `postgres`). Roles are captured as name + memberships only (no attributes, never
+passwords); memberships referencing filtered-out roles are dropped so the emitted set is
+self-contained.
+
+Not yet captured:
+
+- **Sequences** — coming in a later patch.
 - **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
   are skipped, since they can't be represented losslessly yet.
 - **Triggers**, aggregates, operators, domains, composite types.
@@ -334,6 +344,7 @@ dbd merge postgres://user:pass@host/db   # sync into the current project
 dbd merge                                # connection from -d / $DATABASE_URL
 dbd merge --dry-run                      # preview the plan + the snapshot version
 dbd merge --schema config --exclude-schema audit   # same selection flags as init
+dbd merge --roles                        # also reverse-engineer roles (opt-in)
 ```
 
 Every `merge` that proceeds **overwrites the introspected DDL into the project (no `.bak`)
