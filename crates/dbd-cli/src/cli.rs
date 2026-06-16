@@ -191,9 +191,6 @@ pub enum Commands {
         /// Include Supabase platform schemas (bypass the denylist)
         #[arg(long)]
         all_schemas: bool,
-        /// On conflict, back up existing files to .bak and overwrite
-        #[arg(long)]
-        force_overwrite: bool,
         /// Print the plan without writing
         #[arg(long)]
         dry_run: bool,
@@ -211,9 +208,6 @@ pub enum Commands {
         /// Include Supabase platform schemas (bypass the denylist)
         #[arg(long)]
         all_schemas: bool,
-        /// On conflict, back up existing files to .bak and overwrite
-        #[arg(long)]
-        force_overwrite: bool,
         /// Print the plan without writing
         #[arg(long)]
         dry_run: bool,
@@ -270,6 +264,20 @@ mod tests {
         assert!(init.is_ok(), "init --from-db failed");
         let merge = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--dry-run", "--all-schemas"]);
         assert!(merge.is_ok(), "merge failed");
+    }
+
+    /// `--force-overwrite` was removed from both `init` and `merge` when the reverse
+    /// path unified on overwrite+snapshot — parsing it must now fail.
+    #[test]
+    fn force_overwrite_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x", "--force-overwrite"]).is_err(),
+            "init --force-overwrite should be rejected (flag removed)"
+        );
+        assert!(
+            Cli::try_parse_from(["dbd", "merge", "postgres://x", "--force-overwrite"]).is_err(),
+            "merge --force-overwrite should be rejected (flag removed)"
+        );
     }
 
     /// `dbd init --from-db` (no value) must parse to `from_db == Some("")` (env-fallback sentinel).

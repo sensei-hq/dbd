@@ -174,106 +174,27 @@ pub struct Report {
     pub unchanged: usize,
     pub overwritten: usize,
     pub orphans: usize,
-    /// Number of items that conflict with existing on-disk content. In a real
-    /// apply (`dry_run == false`) a non-empty count without `force` aborts before
-    /// writing, so the report is only produced when conflicts are resolved (then
-    /// they show up as `overwritten`). In a `dry_run` this counts the conflicts
-    /// that *would* be backed up and overwritten.
+    /// Number of items that differed from existing on-disk content and were
+    /// overwritten in place (no `.bak`). Equal to `overwritten` for an
+    /// `apply_overwrite` run; surfaced separately so callers can report drift.
     pub conflicts: usize,
-}
-
-/// Pick a non-colliding `.bak` path: `a.ddl.bak`, `a.ddl.bak.1`, …
-fn backup_path(file: &Path) -> PathBuf {
-    let base = format!("{}.bak", file.display());
-    let mut p = PathBuf::from(&base);
-    let mut n = 1;
-    while p.exists() {
-        p = PathBuf::from(format!("{base}.{n}"));
-        n += 1;
-    }
-    p
-}
-
-/// Apply a write-plan to disk.
-///
-/// # Conflict gate (atomic)
-/// If any item has [`FileAction::Conflict`] and `force` is `false`, the function returns
-/// `Err` **before performing any write**.  This gate is atomic: either all writes proceed
-/// or none do (subject to the caveat below).
-///
-/// # Non-transactionality (accepted v1 limitation)
-/// Once past the conflict gate, items are written one by one.  If a write or rename fails
-/// mid-loop (e.g. disk full, permission error), earlier items remain applied with their
-/// `.bak` backups intact and the function returns `Err`.  There is no rollback.  Callers
-/// should treat a mid-loop error as a partial apply and inspect the project directory.
-///
-/// `dry_run` performs no writes. Orphans are counted, never touched.
-pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> Result<Report> {
-    let conflicts: Vec<&PlanItem> =
-        plan.items.iter().filter(|i| i.action == FileAction::Conflict).collect();
-    // A real apply with conflicts and no --force is a hard abort: nothing is
-    // written. A dry-run never errors here — it falls through to produce a plan
-    // report (writing nothing), surfacing the conflict count instead.
-    if !dry_run && !conflicts.is_empty() && !force {
-        let list = conflicts.iter().map(|i| i.path.display().to_string())
-            .collect::<Vec<_>>().join(", ");
-        return Err(DbdError::Config(format!(
-            "{} file conflict(s) — re-run with --force-overwrite to back up and replace: {list}",
-            conflicts.len()
-        )));
-    }
-
-    let mut report = Report {
-        orphans: plan.orphans.len(),
-        conflicts: conflicts.len(),
-        ..Default::default()
-    };
-    for it in &plan.items {
-        match it.action {
-            FileAction::Skip => report.unchanged += 1,
-            FileAction::Create => {
-                report.created += 1;
-                if !dry_run {
-                    let abs = root.join(&it.path);
-                    if let Some(parent) = abs.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| DbdError::Config(format!("mkdir {}: {e}", parent.display())))?;
-                    }
-                    std::fs::write(&abs, &it.content)
-                        .map_err(|e| DbdError::Config(format!("write {}: {e}", abs.display())))?;
-                }
-            }
-            FileAction::Conflict => {
-                report.overwritten += 1;
-                if !dry_run {
-                    let abs = root.join(&it.path);
-                    let bak = backup_path(&abs);
-                    std::fs::rename(&abs, &bak)
-                        .map_err(|e| DbdError::Config(format!("backup {}: {e}", abs.display())))?;
-                    std::fs::write(&abs, &it.content)
-                        .map_err(|e| DbdError::Config(format!("write {}: {e}", abs.display())))?;
-                }
-            }
-        }
-    }
-    Ok(report)
 }
 
 /// Apply a write-plan by **overwriting** every `Create` and `Conflict` item in
 /// place — no `.bak`, no conflict gate.
 ///
-/// This is the managed-database `merge` path (DB version ≥ project version): the
-/// auto-snapshot taken afterwards plus version control are the safety net, so we
-/// deliberately clobber on-disk drift rather than aborting or backing up. `Skip`
-/// items (byte-identical to disk) are left untouched. Orphans are counted but
-/// never deleted. Parent directories are created as needed.
+/// This is the single apply path for both `merge` (foreign DB, or managed DB at/ahead
+/// of the project) and `init --from-db`: the snapshot taken afterwards plus version
+/// control are the safety net, so we deliberately clobber on-disk drift rather than
+/// aborting or backing up. `Skip` items (byte-identical to disk) are left untouched.
+/// Orphans are counted but never deleted. Parent directories are created as needed.
 ///
-/// # Non-transactionality (accepted limitation — same as `apply_plan`)
+/// # Non-transactionality (accepted limitation)
 /// Items are written one by one. If a write fails mid-loop (e.g. disk full,
 /// permission error), earlier files have already been overwritten with no `.bak`
-/// and no rollback. The subsequent `create_snapshot` call in the caller can also
-/// fail after files are written. In either case the partial-apply state should be
-/// recovered via version control (`git checkout -- .` or equivalent).
+/// and no rollback. The subsequent snapshot call in the caller can also fail after
+/// files are written. In either case the partial-apply state should be recovered via
+/// version control (`git checkout -- .` or equivalent).
 pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
     let mut report = Report {
         orphans: plan.orphans.len(),
@@ -463,69 +384,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_without_force_aborts_on_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let plan = WritePlan {
-            items: vec![item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict)],
-            orphans: vec![],
-            skipped_unsafe: vec![],
-        };
-        let err = apply_plan(dir.path(), &plan, /*force*/ false, /*dry_run*/ false).unwrap_err();
-        assert!(err.to_string().contains("conflict"));
-    }
-
-    #[test]
-    fn dry_run_reports_conflicts_without_erroring_or_writing() {
-        use std::fs;
-        let dir = tempfile::tempdir().unwrap();
-        // Seed an existing file so the conflict item has something to (not) back up.
-        fs::create_dir_all(dir.path().join("ddl/table/s")).unwrap();
-        fs::write(dir.path().join("ddl/table/s/a.ddl"), "OLD").unwrap();
-
-        let plan = WritePlan {
-            items: vec![
-                item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict),
-                item("ddl/table/s/b.ddl", "B", FileAction::Create),
-            ],
-            orphans: vec![],
-            skipped_unsafe: vec![],
-        };
-
-        // dry-run + conflict + no force must NOT error.
-        let report = apply_plan(dir.path(), &plan, /*force*/ false, /*dry_run*/ true).unwrap();
-        assert!(report.conflicts >= 1, "report should surface the conflict count");
-        assert_eq!(report.conflicts, 1);
-
-        // Nothing was written or backed up.
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.ddl")).unwrap(), "OLD");
-        assert!(!dir.path().join("ddl/table/s/a.ddl.bak").exists());
-        assert!(!dir.path().join("ddl/table/s/b.ddl").exists());
-    }
-
-    #[test]
-    fn apply_with_force_backs_up_and_writes() {
-        use std::fs;
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("ddl/table/s")).unwrap();
-        fs::write(dir.path().join("ddl/table/s/a.ddl"), "OLD").unwrap();
-        let plan = WritePlan {
-            items: vec![
-                item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict),
-                item("ddl/table/s/b.ddl", "B", FileAction::Create),
-            ],
-            orphans: vec![PathBuf::from("ddl/table/s/legacy.ddl")],
-            skipped_unsafe: vec![],
-        };
-        let report = apply_plan(dir.path(), &plan, true, false).unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.ddl")).unwrap(), "NEW");
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/a.ddl.bak")).unwrap(), "OLD");
-        assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/b.ddl")).unwrap(), "B");
-        assert_eq!(report.created, 1);
-        assert_eq!(report.overwritten, 1);
-        assert_eq!(report.orphans, 1);
-    }
-
-    #[test]
     fn apply_overwrite_clobbers_without_bak() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
@@ -562,18 +420,6 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.conflicts, 1);
         assert_eq!(report.orphans, 1);
-    }
-
-    #[test]
-    fn dry_run_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let plan = WritePlan {
-            items: vec![item("ddl/table/s/b.ddl", "B", FileAction::Create)],
-            orphans: vec![],
-            skipped_unsafe: vec![],
-        };
-        apply_plan(dir.path(), &plan, false, true).unwrap();
-        assert!(!dir.path().join("ddl/table/s/b.ddl").exists());
     }
 
     #[test]
@@ -664,7 +510,7 @@ mod tests {
             "first pass should be all Create: {:?}",
             plan1.items.iter().map(|i| (i.path.clone(), i.action)).collect::<Vec<_>>()
         );
-        apply_plan(root, &plan1, false, false).unwrap();
+        apply_overwrite(root, &plan1).unwrap();
 
         // Simulate `dbd format` over the project: read each generated file, format
         // it, and write it back. With the formatter-equivalent emit, this is a no-op.
@@ -690,7 +536,7 @@ mod tests {
                 it.path.display()
             );
         }
-        let report = apply_plan(root, &plan2, false, false).unwrap();
+        let report = apply_overwrite(root, &plan2).unwrap();
         assert_eq!(report.conflicts, 0, "second pass must have no conflicts");
         assert_eq!(report.unchanged, plan2.items.len());
     }
