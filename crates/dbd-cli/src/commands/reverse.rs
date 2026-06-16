@@ -108,6 +108,7 @@ pub async fn cmd_init_from_db(
     let entities = adapter.introspect().await.context("introspection failed")?;
     run_plan(
         project_dir,
+        config_path,
         entities,
         Some(&project_name),
         Some(version),
@@ -256,6 +257,14 @@ fn merge_snapshot(
         // Only promise a snapshot when there is actually something to write.
         // If every item is Skip the real run would print "already in sync — no
         // snapshot created", so the dry-run preview must match.
+        //
+        // Note: this is a *byte-level* check (the write-plan). The real run's
+        // `create_snapshot` decides no-changes by a *semantic* diff of the parsed
+        // entity model vs the latest snapshot, so a file that differs only
+        // cosmetically (a byte Conflict that parses to an identical entity) is
+        // previewed here as "would snapshot" yet the real run reports in-sync. The
+        // overwrite still happens correctly either way — this is preview accuracy
+        // only, not a data-safety gap.
         let has_changes = plan
             .items
             .iter()
@@ -353,6 +362,7 @@ fn select_and_keep(
 #[allow(clippy::too_many_arguments)]
 fn run_plan(
     project_dir: &Path,
+    config_path: &Path,
     entities: Vec<dbd_core::Entity>,
     name: Option<&str>,
     version: Option<u32>,
@@ -377,7 +387,10 @@ fn run_plan(
             .map(String::from)
             .unwrap_or_else(|| "project".into());
         let yaml = reverse::design_yaml(&project, "postgres", &selected, version.unwrap_or(1));
-        std::fs::write(project_dir.join("design.yaml"), yaml)
+        // Write to the resolved config path (project_dir/<--config>), matching what the
+        // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
+        // diverge under `--config custom.yaml`).
+        std::fs::write(config_path, yaml)
             .context("failed to write design.yaml")?;
     }
 
