@@ -585,3 +585,46 @@ async fn emitted_index_ddl_applies_to_postgres() {
         .await
         .unwrap_or_else(|e| panic!("emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
 }
+
+/// Version-safety: a fresh DB with no `_dbd_meta` is foreign (None); once a
+/// `_dbd_meta` table exists in ANY schema (here `staging`, off the default
+/// search_path) with a matching `(project, env)` row, the adapter reports the
+/// applied version — proving cross-schema, search_path-independent detection.
+#[tokio::test]
+async fn reverse_managed_version_detects_cross_schema_meta() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    // (a) Fresh DB — no `_dbd_meta` anywhere → foreign.
+    let managed = adapter
+        .reverse_managed_version("prod")
+        .await
+        .expect("reverse_managed_version should not error on a fresh DB");
+    assert_eq!(managed, None, "a DB with no _dbd_meta must be foreign (None)");
+
+    // (b) Create `staging._dbd_meta` (NOT on the default search_path) with a row
+    //     for this adapter's project ("embedded_test") and env "prod".
+    adapter
+        .execute_script(
+            "CREATE SCHEMA staging; \
+             CREATE TABLE staging._dbd_meta ( \
+                project varchar NOT NULL, \
+                env     varchar NOT NULL, \
+                version integer NOT NULL \
+             ); \
+             INSERT INTO staging._dbd_meta (project, env, version) \
+             VALUES ('embedded_test', 'prod', 3);",
+        )
+        .await
+        .expect("failed to seed staging._dbd_meta");
+
+    let managed = adapter
+        .reverse_managed_version("prod")
+        .await
+        .expect("reverse_managed_version should read cross-schema _dbd_meta");
+    assert_eq!(
+        managed,
+        Some(3),
+        "must read the applied version from staging._dbd_meta regardless of search_path"
+    );
+}

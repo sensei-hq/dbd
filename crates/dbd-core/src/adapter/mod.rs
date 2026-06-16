@@ -118,6 +118,16 @@ pub trait DatabaseAdapter: Send + Sync {
         ))
     }
 
+    /// Reverse-engineering safety: `Some(version)` if this DB is dbd-managed (a
+    /// `_dbd_meta` table exists in ANY schema), reading the applied version for
+    /// `(self.project, env)` — `0` if the table exists but has no matching row.
+    /// `None` for a foreign DB (no `_dbd_meta`). Default returns `Ok(None)`;
+    /// Postgres overrides. Robust to `_dbd_meta` living outside the search_path.
+    async fn reverse_managed_version(&self, env: &str) -> Result<Option<u32>> {
+        let _ = env;
+        Ok(None)
+    }
+
     // ── Migration tracking ─────────────────────────────
 
     async fn ensure_migrations_table(&self) -> Result<()>;
