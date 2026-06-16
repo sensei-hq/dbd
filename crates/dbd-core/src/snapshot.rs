@@ -1150,6 +1150,64 @@ pub fn create_snapshot(
     Ok(result)
 }
 
+/// Create a **baseline** snapshot at an explicit `version`, writing all files to disk.
+///
+/// Unlike [`create_snapshot`], this never diffs against a prior snapshot: a freshly
+/// reverse-engineered project (`dbd init --from-db`) has no history, so the result is
+/// always a single baseline `SnapshotResult` written to `snapshots/{version}.json`.
+/// `design.yaml`'s `project.version` is set to `version`.
+///
+/// Used by `init --from-db` so the new project is version-tracked from the start at
+/// the user's chosen `--version` (default 1). For incremental snapshots that diff
+/// against the latest existing snapshot, use [`create_snapshot`].
+pub fn create_baseline_snapshot(
+    entities: &[Entity],
+    project_dir: &Path,
+    config_path: &Path,
+    description: &str,
+    version: u32,
+) -> Result<MultiSnapshotResult> {
+    // A fresh project has no prior snapshot — baseline at the requested version.
+    let result = prepare_multi_snapshot(entities, None, version, description);
+
+    let snapshots_dir = project_dir.join(SNAPSHOTS_DIR);
+    std::fs::create_dir_all(&snapshots_dir)?;
+
+    let mut final_version = version;
+    for snap_result in &result.snapshots {
+        if snap_result.no_changes {
+            continue;
+        }
+        let v = snap_result.snapshot.version;
+        final_version = v;
+
+        // Write snapshot JSON.
+        let snap_file = snapshots_dir.join(format!("{}.json", pad_version(v)));
+        std::fs::write(&snap_file, serde_json::to_string_pretty(&snap_result.snapshot)?)?;
+
+        // A baseline has no migration graph, but mirror create_snapshot's write loop
+        // so any (unexpected) staged result is still persisted consistently.
+        if let Some(ref graph) = snap_result.graph {
+            let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(v));
+            std::fs::create_dir_all(&migration_dir)?;
+            std::fs::write(
+                migration_dir.join("graph.json"),
+                serde_json::to_string_pretty(graph)?,
+            )?;
+            for file in &snap_result.migration_files {
+                let full_path = migration_dir.join(&file.relative_path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&full_path, &file.content)?;
+            }
+        }
+    }
+
+    crate::config::update_version(config_path, final_version)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1672,52 @@ mod tests {
         assert!(!result2.snapshots[0].no_changes);
         assert!(tmp.path().join("snapshots/002.json").exists());
         assert!(tmp.path().join("migrations/002/graph.json").exists());
+    }
+
+    #[test]
+    fn create_baseline_snapshot_at_v1() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("design.yaml");
+        fs::write(&config_path, "project:\n  name: test\n  version: 0\ntarget: {}\n").unwrap();
+
+        let entities = vec![make_table_entity("config.users", vec![col("id", "BIGINT")])];
+
+        let result =
+            create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 1).unwrap();
+
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(result.snapshots[0].is_baseline);
+        assert_eq!(result.snapshots[0].snapshot.version, 1);
+        // File name follows the baseline version, not next_version.
+        assert!(tmp.path().join("snapshots/001.json").exists());
+        // No migration graph for a baseline.
+        assert!(!tmp.path().join("migrations/001").exists());
+
+        // design.yaml version updated to 1.
+        let cfg = crate::config::read(&config_path).unwrap();
+        assert_eq!(cfg.project.version, Some(1));
+    }
+
+    #[test]
+    fn create_baseline_snapshot_at_v3() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("design.yaml");
+        fs::write(&config_path, "project:\n  name: test\n  version: 0\ntarget: {}\n").unwrap();
+
+        let entities = vec![make_table_entity("config.users", vec![col("id", "BIGINT")])];
+
+        let result =
+            create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 3).unwrap();
+
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(result.snapshots[0].is_baseline);
+        assert_eq!(result.snapshots[0].snapshot.version, 3);
+        // Baseline file name is the requested version, not 001.
+        assert!(tmp.path().join("snapshots/003.json").exists());
+        assert!(!tmp.path().join("snapshots/001.json").exists());
+
+        let cfg = crate::config::read(&config_path).unwrap();
+        assert_eq!(cfg.project.version, Some(3));
     }
 
     #[test]
