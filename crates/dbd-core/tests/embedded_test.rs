@@ -522,7 +522,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 default_value: Some("gen_random_uuid()".into()),
                 is_pk: false,
                 is_unique: false,
-                is_identity: false,
+                identity: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -533,7 +533,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 default_value: None,
                 is_pk: false,
                 is_unique: false,
-                is_identity: false,
+                identity: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -544,7 +544,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 default_value: Some("'{}'".into()),
                 is_pk: false,
                 is_unique: false,
-                is_identity: false,
+                identity: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -905,4 +905,190 @@ async fn role_membership_grant_survives_apply() {
         )
         .await
         .expect("role membership GRANT did not take effect in database");
+}
+
+// ── Test 12: Standalone sequences + serial / identity columns ─────────────────
+
+/// Reverse-engineer a standalone sequence and serial / identity columns. Creates:
+///   1. `CREATE SEQUENCE app.counter` — standalone, must be captured.
+///   2. a table with `id bigserial PRIMARY KEY` — owned sequence excluded; column → bigserial.
+///   3. a table with `n int GENERATED ALWAYS AS IDENTITY` — owned sequence excluded; column → identity.
+///   4. a table with `c int DEFAULT nextval('app.counter')` — keeps its nextval default.
+#[tokio::test]
+async fn introspect_captures_sequences_and_serial_identity() {
+    use dbd_core::entity::{EntityType, IdentityKind};
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_seq_test").await.unwrap();
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE SEQUENCE app.counter; \
+             CREATE TABLE app.with_serial (id bigserial PRIMARY KEY, label text); \
+             CREATE TABLE app.with_identity (n int GENERATED ALWAYS AS IDENTITY, label text); \
+             CREATE TABLE app.with_ref (id int PRIMARY KEY, c int DEFAULT nextval('app.counter'));",
+        )
+        .await
+        .expect("fixture DDL failed");
+
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // (1) app.counter captured as a standalone Sequence.
+    let counter = entities
+        .iter()
+        .find(|e| e.name == "app.counter")
+        .expect("standalone sequence 'app.counter' not captured");
+    assert_eq!(counter.entity_type, EntityType::Sequence);
+    assert!(
+        counter.writes.first().is_some_and(|w| w.contains("CREATE SEQUENCE")),
+        "sequence entity should carry rendered CREATE SEQUENCE in writes[0], got {:?}",
+        counter.writes
+    );
+
+    // The bigserial- and identity-owned sequences must NOT appear as standalone
+    // Sequence entities (they are column-owned, deptype 'a'/'i').
+    let standalone_seqs: Vec<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Sequence)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        standalone_seqs,
+        vec!["app.counter"],
+        "only the standalone sequence should be captured, got {standalone_seqs:?}"
+    );
+
+    // (2) bigserial column → data_type "bigserial", no nextval default.
+    let with_serial = entities
+        .iter()
+        .find(|e| e.name == "app.with_serial")
+        .expect("table 'app.with_serial' not captured");
+    let id_col = with_serial
+        .table_def
+        .as_ref()
+        .unwrap()
+        .columns
+        .iter()
+        .find(|c| c.name == "id")
+        .expect("column 'id' not found");
+    assert_eq!(id_col.data_type, "bigserial", "bigserial PK should map to data_type bigserial");
+    assert!(
+        id_col.default_value.is_none(),
+        "serial column must drop its owned-sequence default, got {:?}",
+        id_col.default_value
+    );
+    assert!(id_col.identity.is_none(), "serial is not identity");
+
+    // (3) identity column → IdentityKind::Always, no default.
+    let with_identity = entities
+        .iter()
+        .find(|e| e.name == "app.with_identity")
+        .expect("table 'app.with_identity' not captured");
+    let n_col = with_identity
+        .table_def
+        .as_ref()
+        .unwrap()
+        .columns
+        .iter()
+        .find(|c| c.name == "n")
+        .expect("column 'n' not found");
+    assert_eq!(n_col.identity, Some(IdentityKind::Always), "n should be GENERATED ALWAYS AS IDENTITY");
+    assert!(
+        n_col.default_value.is_none(),
+        "identity column must carry no default, got {:?}",
+        n_col.default_value
+    );
+
+    // (4) standalone-referencing column keeps its nextval('app.counter') default.
+    let with_ref = entities
+        .iter()
+        .find(|e| e.name == "app.with_ref")
+        .expect("table 'app.with_ref' not captured");
+    let c_col = with_ref
+        .table_def
+        .as_ref()
+        .unwrap()
+        .columns
+        .iter()
+        .find(|c| c.name == "c")
+        .expect("column 'c' not found");
+    assert_ne!(c_col.data_type, "serial", "standalone-referencing column is not serial");
+    assert!(
+        c_col.default_value.as_deref().is_some_and(|d| d.contains("nextval(") && d.contains("counter")),
+        "standalone-referencing column must keep its nextval('app.counter') default, got {:?}",
+        c_col.default_value
+    );
+}
+
+/// Round-trip apply: emit the standalone sequence + the serial/identity/standalone-ref
+/// tables via `emit_entity` and execute them (sequence before tables) into a fresh
+/// schema → succeeds. Proves self-containment: no missing-sequence error, no
+/// double-create of the column-owned sequences.
+#[tokio::test]
+async fn emitted_sequences_and_serial_identity_apply_to_postgres() {
+    use dbd_core::entity::EntityType;
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "emit_seq_test").await.unwrap();
+
+    // Source schema to introspect from.
+    adapter
+        .execute_script(
+            "CREATE SCHEMA src; \
+             CREATE SEQUENCE src.counter; \
+             CREATE TABLE src.with_serial (id bigserial PRIMARY KEY, label text); \
+             CREATE TABLE src.with_identity (n int GENERATED ALWAYS AS IDENTITY, label text); \
+             CREATE TABLE src.with_ref (id int PRIMARY KEY, c int DEFAULT nextval('src.counter'));",
+        )
+        .await
+        .expect("source DDL failed");
+
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // Fresh destination schema; rewrite each entity's schema/name from src → dst.
+    adapter
+        .execute_script("CREATE SCHEMA dst;")
+        .await
+        .expect("failed to create dst schema");
+
+    let retarget = |e: &dbd_core::Entity| -> dbd_core::Entity {
+        let mut c = e.clone();
+        c.name = c.name.replacen("src.", "dst.", 1);
+        c.schema = Some("dst".into());
+        // The sequence body in writes[0] is fully-qualified to src — retarget it too.
+        c.writes = c.writes.iter().map(|w| w.replace("src", "dst")).collect();
+        c
+    };
+
+    // Apply in apply order: the sequence MUST come before the tables that
+    // reference it via DEFAULT nextval(...).
+    let seq = entities
+        .iter()
+        .find(|e| e.name == "src.counter" && e.entity_type == EntityType::Sequence)
+        .expect("standalone sequence not captured");
+    let seq = retarget(seq);
+    let seq_sql = dbd_core::emit::emit_entity(&seq).expect("sequence should emit");
+    adapter
+        .execute_script(&seq_sql)
+        .await
+        .unwrap_or_else(|e| panic!("emitted sequence DDL rejected: {e}\n--- DDL ---\n{seq_sql}"));
+
+    for tname in ["src.with_serial", "src.with_identity", "src.with_ref"] {
+        let t = entities
+            .iter()
+            .find(|e| e.name == tname && e.entity_type == EntityType::Table)
+            .unwrap_or_else(|| panic!("table {tname} not captured"));
+        let t = retarget(t);
+        let sql = dbd_core::emit::emit_entity(&t).expect("table should emit");
+        adapter
+            .execute_script(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("emitted table DDL rejected for {tname}: {e}\n--- DDL ---\n{sql}"));
+    }
+
+    // Sanity: the dst tables now exist (proves the whole script applied cleanly).
+    assert_table_exists(&*adapter, "dst", "with_serial").await;
+    assert_table_exists(&*adapter, "dst", "with_identity").await;
+    assert_table_exists(&*adapter, "dst", "with_ref").await;
 }
