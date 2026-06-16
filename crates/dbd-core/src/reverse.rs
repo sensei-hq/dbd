@@ -88,6 +88,7 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 pub const MANAGED_KINDS: &[EntityType] = &[
     EntityType::Schema, EntityType::Extension, EntityType::Enum,
     EntityType::Table, EntityType::View,
+    EntityType::Function, EntityType::Procedure,
 ];
 
 use std::path::Path;
@@ -355,9 +356,11 @@ mod tests {
         fs::write(root.join("ddl/table/shop/customers.ddl"), "OLD").unwrap();
         fs::write(root.join("ddl/table/shop/legacy.ddl"), "ORPHAN").unwrap();
         fs::write(root.join("ddl/table/shop/old.sql"), "ORPHAN").unwrap();
-        // an unmanaged kind that must NOT be flagged as orphan:
-        fs::create_dir_all(root.join("ddl/function/shop")).unwrap();
-        fs::write(root.join("ddl/function/shop/f.ddl"), "FN").unwrap();
+        // an unmanaged kind that must NOT be flagged as orphan. `trigger` maps to
+        // no `EntityType`, so it is not in MANAGED_KINDS and the orphan scan never
+        // walks it (functions/procedures ARE managed now, so they would be scanned).
+        fs::create_dir_all(root.join("ddl/trigger/shop")).unwrap();
+        fs::write(root.join("ddl/trigger/shop/t.ddl"), "TRG").unwrap();
 
         let generated = vec![
             (PathBuf::from("ddl/table/shop/orders.ddl"), "SAME".to_string()),     // skip
@@ -375,8 +378,8 @@ mod tests {
             PathBuf::from("ddl/table/shop/legacy.ddl"),
             PathBuf::from("ddl/table/shop/old.sql"),
         ]);
-        // function file is unmanaged → never an orphan
-        assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("function")));
+        // trigger file is unmanaged → never an orphan
+        assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
     }
 
     fn item(p: &str, c: &str, a: FileAction) -> PlanItem {
