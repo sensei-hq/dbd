@@ -118,11 +118,99 @@ pub async fn cmd_init_from_db(
                 .context("role introspection failed")?,
         );
     }
+    init_with_entities(
+        project_dir,
+        config_path,
+        env,
+        entities,
+        &project_name,
+        version,
+        sel,
+        dry_run,
+        "init from database",
+    )
+}
+
+/// Reverse-engineer a fresh project from a DBML file (no DB connection).
+///
+/// DBML is always a foreign source — there is no `_dbd_meta` to gate against, so
+/// this skips the version-safety check entirely and otherwise shares the exact
+/// init tail (write-plan + baseline snapshot) with `cmd_init_from_db` via
+/// [`init_with_entities`].
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_init_from_dbml(
+    project_dir: &Path,
+    dbml_path: &Path,
+    env: &str,
+    config_path: &Path,
+    name: Option<&str>,
+    version: u32,
+    sel: SchemaSelect,
+    dry_run: bool,
+) -> Result<()> {
+    if project_dir.join("design.yaml").exists() {
+        bail!("design.yaml already exists here — use `dbd merge --from-dbml <file>` to sync a DBML file into an existing project");
+    }
+    let entities = parse_dbml_file(dbml_path)?;
+    // The project name is derived from --name or the file stem (there is no DB to
+    // read it from).
+    let project_name = name
+        .map(String::from)
+        .unwrap_or_else(|| {
+            dbml_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| "project".into())
+        });
+    init_with_entities(
+        project_dir,
+        config_path,
+        env,
+        entities,
+        &project_name,
+        version,
+        sel,
+        dry_run,
+        "init from dbml",
+    )
+}
+
+/// Read + parse a DBML file into entities, with file-level error context.
+///
+/// `dbml_path` is an operator-supplied CLI argument (the `--from-dbml <FILE>`
+/// value), intentionally an arbitrary path — the user may keep their `.dbml`
+/// anywhere — so it is not constrained to the project root, mirroring how
+/// `--from-db <CONN>` accepts an arbitrary connection string.
+fn parse_dbml_file(dbml_path: &Path) -> Result<Vec<dbd_core::Entity>> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path — operator-supplied CLI path, not external input
+    let text = std::fs::read_to_string(dbml_path)
+        .with_context(|| format!("failed to read DBML file {}", dbml_path.display()))?;
+    dbd_core::dbml_parse::parse_dbml(&text)
+        .with_context(|| format!("failed to parse DBML file {}", dbml_path.display()))
+}
+
+/// Shared `init` tail for both the DB and DBML sources: build the write-plan,
+/// write `design.yaml`, apply by overwriting, then emit a baseline snapshot at
+/// `version`. The caller owns acquiring `entities` (introspection or DBML parse)
+/// and any source-specific safety gating before calling this.
+#[allow(clippy::too_many_arguments)]
+fn init_with_entities(
+    project_dir: &Path,
+    config_path: &Path,
+    env: &str,
+    entities: Vec<dbd_core::Entity>,
+    project_name: &str,
+    version: u32,
+    sel: SchemaSelect,
+    dry_run: bool,
+    snapshot_label: &str,
+) -> Result<()> {
     run_plan(
         project_dir,
         config_path,
         entities,
-        Some(&project_name),
+        Some(project_name),
         Some(version),
         sel,
         dry_run,
@@ -143,7 +231,7 @@ pub async fn cmd_init_from_db(
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
         .context("failed to reload project after writing DDL")?;
     dbd_core::snapshot::create_baseline_snapshot(
-        design.entities(), project_dir, config_path, "init from database", version,
+        design.entities(), project_dir, config_path, snapshot_label, version,
     )
     .context("failed to create baseline snapshot after writing DDL")?;
     println!("baseline snapshot v{version} created");
@@ -215,6 +303,30 @@ pub async fn cmd_merge(
             )
         }
     }
+}
+
+/// Sync a DBML file into the current project (no DB connection).
+///
+/// DBML is always a foreign source — there is no `_dbd_meta` to gate against, so
+/// this skips the version-safety decision entirely and goes straight to the
+/// shared snapshot path with the parsed entities. Schema selection, orphan
+/// reporting, the undeclared-schema warning, and `--dry-run` all behave exactly
+/// as the DB merge path because both call [`merge_snapshot`].
+pub fn cmd_merge_from_dbml(
+    project_dir: &Path,
+    dbml_path: &Path,
+    env: &str,
+    config_path: &Path,
+    sel: SchemaSelect,
+    dry_run: bool,
+) -> Result<()> {
+    if !config_path.exists() {
+        bail!("no design.yaml here — use `dbd init --from-dbml <file>` to start a new project");
+    }
+    let config = dbd_core::config::read(config_path)
+        .context("failed to read design.yaml")?;
+    let entities = parse_dbml_file(dbml_path)?;
+    merge_snapshot(project_dir, config_path, env, &entities, sel, dry_run, &config)
 }
 
 /// The unified `merge` apply path (foreign DB, or managed DB at/ahead of the project):

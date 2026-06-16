@@ -64,7 +64,8 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 
 ## Commands
 
-- `dbd init` — scaffold project
+- `dbd init` — scaffold project; or **reverse-engineer** a whole project + baseline snapshot from an existing source: `--from-db <conn>` (live DB) or `--from-dbml <file>` (DBML, mutually exclusive). Refuses against a dbd-managed DB (use `merge`) or an existing `design.yaml`. Flags: `--schema`/`--exclude-schema`/`--all-schemas`/`--roles`/`--version`/`--dry-run`; secrets stay out (`$DATABASE_URL`)
+- `dbd merge` — sync a DB (or `--from-dbml <file>`) into the current project (reverse-engineer + reconcile, never edits `design.yaml`): foreign or managed `D≥Y` → overwrite DDL + auto-snapshot the diff; managed `D<Y` → refuse (stale DB, no override); orphans reported never deleted; same selection flags as init
 - `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`); `--from-db` resolves references against the live catalog (uses `-d`/`--database`) and caches to `.dbd/refcache.json`. Surfaces unresolved migration `-- TODO:`s
 - `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
 - `dbd import` — load staging data (CSV/TSV/JSONL); env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches
@@ -80,6 +81,8 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd doctor` — audit/migrate config + layout: old-format design.yaml, stale files, and plural DDL folders → singular (`ddl/functions/`→`ddl/function/`; collision keeps newer, backs up older as `.bkp`)
 - `dbd reset` — drop schemas (guarded by _dbd_meta env check; `--scope` restricts to the scope's schemas)
 - `dbd format [--check]` — DDL formatter; river-style SELECT/VIEW bodies on by default (`query_style: river`/`none`, `gutter`); river output is AST-verified and falls back to keyword-case-only if it can't reproduce a query faithfully (CTEs, etc.). `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
+
+Reverse-engineering coverage (`init --from-db`/`merge`): schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. gin/gist/brin/hash, comments, serial/identity columns), views, functions & procedures (verbatim), roles (opt-in `--roles`), standalone sequences. Not captured: partial/expression indexes, triggers. A DBML source (`--from-dbml`) = schemas/enums/tables/FKs only.
 
 Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). `reset` is schema-granular; the others filter to the entity working set.
 

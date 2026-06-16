@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod config;
 pub mod dbml;
+pub mod dbml_parse;
 pub mod dependency;
 pub mod diagram;
 pub mod diff;

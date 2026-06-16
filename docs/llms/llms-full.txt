@@ -279,6 +279,89 @@ dbd init -n myproject
 dbd init -n myproject --target supabase
 ```
 
+**Reverse-engineer.** `dbd init --from-db <conn>` (or `$DATABASE_URL`/`-d` when no value) and
+`dbd init --from-dbml <file>` generate the whole project from an existing source instead of the
+sample scaffold: introspect → reconstruct canonical DDL → write `design.yaml` + the
+`ddl/<kind>/<schema>/<name>.ddl` tree, then emit a **baseline snapshot at `--version`** (default 1)
+so the project lands version-tracked. `--from-db` and `--from-dbml` are mutually exclusive.
+
+```sh
+dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
+dbd init --from-db                                # connection from -d / $DATABASE_URL
+dbd init --from-dbml schema.dbml                  # from a DBML file (no connection)
+dbd init --from-db $DATABASE_URL --version 3      # base project.version + baseline snapshot version
+dbd init --from-db ... --schema config --schema staging   # allowlist (repeatable)
+dbd init --from-db ... --exclude-schema audit             # drop a schema (repeatable)
+dbd init --from-db ... --all-schemas              # include Supabase platform schemas
+dbd init --from-db ... --roles                    # also reverse-engineer cluster-global roles
+dbd init --from-db ... --dry-run                  # print the plan, write nothing
+```
+
+Flags: `--name` (default = DB name), `--version N` (base `project.version` + baseline snapshot
+version, default 1), `--schema`/`--exclude-schema` (repeatable allow/deny), `--all-schemas`
+(bypass the Supabase platform denylist; Postgres internals always excluded), `--roles` (opt-in
+roles — DBML has none, so a no-op there), `--dry-run`. Postgres internals (`pg_catalog`,
+`information_schema`, `pg_temp*`, `pg_toast*`) are always excluded; on Supabase, platform schemas
+(`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`, `supabase_*`,
+`cron`, `net`, …) are excluded unless `--all-schemas`.
+
+`init --from-db` **refuses** to run against a **dbd-managed** database (a `_dbd_meta` table in any
+schema → use `dbd merge`), and refuses in a directory that already has a `design.yaml` (use
+`merge`). `--target sqlite` with `--from-db` is rejected (Postgres/Supabase only). The generated
+`design.yaml` writes the connection as the literal `$DATABASE_URL` env reference — **secrets never
+land in the repo**.
+
+### dbd merge
+
+Sync a database (or `--from-dbml <file>`) into the **current** project — same introspection and
+emitter as `init --from-db`, but never creates or edits `design.yaml`.
+
+```sh
+dbd merge postgres://user:pass@host/db   # sync into the current project
+dbd merge                                # connection from -d / $DATABASE_URL
+dbd merge --from-dbml schema.dbml        # sync from a DBML file (no connection)
+dbd merge --dry-run                      # preview the plan + the snapshot version
+dbd merge --schema config --exclude-schema audit   # same selection flags as init
+dbd merge --roles                        # also reverse-engineer roles (opt-in)
+```
+
+Every merge that proceeds **overwrites the introspected DDL into the project (no `.bak`)** and
+**captures the delta as a new snapshot version** (a baseline if the project had none), bumping
+`design.yaml`'s `project.version`. Each generated file is classified: **create** (no file → written),
+**skip** (byte-identical → untouched; runs through the same formatter as `dbd format`, so a
+generated-then-formatted file stays a skip), **overwrite** (differs → replaced in place),
+**orphan** (an existing managed `.ddl`/`.sql` with no matching DB entity — **reported, never
+deleted**). `--dry-run` previews the plan + the snapshot version that would be created.
+
+`merge` requires an existing project (refuses if no `design.yaml` → use `init --from-db`). It never
+edits config, so files written for a schema not in `schemas:` produce a **warning**. Secrets never
+written (the connection is not persisted; `$DATABASE_URL`).
+
+**Version safety.** When the target is a **dbd-managed** database (`_dbd_meta` exists), `merge`
+compares the DB's applied version **D** against the project version **Y** (`0` when unset):
+**D < Y → refuse** (project is ahead of a stale DB; overwriting would discard newer work — no
+override flag; `dbd apply` to advance the DB, or revert the project via version control); **D ≥ Y,
+or any foreign DB / DBML source** → the overwrite + auto-snapshot path. (A DBML or foreign source
+has no `_dbd_meta`, so the gate never engages — it always takes the snapshot path.)
+
+### Reverse-engineering — entity coverage
+
+Captured from a **live database** (`init --from-db` / `merge`): schemas, extensions, enums, tables
+(columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. `USING gin/gist/brin/hash`,
+table + column comments, `serial`/identity columns reproduced through the column), views, functions
+& procedures (full bodies, verbatim via `pg_get_functiondef`; overloads share one file;
+extension-provided routines excluded), roles (opt-in `--roles`; cluster-global, name + memberships
+only, never passwords; superusers/`pg_*`/cloud/Supabase platform roles filtered), and standalone
+sequences (`ddl/sequence/<schema>/<name>.ddl`).
+
+**Not captured:** partial indexes (`… WHERE …`), expression indexes (`lower(name)`), triggers,
+aggregates, operators, domains, composite types. dbd's own `_dbd_meta`/`_dbd_migrations` are always
+excluded. Column order reflects the DB's physical order — run `dbd format` to normalize.
+
+A **DBML source** (`--from-dbml`) covers only **schemas + enums + tables + foreign keys** — DBML
+cannot express functions, procedures, views, standalone sequences, roles, or check constraints.
+`serial`/identity survive via the column.
+
 ### dbd inspect
 
 ```sh
