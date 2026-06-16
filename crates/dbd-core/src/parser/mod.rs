@@ -78,8 +78,51 @@ fn preprocess_sql(sql: &str) -> String {
     result.into_owned()
 }
 
+/// Scan role DDL for `GRANT <parent> TO <member>` membership lines.
+///
+/// sqlparser cannot handle `DO $$ … $$` blocks or `GRANT role TO role`, so we
+/// use a simple, non-backtracking regex on the raw SQL instead.
+///
+/// The pattern matches role-membership grants (identifiers only, no privilege
+/// keywords like `SELECT`). The `… ON …` form (object grants such as
+/// `GRANT SELECT ON TABLE … TO …`) will not match because an `ON` clause
+/// appears between the privilege list and the target — the regex requires the
+/// `TO` to follow immediately after the identifier, so object grants are
+/// correctly excluded.
+///
+/// Captured group 1 (the granted/parent role) is recorded as a `Reference`.
+/// Duplicates are deduplicated while preserving first-seen order.
+fn extract_role_memberships(sql: &str, entity: &mut Entity) {
+    let re = regex::Regex::new(
+        r#"(?i)\bGRANT\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?\s+TO\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?"#,
+    )
+    .expect("role membership regex is valid");
+    let mut seen = std::collections::HashSet::new();
+    for cap in re.captures_iter(sql) {
+        let granted = cap[1].to_string();
+        if seen.insert(granted.clone()) {
+            entity.references.push(Reference {
+                name: granted,
+                ref_type: None,
+            });
+        }
+    }
+    entity.refers = entity
+        .references
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+}
+
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
+
+    // Role DDL contains DO $$ … $$ blocks that sqlparser cannot parse.
+    // Scan the raw SQL directly with a regex and return early — no sqlparser needed.
+    if entity.entity_type == EntityType::Role {
+        extract_role_memberships(sql, &mut entity);
+        return Ok(entity);
+    }
 
     let cleaned = preprocess_sql(sql);
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
@@ -249,5 +292,81 @@ mod tests {
         )
         .unwrap();
         assert!(!entity.errors.is_empty());
+    }
+
+    // ── Role round-trip: emit → parse → refers ───────────────────────────────
+    //
+    // Proves that generate_role_script output is correctly parsed back, so that
+    // role memberships survive a dbd apply cycle.
+    #[test]
+    fn role_membership_round_trip() {
+        use crate::entity::EntityType;
+        use crate::script::ddl_from_entity;
+
+        // Build a role entity with two parent memberships.
+        let mut role = crate::entity::Entity::new(EntityType::Role, "app_ro");
+        role.refers = vec!["app_admin".to_string(), "other_parent".to_string()];
+
+        // Emit DDL via the existing Role arm of ddl_from_entity.
+        let emitted = ddl_from_entity(&role).expect("ddl_from_entity must return Some for Role");
+
+        // The emitted text should contain the GRANT lines.
+        assert!(
+            emitted.contains("GRANT \"app_admin\" TO \"app_ro\""),
+            "emitted DDL missing app_admin grant:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("GRANT \"other_parent\" TO \"app_ro\""),
+            "emitted DDL missing other_parent grant:\n{emitted}"
+        );
+
+        // Now parse the emitted DDL back — this is the path `dbd apply` takes
+        // when it re-reads a file written by `dbd merge --roles`.
+        let parsed = parse_entity(Path::new("ddl/role/app_ro.ddl"), &emitted)
+            .expect("parse_entity must not error on role DDL");
+
+        assert_eq!(parsed.entity_type, EntityType::Role);
+        assert_eq!(parsed.name, "app_ro");
+
+        // Both parent roles must survive the round-trip.
+        assert!(
+            parsed.refers.contains(&"app_admin".to_string()),
+            "app_admin missing from parsed refers: {:?}",
+            parsed.refers
+        );
+        assert!(
+            parsed.refers.contains(&"other_parent".to_string()),
+            "other_parent missing from parsed refers: {:?}",
+            parsed.refers
+        );
+        assert_eq!(parsed.refers.len(), 2, "unexpected extra refers: {:?}", parsed.refers);
+    }
+
+    #[test]
+    fn role_with_no_grants_has_empty_refers() {
+        use crate::entity::EntityType;
+        use crate::script::ddl_from_entity;
+
+        let role = crate::entity::Entity::new(EntityType::Role, "basic");
+        let emitted = ddl_from_entity(&role).unwrap();
+
+        let parsed = parse_entity(Path::new("ddl/role/basic.ddl"), &emitted).unwrap();
+        assert!(
+            parsed.refers.is_empty(),
+            "role with no grants should have empty refers, got {:?}",
+            parsed.refers
+        );
+    }
+
+    #[test]
+    fn role_bare_identifier_grant_parsed() {
+        // Hand-authored files may omit double-quotes; the regex must handle bare identifiers.
+        let sql = "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'child') THEN\n    CREATE ROLE \"child\";\n  END IF;\nEND $$;\nGRANT parent TO child;\n";
+        let parsed = parse_entity(Path::new("ddl/role/child.ddl"), sql).unwrap();
+        assert!(
+            parsed.refers.contains(&"parent".to_string()),
+            "bare-identifier grant not parsed; refers: {:?}",
+            parsed.refers
+        );
     }
 }

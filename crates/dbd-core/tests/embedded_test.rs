@@ -782,3 +782,59 @@ async fn reverse_managed_version_detects_cross_schema_meta() {
         "must read version from staging._dbd_meta regardless of env (project-only key)"
     );
 }
+
+// ── Test 12: Role membership GRANTs survive apply (round-trip fix) ────────────
+
+/// Proves that role membership GRANTs written by `generate_role_script` are
+/// preserved when the DDL file is re-read and applied — the core bug being
+/// fixed. Constructs role entities, emits DDL via `ddl_from_entity`, applies
+/// them, and asserts the membership exists in `pg_auth_members`.
+#[tokio::test]
+async fn role_membership_grant_survives_apply() {
+    use dbd_core::entity::{Entity, EntityType};
+    use dbd_core::script::ddl_from_entity;
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "role_grant_test").await.unwrap();
+
+    // Create the parent role first.
+    let parent = Entity::new(EntityType::Role, "app_admin");
+    let parent_ddl = ddl_from_entity(&parent).expect("ddl_from_entity(app_admin) must return Some");
+    adapter
+        .execute_script(&parent_ddl)
+        .await
+        .expect("failed to apply parent role DDL");
+
+    // Create the child role with the parent as a member.
+    let mut child = Entity::new(EntityType::Role, "app_ro");
+    child.refers = vec!["app_admin".to_string()];
+    let child_ddl = ddl_from_entity(&child).expect("ddl_from_entity(app_ro) must return Some");
+
+    // Verify the emitted DDL contains the GRANT.
+    assert!(
+        child_ddl.contains("GRANT \"app_admin\" TO \"app_ro\""),
+        "emitted role DDL missing GRANT line:\n{child_ddl}"
+    );
+
+    adapter
+        .execute_script(&child_ddl)
+        .await
+        .expect("failed to apply child role DDL");
+
+    // Query pg_auth_members to assert the membership actually exists.
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF NOT EXISTS ( \
+                 SELECT 1 FROM pg_auth_members am \
+                 JOIN pg_roles member ON member.oid = am.member \
+                 JOIN pg_roles granted ON granted.oid = am.roleid \
+                 WHERE member.rolname = 'app_ro' AND granted.rolname = 'app_admin' \
+               ) THEN \
+                 RAISE EXCEPTION 'membership app_ro -> app_admin not found in pg_auth_members'; \
+               END IF; \
+             END $$",
+        )
+        .await
+        .expect("role membership GRANT did not take effect in database");
+}
