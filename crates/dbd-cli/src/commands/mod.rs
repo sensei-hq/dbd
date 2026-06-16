@@ -111,6 +111,7 @@ pub async fn run(
                     project_dir,
                     from_db_explicit,
                     database_url,
+                    env,
                     name.as_deref(),
                     *version,
                     sel,
@@ -136,7 +137,7 @@ pub async fn run(
             };
             // Fix 1: thread database_url so the global -d flag is honoured.
             // Precedence: explicit positional conn > global -d/$DATABASE_URL.
-            reverse::cmd_merge(project_dir, conn.as_deref(), database_url, sel, *force_overwrite, *dry_run).await
+            reverse::cmd_merge(project_dir, conn.as_deref(), database_url, env, config, sel, *force_overwrite, *dry_run).await
         }
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
