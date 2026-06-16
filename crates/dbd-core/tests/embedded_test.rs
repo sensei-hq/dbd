@@ -735,6 +735,74 @@ async fn emitted_routine_ddl_applies_to_postgres() {
         .unwrap_or_else(|e| panic!("emitted routine DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
 }
 
+// ── Test 10: Role introspection (opt-in) ──────────────────────────────────────
+
+/// Reverse-engineer cluster-global roles via `introspect_roles`. Creates two
+/// project roles with a membership, then asserts they are captured as
+/// `EntityType::Role`, the membership is preserved in `refers`, and no
+/// platform/superuser role (the embedded cluster's bootstrap superuser) leaks in.
+#[tokio::test]
+async fn introspect_roles_captures_project_roles_and_memberships() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_roles_test").await.unwrap();
+
+    adapter
+        .execute_script(
+            "CREATE ROLE app_admin; \
+             CREATE ROLE app_ro; \
+             GRANT app_admin TO app_ro;",
+        )
+        .await
+        .expect("failed to create roles");
+
+    let roles = adapter
+        .introspect_roles()
+        .await
+        .expect("introspect_roles failed");
+
+    // app_admin and app_ro captured as Role entities.
+    let app_admin = roles
+        .iter()
+        .find(|e| e.name == "app_admin")
+        .expect("role 'app_admin' not found");
+    assert_eq!(app_admin.entity_type, dbd_core::EntityType::Role);
+    assert!(
+        app_admin.refers.is_empty(),
+        "app_admin should have no memberships, got {:?}",
+        app_admin.refers
+    );
+
+    let app_ro = roles
+        .iter()
+        .find(|e| e.name == "app_ro")
+        .expect("role 'app_ro' not found");
+    assert_eq!(app_ro.entity_type, dbd_core::EntityType::Role);
+    assert_eq!(
+        app_ro.refers,
+        vec!["app_admin".to_string()],
+        "app_ro should be a member of app_admin"
+    );
+
+    // No platform/superuser role (e.g. the bootstrap superuser, or any pg_* role)
+    // may appear — they are filtered by `role_is_managed`.
+    for e in &roles {
+        assert!(
+            !e.name.starts_with("pg_"),
+            "platform role '{}' must not be captured",
+            e.name
+        );
+    }
+    // The embedded cluster's bootstrap superuser is created by name from the
+    // current OS user / settings; whatever it is, it is a superuser and must be
+    // excluded — assert the kept set is exactly the two project roles.
+    let names: Vec<&str> = roles.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["app_admin", "app_ro"],
+        "only the two project roles should be captured, got {names:?}"
+    );
+}
+
 /// Version-safety: a fresh DB with no `_dbd_meta` is foreign (None); once a
 /// `_dbd_meta` table exists in ANY schema (here `staging`, off the default
 /// search_path), the adapter reports the applied version regardless of which `env`

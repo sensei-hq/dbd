@@ -1083,6 +1083,64 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(out)
     }
 
+    async fn introspect_roles(&self) -> Result<Vec<Entity>> {
+        use std::collections::HashSet;
+
+        // 1. All roles + superuser flag. Filter out platform/managed roles via
+        //    `role_is_managed`; the survivors are the project's own roles.
+        let role_rows = sqlx::query("SELECT r.rolname, r.rolsuper FROM pg_roles r ORDER BY r.rolname")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_roles roles query failed: {e}")))?;
+
+        let mut kept_names: Vec<String> = Vec::new();
+        for row in &role_rows {
+            let rolname: String = row.get("rolname");
+            let rolsuper: bool = row.get("rolsuper");
+            if !crate::reverse::role_is_managed(&rolname, rolsuper) {
+                kept_names.push(rolname);
+            }
+        }
+        let kept: HashSet<String> = kept_names.iter().cloned().collect();
+
+        // 2. Memberships as (member rolname, granted rolname) pairs. Filter to
+        //    only kept↔kept edges so every emitted `GRANT … TO …` target is also
+        //    emitted (self-contained); drop memberships into denied/platform roles.
+        let mem_rows = sqlx::query(
+            "SELECT m.rolname AS member, g.rolname AS granted \
+             FROM pg_auth_members am \
+             JOIN pg_roles m ON m.oid = am.member \
+             JOIN pg_roles g ON g.oid = am.roleid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect_roles memberships query failed: {e}")))?;
+
+        let pairs: Vec<(String, String)> = mem_rows
+            .iter()
+            .map(|row| {
+                let member: String = row.get("member");
+                let granted: String = row.get("granted");
+                (member, granted)
+            })
+            .collect();
+        let mut refers_by_member = crate::reverse::keep_memberships(&pairs, &kept);
+
+        // 3. Build one Role entity per kept role (sorted via the ORDER BY above),
+        //    attaching its sorted, self-contained memberships.
+        let entities = kept_names
+            .into_iter()
+            .map(|name| {
+                let mut e = Entity::new(EntityType::Role, &name);
+                if let Some(refers) = refers_by_member.remove(&name) {
+                    e.refers = refers;
+                }
+                e
+            })
+            .collect();
+        Ok(entities)
+    }
+
     async fn reverse_managed_version(&self) -> Result<Option<u32>> {
         // 1. Find the schema that holds `_dbd_meta` via the catalog (not an
         //    unqualified SELECT) — it commonly lives off the search_path
