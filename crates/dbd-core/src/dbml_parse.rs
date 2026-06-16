@@ -487,6 +487,12 @@ fn strip_comment(line: &str) -> &str {
     while i < bytes.len() {
         let c = bytes[i] as char;
         match c {
+            // While inside a single-quoted string a backslash escapes the next
+            // character — skip both without toggling quote state.
+            '\\' if in_single && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             '/' if !in_single
@@ -881,9 +887,9 @@ fn parse_schema_table(s: &str) -> Result<(String, String)> {
     }
 }
 
-/// Map a DBML FK action keyword to an [`FkAction`]. `no action` → `None`
-/// (matches the exporter, which omits a `no action` from its column-level model
-/// but emits the keyword; the round-trip keeps `NoAction` distinguishable).
+/// Map a DBML FK action keyword to an [`FkAction`]. `no action` → `Some(FkAction::NoAction)`
+/// (matches the exporter, which emits the keyword; the round-trip keeps `NoAction`
+/// distinguishable from "no FK action specified").
 fn parse_fk_action(s: &str) -> Option<FkAction> {
     match s.trim().to_ascii_lowercase().as_str() {
         "cascade" => Some(FkAction::Cascade),
@@ -906,6 +912,10 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
     }
     // Walk back to the matching `[`, balancing nested brackets and ignoring
     // brackets inside quotes.
+    //
+    // Escape-awareness (backward walk): a `'` that is immediately preceded by
+    // a `\` is an escaped apostrophe — it must NOT toggle `in_quote`.  We
+    // detect this by peeking at bytes[i - 1] whenever we land on a `'`.
     let bytes = trimmed.as_bytes();
     let mut depth = 0i32;
     let mut in_quote = false;
@@ -914,7 +924,15 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
         i -= 1;
         let c = bytes[i] as char;
         match c {
-            '\'' | '"' => in_quote = !in_quote,
+            '\'' => {
+                // A `'` preceded by `\` is an escaped apostrophe — skip toggle.
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    // Don't toggle; the `\` itself is not a quote character.
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            '"' => in_quote = !in_quote,
             ']' if !in_quote => depth += 1,
             '[' if !in_quote => {
                 depth -= 1;
@@ -962,8 +980,18 @@ fn split_top_level_commas(s: &str) -> Option<Vec<String>> {
     let mut in_double = false;
     let mut in_back = false;
     let mut paren = 0i32;
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            // While inside a single-quoted string a backslash escapes the next
+            // character — consume both and push both without toggling quote state.
+            '\\' if in_single => {
+                cur.push(c);
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+                continue;
+            }
             '\'' if !in_double && !in_back => in_single = !in_single,
             '"' if !in_single && !in_back => in_double = !in_double,
             '`' if !in_single && !in_double => in_back = !in_back,
@@ -995,6 +1023,12 @@ fn split_first_colon(s: &str) -> Option<(&str, &str)> {
     while i < bytes.len() {
         let c = bytes[i] as char;
         match c {
+            // While inside a single-quoted string a backslash escapes the next
+            // character — skip both without toggling quote state.
+            '\\' if in_single && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
             '\'' if !in_double && !in_back => in_single = !in_single,
             '"' if !in_single && !in_back => in_double = !in_double,
             '`' if !in_single && !in_double => in_back = !in_back,
@@ -1291,7 +1325,106 @@ mod tests {
         assert!(matches!(err, DbdError::Parse { .. }));
     }
 
+    // ── Escape-aware scanner tests ────────────────────────────────────────────
+
+    /// A settings group whose note value contains an escaped apostrophe must
+    /// parse both settings (note + nullable flag) without the apostrophe
+    /// corrupting structural quote-tracking.
+    #[test]
+    fn settings_with_escaped_apostrophe_in_note() {
+        // Hand-written: note value is `a'b` (escaped as `a\'b`).
+        let inner = "note: 'a\\'b', not null";
+        let settings = extract_settings(inner).expect("should parse");
+        assert_eq!(settings.len(), 2, "both settings must be present");
+
+        let note_setting = settings
+            .iter()
+            .find(|(k, _)| k == "note")
+            .expect("note setting missing");
+        // The raw value still contains the backslash escape; `parse_single_line_string`
+        // will strip it when the caller interprets the value.
+        assert_eq!(note_setting.1.as_deref(), Some("'a\\'b'"));
+
+        let not_null = settings.iter().find(|(k, _)| k == "not null");
+        assert!(not_null.is_some(), "not null flag must be present");
+    }
+
     // ── Round-trip: exporter → parser → structural equality ──────────────────
+
+    #[test]
+    fn round_trips_with_apostrophes() {
+        use crate::dbml::{generate_dbml, DbmlParams};
+        use crate::entity::TableComments;
+
+        // Table with a column whose comment (note) contains an apostrophe.
+        // The exporter (emit_column) escapes it as `\'` in the DBML.
+        let mut profiles = Entity::new(EntityType::Table, "public.profiles");
+        profiles.table_def = Some(TableDef {
+            columns: vec![
+                ColumnDef {
+                    name: "bio".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    comment: Some("The user's primary biography".into()),
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "nickname".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    default_value: Some("guest".into()),
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    comment: Some("User's display name".into()),
+                    inline_fk: None,
+                },
+            ],
+            constraints: vec![],
+            indexes: vec![],
+            comments: TableComments::default(),
+        });
+
+        let entities = vec![profiles];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "ApostropheTest",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = parse_dbml(&doc.content).unwrap();
+        let t = find_table(&parsed, "public.profiles");
+        let td = t.table_def.as_ref().unwrap();
+
+        let bio = td.columns.iter().find(|c| c.name == "bio").unwrap();
+        // data_type must be clean — no `[note: ...]` glued on.
+        assert_eq!(bio.data_type, "text", "bio data_type must be clean, not glued with settings");
+        assert_eq!(
+            bio.comment.as_deref(),
+            Some("The user's primary biography"),
+            "apostrophe in note must round-trip correctly"
+        );
+
+        let nickname = td.columns.iter().find(|c| c.name == "nickname").unwrap();
+        assert_eq!(nickname.data_type, "text");
+        assert_eq!(
+            nickname.comment.as_deref(),
+            Some("User's display name"),
+            "apostrophe in second column note must round-trip"
+        );
+        assert_eq!(nickname.default_value.as_deref(), Some("guest"));
+    }
 
     #[test]
     fn round_trips_through_generate_dbml() {
