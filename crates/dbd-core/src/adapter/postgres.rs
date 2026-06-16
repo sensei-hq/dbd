@@ -613,6 +613,72 @@ impl PostgresAdapter {
         Ok(entities)
     }
 
+    /// Reverse-engineer functions & procedures via `pg_get_functiondef`.
+    ///
+    /// Captures the canonical `CREATE OR REPLACE FUNCTION|PROCEDURE …` text
+    /// verbatim (lossless). Aggregates/window functions (`prokind a/w`) are
+    /// excluded by the filter; extension-owned routines are excluded via
+    /// `pg_depend deptype = 'e'`.
+    ///
+    /// **Overload grouping:** rows are ordered by `(nspname, proname, oid)`;
+    /// consecutive rows sharing the same `(schema, name, kind)` collapse into a
+    /// single `Entity` whose `writes` holds each overload's definition in oid
+    /// order. This avoids `ddl/<kind>/<schema>/<name>.ddl` path collisions.
+    async fn introspect_functions(&self) -> crate::error::Result<Vec<Entity>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
+            "SELECT n.nspname AS schema, p.proname AS name, p.prokind::text AS kind, \
+                    pg_get_functiondef(p.oid) AS definition \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.prokind IN ('f', 'p') \
+               AND {ns_filter} \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d \
+                   WHERE d.objid = p.oid AND d.deptype = 'e' \
+               ) \
+             ORDER BY n.nspname, p.proname, p.oid"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_functions failed: {e}")))?;
+
+        let mut entities: Vec<Entity> = Vec::new();
+        // Track the key of the entity currently being accumulated so consecutive
+        // overload rows append to its `writes` instead of starting a new entity.
+        let mut current_key: Option<(String, String, String)> = None;
+
+        for row in &rows {
+            let schema: String = row.get("schema");
+            let name: String = row.get("name");
+            let kind: String = row.get("kind");
+            let definition: String = row.get("definition");
+
+            let key = (schema.clone(), name.clone(), kind.clone());
+            if current_key.as_ref() == Some(&key) {
+                // Same routine (overload) — append its body to the current entity.
+                if let Some(last) = entities.last_mut() {
+                    last.writes.push(definition);
+                }
+                continue;
+            }
+
+            let entity_type = if kind == "p" {
+                EntityType::Procedure
+            } else {
+                EntityType::Function
+            };
+            let mut e = Entity::new(entity_type, &format!("{schema}.{name}"));
+            e.schema = Some(schema);
+            e.writes = vec![definition];
+            entities.push(e);
+            current_key = Some(key);
+        }
+
+        Ok(entities)
+    }
+
     /// SQL keywords and types that appear as false-positive references.
     fn is_sql_noise(name: &str) -> bool {
         let lower = name.to_lowercase();
@@ -1013,6 +1079,7 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_enums().await?);
         out.extend(self.introspect_tables().await?);
         out.extend(self.introspect_views().await?);
+        out.extend(self.introspect_functions().await?);
         Ok(out)
     }
 
