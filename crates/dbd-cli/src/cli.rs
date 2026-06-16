@@ -191,6 +191,9 @@ pub enum Commands {
         /// Include Supabase platform schemas (bypass the denylist)
         #[arg(long)]
         all_schemas: bool,
+        /// Also reverse-engineer cluster-global roles (name + memberships; opt-in)
+        #[arg(long)]
+        roles: bool,
         /// Print the plan without writing
         #[arg(long)]
         dry_run: bool,
@@ -208,6 +211,9 @@ pub enum Commands {
         /// Include Supabase platform schemas (bypass the denylist)
         #[arg(long)]
         all_schemas: bool,
+        /// Also reverse-engineer cluster-global roles (name + memberships; opt-in)
+        #[arg(long)]
+        roles: bool,
         /// Print the plan without writing
         #[arg(long)]
         dry_run: bool,
@@ -264,6 +270,40 @@ mod tests {
         assert!(init.is_ok(), "init --from-db failed");
         let merge = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--dry-run", "--all-schemas"]);
         assert!(merge.is_ok(), "merge failed");
+    }
+
+    /// `--roles` is accepted on both `init --from-db` and `merge`, defaults to false
+    /// when absent, and parses to `true` when present.
+    #[test]
+    fn roles_flag_parses_on_init_and_merge() {
+        // init: present → true
+        let cli = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x", "--roles"])
+            .expect("init --from-db --roles should parse");
+        assert!(
+            matches!(&cli.command, Commands::Init { roles: true, .. }),
+            "expected init roles == true"
+        );
+        // init: absent → false
+        let cli = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x"])
+            .expect("init --from-db should parse");
+        assert!(
+            matches!(&cli.command, Commands::Init { roles: false, .. }),
+            "expected init roles == false when absent"
+        );
+        // merge: present → true
+        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--roles"])
+            .expect("merge --roles should parse");
+        assert!(
+            matches!(&cli.command, Commands::Merge { roles: true, .. }),
+            "expected merge roles == true"
+        );
+        // merge: absent → false
+        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x"])
+            .expect("merge should parse");
+        assert!(
+            matches!(&cli.command, Commands::Merge { roles: false, .. }),
+            "expected merge roles == false when absent"
+        );
     }
 
     /// `--force-overwrite` was removed from both `init` and `merge` when the reverse
