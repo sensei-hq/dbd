@@ -13,6 +13,57 @@ pub const SUPABASE_DENYLIST: &[&str] = &[
     "pgtle",
 ];
 
+/// Platform/managed roles excluded from reverse-engineering even with `--roles`.
+/// These are exact-name matches; superusers and prefix-matched platform roles
+/// (`pg_*`, `rds_*`, `azure_*`, `cloudsql*`, `supabase_*`, `pgsodium*`) are
+/// excluded separately in [`role_is_managed`].
+pub const ROLE_DENYLIST: &[&str] = &[
+    "postgres", "anon", "authenticated", "service_role", "authenticator",
+    "dashboard_user", "pgbouncer",
+];
+
+/// Prefixes that mark a role as platform/managed (Postgres internals, cloud
+/// providers, Supabase). A role whose name starts with any of these is excluded.
+const ROLE_DENY_PREFIXES: &[&str] =
+    &["pg_", "rds_", "azure_", "cloudsql", "supabase_", "pgsodium"];
+
+/// Returns `true` if a role is platform/managed and must be EXCLUDED from
+/// reverse-engineering (even with `--roles`). A role is managed when it is a
+/// superuser, its name starts with a platform prefix (`pg_`, `rds_`, `azure_`,
+/// `cloudsql`, `supabase_`, `pgsodium`), or its name is in [`ROLE_DENYLIST`].
+///
+/// Pure (no DB) so it can be unit-tested directly.
+pub fn role_is_managed(name: &str, is_super: bool) -> bool {
+    is_super
+        || ROLE_DENY_PREFIXES.iter().any(|p| name.starts_with(p))
+        || ROLE_DENYLIST.contains(&name)
+}
+
+/// Filter `(member, granted)` membership pairs down to a per-member,
+/// self-contained `refers` map: for each member, the sorted, deduped set of
+/// granted roles that are ALSO in `kept`. Memberships whose member is not kept,
+/// or whose granted role is not kept (denied/platform roles), are dropped — so
+/// every emitted `GRANT … TO …` target is itself emitted.
+///
+/// Pure (no DB) so it can be unit-tested directly.
+pub fn keep_memberships(
+    member_to_granted: &[(String, String)],
+    kept: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (member, granted) in member_to_granted {
+        if kept.contains(member) && kept.contains(granted) {
+            map.entry(member.clone()).or_default().push(granted.clone());
+        }
+    }
+    for refers in map.values_mut() {
+        refers.sort();
+        refers.dedup();
+    }
+    map
+}
+
 fn is_internal(schema: &str) -> bool {
     ALWAYS_EXCLUDED.contains(&schema)
         || schema.starts_with("pg_toast")
@@ -86,8 +137,8 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 
 /// The entity kinds this command generates (used to scope orphan detection).
 pub const MANAGED_KINDS: &[EntityType] = &[
-    EntityType::Schema, EntityType::Extension, EntityType::Enum,
-    EntityType::Table, EntityType::View,
+    EntityType::Schema, EntityType::Extension, EntityType::Role, EntityType::Sequence,
+    EntityType::Enum, EntityType::Table, EntityType::View,
     EntityType::Function, EntityType::Procedure,
 ];
 
@@ -342,6 +393,9 @@ mod tests {
         assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.ddl"));
         let s = Entity::new(EntityType::Schema, "shop");
         assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.ddl"));
+        // Sequences are schema-qualified: ddl/sequence/<schema>/<name>.ddl
+        let seq = Entity::new(EntityType::Sequence, "shop.counter");
+        assert_eq!(entity_path(&seq), PathBuf::from("ddl/sequence/shop/counter.ddl"));
     }
 
     #[test]
@@ -474,7 +528,7 @@ mod tests {
                     default_value: None,
                     is_pk: false,
                     is_unique: false,
-                    is_identity: false,
+                    identity: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -485,7 +539,7 @@ mod tests {
                     default_value: Some("'{}'".into()),
                     is_pk: false,
                     is_unique: false,
-                    is_identity: false,
+                    identity: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -569,6 +623,63 @@ mod tests {
         assert!(!yaml.contains("postgres:"));
         assert!(yaml.contains("url: $DATABASE_URL"));
         assert!(yaml.contains("version: 2"));
+    }
+
+    #[test]
+    fn role_is_managed_keeps_project_roles_drops_platform() {
+        // Project roles are kept (not managed).
+        assert!(!role_is_managed("app_admin", false));
+        assert!(!role_is_managed("app_ro", false));
+
+        // Any superuser is dropped regardless of name.
+        assert!(role_is_managed("app_admin", true));
+
+        // Prefix-matched platform roles are dropped.
+        assert!(role_is_managed("pg_monitor", false));
+        assert!(role_is_managed("rds_superuser", false));
+        assert!(role_is_managed("azure_pg_admin", false));
+        assert!(role_is_managed("cloudsqladmin", false));
+        assert!(role_is_managed("supabase_admin", false));
+        assert!(role_is_managed("pgsodium_keyholder", false));
+
+        // Exact-name denylist entries are dropped.
+        assert!(role_is_managed("anon", false));
+        assert!(role_is_managed("authenticator", false));
+        assert!(role_is_managed("postgres", false));
+        assert!(role_is_managed("authenticated", false));
+        assert!(role_is_managed("service_role", false));
+        assert!(role_is_managed("dashboard_user", false));
+        assert!(role_is_managed("pgbouncer", false));
+    }
+
+    #[test]
+    fn keep_memberships_is_self_contained() {
+        // kept = {app, app_ro}; memberships: app_ro→app (kept) and app→authenticated (denied).
+        let kept: std::collections::HashSet<String> =
+            ["app".to_string(), "app_ro".to_string()].into_iter().collect();
+        let members = vec![
+            ("app_ro".to_string(), "app".to_string()),
+            ("app".to_string(), "authenticated".to_string()),
+        ];
+        let map = keep_memberships(&members, &kept);
+        assert_eq!(map.get("app_ro"), Some(&vec!["app".to_string()]));
+        // app's only membership targets a denied role → dropped entirely (no entry).
+        assert_eq!(map.get("app"), None);
+    }
+
+    #[test]
+    fn keep_memberships_sorts_and_dedups() {
+        let kept: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string(), "c".to_string()]
+                .into_iter()
+                .collect();
+        let members = vec![
+            ("a".to_string(), "c".to_string()),
+            ("a".to_string(), "b".to_string()),
+            ("a".to_string(), "b".to_string()), // duplicate
+        ];
+        let map = keep_memberships(&members, &kept);
+        assert_eq!(map.get("a"), Some(&vec!["b".to_string(), "c".to_string()]));
     }
 
     #[test]

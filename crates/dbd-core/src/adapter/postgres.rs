@@ -306,23 +306,37 @@ impl PostgresAdapter {
             let table: String = trow.get("table_name");
 
             // ── Columns ──────────────────────────────────────────────────────
+            // Reads, per column:
+            //   - `attidentity` ('a'=ALWAYS, 'd'=BY DEFAULT, ''=none) → identity.
+            //   - `col_type` (format_type with typmod) → the declared type.
+            //   - `underlying_type` (atttypid::regtype) → base int type for serial mapping.
+            //   - `owns_default_seq`: whether the column's DEFAULT nextval(...) targets a
+            //     sequence OWNED BY this column (pg_depend deptype 'a'). Only those become
+            //     `serial`; a nextval default on a standalone sequence is kept verbatim.
             let cols_sql =
-                "SELECT c.column_name, \
-                        c.is_nullable, \
-                        c.column_default, \
-                        c.is_identity, \
+                "SELECT a.attname AS column_name, \
+                        a.attnotnull, \
+                        a.attidentity::text AS attidentity, \
+                        pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
                         format_type(a.atttypid, a.atttypmod) AS col_type, \
-                        col_description(a.attrelid, a.attnum) AS col_comment \
-                 FROM information_schema.columns c \
-                 JOIN pg_attribute a \
-                   ON a.attrelid = (SELECT oid FROM pg_class \
-                                    WHERE relname = $2 \
-                                    AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
-                   AND a.attname = c.column_name \
-                   AND a.attnum > 0 \
-                   AND NOT a.attisdropped \
-                 WHERE c.table_schema = $1 AND c.table_name = $2 \
-                 ORDER BY c.ordinal_position";
+                        a.atttypid::regtype::text AS underlying_type, \
+                        col_description(a.attrelid, a.attnum) AS col_comment, \
+                        EXISTS ( \
+                          SELECT 1 FROM pg_depend d \
+                          WHERE d.refclassid = 'pg_class'::regclass \
+                            AND d.refobjid = a.attrelid \
+                            AND d.refobjsubid = a.attnum \
+                            AND d.classid = 'pg_class'::regclass \
+                            AND d.deptype = 'a' \
+                            AND (SELECT relkind FROM pg_class WHERE oid = d.objid) = 'S' \
+                        ) AS owns_default_seq \
+                 FROM pg_attribute a \
+                 JOIN pg_class cls ON cls.oid = a.attrelid \
+                 JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+                 LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+                 WHERE ns.nspname = $1 AND cls.relname = $2 \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum";
 
             let col_rows = sqlx::query(cols_sql)
                 .bind(&schema)
@@ -338,18 +352,56 @@ impl PostgresAdapter {
                 .map(|row| {
                     let name: String = row.get("column_name");
                     let col_type: String = row.get("col_type");
-                    let is_nullable: String = row.get("is_nullable");
+                    let attnotnull: bool = row.get("attnotnull");
                     let default_value: Option<String> = row.get("column_default");
-                    let is_identity_str: String = row.get("is_identity");
+                    let attidentity: String = row.get("attidentity");
+                    let underlying_type: String = row.get("underlying_type");
+                    let owns_default_seq: bool = row.get("owns_default_seq");
                     let comment: Option<String> = row.get("col_comment");
+
+                    // Identity ('a' = ALWAYS, 'd' = BY DEFAULT, '' = none). Identity
+                    // columns carry no user default.
+                    let identity = match attidentity.as_str() {
+                        "a" => Some(crate::entity::IdentityKind::Always),
+                        "d" => Some(crate::entity::IdentityKind::ByDefault),
+                        _ => None,
+                    };
+
+                    // Serial detection: a `nextval('…'::regclass)` default whose sequence is
+                    // OWNED BY this column (deptype 'a') is the `serial`/`bigserial`/
+                    // `smallserial` sugar — map to the serial type per the underlying int
+                    // width and CLEAR the default (Postgres re-creates the owned sequence).
+                    // A nextval default on a STANDALONE sequence (not owned) is left intact;
+                    // that sequence is emitted separately as EntityType::Sequence.
+                    let is_serial = identity.is_none()
+                        && owns_default_seq
+                        && default_value
+                            .as_deref()
+                            .is_some_and(|d| d.contains("nextval("));
+
+                    let (data_type, default_value) = if is_serial {
+                        let serial = match underlying_type.as_str() {
+                            "smallint" | "int2" => "smallserial",
+                            "bigint" | "int8" => "bigserial",
+                            // integer / int4 (and any other int alias) → serial
+                            _ => "serial",
+                        };
+                        (serial.to_string(), None)
+                    } else if identity.is_some() {
+                        // Identity columns: keep the declared type, drop any default.
+                        (col_type, None)
+                    } else {
+                        (col_type, default_value)
+                    };
+
                     ColumnDef {
                         name,
-                        data_type: col_type,
-                        nullable: is_nullable == "YES",
+                        data_type,
+                        nullable: !attnotnull,
                         default_value,
                         is_pk: false,        // filled from constraints
                         is_unique: false,    // filled from constraints
-                        is_identity: is_identity_str == "YES",
+                        identity,
                         comment,
                         inline_fk: None,
                     }
@@ -610,6 +662,78 @@ impl PostgresAdapter {
                 e
             })
             .collect();
+        Ok(entities)
+    }
+
+    /// Reverse-engineer **standalone** sequences as `EntityType::Sequence`.
+    ///
+    /// A sequence is `pg_class.relkind = 'S'`. Column-owned sequences (those backing
+    /// a `serial`/`bigserial` default or an `IDENTITY` column) are EXCLUDED — they
+    /// have a `pg_depend` row `(classid=pg_class, objid=seq, refobjsubid>0,
+    /// deptype IN ('a','i'))` and are reproduced via their owning column (see the
+    /// serial/identity handling in `introspect_tables`). Only non-owned sequences
+    /// are emitted here.
+    ///
+    /// Attributes are read from `pg_sequences` (PG ≥ 10) and the element type from
+    /// `pg_sequence.seqtypid::regtype`. The fully-rendered `CREATE SEQUENCE …;` is
+    /// stashed in `writes[0]` for `emit_sequence` (deterministic; no
+    /// `pg_get_sequencedef` exists, so this is reconstruct-from-catalog).
+    async fn introspect_sequences(&self) -> crate::error::Result<Vec<Entity>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
+            "SELECT s.schemaname, s.sequencename, \
+                    s.start_value, s.min_value, s.max_value, \
+                    s.increment_by, s.cycle, s.cache_size, \
+                    format_type(pgs.seqtypid, NULL) AS seq_type \
+             FROM pg_sequences s \
+             JOIN pg_class c ON c.relname = s.sequencename \
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname \
+             JOIN pg_sequence pgs ON pgs.seqrelid = c.oid \
+             WHERE c.relkind = 'S' \
+               AND {ns_filter} \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM pg_depend d \
+                   WHERE d.classid = 'pg_class'::regclass \
+                     AND d.objid = c.oid \
+                     AND d.refobjsubid > 0 \
+                     AND d.deptype IN ('a', 'i') \
+               ) \
+             ORDER BY s.schemaname, s.sequencename"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_sequences failed: {e}")))?;
+
+        let mut entities: Vec<Entity> = Vec::new();
+        for row in &rows {
+            let schema: String = row.get("schemaname");
+            let name: String = row.get("sequencename");
+            let seq_type: String = row.get("seq_type");
+            let start_value: i64 = row.get("start_value");
+            let min_value: i64 = row.get("min_value");
+            let max_value: i64 = row.get("max_value");
+            let increment_by: i64 = row.get("increment_by");
+            let cycle: bool = row.get("cycle");
+            let cache_size: i64 = row.get("cache_size");
+
+            // Deterministic, fully-explicit CREATE SEQUENCE for fidelity. Quoting
+            // matches the rest of the emitter (q()).
+            let mut ddl = format!(
+                "CREATE SEQUENCE \"{schema}\".\"{name}\" AS {seq_type} \
+                 INCREMENT BY {increment_by} MINVALUE {min_value} MAXVALUE {max_value} \
+                 START WITH {start_value} CACHE {cache_size}"
+            );
+            if cycle {
+                ddl.push_str(" CYCLE");
+            }
+            ddl.push(';');
+
+            let mut e = Entity::new(EntityType::Sequence, &format!("{schema}.{name}"));
+            e.schema = Some(schema);
+            e.writes = vec![ddl];
+            entities.push(e);
+        }
         Ok(entities)
     }
 
@@ -1076,11 +1200,70 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut out: Vec<Entity> = Vec::new();
         out.extend(self.introspect_schemas().await?);
         out.extend(self.introspect_extensions().await?);
+        out.extend(self.introspect_sequences().await?);
         out.extend(self.introspect_enums().await?);
         out.extend(self.introspect_tables().await?);
         out.extend(self.introspect_views().await?);
         out.extend(self.introspect_functions().await?);
         Ok(out)
+    }
+
+    async fn introspect_roles(&self) -> Result<Vec<Entity>> {
+        use std::collections::HashSet;
+
+        // 1. All roles + superuser flag. Filter out platform/managed roles via
+        //    `role_is_managed`; the survivors are the project's own roles.
+        let role_rows = sqlx::query("SELECT r.rolname, r.rolsuper FROM pg_roles r ORDER BY r.rolname")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_roles roles query failed: {e}")))?;
+
+        let mut kept_names: Vec<String> = Vec::new();
+        for row in &role_rows {
+            let rolname: String = row.get("rolname");
+            let rolsuper: bool = row.get("rolsuper");
+            if !crate::reverse::role_is_managed(&rolname, rolsuper) {
+                kept_names.push(rolname);
+            }
+        }
+        let kept: HashSet<String> = kept_names.iter().cloned().collect();
+
+        // 2. Memberships as (member rolname, granted rolname) pairs. Filter to
+        //    only kept↔kept edges so every emitted `GRANT … TO …` target is also
+        //    emitted (self-contained); drop memberships into denied/platform roles.
+        let mem_rows = sqlx::query(
+            "SELECT m.rolname AS member, g.rolname AS granted \
+             FROM pg_auth_members am \
+             JOIN pg_roles m ON m.oid = am.member \
+             JOIN pg_roles g ON g.oid = am.roleid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect_roles memberships query failed: {e}")))?;
+
+        let pairs: Vec<(String, String)> = mem_rows
+            .iter()
+            .map(|row| {
+                let member: String = row.get("member");
+                let granted: String = row.get("granted");
+                (member, granted)
+            })
+            .collect();
+        let mut refers_by_member = crate::reverse::keep_memberships(&pairs, &kept);
+
+        // 3. Build one Role entity per kept role (sorted via the ORDER BY above),
+        //    attaching its sorted, self-contained memberships.
+        let entities = kept_names
+            .into_iter()
+            .map(|name| {
+                let mut e = Entity::new(EntityType::Role, &name);
+                if let Some(refers) = refers_by_member.remove(&name) {
+                    e.refers = refers;
+                }
+                e
+            })
+            .collect();
+        Ok(entities)
     }
 
     async fn reverse_managed_version(&self) -> Result<Option<u32>> {

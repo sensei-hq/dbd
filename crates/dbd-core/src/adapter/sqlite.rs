@@ -128,6 +128,7 @@ impl DatabaseAdapter for SqliteAdapter {
             EntityType::External => Ok(()),
             EntityType::Extension
             | EntityType::Role
+            | EntityType::Sequence
             | EntityType::Enum
             | EntityType::Function
             | EntityType::Procedure => Err(DbdError::Config(format!(

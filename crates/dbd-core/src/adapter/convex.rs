@@ -580,6 +580,7 @@ impl DatabaseAdapter for ConvexAdapter {
             | EntityType::Export => Ok(()),
             EntityType::Extension
             | EntityType::Role
+            | EntityType::Sequence
             | EntityType::Function
             | EntityType::Procedure => Err(DbdError::Config(format!(
                 "Convex adapter does not support {:?} entities ({})",
@@ -749,7 +750,7 @@ mod tests {
             default_value: None,
             is_pk: false,
             is_unique: false,
-            is_identity: false,
+            identity: None,
             comment: None,
             inline_fk: None,
         }

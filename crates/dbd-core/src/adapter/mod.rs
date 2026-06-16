@@ -131,6 +131,21 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Reverse-engineer cluster-global roles (name + role memberships only — no
+    /// attributes, never passwords). Returns one `Entity { entity_type: Role }`
+    /// per kept role, with `refers` = the granted roles that are also kept (so
+    /// the emitted set is self-contained). Platform/managed roles (superusers,
+    /// `pg_*`/cloud-provider/Supabase roles, and the named denylist) are excluded
+    /// — see [`crate::reverse::role_is_managed`].
+    ///
+    /// This is NOT part of `introspect()`: roles are cluster-global and managed
+    /// clusters are dominated by platform roles, so the CLI calls this separately
+    /// and appends the results only when `--roles` is set. Default returns
+    /// `Ok(vec![])`; Postgres overrides.
+    async fn introspect_roles(&self) -> Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
     // ── Migration tracking ─────────────────────────────
 
     async fn ensure_migrations_table(&self) -> Result<()>;

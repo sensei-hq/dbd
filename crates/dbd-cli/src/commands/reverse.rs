@@ -72,6 +72,8 @@ pub async fn cmd_init_from_db(
     name: Option<&str>,
     version: u32,
     sel: SchemaSelect,
+    // Opt-in: also reverse-engineer cluster-global roles.
+    roles: bool,
     dry_run: bool,
 ) -> Result<()> {
     if project_dir.join("design.yaml").exists() {
@@ -105,7 +107,17 @@ pub async fn cmd_init_from_db(
 
     // A fresh project has no design.yaml yet, so use the default format settings —
     // matching what `dbd format` would later apply with a freshly-scaffolded config.
-    let entities = adapter.introspect().await.context("introspection failed")?;
+    let mut entities = adapter.introspect().await.context("introspection failed")?;
+    // Roles are cluster-global and gated behind the `--roles` opt-in: append them
+    // only when asked (introspect_roles is NOT part of introspect()).
+    if roles {
+        entities.extend(
+            adapter
+                .introspect_roles()
+                .await
+                .context("role introspection failed")?,
+        );
+    }
     run_plan(
         project_dir,
         config_path,
@@ -138,6 +150,7 @@ pub async fn cmd_init_from_db(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_merge(
     project_dir: &Path,
     // Explicit positional connection argument.
@@ -148,6 +161,8 @@ pub async fn cmd_merge(
     // The design.yaml path (already resolved by the dispatcher).
     config_path: &Path,
     sel: SchemaSelect,
+    // Opt-in: also reverse-engineer cluster-global roles.
+    roles: bool,
     dry_run: bool,
 ) -> Result<()> {
     if !config_path.exists() {
@@ -184,7 +199,17 @@ pub async fn cmd_merge(
             );
         }
         MergeDecision::Snapshot => {
-            let entities = adapter.introspect().await.context("introspection failed")?;
+            let mut entities = adapter.introspect().await.context("introspection failed")?;
+            // Roles are cluster-global and gated behind the `--roles` opt-in: append
+            // them only when asked (introspect_roles is NOT part of introspect()).
+            if roles {
+                entities.extend(
+                    adapter
+                        .introspect_roles()
+                        .await
+                        .context("role introspection failed")?,
+                );
+            }
             merge_snapshot(
                 project_dir, config_path, env, &entities, sel, dry_run, &config,
             )
