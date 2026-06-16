@@ -1,10 +1,11 @@
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, ReferentialAction, Statement,
-    TableConstraint as SqlTableConstraint,
+    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, GeneratedAs, ReferentialAction,
+    Statement, TableConstraint as SqlTableConstraint,
 };
 
 use crate::entity::{
-    ColumnDef, FkAction, ForeignKey, IndexColumn, IndexDef, Reference, TableComments, TableConstraint, TableDef,
+    ColumnDef, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, Reference, TableComments,
+    TableConstraint, TableDef,
 };
 
 /// Extract table definition and references from parsed statements.
@@ -100,7 +101,7 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
     let mut nullable = true;
     let mut is_pk = false;
     let mut is_unique = false;
-    let mut is_identity = false;
+    let mut identity: Option<IdentityKind> = None;
     let mut default_value = None;
     let mut inline_fk = None;
     let mut references = Vec::new();
@@ -167,17 +168,30 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
                     on_update: convert_referential_action(&fk_constraint.on_update),
                 });
             }
-            ColumnOption::Generated { .. } => {
-                is_identity = true;
+            // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` — an identity column
+            // (sequence-backed). `GENERATED ALWAYS AS (expr) STORED` is a computed
+            // column, not identity, so only map the identity forms (no expression).
+            ColumnOption::Generated {
+                generated_as,
+                generation_expr,
+                ..
+            } if generation_expr.is_none() => {
+                identity = match generated_as {
+                    GeneratedAs::ByDefault => Some(IdentityKind::ByDefault),
+                    // ALWAYS (or the internal ExpStored fallback, which can't occur
+                    // here since generation_expr is None) → ALWAYS.
+                    _ => Some(IdentityKind::Always),
+                };
+                nullable = false;
             }
             _ => {}
         }
     }
 
-    // Detect SERIAL-like types
+    // Detect SERIAL-like types. SERIAL is sugar for an integer + owned sequence;
+    // it is NOT an IDENTITY column, so it does not set `identity`.
     let upper_type = data_type.to_uppercase();
     if upper_type.contains("SERIAL") {
-        is_identity = true;
         is_pk = true;
         nullable = false;
     }
@@ -189,7 +203,7 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
         default_value,
         is_pk,
         is_unique,
-        is_identity,
+        identity,
         comment: None,
         inline_fk,
     };

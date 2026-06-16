@@ -137,8 +137,8 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 
 /// The entity kinds this command generates (used to scope orphan detection).
 pub const MANAGED_KINDS: &[EntityType] = &[
-    EntityType::Schema, EntityType::Extension, EntityType::Role, EntityType::Enum,
-    EntityType::Table, EntityType::View,
+    EntityType::Schema, EntityType::Extension, EntityType::Role, EntityType::Sequence,
+    EntityType::Enum, EntityType::Table, EntityType::View,
     EntityType::Function, EntityType::Procedure,
 ];
 
@@ -393,6 +393,9 @@ mod tests {
         assert_eq!(entity_path(&e), PathBuf::from("ddl/enum/shop/order_status.ddl"));
         let s = Entity::new(EntityType::Schema, "shop");
         assert_eq!(entity_path(&s), PathBuf::from("ddl/schema/shop.ddl"));
+        // Sequences are schema-qualified: ddl/sequence/<schema>/<name>.ddl
+        let seq = Entity::new(EntityType::Sequence, "shop.counter");
+        assert_eq!(entity_path(&seq), PathBuf::from("ddl/sequence/shop/counter.ddl"));
     }
 
     #[test]
@@ -525,7 +528,7 @@ mod tests {
                     default_value: None,
                     is_pk: false,
                     is_unique: false,
-                    is_identity: false,
+                    identity: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -536,7 +539,7 @@ mod tests {
                     default_value: Some("'{}'".into()),
                     is_pk: false,
                     is_unique: false,
-                    is_identity: false,
+                    identity: None,
                     comment: None,
                     inline_fk: None,
                 },

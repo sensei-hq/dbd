@@ -481,8 +481,10 @@ impl Design {
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
         // Sort by type priority then dependencies
-        // Apply order: schemas → extensions → roles → enums → tables → views → functions/procedures → externals
-        let (schemas, extensions, roles, enums, tables, views, functions, externals) =
+        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → functions/procedures → externals
+        // Sequences are placed before tables so a column `DEFAULT nextval('seq')`
+        // referencing a standalone sequence finds the sequence already created.
+        let (schemas, extensions, roles, sequences, enums, tables, views, functions, externals) =
             partition_entities(entities);
         let sorted_roles = dependency::sort_by_dependencies(&roles);
         let sorted_enums = dependency::sort_by_dependencies(&enums);
@@ -491,7 +493,7 @@ impl Design {
         let sorted_functions = dependency::sort_by_dependencies(&functions);
 
         let entities = [
-            schemas, extensions, sorted_roles, sorted_enums,
+            schemas, extensions, sorted_roles, sequences, sorted_enums,
             sorted_tables, sorted_views, sorted_functions, externals,
         ]
         .concat();
@@ -1404,8 +1406,10 @@ impl Design {
 }
 
 /// Partition entities by type for ordered apply.
-/// Partition entities by type for ordered apply.
-/// Returns: (schemas, extensions, roles, enums, tables, views, functions/procedures, externals)
+/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, functions/procedures, externals)
+///
+/// Sequences are emitted before tables so a column `DEFAULT nextval('seq')`
+/// referencing a standalone sequence finds the sequence already created.
 #[allow(clippy::type_complexity)]
 fn partition_entities(
     entities: Vec<Entity>,
@@ -1418,10 +1422,12 @@ fn partition_entities(
     Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
+    Vec<Entity>,
 ) {
     let mut schemas = Vec::new();
     let mut extensions = Vec::new();
     let mut roles = Vec::new();
+    let mut sequences = Vec::new();
     let mut enums = Vec::new();
     let mut tables = Vec::new();
     let mut views = Vec::new();
@@ -1433,6 +1439,7 @@ fn partition_entities(
             EntityType::Schema => schemas.push(entity),
             EntityType::Extension => extensions.push(entity),
             EntityType::Role => roles.push(entity),
+            EntityType::Sequence => sequences.push(entity),
             EntityType::Enum => enums.push(entity),
             EntityType::Table => tables.push(entity),
             EntityType::View => views.push(entity),
@@ -1442,7 +1449,7 @@ fn partition_entities(
         }
     }
 
-    (schemas, extensions, roles, enums, tables, views, functions, externals)
+    (schemas, extensions, roles, sequences, enums, tables, views, functions, externals)
 }
 
 #[cfg(test)]
