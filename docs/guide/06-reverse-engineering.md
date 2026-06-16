@@ -50,8 +50,8 @@ workflow depends on where the project came from.
   <text class="mono" x="523" y="165" text-anchor="middle">dbd snapshot</text>
   <path class="edge" d="M523,114 L523,136" marker-end="url(#dbd-arrow)" />
   <path class="edge" d="M448,160 H313 V114" marker-end="url(#dbd-arrow)" />
-  <rect class="edge-label-bg" x="330" y="150" width="78" height="18" rx="4" />
-  <text class="edge-label" x="369" y="163" text-anchor="middle">iterate: re-apply</text>
+  <rect class="edge-label-bg" x="330" y="123" width="78" height="17" rx="4" />
+  <text class="edge-label" x="369" y="135" text-anchor="middle">iterate: re-apply</text>
 
   <!-- ===== Brownfield lane ===== -->
   <rect class="lane" x="8" y="220" width="804" height="240" rx="10" />
@@ -95,10 +95,11 @@ workflow depends on where the project came from.
   <rect class="box" x="358" y="406" width="180" height="42" rx="10" />
   <text class="box-text" x="448" y="424" text-anchor="middle">DB drift → snapshot</text>
   <text class="edge-label" x="448" y="440" text-anchor="middle">guarded: refuses if DB &lt; project version</text>
-  <path class="edge" d="M358,427 C300,427 240,420 188,400 L160,392" marker-end="url(#dbd-arrow)" />
+  <!-- merge loop: the Postgres DB drifts → dbd merge pulls it back as a snapshot -->
+  <path class="edge" d="M358,427 C280,432 210,400 192,330" marker-end="url(#dbd-arrow)" />
   <path class="edge" d="M538,420 C600,415 668,412 668,408" marker-end="url(#dbd-arrow)" />
-  <rect class="edge-label-bg" x="252" y="430" width="74" height="18" rx="4" />
-  <text class="edge-label mono" x="289" y="443" text-anchor="middle">dbd merge</text>
+  <rect class="edge-label-bg" x="214" y="334" width="74" height="17" rx="4" />
+  <text class="edge-label mono" x="251" y="346" text-anchor="middle">dbd merge</text>
 </svg>
 
 ## Greenfield
