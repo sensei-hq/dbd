@@ -275,12 +275,17 @@ dbd init --from-db ... --dry-run                  # print the plan, write nothin
 |------|-------------|
 | `--from-db [CONN]` | Reverse-engineer instead of scaffolding. With no value, the connection resolves from `-d`/`--database` then `$DATABASE_URL`. |
 | `--name NAME` | `project.name` (default: the database name from the connection). |
-| `--version N` | Base `project.version` written to `design.yaml` (default `1`). |
+| `--version N` | Base `project.version` written to `design.yaml`, and the version of the baseline snapshot (default `1`). |
 | `--schema S` | Limit to exactly these schemas (repeatable). |
 | `--exclude-schema S` | Add to the exclusion set (repeatable). |
 | `--all-schemas` | Bypass the Supabase platform denylist (Postgres internals — `pg_catalog`, `information_schema`, `pg_temp*`, `pg_toast*` — are still always excluded). |
-| `--force-overwrite` | On conflict, back up the existing file to `.bak` and write the new one. |
 | `--dry-run` | Print the plan and exit; touch nothing. |
+
+**Version-tracked from the start.** After writing the `ddl/` tree and `design.yaml`,
+`init --from-db` emits a **baseline snapshot at `--version`** (default 1) — so the new
+project lands with `snapshots/{NNN}.json` and `design.yaml`'s `project.version` set to
+that version, ready for `dbd snapshot`/`dbd apply`. `--dry-run` previews this
+(`would create baseline snapshot v{N}`) and writes nothing.
 
 **Schema selection.** Postgres internals are always excluded. On Supabase, platform schemas
 (`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`,
@@ -324,47 +329,46 @@ creates or edits `design.yaml`.
 ```sh
 dbd merge postgres://user:pass@host/db   # sync into the current project
 dbd merge                                # connection from -d / $DATABASE_URL
-dbd merge --dry-run                      # preview the plan (create/conflict/orphan)
-dbd merge --force-overwrite              # back up conflicts to .bak, then overwrite
+dbd merge --dry-run                      # preview the plan + the snapshot version
 dbd merge --schema config --exclude-schema audit   # same selection flags as init
 ```
 
-Each generated file is classified before anything is written:
+Every `merge` that proceeds **overwrites the introspected DDL into the project (no `.bak`)
+and captures the delta as a new snapshot version** — foreign and dbd-managed databases
+behave identically. The new snapshot plus version control are the record of what changed, so
+`merge` deliberately clobbers on-disk drift rather than aborting or backing up. Each
+generated file is still classified before writing:
 
 - **create** — no file at the path → written.
-- **skip** — file exists and is byte-identical → left as-is (re-runs are idempotent).
-- **conflict** — file exists and differs. Without `--force-overwrite` the run **aborts**
-  and lists the conflicts (nothing is written) — except under `--dry-run`, which always
-  prints the plan (conflicts included) and exits cleanly. With `--force-overwrite`, the
-  existing file is renamed to `<name>.ddl.bak` (`.bak.1`, `.bak.2`, … on collision) and the
-  new file is written. Because generated DDL is run through the same formatter as
-  `dbd format`, a file you generate, then `dbd format`, then re-generate stays a **skip**
-  (no spurious conflicts/`.bak` churn).
+- **skip** — file exists and is byte-identical → left untouched (re-runs are idempotent).
+  Because generated DDL is run through the same formatter as `dbd format`, a file you
+  generate, then `dbd format`, then re-generate stays a **skip** (no spurious churn).
+- **overwrite** — file exists and differs → replaced in place (no `.bak`).
 - **orphan** — an existing `.ddl`/`.sql` file of a managed kind (table/enum/view) under a
   selected schema with no matching DB entity. **Orphans are reported, never deleted** — you
   handle removals. (Orphaned *schema* and *extension* files aren't flagged in v1.)
 
+After writing, `dbd` reloads the project and runs `snapshot::create_snapshot`: if the DDL was
+already in sync with the latest snapshot it reports `already in sync — no snapshot created`,
+otherwise it writes the next snapshot version (a baseline if the project had none yet) and
+bumps `design.yaml`'s `project.version`. `--dry-run` previews the plan and the snapshot
+version that *would* be created, writing nothing.
+
 `merge` requires an existing project (it refuses if there's no `design.yaml`; use
 `init --from-db`). Because it never edits config, if it writes files for a schema not
-listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself. The
-report summarises `created · unchanged · overwritten · orphans`, listing the orphan paths.
+listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself.
 
 **Managed databases & version safety.** When the target is a **dbd-managed** database (a
 `_dbd_meta` table exists in any schema), `merge` compares the database's applied version
 **D** against the project's `design.yaml` `project.version` **Y** (treated as `0` when
-unset):
+unset). The only thing this changes is whether the merge proceeds at all:
 
 - **D < Y → refuse.** The project is ahead of a stale database; overwriting project DDL from
   it would discard newer work. Bring the database up to date with `dbd apply`, or revert the
   project to v`D` via version control if you really mean to discard those changes. (There is
   no override flag.)
-- **D ≥ Y → auto-snapshot.** The introspected DDL is written into the project (**overwriting
-  drift in place — no `.bak`**, since the new snapshot plus version control are the record),
-  then `dbd` captures the delta as a **new snapshot version**. `--dry-run` previews the plan
-  and the snapshot version that would be created, writing nothing.
-
-These checks apply only to managed databases. A **foreign** database (no `_dbd_meta`) takes
-the normal create/skip/conflict/orphan path described above — the primary use of `merge`.
+- **everything else** (a **foreign** database with no `_dbd_meta`, or a managed database with
+  **D ≥ Y**) → the overwrite + auto-snapshot path described above.
 
 ---
 
