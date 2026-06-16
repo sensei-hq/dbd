@@ -40,7 +40,7 @@ WHERE p.prokind IN ('f', 'p')                     -- skip aggregates ('a') / win
       SELECT 1 FROM pg_depend d
       WHERE d.objid = p.oid AND d.deptype = 'e'
   )
-ORDER BY n.nspname, p.proname, p.oid
+ORDER BY n.nspname, p.proname, p.prokind, p.oid   -- prokind keeps each (schema,name,kind) contiguous for grouping
 ```
 
 - **Extension-owned routines excluded** (`pg_depend deptype = 'e'`) — e.g. `uuid-ossp`'s
