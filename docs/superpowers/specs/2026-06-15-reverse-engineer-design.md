@@ -175,6 +175,32 @@ existing `formatter`.
 - Reuse: `Entity`/`TableDef`/`ColumnDef`/`IndexDef`, the internal-schema filter in
   `list_entities()`, `get_adapter()`/`connect()`, the `formatter`.
 
+## Version safety against dbd-managed databases (added 2026-06-15)
+
+Reverse-engineering a database that dbd already manages is dangerous: a database that is
+**behind** the project (its applied version < the project's `design.yaml` version) is stale,
+and overwriting project DDL from it would silently destroy newer work. The gate:
+
+- **Managed detection:** a database is "dbd-managed" iff a `_dbd_meta` table exists in **any**
+  schema (it commonly lives outside the default `search_path`, e.g. `staging._dbd_meta`, so
+  detection is a catalog lookup, not an unqualified read). `reverse_managed_version()` on the
+  adapter returns `Some(version)` for a managed DB (0 if the table exists but has no row for
+  `project`) or `None` for a foreign DB. Default trait impl returns `None`; Postgres overrides
+  it. `_dbd_meta` has `PRIMARY KEY (project)` — one row per project; `env` records the
+  last-applied environment and is not part of the key, so this read is env-agnostic.
+- **`init --from-db` against a managed DB → refuse** (point the user at `merge`). `init` is for
+  foreign databases only.
+- **`merge` against a managed DB**, with DB version **D** and project version **Y**
+  (`design.yaml` `project.version`, treated as `0` when unset):
+  - **D < Y → refuse** (no override flag): the project is ahead of a stale DB; the user should
+    bring the DB current (`dbd apply`) or revert the project via version control.
+  - **D ≥ Y → auto-snapshot**: write the introspected DDL into the project (overwriting drift,
+    no `.bak` — the new snapshot + VCS are the record), then run `snapshot::create_snapshot` to
+    capture the delta as a new version. `--dry-run` previews the plan + the snapshot version,
+    writing nothing. (D > Y is only reachable via manual version tampering, but still snapshots.)
+- **Foreign DB (no `_dbd_meta`) → unchanged**: normal create/skip/conflict/orphan merge. This is
+  the primary intended use of `init --from-db`/`merge`.
+
 ## Risks / notes
 
 - DDL-emitter fidelity is the main risk; the round-trip tests bound it, and the

@@ -320,3 +320,316 @@ async fn migration_upgrades_schema() {
 
     assert_column_exists(&*adapter, "app", "items", "notes").await;
 }
+
+// ── Test 6: Postgres introspection ───────────────────────────────────────────
+
+#[tokio::test]
+async fn introspect_returns_fixture_entities() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_test").await.unwrap();
+
+    // Create a known fixture in the ephemeral DB
+    let fixture_sql = "
+        CREATE SCHEMA revtest;
+
+        CREATE TYPE revtest.color AS ENUM ('red', 'green');
+
+        CREATE TABLE revtest.owner (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+        );
+
+        CREATE TABLE revtest.widget (
+            id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            owner_id uuid NOT NULL REFERENCES revtest.owner(id) ON DELETE CASCADE,
+            name     text NOT NULL,
+            qty      int DEFAULT 0,
+            tags     text[] NOT NULL DEFAULT '{}'
+        );
+
+        ALTER TABLE revtest.widget ADD CONSTRAINT widget_name_key UNIQUE (name);
+
+        CREATE INDEX widget_owner_idx ON revtest.widget (owner_id);
+        CREATE INDEX widget_lower_name_idx ON revtest.widget (lower(name));
+        CREATE INDEX widget_tags_idx ON revtest.widget USING gin (tags);
+
+        COMMENT ON TABLE revtest.widget IS 'Widget objects';
+        COMMENT ON COLUMN revtest.widget.name IS 'Display name';
+
+        CREATE VIEW revtest.active AS SELECT id, name FROM revtest.widget;
+    ";
+    adapter.execute_script(fixture_sql).await.expect("fixture DDL failed");
+
+    // Run introspect
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // ── Assert: schema revtest present ───────────────────────────────────────
+    let has_revtest_schema = entities.iter().any(|e| {
+        e.entity_type == dbd_core::EntityType::Schema && e.name == "revtest"
+    });
+    assert!(has_revtest_schema, "schema 'revtest' not found in introspect output");
+
+    // ── Assert: enum revtest.color present with values [red, green] ──────────
+    let color_enum = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.color"
+    });
+    let color_enum = color_enum.expect("enum 'revtest.color' not found in introspect output");
+    let enum_value_names: Vec<&str> = color_enum.enum_values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(enum_value_names, vec!["red", "green"], "enum values should be [red, green]");
+
+    // ── Assert: table revtest.widget present ──────────────────────────────────
+    let widget = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::Table && e.name == "revtest.widget"
+    });
+    let widget = widget.expect("table 'revtest.widget' not found in introspect output");
+    let td = widget.table_def.as_ref().expect("widget should have a table_def");
+
+    // Columns: id, owner_id, name, qty
+    let col_names: Vec<&str> = td.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"id"), "widget must have column 'id'");
+    assert!(col_names.contains(&"owner_id"), "widget must have column 'owner_id'");
+    assert!(col_names.contains(&"name"), "widget must have column 'name'");
+    assert!(col_names.contains(&"qty"), "widget must have column 'qty'");
+
+    // id: not nullable
+    let id_col = td.columns.iter().find(|c| c.name == "id").unwrap();
+    assert!(!id_col.nullable, "id should be NOT NULL");
+
+    // owner_id: not nullable
+    let owner_col = td.columns.iter().find(|c| c.name == "owner_id").unwrap();
+    assert!(!owner_col.nullable, "owner_id should be NOT NULL");
+
+    // name: not nullable
+    let name_col = td.columns.iter().find(|c| c.name == "name").unwrap();
+    assert!(!name_col.nullable, "name should be NOT NULL");
+
+    // qty: has a default value
+    let qty_col = td.columns.iter().find(|c| c.name == "qty").unwrap();
+    assert!(qty_col.default_value.is_some(), "qty should have a default value");
+
+    // PRIMARY KEY constraint on [id]
+    let pk = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::PrimaryKey { columns, .. } => Some(columns),
+        _ => None,
+    });
+    let pk_cols = pk.expect("widget should have a PRIMARY KEY constraint");
+    assert_eq!(pk_cols, &vec!["id".to_string()], "PK should be on column 'id'");
+
+    // FOREIGN KEY to revtest.owner on CASCADE delete
+    let fk = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::ForeignKey(fk) => Some(fk),
+        _ => None,
+    });
+    let fk = fk.expect("widget should have a FOREIGN KEY constraint");
+    assert_eq!(fk.ref_table, "owner", "FK should reference 'owner'");
+    assert_eq!(fk.ref_schema.as_deref(), Some("revtest"), "FK ref_schema should be 'revtest'");
+    assert_eq!(
+        fk.on_delete,
+        Some(dbd_core::entity::FkAction::Cascade),
+        "FK on_delete should be CASCADE"
+    );
+
+    // UNIQUE constraint on [name]
+    let unique = td.constraints.iter().find_map(|c| match c {
+        dbd_core::entity::TableConstraint::Unique { columns, .. } => Some(columns),
+        _ => None,
+    });
+    let unique_cols = unique.expect("widget should have a UNIQUE constraint");
+    assert!(unique_cols.contains(&"name".to_string()), "UNIQUE should be on 'name'");
+
+    // Non-constraint index widget_owner_idx (plain column — must be captured)
+    let idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_owner_idx"));
+    assert!(idx.is_some(), "index 'widget_owner_idx' should be present");
+
+    // GIN index widget_tags_idx — access method must be captured (a GIN index on a
+    // text[] column would be invalid as a plain btree, so the method must round-trip).
+    let gin_idx = td
+        .indexes
+        .iter()
+        .find(|i| i.name.as_deref() == Some("widget_tags_idx"))
+        .expect("GIN index 'widget_tags_idx' should be present");
+    assert_eq!(
+        gin_idx.index_type,
+        Some(dbd_core::entity::IndexType::Gin),
+        "widget_tags_idx should be captured as a GIN index"
+    );
+
+    // Expression index widget_lower_name_idx — must be skipped (IndexDef cannot represent it)
+    let expr_idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_lower_name_idx"));
+    assert!(
+        expr_idx.is_none(),
+        "expression index 'widget_lower_name_idx' should NOT appear in introspect output"
+    );
+
+    // Table comment
+    assert_eq!(
+        td.comments.table.as_deref(),
+        Some("Widget objects"),
+        "table comment should be 'Widget objects'"
+    );
+
+    // Column comment on name
+    assert_eq!(
+        td.comments.columns.get("name").map(String::as_str),
+        Some("Display name"),
+        "column comment on 'name' should be 'Display name'"
+    );
+
+    // ── Assert: view revtest.active present with SELECT body ──────────────────
+    let view = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::View && e.name == "revtest.active"
+    });
+    let view = view.expect("view 'revtest.active' not found in introspect output");
+    let body = view.writes.first().expect("view should have a body in writes[0]");
+    assert!(
+        body.to_uppercase().contains("SELECT"),
+        "view body should contain SELECT, got: {body}"
+    );
+}
+
+// ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
+
+/// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
+/// GIN index on it, and a HASH index on a plain column, emit DDL via
+/// `emit_table`, and execute it against an embedded Postgres. This guards the
+/// `CREATE INDEX ... USING <method>` grammar — a prior bug emitted `USING gin`
+/// BEFORE `ON table` (invalid Postgres), which only a real apply catches
+/// (sqlparser happily parses the invalid ordering). Postgres accepting the DDL
+/// proves the emitted output is valid, not merely parseable.
+#[tokio::test]
+async fn emitted_index_ddl_applies_to_postgres() {
+    use dbd_core::entity::{
+        ColumnDef, Entity, EntityType, IndexColumn, IndexDef, IndexType, TableConstraint, TableDef,
+    };
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "emit_index_test").await.unwrap();
+
+    // Fresh schema to apply into.
+    adapter
+        .execute_script("CREATE SCHEMA emit_test;")
+        .await
+        .expect("failed to create schema emit_test");
+
+    // Minimal standalone table: a plain column + a text[] column, no FKs.
+    let mut entity = Entity::new(EntityType::Table, "emit_test.doc");
+    entity.schema = Some("emit_test".into());
+    entity.table_def = Some(TableDef {
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "uuid".into(),
+                nullable: false,
+                default_value: Some("gen_random_uuid()".into()),
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+            ColumnDef {
+                name: "title".into(),
+                data_type: "text".into(),
+                nullable: false,
+                default_value: None,
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+            ColumnDef {
+                name: "tags".into(),
+                data_type: "text[]".into(),
+                nullable: false,
+                default_value: Some("'{}'".into()),
+                is_pk: false,
+                is_unique: false,
+                is_identity: false,
+                comment: None,
+                inline_fk: None,
+            },
+        ],
+        constraints: vec![TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+        }],
+        indexes: vec![
+            // GIN index on the array column — invalid as a btree, so the access
+            // method (and its position after `ON table`) must be correct.
+            IndexDef {
+                name: Some("doc_tags_gin".into()),
+                columns: vec![IndexColumn { name: "tags".into(), order: None }],
+                unique: false,
+                index_type: Some(IndexType::Gin),
+            },
+            // HASH index on a plain column.
+            IndexDef {
+                name: Some("doc_title_hash".into()),
+                columns: vec![IndexColumn { name: "title".into(), order: None }],
+                unique: false,
+                index_type: Some(IndexType::Hash),
+            },
+        ],
+        comments: Default::default(),
+    });
+
+    let sql = dbd_core::emit::emit_table(&entity);
+    assert!(
+        sql.contains("USING gin"),
+        "emitted DDL should carry the GIN access method, got:\n{sql}"
+    );
+
+    // The real test: Postgres must accept the emitted DDL verbatim.
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
+}
+
+/// Version-safety: a fresh DB with no `_dbd_meta` is foreign (None); once a
+/// `_dbd_meta` table exists in ANY schema (here `staging`, off the default
+/// search_path), the adapter reports the applied version regardless of which `env`
+/// the row was last written with — proving cross-schema detection is env-agnostic.
+///
+/// The row is seeded with `env='dev'` while the adapter was not constructed with
+/// that env value, confirming the read keys on `project` only (not `(project, env)`).
+#[tokio::test]
+async fn reverse_managed_version_detects_cross_schema_meta() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    // (a) Fresh DB — no `_dbd_meta` anywhere → foreign.
+    let managed = adapter
+        .reverse_managed_version()
+        .await
+        .expect("reverse_managed_version should not error on a fresh DB");
+    assert_eq!(managed, None, "a DB with no _dbd_meta must be foreign (None)");
+
+    // (b) Create `staging._dbd_meta` (NOT on the default search_path) with a row
+    //     seeded with env='dev' — deliberately different from any env the caller
+    //     might pass. The read must succeed regardless, proving the key is
+    //     `project` only.
+    adapter
+        .execute_script(
+            "CREATE SCHEMA staging; \
+             CREATE TABLE staging._dbd_meta ( \
+                project varchar NOT NULL, \
+                env     varchar NOT NULL, \
+                version integer NOT NULL \
+             ); \
+             INSERT INTO staging._dbd_meta (project, env, version) \
+             VALUES ('embedded_test', 'dev', 3);",
+        )
+        .await
+        .expect("failed to seed staging._dbd_meta");
+
+    let managed = adapter
+        .reverse_managed_version()
+        .await
+        .expect("reverse_managed_version should read cross-schema _dbd_meta");
+    assert_eq!(
+        managed,
+        Some(3),
+        "must read version from staging._dbd_meta regardless of env (project-only key)"
+    );
+}

@@ -2,6 +2,7 @@ mod data;
 mod diagram;
 mod migration;
 mod project;
+mod reverse;
 mod schema;
 
 use std::path::{Path, PathBuf};
@@ -88,14 +89,55 @@ pub async fn run(
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 
-        Commands::Init { name, target } => {
-            let project_name = name.as_deref().unwrap_or_else(|| {
-                project_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("my-project")
-            });
-            project::cmd_init(project_dir, project_name, target, verbosity)
+        Commands::Init { name, target, from_db, version, schemas, exclude_schemas, all_schemas, force_overwrite, dry_run } => {
+            if let Some(s) = from_db {
+                // Fix 2: --target must be postgres (or default) when --from-db is set.
+                // Reverse-engineering only supports Postgres/Supabase in this cut.
+                if target != "postgres" {
+                    anyhow::bail!(
+                        "--target {target} is not supported with --from-db; \
+                         reverse-engineering supports Postgres/Supabase only"
+                    );
+                }
+                let sel = dbd_core::reverse::SchemaSelect {
+                    only: schemas.clone(),
+                    exclude: exclude_schemas.clone(),
+                    all: *all_schemas,
+                };
+                // Fix 1: thread database_url so the global -d flag is honoured.
+                // Precedence: explicit --from-db URL > global -d/$DATABASE_URL.
+                let from_db_explicit = if s.is_empty() { None } else { Some(s.as_str()) };
+                reverse::cmd_init_from_db(
+                    project_dir,
+                    from_db_explicit,
+                    database_url,
+                    env,
+                    name.as_deref(),
+                    *version,
+                    sel,
+                    *force_overwrite,
+                    *dry_run,
+                ).await
+            } else {
+                let project_name = name.as_deref().unwrap_or_else(|| {
+                    project_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("my-project")
+                });
+                project::cmd_init(project_dir, project_name, target, verbosity)
+            }
+        }
+
+        Commands::Merge { conn, schemas, exclude_schemas, all_schemas, force_overwrite, dry_run } => {
+            let sel = dbd_core::reverse::SchemaSelect {
+                only: schemas.clone(),
+                exclude: exclude_schemas.clone(),
+                all: *all_schemas,
+            };
+            // Fix 1: thread database_url so the global -d flag is honoured.
+            // Precedence: explicit positional conn > global -d/$DATABASE_URL.
+            reverse::cmd_merge(project_dir, conn.as_deref(), database_url, env, config, sel, *force_overwrite, *dry_run).await
         }
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),

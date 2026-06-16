@@ -254,6 +254,118 @@ Creates design.yaml, ddl/ directory structure, and a sample table DDL.
 Supabase target includes default external entities (auth.users, storage.objects)
 and ignore patterns for managed schemas.
 
+### Reverse-engineer from a database — `--from-db`
+
+Generate a whole project from an existing database instead of the sample scaffold. dbd
+introspects the catalog (schemas, extensions, enums, tables — columns, defaults,
+PK/FK/unique/check constraints, indexes, comments — and views), reconstructs canonical
+`CREATE …` DDL, and writes the usual `design.yaml` + `ddl/<kind>/<schema>/<name>.ddl` tree.
+
+```sh
+dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
+dbd init --from-db                                # connection from $DATABASE_URL (or -d)
+dbd init --from-db $DATABASE_URL --version 3      # base project.version (default 1)
+dbd init --from-db ... --schema config --schema staging   # only these schemas
+dbd init --from-db ... --exclude-schema audit             # drop a schema
+dbd init --from-db ... --all-schemas              # include Supabase platform schemas
+dbd init --from-db ... --dry-run                  # print the plan, write nothing
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from-db [CONN]` | Reverse-engineer instead of scaffolding. With no value, the connection resolves from `-d`/`--database` then `$DATABASE_URL`. |
+| `--name NAME` | `project.name` (default: the database name from the connection). |
+| `--version N` | Base `project.version` written to `design.yaml` (default `1`). |
+| `--schema S` | Limit to exactly these schemas (repeatable). |
+| `--exclude-schema S` | Add to the exclusion set (repeatable). |
+| `--all-schemas` | Bypass the Supabase platform denylist (Postgres internals — `pg_catalog`, `information_schema`, `pg_temp*`, `pg_toast*` — are still always excluded). |
+| `--force-overwrite` | On conflict, back up the existing file to `.bak` and write the new one. |
+| `--dry-run` | Print the plan and exit; touch nothing. |
+
+**Schema selection.** Postgres internals are always excluded. On Supabase, platform schemas
+(`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`,
+`supabase_*`, `cron`, `net`, …) are excluded by default; `--all-schemas` includes them.
+`--schema` (allowlist) and `--exclude-schema` compose with these.
+
+**Secrets stay out of the repo.** The generated `design.yaml` target URL is written as the
+literal `$DATABASE_URL` env reference — never the connection string you passed.
+
+`init --from-db` refuses to run in a directory that already has a `design.yaml` (use
+`merge` to sync into an existing project). Reverse-engineering supports Postgres/Supabase
+connections only; `--target sqlite` with `--from-db` is rejected.
+
+**Managed databases & version safety.** `init --from-db` is for databases **not** managed by
+dbd. If it detects a `_dbd_meta` table (in any schema — dbd tracks the applied version there),
+it **refuses** and points you at `merge`, which knows how to reconcile a managed database into
+its own project safely.
+
+**What v1 captures (and what it doesn't).** This release reverse-engineers the **data
+model**: schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
+constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments) and
+views. Not yet captured:
+
+- **Functions, procedures, roles, sequences** — coming in later patches.
+- **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
+  are skipped, since they can't be represented losslessly yet.
+- dbd's own bookkeeping tables (`_dbd_meta`, `_dbd_migrations`) are always excluded.
+
+Column order reflects the database's **physical** order (which can differ from a
+hand-authored file after `ALTER TABLE ADD COLUMN`). Run `dbd format` on the result to
+normalize the output to your project's conventions.
+
+---
+
+## `dbd merge`
+
+Sync a database into the **current** project — reverse-engineer, then reconcile against the
+files already on disk. Same introspection and emitter as `init --from-db`, but it never
+creates or edits `design.yaml`.
+
+```sh
+dbd merge postgres://user:pass@host/db   # sync into the current project
+dbd merge                                # connection from -d / $DATABASE_URL
+dbd merge --dry-run                      # preview the plan (create/conflict/orphan)
+dbd merge --force-overwrite              # back up conflicts to .bak, then overwrite
+dbd merge --schema config --exclude-schema audit   # same selection flags as init
+```
+
+Each generated file is classified before anything is written:
+
+- **create** — no file at the path → written.
+- **skip** — file exists and is byte-identical → left as-is (re-runs are idempotent).
+- **conflict** — file exists and differs. Without `--force-overwrite` the run **aborts**
+  and lists the conflicts (nothing is written) — except under `--dry-run`, which always
+  prints the plan (conflicts included) and exits cleanly. With `--force-overwrite`, the
+  existing file is renamed to `<name>.ddl.bak` (`.bak.1`, `.bak.2`, … on collision) and the
+  new file is written. Because generated DDL is run through the same formatter as
+  `dbd format`, a file you generate, then `dbd format`, then re-generate stays a **skip**
+  (no spurious conflicts/`.bak` churn).
+- **orphan** — an existing `.ddl`/`.sql` file of a managed kind (table/enum/view) under a
+  selected schema with no matching DB entity. **Orphans are reported, never deleted** — you
+  handle removals. (Orphaned *schema* and *extension* files aren't flagged in v1.)
+
+`merge` requires an existing project (it refuses if there's no `design.yaml`; use
+`init --from-db`). Because it never edits config, if it writes files for a schema not
+listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself. The
+report summarises `created · unchanged · overwritten · orphans`, listing the orphan paths.
+
+**Managed databases & version safety.** When the target is a **dbd-managed** database (a
+`_dbd_meta` table exists in any schema), `merge` compares the database's applied version
+**D** against the project's `design.yaml` `project.version` **Y** (treated as `0` when
+unset):
+
+- **D < Y → refuse.** The project is ahead of a stale database; overwriting project DDL from
+  it would discard newer work. Bring the database up to date with `dbd apply`, or revert the
+  project to v`D` via version control if you really mean to discard those changes. (There is
+  no override flag.)
+- **D ≥ Y → auto-snapshot.** The introspected DDL is written into the project (**overwriting
+  drift in place — no `.bak`**, since the new snapshot plus version control are the record),
+  then `dbd` captures the delta as a **new snapshot version**. `--dry-run` previews the plan
+  and the snapshot version that would be created, writing nothing.
+
+These checks apply only to managed databases. A **foreign** database (no `_dbd_meta`) takes
+the normal create/skip/conflict/orphan path described above — the primary use of `merge`.
+
 ---
 
 ## `dbd format`

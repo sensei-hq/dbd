@@ -53,7 +53,8 @@ myproject/
 
 | Command | Purpose |
 |---------|---------|
-| `dbd init` | Scaffold a new project (postgres or supabase) |
+| `dbd init` | Scaffold a new project (postgres or supabase), or reverse-engineer one from a live DB with `--from-db` |
+| `dbd merge` | Sync an existing database into the current project (reverse-engineer + reconcile) |
 | `dbd inspect` | Validate configuration, report errors and warnings |
 | `dbd apply` | Apply schemas, entities, and pending migrations |
 | `dbd import` | Load staging data from CSV/TSV/JSONL files |

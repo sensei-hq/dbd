@@ -106,6 +106,31 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Introspect the live database and return a complete `Vec<Entity>` covering
+    /// schemas, extensions, enums, tables (with columns, constraints, indexes,
+    /// and comments), and views — in that order.
+    ///
+    /// The default implementation returns an unsupported error. Adapters that
+    /// support full introspection (currently only `PostgresAdapter`) override this.
+    async fn introspect(&self) -> Result<Vec<Entity>> {
+        Err(crate::error::DbdError::Config(
+            "introspect() is not supported for this adapter".to_string(),
+        ))
+    }
+
+    /// Reverse-engineering safety: `Some(version)` if this DB is dbd-managed (a
+    /// `_dbd_meta` table exists in ANY schema), reading the applied version for
+    /// `self.project` — `0` if the table exists but has no matching row. `None`
+    /// for a foreign DB (no `_dbd_meta`). Default returns `Ok(None)`; Postgres
+    /// overrides. Robust to `_dbd_meta` living outside the search_path.
+    ///
+    /// Note: `_dbd_meta` has `PRIMARY KEY (project)` — exactly one row per
+    /// project. `env` records the *last-applied* environment and is not part of
+    /// the key, so this read is keyed on `project` only (env-agnostic).
+    async fn reverse_managed_version(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
     // ── Migration tracking ─────────────────────────────
 
     async fn ensure_migrations_table(&self) -> Result<()>;

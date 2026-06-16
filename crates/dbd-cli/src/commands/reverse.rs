@@ -1,0 +1,523 @@
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use dbd_core::config::FormatConfig;
+use dbd_core::reverse::{self, SchemaSelect};
+
+/// Returns schemas that appear in `written` but not in `declared`, sorted and deduped.
+fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
+    let declared_set: std::collections::HashSet<&String> = declared.iter().collect();
+    let mut result: Vec<String> = written
+        .iter()
+        .filter(|s| !declared_set.contains(s))
+        .cloned()
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+
+/// Resolve the connection string from the single pre-resolved candidate.
+///
+/// The caller is responsible for combining explicit flag values with the
+/// global `-d`/`$DATABASE_URL` value (which clap already reads from the
+/// environment). This function simply bails with an actionable error when
+/// nothing was resolved.
+pub(crate) fn resolve_conn(candidate: Option<&str>) -> Result<String> {
+    match candidate {
+        Some(c) if !c.is_empty() => Ok(c.to_string()),
+        _ => anyhow::bail!(
+            "no connection given — pass a connection URL via the positional argument, \
+             --from-db <url>, -d <url>, or $DATABASE_URL"
+        ),
+    }
+}
+
+/// The version-safety decision for a `merge` against a (possibly managed) DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeDecision {
+    /// Foreign DB (no `_dbd_meta`) — run the normal create/skip/conflict merge.
+    Foreign,
+    /// Managed DB behind the project (D < Y) — refuse; the project is ahead of a stale DB.
+    Refuse { db: u32, project: u32 },
+    /// Managed DB at or ahead of the project (D ≥ Y) — overwrite + auto-snapshot.
+    Snapshot,
+}
+
+/// Decide what a `merge` should do given the DB's managed version (`None` = foreign)
+/// and the project's `design.yaml` version. This is the single source of truth for
+/// the gate — the handler routes through it so the tested logic is the real logic.
+pub(crate) fn merge_decision(managed: Option<u32>, project_version: u32) -> MergeDecision {
+    match managed {
+        None => MergeDecision::Foreign,
+        Some(d) if d < project_version => MergeDecision::Refuse { db: d, project: project_version },
+        Some(_) => MergeDecision::Snapshot,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_init_from_db(
+    project_dir: &Path,
+    // Explicit --from-db value (None = flag absent; Some("") = bare flag → fall back).
+    from_db: Option<&str>,
+    // Global -d / $DATABASE_URL, already resolved by clap.
+    database_url: Option<&str>,
+    _env: &str,
+    name: Option<&str>,
+    version: u32,
+    sel: SchemaSelect,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if project_dir.join("design.yaml").exists() {
+        bail!("design.yaml already exists here — use `dbd merge` to sync a DB into an existing project");
+    }
+    // Precedence: explicit --from-db URL > global -d/$DATABASE_URL.
+    let candidate = match from_db {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => database_url,
+    };
+    let conn = resolve_conn(candidate)?;
+
+    // Resolve the project name used both for the connection (the per-project meta
+    // read keys on it) and as the generated `design.yaml` `project.name`:
+    // --name > db name parsed from the conn > "project".
+    let project_name = name
+        .map(String::from)
+        .unwrap_or_else(|| db_name_from_conn(&conn).unwrap_or_else(|| "project".into()));
+
+    // Version-safety gate: `init --from-db` is only for databases NOT managed by
+    // dbd. Detect a `_dbd_meta` table in any schema and refuse if found.
+    let adapter = dbd_core::connect(&conn, &project_name)
+        .await
+        .context("failed to connect to the database")?;
+    if let Some(d) = adapter.reverse_managed_version().await? {
+        bail!(
+            "database is managed by dbd (version {d}); `dbd init --from-db` is only for \
+             databases not managed by dbd — use `dbd merge` from the project's repository instead"
+        );
+    }
+
+    // A fresh project has no design.yaml yet, so use the default format settings —
+    // matching what `dbd format` would later apply with a freshly-scaffolded config.
+    let entities = adapter.introspect().await.context("introspection failed")?;
+    run_plan(
+        project_dir,
+        entities,
+        Some(&project_name),
+        Some(version),
+        sel,
+        force,
+        dry_run,
+        true,
+        &FormatConfig::default(),
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_merge(
+    project_dir: &Path,
+    // Explicit positional connection argument.
+    conn: Option<&str>,
+    // Global -d / $DATABASE_URL, already resolved by clap.
+    database_url: Option<&str>,
+    env: &str,
+    // The design.yaml path (already resolved by the dispatcher).
+    config_path: &Path,
+    sel: SchemaSelect,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if !config_path.exists() {
+        bail!("no design.yaml here — use `dbd init --from-db <conn>` to start a new project");
+    }
+    // Load the existing project's config once: its `project.name` keys the per-project
+    // meta read AND the live connection; its `format` settings drive emit-side
+    // formatting; its declared schemas drive the undeclared-schema warning below.
+    let config = dbd_core::config::read(config_path)
+        .context("failed to read design.yaml")?;
+    let project_name = config.project.name.clone();
+    // Precedence: explicit positional conn > global -d/$DATABASE_URL.
+    let candidate = conn.or(database_url);
+    let conn = resolve_conn(candidate)?;
+
+    // Connect with the REAL project name (not the literal "reverse") so the
+    // `_dbd_meta` lookup keys on the right (project, env).
+    let adapter = dbd_core::connect(&conn, &project_name)
+        .await
+        .context("failed to connect to the database")?;
+
+    // Version-safety gate.
+    let managed = adapter.reverse_managed_version().await?;
+    let project_version = config.project.version.unwrap_or(0);
+    match merge_decision(managed, project_version) {
+        MergeDecision::Refuse { db, project } => {
+            bail!(
+                "refusing to merge: database is at version {db} but this project is at version \
+                 {project} — the project is ahead of a stale database. Bring the database up to \
+                 date (`dbd apply`), or revert the project to v{db} via version control if you \
+                 mean to discard those changes."
+            );
+        }
+        MergeDecision::Snapshot => {
+            let entities = adapter.introspect().await.context("introspection failed")?;
+            managed_merge_snapshot(
+                project_dir, config_path, env, &entities, sel, dry_run, &config.format,
+            )
+        }
+        MergeDecision::Foreign => {
+            // Existing normal merge path — UNCHANGED behaviour.
+            let entities = adapter.introspect().await.context("introspection failed")?;
+            let covered = run_plan(
+                project_dir, entities, None, None, sel, force, dry_run, false,
+                &config.format,
+            )?;
+
+            // Warn about schemas written but not declared in design.yaml (spec line 67).
+            let declared = config.schema_names();
+            for schema in undeclared_schemas(&covered, &declared) {
+                eprintln!(
+                    "  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Managed `merge` (DB version ≥ project version): write the introspected DDL into
+/// the project, **overwriting drift with NO `.bak`**, then auto-snapshot the delta
+/// as a new version. `--dry-run` previews the plan + the snapshot version and writes
+/// nothing.
+///
+/// # Non-transactionality (accepted limitation)
+/// `apply_overwrite` writes all DDL files before the project is reloaded and
+/// `create_snapshot` is called. If the reload or snapshot step fails after files
+/// have been written, the project directory is in a partial-apply state: files are
+/// already overwritten with no `.bak` and no snapshot exists. Recover via version
+/// control (`git checkout -- .` or equivalent). This mirrors the non-transactionality
+/// note on `apply_plan` and `apply_overwrite`.
+fn managed_merge_snapshot(
+    project_dir: &Path,
+    config_path: &Path,
+    env: &str,
+    entities: &[dbd_core::Entity],
+    sel: SchemaSelect,
+    dry_run: bool,
+    format: &FormatConfig,
+) -> Result<()> {
+    // Select schemas + keep only entities under a selected schema (same logic as
+    // the normal path).
+    let (selected, kept) = select_and_keep(entities, &sel);
+    if selected.is_empty() {
+        println!("No user schemas to reverse-engineer (after filtering). Nothing to do.");
+        return Ok(());
+    }
+
+    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
+
+    if dry_run {
+        let report = reverse::apply_plan(project_dir, &plan, /*force*/ false, /*dry_run*/ true)?;
+        println!(
+            "[dry-run] {} created · {} unchanged · {} conflict(s) (would overwrite, no .bak)",
+            report.created, report.unchanged, report.conflicts
+        );
+        for it in plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict) {
+            println!("  conflict (differs from DB): {}", it.path.display());
+        }
+        for o in &plan.orphans {
+            println!("  orphan (no DB entity): {}", o.display());
+        }
+        for label in &plan.skipped_unsafe {
+            eprintln!("  warning: skipped unsafe path segment: {label}");
+        }
+        // Only promise a snapshot when there is actually something to write.
+        // If every item is Skip the real run would print "already in sync — no
+        // snapshot created", so the dry-run preview must match.
+        let has_changes = plan
+            .items
+            .iter()
+            .any(|i| i.action != reverse::FileAction::Skip);
+        if has_changes {
+            let n = dbd_core::snapshot::next_version(project_dir);
+            println!("[dry-run] would capture changes as snapshot v{n}");
+        } else {
+            println!("[dry-run] already in sync — no snapshot needed");
+        }
+        return Ok(());
+    }
+
+    // Apply: overwrite Create + Conflict in place (no `.bak`), skip Skip.
+    let report = reverse::apply_overwrite(project_dir, &plan)?;
+    for o in &plan.orphans {
+        println!("  orphan (no DB entity): {}", o.display());
+    }
+    for label in &plan.skipped_unsafe {
+        eprintln!("  warning: skipped unsafe path segment: {label}");
+    }
+    let files_written = report.created + report.overwritten;
+
+    // Reload the project from the freshly-written DDL, then snapshot the delta.
+    // `create_snapshot` bumps design.yaml's version and writes snapshot+migration
+    // files itself — do not duplicate that here.
+    //
+    // NOTE: both calls below happen *after* apply_overwrite has written all DDL
+    // files. A failure here leaves the project in a partial-apply state (files
+    // overwritten, no snapshot). Recover via version control.
+    let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
+        .context("failed to reload project after writing DDL — recover via version control if files were partially written")?;
+    let snap = dbd_core::snapshot::create_snapshot(
+        design.entities(), project_dir, config_path, "merge from database",
+    )
+    .context("failed to create snapshot after writing DDL — recover via version control if files were partially written")?;
+
+    // `create_snapshot` handles the no-previous-snapshot (baseline) case, so a
+    // project without prior snapshots still snapshots cleanly. A single result
+    // flagged `no_changes` means the DDL was already in sync with the latest snapshot.
+    if snap.snapshots.len() == 1 && snap.snapshots[0].no_changes {
+        println!(
+            "{files_written} file(s) written — already in sync — no snapshot created"
+        );
+    } else {
+        let version = snap.snapshots.last().map(|s| s.snapshot.version).unwrap_or(0);
+        println!("{files_written} file(s) written · snapshot v{version} created");
+    }
+    Ok(())
+}
+
+/// Select schemas from the introspected entities and keep only the entities under
+/// a selected schema.
+///
+/// A schema entity "belongs to" itself (its own name), so it is filtered by name —
+/// otherwise a denylisted/excluded schema (e.g. Supabase `extensions`) would still
+/// get a stray `ddl/schema/<name>.ddl` file even though it's left out of
+/// design.yaml. Truly schema-less entities (e.g. roles) have no owning schema and
+/// are always kept.
+fn select_and_keep(
+    entities: &[dbd_core::Entity],
+    sel: &SchemaSelect,
+) -> (Vec<String>, Vec<dbd_core::Entity>) {
+    let db_schemas: Vec<String> = {
+        let mut s: Vec<String> = entities.iter().filter_map(|e| e.schema.clone()).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    let selected = reverse::select_schemas(&db_schemas, sel);
+    let kept: Vec<_> = entities
+        .iter()
+        .filter(|e| {
+            let owning = if e.entity_type == dbd_core::EntityType::Schema {
+                Some(e.name.as_str())
+            } else {
+                e.schema.as_deref()
+            };
+            owning.is_none_or(|s| selected.iter().any(|sel| sel == s))
+        })
+        .cloned()
+        .collect();
+    (selected, kept)
+}
+
+/// Build the write-plan from already-introspected entities, write `design.yaml`
+/// (init only), apply, and report. The caller owns the connection + introspection
+/// (so the version-safety gate can act on the adapter before any writes).
+#[allow(clippy::too_many_arguments)]
+fn run_plan(
+    project_dir: &Path,
+    entities: Vec<dbd_core::Entity>,
+    name: Option<&str>,
+    version: Option<u32>,
+    sel: SchemaSelect,
+    force: bool,
+    dry_run: bool,
+    write_config: bool,
+    format: &FormatConfig,
+) -> Result<Vec<String>> {
+    // 1. select schemas + keep only entities under a selected schema
+    let (selected, kept) = select_and_keep(&entities, &sel);
+    if selected.is_empty() {
+        println!("No user schemas to reverse-engineer (after filtering). Nothing to do.");
+        return Ok(vec![]);
+    }
+
+    // 2. build write-plan (emitted DDL is formatted so it matches `dbd format`)
+    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
+
+    // 3. write design.yaml (init only; only if absent; skip on dry-run)
+    if write_config && !dry_run {
+        let project = name
+            .map(String::from)
+            .unwrap_or_else(|| "project".into());
+        let yaml = reverse::design_yaml(&project, "postgres", &selected, version.unwrap_or(1));
+        std::fs::write(project_dir.join("design.yaml"), yaml)
+            .context("failed to write design.yaml")?;
+    }
+
+    // 4. apply + report
+    let report = reverse::apply_plan(project_dir, &plan, force, dry_run)?;
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+    println!(
+        "{}{} created · {} unchanged · {} conflict(s) · {} overwritten (.bak) · {} orphan(s) left as-is",
+        prefix,
+        report.created,
+        report.unchanged,
+        report.conflicts,
+        report.overwritten,
+        report.orphans
+    );
+    // In a dry-run, conflicts aren't an error — list the diverging files (like
+    // orphans below) so the user can see what `--force-overwrite` would replace.
+    if dry_run {
+        for it in plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict) {
+            println!("  conflict (differs from DB): {}", it.path.display());
+        }
+    }
+    for o in &plan.orphans {
+        println!("  orphan (no DB entity): {}", o.display());
+    }
+    for label in &plan.skipped_unsafe {
+        eprintln!("  warning: skipped unsafe path segment: {label}");
+    }
+    Ok(selected)
+}
+
+/// Parse the database name out of a connection string for the default project name.
+/// Best-effort heuristic: a URL with a trailing slash and no db name (e.g. `postgres://host/`)
+/// yields `None` and falls back to `"project"`; `--name` always overrides this entirely.
+fn db_name_from_conn(conn: &str) -> Option<String> {
+    let after = conn.rsplit('/').next()?;
+    let db = after.split(['?', '#']).next()?;
+    if db.is_empty() {
+        None
+    } else {
+        Some(db.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// All written schemas are declared — no warnings.
+    #[test]
+    fn undeclared_schemas_all_declared_returns_empty() {
+        let written = strs(&["app", "config"]);
+        let declared = strs(&["app", "config", "staging"]);
+        assert_eq!(undeclared_schemas(&written, &declared), Vec::<String>::new());
+    }
+
+    /// One written schema is missing from declared — returned.
+    #[test]
+    fn undeclared_schemas_one_missing() {
+        let written = strs(&["app", "new_schema"]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["new_schema"]));
+    }
+
+    /// Duplicates in `written` are deduped in the result.
+    #[test]
+    fn undeclared_schemas_deduplicates() {
+        let written = strs(&["app", "app", "new_schema", "new_schema"]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["new_schema"]));
+    }
+
+    /// Result is sorted alphabetically.
+    #[test]
+    fn undeclared_schemas_sorted() {
+        let written = strs(&["zzz", "aaa", "mmm"]);
+        let declared = strs(&[]);
+        assert_eq!(undeclared_schemas(&written, &declared), strs(&["aaa", "mmm", "zzz"]));
+    }
+
+    /// Empty written — empty result regardless of declared.
+    #[test]
+    fn undeclared_schemas_empty_written() {
+        let written = strs(&[]);
+        let declared = strs(&["app"]);
+        assert_eq!(undeclared_schemas(&written, &declared), Vec::<String>::new());
+    }
+
+    // ── merge_decision ────────────────────────────────────────────────────────
+
+    /// Foreign DB (no `_dbd_meta`) → normal merge.
+    #[test]
+    fn merge_decision_foreign_when_unmanaged() {
+        assert_eq!(merge_decision(None, 5), MergeDecision::Foreign);
+    }
+
+    /// Managed DB behind the project (D < Y) → refuse.
+    #[test]
+    fn merge_decision_refuses_when_db_behind() {
+        assert_eq!(merge_decision(Some(2), 5), MergeDecision::Refuse { db: 2, project: 5 });
+    }
+
+    /// Managed DB at the project version (D == Y) → snapshot.
+    #[test]
+    fn merge_decision_snapshots_when_equal() {
+        assert_eq!(merge_decision(Some(5), 5), MergeDecision::Snapshot);
+    }
+
+    /// Managed DB ahead of the project (D > Y) → snapshot.
+    #[test]
+    fn merge_decision_snapshots_when_db_ahead() {
+        assert_eq!(merge_decision(Some(7), 5), MergeDecision::Snapshot);
+    }
+
+    /// Both at zero (unset project version) → snapshot.
+    #[test]
+    fn merge_decision_snapshots_at_zero() {
+        assert_eq!(merge_decision(Some(0), 0), MergeDecision::Snapshot);
+    }
+
+    // ── resolve_conn ──────────────────────────────────────────────────────────
+
+    /// Explicit non-empty value is returned as-is.
+    #[test]
+    fn resolve_conn_explicit_wins() {
+        let got = resolve_conn(Some("postgres://explicit/db")).unwrap();
+        assert_eq!(got, "postgres://explicit/db");
+    }
+
+    /// None candidate bails with an actionable message.
+    #[test]
+    fn resolve_conn_none_bails() {
+        let err = resolve_conn(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+    }
+
+    /// Empty string candidate bails (same as None — sentinel for bare --from-db with no fallback).
+    #[test]
+    fn resolve_conn_empty_bails() {
+        let err = resolve_conn(Some("")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+    }
+
+    // ── db_name_from_conn ─────────────────────────────────────────────────────
+
+    /// Standard postgres URL → database name extracted.
+    #[test]
+    fn db_name_from_conn_standard_url() {
+        assert_eq!(db_name_from_conn("postgres://user:pass@host/mydb"), Some("mydb".into()));
+    }
+
+    /// URL with query string → query stripped.
+    #[test]
+    fn db_name_from_conn_strips_query() {
+        assert_eq!(db_name_from_conn("postgres://host/mydb?sslmode=require"), Some("mydb".into()));
+    }
+
+    /// URL with trailing slash and no db name → None (falls back to "project" at call site).
+    #[test]
+    fn db_name_from_conn_trailing_slash_returns_none() {
+        assert_eq!(db_name_from_conn("postgres://host/"), None);
+    }
+}
