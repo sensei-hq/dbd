@@ -319,9 +319,13 @@ cloud roles (`rds_*`/`azure_*`/`cloudsql*`), and Supabase platform roles (`anon`
 passwords); memberships referencing filtered-out roles are dropped so the emitted set is
 self-contained.
 
+**Sequences** are captured: standalone sequences become `ddl/sequence/<schema>/<name>.ddl`
+(`CREATE SEQUENCE …`), while sequences owned by a `serial`/`IDENTITY` column are reproduced
+through the column itself — such columns emit `serial`/`bigserial`/`smallserial` or
+`GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` rather than a separate sequence file.
+
 Not yet captured:
 
-- **Sequences** — coming in a later patch.
 - **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
   are skipped, since they can't be represented losslessly yet.
 - **Triggers**, aggregates, operators, domains, composite types.
