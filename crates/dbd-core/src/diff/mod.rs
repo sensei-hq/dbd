@@ -12,7 +12,7 @@ pub use types::*;
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, EntityType, FkAction, ForeignKey, IndexColumn, IndexDef, IndexType, SortOrder, TableConstraint};
+    use crate::entity::{ColumnDef, EntityType, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, SortOrder, TableConstraint};
     use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
     // ── Helpers ─────────────────────────────────────────────
@@ -26,7 +26,7 @@ mod tests {
             default_value: None,
             is_pk: false,
             is_unique: false,
-            is_identity: false,
+            identity: None,
             comment: None,
             inline_fk: None,
         }

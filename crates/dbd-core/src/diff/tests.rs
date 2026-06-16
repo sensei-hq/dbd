@@ -1046,15 +1046,15 @@
         }
     }
 
-    // M1.3: is_identity changed
+    // M1.3: identity changed
     #[test]
     fn d_column_is_identity_changed() {
         let old_col = ColumnDef {
-            is_identity: false,
+            identity: None,
             ..col("id", "int")
         };
         let new_col = ColumnDef {
-            is_identity: true,
+            identity: Some(IdentityKind::Always),
             ..col("id", "int")
         };
         let a = snap(vec![table("public", "users", vec![old_col])], vec![]);

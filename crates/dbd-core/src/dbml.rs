@@ -344,7 +344,7 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     if col.is_pk || pk_columns.contains(&col.name) {
         settings.push("pk".to_string());
     }
-    if col.is_identity {
+    if col.identity.is_some() {
         settings.push("increment".to_string());
     }
     if !col.nullable {
@@ -667,7 +667,7 @@ mod tests {
             default_value: None,
             is_pk: false,
             is_unique: false,
-            is_identity: false,
+            identity: None,
             comment: None,
             inline_fk: None,
         }
