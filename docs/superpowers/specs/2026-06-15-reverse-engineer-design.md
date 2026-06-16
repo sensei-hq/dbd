@@ -34,25 +34,30 @@ tree) from an existing database, instead of authoring DDL by hand. Two entry poi
 ```
 dbd init --from-db <conn> [--version N] [--name NAME]
          [--schema S]... [--exclude-schema S]... [--all-schemas]
-         [--force-overwrite] [--dry-run]
+         [--dry-run]
 
 dbd merge <conn>
          [--schema S]... [--exclude-schema S]... [--all-schemas]
-         [--force-overwrite] [--dry-run]
+         [--dry-run]
 ```
 
 - `<conn>` resolves from the flag value, then `$DATABASE_URL`. `init` cannot read a
   config yet, so connection is flag/env only (no config fallback).
-- `--version N` — base `project.version` in the generated `design.yaml`. Default **1**.
-  (`init` only; `merge` keeps the existing config and ignores it.)
+- `--version N` — base `project.version` in the generated `design.yaml`, and the version
+  of the baseline snapshot `init` emits. Default **1**. (`init` only; `merge` keeps the
+  existing config and ignores it.)
 - `--name NAME` — `project.name`. Default: the database name parsed from `<conn>`.
 - `--schema` (repeatable) — limit to exactly these schemas.
 - `--exclude-schema` (repeatable) — add to the exclusion set.
 - `--all-schemas` — bypass the Supabase platform denylist (Postgres internals are
   still always excluded).
-- `--force-overwrite` — on conflict, back up the existing file to `.bak` and write
-  the new one (see Write-plan). Without it, conflicts abort the run.
 - `--dry-run` — print the plan and exit; touch nothing.
+
+> **Note (v0.5.1):** `--force-overwrite` was removed. The reverse path unified on
+> overwrite + snapshot: `merge` always overwrites the introspected DDL (no `.bak`) and
+> auto-snapshots the delta unless the DB is a managed database strictly behind the project
+> (see Version safety); `init --from-db` writes into a fresh directory (all creates) and
+> then emits a baseline snapshot at `--version`.
 
 ## Architecture — one shared engine
 
@@ -126,15 +131,20 @@ existing `formatter`.
     view — the kinds this run generates) **under a selected schema**, with no
     corresponding DB entity. Files of unmanaged kinds (e.g. `ddl/function/**`) and files
     under non-selected schemas are never flagged.
-- **Apply:**
-  - If there are conflicts and **not** `--force-overwrite` → **abort**, print the
-    conflict list, write nothing.
-  - With `--force-overwrite` → rename each conflicting file to `<name>.sql.bak`
-    (`.bak.1`, `.bak.2`, … on collision), then write the new file.
+- **Apply (unified on overwrite + snapshot since v0.5.1):**
+  - **conflict** files are **overwritten in place — no `.bak`** (the snapshot taken
+    afterwards plus version control are the record). There is no conflict-abort gate and no
+    `--force-overwrite` flag.
   - **Orphans are reported, never deleted** — the user handles deletes.
-  - `--dry-run` prints the plan and exits before any writes.
-- **Report:** `N created · M unchanged · K overwritten (.bak) · J orphans (left as-is)`,
-  with the orphan paths listed.
+  - `--dry-run` prints the plan + the snapshot version that would be created, then exits
+    before any writes.
+  - After writing, the project is reloaded and a snapshot is created: `merge` runs
+    `snapshot::create_snapshot` (next-version, diff-based; baseline if no prior snapshot);
+    `init --from-db` runs `snapshot::create_baseline_snapshot` at `--version`.
+- **Report (merge):** `N file(s) written · snapshot v{n} created` (or
+  `… — already in sync — no snapshot created`), with orphan paths listed. **(init):**
+  `N file(s) written · M unchanged · J orphan(s) left as-is`, then `baseline snapshot v{N}
+  created`.
 
 ## Errors / edge cases
 
@@ -143,7 +153,8 @@ existing `formatter`.
 - Unsupported / exotic column types → emit the raw type string verbatim (lossless
   passthrough; never silently drop a column).
 - Reserved-word / mixed-case identifiers → always quote in the emitter.
-- `.bak` name collisions → `.bak`, then `.bak.1`, `.bak.2`, …
+- Drift on disk (a file differs from the DB) → **overwritten in place, no `.bak`**; the
+  snapshot + version control are the record (no conflict-abort, no `--force-overwrite`).
 - `init` in a dir that already has `design.yaml`/`ddl/` → refuse, suggest `merge`.
 - `merge` in a dir with no project → refuse, suggest `init --from-db`.
 
@@ -152,8 +163,9 @@ existing `formatter`.
 - **Emitter** — round-trip unit tests per entity kind: parse a fixture DDL → `TableDef`
   → `emit_ddl` → re-parse → assert structural equality. No DB required.
 - **Write-plan / apply** — pure unit tests over a temp dir: create / skip (identical) /
-  conflict (abort) / conflict (`--force-overwrite` → `.bak`) / orphan reporting /
-  `--dry-run` (no writes).
+  overwrite-in-place (`apply_overwrite`, no `.bak`) / orphan reporting / format-stable
+  round-trip (re-generate after `dbd format` → all skip). Snapshot helpers
+  (`create_baseline_snapshot` at v1/v3) are unit-tested in `snapshot.rs`.
 - **Schema selection** — unit tests over the filter (internal always out; Supabase
   denylist; `--schema` / `--exclude-schema` / `--all-schemas`).
 - **Introspection** — exercised against a real Postgres, gated the same way the
@@ -169,13 +181,13 @@ existing `formatter`.
   `adapter/postgres.rs` (impl + catalog queries).
 - Extend: `crates/dbd-core/src/config.rs` (write a `design.yaml` from introspection) +
   reuse `init.rs` scaffolding.
-- CLI: `crates/dbd-cli/src/cli.rs` (`--from-db`/`--version`/`--name`/schema/force/
+- CLI: `crates/dbd-cli/src/cli.rs` (`--from-db`/`--version`/`--name`/schema/
   dry-run flags on `init`; new `merge` command), `commands/mod.rs` dispatch,
   `commands/` impl for both (thin wrappers over `reverse`).
 - Reuse: `Entity`/`TableDef`/`ColumnDef`/`IndexDef`, the internal-schema filter in
   `list_entities()`, `get_adapter()`/`connect()`, the `formatter`.
 
-## Version safety against dbd-managed databases (added 2026-06-15)
+## Version safety against dbd-managed databases (added 2026-06-15; unified v0.5.1)
 
 Reverse-engineering a database that dbd already manages is dangerous: a database that is
 **behind** the project (its applied version < the project's `design.yaml` version) is stale,
@@ -189,17 +201,27 @@ and overwriting project DDL from it would silently destroy newer work. The gate:
   it. `_dbd_meta` has `PRIMARY KEY (project)` — one row per project; `env` records the
   last-applied environment and is not part of the key, so this read is env-agnostic.
 - **`init --from-db` against a managed DB → refuse** (point the user at `merge`). `init` is for
-  foreign databases only.
-- **`merge` against a managed DB**, with DB version **D** and project version **Y**
-  (`design.yaml` `project.version`, treated as `0` when unset):
-  - **D < Y → refuse** (no override flag): the project is ahead of a stale DB; the user should
-    bring the DB current (`dbd apply`) or revert the project via version control.
-  - **D ≥ Y → auto-snapshot**: write the introspected DDL into the project (overwriting drift,
-    no `.bak` — the new snapshot + VCS are the record), then run `snapshot::create_snapshot` to
-    capture the delta as a new version. `--dry-run` previews the plan + the snapshot version,
-    writing nothing. (D > Y is only reachable via manual version tampering, but still snapshots.)
-- **Foreign DB (no `_dbd_meta`) → unchanged**: normal create/skip/conflict/orphan merge. This is
-  the primary intended use of `init --from-db`/`merge`.
+  foreign databases only. Against a **foreign** DB, `init` generates the DDL tree +
+  `design.yaml`, then emits a **baseline snapshot at `--version`** (default 1) via
+  `snapshot::create_baseline_snapshot` so the new project is version-tracked from the start.
+  `--dry-run` previews `would create baseline snapshot v{N}` and writes nothing.
+- **`merge` — every operation that proceeds ends in a snapshot.** The decision (the single
+  source of truth, unit-tested in `merge_decision`) collapses to two outcomes, with **D** the
+  DB's managed version and **Y** the project's `design.yaml` `project.version` (treated as `0`
+  when unset):
+  - **Managed DB with D < Y → refuse** (no override flag): the project is ahead of a stale DB;
+    the user should bring the DB current (`dbd apply`) or revert the project via version control.
+  - **Everything else** — a **foreign** DB (no `_dbd_meta`), OR a managed DB with **D ≥ Y** —
+    → **overwrite + auto-snapshot**: write the introspected DDL into the project (overwriting
+    drift in place, **no `.bak`** — the new snapshot + VCS are the record), then run
+    `snapshot::create_snapshot` to capture the delta as a new version (a baseline if the project
+    had no prior snapshot). `--dry-run` previews the plan + the snapshot version, writing nothing.
+    Orphans are reported (never deleted), the undeclared-schema warning still fires, and unsafe
+    path segments are still skipped with a warning.
+
+  This unifies the former foreign (conflict-abort/`.bak`/`--force-overwrite`) path and the
+  managed-`D ≥ Y` path into one overwrite + snapshot path, so foreign and managed databases
+  behave identically once past the refusal gate.
 
 ## Risks / notes
 
