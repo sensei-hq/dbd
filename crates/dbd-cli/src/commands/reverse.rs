@@ -34,24 +34,28 @@ pub(crate) fn resolve_conn(candidate: Option<&str>) -> Result<String> {
 }
 
 /// The version-safety decision for a `merge` against a (possibly managed) DB.
+///
+/// Every `merge` that proceeds ends in a snapshot, so foreign and managed databases
+/// behave identically — there are only two outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeDecision {
-    /// Foreign DB (no `_dbd_meta`) — run the normal create/skip/conflict merge.
-    Foreign,
     /// Managed DB behind the project (D < Y) — refuse; the project is ahead of a stale DB.
     Refuse { db: u32, project: u32 },
-    /// Managed DB at or ahead of the project (D ≥ Y) — overwrite + auto-snapshot.
+    /// Foreign DB (no `_dbd_meta`) OR managed DB at/ahead of the project (D ≥ Y) —
+    /// overwrite the introspected DDL (no `.bak`) + auto-snapshot the delta as a new version.
     Snapshot,
 }
 
 /// Decide what a `merge` should do given the DB's managed version (`None` = foreign)
 /// and the project's `design.yaml` version. This is the single source of truth for
 /// the gate — the handler routes through it so the tested logic is the real logic.
+///
+/// Only a managed DB strictly behind the project (`D < Y`) is refused; everything
+/// else (a foreign DB, or a managed DB at/ahead of the project) snapshots.
 pub(crate) fn merge_decision(managed: Option<u32>, project_version: u32) -> MergeDecision {
     match managed {
-        None => MergeDecision::Foreign,
         Some(d) if d < project_version => MergeDecision::Refuse { db: d, project: project_version },
-        Some(_) => MergeDecision::Snapshot,
+        _ => MergeDecision::Snapshot,
     }
 }
 
@@ -62,11 +66,12 @@ pub async fn cmd_init_from_db(
     from_db: Option<&str>,
     // Global -d / $DATABASE_URL, already resolved by clap.
     database_url: Option<&str>,
-    _env: &str,
+    env: &str,
+    // The design.yaml path (already resolved by the dispatcher).
+    config_path: &Path,
     name: Option<&str>,
     version: u32,
     sel: SchemaSelect,
-    force: bool,
     dry_run: bool,
 ) -> Result<()> {
     if project_dir.join("design.yaml").exists() {
@@ -103,19 +108,36 @@ pub async fn cmd_init_from_db(
     let entities = adapter.introspect().await.context("introspection failed")?;
     run_plan(
         project_dir,
+        config_path,
         entities,
         Some(&project_name),
         Some(version),
         sel,
-        force,
         dry_run,
         true,
         &FormatConfig::default(),
+    )?;
+
+    // Emit a baseline snapshot at `--version` so the new project is version-tracked
+    // from the start (end state: snapshots/{version}.json + design.yaml
+    // project.version = version). Skip entirely on --dry-run.
+    if dry_run {
+        println!("[dry-run] would create baseline snapshot v{version}");
+        return Ok(());
+    }
+
+    // Reload from the freshly-written DDL so the snapshot reflects exactly what landed
+    // on disk (and what `dbd apply` would later read), then write the baseline.
+    let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
+        .context("failed to reload project after writing DDL")?;
+    dbd_core::snapshot::create_baseline_snapshot(
+        design.entities(), project_dir, config_path, "init from database", version,
     )
-    .map(|_| ())
+    .context("failed to create baseline snapshot after writing DDL")?;
+    println!("baseline snapshot v{version} created");
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn cmd_merge(
     project_dir: &Path,
     // Explicit positional connection argument.
@@ -126,7 +148,6 @@ pub async fn cmd_merge(
     // The design.yaml path (already resolved by the dispatcher).
     config_path: &Path,
     sel: SchemaSelect,
-    force: bool,
     dry_run: bool,
 ) -> Result<()> {
     if !config_path.exists() {
@@ -148,7 +169,9 @@ pub async fn cmd_merge(
         .await
         .context("failed to connect to the database")?;
 
-    // Version-safety gate.
+    // Version-safety gate. Every merge that proceeds ends in a snapshot, so foreign
+    // and managed databases take the same overwrite+snapshot path; only a managed DB
+    // strictly behind the project is refused.
     let managed = adapter.reverse_managed_version().await?;
     let project_version = config.project.version.unwrap_or(0);
     match merge_decision(managed, project_version) {
@@ -162,34 +185,20 @@ pub async fn cmd_merge(
         }
         MergeDecision::Snapshot => {
             let entities = adapter.introspect().await.context("introspection failed")?;
-            managed_merge_snapshot(
-                project_dir, config_path, env, &entities, sel, dry_run, &config.format,
+            merge_snapshot(
+                project_dir, config_path, env, &entities, sel, dry_run, &config,
             )
-        }
-        MergeDecision::Foreign => {
-            // Existing normal merge path — UNCHANGED behaviour.
-            let entities = adapter.introspect().await.context("introspection failed")?;
-            let covered = run_plan(
-                project_dir, entities, None, None, sel, force, dry_run, false,
-                &config.format,
-            )?;
-
-            // Warn about schemas written but not declared in design.yaml (spec line 67).
-            let declared = config.schema_names();
-            for schema in undeclared_schemas(&covered, &declared) {
-                eprintln!(
-                    "  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files"
-                );
-            }
-            Ok(())
         }
     }
 }
 
-/// Managed `merge` (DB version ≥ project version): write the introspected DDL into
-/// the project, **overwriting drift with NO `.bak`**, then auto-snapshot the delta
-/// as a new version. `--dry-run` previews the plan + the snapshot version and writes
-/// nothing.
+/// The unified `merge` apply path (foreign DB, or managed DB at/ahead of the project):
+/// write the introspected DDL into the project, **overwriting drift with NO `.bak`**,
+/// then auto-snapshot the delta as a new version. `--dry-run` previews the plan + the
+/// snapshot version and writes nothing.
+///
+/// Reports orphans (never deleted), unsafe-path skips, and warns about schemas written
+/// but not declared in `design.yaml` — the same surfacing the foreign path used.
 ///
 /// # Non-transactionality (accepted limitation)
 /// `apply_overwrite` writes all DDL files before the project is reloaded and
@@ -197,16 +206,17 @@ pub async fn cmd_merge(
 /// have been written, the project directory is in a partial-apply state: files are
 /// already overwritten with no `.bak` and no snapshot exists. Recover via version
 /// control (`git checkout -- .` or equivalent). This mirrors the non-transactionality
-/// note on `apply_plan` and `apply_overwrite`.
-fn managed_merge_snapshot(
+/// note on `apply_overwrite`.
+fn merge_snapshot(
     project_dir: &Path,
     config_path: &Path,
     env: &str,
     entities: &[dbd_core::Entity],
     sel: SchemaSelect,
     dry_run: bool,
-    format: &FormatConfig,
+    config: &dbd_core::config::DesignConfig,
 ) -> Result<()> {
+    let format = &config.format;
     // Select schemas + keep only entities under a selected schema (same logic as
     // the normal path).
     let (selected, kept) = select_and_keep(entities, &sel);
@@ -215,13 +225,25 @@ fn managed_merge_snapshot(
         return Ok(());
     }
 
+    // Warn about schemas written but not declared in design.yaml (spec line 67).
+    // `merge` never edits config — it surfaces the gap so the user adds the schema.
+    let declared = config.schema_names();
+    for schema in undeclared_schemas(&selected, &declared) {
+        eprintln!(
+            "  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files"
+        );
+    }
+
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
     if dry_run {
-        let report = reverse::apply_plan(project_dir, &plan, /*force*/ false, /*dry_run*/ true)?;
+        // Count straight off the plan — a dry-run writes nothing, so there's no
+        // apply step to perform; the overwrite path has no conflict gate.
+        let created = plan.items.iter().filter(|i| i.action == reverse::FileAction::Create).count();
+        let unchanged = plan.items.iter().filter(|i| i.action == reverse::FileAction::Skip).count();
+        let conflicts = plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict).count();
         println!(
-            "[dry-run] {} created · {} unchanged · {} conflict(s) (would overwrite, no .bak)",
-            report.created, report.unchanged, report.conflicts
+            "[dry-run] {created} created · {unchanged} unchanged · {conflicts} conflict(s) (would overwrite, no .bak)"
         );
         for it in plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict) {
             println!("  conflict (differs from DB): {}", it.path.display());
@@ -235,6 +257,14 @@ fn managed_merge_snapshot(
         // Only promise a snapshot when there is actually something to write.
         // If every item is Skip the real run would print "already in sync — no
         // snapshot created", so the dry-run preview must match.
+        //
+        // Note: this is a *byte-level* check (the write-plan). The real run's
+        // `create_snapshot` decides no-changes by a *semantic* diff of the parsed
+        // entity model vs the latest snapshot, so a file that differs only
+        // cosmetically (a byte Conflict that parses to an identical entity) is
+        // previewed here as "would snapshot" yet the real run reports in-sync. The
+        // overwrite still happens correctly either way — this is preview accuracy
+        // only, not a data-safety gap.
         let has_changes = plan
             .items
             .iter()
@@ -321,16 +351,22 @@ fn select_and_keep(
 }
 
 /// Build the write-plan from already-introspected entities, write `design.yaml`
-/// (init only), apply, and report. The caller owns the connection + introspection
-/// (so the version-safety gate can act on the adapter before any writes).
+/// (init only), apply by **overwriting** in place (no `.bak`), and report. The caller
+/// owns the connection + introspection (so the version-safety gate can act on the
+/// adapter before any writes).
+///
+/// This is the `init --from-db` path. A fresh project directory has no managed files
+/// yet, so every item is a `Create`; `apply_overwrite` handles that the same as the
+/// unified `merge` path (and harmlessly clobbers any pre-existing drift, since the
+/// baseline snapshot + version control are the record).
 #[allow(clippy::too_many_arguments)]
 fn run_plan(
     project_dir: &Path,
+    config_path: &Path,
     entities: Vec<dbd_core::Entity>,
     name: Option<&str>,
     version: Option<u32>,
     sel: SchemaSelect,
-    force: bool,
     dry_run: bool,
     write_config: bool,
     format: &FormatConfig,
@@ -351,28 +387,28 @@ fn run_plan(
             .map(String::from)
             .unwrap_or_else(|| "project".into());
         let yaml = reverse::design_yaml(&project, "postgres", &selected, version.unwrap_or(1));
-        std::fs::write(project_dir.join("design.yaml"), yaml)
+        // Write to the resolved config path (project_dir/<--config>), matching what the
+        // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
+        // diverge under `--config custom.yaml`).
+        std::fs::write(config_path, yaml)
             .context("failed to write design.yaml")?;
     }
 
     // 4. apply + report
-    let report = reverse::apply_plan(project_dir, &plan, force, dry_run)?;
-    let prefix = if dry_run { "[dry-run] " } else { "" };
-    println!(
-        "{}{} created · {} unchanged · {} conflict(s) · {} overwritten (.bak) · {} orphan(s) left as-is",
-        prefix,
-        report.created,
-        report.unchanged,
-        report.conflicts,
-        report.overwritten,
-        report.orphans
-    );
-    // In a dry-run, conflicts aren't an error — list the diverging files (like
-    // orphans below) so the user can see what `--force-overwrite` would replace.
     if dry_run {
-        for it in plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict) {
-            println!("  conflict (differs from DB): {}", it.path.display());
-        }
+        let created = plan.items.iter().filter(|i| i.action == reverse::FileAction::Create).count();
+        let unchanged = plan.items.iter().filter(|i| i.action == reverse::FileAction::Skip).count();
+        println!(
+            "[dry-run] {created} created · {unchanged} unchanged · {} orphan(s) left as-is",
+            plan.orphans.len()
+        );
+    } else {
+        let report = reverse::apply_overwrite(project_dir, &plan)?;
+        let files_written = report.created + report.overwritten;
+        println!(
+            "{files_written} file(s) written · {} unchanged · {} orphan(s) left as-is",
+            report.unchanged, report.orphans
+        );
     }
     for o in &plan.orphans {
         println!("  orphan (no DB entity): {}", o.display());
@@ -446,10 +482,10 @@ mod tests {
 
     // ── merge_decision ────────────────────────────────────────────────────────
 
-    /// Foreign DB (no `_dbd_meta`) → normal merge.
+    /// Foreign DB (no `_dbd_meta`) → snapshot (unified overwrite + auto-snapshot path).
     #[test]
-    fn merge_decision_foreign_when_unmanaged() {
-        assert_eq!(merge_decision(None, 5), MergeDecision::Foreign);
+    fn merge_decision_foreign_snapshots() {
+        assert_eq!(merge_decision(None, 5), MergeDecision::Snapshot);
     }
 
     /// Managed DB behind the project (D < Y) → refuse.
