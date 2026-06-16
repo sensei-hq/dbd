@@ -174,8 +174,28 @@ pub fn emit_view(entity: &Entity) -> String {
     format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
 }
 
+/// `CREATE OR REPLACE FUNCTION|PROCEDURE …;` for each overload, joined by a
+/// blank line.
+///
+/// The bodies are carried verbatim in `entity.writes` (one per overload, set by
+/// the introspector via `pg_get_functiondef`, whose output omits the trailing
+/// semicolon). Each piece is trimmed of trailing whitespace and any trailing
+/// `;`, then terminated with exactly one `;`, so the result is a valid script.
+pub fn emit_routine(entity: &Entity) -> String {
+    entity
+        .writes
+        .iter()
+        .map(|w| {
+            let body = w.trim_end();
+            let body = body.trim_end_matches(';').trim_end();
+            format!("{body};")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Emit DDL text for any reverse-engineerable entity, or `None` for kinds we
-/// don't generate (External, file-based Function/Procedure in this cut).
+/// don't generate (External, Import/Export).
 pub fn emit_entity(entity: &Entity) -> Option<String> {
     use crate::entity::EntityType;
     match entity.entity_type {
@@ -185,6 +205,7 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
         EntityType::Enum => Some(emit_enum(entity)),
         EntityType::Table => Some(emit_table(entity)),
         EntityType::View => Some(emit_view(entity)),
+        EntityType::Function | EntityType::Procedure => Some(emit_routine(entity)),
         _ => None,
     }
 }
@@ -337,6 +358,38 @@ mod tests {
             sql,
             "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
         );
+    }
+
+    #[test]
+    fn emit_routine_joins_overloads() {
+        // An overloaded function: two signatures captured as two `writes` bodies
+        // (as the introspector would group them). `pg_get_functiondef` output has
+        // no trailing semicolon — emit_routine must add exactly one per piece.
+        let mut e = Entity::new(EntityType::Function, "app.f");
+        e.schema = Some("app".into());
+        e.writes = vec![
+            "CREATE OR REPLACE FUNCTION app.f(a int) RETURNS int LANGUAGE sql AS $$ select 1 $$"
+                .into(),
+            "CREATE OR REPLACE FUNCTION app.f(a text) RETURNS int LANGUAGE sql AS $$ select 2 $$"
+                .into(),
+        ];
+        let sql = emit_routine(&e);
+
+        // Both overloads present.
+        assert!(sql.contains("app.f(a int)"), "first overload missing:\n{sql}");
+        assert!(sql.contains("app.f(a text)"), "second overload missing:\n{sql}");
+        // Each statement ends in a single `;` (no double `;;`).
+        assert!(sql.contains("$$ select 1 $$;"), "first body not ;-terminated:\n{sql}");
+        assert!(sql.contains("$$ select 2 $$;"), "second body not ;-terminated:\n{sql}");
+        assert!(!sql.contains(";;"), "no statement should be double-terminated:\n{sql}");
+        // Separated by a blank line.
+        assert!(sql.contains(";\n\n"), "overloads should be separated by a blank line:\n{sql}");
+
+        // Dispatch wiring: emit_entity routes Function/Procedure to emit_routine.
+        assert_eq!(emit_entity(&e).as_deref(), Some(sql.as_str()));
+        let mut p = Entity::new(EntityType::Procedure, "app.p");
+        p.writes = vec!["CREATE OR REPLACE PROCEDURE app.p() LANGUAGE sql AS $$ select 1 $$".into()];
+        assert!(emit_entity(&p).unwrap().ends_with("$$;"));
     }
 
     #[test]
