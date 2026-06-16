@@ -588,8 +588,11 @@ async fn emitted_index_ddl_applies_to_postgres() {
 
 /// Version-safety: a fresh DB with no `_dbd_meta` is foreign (None); once a
 /// `_dbd_meta` table exists in ANY schema (here `staging`, off the default
-/// search_path) with a matching `(project, env)` row, the adapter reports the
-/// applied version — proving cross-schema, search_path-independent detection.
+/// search_path), the adapter reports the applied version regardless of which `env`
+/// the row was last written with — proving cross-schema detection is env-agnostic.
+///
+/// The row is seeded with `env='dev'` while the adapter was not constructed with
+/// that env value, confirming the read keys on `project` only (not `(project, env)`).
 #[tokio::test]
 async fn reverse_managed_version_detects_cross_schema_meta() {
     let (_pg, url) = start_pg().await;
@@ -597,13 +600,15 @@ async fn reverse_managed_version_detects_cross_schema_meta() {
 
     // (a) Fresh DB — no `_dbd_meta` anywhere → foreign.
     let managed = adapter
-        .reverse_managed_version("prod")
+        .reverse_managed_version()
         .await
         .expect("reverse_managed_version should not error on a fresh DB");
     assert_eq!(managed, None, "a DB with no _dbd_meta must be foreign (None)");
 
     // (b) Create `staging._dbd_meta` (NOT on the default search_path) with a row
-    //     for this adapter's project ("embedded_test") and env "prod".
+    //     seeded with env='dev' — deliberately different from any env the caller
+    //     might pass. The read must succeed regardless, proving the key is
+    //     `project` only.
     adapter
         .execute_script(
             "CREATE SCHEMA staging; \
@@ -613,18 +618,18 @@ async fn reverse_managed_version_detects_cross_schema_meta() {
                 version integer NOT NULL \
              ); \
              INSERT INTO staging._dbd_meta (project, env, version) \
-             VALUES ('embedded_test', 'prod', 3);",
+             VALUES ('embedded_test', 'dev', 3);",
         )
         .await
         .expect("failed to seed staging._dbd_meta");
 
     let managed = adapter
-        .reverse_managed_version("prod")
+        .reverse_managed_version()
         .await
         .expect("reverse_managed_version should read cross-schema _dbd_meta");
     assert_eq!(
         managed,
         Some(3),
-        "must read the applied version from staging._dbd_meta regardless of search_path"
+        "must read version from staging._dbd_meta regardless of env (project-only key)"
     );
 }

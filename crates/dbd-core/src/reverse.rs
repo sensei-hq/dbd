@@ -267,6 +267,13 @@ pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> 
 /// deliberately clobber on-disk drift rather than aborting or backing up. `Skip`
 /// items (byte-identical to disk) are left untouched. Orphans are counted but
 /// never deleted. Parent directories are created as needed.
+///
+/// # Non-transactionality (accepted limitation — same as `apply_plan`)
+/// Items are written one by one. If a write fails mid-loop (e.g. disk full,
+/// permission error), earlier files have already been overwritten with no `.bak`
+/// and no rollback. The subsequent `create_snapshot` call in the caller can also
+/// fail after files are written. In either case the partial-apply state should be
+/// recovered via version control (`git checkout -- .` or equivalent).
 pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
     let mut report = Report {
         orphans: plan.orphans.len(),

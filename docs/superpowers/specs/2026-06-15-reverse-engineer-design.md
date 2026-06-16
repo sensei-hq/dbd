@@ -183,10 +183,11 @@ and overwriting project DDL from it would silently destroy newer work. The gate:
 
 - **Managed detection:** a database is "dbd-managed" iff a `_dbd_meta` table exists in **any**
   schema (it commonly lives outside the default `search_path`, e.g. `staging._dbd_meta`, so
-  detection is a catalog lookup, not an unqualified read). `reverse_managed_version(env)` on the
+  detection is a catalog lookup, not an unqualified read). `reverse_managed_version()` on the
   adapter returns `Some(version)` for a managed DB (0 if the table exists but has no row for
-  `(project, env)`) or `None` for a foreign DB. Default trait impl returns `None`; Postgres
-  overrides it.
+  `project`) or `None` for a foreign DB. Default trait impl returns `None`; Postgres overrides
+  it. `_dbd_meta` has `PRIMARY KEY (project)` — one row per project; `env` records the
+  last-applied environment and is not part of the key, so this read is env-agnostic.
 - **`init --from-db` against a managed DB → refuse** (point the user at `merge`). `init` is for
   foreign databases only.
 - **`merge` against a managed DB**, with DB version **D** and project version **Y**

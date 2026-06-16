@@ -62,7 +62,7 @@ pub async fn cmd_init_from_db(
     from_db: Option<&str>,
     // Global -d / $DATABASE_URL, already resolved by clap.
     database_url: Option<&str>,
-    env: &str,
+    _env: &str,
     name: Option<&str>,
     version: u32,
     sel: SchemaSelect,
@@ -91,7 +91,7 @@ pub async fn cmd_init_from_db(
     let adapter = dbd_core::connect(&conn, &project_name)
         .await
         .context("failed to connect to the database")?;
-    if let Some(d) = adapter.reverse_managed_version(env).await? {
+    if let Some(d) = adapter.reverse_managed_version().await? {
         bail!(
             "database is managed by dbd (version {d}); `dbd init --from-db` is only for \
              databases not managed by dbd — use `dbd merge` from the project's repository instead"
@@ -149,7 +149,7 @@ pub async fn cmd_merge(
         .context("failed to connect to the database")?;
 
     // Version-safety gate.
-    let managed = adapter.reverse_managed_version(env).await?;
+    let managed = adapter.reverse_managed_version().await?;
     let project_version = config.project.version.unwrap_or(0);
     match merge_decision(managed, project_version) {
         MergeDecision::Refuse { db, project } => {
@@ -190,6 +190,14 @@ pub async fn cmd_merge(
 /// the project, **overwriting drift with NO `.bak`**, then auto-snapshot the delta
 /// as a new version. `--dry-run` previews the plan + the snapshot version and writes
 /// nothing.
+///
+/// # Non-transactionality (accepted limitation)
+/// `apply_overwrite` writes all DDL files before the project is reloaded and
+/// `create_snapshot` is called. If the reload or snapshot step fails after files
+/// have been written, the project directory is in a partial-apply state: files are
+/// already overwritten with no `.bak` and no snapshot exists. Recover via version
+/// control (`git checkout -- .` or equivalent). This mirrors the non-transactionality
+/// note on `apply_plan` and `apply_overwrite`.
 fn managed_merge_snapshot(
     project_dir: &Path,
     config_path: &Path,
@@ -224,8 +232,19 @@ fn managed_merge_snapshot(
         for label in &plan.skipped_unsafe {
             eprintln!("  warning: skipped unsafe path segment: {label}");
         }
-        let n = dbd_core::snapshot::next_version(project_dir);
-        println!("[dry-run] would capture changes as snapshot v{n}");
+        // Only promise a snapshot when there is actually something to write.
+        // If every item is Skip the real run would print "already in sync — no
+        // snapshot created", so the dry-run preview must match.
+        let has_changes = plan
+            .items
+            .iter()
+            .any(|i| i.action != reverse::FileAction::Skip);
+        if has_changes {
+            let n = dbd_core::snapshot::next_version(project_dir);
+            println!("[dry-run] would capture changes as snapshot v{n}");
+        } else {
+            println!("[dry-run] already in sync — no snapshot needed");
+        }
         return Ok(());
     }
 
@@ -242,12 +261,16 @@ fn managed_merge_snapshot(
     // Reload the project from the freshly-written DDL, then snapshot the delta.
     // `create_snapshot` bumps design.yaml's version and writes snapshot+migration
     // files itself — do not duplicate that here.
+    //
+    // NOTE: both calls below happen *after* apply_overwrite has written all DDL
+    // files. A failure here leaves the project in a partial-apply state (files
+    // overwritten, no snapshot). Recover via version control.
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
-        .context("failed to reload project after writing DDL")?;
+        .context("failed to reload project after writing DDL — recover via version control if files were partially written")?;
     let snap = dbd_core::snapshot::create_snapshot(
         design.entities(), project_dir, config_path, "merge from database",
     )
-    .context("failed to create snapshot")?;
+    .context("failed to create snapshot after writing DDL — recover via version control if files were partially written")?;
 
     // `create_snapshot` handles the no-previous-snapshot (baseline) case, so a
     // project without prior snapshots still snapshots cleanly. A single result
