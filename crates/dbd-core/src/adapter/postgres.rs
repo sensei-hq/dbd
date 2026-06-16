@@ -1016,7 +1016,7 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(out)
     }
 
-    async fn reverse_managed_version(&self, env: &str) -> Result<Option<u32>> {
+    async fn reverse_managed_version(&self) -> Result<Option<u32>> {
         // 1. Find the schema that holds `_dbd_meta` via the catalog (not an
         //    unqualified SELECT) — it commonly lives off the search_path
         //    (e.g. `staging._dbd_meta`). No row → foreign DB.
@@ -1034,17 +1034,18 @@ impl DatabaseAdapter for PostgresAdapter {
         };
         let schema: String = schema_row.get("nspname");
 
-        // 2. Read the applied version for (project, env) from that schema's
+        // 2. Read the applied version for this project from that schema's
         //    `_dbd_meta`. `schema` comes from the catalog (not user input) but is
-        //    still quoted defensively. Row → Some(version); no row → Some(0)
-        //    (the table exists, so the DB is managed, just no matching record).
+        //    still quoted defensively. `_dbd_meta` has PRIMARY KEY (project), so
+        //    there is exactly one row per project; `env` records the *last-applied*
+        //    environment and is NOT part of the key. Row → Some(version); no row →
+        //    Some(0) (the table exists, so the DB is managed, just no row yet).
         let quoted = schema.replace('"', "\"\"");
         let query = format!(
-            "SELECT version FROM \"{quoted}\"._dbd_meta WHERE project = $1 AND env = $2"
+            "SELECT version FROM \"{quoted}\"._dbd_meta WHERE project = $1"
         );
         let version_row = sqlx::query(&query)
             .bind(&self.project)
-            .bind(env)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("reverse_managed_version version read failed: {e}")))?;
