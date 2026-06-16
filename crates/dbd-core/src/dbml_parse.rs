@@ -677,16 +677,37 @@ fn parse_type(input: &str) -> String {
     input.to_string()
 }
 
-/// Parse a `default: <v>` value into the stored `default_value` string.
-/// `'str'` → inner `str`; `` `expr` `` → inner `expr`; number/bool/null → as-is.
+/// Parse a `default: <v>` DBML value into a SQL-ready `default_value` string.
+///
+/// The mapping exactly inverts [`crate::dbml::quote_default`] (the DBML exporter):
+///
+/// | DBML form        | SQL form stored            | Notes                                  |
+/// |------------------|----------------------------|-----------------------------------------|
+/// | `'str'`          | `'str'`                    | DBML `\'` → SQL `'` then SQL-doubled   |
+/// | `` `expr` ``     | `expr`                     | raw/expression, no quoting             |
+/// | bare token       | token as-is                | numbers, `true`, `false`, `null`       |
+///
+/// Concretely: `'claude'` → `'claude'`; `'{}'` → `'{}'`; `''` → `''`;
+/// `'a\'b'` → `'a''b'`; `` `now()` `` → `now()`; `0` → `0`.
 fn parse_default_value(v: &str) -> String {
     let v = v.trim();
+    // Backtick-quoted expression (raw SQL expression in DBML) → strip backticks.
     if let Some(rest) = v.strip_prefix('`') {
         return rest.strip_suffix('`').unwrap_or(rest).to_string();
     }
-    if let Some(s) = parse_single_line_string(v) {
-        return s;
+    // Single-quoted DBML string literal → produce a SQL string literal.
+    // 1. Use `parse_single_line_string` to strip the surrounding `'…'` and
+    //    unescape DBML `\'` → `'`.
+    // 2. Re-quote for SQL: wrap in single quotes and double any internal `'`
+    //    (SQL standard escape), so `a'b` → `'a''b'`.
+    if v.starts_with('\'')
+        && let Some(inner) = parse_single_line_string(v)
+    {
+        // `inner` already has `\'` → `'` applied by parse_single_line_string.
+        let sql_escaped = inner.replace('\'', "''");
+        return format!("'{sql_escaped}'");
     }
+    // Bare token (number, true, false, null) — store as-is.
     v.to_string()
 }
 
@@ -1116,7 +1137,8 @@ mod tests {
         assert_eq!(td.columns[2].default_value.as_deref(), Some("true"));
         assert_eq!(td.columns[3].default_value.as_deref(), Some("42"));
         assert_eq!(td.columns[4].default_value.as_deref(), Some("now()"));
-        assert_eq!(td.columns[5].default_value.as_deref(), Some("hi"));
+        // String default `'hi'` in DBML → SQL-ready `'hi'` (with quotes preserved).
+        assert_eq!(td.columns[5].default_value.as_deref(), Some("'hi'"));
         assert_eq!(td.columns[5].comment.as_deref(), Some("a label"));
         assert_eq!(td.columns[6].default_value.as_deref(), Some("null"));
 
@@ -1423,7 +1445,9 @@ mod tests {
             Some("User's display name"),
             "apostrophe in second column note must round-trip"
         );
-        assert_eq!(nickname.default_value.as_deref(), Some("guest"));
+        // "guest" in SQL form is a bare string default; quote_default wraps it
+        // as DBML `'guest'`; the fixed parser stores it back as SQL `'guest'`.
+        assert_eq!(nickname.default_value.as_deref(), Some("'guest'"));
     }
 
     #[test]
@@ -1598,5 +1622,123 @@ mod tests {
         assert!(schemas.contains(&"auth"));
         assert!(schemas.contains(&"shop"));
         assert!(schemas.contains(&"config"));
+    }
+
+    // ── Default-value parsing unit tests ─────────────────────────────────────
+
+    /// DBML string defaults must be stored as SQL string literals (with quotes).
+    #[test]
+    fn parse_default_value_string_literal_keeps_quotes() {
+        // `'claude'` in DBML → SQL `'claude'`
+        assert_eq!(parse_default_value("'claude'"), "'claude'");
+        // Empty string: `''` → SQL `''`
+        assert_eq!(parse_default_value("''"), "''");
+        // JSON/struct value: `'{}'` → SQL `'{}'`
+        assert_eq!(parse_default_value("'{}'"), "'{}'");
+    }
+
+    /// DBML backtick expressions must be stored as bare SQL expressions.
+    #[test]
+    fn parse_default_value_backtick_expr_strips_backticks() {
+        assert_eq!(parse_default_value("`now()`"), "now()");
+        assert_eq!(parse_default_value("`uuid_generate_v4()`"), "uuid_generate_v4()");
+    }
+
+    /// Bare tokens (numbers, booleans, null) must be stored as-is.
+    #[test]
+    fn parse_default_value_bare_tokens_stored_as_is() {
+        assert_eq!(parse_default_value("0"), "0");
+        assert_eq!(parse_default_value("true"), "true");
+        assert_eq!(parse_default_value("false"), "false");
+        assert_eq!(parse_default_value("null"), "null");
+        assert_eq!(parse_default_value("42"), "42");
+    }
+
+    /// A DBML-escaped apostrophe `'a\'b'` must survive as SQL `'a''b'`.
+    #[test]
+    fn parse_default_value_dbml_escaped_apostrophe_becomes_sql_doubled() {
+        // DBML: `'a\'b'` — the backslash-escaped apostrophe inside a DBML string.
+        // parse_single_line_string strips outer quotes and converts `\'` → `'`,
+        // giving inner `a'b`, which parse_default_value re-quotes as `'a''b'`.
+        assert_eq!(parse_default_value("'a\\'b'"), "'a''b'");
+    }
+
+    // ── DBML → DDL validity round-trip ───────────────────────────────────────
+
+    /// Parse a DBML table with various default kinds → emit DDL →
+    /// assert the DDL contains valid SQL defaults → re-parse the DDL with
+    /// the DDL parser (proving valid SQL).
+    #[test]
+    fn dbml_string_defaults_produce_valid_ddl() {
+        use crate::emit::emit_table;
+
+        let dbml = concat!(
+            "Table \"public\".\"t\" {\n",
+            "  \"a\" text [default: 'claude']\n",
+            "  \"b\" text [default: '']\n",
+            "  \"c\" timestamptz [default: `now()`]\n",
+            "  \"d\" int [default: 0]\n",
+            "}\n"
+        );
+
+        let entities = parse_dbml(dbml).expect("DBML must parse cleanly");
+        let t = find_table(&entities, "public.t");
+
+        let td = t.table_def.as_ref().unwrap();
+        assert_eq!(td.columns[0].default_value.as_deref(), Some("'claude'"), "col a");
+        assert_eq!(td.columns[1].default_value.as_deref(), Some("''"), "col b");
+        assert_eq!(td.columns[2].default_value.as_deref(), Some("now()"), "col c");
+        assert_eq!(td.columns[3].default_value.as_deref(), Some("0"), "col d");
+
+        // Emit DDL and check the SQL text is correct.
+        let sql = emit_table(t);
+        assert!(
+            sql.contains("DEFAULT 'claude'"),
+            "expected DEFAULT 'claude' in:\n{sql}"
+        );
+        assert!(
+            sql.contains("DEFAULT ''"),
+            "expected DEFAULT '' in:\n{sql}"
+        );
+        assert!(
+            sql.contains("DEFAULT now()"),
+            "expected DEFAULT now() in:\n{sql}"
+        );
+        assert!(
+            sql.contains("DEFAULT 0"),
+            "expected DEFAULT 0 in:\n{sql}"
+        );
+
+        // Re-parse the emitted DDL to confirm it is valid SQL.
+        let fake_path = std::path::Path::new("ddl/table/public/t.sql");
+        crate::parser::parse_entity(fake_path, &sql)
+            .unwrap_or_else(|e| panic!("emitted DDL failed to re-parse: {e}\nSQL:\n{sql}"));
+    }
+
+    /// Apostrophe-in-string-default survives DBML → entity → DDL as `'a''b'`.
+    #[test]
+    fn dbml_apostrophe_in_string_default_round_trips_to_valid_ddl() {
+        use crate::emit::emit_table;
+
+        // DBML `'a\'b'` is a string containing an apostrophe.
+        let dbml = "Table \"public\".\"t\" {\n  \"x\" text [default: 'a\\'b']\n}\n";
+
+        let entities = parse_dbml(dbml).expect("DBML must parse cleanly");
+        let t = find_table(&entities, "public.t");
+        let td = t.table_def.as_ref().unwrap();
+
+        // Parser must produce the SQL-ready form with a doubled apostrophe.
+        assert_eq!(
+            td.columns[0].default_value.as_deref(),
+            Some("'a''b'"),
+            "apostrophe must be SQL-doubled in stored default"
+        );
+
+        // Emit and re-parse to confirm valid SQL.
+        let sql = emit_table(t);
+        assert!(sql.contains("DEFAULT 'a''b'"), "got:\n{sql}");
+        let fake_path = std::path::Path::new("ddl/table/public/t.sql");
+        crate::parser::parse_entity(fake_path, &sql)
+            .unwrap_or_else(|e| panic!("emitted DDL failed to re-parse: {e}\nSQL:\n{sql}"));
     }
 }
