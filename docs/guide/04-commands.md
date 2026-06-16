@@ -304,14 +304,17 @@ dbd. If it detects a `_dbd_meta` table (in any schema — dbd tracks the applied
 it **refuses** and points you at `merge`, which knows how to reconcile a managed database into
 its own project safely.
 
-**What v1 captures (and what it doesn't).** This release reverse-engineers the **data
-model**: schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
-constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments) and
-views. Not yet captured:
+**What's captured (and what isn't).** Reverse-engineering covers the **data model**:
+schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
+constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments), views,
+and **functions & procedures** (full bodies, captured verbatim via `pg_get_functiondef`;
+overloads of the same name share one file; extension-provided routines are excluded). Not
+yet captured:
 
-- **Functions, procedures, roles, sequences** — coming in later patches.
+- **Roles and sequences** — coming in later patches.
 - **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
   are skipped, since they can't be represented losslessly yet.
+- **Triggers**, aggregates, operators, domains, composite types.
 - dbd's own bookkeeping tables (`_dbd_meta`, `_dbd_migrations`) are always excluded.
 
 Column order reflects the database's **physical** order (which can differ from a
