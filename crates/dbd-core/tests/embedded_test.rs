@@ -586,6 +586,155 @@ async fn emitted_index_ddl_applies_to_postgres() {
         .unwrap_or_else(|e| panic!("emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
 }
 
+// ── Test 8: Function & procedure introspection (with overloads + extension) ───
+
+/// Reverse-engineer functions and procedures via `pg_get_functiondef`. Creates a
+/// plain function, a procedure, an overloaded function (two signatures), and
+/// installs `uuid-ossp` whose functions are extension-owned and must be excluded.
+#[tokio::test]
+async fn introspect_captures_functions_and_procedures() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_fn_test").await.unwrap();
+
+    let fixture_sql = "
+        CREATE SCHEMA revfunc;
+
+        -- plain function
+        CREATE FUNCTION revfunc.add_one(n integer) RETURNS integer
+            LANGUAGE sql IMMUTABLE AS $$ SELECT n + 1 $$;
+
+        -- procedure
+        CREATE PROCEDURE revfunc.noop()
+            LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;
+
+        -- overloaded function: two signatures, same name
+        CREATE FUNCTION revfunc.greet(name text) RETURNS text
+            LANGUAGE sql AS $$ SELECT 'hi ' || name $$;
+        CREATE FUNCTION revfunc.greet(name text, loud boolean) RETURNS text
+            LANGUAGE sql AS $$ SELECT 'HI ' || name $$;
+
+        -- extension whose functions (uuid_generate_v4, etc.) must be EXCLUDED
+        CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA revfunc;
+    ";
+    adapter.execute_script(fixture_sql).await.expect("fixture DDL failed");
+
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // ── plain function captured as EntityType::Function ──────────────────────
+    let add_one = entities
+        .iter()
+        .find(|e| e.name == "revfunc.add_one")
+        .expect("function 'revfunc.add_one' not found");
+    assert_eq!(
+        add_one.entity_type,
+        dbd_core::EntityType::Function,
+        "add_one should be a Function"
+    );
+    assert_eq!(add_one.writes.len(), 1, "add_one has one body");
+    assert!(
+        add_one.writes[0].to_uppercase().contains("FUNCTION"),
+        "add_one body should be a CREATE FUNCTION, got: {}",
+        add_one.writes[0]
+    );
+
+    // ── procedure captured as EntityType::Procedure ──────────────────────────
+    let noop = entities
+        .iter()
+        .find(|e| e.name == "revfunc.noop")
+        .expect("procedure 'revfunc.noop' not found");
+    assert_eq!(
+        noop.entity_type,
+        dbd_core::EntityType::Procedure,
+        "noop should be a Procedure"
+    );
+    assert!(
+        noop.writes[0].to_uppercase().contains("PROCEDURE"),
+        "noop body should be a CREATE PROCEDURE, got: {}",
+        noop.writes[0]
+    );
+
+    // ── overloaded function: ONE entity with TWO writes ──────────────────────
+    let greet_entities: Vec<_> = entities
+        .iter()
+        .filter(|e| e.name == "revfunc.greet")
+        .collect();
+    assert_eq!(
+        greet_entities.len(),
+        1,
+        "overloaded 'revfunc.greet' must collapse into exactly ONE entity, got {}",
+        greet_entities.len()
+    );
+    let greet = greet_entities[0];
+    assert_eq!(
+        greet.entity_type,
+        dbd_core::EntityType::Function,
+        "greet should be a Function"
+    );
+    assert_eq!(
+        greet.writes.len(),
+        2,
+        "overloaded greet must hold TWO definitions in writes, got {}",
+        greet.writes.len()
+    );
+    // Both signatures present across the two bodies.
+    let joined = greet.writes.join("\n");
+    assert!(joined.contains("name text") , "first overload signature missing");
+    assert!(joined.contains("loud boolean"), "second overload signature missing");
+
+    // ── extension-provided functions must be EXCLUDED ────────────────────────
+    let has_ext_fn = entities.iter().any(|e| {
+        (e.entity_type == dbd_core::EntityType::Function
+            || e.entity_type == dbd_core::EntityType::Procedure)
+            && e.name.contains("uuid_generate")
+    });
+    assert!(
+        !has_ext_fn,
+        "extension-owned functions (uuid_generate_*) must NOT appear in introspect output"
+    );
+}
+
+// ── Test 9: Emitted routine DDL applies to a real Postgres ────────────────────
+
+/// Round-trip: capture a function via introspect, `emit_routine` it, and execute
+/// the emitted DDL into a fresh schema → succeeds (proves emitted routine DDL is
+/// valid, mirroring `emitted_index_ddl_applies_to_postgres`).
+#[tokio::test]
+async fn emitted_routine_ddl_applies_to_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "emit_routine_test").await.unwrap();
+
+    // Source schema with a function to capture.
+    adapter
+        .execute_script(
+            "CREATE SCHEMA src; \
+             CREATE FUNCTION src.double_it(n integer) RETURNS integer \
+                 LANGUAGE sql IMMUTABLE AS $$ SELECT n * 2 $$;",
+        )
+        .await
+        .expect("failed to create source function");
+
+    let entities = adapter.introspect().await.expect("introspect failed");
+    let func = entities
+        .iter()
+        .find(|e| e.name == "src.double_it")
+        .expect("captured function 'src.double_it' not found");
+
+    // Emit the routine DDL from the captured entity.
+    let sql = dbd_core::emit::emit_routine(func);
+    assert!(sql.trim_end().ends_with(';'), "emitted routine must end in ';':\n{sql}");
+
+    // Apply into a fresh schema. `pg_get_functiondef` emits a fully-qualified,
+    // `CREATE OR REPLACE` definition, so re-running it succeeds.
+    adapter
+        .execute_script("CREATE SCHEMA dst;")
+        .await
+        .expect("failed to create dst schema");
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("emitted routine DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
+}
+
 /// Version-safety: a fresh DB with no `_dbd_meta` is foreign (None); once a
 /// `_dbd_meta` table exists in ANY schema (here `staging`, off the default
 /// search_path), the adapter reports the applied version regardless of which `env`
