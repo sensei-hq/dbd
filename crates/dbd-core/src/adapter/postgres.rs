@@ -1016,6 +1016,48 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(out)
     }
 
+    async fn reverse_managed_version(&self, env: &str) -> Result<Option<u32>> {
+        // 1. Find the schema that holds `_dbd_meta` via the catalog (not an
+        //    unqualified SELECT) — it commonly lives off the search_path
+        //    (e.g. `staging._dbd_meta`). No row → foreign DB.
+        let schema_row = sqlx::query(
+            "SELECT n.nspname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = '_dbd_meta' AND c.relkind = 'r' LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reverse_managed_version schema lookup failed: {e}")))?;
+
+        let Some(schema_row) = schema_row else {
+            return Ok(None);
+        };
+        let schema: String = schema_row.get("nspname");
+
+        // 2. Read the applied version for (project, env) from that schema's
+        //    `_dbd_meta`. `schema` comes from the catalog (not user input) but is
+        //    still quoted defensively. Row → Some(version); no row → Some(0)
+        //    (the table exists, so the DB is managed, just no matching record).
+        let quoted = schema.replace('"', "\"\"");
+        let query = format!(
+            "SELECT version FROM \"{quoted}\"._dbd_meta WHERE project = $1 AND env = $2"
+        );
+        let version_row = sqlx::query(&query)
+            .bind(&self.project)
+            .bind(env)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reverse_managed_version version read failed: {e}")))?;
+
+        match version_row {
+            Some(row) => {
+                let version: i32 = row.get("version");
+                Ok(Some(version as u32))
+            }
+            None => Ok(Some(0)),
+        }
+    }
+
     async fn ensure_migrations_table(&self) -> Result<()> {
         self.execute_script(
             "CREATE TABLE IF NOT EXISTS _dbd_migrations ( \

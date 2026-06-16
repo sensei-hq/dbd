@@ -259,6 +259,42 @@ pub fn apply_plan(root: &Path, plan: &WritePlan, force: bool, dry_run: bool) -> 
     Ok(report)
 }
 
+/// Apply a write-plan by **overwriting** every `Create` and `Conflict` item in
+/// place — no `.bak`, no conflict gate.
+///
+/// This is the managed-database `merge` path (DB version ≥ project version): the
+/// auto-snapshot taken afterwards plus version control are the safety net, so we
+/// deliberately clobber on-disk drift rather than aborting or backing up. `Skip`
+/// items (byte-identical to disk) are left untouched. Orphans are counted but
+/// never deleted. Parent directories are created as needed.
+pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
+    let mut report = Report {
+        orphans: plan.orphans.len(),
+        ..Default::default()
+    };
+    for it in &plan.items {
+        match it.action {
+            FileAction::Skip => report.unchanged += 1,
+            FileAction::Create | FileAction::Conflict => {
+                if it.action == FileAction::Create {
+                    report.created += 1;
+                } else {
+                    report.overwritten += 1;
+                }
+                let abs = root.join(&it.path);
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| DbdError::Config(format!("mkdir {}: {e}", parent.display())))?;
+                }
+                std::fs::write(&abs, &it.content)
+                    .map_err(|e| DbdError::Config(format!("write {}: {e}", abs.display())))?;
+            }
+        }
+    }
+    report.conflicts = plan.items.iter().filter(|i| i.action == FileAction::Conflict).count();
+    Ok(report)
+}
+
 /// Emit DDL for each entity and build a write-plan against `root`.
 ///
 /// Entities whose kind has no emitter (External, Function/Procedure) are silently skipped.
@@ -479,6 +515,45 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.path().join("ddl/table/s/b.ddl")).unwrap(), "B");
         assert_eq!(report.created, 1);
         assert_eq!(report.overwritten, 1);
+        assert_eq!(report.orphans, 1);
+    }
+
+    #[test]
+    fn apply_overwrite_clobbers_without_bak() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Seed an existing file that the conflict item will overwrite, and an
+        // identical file that must be skipped.
+        fs::create_dir_all(root.join("ddl/table/s")).unwrap();
+        fs::write(root.join("ddl/table/s/a.ddl"), "OLD").unwrap();
+        fs::write(root.join("ddl/table/s/same.ddl"), "SAME").unwrap();
+
+        let plan = WritePlan {
+            items: vec![
+                item("ddl/table/s/a.ddl", "NEW", FileAction::Conflict),
+                item("ddl/table/s/b.ddl", "B", FileAction::Create),
+                item("ddl/table/s/same.ddl", "SAME", FileAction::Skip),
+            ],
+            orphans: vec![PathBuf::from("ddl/table/s/legacy.ddl")],
+            skipped_unsafe: vec![],
+        };
+
+        let report = apply_overwrite(root, &plan).unwrap();
+
+        // Conflict overwritten in place — NO `.bak`.
+        assert_eq!(fs::read_to_string(root.join("ddl/table/s/a.ddl")).unwrap(), "NEW");
+        assert!(!root.join("ddl/table/s/a.ddl.bak").exists(), "apply_overwrite must not create .bak files");
+        // Create written.
+        assert_eq!(fs::read_to_string(root.join("ddl/table/s/b.ddl")).unwrap(), "B");
+        // Skip left untouched.
+        assert_eq!(fs::read_to_string(root.join("ddl/table/s/same.ddl")).unwrap(), "SAME");
+
+        // Counts.
+        assert_eq!(report.created, 1);
+        assert_eq!(report.overwritten, 1);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.conflicts, 1);
         assert_eq!(report.orphans, 1);
     }
 
