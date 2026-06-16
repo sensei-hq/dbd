@@ -274,6 +274,7 @@ dbd init --from-db ... --dry-run                  # print the plan, write nothin
 | Flag | Description |
 |------|-------------|
 | `--from-db [CONN]` | Reverse-engineer instead of scaffolding. With no value, the connection resolves from `-d`/`--database` then `$DATABASE_URL`. |
+| `--from-dbml <FILE>` | Reverse-engineer from a DBML file instead of a connection; mutually exclusive with `--from-db`. Produces schemas + enums + tables + foreign keys only (see note below). |
 | `--name NAME` | `project.name` (default: the database name from the connection). |
 | `--version N` | Base `project.version` written to `design.yaml`, and the version of the baseline snapshot (default `1`). |
 | `--schema S` | Limit to exactly these schemas (repeatable). |
@@ -324,6 +325,13 @@ self-contained.
 through the column itself — such columns emit `serial`/`bigserial`/`smallserial` or
 `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` rather than a separate sequence file.
 
+**From a DBML file (`--from-dbml`).** A DBML source produces **schemas + enums + tables + foreign
+keys only** — DBML cannot express functions, procedures, views, standalone sequences, roles, or
+check constraints, so none of those appear. `serial`/identity columns survive (dbd's DBML carries
+`bigserial`/`[increment]`, so the reconstructed column keeps it). All the schema-selection flags
+(`--schema`/`--exclude-schema`/`--all-schemas`) still filter the parsed entities; `--roles` is a
+no-op since DBML has no roles.
+
 Not yet captured:
 
 - **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
@@ -346,6 +354,7 @@ creates or edits `design.yaml`.
 ```sh
 dbd merge postgres://user:pass@host/db   # sync into the current project
 dbd merge                                # connection from -d / $DATABASE_URL
+dbd merge --from-dbml schema.dbml        # sync from a DBML file (no connection)
 dbd merge --dry-run                      # preview the plan + the snapshot version
 dbd merge --schema config --exclude-schema audit   # same selection flags as init
 dbd merge --roles                        # also reverse-engineer roles (opt-in)

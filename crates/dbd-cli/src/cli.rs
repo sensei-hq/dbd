@@ -179,6 +179,9 @@ pub enum Commands {
         /// Reverse-engineer the project from a database connection string (or $DATABASE_URL)
         #[arg(long, value_name = "CONN", num_args = 0..=1, default_missing_value = "")]
         from_db: Option<String>,
+        /// Reverse-engineer the project from a DBML file (mutually exclusive with --from-db)
+        #[arg(long, value_name = "FILE", conflicts_with = "from_db")]
+        from_dbml: Option<PathBuf>,
         /// Base project version written to design.yaml
         #[arg(long, default_value_t = 1)]
         version: u32,
@@ -202,6 +205,9 @@ pub enum Commands {
     Merge {
         /// Database connection string (or $DATABASE_URL)
         conn: Option<String>,
+        /// Sync from a DBML file instead of a live database (mutually exclusive with the conn argument)
+        #[arg(long, value_name = "FILE", conflicts_with = "conn")]
+        from_dbml: Option<PathBuf>,
         /// Limit to these schemas (repeatable)
         #[arg(long = "schema", value_name = "SCHEMA")]
         schemas: Vec<String>,
@@ -351,6 +357,42 @@ mod tests {
             matches!(&cli.command, Commands::Init { from_db: None, .. }),
             "expected from_db == None"
         );
+    }
+
+    /// `dbd init --from-dbml <file>` and `dbd merge --from-dbml <file>` parse, and
+    /// the parsed value is captured on the right subcommand.
+    #[test]
+    fn init_and_merge_from_dbml_parse() {
+        let init = Cli::try_parse_from(["dbd", "init", "--from-dbml", "schema.dbml", "--name", "demo"])
+            .expect("init --from-dbml should parse");
+        assert!(
+            matches!(&init.command, Commands::Init { from_dbml: Some(p), .. } if p.ends_with("schema.dbml")),
+            "expected init from_dbml == Some(schema.dbml)"
+        );
+        let merge = Cli::try_parse_from(["dbd", "merge", "--from-dbml", "schema.dbml", "--dry-run"])
+            .expect("merge --from-dbml should parse");
+        assert!(
+            matches!(&merge.command, Commands::Merge { from_dbml: Some(p), .. } if p.ends_with("schema.dbml")),
+            "expected merge from_dbml == Some(schema.dbml)"
+        );
+    }
+
+    /// `--from-db` and `--from-dbml` are mutually exclusive on `init`.
+    #[test]
+    fn init_from_db_and_from_dbml_together_is_rejected() {
+        let res = Cli::try_parse_from([
+            "dbd", "init", "--from-db", "postgres://x", "--from-dbml", "schema.dbml",
+        ]);
+        assert!(res.is_err(), "init --from-db + --from-dbml together should be rejected");
+    }
+
+    /// On `merge`, the positional `conn` and `--from-dbml` are mutually exclusive.
+    #[test]
+    fn merge_conn_and_from_dbml_together_is_rejected() {
+        let res = Cli::try_parse_from([
+            "dbd", "merge", "postgres://x", "--from-dbml", "schema.dbml",
+        ]);
+        assert!(res.is_err(), "merge conn + --from-dbml together should be rejected");
     }
 
     /// The global `-d/--database <url>` and `inspect --from-db` must coexist.
