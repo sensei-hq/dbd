@@ -88,6 +88,7 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 pub const MANAGED_KINDS: &[EntityType] = &[
     EntityType::Schema, EntityType::Extension, EntityType::Enum,
     EntityType::Table, EntityType::View,
+    EntityType::Function, EntityType::Procedure,
 ];
 
 use std::path::Path;
@@ -225,7 +226,7 @@ pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
 
 /// Emit DDL for each entity and build a write-plan against `root`.
 ///
-/// Entities whose kind has no emitter (External, Function/Procedure) are silently skipped.
+/// Entities whose kind has no emitter (External, Import/Export) are silently skipped.
 /// Entities whose schema or bare name fails [`is_safe_segment`] are excluded from the plan
 /// and reported in [`WritePlan::skipped_unsafe`] so the caller can surface a warning.
 ///
@@ -355,9 +356,11 @@ mod tests {
         fs::write(root.join("ddl/table/shop/customers.ddl"), "OLD").unwrap();
         fs::write(root.join("ddl/table/shop/legacy.ddl"), "ORPHAN").unwrap();
         fs::write(root.join("ddl/table/shop/old.sql"), "ORPHAN").unwrap();
-        // an unmanaged kind that must NOT be flagged as orphan:
-        fs::create_dir_all(root.join("ddl/function/shop")).unwrap();
-        fs::write(root.join("ddl/function/shop/f.ddl"), "FN").unwrap();
+        // an unmanaged kind that must NOT be flagged as orphan. `trigger` maps to
+        // no `EntityType`, so it is not in MANAGED_KINDS and the orphan scan never
+        // walks it (functions/procedures ARE managed now, so they would be scanned).
+        fs::create_dir_all(root.join("ddl/trigger/shop")).unwrap();
+        fs::write(root.join("ddl/trigger/shop/t.ddl"), "TRG").unwrap();
 
         let generated = vec![
             (PathBuf::from("ddl/table/shop/orders.ddl"), "SAME".to_string()),     // skip
@@ -375,8 +378,8 @@ mod tests {
             PathBuf::from("ddl/table/shop/legacy.ddl"),
             PathBuf::from("ddl/table/shop/old.sql"),
         ]);
-        // function file is unmanaged → never an orphan
-        assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("function")));
+        // trigger file is unmanaged → never an orphan
+        assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
     }
 
     fn item(p: &str, c: &str, a: FileAction) -> PlanItem {
