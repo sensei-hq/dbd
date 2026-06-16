@@ -1377,7 +1377,7 @@ mod tests {
             default_value: None,
             is_pk: false,
             is_unique: false,
-            is_identity: false,
+            identity: None,
             comment: None,
             inline_fk: None,
         }
@@ -1641,6 +1641,40 @@ mod tests {
         assert_eq!(deserialized.tables[0].name, "users");
         assert_eq!(deserialized.enums.len(), 1);
         assert_eq!(deserialized.enums[0].name, "status");
+    }
+
+    // ── SC9b: Pre-`identity` snapshots (with the obsolete `is_identity` field)
+    //          still deserialize — `identity` defaults to None and `is_identity`
+    //          is ignored. Locks in forward-compat for snapshots written before
+    //          the serial/identity work.
+    #[test]
+    fn sc9b_old_snapshot_with_is_identity_deserializes() {
+        let json = r#"{
+            "version": 1,
+            "description": "legacy",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tables": [{
+                "name": "users",
+                "schema": "config",
+                "columns": [{
+                    "name": "id",
+                    "data_type": "int",
+                    "nullable": false,
+                    "default_value": null,
+                    "is_pk": true,
+                    "is_unique": false,
+                    "is_identity": false,
+                    "comment": null,
+                    "inline_fk": null
+                }],
+                "indexes": [],
+                "table_constraints": []
+            }],
+            "enums": []
+        }"#;
+        let snap: Snapshot = serde_json::from_str(json)
+            .expect("legacy snapshot with is_identity should deserialize");
+        assert_eq!(snap.tables[0].columns[0].identity, None);
     }
 
     // ── SC10: create_snapshot I/O integration ────────────
