@@ -15,7 +15,8 @@ export const nav = {
 		{ label: 'Concepts', href: '/#concepts' },
 		{ label: 'Targets', href: '/#targets' },
 		{ label: "Who it's for", href: '/#audience' },
-		{ label: 'Guide', href: '/guide' }
+		{ label: 'Guide', href: '/guide' },
+		{ label: 'Projects', href: '/projects' }
 	],
 	cta: { label: 'Get started', href: '/#start' }
 };
