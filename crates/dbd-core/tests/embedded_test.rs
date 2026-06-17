@@ -81,6 +81,38 @@ async fn assert_table_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &s
         .unwrap_or_else(|e| panic!("assert_table_absent({schema}.{table}) failed: {e}"));
 }
 
+/// Assert that a schema exists; panics if it doesn't.
+async fn assert_schema_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str) {
+    let sql = format!(
+        "DO $$ BEGIN \
+           IF NOT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}' \
+           ) THEN RAISE EXCEPTION 'schema {schema} does not exist'; \
+           END IF; \
+         END $$"
+    );
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("assert_schema_exists({schema}) failed: {e}"));
+}
+
+/// Assert that a schema is absent; panics if it exists.
+async fn assert_schema_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str) {
+    let sql = format!(
+        "DO $$ BEGIN \
+           IF EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}' \
+           ) THEN RAISE EXCEPTION 'schema {schema} unexpectedly exists'; \
+           END IF; \
+         END $$"
+    );
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("assert_schema_absent({schema}) failed: {e}"));
+}
+
 /// Assert that a column exists on a table; panics if it doesn't.
 async fn assert_column_exists(
     adapter: &dyn dbd_core::DatabaseAdapter,
@@ -1091,4 +1123,58 @@ async fn emitted_sequences_and_serial_identity_apply_to_postgres() {
     assert_table_exists(&*adapter, "dst", "with_serial").await;
     assert_table_exists(&*adapter, "dst", "with_identity").await;
     assert_table_exists(&*adapter, "dst", "with_ref").await;
+}
+
+// ── Reset: entity-level by default (schemas + extensions survive) ─────────────
+
+#[tokio::test]
+async fn reset_default_drops_entities_keeps_schema_and_reapplies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    let design = load_design();
+
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("deploy failed");
+    assert_table_exists(&*adapter, "app", "items").await;
+
+    // Default reset: force past the prod/migrations guards; no schema/extension drops.
+    design
+        .reset(&*adapter, "postgres", true, false, false, None)
+        .await
+        .expect("reset failed");
+
+    // Entities are gone …
+    assert_table_absent(&*adapter, "app", "items").await;
+    assert_table_absent(&*adapter, "app", "orders").await;
+    // … but the schema survives — entity-level reset never drops schemas.
+    assert_schema_exists(&*adapter, "app").await;
+
+    // Re-apply works after a default reset (db is back to v0 → a Fresh install).
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("re-deploy after reset failed");
+    assert_table_exists(&*adapter, "app", "items").await;
+}
+
+#[tokio::test]
+async fn reset_with_schemas_drops_the_schema() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    let design = load_design();
+
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("deploy failed");
+    assert_schema_exists(&*adapter, "app").await;
+
+    // `--schemas` on a postgres target also drops the managed schema itself.
+    design
+        .reset(&*adapter, "postgres", true, true, false, None)
+        .await
+        .expect("reset --schemas failed");
+    assert_schema_absent(&*adapter, "app").await;
 }

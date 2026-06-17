@@ -145,7 +145,7 @@ pub enum Commands {
         #[arg(long)]
         status: bool,
     },
-    /// Drop all schemas (with safety guards)
+    /// Drop the project's managed objects (with safety guards)
     Reset {
         /// Target platform
         #[arg(long, default_value = "postgres")]
@@ -156,6 +156,16 @@ pub enum Commands {
         /// Override safety guards
         #[arg(long)]
         force: bool,
+        /// Also drop the project's managed schemas (DROP SCHEMA … CASCADE),
+        /// skipping protected schemas
+        #[arg(long)]
+        schemas: bool,
+        /// Also drop the target's configured extensions (DROP EXTENSION … CASCADE)
+        #[arg(long)]
+        extensions: bool,
+        /// Shorthand for --schemas --extensions
+        #[arg(long)]
+        clean: bool,
     },
     /// Audit design.yaml for stale entries
     Doctor {
@@ -332,6 +342,35 @@ mod tests {
             Cli::try_parse_from(["dbd", "merge", "postgres://x", "--force-overwrite"]).is_err(),
             "merge --force-overwrite should be rejected (flag removed)"
         );
+    }
+
+    /// `dbd reset` and its flags parse; `--clean`/`--schemas`/`--extensions`
+    /// default to false and flip to true when present, alongside `--force`/`--dry-run`.
+    #[test]
+    fn reset_flags_parse() {
+        // bare reset → all opt-in flags false
+        let cli = Cli::try_parse_from(["dbd", "reset"]).expect("reset should parse");
+        assert!(
+            matches!(
+                &cli.command,
+                Commands::Reset { schemas: false, extensions: false, clean: false, force: false, dry_run: false, .. }
+            ),
+            "expected all reset flags false by default"
+        );
+        // --schemas --extensions
+        let cli = Cli::try_parse_from(["dbd", "reset", "--schemas", "--extensions"])
+            .expect("reset --schemas --extensions should parse");
+        assert!(matches!(
+            &cli.command,
+            Commands::Reset { schemas: true, extensions: true, clean: false, .. }
+        ));
+        // --clean --force --dry-run
+        let cli = Cli::try_parse_from(["dbd", "reset", "--clean", "--force", "--dry-run"])
+            .expect("reset --clean --force --dry-run should parse");
+        assert!(matches!(
+            &cli.command,
+            Commands::Reset { clean: true, force: true, dry_run: true, .. }
+        ));
     }
 
     /// `dbd init --from-db` (no value) must parse to `from_db == Some("")` (env-fallback sentinel).

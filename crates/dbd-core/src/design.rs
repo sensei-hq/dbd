@@ -1361,6 +1361,8 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         target: &str,
         force: bool,
+        drop_schemas: bool,
+        drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<()> {
         if !force
@@ -1379,6 +1381,26 @@ impl Design {
                 }
             }
 
+        if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
+            adapter.execute_script(&sql).await?;
+        }
+        adapter.clear_project_migrations().await?;
+
+        Ok(())
+    }
+
+    /// Build the SQL a `reset` would run, without touching the database. Drops
+    /// the project's managed data-model entities individually (scope-filtered)
+    /// and, when `drop_schemas`/`drop_extensions` are set, the managed schemas /
+    /// configured extensions. Returns `None` when there is nothing to drop.
+    /// Used by `reset()` and by `--dry-run`.
+    pub fn reset_script(
+        &self,
+        target: &str,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<Option<String>> {
         // Roles aren't scope-selectable, so only a full reset drops them; a
         // subset scope leaves shared roles intact.
         let is_subset = matches!(scope, Some(s) if !s.is_all);
@@ -1393,15 +1415,53 @@ impl Design {
                 .unwrap_or(&[])
         };
 
-        // Schemas to drop — all managed schemas, or just those the scope occupies.
+        // Data-model entities to drop individually (scope-filtered), in the
+        // builder's reverse dependency order.
+        let is_data_model = |e: &Entity| {
+            matches!(
+                e.entity_type,
+                EntityType::Table
+                    | EntityType::View
+                    | EntityType::Function
+                    | EntityType::Procedure
+                    | EntityType::Enum
+                    | EntityType::Sequence
+            )
+        };
+        let entities: Vec<&Entity> = match scope {
+            Some(s) if !s.is_all => {
+                let ws = self.working_set(s)?;
+                self.entities
+                    .iter()
+                    .filter(|e| is_data_model(e) && Self::entity_in_scope(e, s, &ws))
+                    .collect()
+            }
+            _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
+        };
+
+        // Schemas the `--schemas` path may drop — all managed schemas, or just
+        // those the scope occupies.
         let schemas = self.reset_target_schemas(scope)?;
-        if let Some(sql) = script::build_reset_script(&schemas, roles, target, &[])
-            .map_err(DbdError::SafetyGuard)? {
-            adapter.execute_script(&sql).await?;
-        }
-        adapter.clear_project_migrations().await?;
-        
-        Ok(())
+
+        // The active target's extensions (by bare name) for the `--extensions` path.
+        let extensions: Vec<String> = self
+            .config
+            .target
+            .values()
+            .next()
+            .map(|t| t.extensions.iter().map(|e| e.name().to_string()).collect())
+            .unwrap_or_default();
+
+        script::build_reset_script(
+            &entities,
+            roles,
+            &extensions,
+            target,
+            drop_schemas,
+            drop_extensions,
+            &schemas,
+        )
+        .map_err(DbdError::SafetyGuard)
     }
 }
 
@@ -1591,7 +1651,7 @@ mod tests {
         let design = Design::from_config(&config_path, "prod").unwrap();
         let mock = MockAdapter::new().with_meta("prod", 0);
 
-        let result = design.reset(&mock, "postgres", false, None).await;
+        let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
@@ -1602,7 +1662,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_meta("dev", 1);
 
-        let result = design.reset(&mock, "postgres", false, None).await;
+        let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("migrations"));
     }
@@ -1613,7 +1673,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_meta("dev", 0);
 
-        let result = design.reset(&mock, "postgres", false, None).await;
+        let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_ok());
     }
 
@@ -1623,7 +1683,7 @@ mod tests {
         let design = Design::from_config(&config_path, "prod").unwrap();
         let mock = MockAdapter::new().with_meta("prod", 5);
 
-        let result = design.reset(&mock, "postgres", true, None).await;
+        let result = design.reset(&mock, "postgres", true, false, false, None).await;
         assert!(result.is_ok());
     }
 
