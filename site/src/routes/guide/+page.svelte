@@ -1,12 +1,13 @@
 <script lang="ts">
 	import Eyebrow from '$lib/components/Eyebrow.svelte';
+	import Seo from '$lib/components/Seo.svelte';
 	import { pages } from '$lib/guide';
 </script>
 
-<svelte:head>
-	<title>Guide — dbd</title>
-	<meta name="description" content="Guides for dbd: getting started, the design.yaml reference, commands, and schema evolution." />
-</svelte:head>
+<Seo
+	title="Guide — dbd"
+	description="Guides for dbd: getting started, the design.yaml reference, commands, schema evolution, and recommended workflows."
+/>
 
 <section class="mx-auto max-w-content px-6 py-section">
 	<div class="flex flex-col gap-4">

@@ -74,7 +74,13 @@
   const pick = (key: string | null) => (selected = key || null);
 </script>
 
-<svelte:head><title>{model.project.name} — dbd</title></svelte:head>
+<svelte:head>
+  <title>{model.project.name} — dbd</title>
+  <meta
+    name="description"
+    content="Interactive ER diagram viewer — pan, zoom, and inspect tables, columns, and relationships."
+  />
+</svelte:head>
 
 <div
   class="dbd-app relative flex h-screen flex-col overflow-hidden"

@@ -32,11 +32,37 @@ function rewriteLinks(html: string): string {
 	});
 }
 
-export type GuidePage = { slug: string; order: number; title: string; html: string };
+export type GuidePage = {
+	slug: string;
+	order: number;
+	title: string;
+	description: string;
+	html: string;
+};
 
 function titleFrom(raw: string, fallback: string): string {
 	const m = raw.match(/^#\s+(.+)$/m);
 	return m ? m[1].trim() : fallback;
+}
+
+/** First prose paragraph after the H1, stripped to plain text + clamped — used as
+ *  the page's meta/OG description. */
+function descriptionFrom(raw: string, fallback: string): string {
+	const body = raw.replace(/^#\s+.+$/m, ''); // drop the H1
+	for (const block of body.split(/\n\s*\n/)) {
+		const t = block.trim();
+		// Skip headings, code fences, tables, lists, blockquotes, raw HTML/SVG.
+		if (!t || /^[#`|>\-*<]/.test(t)) continue;
+		const text = t
+			.replace(/`([^`]+)`/g, '$1')
+			.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+			.replace(/[*_]/g, '')
+			.replace(/\s+/g, ' ')
+			.trim();
+		if (text.length < 20) continue;
+		return text.length > 155 ? text.slice(0, 152).trimEnd() + '…' : text;
+	}
+	return fallback;
 }
 
 export const pages: GuidePage[] = Object.entries(raws)
@@ -49,6 +75,7 @@ export const pages: GuidePage[] = Object.entries(raws)
 			slug,
 			order,
 			title: titleFrom(md, slug),
+			description: descriptionFrom(md, `${titleFrom(md, slug)} — dbd documentation.`),
 			html: rewriteLinks(addHeadingIds(marked.parse(md) as string))
 		};
 	})

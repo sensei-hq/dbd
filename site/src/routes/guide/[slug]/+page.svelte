@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { pages, findPage } from '$lib/guide';
+	import Seo from '$lib/components/Seo.svelte';
 
 	let { data }: { data: { slug: string } } = $props();
 
@@ -9,9 +10,11 @@
 	const next = $derived(idx >= 0 && idx < pages.length - 1 ? pages[idx + 1] : undefined);
 </script>
 
-<svelte:head>
-	<title>{current?.title ?? 'Guide'} — dbd</title>
-</svelte:head>
+<Seo
+	title="{current?.title ?? 'Guide'} — dbd"
+	description={current?.description ?? 'dbd documentation: managing database schemas as code.'}
+	type="article"
+/>
 
 <div class="mx-auto grid max-w-content gap-12 px-6 py-section lg:grid-cols-[16rem_1fr]">
 	<!-- Sidebar -->
