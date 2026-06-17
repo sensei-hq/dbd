@@ -1,3 +1,5 @@
 # allow crawling everything by default
 User-agent: *
-Disallow:
+Disallow: /projects
+
+Sitemap: https://dbd.sensei-hq.com/sitemap.xml

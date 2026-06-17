@@ -50,8 +50,10 @@ pub async fn run(
             }
         }
 
-        Commands::Reset { target, dry_run, force } => {
-            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, scope, deps, verbosity).await
+        Commands::Reset { target, dry_run, force, schemas, extensions, clean } => {
+            let drop_schemas = *schemas || *clean;
+            let drop_extensions = *extensions || *clean;
+            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, drop_schemas, drop_extensions, scope, deps, verbosity).await
         }
 
         Commands::Snapshot { list, name } => {
