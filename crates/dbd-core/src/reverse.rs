@@ -343,11 +343,18 @@ pub fn plan_from_entities(
 /// `"sqlite"` maps to the `sqlite` target key, everything else maps to `"postgres"`.
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
     let target_key = if dialect == "sqlite" { "sqlite" } else { "postgres" };
-    let schema_lines = schemas.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n");
+    // A schema-less source (SQLite) yields no schemas — emit an explicit empty
+    // sequence rather than a bare `schemas:` (which parses as null, not a list).
+    let schemas_block = if schemas.is_empty() {
+        "schemas: []\n".to_string()
+    } else {
+        let lines = schemas.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n");
+        format!("schemas:\n{lines}\n")
+    };
     format!(
         "project:\n  name: {project}\n  version: {version}\n\n\
          target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
-         schemas:\n{schema_lines}\n"
+         {schemas_block}"
     )
 }
 

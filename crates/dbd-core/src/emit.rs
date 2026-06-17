@@ -255,6 +255,13 @@ pub fn emit_routine(entity: &Entity) -> String {
 /// don't generate (External, Import/Export).
 pub fn emit_entity(entity: &Entity) -> Option<String> {
     use crate::entity::EntityType;
+    // Verbatim path: a source that already holds the exact `CREATE …` text (e.g.
+    // SQLite's `sqlite_master.sql`) sets `raw_ddl` and bypasses the structured
+    // emitter entirely. Re-terminate with a single trailing `;`.
+    if let Some(raw) = &entity.raw_ddl {
+        let body = raw.trim_end().trim_end_matches(';').trim_end();
+        return Some(format!("{body};"));
+    }
     match entity.entity_type {
         EntityType::Schema | EntityType::Extension | EntityType::Role => {
             crate::script::ddl_from_entity(entity)
@@ -456,6 +463,19 @@ mod tests {
         assert_eq!(emit_entity(&s).unwrap(), "CREATE SCHEMA IF NOT EXISTS \"shop\";");
         let ext_none = Entity::new(EntityType::External, "auth.users");
         assert!(emit_entity(&ext_none).is_none());
+    }
+
+    #[test]
+    fn emit_entity_uses_raw_ddl_verbatim() {
+        // raw_ddl bypasses the structured emitter, single trailing `;`.
+        let mut e = Entity::new(EntityType::Table, "t");
+        e.raw_ddl = Some("CREATE TABLE t (a int)".into());
+        assert_eq!(emit_entity(&e).unwrap(), "CREATE TABLE t (a int);");
+        e.raw_ddl = Some("CREATE TABLE t (a int);\n".into()); // no double `;`
+        assert_eq!(emit_entity(&e).unwrap(), "CREATE TABLE t (a int);");
+        // Without raw_ddl, the structured emitter still runs.
+        let plain = Entity::new(EntityType::Schema, "s");
+        assert_eq!(emit_entity(&plain).unwrap(), "CREATE SCHEMA IF NOT EXISTS \"s\";");
     }
 
     #[test]
