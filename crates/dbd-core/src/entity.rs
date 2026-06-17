@@ -215,6 +215,11 @@ pub struct Entity {
     pub writes: Vec<String>,
     pub table_def: Option<TableDef>,
     pub enum_values: Vec<EnumValue>,
+    /// Verbatim DDL to emit as-is, bypassing the structured emitter. Used by sources
+    /// that already hold the exact `CREATE …` text (e.g. SQLite's `sqlite_master.sql`).
+    /// `None` for the Postgres/DBML paths, which reconstruct DDL from the structured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_ddl: Option<String>,
 }
 
 impl Entity {
@@ -236,6 +241,7 @@ impl Entity {
             writes: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),
+            raw_ddl: None,
         }
     }
 
@@ -295,6 +301,7 @@ impl Entity {
             writes: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),
+            raw_ddl: None,
         }
     }
 
@@ -369,6 +376,7 @@ impl Entity {
             writes: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),
+            raw_ddl: None,
         }
     }
 
