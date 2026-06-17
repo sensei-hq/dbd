@@ -8,6 +8,6 @@ export default defineConfig({
 	// exclude them from dep pre-bundling so vite-plugin-svelte preprocesses them
 	// instead of the optimizer choking on the TS syntax.
 	optimizeDeps: {
-		exclude: ['@rokkit/app', '@rokkit/ui', '@rokkit/states', '@rokkit/core']
+		exclude: ['@rokkit/ui', '@rokkit/states', '@rokkit/core']
 	}
 });

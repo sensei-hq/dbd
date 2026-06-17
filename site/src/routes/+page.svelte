@@ -7,15 +7,38 @@
 	import FeatureCard from '$lib/components/FeatureCard.svelte';
 	import TargetCard from '$lib/components/TargetCard.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
+	import Seo from '$lib/components/Seo.svelte';
+	import { SITE_URL } from '$lib/seo';
 	import { hero, overview, concepts, targets, audience, start } from '$lib/data';
+
+	const description =
+		'dbd turns plain SQL DDL files into a versioned, deployable schema. No DSL, no ORM — the folder structure is the source of truth. Built in Rust.';
+
+	// JSON-LD structured data (rich results): the site + the dbd CLI/library.
+	const jsonLd = {
+		'@context': 'https://schema.org',
+		'@graph': [
+			{ '@type': 'WebSite', '@id': `${SITE_URL}/#website`, name: 'dbd', url: `${SITE_URL}/` },
+			{
+				'@type': 'SoftwareApplication',
+				'@id': `${SITE_URL}/#app`,
+				name: 'dbd',
+				alternateName: 'Database Designer',
+				applicationCategory: 'DeveloperApplication',
+				operatingSystem: 'macOS, Linux, Windows',
+				url: `${SITE_URL}/`,
+				description,
+				softwareHelp: `${SITE_URL}/guide`,
+				offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }
+			}
+		]
+	};
 </script>
 
+<Seo title="dbd — Database schemas as code" {description} />
 <svelte:head>
-	<title>dbd — Database schemas as code</title>
-	<meta
-		name="description"
-		content="dbd turns plain SQL DDL files into a versioned, deployable schema. No DSL, no ORM — the folder structure is the source of truth. Built in Rust."
-	/>
+	<!-- eslint-disable-next-line svelte/no-at-html-tags — static, developer-authored JSON-LD -->
+	{@html `<script type="application/ld+json">${JSON.stringify(jsonLd)}</` + `script>`}
 </svelte:head>
 
 <!-- Hero -->
