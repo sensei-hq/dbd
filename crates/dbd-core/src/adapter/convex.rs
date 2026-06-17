@@ -635,7 +635,7 @@ impl DatabaseAdapter for ConvexAdapter {
         self.run_npx(&args).await
     }
 
-    async fn export_data(&self, _entity: &Entity) -> Result<()> {
+    async fn export_data(&self, _entity: &Entity, _out_dir: Option<&Path>) -> Result<()> {
         // Convex CLI exports the entire deployment as a zip, not per table.
         // Point the user at the CLI rather than implementing a partial story.
         Err(DbdError::Config(
@@ -1034,7 +1034,7 @@ mod tests {
         let adapter = ConvexAdapter::new(tmp.path(), "test");
         let mut e = Entity::new(EntityType::Table, "config.users");
         e.file = Some(tmp.path().join("users.jsonl"));
-        let err = adapter.export_data(&e).await.unwrap_err();
+        let err = adapter.export_data(&e, None).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("npx convex export"),

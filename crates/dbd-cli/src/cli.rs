@@ -89,6 +89,10 @@ pub enum Commands {
         /// Import a specific table only
         #[arg(short, long)]
         name: Option<String>,
+        /// Load a specific file into the table named by --name (format
+        /// inferred from the extension: .jsonl/.tsv/.csv). Requires --name.
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
         /// Print what would be imported
         #[arg(long)]
         dry_run: bool,
@@ -167,6 +171,10 @@ pub enum Commands {
         /// Output format (csv, tsv, jsonl)
         #[arg(short, long, default_value = "csv")]
         format: String,
+        /// Output directory; selected tables are written flat as
+        /// <dir>/<name>.<fmt> (default: export/<schema>/<name>.<fmt>)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
     /// Initialize a new dbd project
     Init {
@@ -393,6 +401,43 @@ mod tests {
             "dbd", "merge", "postgres://x", "--from-dbml", "schema.dbml",
         ]);
         assert!(res.is_err(), "merge conn + --from-dbml together should be rejected");
+    }
+
+    /// `import -f/--file` parses and requires nothing at the clap layer (the
+    /// `--file requires --name` rule is enforced in the handler, not clap), and
+    /// the back-compat forms (`import`, `import -n t`) still parse.
+    #[test]
+    fn import_file_flag_parses_and_back_compat_holds() {
+        let cli = Cli::try_parse_from(["dbd", "import", "-n", "t", "-f", "f.jsonl"])
+            .expect("import -n t -f f.jsonl should parse");
+        assert!(
+            matches!(&cli.command, Commands::Import { name: Some(n), file: Some(p), .. }
+                if n == "t" && p.ends_with("f.jsonl")),
+            "expected name == t and file == f.jsonl"
+        );
+        // back-compat: no flags
+        let cli = Cli::try_parse_from(["dbd", "import"]).expect("import should parse");
+        assert!(matches!(&cli.command, Commands::Import { name: None, file: None, dry_run: false }));
+        // back-compat: just -n
+        let cli = Cli::try_parse_from(["dbd", "import", "-n", "t"]).expect("import -n t should parse");
+        assert!(matches!(&cli.command, Commands::Import { name: Some(n), file: None, .. } if n == "t"));
+    }
+
+    /// `export -o/--output` parses alongside `-f/--format`, and the back-compat
+    /// form (`export -n t -f jsonl`, no `-o`) still parses.
+    #[test]
+    fn export_output_flag_parses_and_back_compat_holds() {
+        let cli = Cli::try_parse_from(["dbd", "export", "-n", "t", "-f", "jsonl", "-o", "out"])
+            .expect("export -n t -f jsonl -o out should parse");
+        assert!(
+            matches!(&cli.command, Commands::Export { name: Some(n), format, output: Some(p) }
+                if n == "t" && format == "jsonl" && p.ends_with("out")),
+            "expected name == t, format == jsonl, output == out"
+        );
+        // back-compat: no -o → output None, format defaults preserved
+        let cli = Cli::try_parse_from(["dbd", "export", "-n", "t", "-f", "jsonl"])
+            .expect("export -n t -f jsonl should parse");
+        assert!(matches!(&cli.command, Commands::Export { output: None, format, .. } if format == "jsonl"));
     }
 
     /// The global `-d/--database <url>` and `inspect --from-db` must coexist.

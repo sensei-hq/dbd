@@ -68,8 +68,8 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd merge` — sync a DB (or `--from-dbml <file>`) into the current project (reverse-engineer + reconcile, never edits `design.yaml`): foreign or managed `D≥Y` → overwrite DDL + auto-snapshot the diff; managed `D<Y` → refuse (stale DB, no override); orphans reported never deleted; same selection flags as init
 - `dbd inspect` — validate, report errors/warnings (+ scope dependency gaps with `--scope`); `--from-db` resolves references against the live catalog (uses `-d`/`--database`) and caches to `.dbd/refcache.json`. Surfaces unresolved migration `-- TODO:`s
 - `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
-- `dbd import` — load staging data (CSV/TSV/JSONL); env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches
-- `dbd export` — export table data (scope-aware)
+- `dbd import` — load staging data (CSV/TSV/JSONL) from the `import/` convention; env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches. `-n <table> -f <file>` loads one explicit file (format from extension)
+- `dbd export` — export table data (scope-aware) to `export/<schema>/<name>.<fmt>`; `-f/--format` sets the format, `-o/--output <dir>` the destination dir (`<dir>/<name>.<fmt>`, e.g. straight into `import/` for a round-trip)
 - `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
 - `dbd combine` — combine DDL into single SQL file (scope-aware)
 - `dbd graph` — dependency graph as JSON (scope-aware)

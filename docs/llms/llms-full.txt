@@ -395,9 +395,16 @@ Apply order: schemas → extensions → roles → enums → tables (with interle
 ```sh
 dbd import
 dbd import -n staging.lookups
+dbd import -n activity.hook_events -f ~/data/events.jsonl   # ad-hoc: load a specific file
 dbd import --dry-run
 dbd import -e dev
 ```
+
+`-f`/`--file <path>` loads one explicit file into the `-n` table (required), format inferred
+from the extension (.jsonl/.tsv/.csv), bypassing the `import/` convention. Symmetric note: on
+`import` `-f` is the file; on `export` `-f` is the format. `dbd export -n <t> -f <fmt> -o <dir>`
+writes `<dir>/<name>.<fmt>` (default `export/<schema>/<name>.<fmt>`) — `-o` lets export write
+straight into the `import/` tree for a round-trip.
 
 Execution: truncate → COPY data → call import procedures → run after scripts.
 

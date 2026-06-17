@@ -109,7 +109,7 @@ impl DatabaseAdapter for MockAdapter {
         Ok(())
     }
 
-    async fn export_data(&self, _entity: &Entity) -> Result<()> {
+    async fn export_data(&self, _entity: &Entity, _out_dir: Option<&std::path::Path>) -> Result<()> {
         Ok(())
     }
 
