@@ -74,10 +74,16 @@ Load staging data from CSV/TSV/JSONL files.
 
 ```sh
 dbd import                         # Import all tables + call procedures
-dbd import -n staging.lookups      # Import one table
+dbd import -n staging.lookups      # Import one table (from the import/ folder)
+dbd import -n activity.hook_events -f ~/data/events.jsonl   # load a specific file into a table
 dbd import --dry-run               # Show import plan (no DB needed)
 dbd import -e dev                  # Load dev-only data
 ```
+
+**`-f`/`--file`** loads one explicit file into the table named by `-n` (required with `-f`),
+instead of the `import/<schema>/<table>.<ext>` convention. The format is inferred from the file
+extension (`.jsonl`/`.tsv`/`.csv`). (On `import`, `-f` is the *file*; on `export` it's the
+*format* — each is unambiguous within its command.)
 
 **Dry-run output shows the full plan:**
 ```
@@ -231,12 +237,15 @@ dbd export                              # Export all tables as CSV
 dbd export --name config.lookups        # Export one table
 dbd export --format tsv                 # TSV format
 dbd export --format jsonl               # JSONL format
+dbd export -n activity.hook_events -f jsonl -o import/staging   # → import/staging/hook_events.jsonl
 dbd export --scope hub                  # Only tables in the 'hub' scope
 ```
 
-Writes to `export/<schema>/<name>.<format>`.
-If export entries are configured in design.yaml, only those tables are exported.
-`--scope`/`--deps` further restrict the export to the scope's working set.
+By default writes to `export/<schema>/<name>.<format>`. **`-o`/`--output <dir>`** changes the
+destination directory — files are written flat as `<dir>/<name>.<format>` (so you can export
+straight into the `import/` tree for a round-trip). `-f`/`--format` stays the format
+(`csv`/`tsv`/`jsonl`, default `csv`). If export entries are configured in design.yaml, only
+those tables are exported. `--scope`/`--deps` further restrict the export to the scope's working set.
 
 ---
 
