@@ -251,7 +251,31 @@ those tables are exported. `--scope`/`--deps` further restrict the export to the
 
 ## `dbd init`
 
-Scaffold a new dbd project.
+Scaffold a new dbd project, then evolve it: edit DDL, apply, and snapshot each change.
+
+<svg viewBox="0 0 600 116" role="img" aria-label="dbd init lifecycle: dbd init scaffolds the project; you edit the ddl/ folder; dbd apply pushes it to the database; dbd snapshot versions a change; then you loop back to edit for the next change." xmlns="http://www.w3.org/2000/svg" style="max-width:600px;width:100%;height:auto;color:currentColor">
+  <defs><marker id="ar-init" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+  <style>
+    .fb{fill:none;stroke:currentColor;stroke-width:1.5}
+    .fba{fill:currentColor;fill-opacity:.07;stroke:currentColor;stroke-width:1.5}
+    .ft{font-size:12px;fill:currentColor;text-anchor:middle;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    .fe{fill:none;stroke:currentColor;stroke-width:1.5}
+    .fl{font-size:10px;fill:currentColor;fill-opacity:.75;text-anchor:middle;font-family:system-ui,sans-serif}
+  </style>
+  <rect class="fba" x="6"   y="20" width="118" height="44" rx="9"/><text class="ft" x="65"  y="46">dbd init</text>
+  <rect class="fb"  x="166" y="20" width="118" height="44" rx="9"/><text class="ft" x="225" y="46">edit ddl/</text>
+  <rect class="fba" x="326" y="20" width="110" height="44" rx="9"/><text class="ft" x="381" y="46">dbd apply</text>
+  <rect class="fb"  x="478" y="20" width="116" height="44" rx="9"/><text class="ft" x="536" y="46">dbd snapshot</text>
+  <path class="fe" d="M124,42 H162" marker-end="url(#ar-init)"/>
+  <path class="fe" d="M284,42 H322" marker-end="url(#ar-init)"/>
+  <path class="fe" d="M436,42 H474" marker-end="url(#ar-init)"/>
+  <path class="fe" d="M536,64 V94 H225 V68" marker-end="url(#ar-init)"/>
+  <text class="fl" x="380" y="90">next change</text>
+</svg>
+
+(With `--from-db`/`--from-dbml`, dbd **skips the scaffold + hand-editing** — it reverse-engineers
+the DDL and writes the baseline snapshot for you, so you go straight to `dbd apply`. See
+[Reverse-engineering & workflows](06-reverse-engineering.md).)
 
 ```sh
 dbd init                                # Postgres target, name from directory
@@ -369,6 +393,28 @@ normalize the output to your project's conventions.
 Sync a database into the **current** project — reverse-engineer, then reconcile against the
 files already on disk. Same introspection and emitter as `init --from-db`, but it never
 creates or edits `design.yaml`.
+
+<svg viewBox="0 0 540 104" role="img" aria-label="dbd merge flow: dbd merge re-introspects the database, overwrites the DDL and auto-creates a snapshot of the diff, then dbd apply brings the database forward. merge refuses if the database version is behind the project version." xmlns="http://www.w3.org/2000/svg" style="max-width:540px;width:100%;height:auto;color:currentColor">
+  <defs><marker id="ar-merge" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+  <style>
+    .mb{fill:none;stroke:currentColor;stroke-width:1.5}
+    .mba{fill:currentColor;fill-opacity:.07;stroke:currentColor;stroke-width:1.5}
+    .mt{font-size:12px;fill:currentColor;text-anchor:middle;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    .me{fill:none;stroke:currentColor;stroke-width:1.5}
+    .ml{font-size:10px;fill:currentColor;fill-opacity:.75;text-anchor:middle;font-family:system-ui,sans-serif}
+  </style>
+  <rect class="mba" x="6"   y="18" width="130" height="44" rx="9"/><text class="mt" x="71"  y="44">dbd merge</text>
+  <rect class="mb"  x="196" y="18" width="150" height="44" rx="9"/><text class="mt" x="271" y="44">+ snapshot</text>
+  <rect class="mba" x="406" y="18" width="120" height="44" rx="9"/><text class="mt" x="466" y="44">dbd apply</text>
+  <path class="me" d="M136,40 H192" marker-end="url(#ar-merge)"/>
+  <path class="me" d="M346,40 H402" marker-end="url(#ar-merge)"/>
+  <text class="ml" x="160" y="82">refuses if the DB is behind the project version</text>
+</svg>
+
+`merge` overwrites the on-disk DDL from the database and **auto-snapshots the diff** as a new
+version; you then `dbd apply` to bring the database forward. It **refuses** when the database is
+behind the project version (a stale DB can't clobber newer work) — see
+[version safety](06-reverse-engineering.md).
 
 ```sh
 dbd merge postgres://user:pass@host/db   # sync into the current project
