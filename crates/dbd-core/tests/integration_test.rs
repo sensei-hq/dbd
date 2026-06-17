@@ -527,7 +527,7 @@ fn snapshot_listing_on_empty_project() {
 async fn reset_blocked_in_prod() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("prod", 0);
-    let result = d.reset(&mock, "postgres", false, None).await;
+    let result = d.reset(&mock, "postgres", false, false, false, None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("prod"));
 }
@@ -536,7 +536,7 @@ async fn reset_blocked_in_prod() {
 async fn reset_blocked_after_v1_in_dev() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 1);
-    let result = d.reset(&mock, "postgres", false, None).await;
+    let result = d.reset(&mock, "postgres", false, false, false, None).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("migrations"));
 }
@@ -545,7 +545,7 @@ async fn reset_blocked_after_v1_in_dev() {
 async fn reset_allowed_dev_pre_v1() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 0);
-    let result = d.reset(&mock, "postgres", false, None).await;
+    let result = d.reset(&mock, "postgres", false, false, false, None).await;
     assert!(result.is_ok());
 }
 
@@ -553,7 +553,7 @@ async fn reset_allowed_dev_pre_v1() {
 async fn reset_force_overrides_guard() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("prod", 5);
-    let result = d.reset(&mock, "postgres", true, None).await;
+    let result = d.reset(&mock, "postgres", true, false, false, None).await;
     assert!(result.is_ok());
 }
 

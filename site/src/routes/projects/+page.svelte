@@ -46,10 +46,18 @@
   ];
 </script>
 
-<svelte:head><title>Your designs — dbd</title></svelte:head>
+<svelte:head>
+  <title>Your designs — dbd</title>
+  <meta
+    name="description"
+    content="Your saved dbd schema diagrams — open, search, and manage them locally in your browser."
+  />
+  <!-- Personal workspace (localStorage) — also Disallow:ed in robots.txt. -->
+  <meta name="robots" content="noindex" />
+</svelte:head>
 
 <div class="dbd-app flex min-h-screen flex-col">
-  <Header data={headerData} {theme} brandHref="/projects" showUser={false} onToggleTheme={toggleTheme} />
+  <Header data={headerData} {theme} brandHref="/" showUser={false} onToggleTheme={toggleTheme} />
 
   <main class="mx-auto w-full max-w-5xl flex-1 px-5 py-8 lg:py-10">
     <div class="flex flex-wrap items-end gap-4">

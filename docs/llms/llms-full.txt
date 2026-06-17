@@ -248,8 +248,9 @@ documentation/read/destructive commands (`dbml`, `combine`, `graph`, `export`,
 `reset`) filter to the scope's working set without gating — `inspect --scope` is
 where gaps surface. `dbml`/`combine` emit external stub tables for out-of-scope FK
 targets (and `combine` keeps roles + the scope's allowed extensions); `reset` is
-schema-granular (`DROP SCHEMA … CASCADE`, restricted to the schemas the scope
-occupies, roles dropped only on a full reset). The shared primitive is
+entity-level (drops the scope's own objects individually; `--schemas` additionally
+restricts the dropped schemas to those the scope occupies, roles dropped only on a
+full reset). The shared primitive is
 `Design::scoped_entities(&ResolvedScope) -> Vec<Entity>` (closure under `include`,
 plain set under `report`, everything for the all-scope).
 
@@ -576,16 +577,30 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ### dbd reset
 
-Guarded by `_dbd_meta` environment check. Schema-granular (`DROP SCHEMA … CASCADE`).
+Guarded by `_dbd_meta` environment check. **Entity-level by default**: drops the
+project's own objects individually — functions/procedures (every overload via a
+`DROP ROUTINE` DO-block), views, tables, sequences, enums — in reverse dependency
+order. Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
+and extensions (e.g. pgvector) survive and never abort on `public`; the next `apply`
+repopulates the schemas.
 
 ```sh
 dbd reset                    # Blocked if prod or version >= 1
 dbd reset --force            # Override guard
 dbd reset --dry-run
-dbd reset --scope hub --dry-run   # only the schemas the 'hub' scope occupies
+dbd reset --schemas          # also DROP SCHEMA for managed schemas
+dbd reset --extensions       # also DROP EXTENSION for configured extensions
+dbd reset --clean            # = --schemas --extensions
+dbd reset --scope hub --dry-run   # only the objects the 'hub' scope occupies
 ```
 
-`--scope` restricts the dropped schemas to those the scope's working set occupies; roles are dropped only on a full reset (no `--scope`).
+`--schemas` additionally `DROP SCHEMA … CASCADE`s the managed schemas, always skipping
+`pg_catalog`/`information_schema`/`pg_toast`; on a `supabase` target also skipping the
+Supabase set (`auth`, `storage`, …, `public`), while on `postgres` `public` is dropped.
+`--extensions` `DROP EXTENSION … CASCADE`s each extension in the target's `extensions:`
+config. `--clean` = both. `--scope` restricts the reset to the objects (and, with
+`--schemas`, the schemas) the scope's working set occupies; roles are dropped only on a
+full reset (no `--scope`).
 
 ### dbd doctor
 
