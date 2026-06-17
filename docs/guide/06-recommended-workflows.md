@@ -1,4 +1,4 @@
-# Reverse-engineering & workflows
+# Recommended workflows
 
 dbd supports two ways of starting a schema. **Greenfield** — author the DDL from scratch.
 **Brownfield** — generate a project from an existing database or a DBML diagram. Either way you
