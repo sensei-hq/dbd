@@ -262,14 +262,24 @@ PK/FK/unique/check constraints, indexes, comments — and views), reconstructs c
 `CREATE …` DDL, and writes the usual `design.yaml` + `ddl/<kind>/<schema>/<name>.ddl` tree.
 
 ```sh
-dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
+dbd init --from-db postgres://user:pass@host/db   # new project from a live Postgres DB
+dbd init --from-db sqlite://./app.db              # …or a SQLite database (file:/sqlite:: also work)
 dbd init --from-db                                # connection from $DATABASE_URL (or -d)
 dbd init --from-db $DATABASE_URL --version 3      # base project.version (default 1)
-dbd init --from-db ... --schema config --schema staging   # only these schemas
+dbd init --from-db ... --schema config --schema staging   # only these schemas (Postgres)
 dbd init --from-db ... --exclude-schema audit             # drop a schema
 dbd init --from-db ... --all-schemas              # include Supabase platform schemas
 dbd init --from-db ... --dry-run                  # print the plan, write nothing
 ```
+
+The **dialect is taken from the connection URL scheme** (`postgres://` → a `postgres`
+target, `sqlite://`/`file:` → a `sqlite` target). **SQLite** is captured verbatim from
+`sqlite_master`: tables (with their CHECK constraints, type affinity, `AUTOINCREMENT`,
+`WITHOUT ROWID`), user indexes, and views — losslessly. SQLite has no schemas/enums/
+functions/sequences/roles, so those don't apply, and **triggers are skipped** (no `CREATE
+TRIGGER` support yet). Files land flat (`ddl/table/<name>.ddl`) and `design.yaml` has an
+empty `schemas:` list. (`dbd inspect` on a SQLite project may emit benign
+schema-qualification warnings for cross-object references; the DDL is valid and applies.)
 
 | Flag | Description |
 |------|-------------|

@@ -6,7 +6,7 @@ existing database or a DBML diagram, then evolve it the same way. Both paths con
 same `design.yaml` + `ddl/` tree, snapshots, and `dbd apply`, so nothing about the day-to-day
 workflow depends on where the project came from.
 
-<svg viewBox="0 0 820 470" role="img" aria-label="dbd greenfield and brownfield workflows. Greenfield: dbd init scaffolds a sample, you edit the ddl folder, then dbd apply, iterating with dbd snapshot and dbd apply. Brownfield: an existing Postgres database or a DBML file is reverse-engineered with dbd init --from-db or dbd init --from-dbml into a generated project with a baseline snapshot, which you review and format before dbd apply; ongoing database drift is synced back with dbd merge, which is guarded and refuses if the database is behind the project version." xmlns="http://www.w3.org/2000/svg" style="max-width:820px;width:100%;height:auto;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:currentColor">
+<svg viewBox="0 0 820 470" role="img" aria-label="dbd greenfield and brownfield workflows. Greenfield: dbd init scaffolds a sample, you edit the ddl folder, then dbd apply, iterating with dbd snapshot and dbd apply. Brownfield: an existing Postgres or SQLite database, or a DBML file, is reverse-engineered with dbd init --from-db or dbd init --from-dbml into a generated project with a baseline snapshot, which you review and format before dbd apply; ongoing database drift is synced back with dbd merge, which is guarded and refuses if the database is behind the project version." xmlns="http://www.w3.org/2000/svg" style="max-width:820px;width:100%;height:auto;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:currentColor">
   <title>dbd workflows: greenfield (author from scratch) and brownfield (reverse-engineer)</title>
   <defs>
     <marker id="dbd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -59,7 +59,8 @@ workflow depends on where the project came from.
 
   <!-- sources -->
   <rect class="box-accent" x="28" y="276" width="160" height="50" rx="10" />
-  <text class="box-text" x="108" y="305" text-anchor="middle">existing Postgres DB</text>
+  <text class="box-text" x="108" y="299" text-anchor="middle">existing database</text>
+  <text class="box-text" x="108" y="315" text-anchor="middle" font-size="11">Postgres · SQLite</text>
 
   <rect class="box-accent" x="28" y="356" width="160" height="50" rx="10" />
   <text class="box-text" x="108" y="385" text-anchor="middle">DBML file</text>
@@ -140,6 +141,16 @@ DBML can only express a subset of a real schema, so a DBML source produces **sch
 tables + foreign keys only**. Functions, procedures, views, standalone sequences, roles, and
 check constraints are not in DBML and therefore aren't generated. `serial`/identity columns do
 survive, because dbd's own DBML carries `bigserial`/`[increment]` on the column.
+
+## Brownfield — from SQLite
+
+`dbd init --from-db sqlite://app.db` (also `file:` / `sqlite::memory:`) reverse-engineers a
+SQLite database — the dialect is taken from the URL scheme, so the generated `design.yaml`
+gets a `sqlite` target. SQLite objects are captured **verbatim** from `sqlite_master`, so
+tables (including their CHECK constraints, type affinity, `AUTOINCREMENT`, and `WITHOUT
+ROWID`), user indexes, and views all survive losslessly. SQLite has no schemas, enums,
+functions, sequences, or roles, so those don't apply; **triggers are skipped** for now. Files
+are written flat (`ddl/table/<name>.ddl`) and `design.yaml` carries an empty `schemas:` list.
 
 ## Version safety
 
