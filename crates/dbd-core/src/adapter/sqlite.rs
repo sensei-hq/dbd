@@ -269,6 +269,90 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("name")).collect())
     }
 
+    /// Reverse-engineer the database into entities. SQLite has no schemas/enums/
+    /// functions/sequences/roles, and `sqlite_master.sql` holds the exact `CREATE`
+    /// text — so we capture tables (+ their user indexes) and views verbatim via
+    /// `raw_ddl` (lossless: CHECK constraints, type affinity, AUTOINCREMENT,
+    /// WITHOUT ROWID all survive). Triggers, auto-indexes (PK/UNIQUE-backed,
+    /// `sql IS NULL`), and `sqlite_*`/`_dbd_*` internals are skipped.
+    async fn introspect(&self) -> Result<Vec<Entity>> {
+        let mut entities = Vec::new();
+
+        let table_rows = sqlx::query(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+               AND name NOT IN ('_dbd_migrations', '_dbd_meta') \
+             ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect tables failed: {e}")))?;
+
+        for row in &table_rows {
+            let name: String = row.get("name");
+            let Some(table_sql): Option<String> = row.get("sql") else { continue };
+
+            // Only user-created indexes carry a `sql`; auto PK/UNIQUE indexes are
+            // NULL and ride inside the table definition.
+            let idx_rows = sqlx::query(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
+                 ORDER BY name",
+            )
+            .bind(&name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect indexes for {name} failed: {e}")))?;
+
+            let mut parts: Vec<String> = vec![table_sql.trim().to_string()];
+            for ir in &idx_rows {
+                let isql: String = ir.get("sql");
+                parts.push(isql.trim().to_string());
+            }
+            let mut e = Entity::new(EntityType::Table, &name);
+            e.schema = None; // SQLite is schema-less
+            e.raw_ddl = Some(parts.join(";\n\n"));
+            entities.push(e);
+        }
+
+        let view_rows =
+            sqlx::query("SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("introspect views failed: {e}")))?;
+
+        for row in &view_rows {
+            let name: String = row.get("name");
+            let Some(sql): Option<String> = row.get("sql") else { continue };
+            let mut e = Entity::new(EntityType::View, &name);
+            e.schema = None;
+            e.raw_ddl = Some(sql.trim().to_string());
+            entities.push(e);
+        }
+
+        Ok(entities)
+    }
+
+    /// For reverse-engineering safety: `Some(version)` if this DB is dbd-managed
+    /// (a `_dbd_meta` table exists), `None` if foreign. Version is 0 if the table
+    /// exists but has no row for this project.
+    async fn reverse_managed_version(&self) -> Result<Option<u32>> {
+        let exists =
+            sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_dbd_meta'")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reverse_managed_version detect failed: {e}")))?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT version FROM _dbd_meta WHERE project = ?1")
+            .bind(&self.project)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reverse_managed_version read failed: {e}")))?;
+        Ok(Some(row.map(|r| r.get::<i64, _>("version") as u32).unwrap_or(0)))
+    }
+
     async fn ensure_migrations_table(&self) -> Result<()> {
         self.execute_script(
             "CREATE TABLE IF NOT EXISTS _dbd_migrations ( \
@@ -929,5 +1013,56 @@ mod tests {
             adapter.classify_reference("my_helper", &[]),
             ReferenceClass::UserDefined
         ));
+    }
+
+    #[tokio::test]
+    async fn introspect_captures_tables_views_indexes_verbatim() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE author (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);\n\
+             CREATE TABLE book (\
+                id INTEGER PRIMARY KEY,\
+                author_id INTEGER NOT NULL REFERENCES author(id) ON DELETE CASCADE,\
+                status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published')),\
+                isbn TEXT UNIQUE\
+             ) WITHOUT ROWID;\n\
+             CREATE INDEX book_author_idx ON book(author_id);\n\
+             CREATE VIEW published AS SELECT id FROM book WHERE status='published';\n\
+             CREATE TRIGGER trg AFTER INSERT ON book BEGIN UPDATE author SET name=name; END;",
+        )
+        .await
+        .unwrap();
+
+        let ents = a.introspect().await.unwrap();
+        let by = |n: &str| ents.iter().find(|e| e.name == n);
+
+        // Table captured verbatim + schema-less; CHECK/WITHOUT ROWID preserved.
+        let book = by("book").expect("book table captured");
+        assert_eq!(book.entity_type, EntityType::Table);
+        assert!(book.schema.is_none());
+        let raw = book.raw_ddl.as_deref().unwrap();
+        assert!(raw.contains("WITHOUT ROWID"), "verbatim preserved: {raw}");
+        assert!(raw.contains("CHECK"));
+        // The explicit index rides with the table; the auto UNIQUE index does not.
+        assert!(raw.contains("book_author_idx"), "user index appended: {raw}");
+        assert!(!raw.to_lowercase().contains("autoindex"));
+
+        // View captured; trigger NOT captured; internals excluded.
+        let v = by("published").expect("view captured");
+        assert_eq!(v.entity_type, EntityType::View);
+        assert!(v.raw_ddl.as_deref().unwrap().to_uppercase().contains("CREATE VIEW"));
+        assert!(by("trg").is_none(), "triggers are not captured in v1");
+        assert!(ents.iter().all(|e| e.name != "_dbd_meta" && !e.name.starts_with("sqlite_")));
+    }
+
+    #[tokio::test]
+    async fn reverse_managed_version_detects_meta() {
+        let a = mem().await;
+        // Fresh DB with no _dbd_meta → foreign.
+        assert_eq!(a.reverse_managed_version().await.unwrap(), None);
+        // After dbd's meta table + a row for this project → managed at that version.
+        a.ensure_meta_table().await.unwrap();
+        a.set_project_meta("prod", 3).await.unwrap();
+        assert_eq!(a.reverse_managed_version().await.unwrap(), Some(3));
     }
 }
