@@ -275,7 +275,7 @@ Scaffold a new dbd project, then evolve it: edit DDL, apply, and snapshot each c
 
 (With `--from-db`/`--from-dbml`, dbd **skips the scaffold + hand-editing** — it reverse-engineers
 the DDL and writes the baseline snapshot for you, so you go straight to `dbd apply`. See
-[Reverse-engineering & workflows](06-reverse-engineering.md).)
+[recommended workflows](06-recommended-workflows.md).)
 
 ```sh
 dbd init                                # Postgres target, name from directory
@@ -414,7 +414,7 @@ creates or edits `design.yaml`.
 `merge` overwrites the on-disk DDL from the database and **auto-snapshots the diff** as a new
 version; you then `dbd apply` to bring the database forward. It **refuses** when the database is
 behind the project version (a stale DB can't clobber newer work) — see
-[version safety](06-reverse-engineering.md).
+[version safety](06-recommended-workflows.md#version-safety).
 
 ```sh
 dbd merge postgres://user:pass@host/db   # sync into the current project
