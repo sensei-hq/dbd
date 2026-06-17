@@ -1,23 +1,60 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use dbd_core::design::ImportComplete;
-use dbd_core::Design;
+use dbd_core::{Design, Entity, EntityType};
 
 use super::{format_import_summary, get_adapter};
 use crate::output::{self, Verbosity};
 
+/// Infer the import/export data format from a file extension.
+/// `.jsonl` → "jsonl", `.tsv` → "tsv", everything else → "csv".
+fn format_from_ext(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("jsonl") => "jsonl",
+        Some(ext) if ext.eq_ignore_ascii_case("tsv") => "tsv",
+        _ => "csv",
+    }
+}
+
+/// Resolve the schema-qualified name of a `Table` entity matching `name`.
+/// Falls back to `name` verbatim when no matching table is found (so an
+/// ad-hoc COPY target can still be addressed by its bare name).
+fn resolve_table_name(design: &Design, name: &str) -> String {
+    design
+        .entities()
+        .iter()
+        .find(|e| e.entity_type == EntityType::Table && (e.name == name || e.name.ends_with(&format!(".{name}"))))
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_import_dry_run(
     config: &Path,
     env: &str,
     project_dir: &Path,
     name: Option<&str>,
+    file: Option<&Path>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
+
+    // Ad-hoc single-file import plan: print the one line and write nothing.
+    if let Some(path) = file {
+        let name = match name {
+            Some(n) => n,
+            None => bail!("--file requires --name <entity>"),
+        };
+        let qualified = resolve_table_name(&design, name);
+        output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
+        output::summary(0, 0, 1);
+        return Ok(());
+    }
+
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     // Surface the same gap/closure errors a real import would (dry-run must
@@ -67,12 +104,36 @@ pub async fn cmd_import(
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
+    file: Option<&Path>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
+
+    // Ad-hoc single-file import: `dbd import -n <entity> -f <path>`.
+    if let Some(path) = file {
+        let name = match name {
+            Some(n) => n,
+            None => bail!("--file requires --name <entity>"),
+        };
+        let qualified = resolve_table_name(&design, name);
+        let format = format_from_ext(path);
+
+        let adapter = get_adapter(config, database_url).await?;
+        let mut entity = Entity::new(EntityType::Table, &qualified);
+        entity.file = Some(path.to_path_buf());
+        entity.format = Some(format.to_string());
+        adapter
+            .import_data(&entity, false)
+            .await
+            .context(format!("Failed to import {qualified} ← {}", path.display()))?;
+
+        output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
+        return Ok(());
+    }
+
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     let adapter = get_adapter(config, database_url).await?;
@@ -107,6 +168,7 @@ pub async fn cmd_export(
     database_url: Option<&str>,
     name: Option<&str>,
     format: &str,
+    output: Option<&Path>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -166,11 +228,39 @@ pub async fn cmd_export(
 
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
-        adapter.export_data(&export_entity).await
+        adapter.export_data(&export_entity, output).await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
     }
 
-    output::info(verbosity, "Export complete. Files written to export/");
+    let dest = output.map(|p| p.display().to_string()).unwrap_or_else(|| "export/".to_string());
+    output::info(verbosity, &format!("Export complete. Files written to {dest}"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn format_from_ext_maps_known_extensions() {
+        assert_eq!(format_from_ext(&PathBuf::from("data/users.jsonl")), "jsonl");
+        assert_eq!(format_from_ext(&PathBuf::from("data/users.tsv")), "tsv");
+        assert_eq!(format_from_ext(&PathBuf::from("data/users.csv")), "csv");
+    }
+
+    #[test]
+    fn format_from_ext_unknown_and_missing_default_to_csv() {
+        // Unknown extension → csv.
+        assert_eq!(format_from_ext(&PathBuf::from("dump.txt")), "csv");
+        // No extension → csv.
+        assert_eq!(format_from_ext(&PathBuf::from("dump")), "csv");
+    }
+
+    #[test]
+    fn format_from_ext_is_case_insensitive() {
+        assert_eq!(format_from_ext(&PathBuf::from("USERS.JSONL")), "jsonl");
+        assert_eq!(format_from_ext(&PathBuf::from("Users.Tsv")), "tsv");
+    }
 }

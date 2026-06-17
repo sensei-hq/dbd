@@ -42,11 +42,11 @@ pub async fn run(
             schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, scope, deps, verbosity).await
         }
 
-        Commands::Import { name, dry_run } => {
+        Commands::Import { name, file, dry_run } => {
             if *dry_run {
-                data::cmd_import_dry_run(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
+                data::cmd_import_dry_run(config, env, project_dir, name.as_deref(), file.as_deref(), scope, deps, verbosity)
             } else {
-                data::cmd_import(config, env, project_dir, database_url, name.as_deref(), scope, deps, verbosity).await
+                data::cmd_import(config, env, project_dir, database_url, name.as_deref(), file.as_deref(), scope, deps, verbosity).await
             }
         }
 
@@ -75,8 +75,8 @@ pub async fn run(
             project::cmd_deploy(source, config, env, database_url, *dry_run, scope, deps, verbosity).await
         }
 
-        Commands::Export { name, format } => {
-            data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, scope, deps, verbosity).await
+        Commands::Export { name, format, output } => {
+            data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, output.as_deref(), scope, deps, verbosity).await
         }
 
         Commands::Dbml { file } => {

@@ -173,7 +173,7 @@ impl DatabaseAdapter for SqliteAdapter {
         }
     }
 
-    async fn export_data(&self, entity: &Entity) -> Result<()> {
+    async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let table = Self::bare_name(&entity.name);
         let format = entity.format.as_deref().unwrap_or("csv");
 
@@ -218,7 +218,11 @@ impl DatabaseAdapter for SqliteAdapter {
             }
         }
 
-        let export_dir = Path::new("export");
+        // `Some(dir)` → write `dir/<table>.<format>`; `None` → today's `export/`.
+        let export_dir = match out_dir {
+            Some(dir) => dir,
+            None => Path::new("export"),
+        };
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         std::fs::create_dir_all(export_dir)?;
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
@@ -853,6 +857,37 @@ mod tests {
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
         assert_eq!(SqliteAdapter::bare_name("plain"), "plain");
+    }
+
+    /// `export_data(.., Some(dir))` writes `dir/<bare-name>.<fmt>` (flat, no
+    /// schema subdir) with the expected content. `None` falls back to the
+    /// cwd-relative `export/<bare-name>.<fmt>` convention. Both paths are
+    /// exercised here under a single cwd guard to avoid racing on the
+    /// process-global current directory.
+    #[tokio::test]
+    async fn s12_export_data_honors_out_dir() {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE people (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        a.execute_script("INSERT INTO people VALUES (1, 'alice')")
+            .await
+            .unwrap();
+
+        let mut entity = Entity::new(EntityType::Table, "default.people");
+        entity.format = Some("csv".to_string());
+
+        // Some(dir) → flat `dir/people.csv` (the new behavior; cwd-independent).
+        // The None path (cwd-relative `export/<schema>/...`) is unchanged
+        // pre-existing behavior and is deliberately NOT exercised here, to avoid
+        // mutating the process-global cwd (which would race other parallel tests).
+        let out = tempfile::tempdir().unwrap();
+        a.export_data(&entity, Some(out.path())).await.unwrap();
+        let written = out.path().join("people.csv");
+        assert!(written.exists(), "expected {} to exist", written.display());
+        let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("id,name"), "header missing: {body}");
+        assert!(body.contains("1,alice"), "row missing: {body}");
     }
 
     #[test]
