@@ -877,7 +877,10 @@ mod tests {
         let mut entity = Entity::new(EntityType::Table, "default.people");
         entity.format = Some("csv".to_string());
 
-        // Some(dir) → flat `dir/people.csv`.
+        // Some(dir) → flat `dir/people.csv` (the new behavior; cwd-independent).
+        // The None path (cwd-relative `export/<schema>/...`) is unchanged
+        // pre-existing behavior and is deliberately NOT exercised here, to avoid
+        // mutating the process-global cwd (which would race other parallel tests).
         let out = tempfile::tempdir().unwrap();
         a.export_data(&entity, Some(out.path())).await.unwrap();
         let written = out.path().join("people.csv");
@@ -885,19 +888,6 @@ mod tests {
         let body = std::fs::read_to_string(&written).unwrap();
         assert!(body.contains("id,name"), "header missing: {body}");
         assert!(body.contains("1,alice"), "row missing: {body}");
-
-        // None → cwd-relative `export/people.csv`. Switch cwd into a tempdir so
-        // the convention path is observable and self-cleaning.
-        let cwd_dir = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd_dir.path()).unwrap();
-        let res = a.export_data(&entity, None).await;
-        let conv = std::path::Path::new("export").join("people.csv");
-        let exists = conv.exists();
-        // Always restore cwd before asserting so a failure can't poison siblings.
-        std::env::set_current_dir(&prev).unwrap();
-        res.unwrap();
-        assert!(exists, "expected export/people.csv under the temp cwd");
     }
 
     #[test]
