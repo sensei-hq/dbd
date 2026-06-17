@@ -127,6 +127,7 @@ pub async fn cmd_init_from_db(
         version,
         sel,
         dry_run,
+        dialect_for_conn(&conn),
         "init from database",
     )
 }
@@ -172,6 +173,7 @@ pub fn cmd_init_from_dbml(
         version,
         sel,
         dry_run,
+        "postgres", // DBML emits generic Postgres-style DDL
         "init from dbml",
     )
 }
@@ -190,6 +192,17 @@ fn parse_dbml_file(dbml_path: &Path) -> Result<Vec<dbd_core::Entity>> {
         .with_context(|| format!("failed to parse DBML file {}", dbml_path.display()))
 }
 
+/// Pick the `design.yaml` target dialect from the connection URL scheme:
+/// `sqlite:`/`file:` → `"sqlite"`, everything else → `"postgres"`. (The reverse
+/// source's dialect comes from the connection, not the `--target` flag.)
+fn dialect_for_conn(conn: &str) -> &'static str {
+    if conn.starts_with("sqlite:") || conn.starts_with("file:") {
+        "sqlite"
+    } else {
+        "postgres"
+    }
+}
+
 /// Shared `init` tail for both the DB and DBML sources: build the write-plan,
 /// write `design.yaml`, apply by overwriting, then emit a baseline snapshot at
 /// `version`. The caller owns acquiring `entities` (introspection or DBML parse)
@@ -204,6 +217,7 @@ fn init_with_entities(
     version: u32,
     sel: SchemaSelect,
     dry_run: bool,
+    dialect: &str,
     snapshot_label: &str,
 ) -> Result<()> {
     run_plan(
@@ -215,6 +229,7 @@ fn init_with_entities(
         sel,
         dry_run,
         true,
+        dialect,
         &FormatConfig::default(),
     )?;
 
@@ -357,8 +372,10 @@ fn merge_snapshot(
     // Select schemas + keep only entities under a selected schema (same logic as
     // the normal path).
     let (selected, kept) = select_and_keep(entities, &sel);
-    if selected.is_empty() {
-        println!("No user schemas to reverse-engineer (after filtering). Nothing to do.");
+    // Gate on entities, not schemas: a schema-less source (SQLite) has an empty
+    // `selected` but non-empty `kept`.
+    if kept.is_empty() {
+        println!("Nothing to reverse-engineer (no entities after filtering).");
         return Ok(());
     }
 
@@ -506,12 +523,16 @@ fn run_plan(
     sel: SchemaSelect,
     dry_run: bool,
     write_config: bool,
+    dialect: &str,
     format: &FormatConfig,
 ) -> Result<Vec<String>> {
     // 1. select schemas + keep only entities under a selected schema
     let (selected, kept) = select_and_keep(&entities, &sel);
-    if selected.is_empty() {
-        println!("No user schemas to reverse-engineer (after filtering). Nothing to do.");
+    // Bail only when there's genuinely nothing to write. A schema-less source
+    // (SQLite) yields entities with no schema → `selected` is empty but `kept`
+    // is not, so gate on `kept`, not `selected`.
+    if kept.is_empty() {
+        println!("Nothing to reverse-engineer (no entities after filtering).");
         return Ok(vec![]);
     }
 
@@ -523,7 +544,7 @@ fn run_plan(
         let project = name
             .map(String::from)
             .unwrap_or_else(|| "project".into());
-        let yaml = reverse::design_yaml(&project, "postgres", &selected, version.unwrap_or(1));
+        let yaml = reverse::design_yaml(&project, dialect, &selected, version.unwrap_or(1));
         // Write to the resolved config path (project_dir/<--config>), matching what the
         // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
         // diverge under `--config custom.yaml`).
