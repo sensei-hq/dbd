@@ -185,7 +185,7 @@ Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.7.2
+  rev: v0.7.3
   hooks:
     - id: dbd-format
 ```
