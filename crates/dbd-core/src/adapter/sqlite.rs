@@ -1027,6 +1027,8 @@ mod tests {
                 isbn TEXT UNIQUE\
              ) WITHOUT ROWID;\n\
              CREATE INDEX book_author_idx ON book(author_id);\n\
+             CREATE INDEX book_status_idx ON book(status);\n\
+             CREATE INDEX author_name_idx ON author(name);\n\
              CREATE VIEW published AS SELECT id FROM book WHERE status='published';\n\
              CREATE TRIGGER trg AFTER INSERT ON book BEGIN UPDATE author SET name=name; END;",
         )
@@ -1043,9 +1045,17 @@ mod tests {
         let raw = book.raw_ddl.as_deref().unwrap();
         assert!(raw.contains("WITHOUT ROWID"), "verbatim preserved: {raw}");
         assert!(raw.contains("CHECK"));
-        // The explicit index rides with the table; the auto UNIQUE index does not.
-        assert!(raw.contains("book_author_idx"), "user index appended: {raw}");
+        // Both explicit indexes ride with the table, in name order; the auto
+        // UNIQUE index does not; and another table's index never leaks in.
+        let author_pos = raw.find("book_author_idx").expect("book_author_idx appended");
+        let status_pos = raw.find("book_status_idx").expect("book_status_idx appended");
+        assert!(author_pos < status_pos, "indexes ordered by name: {raw}");
         assert!(!raw.to_lowercase().contains("autoindex"));
+        assert!(!raw.contains("author_name_idx"), "another table's index must not leak: {raw}");
+        let author = by("author").expect("author table captured");
+        let araw = author.raw_ddl.as_deref().unwrap();
+        assert!(araw.contains("author_name_idx"), "author keeps its own index");
+        assert!(!araw.contains("book_"), "book indexes must not leak into author: {araw}");
 
         // View captured; trigger NOT captured; internals excluded.
         let v = by("published").expect("view captured");

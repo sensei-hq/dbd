@@ -114,14 +114,10 @@ pub async fn run(
                 );
             }
             if let Some(s) = from_db {
-                // Fix 2: --target must be postgres (or default) when --from-db is set.
-                // Reverse-engineering only supports Postgres/Supabase in this cut.
-                if target != "postgres" {
-                    anyhow::bail!(
-                        "--target {target} is not supported with --from-db; \
-                         reverse-engineering supports Postgres/Supabase only"
-                    );
-                }
+                // The reverse dialect is derived from the connection URL scheme
+                // (postgres:// → postgres, sqlite://`/`file: → sqlite), so the
+                // `--target` flag does not gate `--from-db`.
+                let _ = target;
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
