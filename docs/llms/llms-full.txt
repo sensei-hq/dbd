@@ -286,7 +286,8 @@ sample scaffold: introspect → reconstruct canonical DDL → write `design.yaml
 so the project lands version-tracked. `--from-db` and `--from-dbml` are mutually exclusive.
 
 ```sh
-dbd init --from-db postgres://user:pass@host/db   # new project from a live DB
+dbd init --from-db postgres://user:pass@host/db   # new project from a live Postgres DB
+dbd init --from-db sqlite://./app.db              # …or a SQLite database (file:/sqlite:: too)
 dbd init --from-db                                # connection from -d / $DATABASE_URL
 dbd init --from-dbml schema.dbml                  # from a DBML file (no connection)
 dbd init --from-db $DATABASE_URL --version 3      # base project.version + baseline snapshot version
@@ -305,11 +306,17 @@ roles — DBML has none, so a no-op there), `--dry-run`. Postgres internals (`pg
 (`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`, `supabase_*`,
 `cron`, `net`, …) are excluded unless `--all-schemas`.
 
-`init --from-db` **refuses** to run against a **dbd-managed** database (a `_dbd_meta` table in any
-schema → use `dbd merge`), and refuses in a directory that already has a `design.yaml` (use
-`merge`). `--target sqlite` with `--from-db` is rejected (Postgres/Supabase only). The generated
-`design.yaml` writes the connection as the literal `$DATABASE_URL` env reference — **secrets never
-land in the repo**.
+The target **dialect is taken from the connection URL scheme** (`postgres://` → `postgres`
+target; `sqlite://`/`file:`/`sqlite::memory:` → `sqlite` target). **SQLite** is captured verbatim
+from `sqlite_master` — tables (CHECK, type affinity, AUTOINCREMENT, WITHOUT ROWID), user indexes,
+and views, losslessly; no schemas/enums/functions/sequences/roles, **triggers skipped**; files are
+flat (`ddl/table/<name>.ddl`) and `design.yaml` carries `schemas: []`. (`dbd inspect` on a SQLite
+project may emit benign schema-qualification warnings; the DDL is valid and applies.)
+
+`init --from-db` **refuses** to run against a **dbd-managed** database (a `_dbd_meta` table → use
+`dbd merge`), and refuses in a directory that already has a `design.yaml` (use `merge`). The
+generated `design.yaml` writes the connection as the literal `$DATABASE_URL` env reference —
+**secrets never land in the repo**.
 
 ### dbd merge
 
