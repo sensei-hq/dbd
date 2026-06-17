@@ -941,7 +941,7 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
-    async fn export_data(&self, entity: &Entity) -> Result<()> {
+    async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let qualified = entity.name.replace('.', "\".\"");
         let format = entity.format.as_deref().unwrap_or("csv");
 
@@ -972,7 +972,7 @@ impl DatabaseAdapter for PostgresAdapter {
             data.extend_from_slice(&chunk);
         }
 
-        // Write to export/<schema>/<name>.<format>
+        // Resolve the bare table name (strip any `schema.` prefix).
         let parts: Vec<&str> = entity.name.split('.').collect();
         let (schema, name) = if parts.len() > 1 {
             (parts[0], parts[1])
@@ -980,7 +980,12 @@ impl DatabaseAdapter for PostgresAdapter {
             ("public", parts[0])
         };
 
-        let export_dir = Path::new("export").join(schema);
+        // `Some(dir)` → write `dir/<name>.<format>` (flat).
+        // `None`      → folder convention `export/<schema>/<name>.<format>`.
+        let export_dir = match out_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => Path::new("export").join(schema),
+        };
         std::fs::create_dir_all(&export_dir)?;
         std::fs::write(export_dir.join(format!("{name}.{format}")), &data)?;
 

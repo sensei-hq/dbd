@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use async_trait::async_trait;
 
@@ -75,11 +76,18 @@ pub trait DatabaseAdapter: Send + Sync {
     // ── Data operations ────────────────────────────────
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()>;
-    async fn export_data(&self, entity: &Entity) -> Result<()>;
+
+    /// Export a table's data to a file.
+    ///
+    /// `out_dir`:
+    /// - `Some(dir)` → write `dir/<name>.<format>` (the directory is created if
+    ///   needed); `<name>` is the bare table name (any `schema.` prefix stripped).
+    /// - `None` → the folder convention: `export/<schema>/<name>.<format>`.
+    async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()>;
 
     async fn batch_export(&self, entities: &[Entity]) -> Result<()> {
         for entity in entities {
-            self.export_data(entity).await?;
+            self.export_data(entity, None).await?;
         }
         Ok(())
     }
