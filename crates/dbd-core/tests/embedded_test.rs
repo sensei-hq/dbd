@@ -622,7 +622,9 @@ async fn emitted_index_ddl_applies_to_postgres() {
 
 /// Reverse-engineer functions and procedures via `pg_get_functiondef`. Creates a
 /// plain function, a procedure, an overloaded function (two signatures), and
-/// installs `uuid-ossp` whose functions are extension-owned and must be excluded.
+/// installs `tablefunc` whose functions are extension-owned and must be excluded.
+/// (`tablefunc` is a pure-SQL contrib extension with no external shared-library
+/// dependency, so the embedded server can load it on any runner.)
 #[tokio::test]
 async fn introspect_captures_functions_and_procedures() {
     let (_pg, url) = start_pg().await;
@@ -645,8 +647,8 @@ async fn introspect_captures_functions_and_procedures() {
         CREATE FUNCTION revfunc.greet(name text, loud boolean) RETURNS text
             LANGUAGE sql AS $$ SELECT 'HI ' || name $$;
 
-        -- extension whose functions (uuid_generate_v4, etc.) must be EXCLUDED
-        CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA revfunc;
+        -- extension whose functions (crosstab/connectby/normal_rand) must be EXCLUDED
+        CREATE EXTENSION IF NOT EXISTS tablefunc WITH SCHEMA revfunc;
     ";
     adapter.execute_script(fixture_sql).await.expect("fixture DDL failed");
 
@@ -714,14 +716,18 @@ async fn introspect_captures_functions_and_procedures() {
     assert!(joined.contains("loud boolean"), "second overload signature missing");
 
     // ── extension-provided functions must be EXCLUDED ────────────────────────
+    // `tablefunc` installs regular functions (crosstab/connectby/normal_rand)
+    // owned by the extension (pg_depend deptype 'e'); they must be filtered out.
     let has_ext_fn = entities.iter().any(|e| {
         (e.entity_type == dbd_core::EntityType::Function
             || e.entity_type == dbd_core::EntityType::Procedure)
-            && e.name.contains("uuid_generate")
+            && (e.name.contains("crosstab")
+                || e.name.contains("connectby")
+                || e.name.contains("normal_rand"))
     });
     assert!(
         !has_ext_fn,
-        "extension-owned functions (uuid_generate_*) must NOT appear in introspect output"
+        "extension-owned functions (crosstab/connectby/normal_rand) must NOT appear in introspect output"
     );
 }
 
