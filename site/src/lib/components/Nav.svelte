@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Button } from '@rokkit/ui';
-	import ThemeToggle from './ThemeToggle.svelte';
+	import { ThemeSwitcherToggle } from '@rokkit/app';
 	import BrandMark from './BrandMark.svelte';
 	import ArrowIcon from './ArrowIcon.svelte';
 	import { brand, nav } from '$lib/data';
@@ -22,7 +22,7 @@
 			{/each}
 		</nav>
 		<div class="flex items-center gap-3">
-			<ThemeToggle />
+			<ThemeSwitcherToggle variant="single" size="md" />
 			<div class="hidden sm:block">
 				<Button href={nav.cta.href} variant="primary">
 					{nav.cta.label}
