@@ -31,7 +31,9 @@
 		<div
 			class="mx-auto flex max-w-content flex-col gap-2 px-6 py-5 sm:flex-row sm:items-center sm:justify-between"
 		>
-			<span class="font-mono text-xs text-ink-soft">{brand.name} — {brand.full}</span>
+			<span class="font-mono text-xs text-ink-soft">
+				{brand.name} — {brand.full} · v{__APP_VERSION__}
+			</span>
 			<span class="text-xs text-ink-soft">{footer.legal}</span>
 		</div>
 	</div>
