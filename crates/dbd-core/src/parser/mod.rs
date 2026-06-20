@@ -174,7 +174,12 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
             entity.enum_values = extractors::extract_enum_values(&statements);
         }
         EntityType::Function | EntityType::Procedure => {
-            let (reads, writes) = extractors::extract_proc_reads_writes(sql);
+            let default_schema = entity
+                .search_paths
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("public");
+            let (reads, writes) = extractors::extract_proc_refs(&statements, sql, default_schema);
             entity.reads = reads;
             entity.writes = writes;
             // References from reads/writes
