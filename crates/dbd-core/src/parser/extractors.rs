@@ -68,28 +68,55 @@ fn extract_table_refs_from_query(
     default_schema: &str,
     refs: &mut Vec<Reference>,
 ) {
-    use sqlparser::ast::Visit;
+    for reference in collect_table_refs(query, default_schema) {
+        if !refs.iter().any(|r| r.name == reference.name) {
+            refs.push(reference);
+        }
+    }
+}
 
+/// Walk any AST node, collecting every table reference with query-local CTE
+/// references filtered out. Works on a `Query`, a `Statement`, or any other
+/// node that implements `Visit`.
+fn collect_table_refs<N: sqlparser::ast::Visit>(node: &N, default_schema: &str) -> Vec<Reference> {
     let mut visitor = TableRefVisitor {
         default_schema,
         cte_names: Vec::new(),
         refs: Vec::new(),
     };
-    let _ = query.visit(&mut visitor);
+    let _ = node.visit(&mut visitor);
 
-    for reference in visitor.refs {
-        // CTE references are unqualified, so they resolve to
-        // `{default_schema}.{name}`. Drop those — they're query-local.
-        let is_cte = visitor
-            .cte_names
-            .iter()
-            .any(|name| reference.name == format!("{default_schema}.{name}"));
-        if is_cte {
-            continue;
+    // CTE references are unqualified, so they resolve to `{default_schema}.{name}`.
+    // Drop those — they're query-local, not real tables.
+    visitor
+        .refs
+        .into_iter()
+        .filter(|r| {
+            !visitor
+                .cte_names
+                .iter()
+                .any(|name| r.name == format!("{default_schema}.{name}"))
+        })
+        .collect()
+}
+
+/// Qualify a relation `ObjectName` to `schema.table`: apply the default schema
+/// to unqualified names, and drop references into system schemas.
+fn qualify_relation(name: &sqlparser::ast::ObjectName, default_schema: &str) -> Option<String> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.as_str())
+        .collect();
+
+    if parts.len() >= 2 {
+        if SYSTEM_SCHEMAS.contains(&parts[0]) {
+            return None;
         }
-        if !refs.iter().any(|r| r.name == reference.name) {
-            refs.push(reference);
-        }
+        Some(format!("{}.{}", parts[0], parts[1]))
+    } else {
+        parts.first().map(|table| format!("{default_schema}.{table}"))
     }
 }
 
@@ -121,27 +148,9 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
         &mut self,
         name: &sqlparser::ast::ObjectName,
     ) -> core::ops::ControlFlow<Self::Break> {
-        let parts: Vec<&str> = name
-            .0
-            .iter()
-            .filter_map(|p| p.as_ident())
-            .map(|i| i.value.as_str())
-            .collect();
-
-        let qualified = if parts.len() >= 2 {
-            let schema = parts[0];
-            let table = parts[1];
-            if SYSTEM_SCHEMAS.contains(&schema) {
-                return core::ops::ControlFlow::Continue(());
-            }
-            format!("{schema}.{table}")
-        } else if let Some(table) = parts.first() {
-            format!("{}.{table}", self.default_schema)
-        } else {
-            return core::ops::ControlFlow::Continue(());
-        };
-
-        if !self.refs.iter().any(|r| r.name == qualified) {
+        if let Some(qualified) = qualify_relation(name, self.default_schema)
+            && !self.refs.iter().any(|r| r.name == qualified)
+        {
             self.refs.push(Reference {
                 name: qualified,
                 ref_type: Some("table".to_string()),
@@ -168,19 +177,176 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     Vec::new()
 }
 
-/// Extract reads and writes from a procedure/function body using pattern matching.
+/// Extract read/write table dependencies from a function/procedure.
+///
+/// When the body is statically-parseable SQL (a `LANGUAGE sql` function), the
+/// body is re-parsed and walked with the AST visitor — giving the same
+/// precision as view extraction (sub-selects, set operations, CTEs, correct
+/// read/write classification, and no false positives). Bodies sqlparser cannot
+/// parse (PL/pgSQL, `CREATE PROCEDURE`) fall back to the regex scanner.
+///
+/// Dynamic SQL (`EXECUTE 'text'`) is intentionally NOT tracked: it is a runtime
+/// dependency, not a compile-time one, so it never affects whether the object
+/// can be created. The AST path ignores it for free (it is a string literal);
+/// the regex fallback inherits the existing best-effort behavior.
+pub fn extract_proc_refs(
+    statements: &[Statement],
+    raw_sql: &str,
+    default_schema: &str,
+) -> (Vec<String>, Vec<String>) {
+    if let Some((reads, writes)) = extract_proc_refs_via_ast(statements, default_schema) {
+        return (reads, writes);
+    }
+    // PL/pgSQL and other bodies sqlparser can't statically parse.
+    extract_proc_reads_writes(raw_sql)
+}
+
+/// Try to extract reads/writes from a `LANGUAGE sql` function body via the AST.
+///
+/// Returns `Some` once at least one statically-parseable SQL body is found
+/// (even if it references no tables), so the caller knows the AST path applied
+/// and the regex fallback should be skipped. Returns `None` when no body could
+/// be parsed as SQL (e.g. PL/pgSQL), leaving the caller to fall back.
+fn extract_proc_refs_via_ast(
+    statements: &[Statement],
+    default_schema: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let mut reads: Vec<String> = Vec::new();
+    let mut writes: Vec<String> = Vec::new();
+    let mut parsed_any = false;
+
+    for stmt in statements {
+        let Statement::CreateFunction(cf) = stmt else {
+            continue;
+        };
+        // Only LANGUAGE sql bodies are statically-parseable SQL; PL/pgSQL is not.
+        let is_sql = cf
+            .language
+            .as_ref()
+            .is_some_and(|l| l.value.eq_ignore_ascii_case("sql"));
+        if !is_sql {
+            continue;
+        }
+        let Some(body_text) = function_body_text(cf) else {
+            continue;
+        };
+        let Ok(body_stmts) = sqlparser::parser::Parser::parse_sql(&dialect, body_text) else {
+            continue;
+        };
+
+        parsed_any = true;
+        for body_stmt in &body_stmts {
+            let targets = proc_write_targets(body_stmt, default_schema);
+            for reference in collect_table_refs(body_stmt, default_schema) {
+                if targets.contains(&reference.name) {
+                    push_unique(&mut writes, reference.name);
+                } else {
+                    push_unique(&mut reads, reference.name);
+                }
+            }
+            // A write target may not surface as a visited relation (e.g. an
+            // INSERT target); make sure it's recorded.
+            for target in targets {
+                push_unique(&mut writes, target);
+            }
+        }
+    }
+
+    parsed_any.then_some((reads, writes))
+}
+
+/// Extract the raw SQL text of a function body (dollar-quoted or string literal).
+fn function_body_text(cf: &sqlparser::ast::CreateFunction) -> Option<&str> {
+    use sqlparser::ast::{CreateFunctionBody, Expr, Value};
+
+    let body_expr = match cf.function_body.as_ref()? {
+        CreateFunctionBody::AsBeforeOptions { body, .. } => body,
+        CreateFunctionBody::AsAfterOptions(body) => body,
+        _ => return None,
+    };
+    if let Expr::Value(vws) = body_expr {
+        match &vws.value {
+            Value::DollarQuotedString(dq) => return Some(&dq.value),
+            Value::SingleQuotedString(s) => return Some(s),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Identify the table(s) a statement writes to (INSERT/UPDATE/DELETE targets).
+fn proc_write_targets(stmt: &Statement, default_schema: &str) -> Vec<String> {
+    use sqlparser::ast::{FromTable, TableFactor, TableObject};
+
+    let mut targets = Vec::new();
+    match stmt {
+        Statement::Insert(insert) => {
+            if let TableObject::TableName(name) = &insert.table
+                && let Some(q) = qualify_relation(name, default_schema)
+            {
+                push_unique(&mut targets, q);
+            }
+        }
+        Statement::Update(update) => {
+            if let TableFactor::Table { name, .. } = &update.table.relation
+                && let Some(q) = qualify_relation(name, default_schema)
+            {
+                push_unique(&mut targets, q);
+            }
+        }
+        Statement::Delete(delete) => {
+            let twjs = match &delete.from {
+                FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
+            };
+            for twj in twjs {
+                if let TableFactor::Table { name, .. } = &twj.relation
+                    && let Some(q) = qualify_relation(name, default_schema)
+                {
+                    push_unique(&mut targets, q);
+                }
+            }
+            for name in &delete.tables {
+                if let Some(q) = qualify_relation(name, default_schema) {
+                    push_unique(&mut targets, q);
+                }
+            }
+        }
+        _ => {}
+    }
+    targets
+}
+
+/// Push a value only if not already present (preserves insertion order).
+fn push_unique(v: &mut Vec<String>, item: String) {
+    if !v.contains(&item) {
+        v.push(item);
+    }
+}
+
+/// Fallback reads/writes scanner for bodies that aren't statically-parseable SQL.
+///
+/// `extract_proc_refs` handles `LANGUAGE sql` bodies via the AST; this regex
+/// scan is the fallback for the rest.
 ///
 /// WORKAROUND: sqlparser-plpgsql-body
-/// Limitation: sqlparser captures function/procedure bodies as opaque
+/// Limitation: sqlparser captures PL/pgSQL function/procedure bodies as opaque
 ///             DollarQuotedString values. The PL/pgSQL inside is NOT parsed
 ///             into AST nodes — there are no Statement nodes for the body's
-///             INSERT/SELECT/UPDATE/DELETE.
-/// Impact:     Cannot use AST to extract table reads/writes from procedures.
-/// Fix:        Scan the raw body text for DML patterns (FROM, JOIN, INSERT INTO, etc.)
-/// Check:      If sqlparser adds PL/pgSQL body parsing, extract reads/writes from
-///             the body's AST instead. Look for CreateFunction.function_body containing
-///             parsed Statement nodes rather than a DollarQuotedString.
+///             INSERT/SELECT/UPDATE/DELETE. (`CREATE PROCEDURE` also fails to
+///             parse entirely in sqlparser 0.61.)
+/// Impact:     Cannot use the AST for PL/pgSQL bodies; scan the text instead.
+/// Caveats:    Text scanning only matches qualified `schema.table` names (misses
+///             unqualified ones) and can over-match (e.g. `EXTRACT(... FROM x.y)`).
+///             It is also blind to read/write classification beyond the keyword.
+/// Check:      If sqlparser adds PL/pgSQL body parsing, walk the body's AST with
+///             `collect_table_refs` instead (as `extract_proc_refs` already does
+///             for `LANGUAGE sql`).
 /// Alternative: pg_query crate has experimental parse_plpgsql() that returns JSON AST.
+///
+/// Note: dynamic SQL (`EXECUTE 'text'`) is a runtime dependency, not compile-time,
+/// and is out of scope for dependency tracking. The text scan may still match
+/// qualified names inside such literals — a known limitation of the fallback.
 ///
 /// Patterns matched:
 /// - SELECT ... FROM schema.table → read
@@ -254,6 +420,83 @@ fn regex_table_after(sql: &str, pattern: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Parse a CREATE FUNCTION/PROCEDURE and extract its read/write deps.
+    fn proc_refs(sql: &str) -> (Vec<String>, Vec<String>) {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+        extract_proc_refs(&stmts, sql, "public")
+    }
+
+    #[test]
+    fn proc_sql_body_extracts_reads_via_ast() {
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ \
+             SELECT id FROM real.orders WHERE id IN (SELECT id FROM real.allow) $$;",
+        );
+        assert!(reads.contains(&"real.orders".to_string()), "reads={reads:?}");
+        assert!(reads.contains(&"real.allow".to_string()), "reads={reads:?}");
+        assert!(writes.is_empty(), "writes={writes:?}");
+    }
+
+    #[test]
+    fn proc_sql_body_resolves_unqualified_with_default_schema() {
+        // Differentiator vs regex: unqualified table resolves to default schema.
+        let (reads, _) = proc_refs(
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT id FROM orders $$;",
+        );
+        assert!(reads.contains(&"public.orders".to_string()), "reads={reads:?}");
+    }
+
+    #[test]
+    fn proc_sql_body_classifies_insert_write_and_select_read() {
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$ \
+             INSERT INTO sink.t SELECT id FROM (SELECT id FROM nested.src) s $$;",
+        );
+        assert!(writes.contains(&"sink.t".to_string()), "writes={writes:?}");
+        assert!(reads.contains(&"nested.src".to_string()), "reads={reads:?}");
+        assert!(!reads.contains(&"sink.t".to_string()), "write target leaked into reads: {reads:?}");
+    }
+
+    #[test]
+    fn proc_sql_body_classifies_update_and_delete() {
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$ \
+             UPDATE tgt.t SET x = 1 FROM ref.r WHERE t.id = r.id; \
+             DELETE FROM del.t USING use.u WHERE t.id = u.id; $$;",
+        );
+        assert!(writes.contains(&"tgt.t".to_string()), "writes={writes:?}");
+        assert!(writes.contains(&"del.t".to_string()), "writes={writes:?}");
+        assert!(reads.contains(&"ref.r".to_string()), "reads={reads:?}");
+        assert!(reads.contains(&"use.u".to_string()), "reads={reads:?}");
+    }
+
+    #[test]
+    fn proc_sql_body_no_false_positive_from_extract() {
+        // Differentiator vs regex: EXTRACT(... FROM col) must NOT yield a table.
+        let (reads, _) = proc_refs(
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ \
+             SELECT EXTRACT(epoch FROM ts.created) FROM real.events $$;",
+        );
+        assert!(reads.contains(&"real.events".to_string()), "reads={reads:?}");
+        assert!(
+            !reads.iter().any(|r| r.ends_with(".created")),
+            "EXTRACT false positive: {reads:?}"
+        );
+    }
+
+    #[test]
+    fn proc_plpgsql_body_falls_back_to_regex() {
+        // PL/pgSQL isn't statically parseable SQL → regex fallback still works.
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$ \
+             BEGIN INSERT INTO sink.t SELECT id FROM real.src; END; $$;",
+        );
+        assert!(reads.contains(&"real.src".to_string()), "reads={reads:?}");
+        assert!(writes.contains(&"sink.t".to_string()), "writes={writes:?}");
+    }
 
     #[test]
     fn extract_proc_reads() {

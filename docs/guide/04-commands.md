@@ -96,6 +96,10 @@ extension (`.jsonl`/`.tsv`/`.csv`). (On `import`, `-f` is the *file*; on `export
 
 Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention.
 
+**How reads/writes are derived.** For `LANGUAGE sql` functions the body is parsed and walked as an AST, so reads and writes are detected precisely through sub-selects, joins, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and CTEs. PL/pgSQL bodies (and anything sqlparser can't parse as plain SQL) fall back to a text-pattern scan over the body.
+
+**Dynamic SQL is not tracked.** Statements built and run as strings (`EXECUTE format(...)`, `EXECUTE 'INSERT ...'`) are deliberately ignored. They create only a *runtime* dependency — they never determine whether the function can be created — so they are out of scope for dependency ordering. Tables referenced only inside dynamic SQL will not appear in the reads/writes analysis; reference them statically if you need them ordered.
+
 **Environment-specific data.** Files placed under `import/<env>/<schema>/<file>` are loaded only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment. So `import/dev/staging/seed.csv` loads on `dbd import -e dev` but not under `prod`, letting you ship dev seed data without it reaching production.
 
 ---
