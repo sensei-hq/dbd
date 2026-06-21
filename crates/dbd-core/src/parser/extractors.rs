@@ -179,26 +179,116 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
 
 /// Extract read/write table dependencies from a function/procedure.
 ///
-/// When the body is statically-parseable SQL (a `LANGUAGE sql` function), the
-/// body is re-parsed and walked with the AST visitor — giving the same
-/// precision as view extraction (sub-selects, set operations, CTEs, correct
-/// read/write classification, and no false positives). Bodies sqlparser cannot
-/// parse (PL/pgSQL, `CREATE PROCEDURE`) fall back to the regex scanner.
+/// Three tiers, tried in order:
+/// 1. `LANGUAGE sql` bodies → re-parsed with sqlparser and walked by the view
+///    visitor (sub-selects, set operations, CTEs, exact read/write split).
+/// 2. PL/pgSQL bodies → parsed with libpg_query (Postgres's own parser), which
+///    sees through `SELECT ... INTO`, `PERFORM`, `FOR ... IN ... LOOP`,
+///    `RETURN QUERY`, and `IF` conditions.
+/// 3. Anything neither parser accepts → regex scan of the raw text.
 ///
 /// Dynamic SQL (`EXECUTE 'text'`) is intentionally NOT tracked: it is a runtime
 /// dependency, not a compile-time one, so it never affects whether the object
-/// can be created. The AST path ignores it for free (it is a string literal);
-/// the regex fallback inherits the existing best-effort behavior.
+/// can be created. Tiers 1 and 2 ignore it for free (it is a string literal);
+/// the tier-3 regex inherits the existing best-effort behavior.
 pub fn extract_proc_refs(
     statements: &[Statement],
     raw_sql: &str,
     default_schema: &str,
 ) -> (Vec<String>, Vec<String>) {
+    // 1. `LANGUAGE sql` bodies: re-parse with sqlparser + the view visitor.
     if let Some((reads, writes)) = extract_proc_refs_via_ast(statements, default_schema) {
         return (reads, writes);
     }
-    // PL/pgSQL and other bodies sqlparser can't statically parse.
+    // 2. PL/pgSQL: parse with libpg_query (the real Postgres parser).
+    if let Some((reads, writes)) = extract_proc_refs_via_pg_query(raw_sql, default_schema) {
+        return (reads, writes);
+    }
+    // 3. Last resort: regex scan (bodies neither parser can handle).
     extract_proc_reads_writes(raw_sql)
+}
+
+/// Extract reads/writes from a PL/pgSQL body using libpg_query (Postgres's own
+/// parser), which cleanly separates embedded SQL from PL/pgSQL control flow
+/// (`SELECT ... INTO`, `PERFORM`, `FOR ... IN ... LOOP`, `RETURN QUERY`, `IF`).
+///
+/// Returns `None` when the input isn't a PL/pgSQL routine libpg_query can parse
+/// (e.g. a `LANGUAGE sql` body, or invalid PL/pgSQL), so the caller falls back.
+///
+/// Dynamic SQL (`EXECUTE '...'`) is ignored: the embedded text is a string
+/// literal, so re-parsing it yields a constant with no table references.
+fn extract_proc_refs_via_pg_query(
+    raw_sql: &str,
+    default_schema: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let tree = pg_query::parse_plpgsql(raw_sql).ok()?;
+
+    let mut queries = Vec::new();
+    collect_plpgsql_queries(&tree, &mut queries);
+
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for query in &queries {
+        // A `query` may be a full statement, or a bare expression (e.g. an `IF`
+        // condition). Parse it directly, else `SELECT`-wrap it so any subqueries
+        // are still seen. A dynamic-SQL string literal yields no tables either way.
+        let Ok(parsed) =
+            pg_query::parse(query).or_else(|_| pg_query::parse(&format!("SELECT {query}")))
+        else {
+            continue;
+        };
+        for table in parsed.select_tables() {
+            if let Some(name) = qualify_name_str(&table, default_schema) {
+                push_unique(&mut reads, name);
+            }
+        }
+        for table in parsed.dml_tables() {
+            if let Some(name) = qualify_name_str(&table, default_schema) {
+                push_unique(&mut writes, name);
+            }
+        }
+    }
+    Some((reads, writes))
+}
+
+/// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
+/// JSON tree (libpg_query stores each statement's SQL under a `"query"` key).
+fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                if key == "query"
+                    && let Some(s) = val.as_str()
+                    && !s.is_empty()
+                {
+                    out.push(s.to_string());
+                }
+                collect_plpgsql_queries(val, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_plpgsql_queries(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Qualify a `schema.table` / `table` string (as returned by libpg_query):
+/// apply the default schema to unqualified names, drop system-schema refs.
+fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [.., schema, table] => {
+            if SYSTEM_SCHEMAS.contains(schema) {
+                return None;
+            }
+            Some(format!("{schema}.{table}"))
+        }
+        [table] => Some(format!("{default_schema}.{table}")),
+        _ => None,
+    }
 }
 
 /// Try to extract reads/writes from a `LANGUAGE sql` function body via the AST.
@@ -324,29 +414,17 @@ fn push_unique(v: &mut Vec<String>, item: String) {
     }
 }
 
-/// Fallback reads/writes scanner for bodies that aren't statically-parseable SQL.
+/// Last-resort reads/writes scanner for bodies neither parser accepts.
 ///
-/// `extract_proc_refs` handles `LANGUAGE sql` bodies via the AST; this regex
-/// scan is the fallback for the rest.
+/// `extract_proc_refs` handles `LANGUAGE sql` bodies via sqlparser and PL/pgSQL
+/// via libpg_query; this regex scan runs only when both fail (e.g. a body that
+/// is invalid PL/pgSQL, or an unsupported routine form).
 ///
-/// WORKAROUND: sqlparser-plpgsql-body
-/// Limitation: sqlparser captures PL/pgSQL function/procedure bodies as opaque
-///             DollarQuotedString values. The PL/pgSQL inside is NOT parsed
-///             into AST nodes — there are no Statement nodes for the body's
-///             INSERT/SELECT/UPDATE/DELETE. (`CREATE PROCEDURE` also fails to
-///             parse entirely in sqlparser 0.61.)
-/// Impact:     Cannot use the AST for PL/pgSQL bodies; scan the text instead.
-/// Caveats:    Text scanning only matches qualified `schema.table` names (misses
-///             unqualified ones) and can over-match (e.g. `EXTRACT(... FROM x.y)`).
-///             It is also blind to read/write classification beyond the keyword.
-/// Check:      If sqlparser adds PL/pgSQL body parsing, walk the body's AST with
-///             `collect_table_refs` instead (as `extract_proc_refs` already does
-///             for `LANGUAGE sql`).
-/// Alternative: pg_query crate has experimental parse_plpgsql() that returns JSON AST.
-///
-/// Note: dynamic SQL (`EXECUTE 'text'`) is a runtime dependency, not compile-time,
-/// and is out of scope for dependency tracking. The text scan may still match
-/// qualified names inside such literals — a known limitation of the fallback.
+/// Caveats: only matches qualified `schema.table` names (misses unqualified
+/// ones), can over-match (e.g. `EXTRACT(... FROM x.y)` or tables inside an
+/// `EXECUTE '...'` dynamic-SQL literal), and is blind to read/write
+/// classification beyond the leading keyword. The libpg_query path has none of
+/// these issues, so this is reached rarely.
 ///
 /// Patterns matched:
 /// - SELECT ... FROM schema.table → read
@@ -423,9 +501,13 @@ mod tests {
 
 
     /// Parse a CREATE FUNCTION/PROCEDURE and extract its read/write deps.
+    ///
+    /// Mirrors the real pipeline: when sqlparser can't parse the statement
+    /// (e.g. `RETURNS SETOF`), `statements` is empty and extraction relies on
+    /// the libpg_query / regex paths driven by the raw text.
     fn proc_refs(sql: &str) -> (Vec<String>, Vec<String>) {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap_or_default();
         extract_proc_refs(&stmts, sql, "public")
     }
 
@@ -488,14 +570,74 @@ mod tests {
     }
 
     #[test]
-    fn proc_plpgsql_body_falls_back_to_regex() {
-        // PL/pgSQL isn't statically parseable SQL → regex fallback still works.
+    fn proc_plpgsql_body_extracts_via_pg_query() {
+        // PL/pgSQL is parsed by libpg_query (real Postgres parser).
         let (reads, writes) = proc_refs(
             "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$ \
              BEGIN INSERT INTO sink.t SELECT id FROM real.src; END; $$;",
         );
         assert!(reads.contains(&"real.src".to_string()), "reads={reads:?}");
         assert!(writes.contains(&"sink.t".to_string()), "writes={writes:?}");
+        assert!(!writes.contains(&"real.src".to_string()), "read leaked into writes: {writes:?}");
+    }
+
+    #[test]
+    fn proc_plpgsql_unwraps_perform_for_loop_select_into_return_query() {
+        // libpg_query strips PL/pgSQL wrappers, exposing the embedded SQL:
+        // SELECT..INTO, PERFORM, FOR..IN..LOOP, IF EXISTS(..), RETURN QUERY.
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE plpgsql AS $$ \
+             DECLARE v int; rec record; \
+             BEGIN \
+               SELECT count(*) INTO v FROM staging.lookups WHERE active; \
+               PERFORM id FROM work.queue; \
+               FOR rec IN SELECT id FROM work.items LOOP \
+                 DELETE FROM work.items WHERE id = rec.id; \
+               END LOOP; \
+               IF EXISTS (SELECT 1 FROM audit.log) THEN RETURN; END IF; \
+               RETURN QUERY SELECT id FROM report.summary; \
+             END; $$;",
+        );
+        for t in ["staging.lookups", "work.queue", "work.items", "audit.log", "report.summary"] {
+            assert!(reads.contains(&t.to_string()), "missing read {t}: {reads:?}");
+        }
+        assert!(writes.contains(&"work.items".to_string()), "writes={writes:?}");
+    }
+
+    #[test]
+    fn proc_plpgsql_ignores_dynamic_sql() {
+        // EXECUTE '...' is dynamic (runtime) SQL — its tables must NOT be tracked.
+        let (reads, writes) = proc_refs(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               INSERT INTO real.audit(n) VALUES (1); \
+               EXECUTE 'INSERT INTO dyn.sink SELECT * FROM dyn.src'; \
+             END; $$;",
+        );
+        assert!(writes.contains(&"real.audit".to_string()), "writes={writes:?}");
+        assert!(!reads.iter().any(|r| r.starts_with("dyn.")), "dynamic read leaked: {reads:?}");
+        assert!(!writes.iter().any(|w| w.starts_with("dyn.")), "dynamic write leaked: {writes:?}");
+    }
+
+    #[test]
+    fn proc_plpgsql_resolves_unqualified_with_default_schema() {
+        let (reads, _) = proc_refs(
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE plpgsql AS $$ \
+             BEGIN RETURN QUERY SELECT id FROM orders; END; $$;",
+        );
+        assert!(reads.contains(&"public.orders".to_string()), "reads={reads:?}");
+    }
+
+    #[test]
+    fn proc_plpgsql_excludes_cte_names() {
+        // A CTE defined in the body must not be reported as a real table.
+        let (reads, _) = proc_refs(
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE plpgsql AS $$ \
+             BEGIN RETURN QUERY WITH recent AS (SELECT id FROM sales.orders) \
+               SELECT id FROM recent; END; $$;",
+        );
+        assert!(reads.contains(&"sales.orders".to_string()), "reads={reads:?}");
+        assert!(!reads.contains(&"public.recent".to_string()), "CTE leaked: {reads:?}");
     }
 
     #[test]

@@ -96,7 +96,7 @@ extension (`.jsonl`/`.tsv`/`.csv`). (On `import`, `-f` is the *file*; on `export
 
 Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention.
 
-**How reads/writes are derived.** For `LANGUAGE sql` functions the body is parsed and walked as an AST, so reads and writes are detected precisely through sub-selects, joins, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and CTEs. PL/pgSQL bodies (and anything sqlparser can't parse as plain SQL) fall back to a text-pattern scan over the body.
+**How reads/writes are derived.** Function and procedure bodies are parsed, not text-matched. `LANGUAGE sql` bodies are parsed as an AST; PL/pgSQL bodies are parsed by libpg_query (PostgreSQL's own parser), which sees through `SELECT … INTO`, `PERFORM`, `FOR … IN … LOOP`, `RETURN QUERY`, and `IF` conditions. Either way, reads and writes are detected precisely through sub-selects, joins, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and CTEs, and a write target (`INSERT`/`UPDATE`/`DELETE`) is distinguished from the tables it reads. A best-effort regex scan is used only if a body can't be parsed at all.
 
 **Dynamic SQL is not tracked.** Statements built and run as strings (`EXECUTE format(...)`, `EXECUTE 'INSERT ...'`) are deliberately ignored. They create only a *runtime* dependency — they never determine whether the function can be created — so they are out of scope for dependency ordering. Tables referenced only inside dynamic SQL will not appear in the reads/writes analysis; reference them statically if you need them ordered.
 
