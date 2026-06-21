@@ -18,6 +18,7 @@ thiserror.workspace = true
 
 # SQL Parsing
 sqlparser = { version = "0.61", features = ["visitor"] }
+pg_query = "6"
 
 # File system & parallelism
 walkdir = "2"

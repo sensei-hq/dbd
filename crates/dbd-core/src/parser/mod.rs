@@ -130,11 +130,12 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
         Ok(stmts) => stmts,
         Err(e) => {
             entity.errors.push(format!("Parse error: {e}"));
-            // For procedures/functions, we can still extract reads/writes from
-            // the raw SQL even when sqlparser can't parse the full statement
-            // (e.g. CREATE OR REPLACE PROCEDURE is not fully supported).
+            // For procedures/functions we can still extract reads/writes even
+            // when sqlparser can't parse the statement (e.g. RETURNS SETOF/TABLE):
+            // libpg_query parses the body, with the regex scanner as last resort.
+            // No parsed statements here, so the LANGUAGE sql AST path is skipped.
             if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
-                let (reads, writes) = extractors::extract_proc_reads_writes(sql);
+                let (reads, writes) = extractors::extract_proc_refs(&[], &cleaned, "public");
                 entity.reads = reads;
                 entity.writes = writes;
                 entity.references = entity
@@ -179,7 +180,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
                 .first()
                 .map(|s| s.as_str())
                 .unwrap_or("public");
-            let (reads, writes) = extractors::extract_proc_refs(&statements, sql, default_schema);
+            let (reads, writes) = extractors::extract_proc_refs(&statements, &cleaned, default_schema);
             entity.reads = reads;
             entity.writes = writes;
             // References from reads/writes
