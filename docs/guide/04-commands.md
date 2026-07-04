@@ -237,9 +237,58 @@ dbd deploy --source ./local/project                       # From local path
 dbd deploy --dry-run --source owner/repo/path             # Preview
 dbd deploy --scope hub --database $HUB_URL               # Deploy a named scope
 dbd deploy --scope hub --deps include -d $HUB_URL        # Auto-expand dependencies
+dbd deploy --no-cache --source owner/repo/path -d $URL     # Re-download this source
+dbd deploy --clear-cache --source owner/repo/path -d $URL  # Wipe the whole cache first
 ```
 
-GitHub sources are cached in ~/.cache/dbd/.
+GitHub sources are cached in `~/.cache/dbd/` (macOS: `~/Library/Caches/dbd`), keyed by
+`owner-repo-ref`. `--no-cache` ignores the cached copy of the current source and re-downloads it;
+`--clear-cache` removes the entire cache directory before deploying. Both are no-ops for local path
+sources (`--clear-cache` still clears the cache).
+
+---
+
+## `dbd reconcile`
+
+Pre-release (pre-v1) **declarative** apply: diff the live database against the design and apply the
+difference in place — `CREATE` for new tables, `ALTER` for changed ones — with **no snapshot files
+and no version bump**. Ideal while the schema is still churning and cutting a snapshot per change is
+overkill.
+
+```sh
+dbd reconcile --dry-run -d $DATABASE_URL              # Preview the plan
+dbd reconcile -d $DATABASE_URL                        # Apply (create + alter)
+dbd reconcile --allow-destructive -d $DATABASE_URL    # Also drop columns/constraints
+dbd reconcile --prune -d $DATABASE_URL                # Also drop orphaned tables
+```
+
+The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
+schemas. Two kinds of destruction each need an explicit opt-in:
+
+- **`--allow-destructive`** — drop a *column* or constraint from a managed table.
+- **`--prune`** — drop a whole *table* still in a managed schema but no longer in the design (an
+  orphan). Without `--prune`, orphans are reported and left in place.
+
+Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
+Reconcile is **disabled once the project is released** (`project.released: true`) — see `dbd release`.
+`--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
+
+---
+
+## `dbd release` (alias `dbd baseline`)
+
+Cut the first version: write a **baseline snapshot** at the current `project.version` (the anchor
+future `dbd snapshot` diffs against) and set `project.released: true`, locking the project into the
+snapshot/migration workflow and disabling `dbd reconcile`.
+
+```sh
+dbd release --name "v1 GA"    # Baseline snapshot + released: true
+dbd baseline                  # Alias
+```
+
+Refuses if the project is already released, if snapshots already exist (it's already on the
+migration track), or if the design has entity errors (run `dbd inspect` first). After release the
+flow is the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
 
 ---
 

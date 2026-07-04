@@ -70,7 +70,9 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
 - `dbd import` — load staging data (CSV/TSV/JSONL) from the `import/` convention; env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches. `-n <table> -f <file>` loads one explicit file (format from extension)
 - `dbd export` — export table data (scope-aware) to `export/<schema>/<name>.<fmt>`; `-f/--format` sets the format, `-o/--output <dir>` the destination dir (`<dir>/<name>.<fmt>`, e.g. straight into `import/` for a round-trip)
-- `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub
+- `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub; GitHub sources cache under `~/.cache/dbd` — `--no-cache` re-downloads this source, `--clear-cache` wipes the whole cache first
+- `dbd reconcile` — pre-release (pre-v1) **declarative** apply: diff the live DB against the design and apply `CREATE`/`ALTER` in place, no snapshots/version bump; scoped to managed schemas. `--allow-destructive` drops columns/constraints on managed tables; `--prune` drops orphaned tables (in a managed schema, gone from the design); orphaned enums are only warned. Disabled once `project.released`
+- `dbd release` (alias `dbd baseline`) — cut v1: write a baseline snapshot at the current `project.version` and set `project.released: true`, locking in the snapshot/migration workflow (disables `reconcile`). Refuses if already released, snapshots exist, or the design has errors
 - `dbd combine` — combine DDL into single SQL file (scope-aware)
 - `dbd graph` — dependency graph as JSON (scope-aware)
 - `dbd diagram` — build the schema model and open the hosted interactive viewer (model gzip-encoded in the URL fragment, client-side only); `--print-url` prints the link, `--site`/`$DBD_DIAGRAM_URL` overrides the base, `--json -f` writes the raw SchemaModel JSON for upload/tooling
@@ -84,7 +86,7 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 
 Reverse-engineering coverage (`init --from-db`/`merge`): schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. gin/gist/brin/hash, comments, serial/identity columns), views, functions & procedures (verbatim), roles (opt-in `--roles`), standalone sequences. Not captured: partial/expression indexes, triggers. A DBML source (`--from-dbml`) = schemas/enums/tables/FKs only. A SQLite source (`--from-db sqlite://…`) = tables/views/user-indexes captured verbatim from `sqlite_master` (CHECK/affinity/AUTOINCREMENT/WITHOUT ROWID preserved; no schemas/enums/functions/sequences/roles; triggers skipped). The reverse dialect (postgres vs sqlite target) is taken from the connection URL scheme.
 
-Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). All filter to the entity working set (`reset` drops those entities; `--schemas` additionally restricts the dropped schemas to the scope's).
+Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy`/`reconcile` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). All filter to the entity working set (`reset` drops those entities; `--schemas` additionally restricts the dropped schemas to the scope's).
 
 ## Architecture
 
@@ -110,6 +112,8 @@ Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report
 
 - `_dbd_meta` table records environment (dev/prod) and version in the database
 - `dbd reset` blocked in prod (always) and in dev after v1 snapshot
+- `project.released` (set by `dbd release`) disables the in-place `dbd reconcile` workflow — after release, schema changes must go through snapshots + `dbd apply`
+- `dbd reconcile` never touches schemas the design doesn't declare; column drops need `--allow-destructive`, whole-table (orphan) drops need `--prune`
 - `--force` overrides safety guards
 - For Convex (codegen target) the equivalent state lives in `<output>/.dbd_state.json`
 

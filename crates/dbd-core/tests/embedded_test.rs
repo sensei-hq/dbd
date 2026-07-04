@@ -1184,3 +1184,164 @@ async fn reset_with_schemas_drops_the_schema() {
         .expect("reset --schemas failed");
     assert_schema_absent(&*adapter, "app").await;
 }
+
+// ── Test: reconcile (declarative, pre-release apply) ──────────────────────────
+
+/// Reconcile creates missing objects, ALTERs an existing table to add a column,
+/// refuses a destructive column drop unless `allow_destructive` is set, and
+/// prunes an orphaned table only when `prune` is set — all in place, without
+/// snapshots or a version bump.
+#[tokio::test]
+async fn reconcile_creates_alters_and_drops_in_place() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+
+    let write_design = |version: u32| {
+        std::fs::write(
+            dir.join("design.yaml"),
+            format!(
+                "project:\n  name: reconcile_test\n  version: {version}\n\
+                 source:\n  dialect: postgresql\nschemas:\n  - app\n"
+            ),
+        )
+        .unwrap();
+    };
+    let write_items = |body: &str| {
+        std::fs::write(dir.join("ddl/table/app/items.ddl"), body).unwrap();
+    };
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+            .expect("load design")
+    };
+
+    write_design(1);
+
+    // ── Phase 1: initial table → reconcile creates schema + table ──
+    write_items(
+        "set search_path to app;\n\
+         create table if not exists items (\n\
+           id   uuid primary key default gen_random_uuid()\n\
+         , name text not null\n\
+         );\n",
+    );
+    load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile phase 1 failed");
+    assert_schema_exists(&*adapter, "app").await;
+    assert_table_exists(&*adapter, "app", "items").await;
+    assert_column_exists(&*adapter, "app", "items", "name").await;
+
+    // ── Phase 2: add a column → reconcile ALTERs in place ──
+    write_items(
+        "set search_path to app;\n\
+         create table if not exists items (\n\
+           id   uuid primary key default gen_random_uuid()\n\
+         , name text not null\n\
+         , qty  integer not null default 0\n\
+         );\n",
+    );
+    let mut summary = None;
+    load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |s| summary = Some(s))
+        .await
+        .expect("reconcile phase 2 failed");
+    assert_column_exists(&*adapter, "app", "items", "qty").await;
+    assert_eq!(summary.unwrap().altered, 1, "exactly one table altered");
+
+    // ── Phase 3: drop a column → refused without allow_destructive ──
+    write_items(
+        "set search_path to app;\n\
+         create table if not exists items (\n\
+           id  uuid primary key default gen_random_uuid()\n\
+         , qty integer not null default 0\n\
+         );\n",
+    );
+    let refused = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await;
+    assert!(
+        refused.is_err(),
+        "destructive reconcile must be refused without allow_destructive"
+    );
+    assert_column_exists(&*adapter, "app", "items", "name").await; // still present
+
+    // ── Phase 4: same drop with allow_destructive → applied ──
+    load()
+        .reconcile(&*adapter, false, true, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile phase 4 failed");
+    assert_column_absent(&*adapter, "app", "items", "name").await;
+
+    // ── Phase 5: orphaned table pruned only with `prune` ──
+    // Add a second managed table, reconcile creates it.
+    std::fs::write(
+        dir.join("ddl/table/app/notes.ddl"),
+        "set search_path to app;\n\
+         create table if not exists notes (id uuid primary key, body text);\n",
+    )
+    .unwrap();
+    load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile creating notes failed");
+    assert_table_exists(&*adapter, "app", "notes").await;
+
+    // Remove it from the design → it is now an orphan in a managed schema.
+    std::fs::remove_file(dir.join("ddl/table/app/notes.ddl")).unwrap();
+
+    // Without prune: the orphan is reported in the plan but left in place.
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile without prune failed");
+    assert_eq!(plan.dropped.len(), 1, "notes should be reported as an orphan");
+    assert_eq!(plan.dropped[0].entity_name, "app.notes");
+    assert_table_exists(&*adapter, "app", "notes").await; // still present
+
+    // With prune: the orphan is dropped.
+    let mut prune_summary = None;
+    load()
+        .reconcile(&*adapter, false, false, true, None, |_| {}, |_, _| {}, |s| prune_summary = Some(s))
+        .await
+        .expect("reconcile with prune failed");
+    assert_eq!(prune_summary.unwrap().dropped, 1, "one table pruned");
+    assert_table_absent(&*adapter, "app", "notes").await;
+}
+
+/// A dry-run reconcile computes a plan but writes nothing.
+#[tokio::test]
+async fn reconcile_dry_run_is_read_only() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_dry").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_dry\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id uuid primary key);\n",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+    let plan = design
+        .reconcile(&*adapter, true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("dry-run reconcile failed");
+
+    assert_eq!(plan.added, vec!["app.items".to_string()], "plan proposes the new table");
+    assert_table_absent(&*adapter, "app", "items").await; // nothing created
+}

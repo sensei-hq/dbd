@@ -64,6 +64,8 @@ myproject/
 | `dbd graph` | Output dependency graph as JSON |
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
+| `dbd reconcile` | Pre-release: diff the live DB against the design and apply ALTER/CREATE in place (no snapshots) |
+| `dbd release` (alias `baseline`) | Write a baseline snapshot and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
 | `dbd format` | Format DDL files (river-style; `--check` for CI/pre-commit) |

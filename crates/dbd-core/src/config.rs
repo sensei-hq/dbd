@@ -104,6 +104,11 @@ pub struct ProjectConfig {
     pub name: String,
     pub note: Option<String>,
     pub version: Option<u32>,
+    /// Whether the project has been released (baselined). Once released, the
+    /// declarative `dbd reconcile` workflow is disabled and schema changes must
+    /// go through snapshots + migrations. Set by `dbd release`.
+    #[serde(default)]
+    pub released: bool,
 }
 
 // ── Source ───────────────────────────────────────────────
@@ -473,6 +478,20 @@ pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
     Ok(())
 }
 
+/// Set the `project.released` flag in a design.yaml file.
+pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
+    })?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    value["project"]["released"] = serde_yaml::Value::Bool(released);
+    let output = serde_yaml::to_string(&value)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::write(config_path, output)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +639,31 @@ mod tests {
         let yaml = "project:\n  name: test\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.project.version, None);
+    }
+
+    #[test]
+    fn released_defaults_to_false_and_parses_true() {
+        let config: DesignConfig = serde_yaml::from_str("project:\n  name: test\n").unwrap();
+        assert!(!config.project.released, "released should default to false");
+        let config: DesignConfig =
+            serde_yaml::from_str("project:\n  name: test\n  released: true\n").unwrap();
+        assert!(config.project.released);
+    }
+
+    #[test]
+    fn set_released_writes_and_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("design.yaml");
+        std::fs::write(&path, "project:\n  name: test\n  version: 1\n").unwrap();
+
+        set_released(&path, true).unwrap();
+        let config = read(&path).unwrap();
+        assert!(config.project.released);
+        // Existing fields survive the round-trip.
+        assert_eq!(config.project.version, Some(1));
+
+        set_released(&path, false).unwrap();
+        assert!(!read(&path).unwrap().project.released);
     }
 
     // ── ExportEntry::format ───────────────────────────────

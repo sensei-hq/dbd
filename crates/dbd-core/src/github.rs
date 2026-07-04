@@ -154,10 +154,15 @@ pub fn is_github_source(source: &str) -> bool {
     source.split('/').count() >= 2
 }
 
-/// Cache directory for GitHub downloads.
-pub fn cache_dir(owner: &str, repo: &str, git_ref: &str) -> PathBuf {
+/// Root directory holding every cached GitHub download.
+pub fn cache_root() -> PathBuf {
     let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
-    base.join("dbd").join(format!("{}-{}-{}", owner, repo, git_ref))
+    base.join("dbd")
+}
+
+/// Cache directory for a single GitHub source.
+pub fn cache_dir(owner: &str, repo: &str, git_ref: &str) -> PathBuf {
+    cache_root().join(format!("{}-{}-{}", owner, repo, git_ref))
 }
 
 #[cfg(test)]
