@@ -12,9 +12,40 @@ Step-by-step flows for each command are in the command reference:
 
 ### Greenfield — a brand-new schema
 
-No database yet. `dbd init` scaffolds `design.yaml`, the `ddl/` tree, and a sample table; edit the
-DDL, `dbd apply`, and `dbd snapshot` each change (see
-[snapshots & migrations](05-snapshots-migrations.md)).
+No database yet. `dbd init` scaffolds `design.yaml`, the `ddl/` tree, and a sample table.
+
+**Before v1 — iterate fast with `reconcile`.** While the schema is still churning, cutting a
+snapshot for every column tweak is tedious. `dbd reconcile` diffs the live database against the
+design and applies the difference in place — `CREATE` for new tables, `ALTER` for changed ones — with
+no snapshot files and no version bump:
+
+```sh
+dbd reconcile --dry-run -d $DATABASE_URL   # preview the plan
+dbd reconcile -d $DATABASE_URL             # apply it
+dbd reconcile --allow-destructive -d $DATABASE_URL   # also drop columns/constraints
+dbd reconcile --prune -d $DATABASE_URL     # also drop orphaned tables (removed from the design)
+```
+
+Reconcile only diffs within the schemas the design declares, so it never touches tables in other
+schemas. Two kinds of destruction each need their own opt-in:
+
+- **`--allow-destructive`** — drop a *column* or constraint from a managed table.
+- **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
+  design (an orphan). Without `--prune`, orphans are reported and left in place.
+
+Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
+
+**Cut v1 with `dbd release`.** When the schema stabilizes, `dbd release` (alias `dbd baseline`)
+writes a baseline snapshot at the current version and flips `project.released: true`:
+
+```sh
+dbd release --name "v1 GA"
+```
+
+After release, `reconcile` is disabled and the project is on the migration track: edit the DDL,
+`dbd snapshot` each change, and `dbd apply` (see
+[snapshots & migrations](05-snapshots-migrations.md)). This mirrors the guarantee you want in
+production — every change is a versioned, reviewable migration.
 
 ### Adopt dbd for an existing database
 

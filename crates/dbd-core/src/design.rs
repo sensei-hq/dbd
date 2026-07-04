@@ -1000,6 +1000,223 @@ impl Design {
         Ok(())
     }
 
+    /// Reconcile the live database to the desired schema in place (declarative).
+    ///
+    /// Introspects the target, diffs its tables/enums against the project, and
+    /// applies the result directly — no snapshot files, no version bump. Added
+    /// tables/enums get a full create; existing ones are `ALTER`ed to match;
+    /// other objects (schemas, extensions, sequences, functions, views, roles)
+    /// are re-applied idempotently.
+    ///
+    /// The diff is scoped to the schemas the design declares, so reconcile never
+    /// touches tables in other schemas. Within those schemas, tables the design
+    /// no longer declares (orphans) are dropped **only** when `prune` is set —
+    /// otherwise they are left untouched and reported via the returned plan.
+    ///
+    /// This is the pre-release (pre-v1) workflow; callers gate it on
+    /// `project.released`. When the plan drops a column or constraint from an
+    /// existing table and `allow_destructive` is false, it refuses before any
+    /// write. Returns the computed plan so callers can surface warnings, orphans,
+    /// and a summary.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        allow_destructive: bool,
+        prune: bool,
+        scope: Option<&ResolvedScope>,
+        mut on_start: S,
+        mut on_done: D,
+        mut on_complete: C,
+    ) -> Result<crate::reconcile::ReconcilePlan>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+        C: FnMut(crate::reconcile::ReconcileComplete),
+    {
+        use crate::reconcile::{
+            plan_reconcile, qualified_entity_name, snapshot_from_entities, ReconcileComplete,
+            DEFAULT_SCHEMA,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        // Batch adapters (e.g. Convex) have no live SQL schema to diff.
+        if adapter.prefers_batch_apply() {
+            return Err(DbdError::Config(
+                "reconcile is not supported for this target (no live SQL schema to diff)"
+                    .to_string(),
+            ));
+        }
+
+        // Resolve scope → working set, gap-gate under `report` (abort before writes).
+        let working_set: Option<HashSet<String>> = match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                Some(self.working_set(s)?)
+            }
+            _ => None,
+        };
+
+        // Desired entities: valid, non-external, in scope — in dependency order.
+        let desired_entities: Vec<&Entity> = self
+            .entities
+            .iter()
+            .filter(|e| e.errors.is_empty())
+            .filter(|e| e.entity_type != EntityType::External)
+            .filter(|e| match (&working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
+            .collect();
+
+        // Desired snapshot (tables + enums, schema-normalized).
+        let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
+        let desired = snapshot_from_entities(&desired_owned);
+
+        // Schemas the design manages. Reconcile only diffs within these, so it
+        // never considers (or prunes) tables in schemas the project doesn't own.
+        let managed_schemas: HashSet<String> = desired_entities
+            .iter()
+            .map(|e| match e.entity_type {
+                EntityType::Schema => e.name.clone(),
+                _ => {
+                    let s = e.schema.clone().unwrap_or_default();
+                    if s.is_empty() {
+                        DEFAULT_SCHEMA.to_string()
+                    } else {
+                        s
+                    }
+                }
+            })
+            .collect();
+
+        // Live snapshot, restricted to managed schemas. Tables here but not in
+        // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
+        let live_entities = adapter.introspect().await?;
+        let live_full = snapshot_from_entities(&live_entities);
+        let live = crate::snapshot::Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: live_full
+                .tables
+                .into_iter()
+                .filter(|t| managed_schemas.contains(&t.schema))
+                .collect(),
+            enums: live_full
+                .enums
+                .into_iter()
+                .filter(|e| managed_schemas.contains(&e.schema))
+                .collect(),
+        };
+
+        let plan = plan_reconcile(&live, &desired);
+
+        if dry_run {
+            return Ok(plan);
+        }
+
+        if plan.destructive && !allow_destructive {
+            let details: String = plan
+                .altered
+                .iter()
+                .map(|s| format!("  {}", s.entity_name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(DbdError::Config(format!(
+                "reconcile would make destructive changes (dropped columns/constraints) on:\n{details}\n\
+                 Re-run with --allow-destructive to proceed."
+            )));
+        }
+
+        let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
+        let alter_sql: HashMap<&str, &str> = plan
+            .altered
+            .iter()
+            .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
+            .collect();
+
+        let mut summary = ReconcileComplete::default();
+
+        // Pass A — prerequisites + added tables/enums, in dependency order.
+        //   schema/extension/role/sequence: always (idempotent DDL);
+        //   enum/table: only when newly added (a full create).
+        for e in &desired_entities {
+            let do_apply = match e.entity_type {
+                EntityType::Schema
+                | EntityType::Extension
+                | EntityType::Role
+                | EntityType::Sequence => true,
+                EntityType::Enum | EntityType::Table => {
+                    added.contains(qualified_entity_name(e).as_str())
+                }
+                _ => false,
+            };
+            if !do_apply {
+                continue;
+            }
+            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter.apply_entity(e).await;
+            report_step_result(&desc, &mut on_done, result)?;
+            if is_created {
+                summary.created += 1;
+            } else {
+                summary.reapplied += 1;
+            }
+        }
+
+        // Pass B — ALTER existing tables/enums, in dependency order.
+        for e in &desired_entities {
+            let n = qualified_entity_name(e);
+            if let Some(sql) = alter_sql.get(n.as_str()) {
+                let desc = format!("alter {}:{n}", e.entity_type.tag());
+                on_start(&desc);
+                let result = adapter.execute_script(sql).await;
+                report_step_result(&desc, &mut on_done, result)?;
+                summary.altered += 1;
+            }
+        }
+
+        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
+        for e in &desired_entities {
+            if !matches!(
+                e.entity_type,
+                EntityType::View | EntityType::Function | EntityType::Procedure
+            ) {
+                continue;
+            }
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter.apply_entity(e).await;
+            report_step_result(&desc, &mut on_done, result)?;
+            summary.reapplied += 1;
+        }
+
+        // Pass D — prune orphaned tables (in managed schemas, gone from the
+        // design), only when explicitly requested. Otherwise they are reported
+        // via the returned plan and left untouched.
+        if prune {
+            for stmt in &plan.dropped {
+                let desc = format!("prune table:{}", stmt.entity_name);
+                on_start(&desc);
+                let result = adapter.execute_script(&stmt.sql).await;
+                report_step_result(&desc, &mut on_done, result)?;
+                summary.dropped += 1;
+            }
+        }
+
+        // Stamp the project version so `migrate --status` / `apply` stay consistent.
+        let version = self.config.project.version.unwrap_or(1);
+        adapter.ensure_meta_table().await?;
+        adapter.set_project_meta(&self.env, version).await?;
+
+        on_complete(summary);
+        Ok(plan)
+    }
+
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
     /// Procedure matching is based on reads/writes analysis, not naming convention:

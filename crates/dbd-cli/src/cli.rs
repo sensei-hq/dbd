@@ -129,6 +129,13 @@ pub enum Commands {
         /// Preview what would be executed
         #[arg(long)]
         dry_run: bool,
+        /// Ignore any cached copy of the source and re-download it fresh
+        /// (GitHub sources only)
+        #[arg(long)]
+        no_cache: bool,
+        /// Remove the entire download cache before deploying
+        #[arg(long)]
+        clear_cache: bool,
     },
     /// Create a versioned schema snapshot
     Snapshot {
@@ -254,6 +261,30 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reconcile the live database to the design in place (pre-release, declarative)
+    ///
+    /// Diffs the live schema against the design and applies ALTER/CREATE
+    /// directly — no snapshots, no version bump. Disabled once the project is
+    /// released; whole-table drops stay a `snapshot`/`reset` operation.
+    Reconcile {
+        /// Preview the plan without executing
+        #[arg(long)]
+        dry_run: bool,
+        /// Allow destructive changes (dropping columns/constraints)
+        #[arg(long)]
+        allow_destructive: bool,
+        /// Drop orphaned tables — those in a managed schema but no longer in the design
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Release the current version: write a baseline snapshot and lock in the
+    /// snapshot/migration workflow (disables `reconcile`)
+    #[command(visible_alias = "baseline")]
+    Release {
+        /// Description for the baseline snapshot
+        #[arg(short, long)]
+        name: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -277,7 +308,7 @@ mod tests {
         let cmds = [
             "inspect", "apply", "combine", "import", "graph", "dbml", "diagram", "deploy",
             "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
-            "policies",
+            "policies", "reconcile", "release",
         ];
         for c in cmds {
             Cli::try_parse_from(["dbd", c])
@@ -327,6 +358,63 @@ mod tests {
         assert!(
             matches!(&cli.command, Commands::Merge { roles: false, .. }),
             "expected merge roles == false when absent"
+        );
+    }
+
+    /// `dbd deploy` cache flags default to false and flip to true when present.
+    #[test]
+    fn deploy_cache_flags_parse() {
+        // absent → both false
+        let cli = Cli::try_parse_from(["dbd", "deploy"]).expect("deploy should parse");
+        assert!(
+            matches!(&cli.command, Commands::Deploy { no_cache: false, clear_cache: false, .. }),
+            "expected deploy cache flags == false when absent"
+        );
+        // present → both true
+        let cli = Cli::try_parse_from(["dbd", "deploy", "--no-cache", "--clear-cache"])
+            .expect("deploy --no-cache --clear-cache should parse");
+        assert!(
+            matches!(&cli.command, Commands::Deploy { no_cache: true, clear_cache: true, .. }),
+            "expected deploy cache flags == true when present"
+        );
+    }
+
+    /// `dbd reconcile` flags default to false and flip to true when present.
+    #[test]
+    fn reconcile_flags_parse() {
+        let cli = Cli::try_parse_from(["dbd", "reconcile"]).expect("reconcile should parse");
+        assert!(
+            matches!(
+                &cli.command,
+                Commands::Reconcile { dry_run: false, allow_destructive: false, prune: false }
+            ),
+            "expected reconcile flags == false when absent"
+        );
+        let cli = Cli::try_parse_from([
+            "dbd", "reconcile", "--dry-run", "--allow-destructive", "--prune",
+        ])
+        .expect("reconcile flags should parse");
+        assert!(
+            matches!(
+                &cli.command,
+                Commands::Reconcile { dry_run: true, allow_destructive: true, prune: true }
+            ),
+            "expected reconcile flags == true when present"
+        );
+    }
+
+    /// `dbd release` parses, and `dbd baseline` is accepted as a visible alias.
+    #[test]
+    fn release_and_baseline_alias_parse() {
+        let cli = Cli::try_parse_from(["dbd", "release"]).expect("release should parse");
+        assert!(matches!(&cli.command, Commands::Release { name: None }));
+        let cli = Cli::try_parse_from(["dbd", "release", "--name", "v1 GA"])
+            .expect("release --name should parse");
+        assert!(matches!(&cli.command, Commands::Release { name: Some(_) }));
+        let cli = Cli::try_parse_from(["dbd", "baseline"]).expect("baseline alias should parse");
+        assert!(
+            matches!(&cli.command, Commands::Release { .. }),
+            "baseline should alias to Release"
         );
     }
 

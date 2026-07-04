@@ -425,7 +425,52 @@ dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 dbd deploy --dry-run --source owner/repo/path -d $DATABASE_URL
 dbd deploy --scope hub -d $HUB_URL          # deploy only the hub subset
 dbd deploy --scope hub --deps include -d $HUB_URL   # auto-include dependencies
+dbd deploy --no-cache --source owner/repo/path -d $URL     # re-download this source
+dbd deploy --clear-cache --source owner/repo/path -d $URL  # wipe the whole cache first
 ```
+
+GitHub sources are cached under `~/.cache/dbd` (macOS: `~/Library/Caches/dbd`).
+`--no-cache` re-downloads the current source; `--clear-cache` removes the entire
+cache directory before deploying. Both are no-ops for local path sources
+(`--clear-cache` still clears the cache).
+
+### dbd reconcile
+
+Pre-release (pre-v1) **declarative** apply: diff the live database against the
+design and apply the difference in place — `CREATE` for new tables, `ALTER` for
+changed ones — with **no snapshot files and no version bump**. This avoids
+cutting a throwaway snapshot for every schema tweak while the design churns.
+
+```sh
+dbd reconcile --dry-run -d $DATABASE_URL              # preview the plan
+dbd reconcile -d $DATABASE_URL                        # apply (create + alter)
+dbd reconcile --allow-destructive -d $DATABASE_URL    # also drop columns/constraints
+dbd reconcile --prune -d $DATABASE_URL                # also drop orphaned tables
+```
+
+The diff is scoped to the schemas the design declares — reconcile never touches
+tables in other schemas. Two kinds of destruction each need an explicit opt-in:
+`--allow-destructive` drops a **column**/constraint from a managed table;
+`--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
+design). Without `--prune`, orphans are reported and left in place. Orphaned
+enums are only warned about, never auto-dropped. Reconcile is **disabled once the
+project is released** (`project.released: true`) — see `dbd release`.
+
+### dbd release (alias: dbd baseline)
+
+Cut the first version: write a **baseline snapshot** at the current
+`project.version` (the anchor future `dbd snapshot` diffs against) and set
+`project.released: true`, which locks the project into the snapshot/migration
+workflow and disables `dbd reconcile`.
+
+```sh
+dbd release --name "v1 GA"   # baseline snapshot + released: true
+dbd baseline                 # alias
+```
+
+Refuses if the project is already released or if snapshots already exist, and if
+the design has entity errors (run `dbd inspect` first). After release the flow is
+the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
 
 ### dbd snapshot
 
@@ -625,8 +670,10 @@ dbd apply --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 # Full URL
 dbd inspect --source https://github.com/owner/repo/tree/main/database
 
-# Individual commands cache downloads (~/.cache/dbd/, 1 hour TTL)
-# dbd deploy downloads to temp and cleans up after
+# GitHub downloads are cached under ~/.cache/dbd (macOS: ~/Library/Caches/dbd),
+# keyed by owner-repo-ref and reused while a design.yaml is present.
+# dbd deploy --no-cache re-downloads the current source;
+# dbd deploy --clear-cache wipes the entire cache directory first.
 ```
 
 Set `GITHUB_TOKEN` for private repositories.

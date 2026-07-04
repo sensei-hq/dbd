@@ -242,13 +242,20 @@ pub async fn cmd_deploy(
     env: &str,
     database_url: Option<&str>,
     dry_run: bool,
+    no_cache: bool,
+    clear_cache: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     output::info(verbosity, &format!("Deploying from source: {source}"));
 
-    let project_dir = dbd_core::deploy::resolve_source(source)
+    if clear_cache {
+        dbd_core::deploy::clear_cache().context("Failed to clear cache")?;
+        output::info(verbosity, "Cleared download cache");
+    }
+
+    let project_dir = dbd_core::deploy::resolve_source(source, no_cache)
         .await
         .context("Failed to resolve source")?;
 
@@ -347,5 +354,162 @@ pub async fn cmd_deploy(
         }),
     };
     output::info(verbosity, &format_deploy_summary(&summary));
+    Ok(())
+}
+
+/// Reconcile the live database to the design in place (pre-release workflow).
+///
+/// Gated on `project.released`: once a project is released, schema changes must
+/// go through `dbd snapshot` + `dbd apply` instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_reconcile(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+    dry_run: bool,
+    allow_destructive: bool,
+    prune: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+
+    if design.config().project.released {
+        anyhow::bail!(
+            "Project is released — `reconcile` is disabled. \
+             Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
+        );
+    }
+
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let adapter = get_adapter(config, database_url).await?;
+
+    if dry_run {
+        let plan = design
+            .reconcile(&*adapter, true, allow_destructive, prune, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .await
+            .context("Reconcile planning failed")?;
+        print_reconcile_plan(&plan, prune, verbosity);
+        output::info(verbosity, "[dry-run] No changes applied.");
+        return Ok(());
+    }
+
+    output::info(verbosity, "Reconciling schema to design...");
+    let mut summary = None;
+    let plan = {
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .reconcile(
+                &*adapter,
+                false,
+                allow_destructive,
+                prune,
+                Some(&resolved),
+                |desc| spinner.start(desc),
+                |desc, err| spinner.done(desc, err),
+                |s| summary = Some(s),
+            )
+            .await;
+        spinner.finish();
+        result.context("Reconcile failed")?
+    };
+
+    for w in &plan.warnings {
+        output::always(&format!("⚠ {w}"));
+    }
+    // Orphaned tables left untouched (only pruned with --prune).
+    if !prune && !plan.dropped.is_empty() {
+        output::always(&format!(
+            "{} orphaned table(s) not in the design were left untouched (re-run with --prune to drop):",
+            plan.dropped.len()
+        ));
+        for s in &plan.dropped {
+            output::always(&format!("    {}", s.entity_name));
+        }
+    }
+    if let Some(s) = summary {
+        output::info(
+            verbosity,
+            &format!(
+                "Reconciled — {} created, {} altered, {} re-applied, {} pruned.",
+                s.created, s.altered, s.reapplied, s.dropped
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Print a reconcile plan (used by `--dry-run`).
+fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) {
+    if plan.is_empty() && plan.dropped.is_empty() {
+        output::info(verbosity, "Already in sync — no changes.");
+        return;
+    }
+    for name in &plan.added {
+        output::always(&format!("  + create {name}"));
+    }
+    for s in &plan.altered {
+        output::always(&format!("  ~ alter  {}", s.entity_name));
+    }
+    for s in &plan.dropped {
+        if prune {
+            output::always(&format!("  - prune  {}", s.entity_name));
+        } else {
+            output::always(&format!("  · orphan {} (use --prune to drop)", s.entity_name));
+        }
+    }
+    for w in &plan.warnings {
+        output::always(&format!("  ⚠ {w}"));
+    }
+    if plan.destructive && !plan.altered.is_empty() {
+        output::always("This plan drops columns/constraints — re-run with --allow-destructive to apply.");
+    }
+}
+
+/// Release the current version: write a baseline snapshot and set the released
+/// flag, locking the project into the snapshot/migration workflow.
+pub fn cmd_release(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+
+    if design.config().project.released {
+        anyhow::bail!("Project is already released.");
+    }
+    if dbd_core::snapshot::has_snapshots(project_dir) {
+        anyhow::bail!(
+            "Snapshots already exist — the project is already on the migration track. \
+             Use `dbd snapshot` for subsequent versions."
+        );
+    }
+
+    let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
+    if error_count > 0 {
+        anyhow::bail!(
+            "Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`)."
+        );
+    }
+
+    let version = design.config().project.version.unwrap_or(1);
+    let desc = name.unwrap_or("baseline release");
+    dbd_core::snapshot::create_baseline_snapshot(design.entities(), project_dir, config, desc, version)
+        .context("Failed to create baseline snapshot")?;
+    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
+
+    output::always(&format!(
+        "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
+    ));
+    output::info(
+        verbosity,
+        "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
+    );
     Ok(())
 }

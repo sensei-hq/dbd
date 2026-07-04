@@ -3,11 +3,29 @@ use std::path::{Path, PathBuf};
 use crate::error::{DbdError, Result};
 use crate::github;
 
+/// Remove the entire GitHub download cache directory.
+///
+/// No-op if the cache does not exist yet. Only affects downloaded GitHub
+/// sources; local sources are never cached.
+pub fn clear_cache() -> Result<()> {
+    clear_cache_dir(&github::cache_root())
+}
+
+fn clear_cache_dir(root: &Path) -> Result<()> {
+    if root.exists() {
+        std::fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
 /// Resolve a source string to a local project directory.
 ///
 /// - Local path (starts with `.`, `/`, or exists on disk): return as-is
 /// - GitHub source: download tarball, extract to cache, return cache path
-pub async fn resolve_source(source: &str) -> Result<PathBuf> {
+///
+/// When `no_cache` is true, any cached copy of the source is discarded and the
+/// tarball is re-downloaded fresh. Local sources ignore `no_cache`.
+pub async fn resolve_source(source: &str, no_cache: bool) -> Result<PathBuf> {
     if !github::is_github_source(source) {
         // Local path
         let path = PathBuf::from(source);
@@ -23,10 +41,15 @@ pub async fn resolve_source(source: &str) -> Result<PathBuf> {
     let gh = github::parse_github_source(source)?;
     let cache = github::cache_dir(&gh.owner, &gh.repo, &gh.git_ref);
 
-    // Check if already cached — resolve subpath first so subpath sources hit correctly
-    let resolved = resolve_subpath(&cache, gh.subpath.as_deref());
-    if resolved.join("design.yaml").exists() {
-        return Ok(resolved);
+    if no_cache {
+        // Drop any stale copy so the fresh download can't be shadowed by it.
+        std::fs::remove_dir_all(&cache).ok();
+    } else {
+        // Check if already cached — resolve subpath first so subpath sources hit correctly
+        let resolved = resolve_subpath(&cache, gh.subpath.as_deref());
+        if resolved.join("design.yaml").exists() {
+            return Ok(resolved);
+        }
     }
 
     // Download and extract
@@ -155,13 +178,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_path() {
         let tmp = TempDir::new().unwrap();
-        let result = resolve_source(tmp.path().to_str().unwrap()).await.unwrap();
+        let result = resolve_source(tmp.path().to_str().unwrap(), false).await.unwrap();
         assert_eq!(result, tmp.path());
     }
 
     #[tokio::test]
     async fn resolve_local_path_not_found() {
-        let result = resolve_source("/nonexistent/path/to/project").await;
+        let result = resolve_source("/nonexistent/path/to/project", false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -177,7 +200,7 @@ mod tests {
         std::fs::write(database_dir.join("design.yaml"), "project:\n  name: test\n").unwrap();
 
         // Should return the database/ subpath without attempting a network download
-        let result = resolve_source("sensei-hq/daemon/database@test-cache-hit-v1").await;
+        let result = resolve_source("sensei-hq/daemon/database@test-cache-hit-v1", false).await;
 
         // Cleanup before assertions so a failure doesn't leave files behind
         std::fs::remove_dir_all(&cache).ok();
@@ -188,5 +211,24 @@ mod tests {
             "should resolve to database/ subpath, got: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn clear_cache_dir_removes_everything() {
+        // Operate on an isolated temp root so the shared real cache (and any
+        // parallel test using it) is never touched.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("dbd");
+        let source_a = root.join("owner-repo-a");
+        let source_b = root.join("owner-repo-b");
+        std::fs::create_dir_all(&source_a).unwrap();
+        std::fs::create_dir_all(&source_b).unwrap();
+        std::fs::write(source_a.join("design.yaml"), "project:\n  name: a\n").unwrap();
+
+        clear_cache_dir(&root).expect("clear should succeed");
+        assert!(!root.exists(), "entire cache root should be removed");
+
+        // Idempotent: clearing an already-absent cache is a no-op, not an error.
+        clear_cache_dir(&root).expect("clear on missing cache should be a no-op");
     }
 }

@@ -73,8 +73,8 @@ pub async fn run(
             }
         }
 
-        Commands::Deploy { dry_run } => {
-            project::cmd_deploy(source, config, env, database_url, *dry_run, scope, deps, verbosity).await
+        Commands::Deploy { dry_run, no_cache, clear_cache } => {
+            project::cmd_deploy(source, config, env, database_url, *dry_run, *no_cache, *clear_cache, scope, deps, verbosity).await
         }
 
         Commands::Export { name, format, output } => {
@@ -170,6 +170,14 @@ pub async fn run(
 
         Commands::Policies { dry_run } => {
             schema::cmd_policies(config, project_dir, database_url, *dry_run, verbosity).await
+        }
+
+        Commands::Reconcile { dry_run, allow_destructive, prune } => {
+            project::cmd_reconcile(config, env, project_dir, database_url, *dry_run, *allow_destructive, *prune, scope, deps, verbosity).await
+        }
+
+        Commands::Release { name } => {
+            project::cmd_release(config, env, project_dir, name.as_deref(), verbosity)
         }
     }
 }

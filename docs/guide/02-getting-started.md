@@ -152,3 +152,13 @@ dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
 dbd deploy --source ./local/path -d $DATABASE_URL
 dbd deploy --dry-run --source owner/repo/path
 ```
+
+GitHub sources are downloaded once and cached under `~/.cache/dbd`
+(`~/Library/Caches/dbd` on macOS). To force a fresh copy:
+
+```sh
+dbd deploy --no-cache --source owner/repo/path -d $DATABASE_URL     # re-download this source
+dbd deploy --clear-cache --source owner/repo/path -d $DATABASE_URL  # wipe the whole cache first
+```
+
+Both flags are no-ops for local path sources (`--clear-cache` still clears the cache).
