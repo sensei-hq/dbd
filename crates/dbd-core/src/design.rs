@@ -1168,13 +1168,32 @@ impl Design {
             }
         }
 
+        // Generated ALTERs carry no `set search_path`, unlike the project's DDL
+        // files. Prepend one covering every managed schema (+ public) so bare
+        // references — e.g. an enum type or a default calling a managed function —
+        // resolve the same way they do when the DDL file runs.
+        let search_path = {
+            let mut schemas: Vec<&str> = managed_schemas.iter().map(|s| s.as_str()).collect();
+            schemas.sort_unstable();
+            if !schemas.contains(&"public") {
+                schemas.push("public");
+            }
+            let list = schemas
+                .iter()
+                .map(|s| format!("\"{s}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("SET search_path TO {list};\n")
+        };
+
         // Pass B — ALTER existing tables/enums, in dependency order.
         for e in &desired_entities {
             let n = qualified_entity_name(e);
             if let Some(sql) = alter_sql.get(n.as_str()) {
                 let desc = format!("alter {}:{n}", e.entity_type.tag());
                 on_start(&desc);
-                let result = adapter.execute_script(sql).await;
+                let script = format!("{search_path}{sql}");
+                let result = adapter.execute_script(&script).await;
                 report_step_result(&desc, &mut on_done, result)?;
                 summary.altered += 1;
             }

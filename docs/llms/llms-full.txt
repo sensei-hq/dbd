@@ -456,6 +456,17 @@ design). Without `--prune`, orphans are reported and left in place. Orphaned
 enums are only warned about, never auto-dropped. Reconcile is **disabled once the
 project is released** (`project.released: true`) — see `dbd release`.
 
+Reconcile compares the introspected live schema against the design and
+canonicalizes the two representations first: it lifts inline PK/UNIQUE to
+structural constraints, strips constraint names, schema-qualifies bare enum types
+(`status` → `config.status`) to match introspection, and normalizes type aliases
+(`int4` → `integer`, `timestamptz` → `timestamp with time zone`). It reconciles
+**columns** (name/type/nullability/default/identity) and **PK/UNIQUE**
+constraints only. Foreign keys, check constraints, and indexes are **not**
+diffed on existing tables (introspected vs parsed forms diverge) — change those
+via `dbd snapshot`. Generated ALTERs run with the managed schemas on
+`search_path`, mirroring the DDL files.
+
 ### dbd release (alias: dbd baseline)
 
 Cut the first version: write a **baseline snapshot** at the current
