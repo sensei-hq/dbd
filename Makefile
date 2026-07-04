@@ -25,7 +25,13 @@ else
   NEW := $(MAJOR).$(MINOR).$(shell echo $$(($(PATCH)+1)))
 endif
 
-.PHONY: help bump patch minor major install _check-clean _check-ci
+# Builds invoked through this Makefile (bump's test/clippy/build) run once and
+# then get wiped, so incremental compilation only writes cache we immediately
+# delete. Disable it for all make-driven cargo builds — day-to-day dev uses
+# plain `cargo` and is unaffected.
+export CARGO_INCREMENTAL := 0
+
+.PHONY: help bump patch minor major install clean sweep _check-clean _check-ci
 
 ## Show this help.
 help:
@@ -35,10 +41,13 @@ help:
 	@echo "  make bump minor    Bump minor, commit, tag, push"
 	@echo "  make bump major    Bump major, commit, tag, push"
 	@echo "  make install       Install dbd into ~/.cargo/bin from working tree"
+	@echo "  make clean         Remove the target/ build directory (cargo clean)"
+	@echo "  make sweep         Prune stale/old-version artifacts (needs cargo-sweep)"
 	@echo ""
 	@echo "All bump targets refuse to run if the working tree has uncommitted"
 	@echo "changes or local HEAD differs from origin/main, and require tests"
-	@echo "and clippy to pass first."
+	@echo "and clippy to pass first. After a successful push, bump runs"
+	@echo "'cargo clean' to reclaim disk (next dev build recompiles fresh)."
 	@echo ""
 	@echo "Current version: $(VERSION)"
 
@@ -49,6 +58,22 @@ patch minor major:
 ## Install the dbd binary into ~/.cargo/bin from the current working tree.
 install:
 	@cargo install --path crates/dbd-cli --locked --force
+
+## Remove the target/ build directory to reclaim disk space.
+clean:
+	@cargo clean
+
+## Prune stale build artifacts (other toolchains + files untouched for 14 days),
+## keeping the current working set so the next build stays warm. Needs cargo-sweep.
+sweep:
+	@if ! command -v cargo-sweep >/dev/null 2>&1; then \
+	  echo "cargo-sweep not installed. Install it with:"; \
+	  echo "  cargo install cargo-sweep"; \
+	  echo "Or run 'make clean' to wipe target/ entirely."; \
+	  exit 1; \
+	fi
+	@cargo sweep --installed
+	@cargo sweep --time 14
 
 ## Bump version (commits, tags, pushes). Refuses if tree is dirty or CI fails.
 bump: _check-clean _check-ci
@@ -65,6 +90,9 @@ bump: _check-clean _check-ci
 	@git push origin $(BRANCH)
 	@git push origin "v$(NEW)"
 	@echo "Released v$(NEW) on $(BRANCH). Now merge $(BRANCH) → main."
+	@echo "Reclaiming disk: removing debug + stale build artifacts..."
+	@cargo clean
+	@echo "target/ cleaned; next build recompiles against the current lockfile."
 
 # Refuse to bump if the working tree has uncommitted changes or untracked
 # files. Also require local HEAD to be in sync with origin/<current branch>
