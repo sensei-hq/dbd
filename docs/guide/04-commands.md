@@ -273,6 +273,16 @@ Orphaned *enums* are only warned about, never auto-dropped (columns may still re
 Reconcile is **disabled once the project is released** (`project.released: true`) — see `dbd release`.
 `--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
 
+**What reconcile compares** (against the introspected live schema): columns
+(name, type, nullability, default, identity) and primary-key / unique constraints. Bare enum types
+are schema-qualified to match introspection, and common type aliases are normalized (`int4` →
+`integer`, `timestamptz` → `timestamp with time zone`). **Not** reconciled on existing tables:
+foreign keys, check constraints, and indexes — their introspected and parsed forms differ too much
+to diff reliably, so change those via `dbd snapshot` (they're still created with the initial
+`CREATE`). Because introspected and hand-written DDL can spell a default or exotic type differently,
+reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
+`--dry-run` first.
+
 ---
 
 ## `dbd release` (alias `dbd baseline`)

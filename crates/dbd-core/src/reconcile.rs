@@ -13,8 +13,10 @@
 //! module holds the pure planning logic so it can be unit-tested without a
 //! database.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::diff::{self, ChangeAction, DiffAction, MigrationDiff};
-use crate::entity::{Entity, EntityType};
+use crate::entity::{Entity, EntityType, TableConstraint};
 use crate::snapshot::{self, Snapshot};
 
 /// A single entity that will be altered or dropped, paired with its DDL.
@@ -91,12 +93,130 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
             e
         })
         .collect();
-    Snapshot {
+    let mut snap = Snapshot {
         version: 0,
         description: String::new(),
         timestamp: String::new(),
         tables,
         enums,
+    };
+    canonicalize(&mut snap);
+    snap
+}
+
+/// Canonicalize a snapshot so a **parsed** (desired) table and an **introspected**
+/// (live) table of the same shape compare equal. The two representations diverge:
+///
+/// - Introspection decomposes inline `PRIMARY KEY`/`UNIQUE` into named table-level
+///   constraints and never sets column `is_pk`/`is_unique`; the parser keeps them
+///   inline. → lift inline flags into unnamed constraints, strip constraint names,
+///   clear the column flags.
+/// - Introspection schema-qualifies enum types not on the session `search_path`
+///   (`config.status`) while DDL written with `set search_path` leaves them bare
+///   (`status`). → qualify column types that name a known enum, and lowercase +
+///   alias-normalize type spellings (`INT4` → `integer`, `timestamptz` →
+///   `timestamp with time zone`).
+///
+/// Foreign keys, check constraints and indexes are **dropped from the diff
+/// entirely** — their introspected/parsed forms differ too much to compare
+/// reliably, so reconcile does not manage them on existing tables (create them via
+/// the initial `CREATE`, or use snapshots). Column comments are cleared too.
+pub fn canonicalize(snap: &mut Snapshot) {
+    // short enum name (lowercased) → canonical column-type spelling. Mirrors what
+    // Postgres `format_type` emits: bare for `public`, `schema.name` otherwise.
+    let mut enum_types: HashMap<String, String> = HashMap::new();
+    for e in &snap.enums {
+        let short = e.name.to_lowercase();
+        let canonical = if e.schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            short.clone()
+        } else {
+            format!("{}.{}", e.schema.to_lowercase(), short)
+        };
+        enum_types.insert(short, canonical);
+    }
+
+    for t in &mut snap.tables {
+        // Collect PK/UNIQUE from inline column flags + existing table constraints,
+        // strip names, dedup by structure. FK/CHECK are intentionally excluded.
+        let mut kept: Vec<TableConstraint> = Vec::new();
+        let mut seen: HashSet<(char, String)> = HashSet::new();
+        let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
+            let key = match &c {
+                TableConstraint::PrimaryKey { columns, .. } => ('p', columns.join(",")),
+                TableConstraint::Unique { columns, .. } => ('u', columns.join(",")),
+                _ => return,
+            };
+            if seen.insert(key) {
+                kept.push(c);
+            }
+        };
+        for con in std::mem::take(&mut t.table_constraints) {
+            match con {
+                TableConstraint::PrimaryKey { columns, .. } => {
+                    push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
+                }
+                TableConstraint::Unique { columns, .. } => {
+                    push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
+                }
+                _ => {} // FK / CHECK excluded
+            }
+        }
+        for c in &t.columns {
+            if c.is_pk {
+                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
+            }
+            if c.is_unique {
+                push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
+            }
+        }
+        t.table_constraints = kept;
+        // Indexes are not reconciled (introspect/parse forms diverge).
+        t.indexes.clear();
+        // Normalize column types; clear inline flags and comments.
+        for c in &mut t.columns {
+            c.data_type = canonical_type(&c.data_type, &enum_types);
+            c.is_pk = false;
+            c.is_unique = false;
+            c.inline_fk = None;
+            c.comment = None;
+        }
+    }
+}
+
+/// Normalize a column type for cross-representation comparison: lowercase, drop a
+/// redundant `public.` prefix, map common Postgres aliases to the `format_type`
+/// spelling, and schema-qualify a bare enum name using `enum_types`.
+fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
+    let mut s = raw.trim().to_lowercase();
+    if let Some(rest) = s.strip_prefix("public.") {
+        s = rest.to_string();
+    }
+    // Split "base(args)" so parameterized aliases (varchar(255)) normalize too.
+    let (base, args) = match s.split_once('(') {
+        Some((b, rest)) => (b.trim().to_string(), Some(format!("({rest}"))),
+        None => (s.clone(), None),
+    };
+    let base = match base.as_str() {
+        "int" | "int4" => "integer".to_string(),
+        "int8" => "bigint".to_string(),
+        "int2" => "smallint".to_string(),
+        "bool" => "boolean".to_string(),
+        "float8" => "double precision".to_string(),
+        "float4" => "real".to_string(),
+        "timestamptz" => "timestamp with time zone".to_string(),
+        "timetz" => "time with time zone".to_string(),
+        "varchar" => "character varying".to_string(),
+        "char" | "bpchar" => "character".to_string(),
+        "decimal" => "numeric".to_string(),
+        // Qualify a bare enum reference to match introspection.
+        other if !other.contains('.') => {
+            enum_types.get(other).cloned().unwrap_or_else(|| other.to_string())
+        }
+        other => other.to_string(),
+    };
+    match args {
+        Some(a) => format!("{base}{a}"),
+        None => base,
     }
 }
 
@@ -182,7 +302,7 @@ pub struct ReconcileComplete {
 mod tests {
     use super::*;
     use crate::entity::ColumnDef;
-    use crate::snapshot::TableSnapshot;
+    use crate::snapshot::{EnumSnapshot, TableSnapshot};
 
     fn col(name: &str, data_type: &str) -> ColumnDef {
         ColumnDef {
@@ -283,6 +403,76 @@ mod tests {
         assert!(
             !plan.destructive,
             "whole-table drop is gated by prune, not allow_destructive"
+        );
+    }
+
+    fn pk_col(name: &str, ty: &str) -> ColumnDef {
+        ColumnDef { is_pk: true, nullable: false, ..col(name, ty) }
+    }
+    fn not_null(name: &str, ty: &str) -> ColumnDef {
+        ColumnDef { nullable: false, ..col(name, ty) }
+    }
+
+    /// The core cross-representation guarantee: a table as the parser sees it
+    /// (inline PK, bare enum type, uppercase spelling) and as introspection sees
+    /// it (named PK constraint, schema-qualified enum, lowercase) reconcile to
+    /// *no changes* after canonicalization.
+    #[test]
+    fn canonicalize_reconciles_parsed_vs_introspected() {
+        let enum_def = EnumSnapshot {
+            name: "assistant_family".to_string(),
+            schema: "config".to_string(),
+            values: vec!["gpt".to_string(), "claude".to_string()],
+        };
+
+        // Parsed (desired): inline PK, uppercase `UUID`, bare enum type, int alias.
+        let mut desired = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "agents".to_string(),
+                schema: "config".to_string(),
+                columns: vec![
+                    pk_col("id", "UUID"),
+                    not_null("family", "assistant_family"),
+                    not_null("rank", "int4"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![enum_def.clone()],
+        };
+
+        // Introspected (live): PK as a named table constraint, qualified enum type,
+        // canonical lowercase spellings, plus a PK-backing index (ignored).
+        let mut live = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "agents".to_string(),
+                schema: "config".to_string(),
+                columns: vec![
+                    not_null("id", "uuid"),
+                    not_null("family", "config.assistant_family"),
+                    not_null("rank", "integer"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![TableConstraint::PrimaryKey {
+                    name: Some("agents_pkey".to_string()),
+                    columns: vec!["id".to_string()],
+                }],
+            }],
+            enums: vec![enum_def],
+        };
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "parsed and introspected forms of the same table must reconcile to no changes; got {plan:?}"
         );
     }
 }
