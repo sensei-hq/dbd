@@ -73,6 +73,37 @@ pub trait DatabaseAdapter: Send + Sync {
         false
     }
 
+    // ── Batch transaction (atomic apply) ───────────────
+    //
+    // When an adapter's backend has transactional DDL, `Design::apply` wraps the
+    // whole execution plan in one transaction: begin → run every step → commit,
+    // or rollback on the first failure so an interrupted upgrade leaves the schema
+    // at its prior version rather than half-applied. Adapters opt in by returning
+    // `true` here and routing their DDL/meta writes through the open transaction
+    // between `begin_batch` and `commit_batch`/`rollback_batch`.
+
+    /// True if an entire apply batch can run inside one transaction (the backend
+    /// has transactional DDL). Default `false` — apply runs step-by-step as today.
+    fn supports_transactional_apply(&self) -> bool {
+        false
+    }
+
+    /// Open a batch transaction. Until `commit_batch`/`rollback_batch`, DDL and
+    /// meta writes route through it. Default is a no-op.
+    async fn begin_batch(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commit the open batch transaction. Default is a no-op.
+    async fn commit_batch(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Roll back the open batch transaction. Default is a no-op.
+    async fn rollback_batch(&self) -> Result<()> {
+        Ok(())
+    }
+
     // ── Data operations ────────────────────────────────
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()>;

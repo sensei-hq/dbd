@@ -919,72 +919,104 @@ impl Design {
             .map(|e| (e.name.as_str(), e))
             .collect();
 
-        // Execute plan steps
-        for step in &plan.steps {
-            match step {
-                ExecutionStep::CreateEntity(entity_name) => {
-                    if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                        let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+        // Wrap the whole plan in one transaction when the backend supports it,
+        // so an interrupted upgrade rolls back to the prior schema instead of
+        // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
+        // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
+        let use_txn = adapter.supports_transactional_apply()
+            && std::env::var_os("DBD_NO_TX").is_none()
+            && !plan.steps.is_empty();
+
+        if use_txn {
+            adapter.begin_batch().await?;
+        }
+
+        // Execute plan steps inside an async block so a mid-plan error routes
+        // through rollback below rather than returning early.
+        let exec: Result<()> = async {
+            for step in &plan.steps {
+                match step {
+                    ExecutionStep::CreateEntity(entity_name) => {
+                        if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                            let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+                            on_start(&desc);
+                            let result = adapter.apply_entity(entity).await;
+                            report_step_result(&desc, &mut on_done, result)?;
+                            count_created += 1;
+                            count_applied += 1;
+                        }
+                    }
+                    ExecutionStep::ApplyEntity(entity_name) => {
+                        if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                            let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+                            on_start(&desc);
+                            let result = adapter.apply_entity(entity).await;
+                            report_step_result(&desc, &mut on_done, result)?;
+                            count_applied += 1;
+                        }
+                    }
+                    ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
+                        let type_tag = entity_map.get(entity_name.as_str())
+                            .map(|e| e.entity_type.tag())
+                            .unwrap_or_else(|| "entity".to_string());
+                        let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
                         on_start(&desc);
-                        let result = adapter.apply_entity(entity).await;
+                        let result: Result<()> = async {
+                            if migration_sql_path.exists() {
+                                let sql = std::fs::read_to_string(migration_sql_path)?;
+                                adapter.execute_script(&sql).await?;
+                            }
+                            let data_path = migration_sql_path.with_extension("data.sql");
+                            if data_path.exists() {
+                                let sql = std::fs::read_to_string(&data_path)?;
+                                adapter.execute_script(&sql).await?;
+                            }
+                            Ok(())
+                        }.await;
                         report_step_result(&desc, &mut on_done, result)?;
-                        count_created += 1;
-                        count_applied += 1;
+                        count_migrated += 1;
+                    }
+                    ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
+                        let type_tag = entity_map.get(entity_name.as_str())
+                            .map(|e| e.entity_type.tag())
+                            .unwrap_or_else(|| "entity".to_string());
+                        let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
+                        on_start(&desc);
+                        let result: Result<()> = async {
+                            if drop_sql_path.exists() {
+                                let sql = std::fs::read_to_string(drop_sql_path)?;
+                                adapter.execute_script(&sql).await?;
+                            }
+                            Ok(())
+                        }.await;
+                        report_step_result(&desc, &mut on_done, result)?;
+                        count_dropped += 1;
+                    }
+                    ExecutionStep::RecordMigration { version, checksum } => {
+                        let desc = format!("migration to v{version}");
+                        adapter.apply_migration(*version, "", &desc, checksum).await?;
+                    }
+                    ExecutionStep::SetVersion(version) => {
+                        adapter.set_project_meta(&self.env, *version).await?;
                     }
                 }
-                ExecutionStep::ApplyEntity(entity_name) => {
-                    if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                        let desc = format!("{}:{entity_name}", entity.entity_type.tag());
-                        on_start(&desc);
-                        let result = adapter.apply_entity(entity).await;
-                        report_step_result(&desc, &mut on_done, result)?;
-                        count_applied += 1;
-                    }
+            }
+            Ok(())
+        }
+        .await;
+
+        match exec {
+            Ok(()) => {
+                if use_txn {
+                    adapter.commit_batch().await?;
                 }
-                ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                    let type_tag = entity_map.get(entity_name.as_str())
-                        .map(|e| e.entity_type.tag())
-                        .unwrap_or_else(|| "entity".to_string());
-                    let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
-                    on_start(&desc);
-                    let result: Result<()> = async {
-                        if migration_sql_path.exists() {
-                            let sql = std::fs::read_to_string(migration_sql_path)?;
-                            adapter.execute_script(&sql).await?;
-                        }
-                        let data_path = migration_sql_path.with_extension("data.sql");
-                        if data_path.exists() {
-                            let sql = std::fs::read_to_string(&data_path)?;
-                            adapter.execute_script(&sql).await?;
-                        }
-                        Ok(())
-                    }.await;
-                    report_step_result(&desc, &mut on_done, result)?;
-                    count_migrated += 1;
+            }
+            Err(e) => {
+                if use_txn {
+                    // Best-effort rollback; surface the original failure.
+                    let _ = adapter.rollback_batch().await;
                 }
-                ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                    let type_tag = entity_map.get(entity_name.as_str())
-                        .map(|e| e.entity_type.tag())
-                        .unwrap_or_else(|| "entity".to_string());
-                    let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
-                    on_start(&desc);
-                    let result: Result<()> = async {
-                        if drop_sql_path.exists() {
-                            let sql = std::fs::read_to_string(drop_sql_path)?;
-                            adapter.execute_script(&sql).await?;
-                        }
-                        Ok(())
-                    }.await;
-                    report_step_result(&desc, &mut on_done, result)?;
-                    count_dropped += 1;
-                }
-                ExecutionStep::RecordMigration { version, checksum } => {
-                    let desc = format!("migration to v{version}");
-                    adapter.apply_migration(*version, "", &desc, checksum).await?;
-                }
-                ExecutionStep::SetVersion(version) => {
-                    adapter.set_project_meta(&self.env, *version).await?;
-                }
+                return Err(e);
             }
         }
 
@@ -1857,6 +1889,54 @@ mod tests {
         let mock = MockAdapter::new();
 
         design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        assert!(!mock.applied_names().is_empty());
+    }
+
+    // ── Transactional apply (atomic batch) ───────────────
+
+    #[tokio::test]
+    async fn apply_commits_batch_transaction_on_success() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new().with_transactions();
+
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+
+        assert_eq!(mock.txn_log(), vec!["begin", "commit"]);
+    }
+
+    #[tokio::test]
+    async fn apply_rolls_back_batch_transaction_on_failure() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        // Fail on the first entity that would be applied, so the batch aborts mid-plan.
+        let target = design
+            .entities()
+            .iter()
+            .find(|e| e.errors.is_empty() && e.entity_type != EntityType::External)
+            .map(|e| e.name.clone())
+            .expect("fixture has at least one applicable entity");
+        let mock = MockAdapter::new().with_transactions().fail_on_entity(&target);
+
+        let err = design
+            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected failure"));
+        assert_eq!(mock.txn_log(), vec!["begin", "rollback"]);
+    }
+
+    #[tokio::test]
+    async fn apply_without_txn_support_skips_transaction() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new(); // supports_transactional_apply() == false
+
+        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+
+        assert!(mock.txn_log().is_empty());
         assert!(!mock.applied_names().is_empty());
     }
 

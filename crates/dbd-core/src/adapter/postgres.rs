@@ -51,6 +51,11 @@ pub struct PostgresAdapter {
     catalog: CatalogData,
     /// SHA-256 of the connection URL, used as cache key.
     url_hash: String,
+    /// Open batch transaction, if `begin_batch` has been called. While `Some`,
+    /// DDL and meta writes route through it so `Design::apply` is atomic.
+    /// `Pool::begin` yields a `'static` transaction (it owns a pooled
+    /// connection), so it can be held across the whole apply loop.
+    batch: tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>,
 }
 
 impl PostgresAdapter {
@@ -73,7 +78,34 @@ impl PostgresAdapter {
             project: project.to_string(),
             catalog: CatalogData::default(),
             url_hash,
+            batch: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Execute raw SQL against the open batch transaction if one exists, else
+    /// against the pool. Kept as an inherent async fn (not a trait method) so
+    /// the `Executor` bound resolves without the HRTB error that `#[async_trait]`
+    /// desugaring produces for `raw_sql` against `&mut PgConnection`.
+    async fn exec_raw(&self, sql: &str) -> Result<()> {
+        use sqlx::Executor as _;
+        let mut guard = self.batch.lock().await;
+        if let Some(mut tx) = guard.take() {
+            // Inside a batch transaction, execute via `Executor::execute(&str)`.
+            // A bare `&str` carries no bind arguments, so sqlx uses the simple
+            // query protocol — multi-statement DDL runs as one unit, just like
+            // `raw_sql` on the pool below. Unlike `raw_sql`, this future is
+            // `Send` against `&mut PgConnection`, which `#[async_trait]` requires.
+            // We own the transaction locally while executing, then put it back.
+            let result = (&mut *tx).execute(sql).await;
+            *guard = Some(tx);
+            result.map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+        } else {
+            sqlx::raw_sql(sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Static pattern matching for reference classification (offline fallback).
@@ -847,12 +879,8 @@ impl DatabaseAdapter for PostgresAdapter {
         // Ensure `public` is always in the search_path — extensions may be
         // installed there and DDL files often SET search_path without including it.
         let sql = ensure_public_in_search_path(sql);
-
-        sqlx::raw_sql(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
-        Ok(())
+        // Route through the open batch transaction if one exists (see `exec_raw`).
+        self.exec_raw(&sql).await
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
@@ -1356,7 +1384,10 @@ impl DatabaseAdapter for PostgresAdapter {
         if !sql.is_empty() {
             self.execute_script(sql).await?;
         }
-        sqlx::query(
+        // Reset any leaked search_path (see `set_project_meta`) so the migration
+        // row lands in the same schema `_dbd_migrations` was created in.
+        self.execute_script("RESET search_path").await?;
+        let q = sqlx::query(
             "INSERT INTO _dbd_migrations (project, version, description, checksum) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (project, version) DO NOTHING"
@@ -1364,9 +1395,12 @@ impl DatabaseAdapter for PostgresAdapter {
         .bind(&self.project)
         .bind(version as i32)
         .bind(description)
-        .bind(checksum)
-        .execute(&self.pool)
-        .await
+        .bind(checksum);
+        let mut guard = self.batch.lock().await;
+        match guard.as_mut() {
+            Some(tx) => q.execute(&mut **tx).await,
+            None => q.execute(&self.pool).await,
+        }
         .map_err(|e| DbdError::Migration(format!("Record migration failed: {e}")))?;
 
         Ok(())
@@ -1428,8 +1462,13 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+        // Reset the ambient search_path first: inside a batch transaction every
+        // statement shares one connection, so an entity's `SET search_path`
+        // leaks here and would otherwise create/insert `_dbd_meta` in the wrong
+        // schema. Reset makes the bookkeeping tables resolve deterministically.
+        self.execute_script("RESET search_path").await?;
         self.ensure_meta_table().await?;
-        sqlx::query(
+        let q = sqlx::query(
             "INSERT INTO _dbd_meta (project, env, version) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (project) DO UPDATE \
@@ -1437,11 +1476,47 @@ impl DatabaseAdapter for PostgresAdapter {
         )
         .bind(&self.project)
         .bind(env)
-        .bind(version as i32)
-        .execute(&self.pool)
-        .await
+        .bind(version as i32);
+        let mut guard = self.batch.lock().await;
+        match guard.as_mut() {
+            Some(tx) => q.execute(&mut **tx).await,
+            None => q.execute(&self.pool).await,
+        }
         .map_err(|e| DbdError::Config(format!("Set project meta failed: {e}")))?;
 
+        Ok(())
+    }
+
+    // ── Batch transaction (atomic apply) ───────────────
+
+    fn supports_transactional_apply(&self) -> bool {
+        true
+    }
+
+    async fn begin_batch(&self) -> Result<()> {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbdError::Config(format!("begin batch transaction failed: {e}")))?;
+        *self.batch.lock().await = Some(tx);
+        Ok(())
+    }
+
+    async fn commit_batch(&self) -> Result<()> {
+        if let Some(tx) = self.batch.lock().await.take() {
+            tx.commit()
+                .await
+                .map_err(|e| DbdError::Config(format!("commit batch transaction failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_batch(&self) -> Result<()> {
+        if let Some(tx) = self.batch.lock().await.take() {
+            // Best-effort — the caller is already returning the original error.
+            let _ = tx.rollback().await;
+        }
         Ok(())
     }
 }
