@@ -17,6 +17,12 @@ pub struct MockAdapter {
     pub connected: bool,
     /// Entity names that `resolve_entity` should report as existing.
     pub known_entities: Arc<Mutex<HashSet<String>>>,
+    /// Ordered log of batch-transaction lifecycle calls: "begin"/"commit"/"rollback".
+    pub txn: Arc<Mutex<Vec<String>>>,
+    /// Whether this mock reports transactional-apply support.
+    pub supports_txn: bool,
+    /// If set, `apply_entity` errors for this entity name (fault injection).
+    pub fail_on: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for MockAdapter {
@@ -34,7 +40,27 @@ impl MockAdapter {
             meta: Arc::new(Mutex::new(None)),
             connected: false,
             known_entities: Arc::new(Mutex::new(HashSet::new())),
+            txn: Arc::new(Mutex::new(Vec::new())),
+            supports_txn: false,
+            fail_on: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Report transactional-apply support so `Design::apply` wraps the batch.
+    pub fn with_transactions(mut self) -> Self {
+        self.supports_txn = true;
+        self
+    }
+
+    /// Make `apply_entity` fail when it reaches `name`, to exercise rollback.
+    pub fn fail_on_entity(self, name: &str) -> Self {
+        *self.fail_on.lock().unwrap() = Some(name.to_string());
+        self
+    }
+
+    /// Ordered batch-transaction lifecycle log ("begin"/"commit"/"rollback").
+    pub fn txn_log(&self) -> Vec<String> {
+        self.txn.lock().unwrap().clone()
     }
 
     /// Configure `resolve_entity` to report these names as existing in the DB.
@@ -100,7 +126,32 @@ impl DatabaseAdapter for MockAdapter {
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
+        if self.fail_on.lock().unwrap().as_deref() == Some(entity.name.as_str()) {
+            return Err(crate::error::DbdError::Config(format!(
+                "mock: injected failure applying {}",
+                entity.name
+            )));
+        }
         self.applied.lock().unwrap().push(entity.name.clone());
+        Ok(())
+    }
+
+    fn supports_transactional_apply(&self) -> bool {
+        self.supports_txn
+    }
+
+    async fn begin_batch(&self) -> Result<()> {
+        self.txn.lock().unwrap().push("begin".to_string());
+        Ok(())
+    }
+
+    async fn commit_batch(&self) -> Result<()> {
+        self.txn.lock().unwrap().push("commit".to_string());
+        Ok(())
+    }
+
+    async fn rollback_batch(&self) -> Result<()> {
+        self.txn.lock().unwrap().push("rollback".to_string());
         Ok(())
     }
 

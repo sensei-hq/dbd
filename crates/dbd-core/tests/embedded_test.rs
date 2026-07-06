@@ -1345,3 +1345,58 @@ async fn reconcile_dry_run_is_read_only() {
     assert_eq!(plan.added, vec!["app.items".to_string()], "plan proposes the new table");
     assert_table_absent(&*adapter, "app", "items").await; // nothing created
 }
+
+// ── Batch transaction (atomic apply) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn batch_commit_persists_ddl() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "batch_test").await.unwrap();
+
+    adapter.begin_batch().await.expect("begin_batch");
+    adapter
+        .execute_script("CREATE SCHEMA committed_schema")
+        .await
+        .expect("ddl inside batch");
+    adapter.commit_batch().await.expect("commit_batch");
+
+    // After commit the schema is durable and visible on a fresh pool connection.
+    assert_schema_exists(&*adapter, "committed_schema").await;
+}
+
+#[tokio::test]
+async fn batch_rollback_discards_ddl() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "batch_test").await.unwrap();
+
+    adapter.begin_batch().await.expect("begin_batch");
+    adapter
+        .execute_script("CREATE SCHEMA rolled_back_schema")
+        .await
+        .expect("ddl inside batch");
+    adapter.rollback_batch().await.expect("rollback_batch");
+
+    // The schema created inside the batch must be gone after rollback.
+    assert_schema_absent(&*adapter, "rolled_back_schema").await;
+}
+
+#[tokio::test]
+async fn batch_failure_mid_plan_rolls_back_prior_ddl() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "batch_test").await.unwrap();
+
+    // Simulate an interrupted upgrade: an early object succeeds, a later one
+    // fails. The whole batch must roll back — the prior object leaves no trace.
+    adapter.begin_batch().await.expect("begin_batch");
+    adapter
+        .execute_script("CREATE SCHEMA partial_schema")
+        .await
+        .expect("first object applies");
+    let failed = adapter
+        .execute_script("CREATE TABLE partial_schema.t (id nonexistent_type)")
+        .await;
+    assert!(failed.is_err(), "invalid DDL should error");
+    adapter.rollback_batch().await.expect("rollback_batch");
+
+    assert_schema_absent(&*adapter, "partial_schema").await;
+}
