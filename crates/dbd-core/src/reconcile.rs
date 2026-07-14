@@ -150,9 +150,11 @@ pub fn canonicalize(snap: &mut Snapshot) {
                 kept.push(c);
             }
         };
+        let mut has_table_pk = false;
         for con in std::mem::take(&mut t.table_constraints) {
             match con {
                 TableConstraint::PrimaryKey { columns, .. } => {
+                    has_table_pk = true;
                     push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
                 }
                 TableConstraint::Unique { columns, .. } => {
@@ -162,7 +164,16 @@ pub fn canonicalize(snap: &mut Snapshot) {
             }
         }
         for c in &t.columns {
-            if c.is_pk {
+            // A column's is_pk flag restates the table's single primary key. When a
+            // table-level PRIMARY KEY is already present — e.g. a composite
+            // `primary key (a, b)`, which the SQL parser emits BOTH as a table
+            // constraint AND as an is_pk flag on each member column — lifting the
+            // per-column flags would fabricate spurious single-column PKs (pk(a),
+            // pk(b)) that no live table has, producing bogus `ADD CONSTRAINT …
+            // PRIMARY KEY` reconcile steps (and "multiple primary keys" errors). A
+            // table has exactly one PK, so only synthesize one from a column flag
+            // when no table-level PK exists (the inline single-column PK case).
+            if c.is_pk && !has_table_pk {
                 push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
             }
             if c.is_unique {
@@ -172,9 +183,10 @@ pub fn canonicalize(snap: &mut Snapshot) {
         t.table_constraints = kept;
         // Indexes are not reconciled (introspect/parse forms diverge).
         t.indexes.clear();
-        // Normalize column types; clear inline flags and comments.
+        // Normalize column types and defaults; clear inline flags and comments.
         for c in &mut t.columns {
             c.data_type = canonical_type(&c.data_type, &enum_types);
+            c.default_value = c.default_value.as_deref().map(canonical_default);
             c.is_pk = false;
             c.is_unique = false;
             c.inline_fk = None;
@@ -218,6 +230,77 @@ fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
         Some(a) => format!("{base}{a}"),
         None => base,
     }
+}
+
+/// Normalize a column default so a **parsed** literal and Postgres's
+/// **introspected** round-trip of the same default compare equal.
+///
+/// Introspection reads defaults back through `pg_get_expr`, which re-emits them
+/// in a canonical form that annotates the whole expression with an explicit cast:
+/// a source `'{}'` comes back as `'{}'::text[]`, `'active'` as
+/// `'active'::config.status`, `''` as `''::text`. Compared textually against the
+/// source these look changed, so reconcile emits a redundant `SET DEFAULT` on
+/// every run against an already-current DB (issue #5).
+///
+/// Strip a single trailing top-level `::type` cast plus surrounding whitespace so
+/// both sides converge on the bare literal. Casts *inside* the expression are left
+/// intact — `nextval('seq'::regclass)` and other function calls are untouched —
+/// and a genuine type change is still caught by the column's `data_type` diff, so
+/// erasing the cast here can't hide a real change.
+fn canonical_default(raw: &str) -> String {
+    strip_trailing_cast(raw.trim()).trim().to_string()
+}
+
+/// Remove a trailing top-level `::type` cast from a default expression. Tracks
+/// single-quoted string literals (with `''` escapes) and parenthesis depth so a
+/// `::` inside a string or a function call's arguments is never mistaken for the
+/// outer cast. Returns the input unchanged when there is no such cast or the tail
+/// after it isn't a plausible type name (guards against clipping an operator
+/// expression like `'a'::text || 'b'`).
+fn strip_trailing_cast(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut in_str = false;
+    let mut depth: i32 = 0;
+    let mut last_cast: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                // `''` inside a string is an escaped quote, not a terminator.
+                if in_str && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_str = !in_str;
+            }
+            b'(' if !in_str => depth += 1,
+            b')' if !in_str => depth -= 1,
+            b':' if !in_str && depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                last_cast = Some(i);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match last_cast {
+        Some(pos) if is_plausible_type(&s[pos + 2..]) => s[..pos].trim_end(),
+        _ => s,
+    }
+}
+
+/// Whether `tail` (the text after a top-level `::`) looks like a bare type name —
+/// only the characters Postgres uses in type spellings: letters, digits, and
+/// `_ . [ ] ( ) ,` plus spaces (`timestamp with time zone`) and `"` (quoted
+/// identifiers). Anything else means the `::` was part of a larger expression, so
+/// we must not strip it.
+fn is_plausible_type(tail: &str) -> bool {
+    let tail = tail.trim();
+    !tail.is_empty()
+        && tail
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _.[](),\"".contains(c))
 }
 
 /// Qualified name of an entity using the same normalization as
@@ -474,5 +557,153 @@ mod tests {
             plan.is_empty() && !plan.destructive,
             "parsed and introspected forms of the same table must reconcile to no changes; got {plan:?}"
         );
+    }
+
+    /// Regression: a COMPOSITE table-level `primary key (a, b)` must reconcile to
+    /// no changes. The SQL parser emits it both as a table constraint AND as an
+    /// is_pk flag on each member column; canonicalize must not lift those flags
+    /// into spurious single-column PKs (pk(a), pk(b)) that the live DB lacks —
+    /// which produced bogus `ADD CONSTRAINT … PRIMARY KEY` steps and Postgres
+    /// "multiple primary keys" apply failures.
+    #[test]
+    fn canonicalize_composite_pk_no_spurious_single_column_pks() {
+        // Parsed (desired): composite PK as a table constraint, and — as the SQL
+        // parser does — is_pk flagged on each member column.
+        let mut desired = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "transcript_cursor".to_string(),
+                schema: "activity".to_string(),
+                columns: vec![
+                    pk_col("source", "text"),
+                    pk_col("file_path", "text"),
+                    col("session_id", "text"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["source".to_string(), "file_path".to_string()],
+                }],
+            }],
+            enums: vec![],
+        };
+
+        // Introspected (live): one named composite PK; columns carry no is_pk flag.
+        let mut live = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "transcript_cursor".to_string(),
+                schema: "activity".to_string(),
+                columns: vec![
+                    not_null("source", "text"),
+                    not_null("file_path", "text"),
+                    col("session_id", "text"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![TableConstraint::PrimaryKey {
+                    name: Some("transcript_cursor_pkey".to_string()),
+                    columns: vec!["source".to_string(), "file_path".to_string()],
+                }],
+            }],
+            enums: vec![],
+        };
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "composite PK must reconcile to no changes (no spurious single-column PK adds); got {plan:?}"
+        );
+    }
+
+    fn col_default(name: &str, ty: &str, default: &str) -> ColumnDef {
+        ColumnDef {
+            default_value: Some(default.to_string()),
+            nullable: false,
+            ..col(name, ty)
+        }
+    }
+
+    /// Issue #5: a source default (`'{}'`) and Postgres's introspected round-trip
+    /// of the same default (`'{}'::text[]`) must canonicalize equal, so an
+    /// already-current DB reconciles to an empty plan instead of re-emitting a
+    /// no-op `SET DEFAULT` every run.
+    #[test]
+    fn canonicalize_matches_default_across_introspected_cast() {
+        // Parsed (desired): bare literal from the `.ddl` source.
+        let mut desired = snap(vec![table(
+            "public",
+            "org",
+            vec![col_default("org_slugs", "text[]", "'{}'")],
+        )]);
+        // Introspected (live): pg_get_expr appends the type cast.
+        let mut live = snap(vec![table(
+            "public",
+            "org",
+            vec![col_default("org_slugs", "text[]", "'{}'::text[]")],
+        )]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "unchanged array default must reconcile to no changes; got {plan:?}"
+        );
+    }
+
+    /// A genuinely changed default still produces a `SET DEFAULT` — normalization
+    /// strips only the redundant cast, never a real change.
+    #[test]
+    fn canonicalize_still_detects_real_default_change() {
+        let mut desired = snap(vec![table(
+            "public",
+            "counter",
+            vec![col_default("n", "integer", "1")],
+        )]);
+        let mut live = snap(vec![table(
+            "public",
+            "counter",
+            vec![col_default("n", "integer", "0")],
+        )]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert_eq!(plan.altered.len(), 1, "changed default must be planned; got {plan:?}");
+        assert!(plan.altered[0].sql.contains("SET DEFAULT 1"));
+    }
+
+    #[test]
+    fn canonical_default_strips_trailing_cast() {
+        assert_eq!(canonical_default("'{}'::text[]"), "'{}'");
+        assert_eq!(canonical_default("''::text"), "''");
+        assert_eq!(canonical_default("'active'::config.status"), "'active'");
+        assert_eq!(
+            canonical_default("'2020-01-01'::timestamp with time zone"),
+            "'2020-01-01'"
+        );
+        assert_eq!(canonical_default("0::numeric(10,2)"), "0");
+        assert_eq!(canonical_default("  'x' :: text "), "'x'");
+    }
+
+    #[test]
+    fn canonical_default_leaves_non_casts_intact() {
+        // No top-level cast → unchanged.
+        assert_eq!(canonical_default("now()"), "now()");
+        assert_eq!(canonical_default("0"), "0");
+        assert_eq!(canonical_default("false"), "false");
+        // Cast lives inside the function args, not on the whole expression.
+        assert_eq!(
+            canonical_default("nextval('app.seq'::regclass)"),
+            "nextval('app.seq'::regclass)"
+        );
+        // `::` embedded in a string literal must not be treated as a cast.
+        assert_eq!(canonical_default("'a::b'"), "'a::b'");
     }
 }
