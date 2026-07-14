@@ -150,9 +150,11 @@ pub fn canonicalize(snap: &mut Snapshot) {
                 kept.push(c);
             }
         };
+        let mut has_table_pk = false;
         for con in std::mem::take(&mut t.table_constraints) {
             match con {
                 TableConstraint::PrimaryKey { columns, .. } => {
+                    has_table_pk = true;
                     push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
                 }
                 TableConstraint::Unique { columns, .. } => {
@@ -162,7 +164,16 @@ pub fn canonicalize(snap: &mut Snapshot) {
             }
         }
         for c in &t.columns {
-            if c.is_pk {
+            // A column's is_pk flag restates the table's single primary key. When a
+            // table-level PRIMARY KEY is already present — e.g. a composite
+            // `primary key (a, b)`, which the SQL parser emits BOTH as a table
+            // constraint AND as an is_pk flag on each member column — lifting the
+            // per-column flags would fabricate spurious single-column PKs (pk(a),
+            // pk(b)) that no live table has, producing bogus `ADD CONSTRAINT …
+            // PRIMARY KEY` reconcile steps (and "multiple primary keys" errors). A
+            // table has exactly one PK, so only synthesize one from a column flag
+            // when no table-level PK exists (the inline single-column PK case).
+            if c.is_pk && !has_table_pk {
                 push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
             }
             if c.is_unique {
@@ -473,6 +484,68 @@ mod tests {
         assert!(
             plan.is_empty() && !plan.destructive,
             "parsed and introspected forms of the same table must reconcile to no changes; got {plan:?}"
+        );
+    }
+
+    /// Regression: a COMPOSITE table-level `primary key (a, b)` must reconcile to
+    /// no changes. The SQL parser emits it both as a table constraint AND as an
+    /// is_pk flag on each member column; canonicalize must not lift those flags
+    /// into spurious single-column PKs (pk(a), pk(b)) that the live DB lacks —
+    /// which produced bogus `ADD CONSTRAINT … PRIMARY KEY` steps and Postgres
+    /// "multiple primary keys" apply failures.
+    #[test]
+    fn canonicalize_composite_pk_no_spurious_single_column_pks() {
+        // Parsed (desired): composite PK as a table constraint, and — as the SQL
+        // parser does — is_pk flagged on each member column.
+        let mut desired = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "transcript_cursor".to_string(),
+                schema: "activity".to_string(),
+                columns: vec![
+                    pk_col("source", "text"),
+                    pk_col("file_path", "text"),
+                    col("session_id", "text"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["source".to_string(), "file_path".to_string()],
+                }],
+            }],
+            enums: vec![],
+        };
+
+        // Introspected (live): one named composite PK; columns carry no is_pk flag.
+        let mut live = Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "transcript_cursor".to_string(),
+                schema: "activity".to_string(),
+                columns: vec![
+                    not_null("source", "text"),
+                    not_null("file_path", "text"),
+                    col("session_id", "text"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![TableConstraint::PrimaryKey {
+                    name: Some("transcript_cursor_pkey".to_string()),
+                    columns: vec!["source".to_string(), "file_path".to_string()],
+                }],
+            }],
+            enums: vec![],
+        };
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "composite PK must reconcile to no changes (no spurious single-column PK adds); got {plan:?}"
         );
     }
 }
