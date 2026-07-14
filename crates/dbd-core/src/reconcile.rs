@@ -183,9 +183,10 @@ pub fn canonicalize(snap: &mut Snapshot) {
         t.table_constraints = kept;
         // Indexes are not reconciled (introspect/parse forms diverge).
         t.indexes.clear();
-        // Normalize column types; clear inline flags and comments.
+        // Normalize column types and defaults; clear inline flags and comments.
         for c in &mut t.columns {
             c.data_type = canonical_type(&c.data_type, &enum_types);
+            c.default_value = c.default_value.as_deref().map(canonical_default);
             c.is_pk = false;
             c.is_unique = false;
             c.inline_fk = None;
@@ -229,6 +230,77 @@ fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
         Some(a) => format!("{base}{a}"),
         None => base,
     }
+}
+
+/// Normalize a column default so a **parsed** literal and Postgres's
+/// **introspected** round-trip of the same default compare equal.
+///
+/// Introspection reads defaults back through `pg_get_expr`, which re-emits them
+/// in a canonical form that annotates the whole expression with an explicit cast:
+/// a source `'{}'` comes back as `'{}'::text[]`, `'active'` as
+/// `'active'::config.status`, `''` as `''::text`. Compared textually against the
+/// source these look changed, so reconcile emits a redundant `SET DEFAULT` on
+/// every run against an already-current DB (issue #5).
+///
+/// Strip a single trailing top-level `::type` cast plus surrounding whitespace so
+/// both sides converge on the bare literal. Casts *inside* the expression are left
+/// intact — `nextval('seq'::regclass)` and other function calls are untouched —
+/// and a genuine type change is still caught by the column's `data_type` diff, so
+/// erasing the cast here can't hide a real change.
+fn canonical_default(raw: &str) -> String {
+    strip_trailing_cast(raw.trim()).trim().to_string()
+}
+
+/// Remove a trailing top-level `::type` cast from a default expression. Tracks
+/// single-quoted string literals (with `''` escapes) and parenthesis depth so a
+/// `::` inside a string or a function call's arguments is never mistaken for the
+/// outer cast. Returns the input unchanged when there is no such cast or the tail
+/// after it isn't a plausible type name (guards against clipping an operator
+/// expression like `'a'::text || 'b'`).
+fn strip_trailing_cast(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut in_str = false;
+    let mut depth: i32 = 0;
+    let mut last_cast: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                // `''` inside a string is an escaped quote, not a terminator.
+                if in_str && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_str = !in_str;
+            }
+            b'(' if !in_str => depth += 1,
+            b')' if !in_str => depth -= 1,
+            b':' if !in_str && depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                last_cast = Some(i);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match last_cast {
+        Some(pos) if is_plausible_type(&s[pos + 2..]) => s[..pos].trim_end(),
+        _ => s,
+    }
+}
+
+/// Whether `tail` (the text after a top-level `::`) looks like a bare type name —
+/// only the characters Postgres uses in type spellings: letters, digits, and
+/// `_ . [ ] ( ) ,` plus spaces (`timestamp with time zone`) and `"` (quoted
+/// identifiers). Anything else means the `::` was part of a larger expression, so
+/// we must not strip it.
+fn is_plausible_type(tail: &str) -> bool {
+    let tail = tail.trim();
+    !tail.is_empty()
+        && tail
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _.[](),\"".contains(c))
 }
 
 /// Qualified name of an entity using the same normalization as
@@ -547,5 +619,91 @@ mod tests {
             plan.is_empty() && !plan.destructive,
             "composite PK must reconcile to no changes (no spurious single-column PK adds); got {plan:?}"
         );
+    }
+
+    fn col_default(name: &str, ty: &str, default: &str) -> ColumnDef {
+        ColumnDef {
+            default_value: Some(default.to_string()),
+            nullable: false,
+            ..col(name, ty)
+        }
+    }
+
+    /// Issue #5: a source default (`'{}'`) and Postgres's introspected round-trip
+    /// of the same default (`'{}'::text[]`) must canonicalize equal, so an
+    /// already-current DB reconciles to an empty plan instead of re-emitting a
+    /// no-op `SET DEFAULT` every run.
+    #[test]
+    fn canonicalize_matches_default_across_introspected_cast() {
+        // Parsed (desired): bare literal from the `.ddl` source.
+        let mut desired = snap(vec![table(
+            "public",
+            "org",
+            vec![col_default("org_slugs", "text[]", "'{}'")],
+        )]);
+        // Introspected (live): pg_get_expr appends the type cast.
+        let mut live = snap(vec![table(
+            "public",
+            "org",
+            vec![col_default("org_slugs", "text[]", "'{}'::text[]")],
+        )]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "unchanged array default must reconcile to no changes; got {plan:?}"
+        );
+    }
+
+    /// A genuinely changed default still produces a `SET DEFAULT` — normalization
+    /// strips only the redundant cast, never a real change.
+    #[test]
+    fn canonicalize_still_detects_real_default_change() {
+        let mut desired = snap(vec![table(
+            "public",
+            "counter",
+            vec![col_default("n", "integer", "1")],
+        )]);
+        let mut live = snap(vec![table(
+            "public",
+            "counter",
+            vec![col_default("n", "integer", "0")],
+        )]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert_eq!(plan.altered.len(), 1, "changed default must be planned; got {plan:?}");
+        assert!(plan.altered[0].sql.contains("SET DEFAULT 1"));
+    }
+
+    #[test]
+    fn canonical_default_strips_trailing_cast() {
+        assert_eq!(canonical_default("'{}'::text[]"), "'{}'");
+        assert_eq!(canonical_default("''::text"), "''");
+        assert_eq!(canonical_default("'active'::config.status"), "'active'");
+        assert_eq!(
+            canonical_default("'2020-01-01'::timestamp with time zone"),
+            "'2020-01-01'"
+        );
+        assert_eq!(canonical_default("0::numeric(10,2)"), "0");
+        assert_eq!(canonical_default("  'x' :: text "), "'x'");
+    }
+
+    #[test]
+    fn canonical_default_leaves_non_casts_intact() {
+        // No top-level cast → unchanged.
+        assert_eq!(canonical_default("now()"), "now()");
+        assert_eq!(canonical_default("0"), "0");
+        assert_eq!(canonical_default("false"), "false");
+        // Cast lives inside the function args, not on the whole expression.
+        assert_eq!(
+            canonical_default("nextval('app.seq'::regclass)"),
+            "nextval('app.seq'::regclass)"
+        );
+        // `::` embedded in a string literal must not be treated as a cast.
+        assert_eq!(canonical_default("'a::b'"), "'a::b'");
     }
 }
