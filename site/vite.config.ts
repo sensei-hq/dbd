@@ -14,11 +14,5 @@ export default defineConfig({
 	define: {
 		__APP_VERSION__: JSON.stringify(version)
 	},
-	plugins: [UnoCSS(), sveltekit()],
-	// Rokkit packages ship Svelte source (.svelte / .svelte.ts runes modules);
-	// exclude them from dep pre-bundling so vite-plugin-svelte preprocesses them
-	// instead of the optimizer choking on the TS syntax.
-	optimizeDeps: {
-		exclude: ['@rokkit/ui', '@rokkit/states', '@rokkit/core', '@rokkit/actions', '@rokkit/app']
-	}
+	plugins: [UnoCSS(), sveltekit()]
 });
