@@ -94,7 +94,7 @@ export const overview = {
 		{
 			tag: '09',
 			title: 'Reverse-engineer a database',
-			body: 'Point dbd init --from-db at an existing database to generate DDL files, or merge live tables back into a project.'
+			body: 'Run dbd init --from-db to generate a fresh project from an existing database, or dbd merge to sync live tables into a project you already have.'
 		},
 		{
 			tag: '10',
@@ -104,7 +104,7 @@ export const overview = {
 		{
 			tag: '11',
 			title: 'Deploy straight from GitHub',
-			body: 'dbd deploy --source pulls a schema from a Git repository and applies it to any target — no local checkout.'
+			body: 'dbd deploy fetches a schema from a directory or GitHub repo (-s owner/repo/path), then applies and imports it — no local checkout.'
 		},
 		{
 			tag: '12',
@@ -237,11 +237,12 @@ export const commands = {
 			body: 'Validate config and report unresolved references — works offline via a local refcache.'
 		},
 		{ cmd: 'dbd export', body: 'Dump table data back out to CSV, TSV or JSONL.' },
-		{ cmd: 'dbd doctor', body: 'Audit and migrate your design.yaml and DDL layout.' },
-		{ cmd: 'dbd reset', body: 'Drop project schemas, with safety guards.' },
+		{ cmd: 'dbd doctor', body: 'Audit design.yaml for stale entries.' },
+		{ cmd: 'dbd reset', body: "Drop the project's managed objects, with safety guards." },
 		{ cmd: 'dbd combine', body: 'Combine all DDL into a single SQL file.' },
 		{ cmd: 'dbd graph', body: 'Output the dependency graph as JSON.' },
-		{ cmd: 'dbd migrate --status', body: 'Show current migration version status.' }
+		{ cmd: 'dbd migrate', body: 'Show migration status.' },
+		{ cmd: 'dbd diagram', body: 'Open the hosted schema viewer, with the schema encoded in the URL fragment.' }
 	] as Command[]
 };
 

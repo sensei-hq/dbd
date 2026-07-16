@@ -132,7 +132,7 @@
 <section id="commands" class="grid-section">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={commands.eyebrow} title={commands.title} lede={commands.lede} />
-		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+		<div class="mt-12 grid gap-4 sm:grid-cols-2">
 			{#each commands.items as c (c.cmd)}
 				<CommandCard cmd={c.cmd} body={c.body} />
 			{/each}
