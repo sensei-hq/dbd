@@ -40,6 +40,26 @@
   @keyframes dbdRise{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
   .dbd-rise{animation:dbdRise .7s cubic-bezier(.2,.7,.2,1) both;}
   @media (prefers-reduced-motion: reduce){.dbd-rise{animation:none;}}
+  @media (max-width: 960px){
+    .dbd-hero{grid-template-columns:1fr !important;gap:2.5rem !important;padding-top:2.5rem !important;}
+    .dbd-cards-3{grid-template-columns:repeat(2,1fr) !important;}
+    .dbd-cards-4{grid-template-columns:repeat(2,1fr) !important;}
+  }
+  @media (max-width: 820px){
+    .dbd-concept{grid-template-columns:1fr !important;gap:1.75rem !important;}
+    .dbd-concept-text{order:1 !important;}
+    .dbd-concept-code{order:2 !important;}
+    .dbd-start-grid{grid-template-columns:1fr !important;gap:2rem !important;}
+    .dbd-header-nav{display:none !important;}
+  }
+  @media (max-width: 680px){
+    .dbd-cards-2{grid-template-columns:1fr !important;}
+    .dbd-cards-3{grid-template-columns:1fr !important;}
+    .dbd-cards-4{grid-template-columns:1fr !important;}
+    .dbd-footer-grid{grid-template-columns:1fr !important;gap:2rem !important;}
+    .dbd-start-card{padding:1.75rem !important;}
+    .dbd-signin{display:none !important;}
+  }
 </style>
 </helmet>
 <div class="dbd-root" data-theme="light" data-accent="sky" data-density="comfortable" ref="{{ setRoot }}" style="min-height:100vh;background:var(--bg);color:var(--fg);font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased;">
@@ -50,14 +70,14 @@
         <span style="display:inline-flex;flex:none;height:2rem;width:2rem;color:var(--accent);">{{ brandMark }}</span>
         <span style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.15rem;letter-spacing:-0.01em;color:var(--fg);">{{ brand.name }}</span>
       </a>
-      <nav style="display:flex;align-items:center;gap:1.75rem;">
+      <nav class="dbd-header-nav" style="display:flex;align-items:center;gap:1.75rem;">
         <sc-for list="{{ navLinks }}" as="l" hint-placeholder-count="4">
           <a href="{{ l.href }}" style="white-space:nowrap;font-size:0.9rem;color:var(--muted);">{{ l.label }}</a>
         </sc-for>
       </nav>
       <div style="display:flex;align-items:center;gap:0.75rem;">
         <button onClick="{{ toggleTheme }}" aria-label="Toggle color theme" style="display:grid;height:2.25rem;width:2.25rem;place-items:center;border-radius:0.5rem;border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer;">{{ themeIcon }}</button>
-        <a href="#top" style="white-space:nowrap;font-size:0.9rem;color:var(--muted);">Sign in</a>
+        <a href="#top" class="dbd-signin" style="white-space:nowrap;font-size:0.9rem;color:var(--muted);">Sign in</a>
         <a href="{{ navCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.625rem 1.25rem;font-size:0.9rem;background:var(--accent);color:var(--on-accent);white-space:nowrap;">{{ navCta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
       </div>
     </div>
@@ -66,16 +86,16 @@
   <main>
     <section id="top" style="position:relative;overflow:hidden;">
       <div style="position:absolute;inset:0;pointer-events:none;opacity:0.6;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 55%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 55%,transparent 100%);"></div>
-      <div style="position:relative;max-width:76rem;margin:0 auto;display:grid;align-items:center;gap:3rem;padding:4rem 1.5rem var(--section-y);grid-template-columns:1.05fr 0.95fr;">
+      <div style="position:relative;max-width:76rem;margin:0 auto;display:grid;align-items:center;gap:3rem;padding:4rem 1.5rem var(--section-y);grid-template-columns:1.15fr 0.85fr;" class="dbd-hero">
         <div class="dbd-rise" style="display:flex;flex-direction:column;align-items:flex-start;gap:1.5rem;">
           <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ hero.eyebrow }}</div>
           <h1 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:700;font-size:clamp(2.6rem,6vw,4.6rem);line-height:0.98;letter-spacing:-0.035em;color:var(--fg);text-wrap:balance;margin:0;">{{ heroTitleA }}<br><span style="color:var(--accent);">{{ heroTitleB }}</span></h1>
           <p style="max-width:36rem;font-size:1.15rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ hero.lede }}</p>
-          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem;padding-top:0.25rem;">
-            <a href="{{ hero.primaryCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.5rem;font-size:1rem;background:var(--accent);color:var(--on-accent);">{{ hero.primaryCta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
-            <a href="{{ hero.secondaryCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.5rem;font-size:1rem;border:1px solid var(--line);color:var(--fg);background:transparent;">{{ hero.secondaryCta.label }}</a>
+          <div class="dbd-hero-cta" style="display:flex;flex-wrap:nowrap;align-items:center;gap:0.75rem;padding-top:0.25rem;">
+            <a href="{{ hero.primaryCta.href }}" style="display:inline-flex;flex:none;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.25rem;font-size:1rem;background:var(--accent);color:var(--on-accent);white-space:nowrap;">{{ hero.primaryCta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
+            <a href="{{ hero.secondaryCta.href }}" style="display:inline-flex;flex:none;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.25rem;font-size:1rem;border:1px solid var(--line);color:var(--fg);background:transparent;white-space:nowrap;">{{ hero.secondaryCta.label }}</a>
+            <div style="display:inline-flex;flex:none;align-items:center;gap:0.625rem;border-radius:0.5rem;border:1px solid var(--line);background:var(--surface);padding:0.625rem 0.875rem;font-family:'IBM Plex Mono',monospace;font-size:0.9rem;white-space:nowrap;"><span style="color:var(--accent);">$</span><span style="color:var(--fg);">{{ hero.install }}</span></div>
           </div>
-          <div style="margin-top:0.5rem;display:inline-flex;align-items:center;gap:0.75rem;border-radius:0.5rem;border:1px solid var(--line);background:var(--surface);padding:0.625rem 1rem;font-family:'IBM Plex Mono',monospace;font-size:0.9rem;"><span style="color:var(--accent);">$</span><span style="color:var(--fg);">{{ hero.install }}</span></div>
         </div>
         <div class="dbd-rise" style="animation-delay:0.12s;">{{ terminalEl }}</div>
       </div>
@@ -89,10 +109,9 @@
           <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ overviewHead.title }}</h2>
           <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ overviewHead.lede }}</p>
         </div>
-        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(3,1fr);">
+        <div class="dbd-cards-3" style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(3,1fr);">
           <sc-for list="{{ features }}" as="f" hint-placeholder-count="6">
             <div style="display:flex;flex-direction:column;gap:0.75rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
-              <span style="font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--faint);">{{ f.tag }}</span>
               <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.4rem;color:var(--fg);margin:0;">{{ f.title }}</h3>
               <p style="font-size:0.9rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ f.body }}</p>
             </div>
@@ -110,8 +129,8 @@
         </div>
         <div style="margin-top:3.5rem;display:flex;flex-direction:column;gap:4rem;">
           <sc-for list="{{ concepts }}" as="item" hint-placeholder-count="4">
-            <div style="display:grid;align-items:center;gap:3.5rem;grid-template-columns:1fr 1fr;">
-              <div style="{{ item.textStyle }}">
+            <div class="dbd-concept" style="display:grid;align-items:center;gap:3.5rem;grid-template-columns:1fr 1fr;">
+              <div class="dbd-concept-text" style="{{ item.textStyle }}">
                 <div style="display:flex;align-items:center;gap:0.75rem;">
                   <span style="display:grid;height:1.75rem;width:1.75rem;place-items:center;border-radius:0.375rem;border:1px solid var(--accent-line);background:var(--accent-soft);font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--accent);">{{ item.num }}</span>
                   <span style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.14em;color:var(--faint);">{{ item.kicker }}</span>
@@ -119,7 +138,7 @@
                 <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.55rem;line-height:1.25;letter-spacing:-0.015em;color:var(--fg);text-wrap:balance;margin:0;">{{ item.title }}</h3>
                 <p style="font-size:1rem;line-height:1.65;color:var(--muted);text-wrap:pretty;margin:0;">{{ item.body }}</p>
               </div>
-              <div style="{{ item.codeStyle }}">{{ item.codeEl }}</div>
+              <div class="dbd-concept-code" style="{{ item.codeStyle }}">{{ item.codeEl }}</div>
             </div>
           </sc-for>
         </div>
@@ -134,7 +153,7 @@
           <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ targetsHead.title }}</h2>
           <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ targetsHead.lede }}</p>
         </div>
-        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
+        <div class="dbd-cards-4" style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
           <sc-for list="{{ targets }}" as="t" hint-placeholder-count="4">
             <div style="display:flex;flex-direction:column;gap:1rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
               <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.4rem;color:var(--fg);margin:0;">{{ t.name }}</h3>
@@ -159,8 +178,8 @@
           <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ commandsHead.title }}</h2>
           <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ commandsHead.lede }}</p>
         </div>
-        <div style="margin-top:2.5rem;display:grid;gap:1rem;grid-template-columns:repeat(2,1fr);">
-          <sc-for list="{{ commands }}" as="c" hint-placeholder-count="7">
+        <div class="dbd-cards-2" style="margin-top:2.5rem;display:grid;gap:1rem;grid-template-columns:repeat(2,1fr);">
+          <sc-for list="{{ commands }}" as="c" hint-placeholder-count="8">
             <div style="display:flex;align-items:baseline;gap:1rem;border-radius:0.75rem;border:1px solid var(--line);background:var(--surface);padding:1rem 1.25rem;">
               <code style="flex:none;font-family:'IBM Plex Mono',monospace;font-size:0.85rem;color:var(--accent);">{{ c.cmd }}</code>
               <p style="font-size:0.9rem;line-height:1.55;color:var(--muted);text-wrap:pretty;margin:0;">{{ c.body }}</p>
@@ -177,7 +196,7 @@
           <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ audienceHead.eyebrow }}</div>
           <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ audienceHead.title }}</h2>
         </div>
-        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
+        <div class="dbd-cards-4" style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
           <sc-for list="{{ audience }}" as="a" hint-placeholder-count="4">
             <div style="display:flex;flex-direction:column;gap:0.5rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
               <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:500;font-size:1.15rem;color:var(--fg);margin:0;">{{ a.title }}</h3>
@@ -192,7 +211,7 @@
       <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
       <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
         <div style="overflow:hidden;border-radius:1.1rem;border:1px solid var(--accent-line);background:var(--surface);">
-          <div style="display:grid;gap:2.5rem;padding:3rem;grid-template-columns:1fr 1.1fr;">
+          <div class="dbd-start-grid dbd-start-card" style="display:grid;gap:2.5rem;padding:3rem;grid-template-columns:1fr 1.1fr;">
             <div style="display:flex;flex-direction:column;gap:1rem;align-items:flex-start;">
               <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ start.eyebrow }}</div>
               <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);text-wrap:balance;margin:0;">{{ start.title }}</h2>
@@ -219,7 +238,7 @@
   </main>
 
   <footer style="background:var(--bg);">
-    <div style="max-width:76rem;margin:0 auto;display:grid;gap:2.5rem;padding:3.5rem 1.5rem;grid-template-columns:1.4fr 1fr 1fr;">
+    <div class="dbd-footer-grid" style="max-width:76rem;margin:0 auto;display:grid;gap:2.5rem;padding:3.5rem 1.5rem;grid-template-columns:1.4fr 1fr 1fr;">
       <div style="display:flex;flex-direction:column;gap:0.75rem;">
         <a href="#top" style="display:inline-flex;align-items:center;gap:0.625rem;">
           <span style="display:inline-flex;flex:none;height:4rem;width:4rem;color:var(--accent);">{{ brandMark }}</span>
@@ -297,9 +316,9 @@ class Component extends DCLogic {
           { tag: "06", title: "Scoped deployments", body: "Deploy a named subset of the schema to different databases, with dependency-gap checking." },
           { tag: "07", title: "Formatter + pre-commit", body: "dbd format keeps DDL tidy (river-style); dbd format --check drops into pre-commit and CI." },
           { tag: "08", title: "Row-level security", body: "Manage Postgres/Supabase RLS policies as code in policies/ and apply them with dbd policies." },
-          { tag: "09", title: "Reverse-engineer a database", body: "Point dbd init --from-db at an existing database to generate DDL files, or merge live tables back into a project." },
+          { tag: "09", title: "Reverse-engineer a database", body: "Run dbd init --from-db to generate a fresh project from an existing database, or dbd merge to sync live tables into a project you already have." },
           { tag: "10", title: "Interactive schema diagram", body: "dbd diagram opens a live, explorable view of your schema — tables, columns and foreign-key relationships." },
-          { tag: "11", title: "Deploy straight from GitHub", body: "dbd deploy --source pulls a schema from a Git repository and applies it to any target — no local checkout." },
+          { tag: "11", title: "Deploy straight from GitHub", body: "dbd deploy fetches a schema from a directory or GitHub repo (-s owner/repo/path), then applies and imports it — no local checkout." },
           { tag: "12", title: "Environment-scoped data", body: "Seed data is environment-aware: files under import/<env>/<schema>/ load only when you pass -e <env>. Ship dev fixtures that never touch production." },
         ],
       },
@@ -332,11 +351,12 @@ class Component extends DCLogic {
         items: [
           { cmd: "dbd inspect", body: "Validate config and report unresolved references — works offline via a local refcache." },
           { cmd: "dbd export", body: "Dump table data back out to CSV, TSV or JSONL." },
-          { cmd: "dbd doctor", body: "Audit and migrate your design.yaml and DDL layout." },
-          { cmd: "dbd reset", body: "Drop project schemas, with safety guards." },
+          { cmd: "dbd doctor", body: "Audit design.yaml for stale entries." },
+          { cmd: "dbd reset", body: "Drop the project's managed objects, with safety guards." },
           { cmd: "dbd combine", body: "Combine all DDL into a single SQL file." },
           { cmd: "dbd graph", body: "Output the dependency graph as JSON." },
-          { cmd: "dbd migrate --status", body: "Show current migration version status." },
+          { cmd: "dbd migrate", body: "Show migration status." },
+          { cmd: "dbd diagram", body: "Open the hosted schema viewer, with the schema encoded in the URL fragment." },
         ],
       },
       audience: {
