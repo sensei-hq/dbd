@@ -1,0 +1,11 @@
+/* Zen-Sumi · motion
+   Quiet. One easing curve, three durations, and that is all. Hover lifts the
+   background one step. Press is translateY(0.5px). Enter is opacity + 4px rise.
+   No spring, no bounce, no stagger, no skeleton loaders. */
+
+:root {
+  --ease:     cubic-bezier(0.2, 0.6, 0.2, 1); /* @kind other */
+  --dur-fast: 120ms; /* @kind other */
+  --dur:      180ms; /* @kind other */
+  --dur-slow: 280ms; /* @kind other */
+}

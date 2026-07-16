@@ -1,0 +1,110 @@
+/* Zen-Sumi · component classes
+   Plain-CSS references for the brand's primitives. The React components in
+   components/ render exactly these class names — treat this file as the
+   contract they share. Every selector carries .zs for scoping + specificity. */
+
+/* ─── Buttons ─────────────────────────────────────────────────────── */
+.zs .zs-btn {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: 9px 16px; font-size: var(--text-sm); font-weight: 500;
+  border-radius: var(--radius); border: 1px solid transparent;
+  background: transparent; color: var(--ink); cursor: pointer;
+  white-space: nowrap; line-height: 1.2;
+  transition: background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease),
+              transform var(--dur-fast) var(--ease);
+}
+.zs .zs-btn:active { transform: translateY(0.5px); }
+.zs .zs-btn:focus-visible { outline: 1.5px solid var(--focus-ring); outline-offset: 2px; }
+.zs .zs-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+
+.zs .zs-btn-primary { background: var(--ink); color: var(--on-primary); }
+.zs .zs-btn-primary:hover { background: oklch(0.30 0.012 50); }
+
+.zs .zs-btn-secondary { border-color: var(--ink); color: var(--ink); }
+.zs .zs-btn-secondary:hover { background: var(--paper-3); }
+
+.zs .zs-btn-ghost { color: var(--ink-2); }
+.zs .zs-btn-ghost:hover { background: var(--paper-3); color: var(--ink); }
+
+.zs .zs-btn-sm { padding: 6px 12px; font-size: var(--text-xs); }
+.zs .zs-btn-lg { padding: 11px 18px; font-size: var(--text-sm); }
+
+/* Icon button — square, glyph-only */
+.zs .zs-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: var(--radius);
+  color: var(--ink-2); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.zs .zs-icon-btn:hover { background: var(--paper-3); color: var(--ink); }
+.zs .zs-icon-btn:focus-visible { outline: 1.5px solid var(--focus-ring); outline-offset: 2px; }
+
+/* ─── Badges ──────────────────────────────────────────────────────── */
+.zs .zs-badge {
+  display: inline-flex; align-items: center; gap: var(--space-1);
+  padding: 2px 8px; font-family: var(--font-mono); font-size: var(--text-xs);
+  border-radius: var(--radius-sm); color: var(--ink-2); background: var(--paper-3);
+  border: 1px solid oklch(0.22 0.012 50 / 0.06);
+}
+.zs .zs-badge-success { color: var(--success); background: var(--success-soft); border-color: oklch(0.62 0.08 160 / 0.25); }
+.zs .zs-badge-warning { color: oklch(0.55 0.13 60); background: var(--warning-soft); border-color: oklch(0.72 0.12 75 / 0.30); }
+.zs .zs-badge-accent  { color: var(--accent); background: var(--accent-soft); border-color: oklch(0.58 0.15 35 / 0.28); }
+
+/* ─── Cards ───────────────────────────────────────────────────────── */
+/* A card is paper-2 + hairline + radius-lg + space-5. No shadow. No colored
+   left-border. No header fill. That is the whole specification. */
+.zs-card {
+  background: var(--paper-2); border: 1px solid var(--edge);
+  border-radius: var(--radius-lg); padding: var(--space-5);
+}
+.zs-card-flush { background: var(--paper-2); border: 1px solid var(--edge); border-radius: var(--radius-lg); }
+
+/* Hairline rule */
+.zs-rule { height: 1px; background: var(--edge); border: none; margin: 0; }
+
+/* ─── Input ───────────────────────────────────────────────────────── */
+.zs .zs-input {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: 8px 12px; background: var(--paper-2); border: 1px solid var(--edge);
+  border-radius: var(--radius); font-size: var(--text-sm); color: var(--ink);
+  width: 100%; transition: border-color var(--dur-fast) var(--ease);
+}
+.zs .zs-input:focus-within { border-color: var(--ink); }
+.zs .zs-input input { flex: 1; background: transparent; border: none; outline: none; font-size: inherit; color: inherit; }
+.zs .zs-input input::placeholder { color: var(--ink-4); }
+
+/* ─── Status dots ─────────────────────────────────────────────────── */
+.zs-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--ink-3); flex-shrink: 0; }
+.zs-dot-accent  { background: var(--accent); }
+.zs-dot-success { background: var(--success); }
+.zs-dot-warning { background: var(--warning); }
+.zs-ink-dot { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+
+/* ─── Tauri-style window chrome ───────────────────────────────────── */
+.zs-chrome {
+  height: var(--chrome-height); display: flex; align-items: center;
+  padding: 0 14px; border-bottom: 1px solid var(--edge);
+  background: var(--paper); gap: var(--space-2); flex-shrink: 0;
+}
+.zs-traffic { display: flex; gap: 7px; }
+.zs-traffic > span { width: 12px; height: 12px; border-radius: 50%; display: block; background: var(--edge); }
+.zs-traffic > span:nth-child(1) { background: oklch(0.72 0.14 28); }
+.zs-traffic > span:nth-child(2) { background: oklch(0.82 0.13 85); }
+.zs-traffic > span:nth-child(3) { background: oklch(0.72 0.11 145); }
+.zs-chrome-title { flex: 1; text-align: center; font-size: var(--text-xs); color: var(--ink-3); letter-spacing: 0.02em; }
+
+/* ─── Sparkline ───────────────────────────────────────────────────── */
+.zs-sparkline { fill: none; stroke: currentColor; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ─── Scrollbar — invisible until hover ───────────────────────────── */
+.zs ::-webkit-scrollbar { width: 6px; height: 6px; }
+.zs ::-webkit-scrollbar-thumb { background: transparent; border-radius: 3px; }
+.zs:hover ::-webkit-scrollbar-thumb { background: oklch(0.5 0.01 50 / 0.2); }
+
+/* ─── Focus ring ──────────────────────────────────────────────────── */
+.zs button:focus-visible,
+.zs a:focus-visible { outline: 1.5px solid var(--focus-ring); outline-offset: 2px; border-radius: 3px; }
+
+@keyframes zsSpin { to { transform: rotate(360deg); } }
+.zs-spin { animation: zsSpin 1.2s linear infinite; }
