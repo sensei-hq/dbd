@@ -29,7 +29,7 @@ export const hero = {
 	lede: 'dbd turns plain SQL DDL files into a versioned, deployable schema. No DSL, no ORM, no migration files written by hand — just the folder structure as the source of truth.',
 	primaryCta: { label: 'Get started', href: '#start' },
 	secondaryCta: { label: 'Read the concepts', href: '#concepts' },
-	install: 'cargo install dbd',
+	install: 'cargo install dbd-cli',
 	terminal: {
 		file: '~/my-project',
 		lines: [
@@ -191,8 +191,8 @@ export const start = {
 	title: 'Install dbd and snapshot your first schema.',
 	lede: "It's a single Rust binary. Point it at a folder of SQL and a manifest — that's the whole setup.",
 	steps: [
-		{ n: '1', text: 'Install the binary', code: 'cargo install dbd' },
-		{ n: '2', text: 'Scaffold a project', code: 'dbd init my-project' },
+		{ n: '1', text: 'Install the binary', code: 'cargo install dbd-cli' },
+		{ n: '2', text: 'Scaffold a project', code: 'dbd init --name my-project' },
 		{ n: '3', text: 'Apply your schema', code: 'dbd apply' }
 	],
 	cta: { label: 'View on GitHub', href: REPO }
