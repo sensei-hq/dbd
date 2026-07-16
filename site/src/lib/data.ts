@@ -1,4 +1,4 @@
-/* dbd website — content data, ported from the design mockup (data.js). */
+/* dbd website — content data, ported from the design mockup (dbd.dc.html). */
 
 const REPO = 'https://github.com/sensei-hq/dbd';
 
@@ -14,6 +14,7 @@ export const nav = {
 		{ label: 'Overview', href: '/#overview' },
 		{ label: 'Concepts', href: '/#concepts' },
 		{ label: 'Targets', href: '/#targets' },
+		{ label: 'Commands', href: '/#commands' },
 		{ label: "Who it's for", href: '/#audience' },
 		{ label: 'Guide', href: '/guide' },
 		{ label: 'Projects', href: '/projects' }
@@ -79,6 +80,36 @@ export const overview = {
 			tag: '06',
 			title: 'Scoped deployments',
 			body: 'Deploy a named subset of the schema to different databases, with dependency-gap checking.'
+		},
+		{
+			tag: '07',
+			title: 'Formatter + pre-commit',
+			body: 'dbd format keeps DDL tidy (river-style); dbd format --check drops into pre-commit and CI.'
+		},
+		{
+			tag: '08',
+			title: 'Row-level security',
+			body: 'Manage Postgres/Supabase RLS policies as code in policies/ and apply them with dbd policies.'
+		},
+		{
+			tag: '09',
+			title: 'Reverse-engineer a database',
+			body: 'Point dbd init --from-db at an existing database to generate DDL files, or merge live tables back into a project.'
+		},
+		{
+			tag: '10',
+			title: 'Interactive schema diagram',
+			body: 'dbd diagram opens a live, explorable view of your schema — tables, columns and foreign-key relationships.'
+		},
+		{
+			tag: '11',
+			title: 'Deploy straight from GitHub',
+			body: 'dbd deploy --source pulls a schema from a Git repository and applies it to any target — no local checkout.'
+		},
+		{
+			tag: '12',
+			title: 'Environment-scoped data',
+			body: 'Seed data is environment-aware: files under import/<env>/<schema>/ load only when you pass -e <env>. Ship dev fixtures that never touch production.'
 		}
 	]
 };
@@ -87,7 +118,7 @@ export type Code = { lang: string; label: string; source: string };
 
 export const concepts = {
 	eyebrow: 'Core concepts',
-	title: 'Four ideas, and you know dbd.',
+	title: 'Five ideas, and you know dbd.',
 	items: [
 		{
 			id: 'ddl',
@@ -119,13 +150,17 @@ export const concepts = {
 		{
 			id: 'snapshots',
 			kicker: 'Versioning',
-			title: 'Snapshots track schema evolution',
-			body: 'Change a DDL file, then snapshot the diff. dbd writes a full schema state plus the exact ALTER statement. Next dbd apply runs the migration automatically.',
+			title: 'Two modes of schema evolution',
+			body: 'Pre-release, dbd reconcile diffs the live database against the design and alters it in place — no snapshots. When you lock in with dbd release, dbd switches to versioned snapshots with auto-generated migrations. Risky changes (renames, type changes) auto-split into safe staged migrations.',
 			code: {
 				lang: 'sh',
 				label: 'terminal',
 				source:
-					'$ dbd snapshot --name "add notes column"\n# snapshots/002.json            full schema state\n# migrations/002/.../...sql     the ALTER TABLE statement'
+					'$ dbd reconcile        # pre-release: diff live DB, alter in place\n' +
+					'$ dbd release          # lock in: write baseline snapshot\n' +
+					'$ dbd snapshot --name "add notes column"\n' +
+					'# snapshots/002.json            full schema state\n' +
+					'# migrations/002/.../...sql     the ALTER TABLE statement'
 			}
 		},
 		{
@@ -137,7 +172,22 @@ export const concepts = {
 				lang: 'sh',
 				label: 'targets',
 				source:
-					'postgres://…     execute SQL directly via sqlx\nsupabase         managed-infra filtering + grants\nsqlite::memory:  bare-name catalog, batched INSERT\nconvex:          codegen → convex/schema.ts'
+					'postgres://…        execute SQL directly via sqlx\n' +
+					'target: supabase    managed-infra filtering + grants\n' +
+					'sqlite::memory:     bare-name catalog, batched INSERT\n' +
+					'convex:             codegen → convex/schema.ts'
+			}
+		},
+		{
+			id: 'library',
+			kicker: 'Embeddable',
+			title: 'Use it as a library',
+			body: 'Everything the CLI does lives in the dbd-core crate. Embed schema parsing, diffing and deployment in your own Rust tooling — the guide covers the full API.',
+			code: {
+				lang: 'rust',
+				label: 'main.rs',
+				source:
+					'use dbd_core::Design;\n\nlet design = Design::from_config(path, "prod")?;\ndesign.apply(&adapter, None, false).await?;'
 			}
 		}
 	]
@@ -156,8 +206,8 @@ export const targets = {
 		},
 		{
 			name: 'Supabase',
-			scheme: 'supabase',
-			body: 'PostgreSQL with managed-infrastructure filtering and automatic grant handling.',
+			scheme: 'postgres:// + target: supabase',
+			body: 'PostgreSQL with managed-infrastructure filtering and automatic grant handling. Same connection string — the target flag in design.yaml switches the adapter.',
 			notes: ['Managed-infra filtering', 'Grant handling', 'Postgres-compatible']
 		},
 		{
@@ -173,6 +223,26 @@ export const targets = {
 			notes: ['TypeScript codegen', 'v.* validators', 'schema_entity names']
 		}
 	]
+};
+
+export type Command = { cmd: string; body: string };
+
+export const commands = {
+	eyebrow: 'The full toolbelt',
+	title: 'More where that came from.',
+	lede: 'Beyond the everyday flow, dbd ships focused commands for validation, data movement and project hygiene.',
+	items: [
+		{
+			cmd: 'dbd inspect',
+			body: 'Validate config and report unresolved references — works offline via a local refcache.'
+		},
+		{ cmd: 'dbd export', body: 'Dump table data back out to CSV, TSV or JSONL.' },
+		{ cmd: 'dbd doctor', body: 'Audit and migrate your design.yaml and DDL layout.' },
+		{ cmd: 'dbd reset', body: 'Drop project schemas, with safety guards.' },
+		{ cmd: 'dbd combine', body: 'Combine all DDL into a single SQL file.' },
+		{ cmd: 'dbd graph', body: 'Output the dependency graph as JSON.' },
+		{ cmd: 'dbd migrate --status', body: 'Show current migration version status.' }
+	] as Command[]
 };
 
 export const audience = {
