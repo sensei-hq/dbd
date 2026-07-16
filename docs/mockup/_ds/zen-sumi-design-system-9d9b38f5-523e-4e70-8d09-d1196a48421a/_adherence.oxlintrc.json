@@ -1,0 +1,325 @@
+{
+  "plugins": [
+    "react",
+    "import"
+  ],
+  "rules": {
+    "react/forbid-elements": [
+      "warn",
+      {
+        "forbid": []
+      }
+    ],
+    "no-restricted-imports": [
+      "warn",
+      {
+        "patterns": [
+          {
+            "group": [
+              "components/app/**",
+              "components/core/**",
+              "components/data/**",
+              "components/forms/**",
+              "components/surfaces/**",
+              "ui_kits/observatory/**",
+              "ui_kits/site/**"
+            ],
+            "message": "Import design-system components from 'index.js', not component internals."
+          }
+        ]
+      }
+    ],
+    "no-restricted-syntax": [
+      "warn",
+      {
+        "selector": "Literal[value=/#[0-9a-fA-F]{3,8}\\b/]",
+        "message": "Raw hex color — use a design-system color token via var()."
+      },
+      {
+        "selector": "Literal[value=/\\b\\d+px\\b/]",
+        "message": "Raw px value — use a design-system spacing token via var()."
+      },
+      {
+        "selector": "Literal[value=/font-family\\s*:\\s*(?!['\\\"]?(?:Fraunces|Inter|JetBrains Mono|Shippori Mincho))/i]",
+        "message": "Font not provided by the design system. Available: Fraunces, Inter, JetBrains Mono, Shippori Mincho."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Badge'] > JSXAttribute > JSXIdentifier[name!=/^(?:tone|className|children|key|ref|className|style|children)$/]",
+        "message": "<Badge> doesn't accept that prop. Declared props: tone, className, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Badge'] > JSXAttribute[name.name='tone'] > Literal[value!=/^(?:default|success|warning|accent)$/]",
+        "message": "<Badge> tone must be one of 'default' | 'success' | 'warning' | 'accent'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Button'] > JSXAttribute > JSXIdentifier[name!=/^(?:variant|size|disabled|kanji|onClick|type|className|children|key|ref|className|style|children)$/]",
+        "message": "<Button> doesn't accept that prop. Declared props: variant, size, disabled, kanji, onClick, type, className, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Button'] > JSXAttribute[name.name='variant'] > Literal[value!=/^(?:primary|secondary|ghost)$/]",
+        "message": "<Button> variant must be one of 'primary' | 'secondary' | 'ghost'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Button'] > JSXAttribute[name.name='size'] > Literal[value!=/^(?:sm|md|lg)$/]",
+        "message": "<Button> size must be one of 'sm' | 'md' | 'lg'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Button'] > JSXAttribute[name.name='type'] > Literal[value!=/^(?:button|submit|reset)$/]",
+        "message": "<Button> type must be one of 'button' | 'submit' | 'reset'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Card'] > JSXAttribute > JSXIdentifier[name!=/^(?:flush|className|style|children|key|ref|className|style|children)$/]",
+        "message": "<Card> doesn't accept that prop. Declared props: flush, className, style, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Eyebrow'] > JSXAttribute > JSXIdentifier[name!=/^(?:kanji|style|children|key|ref|className|style|children)$/]",
+        "message": "<Eyebrow> doesn't accept that prop. Declared props: kanji, style, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='IconButton'] > JSXAttribute > JSXIdentifier[name!=/^(?:label|onClick|className|children|key|ref|className|style|children)$/]",
+        "message": "<IconButton> doesn't accept that prop. Declared props: label, onClick, className, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Input'] > JSXAttribute > JSXIdentifier[name!=/^(?:value|onChange|placeholder|glyph|type|className|key|ref|className|style|children)$/]",
+        "message": "<Input> doesn't accept that prop. Declared props: value, onChange, placeholder, glyph, type, className."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Insight'] > JSXAttribute > JSXIdentifier[name!=/^(?:kanji|label|text|tag|tone|key|ref|className|style|children)$/]",
+        "message": "<Insight> doesn't accept that prop. Declared props: kanji, label, text, tag, tone."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Insight'] > JSXAttribute[name.name='tone'] > Literal[value!=/^(?:neutral|warning|success|accent)$/]",
+        "message": "<Insight> tone must be one of 'neutral' | 'warning' | 'success' | 'accent'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Kanji'] > JSXAttribute > JSXIdentifier[name!=/^(?:tone|size|title|style|children|key|ref|className|style|children)$/]",
+        "message": "<Kanji> doesn't accept that prop. Declared props: tone, size, title, style, children."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Kanji'] > JSXAttribute[name.name='tone'] > Literal[value!=/^(?:accent|ink|decor|disabled)$/]",
+        "message": "<Kanji> tone must be one of 'accent' | 'ink' | 'decor' | 'disabled'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='Sparkline'] > JSXAttribute > JSXIdentifier[name!=/^(?:data|width|height|accent|key|ref|className|style|children)$/]",
+        "message": "<Sparkline> doesn't accept that prop. Declared props: data, width, height, accent."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='StatusDot'] > JSXAttribute > JSXIdentifier[name!=/^(?:tone|style|key|ref|className|style|children)$/]",
+        "message": "<StatusDot> doesn't accept that prop. Declared props: tone, style."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='StatusDot'] > JSXAttribute[name.name='tone'] > Literal[value!=/^(?:neutral|accent|success|warning)$/]",
+        "message": "<StatusDot> tone must be one of 'neutral' | 'accent' | 'success' | 'warning'."
+      },
+      {
+        "selector": "JSXOpeningElement[name.name='WindowChrome'] > JSXAttribute > JSXIdentifier[name!=/^(?:title|key|ref|className|style|children)$/]",
+        "message": "<WindowChrome> doesn't accept that prop. Declared props: title."
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": [
+        "**/index.js"
+      ],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    }
+  ],
+  "x-omelette": {
+    "components": {
+      "Badge": {
+        "replaces": []
+      },
+      "Button": {
+        "replaces": []
+      },
+      "Card": {
+        "replaces": []
+      },
+      "Eyebrow": {
+        "replaces": []
+      },
+      "IconButton": {
+        "replaces": []
+      },
+      "Input": {
+        "replaces": []
+      },
+      "Insight": {
+        "replaces": []
+      },
+      "Kanji": {
+        "replaces": []
+      },
+      "Sparkline": {
+        "replaces": []
+      },
+      "StatusDot": {
+        "replaces": []
+      },
+      "WindowChrome": {
+        "replaces": []
+      }
+    },
+    "tokens": [
+      "--accent",
+      "--accent-soft",
+      "--amber-500",
+      "--chrome-height",
+      "--danger",
+      "--dur",
+      "--dur-fast",
+      "--dur-slow",
+      "--ease",
+      "--edge",
+      "--focus-ring",
+      "--font-display",
+      "--font-kanji",
+      "--font-mono",
+      "--font-ui",
+      "--hairline",
+      "--ink",
+      "--ink-2",
+      "--ink-3",
+      "--ink-4",
+      "--jade-500",
+      "--leading-loose",
+      "--leading-normal",
+      "--leading-snug",
+      "--leading-tight",
+      "--on-primary",
+      "--paper",
+      "--paper-2",
+      "--paper-3",
+      "--primary",
+      "--radius",
+      "--radius-full",
+      "--radius-lg",
+      "--radius-sm",
+      "--shadow",
+      "--shadow-lg",
+      "--shadow-sm",
+      "--shu-500",
+      "--sidebar-width",
+      "--site-width",
+      "--space-0",
+      "--space-1",
+      "--space-2",
+      "--space-3",
+      "--space-4",
+      "--space-5",
+      "--space-6",
+      "--space-7",
+      "--space-8",
+      "--space-9",
+      "--success",
+      "--success-soft",
+      "--sumi-300",
+      "--sumi-500",
+      "--sumi-700",
+      "--sumi-900",
+      "--text-2xl",
+      "--text-3xl",
+      "--text-4xl",
+      "--text-base",
+      "--text-lg",
+      "--text-sm",
+      "--text-xl",
+      "--text-xs",
+      "--tracking-normal",
+      "--tracking-tight",
+      "--tracking-wide",
+      "--warning",
+      "--warning-soft",
+      "--washi-100",
+      "--washi-200",
+      "--washi-300",
+      "--washi-400",
+      "--washi-50"
+    ],
+    "tokenKinds": {
+      "--washi-50": "color",
+      "--washi-100": "color",
+      "--washi-200": "color",
+      "--washi-300": "color",
+      "--washi-400": "color",
+      "--sumi-900": "color",
+      "--sumi-700": "color",
+      "--sumi-500": "color",
+      "--sumi-300": "color",
+      "--shu-500": "color",
+      "--jade-500": "color",
+      "--amber-500": "color",
+      "--paper": "color",
+      "--paper-2": "color",
+      "--paper-3": "color",
+      "--edge": "color",
+      "--ink": "color",
+      "--ink-2": "color",
+      "--ink-3": "color",
+      "--ink-4": "color",
+      "--primary": "color",
+      "--on-primary": "color",
+      "--accent": "color",
+      "--accent-soft": "color",
+      "--success": "color",
+      "--success-soft": "color",
+      "--warning": "color",
+      "--warning-soft": "color",
+      "--danger": "color",
+      "--focus-ring": "color",
+      "--font-display": "font",
+      "--font-ui": "font",
+      "--font-mono": "font",
+      "--font-kanji": "font",
+      "--text-xs": "font",
+      "--text-sm": "font",
+      "--text-base": "font",
+      "--text-lg": "font",
+      "--text-xl": "font",
+      "--text-2xl": "font",
+      "--text-3xl": "font",
+      "--text-4xl": "font",
+      "--leading-tight": "font",
+      "--leading-snug": "font",
+      "--leading-normal": "font",
+      "--leading-loose": "font",
+      "--tracking-tight": "font",
+      "--tracking-normal": "font",
+      "--tracking-wide": "font",
+      "--space-0": "spacing",
+      "--space-1": "spacing",
+      "--space-2": "spacing",
+      "--space-3": "spacing",
+      "--space-4": "spacing",
+      "--space-5": "spacing",
+      "--space-6": "spacing",
+      "--space-7": "spacing",
+      "--space-8": "spacing",
+      "--space-9": "spacing",
+      "--site-width": "spacing",
+      "--sidebar-width": "spacing",
+      "--chrome-height": "spacing",
+      "--radius-sm": "radius",
+      "--radius": "radius",
+      "--radius-lg": "radius",
+      "--radius-full": "radius",
+      "--hairline": "color",
+      "--shadow-sm": "shadow",
+      "--shadow": "shadow",
+      "--shadow-lg": "shadow",
+      "--ease": "other",
+      "--dur-fast": "other",
+      "--dur": "other",
+      "--dur-slow": "other"
+    },
+    "fontFamilies": [
+      "Fraunces",
+      "Inter",
+      "JetBrains Mono",
+      "Shippori Mincho"
+    ]
+  }
+}

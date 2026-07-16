@@ -1,0 +1,22 @@
+/* ═══════════════════════════════════════════════════════════════════
+   ZEN-SUMI DESIGN SYSTEM — entry point
+   Consumers link this one file. It is a list of @imports only; every token,
+   font, and class ships to consumers through this closure.
+   Aesthetic: washi paper, sumi ink, one rationed vermillion accent.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Foundations — fonts must load first */
+@import url('tokens/fonts.css');
+@import url('tokens/colors.css');
+@import url('tokens/typography.css');
+@import url('tokens/spacing.css');
+@import url('tokens/radius.css');
+@import url('tokens/elevation.css');
+@import url('tokens/motion.css');
+
+/* Base reset + semantic typography classes */
+@import url('base.css');
+
+/* Utility layer + component classes */
+@import url('utilities.css');
+@import url('components.css');

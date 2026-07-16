@@ -6,10 +6,11 @@
 	import Terminal from '$lib/components/Terminal.svelte';
 	import FeatureCard from '$lib/components/FeatureCard.svelte';
 	import TargetCard from '$lib/components/TargetCard.svelte';
+	import CommandCard from '$lib/components/CommandCard.svelte';
 	import ArrowIcon from '$lib/components/ArrowIcon.svelte';
 	import Seo from '$lib/components/Seo.svelte';
 	import { SITE_URL } from '$lib/seo';
-	import { hero, overview, concepts, targets, audience, start } from '$lib/data';
+	import { hero, overview, concepts, targets, commands, audience, start } from '$lib/data';
 
 	const description =
 		'dbd turns plain SQL DDL files into a versioned, deployable schema. No DSL, no ORM — the folder structure is the source of truth. Built in Rust.';
@@ -127,8 +128,20 @@
 	</div>
 </section>
 
+<!-- Commands -->
+<section id="commands" class="grid-section">
+	<div class="mx-auto max-w-content px-6 py-section">
+		<SectionHead eyebrow={commands.eyebrow} title={commands.title} lede={commands.lede} />
+		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			{#each commands.items as c (c.cmd)}
+				<CommandCard cmd={c.cmd} body={c.body} />
+			{/each}
+		</div>
+	</div>
+</section>
+
 <!-- Audience -->
-<section id="audience" class="grid-section">
+<section id="audience" class="grid-section bg-paper-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={audience.eyebrow} title={audience.title} align="center" />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -143,7 +156,7 @@
 </section>
 
 <!-- Get started -->
-<section id="start" class="grid-section bg-paper-soft">
+<section id="start" class="grid-section">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<div class="overflow-hidden rounded-xl border border-accent bg-paper-mute">
 			<div class="grid gap-10 p-8 lg:grid-cols-[1fr_1.1fr] lg:p-12">

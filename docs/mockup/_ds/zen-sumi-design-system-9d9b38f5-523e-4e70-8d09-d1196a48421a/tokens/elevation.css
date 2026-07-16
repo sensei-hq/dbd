@@ -1,0 +1,14 @@
+/* Zen-Sumi · borders, hairlines, elevation
+   The system prefers hairlines to shadows. --hairline is a 1px line used to
+   separate rows, divide sections, and outline cards. Shadows are reserved
+   ONLY for things that physically lift off the page — modals, command
+   palettes, focus overlays. Cards do not shadow. Buttons do not shadow. */
+
+:root {
+  --hairline: 1px solid var(--edge);
+
+  --shadow-sm: 0 1px 2px oklch(0.22 0.012 50 / 0.04);
+  --shadow:    0 1px 3px oklch(0.22 0.012 50 / 0.06),
+               0 8px 24px oklch(0.22 0.012 50 / 0.06);
+  --shadow-lg: 0 24px 60px oklch(0.22 0.012 50 / 0.18);
+}
