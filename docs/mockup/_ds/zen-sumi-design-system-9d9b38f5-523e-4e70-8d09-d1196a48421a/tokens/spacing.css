@@ -1,0 +1,23 @@
+/* Zen-Sumi · spacing
+   Nine stops on a 4px base. That is the entire budget: no 18px, no 26px,
+   no 5px. Always land on a stop; if it doesn't fit, the design is wrong,
+   not the scale. Component padding tends to land at --space-3 (small UI),
+   --space-4 (cards), --space-5 (section headers), --space-7 (between sections). */
+
+:root {
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --space-9: 96px;
+
+  /* ─── Layout constants ────────────────────────────────────────── */
+  --site-width:    1100px;   /* marketing content column */
+  --sidebar-width: 240px;    /* desktop app left rail */
+  --chrome-height: 38px;     /* Tauri window chrome */
+}

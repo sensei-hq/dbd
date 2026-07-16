@@ -1,0 +1,11 @@
+/* Zen-Sumi · radius
+   Four values. Most UI uses --radius (6px). Cards use --radius-lg (10px).
+   Pills and avatars use --radius-full. Square corners are also valid for
+   hairline-only sections. */
+
+:root {
+  --radius-sm:   4px;
+  --radius:      6px;
+  --radius-lg:   10px;
+  --radius-full: 9999px;
+}

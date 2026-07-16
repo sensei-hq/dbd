@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="dbd/dbd-logo.js"></script>
+<style>
+  :root { --accent-h: 245; --accent-c: 0.12; }
+  [data-theme="dark"]{
+    --bg:oklch(0.185 0.035 245);--bg-deep:oklch(0.15 0.035 245);--surface:oklch(0.225 0.037 245);--surface-2:oklch(0.27 0.038 245);--line:oklch(0.325 0.04 245);--line-soft:oklch(0.27 0.035 245);
+    --fg:oklch(0.965 0.006 240);--muted:oklch(0.74 0.014 245);--faint:oklch(0.58 0.016 245);
+    --accent:oklch(0.78 var(--accent-c) var(--accent-h));--accent-2:oklch(0.70 var(--accent-c) var(--accent-h));--on-accent:oklch(0.17 0.02 var(--accent-h));--accent-soft:oklch(0.30 0.05 var(--accent-h));--accent-line:oklch(0.42 0.07 var(--accent-h));
+    --code-bg:oklch(0.16 0.035 245);--tok-comment:oklch(0.56 0.016 245);--tok-key:oklch(0.78 var(--accent-c) var(--accent-h));--tok-str:oklch(0.80 0.09 155);--tok-num:oklch(0.80 0.09 220);--tok-punct:oklch(0.62 0.014 245);--tok-arrow:oklch(0.70 var(--accent-c) var(--accent-h));
+  }
+  [data-theme="light"]{
+    --bg:oklch(0.987 0.006 85);--bg-deep:oklch(0.967 0.008 85);--surface:oklch(0.996 0.004 85);--surface-2:oklch(0.978 0.006 85);--line:oklch(0.905 0.009 85);--line-soft:oklch(0.942 0.007 85);
+    --fg:oklch(0.25 0.012 80);--muted:oklch(0.48 0.014 80);--faint:oklch(0.62 0.014 80);
+    --accent:oklch(0.55 0.13 var(--accent-h));--accent-2:oklch(0.49 0.135 var(--accent-h));--on-accent:oklch(0.99 0.012 var(--accent-h));--accent-soft:oklch(0.93 0.035 var(--accent-h));--accent-line:oklch(0.83 0.06 var(--accent-h));
+    --code-bg:oklch(0.97 0.008 85);--tok-comment:oklch(0.6 0.012 80);--tok-key:oklch(0.5 0.13 var(--accent-h));--tok-str:oklch(0.50 0.11 155);--tok-num:oklch(0.50 0.12 250);--tok-punct:oklch(0.5 0.012 80);--tok-arrow:oklch(0.5 0.13 var(--accent-h));
+  }
+  [data-accent="sky"]{--accent-h:245;--accent-c:0.12;}
+  [data-accent="rust"]{--accent-h:52;--accent-c:0.135;}
+  [data-accent="green"]{--accent-h:155;--accent-c:0.115;}
+  [data-accent="violet"]{--accent-h:300;--accent-c:0.115;}
+  [data-density="compact"]{--section-y:4.5rem;}
+  [data-density="comfortable"]{--section-y:7rem;}
+  [data-density="spacious"]{--section-y:9.5rem;}
+  html{scroll-behavior:smooth;}
+  .dbd-root ::selection{background:var(--accent-soft);color:var(--fg);}
+  .dbd-root pre{font-variant-ligatures:none;}
+  .dbd-root a{text-decoration:none;}
+  @keyframes dbdRise{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:none;}}
+  .dbd-rise{animation:dbdRise .7s cubic-bezier(.2,.7,.2,1) both;}
+  @media (prefers-reduced-motion: reduce){.dbd-rise{animation:none;}}
+</style>
+</helmet>
+<div class="dbd-root" data-theme="light" data-accent="sky" data-density="comfortable" ref="{{ setRoot }}" style="min-height:100vh;background:var(--bg);color:var(--fg);font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased;">
+
+  <header style="position:sticky;top:0;z-index:40;background:color-mix(in oklch, var(--bg) 82%, transparent);backdrop-filter:blur(12px);">
+    <div style="max-width:76rem;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:1.5rem;padding:0.875rem 1.5rem;">
+      <a href="#top" style="display:inline-flex;align-items:center;gap:0.625rem;">
+        <span style="display:inline-flex;flex:none;height:2rem;width:2rem;color:var(--accent);">{{ brandMark }}</span>
+        <span style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.15rem;letter-spacing:-0.01em;color:var(--fg);">{{ brand.name }}</span>
+      </a>
+      <nav style="display:flex;align-items:center;gap:1.75rem;">
+        <sc-for list="{{ navLinks }}" as="l" hint-placeholder-count="4">
+          <a href="{{ l.href }}" style="white-space:nowrap;font-size:0.9rem;color:var(--muted);">{{ l.label }}</a>
+        </sc-for>
+      </nav>
+      <div style="display:flex;align-items:center;gap:0.75rem;">
+        <button onClick="{{ toggleTheme }}" aria-label="Toggle color theme" style="display:grid;height:2.25rem;width:2.25rem;place-items:center;border-radius:0.5rem;border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer;">{{ themeIcon }}</button>
+        <a href="#top" style="white-space:nowrap;font-size:0.9rem;color:var(--muted);">Sign in</a>
+        <a href="{{ navCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.625rem 1.25rem;font-size:0.9rem;background:var(--accent);color:var(--on-accent);white-space:nowrap;">{{ navCta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="top" style="position:relative;overflow:hidden;">
+      <div style="position:absolute;inset:0;pointer-events:none;opacity:0.6;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 55%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 55%,transparent 100%);"></div>
+      <div style="position:relative;max-width:76rem;margin:0 auto;display:grid;align-items:center;gap:3rem;padding:4rem 1.5rem var(--section-y);grid-template-columns:1.05fr 0.95fr;">
+        <div class="dbd-rise" style="display:flex;flex-direction:column;align-items:flex-start;gap:1.5rem;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ hero.eyebrow }}</div>
+          <h1 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:700;font-size:clamp(2.6rem,6vw,4.6rem);line-height:0.98;letter-spacing:-0.035em;color:var(--fg);text-wrap:balance;margin:0;">{{ heroTitleA }}<br><span style="color:var(--accent);">{{ heroTitleB }}</span></h1>
+          <p style="max-width:36rem;font-size:1.15rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ hero.lede }}</p>
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem;padding-top:0.25rem;">
+            <a href="{{ hero.primaryCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.5rem;font-size:1rem;background:var(--accent);color:var(--on-accent);">{{ hero.primaryCta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
+            <a href="{{ hero.secondaryCta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.5rem;font-size:1rem;border:1px solid var(--line);color:var(--fg);background:transparent;">{{ hero.secondaryCta.label }}</a>
+          </div>
+          <div style="margin-top:0.5rem;display:inline-flex;align-items:center;gap:0.75rem;border-radius:0.5rem;border:1px solid var(--line);background:var(--surface);padding:0.625rem 1rem;font-family:'IBM Plex Mono',monospace;font-size:0.9rem;"><span style="color:var(--accent);">$</span><span style="color:var(--fg);">{{ hero.install }}</span></div>
+        </div>
+        <div class="dbd-rise" style="animation-delay:0.12s;">{{ terminalEl }}</div>
+      </div>
+    </section>
+
+    <section id="overview" style="position:relative;background:var(--bg-deep);">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="display:flex;flex-direction:column;gap:1rem;align-items:flex-start;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ overviewHead.eyebrow }}</div>
+          <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ overviewHead.title }}</h2>
+          <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ overviewHead.lede }}</p>
+        </div>
+        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(3,1fr);">
+          <sc-for list="{{ features }}" as="f" hint-placeholder-count="6">
+            <div style="display:flex;flex-direction:column;gap:0.75rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
+              <span style="font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--faint);">{{ f.tag }}</span>
+              <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.4rem;color:var(--fg);margin:0;">{{ f.title }}</h3>
+              <p style="font-size:0.9rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ f.body }}</p>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+
+    <section id="concepts" style="position:relative;">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="display:flex;flex-direction:column;gap:1rem;align-items:center;text-align:center;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ conceptsHead.eyebrow }}</div>
+          <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ conceptsHead.title }}</h2>
+        </div>
+        <div style="margin-top:3.5rem;display:flex;flex-direction:column;gap:4rem;">
+          <sc-for list="{{ concepts }}" as="item" hint-placeholder-count="4">
+            <div style="display:grid;align-items:center;gap:3.5rem;grid-template-columns:1fr 1fr;">
+              <div style="{{ item.textStyle }}">
+                <div style="display:flex;align-items:center;gap:0.75rem;">
+                  <span style="display:grid;height:1.75rem;width:1.75rem;place-items:center;border-radius:0.375rem;border:1px solid var(--accent-line);background:var(--accent-soft);font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--accent);">{{ item.num }}</span>
+                  <span style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.14em;color:var(--faint);">{{ item.kicker }}</span>
+                </div>
+                <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.55rem;line-height:1.25;letter-spacing:-0.015em;color:var(--fg);text-wrap:balance;margin:0;">{{ item.title }}</h3>
+                <p style="font-size:1rem;line-height:1.65;color:var(--muted);text-wrap:pretty;margin:0;">{{ item.body }}</p>
+              </div>
+              <div style="{{ item.codeStyle }}">{{ item.codeEl }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+
+    <section id="targets" style="position:relative;background:var(--bg-deep);">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="display:flex;flex-direction:column;gap:1rem;align-items:flex-start;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ targetsHead.eyebrow }}</div>
+          <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ targetsHead.title }}</h2>
+          <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ targetsHead.lede }}</p>
+        </div>
+        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
+          <sc-for list="{{ targets }}" as="t" hint-placeholder-count="4">
+            <div style="display:flex;flex-direction:column;gap:1rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
+              <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.4rem;color:var(--fg);margin:0;">{{ t.name }}</h3>
+              <code style="width:fit-content;border-radius:0.375rem;background:var(--code-bg);padding:0.25rem 0.625rem;font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--accent);">{{ t.scheme }}</code>
+              <p style="font-size:0.9rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ t.body }}</p>
+              <ul style="margin:0.25rem 0 0;display:flex;flex-direction:column;gap:0.5rem;border-top:1px solid var(--line-soft);padding:1rem 0 0;list-style:none;">
+                <sc-for list="{{ t.notes }}" as="n" hint-placeholder-count="3">
+                  <li style="display:flex;align-items:center;gap:0.625rem;font-size:0.9rem;color:var(--muted);"><span style="height:0.25rem;width:0.25rem;border-radius:9999px;background:var(--accent);flex:none;"></span>{{ n }}</li>
+                </sc-for>
+              </ul>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+
+    <section id="commands" style="position:relative;background:var(--bg-deep);">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="display:flex;flex-direction:column;gap:1rem;align-items:flex-start;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ commandsHead.eyebrow }}</div>
+          <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ commandsHead.title }}</h2>
+          <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);max-width:42rem;text-wrap:pretty;margin:0;">{{ commandsHead.lede }}</p>
+        </div>
+        <div style="margin-top:2.5rem;display:grid;gap:1rem;grid-template-columns:repeat(2,1fr);">
+          <sc-for list="{{ commands }}" as="c" hint-placeholder-count="7">
+            <div style="display:flex;align-items:baseline;gap:1rem;border-radius:0.75rem;border:1px solid var(--line);background:var(--surface);padding:1rem 1.25rem;">
+              <code style="flex:none;font-family:'IBM Plex Mono',monospace;font-size:0.85rem;color:var(--accent);">{{ c.cmd }}</code>
+              <p style="font-size:0.9rem;line-height:1.55;color:var(--muted);text-wrap:pretty;margin:0;">{{ c.body }}</p>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+
+    <section id="audience" style="position:relative;">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="display:flex;flex-direction:column;gap:1rem;align-items:center;text-align:center;">
+          <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ audienceHead.eyebrow }}</div>
+          <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);max-width:42rem;text-wrap:balance;margin:0;">{{ audienceHead.title }}</h2>
+        </div>
+        <div style="margin-top:3rem;display:grid;gap:1rem;grid-template-columns:repeat(4,1fr);">
+          <sc-for list="{{ audience }}" as="a" hint-placeholder-count="4">
+            <div style="display:flex;flex-direction:column;gap:0.5rem;border-radius:1.1rem;border:1px solid var(--line);background:var(--surface);padding:1.5rem;">
+              <h3 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:500;font-size:1.15rem;color:var(--fg);margin:0;">{{ a.title }}</h3>
+              <p style="font-size:0.9rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ a.body }}</p>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </section>
+
+    <section id="start" style="position:relative;background:var(--bg-deep);">
+      <div style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0.55;background-image:linear-gradient(to right,var(--line-soft) 1px,transparent 1px),linear-gradient(to bottom,var(--line-soft) 1px,transparent 1px);background-size:64px 64px;"></div>
+      <div style="position:relative;z-index:1;max-width:76rem;margin:0 auto;padding:var(--section-y) 1.5rem;">
+        <div style="overflow:hidden;border-radius:1.1rem;border:1px solid var(--accent-line);background:var(--surface);">
+          <div style="display:grid;gap:2.5rem;padding:3rem;grid-template-columns:1fr 1.1fr;">
+            <div style="display:flex;flex-direction:column;gap:1rem;align-items:flex-start;">
+              <div style="display:flex;align-items:center;gap:0.625rem;font-size:0.72rem;font-family:'IBM Plex Mono',monospace;font-weight:500;text-transform:uppercase;letter-spacing:0.14em;color:var(--accent);"><span style="display:inline-block;height:0.375rem;width:0.375rem;border-radius:9999px;background:var(--accent);"></span>{{ start.eyebrow }}</div>
+              <h2 style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:clamp(1.9rem,3.2vw,2.7rem);line-height:1.08;letter-spacing:-0.022em;color:var(--fg);text-wrap:balance;margin:0;">{{ start.title }}</h2>
+              <p style="font-size:1.15rem;line-height:1.6;color:var(--muted);text-wrap:pretty;margin:0;">{{ start.lede }}</p>
+              <div style="padding-top:0.5rem;">
+                <a href="{{ start.cta.href }}" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;border-radius:0.5rem;font-weight:500;padding:0.75rem 1.5rem;font-size:1rem;background:var(--accent);color:var(--on-accent);">{{ start.cta.label }}<svg viewBox="0 0 16 16" style="height:0.875rem;width:0.875rem;flex:none;" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></a>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:0.75rem;">
+              <sc-for list="{{ startSteps }}" as="s" hint-placeholder-count="3">
+                <div style="display:flex;align-items:center;gap:1rem;border-radius:0.5rem;border:1px solid var(--line);background:var(--code-bg);padding:1rem 1.25rem;">
+                  <span style="display:grid;height:1.75rem;width:1.75rem;flex:none;place-items:center;border-radius:0.375rem;background:var(--accent-soft);font-family:'IBM Plex Mono',monospace;font-size:0.9rem;color:var(--accent);">{{ s.n }}</span>
+                  <div style="display:flex;flex-direction:column;">
+                    <span style="font-size:0.8rem;color:var(--faint);">{{ s.text }}</span>
+                    <code style="font-family:'IBM Plex Mono',monospace;font-size:0.9rem;color:var(--fg);"><span style="color:var(--accent);">$ </span>{{ s.code }}</code>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer style="background:var(--bg);">
+    <div style="max-width:76rem;margin:0 auto;display:grid;gap:2.5rem;padding:3.5rem 1.5rem;grid-template-columns:1.4fr 1fr 1fr;">
+      <div style="display:flex;flex-direction:column;gap:0.75rem;">
+        <a href="#top" style="display:inline-flex;align-items:center;gap:0.625rem;">
+          <span style="display:inline-flex;flex:none;height:4rem;width:4rem;color:var(--accent);">{{ brandMark }}</span>
+          <span style="font-family:'Space Grotesk',system-ui,sans-serif;font-weight:600;font-size:1.15rem;letter-spacing:-0.01em;color:var(--fg);">{{ brand.name }}</span>
+        </a>
+        <p style="max-width:20rem;font-size:0.9rem;line-height:1.6;color:var(--muted);margin:0;">{{ footerTagline }}</p>
+      </div>
+      <sc-for list="{{ footerColumns }}" as="col" hint-placeholder-count="2">
+        <div style="display:flex;flex-direction:column;gap:0.75rem;">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.14em;color:var(--faint);">{{ col.title }}</span>
+          <ul style="display:flex;flex-direction:column;gap:0.5rem;list-style:none;margin:0;padding:0;">
+            <sc-for list="{{ col.links }}" as="l" hint-placeholder-count="3">
+              <li><a href="{{ l.href }}" style="font-size:0.9rem;color:var(--muted);">{{ l.label }}</a></li>
+            </sc-for>
+          </ul>
+        </div>
+      </sc-for>
+    </div>
+    <div style="border-top:1px solid var(--line);">
+      <div style="max-width:76rem;margin:0 auto;display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;justify-content:space-between;padding:1.25rem 1.5rem;">
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:var(--faint);">{{ brand.name }} — {{ brand.full }}</span>
+        <span style="font-size:0.8rem;color:var(--faint);">{{ footerLegal }}</span>
+      </div>
+    </div>
+  </footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;sky&quot;,&quot;rust&quot;,&quot;green&quot;,&quot;violet&quot;],&quot;default&quot;:&quot;sky&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;compact&quot;,&quot;comfortable&quot;,&quot;spacious&quot;],&quot;default&quot;:&quot;comfortable&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;heroTitleA&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;Your database schema,&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Hero copy&quot;},&quot;heroTitleB&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;managed like source code.&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Hero copy&quot;}}">
+class Component extends DCLogic {
+  state = {};
+
+  get DATA() {
+    return {
+      brand: { name: "dbd", full: "Database Designer" },
+      nav: {
+        links: [
+          { label: "Overview", href: "#overview" },
+          { label: "Concepts", href: "#concepts" },
+          { label: "Targets", href: "#targets" },
+          { label: "Commands", href: "#commands" },
+          { label: "Who it's for", href: "#audience" },
+        ],
+        cta: { label: "Get started", href: "#start" },
+      },
+      hero: {
+        eyebrow: "Schema-as-code · built in Rust",
+        lede: "dbd turns plain SQL DDL files into a versioned, deployable schema. No DSL, no ORM, no migration files written by hand — just the folder structure as the source of truth.",
+        primaryCta: { label: "Get started", href: "#start" },
+        secondaryCta: { label: "Read the concepts", href: "#concepts" },
+        install: "cargo install dbd-cli",
+        terminal: {
+          file: "~/my-project",
+          lines: [
+            { type: "cmd", text: "dbd snapshot --name \"add notes column\"" },
+            { type: "out", text: "\u2713 wrote snapshots/002.json" },
+            { type: "out", text: "\u2713 wrote migrations/002/config/lookup_values.sql" },
+            { type: "cmd", text: "dbd apply" },
+            { type: "out", text: "\u2192 config.lookups        created" },
+            { type: "out", text: "\u2192 config.genders        created" },
+            { type: "out", text: "\u2192 migration 002         applied" },
+            { type: "ok", text: "\u2713 schema in sync" },
+          ],
+        },
+      },
+      overview: {
+        eyebrow: "What dbd handles",
+        title: "One SQL source. Everything else automated.",
+        lede: "Point dbd at a folder of DDL files and a single manifest. It works out ordering, diffs, data loading, docs and deployment for you.",
+        features: [
+          { tag: "01", title: "Dependency ordering", body: "Tables with foreign keys are applied after the tables they reference. No manual sequencing." },
+          { tag: "02", title: "Schema migrations", body: "Versioned snapshots with auto-generated ALTER scripts. Change a file, snapshot the diff." },
+          { tag: "03", title: "Data loading", body: "CSV, TSV and JSONL files loaded into staging tables with automatic procedure calls." },
+          { tag: "04", title: "Documentation", body: "DBML generation for dbdocs.io and dbdiagram.io, straight from your schema." },
+          { tag: "05", title: "Multi-target deploy", body: "PostgreSQL, Supabase, SQLite and Convex — the same parsed schema, different adapters." },
+          { tag: "06", title: "Scoped deployments", body: "Deploy a named subset of the schema to different databases, with dependency-gap checking." },
+          { tag: "07", title: "Formatter + pre-commit", body: "dbd format keeps DDL tidy (river-style); dbd format --check drops into pre-commit and CI." },
+          { tag: "08", title: "Row-level security", body: "Manage Postgres/Supabase RLS policies as code in policies/ and apply them with dbd policies." },
+          { tag: "09", title: "Reverse-engineer a database", body: "Point dbd init --from-db at an existing database to generate DDL files, or merge live tables back into a project." },
+          { tag: "10", title: "Interactive schema diagram", body: "dbd diagram opens a live, explorable view of your schema — tables, columns and foreign-key relationships." },
+          { tag: "11", title: "Deploy straight from GitHub", body: "dbd deploy --source pulls a schema from a Git repository and applies it to any target — no local checkout." },
+          { tag: "12", title: "Environment-scoped data", body: "Seed data is environment-aware: files under import/<env>/<schema>/ load only when you pass -e <env>. Ship dev fixtures that never touch production." },
+        ],
+      },
+      concepts: {
+        eyebrow: "Core concepts",
+        title: "Five ideas, and you know dbd.",
+        items: [
+          { id: "ddl", kicker: "Source of truth", title: "DDL files are the schema", body: "Your schema is standard SQL under ddl/. One entity per file — table, view, function, procedure or enum. The file path determines the entity name. No DSL, no ORM.", code: { lang: "text", label: "ddl/", source: "ddl/table/config/lookups.ddl     \u2192 config.lookups (table)\nddl/view/config/genders.ddl      \u2192 config.genders (view)\nddl/procedure/staging/import.ddl \u2192 staging.import (procedure)\nddl/enum/config/status.sql       \u2192 config.status (enum)" } },
+          { id: "manifest", kicker: "Project manifest", title: "design.yaml declares the project", body: "One YAML file declares metadata, target databases, schemas and data operations. Everything else is auto-discovered from the folder structure.", code: { lang: "yaml", label: "design.yaml", source: "project:\n  name: MyProject\n\nsource:\n  dialect: postgresql\n\ntarget:\n  postgres:\n    url: $DATABASE_URL\n    extensions: [uuid-ossp]\n\nschemas: [config, staging]\n\nimport:\n  staging: [staging]\n  options:\n    truncate: true" } },
+          { id: "snapshots", kicker: "Versioning", title: "Two modes of schema evolution", body: "Pre-release, dbd reconcile diffs the live database against the design and alters it in place — no snapshots. When you lock in with dbd release, dbd switches to versioned snapshots with auto-generated migrations. Risky changes (renames, type changes) auto-split into safe staged migrations.", code: { lang: "sh", label: "terminal", source: "$ dbd reconcile        # pre-release: diff live DB, alter in place\n$ dbd release          # lock in: write baseline snapshot\n$ dbd snapshot --name \"add notes column\"\n# snapshots/002.json            full schema state\n# migrations/002/.../...sql     the ALTER TABLE statement" } },
+          { id: "adapters", kicker: "Deployment", title: "Adapters handle the target", body: "The same parsed schema deploys to different databases. Pick a target by its connection string and dbd does the right thing for that engine.", code: { lang: "sh", label: "targets", source: "postgres://\u2026        execute SQL directly via sqlx\ntarget: supabase    managed-infra filtering + grants\nsqlite::memory:     bare-name catalog, batched INSERT\nconvex:             codegen \u2192 convex/schema.ts" } },
+          { id: "library", kicker: "Embeddable", title: "Use it as a library", body: "Everything the CLI does lives in the dbd-core crate. Embed schema parsing, diffing and deployment in your own Rust tooling — the guide covers the full API.", code: { lang: "rust", label: "main.rs", source: "use dbd_core::Design;\n\nlet design = Design::from_config(path, \"prod\")?;\ndesign.apply(&adapter, None, false).await?;" } },
+        ],
+      },
+      targets: {
+        eyebrow: "Multi-target deployment",
+        title: "Write once. Deploy to four engines.",
+        lede: "One parsed schema, four adapters. Each handles the quirks of its engine so you don't have to.",
+        items: [
+          { name: "PostgreSQL", scheme: "postgres://", body: "Executes SQL directly via sqlx. The reference target — full feature support.", notes: ["Direct DDL execution", "Extensions & enums", "sqlx-backed"] },
+          { name: "Supabase", scheme: "postgres:// + target: supabase", body: "PostgreSQL with managed-infrastructure filtering and automatic grant handling. Same connection string — the target flag in design.yaml switches the adapter.", notes: ["Managed-infra filtering", "Grant handling", "Postgres-compatible"] },
+          { name: "SQLite", scheme: "sqlite::memory:", body: "Bare-name catalog with batched multi-row INSERT import (\u2264500 rows per batch). Triggers stay atomic.", notes: ["Batched INSERT \u2264500", "Atomic CREATE TRIGGER", "Schemas no-op"] },
+          { name: "Convex", scheme: "convex:", body: "Codegen target. Writes convex/schema.ts with v.* validators and v.id() foreign keys.", notes: ["TypeScript codegen", "v.* validators", "schema_entity names"] },
+        ],
+      },
+      commands: {
+        eyebrow: "The full toolbelt",
+        title: "More where that came from.",
+        lede: "Beyond the everyday flow, dbd ships focused commands for validation, data movement and project hygiene.",
+        items: [
+          { cmd: "dbd inspect", body: "Validate config and report unresolved references — works offline via a local refcache." },
+          { cmd: "dbd export", body: "Dump table data back out to CSV, TSV or JSONL." },
+          { cmd: "dbd doctor", body: "Audit and migrate your design.yaml and DDL layout." },
+          { cmd: "dbd reset", body: "Drop project schemas, with safety guards." },
+          { cmd: "dbd combine", body: "Combine all DDL into a single SQL file." },
+          { cmd: "dbd graph", body: "Output the dependency graph as JSON." },
+          { cmd: "dbd migrate --status", body: "Show current migration version status." },
+        ],
+      },
+      audience: {
+        eyebrow: "Who it's for",
+        title: "Built for people who think in SQL.",
+        items: [
+          { title: "Application developers", body: "Who want schema-as-code without reaching for an ORM." },
+          { title: "DevOps & platform teams", body: "Automating database deployments straight from Git." },
+          { title: "Rust developers", body: "Who want to embed schema management directly in their apps." },
+          { title: "Multi-database teams", body: "Driving several databases from a single SQL source." },
+        ],
+      },
+      start: {
+        eyebrow: "Get started",
+        title: "Install dbd and snapshot your first schema.",
+        lede: "It's a single Rust binary. Point it at a folder of SQL and a manifest — that's the whole setup.",
+        steps: [
+          { n: "1", text: "Install the binary", code: "cargo install dbd-cli" },
+          { n: "2", text: "Scaffold a project", code: "dbd init --name my-project" },
+          { n: "3", text: "Apply your schema", code: "dbd apply" },
+        ],
+        cta: { label: "View on GitHub", href: "https://github.com" },
+      },
+      footer: {
+        tagline: "Database schemas as code, built in Rust.",
+        columns: [
+          { title: "Product", links: [ { label: "Overview", href: "#overview" }, { label: "Concepts", href: "#concepts" }, { label: "Targets", href: "#targets" } ] },
+          { title: "Resources", links: [ { label: "Get started", href: "#start" }, { label: "GitHub", href: "https://github.com" }, { label: "DBML docs", href: "#" } ] },
+        ],
+        legal: "An open-source project. SQL is the source of truth.",
+      },
+    };
+  }
+
+  // ---- effective tweak values (state overrides props) ----
+  eff(key, fallback) {
+    if (this.state[key] != null) return this.state[key];
+    if (this.props[key] != null) return this.props[key];
+    return fallback;
+  }
+
+  applyTheme() {
+    if (!this.rootEl) return;
+    this.rootEl.setAttribute("data-theme", this.eff("theme", "light"));
+    this.rootEl.setAttribute("data-accent", this.eff("accent", "sky"));
+    this.rootEl.setAttribute("data-density", this.eff("density", "comfortable"));
+  }
+  componentDidMount() { this.applyTheme(); }
+  componentDidUpdate() { this.applyTheme(); }
+
+  // ---- syntax highlighter (ported) ----
+  highlight(source, lang) {
+    const plain = (line) => [{ t: line, c: "punct" }];
+    const yamlLine = (line) => {
+      const toks = []; const ci = line.indexOf("#");
+      let code = line, comment = "";
+      if (ci >= 0) { code = line.slice(0, ci); comment = line.slice(ci); }
+      const re = /(\s+)|([A-Za-z0-9_-]+)(\s*:)|(\$[A-Za-z_][A-Za-z0-9_]*)|([\[\],])|(.)/g;
+      let m;
+      while ((m = re.exec(code)) !== null) {
+        if (m[1]) toks.push({ t: m[1], c: "ws" });
+        else if (m[2]) { toks.push({ t: m[2], c: "key" }); toks.push({ t: m[3], c: "punct" }); }
+        else if (m[4]) toks.push({ t: m[4], c: "num" });
+        else if (m[5]) toks.push({ t: m[5], c: "punct" });
+        else if (m[6]) toks.push({ t: m[6], c: "str" });
+      }
+      if (comment) toks.push({ t: comment, c: "comment" });
+      return toks.length ? toks : plain(line);
+    };
+    const shLine = (line) => {
+      const toks = []; let rest = line;
+      const pm = rest.match(/^(\s*\$\s)/);
+      if (pm) { toks.push({ t: pm[1], c: "arrow" }); rest = rest.slice(pm[1].length); }
+      if (/^\s*#/.test(rest)) { toks.push({ t: rest, c: "comment" }); return toks; }
+      const re = /(\s+)|("[^"]*")|(--?[A-Za-z][\w-]*)|(\bdbd\b)|([^\s]+)/g;
+      let m;
+      while ((m = re.exec(rest)) !== null) {
+        if (m[1]) toks.push({ t: m[1], c: "ws" });
+        else if (m[2]) toks.push({ t: m[2], c: "str" });
+        else if (m[3]) toks.push({ t: m[3], c: "num" });
+        else if (m[4]) toks.push({ t: m[4], c: "key" });
+        else if (m[5]) toks.push({ t: m[5], c: "punct" });
+      }
+      return toks.length ? toks : plain(line);
+    };
+    const textLine = (line) => {
+      const idx = line.indexOf("\u2192");
+      if (idx >= 0) return [ { t: line.slice(0, idx), c: "punct" }, { t: "\u2192", c: "arrow" }, { t: line.slice(idx + 1), c: "comment" } ];
+      return plain(line);
+    };
+    const fn = lang === "yaml" ? yamlLine : lang === "sh" ? shLine : lang === "text" ? textLine : plain;
+    return String(source).split("\n").map(fn);
+  }
+
+  tokStyle(c) {
+    const map = { punct: "--tok-punct", key: "--tok-key", str: "--tok-str", num: "--tok-num", comment: "--tok-comment", arrow: "--tok-arrow" };
+    return map[c] ? { color: "var(" + map[c] + ")" } : {};
+  }
+
+  dots() {
+    const s = { height: "0.625rem", width: "0.625rem", borderRadius: "9999px", background: "var(--line)" };
+    return [0, 1, 2].map((i) => React.createElement("span", { key: i, style: s }));
+  }
+
+  frame(label, body) {
+    const h = React.createElement;
+    return h("div", { style: { overflow: "hidden", borderRadius: "1.1rem", border: "1px solid var(--line)", background: "var(--code-bg)" } },
+      h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid var(--line-soft)", padding: "0.625rem 1rem" } },
+        h("div", { style: { display: "flex", gap: "0.375rem" } }, this.dots()),
+        h("span", { style: { fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.8rem", color: "var(--faint)" } }, label)
+      ),
+      body
+    );
+  }
+
+  codeBlock(code) {
+    const h = React.createElement;
+    const lines = this.highlight(code.source, code.lang);
+    const pre = h("pre", { style: { overflowX: "auto", padding: "1rem", fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.82rem", lineHeight: "1.6", margin: 0 } },
+      h("code", null, lines.map((toks, i) =>
+        h("div", { key: i, style: { whiteSpace: "pre" } },
+          toks.length ? toks.map((tk, j) => h("span", { key: j, style: this.tokStyle(tk.c) }, tk.t)) : "\n")
+      ))
+    );
+    return this.frame(code.label, pre);
+  }
+
+  terminal(data) {
+    const h = React.createElement;
+    const lineColor = { cmd: "var(--fg)", out: "var(--muted)", ok: "var(--tok-str)" };
+    const body = h("div", { style: { padding: "1rem", fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.82rem", lineHeight: "1.6" } },
+      data.lines.map((ln, i) =>
+        h("div", { key: i, style: { display: "flex", gap: "0.5rem", whiteSpace: "pre" } },
+          h("span", { style: { color: ln.type === "cmd" ? "var(--accent)" : "transparent" } }, "$"),
+          h("span", { style: { color: lineColor[ln.type] } }, ln.text)
+        )
+      )
+    );
+    return this.frame(data.file, body);
+  }
+
+  brandMark() {
+    const svg = (typeof window !== "undefined" && window.DBD_LOGO_SVG) || "";
+    return React.createElement("span", { style: { display: "inline-flex", width: "100%", height: "100%" }, dangerouslySetInnerHTML: { __html: svg } });
+  }
+
+  themeIcon(theme) {
+    const h = React.createElement;
+    if (theme === "dark") {
+      return h("svg", { viewBox: "0 0 20 20", style: { height: "1rem", width: "1rem" }, fill: "none", stroke: "currentColor", strokeWidth: "1.5" },
+        h("circle", { cx: "10", cy: "10", r: "4" }),
+        h("path", { d: "M10 2v2M10 16v2M2 10h2M16 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M15.8 4.2l-1.4 1.4M5.6 14.4l-1.4 1.4", strokeLinecap: "round" })
+      );
+    }
+    return h("svg", { viewBox: "0 0 20 20", style: { height: "1rem", width: "1rem" }, fill: "none", stroke: "currentColor", strokeWidth: "1.5" },
+      h("path", { d: "M16 11.5A6.5 6.5 0 0 1 8.5 4a6.5 6.5 0 1 0 7.5 7.5z", strokeLinejoin: "round" })
+    );
+  }
+
+  renderVals() {
+    const D = this.DATA;
+    const theme = this.eff("theme", "light");
+    const titleA = this.eff("heroTitleA", "Your database schema,");
+    const titleB = this.eff("heroTitleB", "managed like source code.");
+
+    const concepts = D.concepts.items.map((it, i) => ({
+      num: String(i + 1).padStart(2, "0"),
+      kicker: it.kicker,
+      title: it.title,
+      body: it.body,
+      codeEl: this.codeBlock(it.code),
+      textStyle: { display: "flex", flexDirection: "column", gap: "1rem", order: i % 2 === 1 ? 2 : 1 },
+      codeStyle: { order: i % 2 === 1 ? 1 : 2 },
+    }));
+
+    return {
+      brand: D.brand,
+      navLinks: D.nav.links,
+      navCta: D.nav.cta,
+      hero: D.hero,
+      heroTitleA: titleA,
+      heroTitleB: titleB,
+      overviewHead: { eyebrow: D.overview.eyebrow, title: D.overview.title, lede: D.overview.lede },
+      features: D.overview.features,
+      conceptsHead: { eyebrow: D.concepts.eyebrow, title: D.concepts.title },
+      concepts,
+      targetsHead: { eyebrow: D.targets.eyebrow, title: D.targets.title, lede: D.targets.lede },
+      targets: D.targets.items,
+      commandsHead: { eyebrow: D.commands.eyebrow, title: D.commands.title, lede: D.commands.lede },
+      commands: D.commands.items,
+      audienceHead: { eyebrow: D.audience.eyebrow, title: D.audience.title },
+      audience: D.audience.items,
+      start: D.start,
+      startSteps: D.start.steps,
+      footerTagline: D.footer.tagline,
+      footerColumns: D.footer.columns,
+      footerLegal: D.footer.legal,
+      brandMark: this.brandMark(),
+      terminalEl: this.terminal(D.hero.terminal),
+      themeIcon: this.themeIcon(theme),
+      setRoot: (el) => { this.rootEl = el; this.applyTheme(); },
+      toggleTheme: () => this.setState({ theme: theme === "dark" ? "light" : "dark" }),
+    };
+  }
+}
+</script>
+</body>
+</html>
