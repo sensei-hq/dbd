@@ -9,7 +9,7 @@ The current mockup is accurate against the product. Every item from earlier roun
 ## Current state (context for the designer)
 
 - **Current mockup:** `docs/mockup/dbd.dc.html` — single self-contained file. All copy lives inline in the `DBD_DATA` object (~lines 260–360): `hero`, `overview.features[]`, `concepts.items[]`, `targets.items[]`, `commands.items[]`, `audience.items[]`, `start.steps[]`, `footer`.
-- **Live site** content is data-driven from `site/src/lib/data.ts` (rendered by `site/src/routes/+page.svelte`). Note: the site still carries the original 6 overview cards — the mockup's cards 07–12 need porting to `data.ts` when convenient.
+- **Live site** content is data-driven from `site/src/lib/data.ts` (rendered by `site/src/routes/+page.svelte`) and is in sync with the mockup — all 12 overview cards, the 5 concepts, the 8-command toolbelt (incl. `dbd diagram`), and the latest copy edits are ported.
 - Card shapes: `overview.features[]` = `{ tag, title, body }`; `concepts.items[]` = `{ id, kicker, title, body, code }`; `targets.items[]` = `{ name, scheme, body, notes[] }`; `commands.items[]` = `{ cmd, body }`.
 
 ---
