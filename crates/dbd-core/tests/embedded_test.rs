@@ -1400,3 +1400,89 @@ async fn batch_failure_mid_plan_rolls_back_prior_ddl() {
 
     assert_schema_absent(&*adapter, "partial_schema").await;
 }
+
+// ── Bookkeeping table lives in `public`, healing a scoped-apply stray ──────────
+
+/// Assert `_dbd_meta.version` for `project` equals `expected`, reading the given
+/// schema explicitly (so the test doesn't depend on search_path resolution).
+async fn assert_meta_version(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    schema: &str,
+    project: &str,
+    expected: i32,
+) {
+    let sql = format!(
+        "DO $$ DECLARE v integer; BEGIN \
+           SELECT version INTO v FROM \"{schema}\"._dbd_meta WHERE project = '{project}'; \
+           IF v IS DISTINCT FROM {expected} THEN \
+             RAISE EXCEPTION '{schema}._dbd_meta[{project}].version = %, expected {expected}', v; \
+           END IF; \
+         END $$"
+    );
+    adapter
+        .execute_script(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("assert_meta_version({schema}, {project}) failed: {e}"));
+}
+
+/// A scoped apply can leave `_dbd_meta` in a non-`public` schema (pooled
+/// connections don't share `search_path`). Reads must still find it, and the
+/// next write must relocate it into `public` — preserving every row — so later
+/// unqualified/pooled access can't miss it (which surfaced as
+/// `relation "_dbd_meta" does not exist` during reconcile).
+#[tokio::test]
+async fn meta_table_heals_from_stray_schema_into_public() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "meta_heal_test").await.unwrap();
+
+    // Simulate the leak: `_dbd_meta` created in `dojo`, not `public`, with a row
+    // for this project (v7) and an unrelated project's row (v99) to prove the
+    // relocation moves data rather than recreating an empty table.
+    adapter
+        .execute_script(
+            "CREATE SCHEMA dojo; \
+             CREATE TABLE dojo._dbd_meta ( \
+                project     varchar NOT NULL PRIMARY KEY, \
+                env         varchar NOT NULL DEFAULT 'dev', \
+                version     integer NOT NULL DEFAULT 0, \
+                created_at  timestamptz NOT NULL DEFAULT now(), \
+                updated_at  timestamptz NOT NULL DEFAULT now() \
+             ); \
+             INSERT INTO dojo._dbd_meta (project, env, version) \
+                VALUES ('meta_heal_test', 'prod', 7), ('other_project', 'dev', 99)",
+        )
+        .await
+        .expect("seed stray dojo._dbd_meta");
+
+    // Precondition: no `public._dbd_meta` yet, and the version read must find the
+    // stray copy (v7) — NOT silently fall back to 0.
+    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
+    assert_eq!(
+        adapter.get_db_version().await.unwrap(),
+        7,
+        "get_db_version must read the stray dojo._dbd_meta, not miss it as 0"
+    );
+
+    // A write heals the location: relocate into `public` and upsert this project
+    // to v8. This is exactly what reconcile/apply do at the end of a run.
+    adapter
+        .set_project_meta("prod", 8)
+        .await
+        .expect("set_project_meta should heal + upsert");
+
+    // `_dbd_meta` now lives in `public`; the stray `dojo` copy is gone.
+    assert_table_exists(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "dojo", "_dbd_meta").await;
+
+    // This project's row was updated in place (v8), and the unrelated row rode
+    // along with the relocation (v99) — proving data was moved, not dropped.
+    assert_meta_version(&*adapter, "public", "meta_heal_test", 8).await;
+    assert_meta_version(&*adapter, "public", "other_project", 99).await;
+
+    // And the version reads resolve against `public` now.
+    assert_eq!(adapter.get_db_version().await.unwrap(), 8);
+    let meta = adapter.get_project_meta().await.unwrap().unwrap();
+    assert_eq!(meta.version, 8);
+    assert_eq!(meta.env, "prod");
+    assert_eq!(meta.project, "meta_heal_test");
+}
