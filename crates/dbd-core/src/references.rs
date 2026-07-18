@@ -1,4 +1,6 @@
-use crate::entity::Entity;
+use std::collections::HashSet;
+
+use crate::entity::{Entity, ForeignKey, TableConstraint};
 
 /// Match parsed references against known entities and external entities.
 ///
@@ -9,18 +11,17 @@ use crate::entity::Entity;
 /// A bare cross-schema FK (`REFERENCES t`, no schema) is pre-qualified by the
 /// parser to `<default_schema>.t` (the referencing table's own schema). When the
 /// real target lives in another schema on the table's `search_path` (e.g. a
-/// `dojo` table referencing `sensei.t`), that guess is wrong and would drop the
-/// edge — hiding the dependency from scope-gap analysis and the topo sort. So an
-/// unresolved reference qualified with the default schema is re-resolved along
-/// the table's search_path, mirroring how Postgres itself resolves the bare name.
+/// `dojo` table referencing `sensei.t`), that guess is wrong. Left uncorrected it
+/// (a) drops the edge from `refers` — hiding the dependency from scope-gap
+/// analysis and the topo sort — and (b) leaves the FK's `ref_schema` pointing at
+/// the wrong schema, so emit/dbml and reconcile's parsed-vs-live FK diff disagree
+/// with the database. Both the `refers` strings and the `ForeignKey.ref_schema`
+/// values are re-resolved along the table's search_path, mirroring how Postgres
+/// itself resolves the bare name (first schema on the path that has the table).
 ///
 /// Also filters out references that match the ignore list (patterns from design.yaml).
-pub fn resolve_references(
-    entities: &mut [Entity],
-    external_names: &[String],
-    ignore: &[String],
-) {
-    let known_names: std::collections::HashSet<String> = entities
+pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ignore: &[String]) {
+    let known_names: HashSet<String> = entities
         .iter()
         .map(|e| e.name.clone())
         .chain(external_names.iter().cloned())
@@ -28,23 +29,23 @@ pub fn resolve_references(
 
     for entity in entities.iter_mut() {
         // The parser qualifies bare references with the first search_path entry.
+        // dbd appends `public` to every applied search_path (see
+        // `ensure_public_in_search_path`), so a bare name can resolve there too.
         let default_schema = entity
             .search_paths
             .first()
-            .map(|s| s.as_str())
-            .unwrap_or("public");
-        // dbd appends `public` to every applied search_path (see
-        // `ensure_public_in_search_path`), so a bare name can resolve there too.
-        let search_path: Vec<&str> = {
-            let mut sp: Vec<&str> = entity.search_paths.iter().map(|s| s.as_str()).collect();
-            if !sp.contains(&"public") {
-                sp.push("public");
+            .cloned()
+            .unwrap_or_else(|| "public".to_string());
+        let search_path: Vec<String> = {
+            let mut sp = entity.search_paths.clone();
+            if !sp.iter().any(|s| s == "public") {
+                sp.push("public".to_string());
             }
             sp
         };
 
+        // (1) String references → refers (FK targets, view/proc deps).
         let mut resolved_refers = Vec::new();
-
         for ref_name in &entity.refers {
             if is_ignored(ref_name, ignore) {
                 continue;
@@ -53,25 +54,72 @@ pub fn resolve_references(
                 resolved_refers.push(ref_name.clone());
                 continue;
             }
-            // Unresolved as written. If it carries the default schema, it may be a
-            // bare cross-schema FK the parser mis-qualified — re-resolve the bare
-            // table name along the search_path (first hit wins, as in Postgres).
             if let Some((schema, table)) = ref_name.split_once('.')
-                && schema == default_schema
-                && let Some(found) = search_path
-                    .iter()
-                    .map(|s| format!("{s}.{table}"))
-                    .find(|cand| known_names.contains(cand))
+                && let Some(sch) =
+                    recover_bare_target(schema, table, &default_schema, &search_path, &known_names)
             {
-                resolved_refers.push(found);
+                resolved_refers.push(format!("{sch}.{table}"));
                 continue;
             }
             entity
                 .warnings
                 .push(format!("Unresolved reference: {ref_name}"));
         }
-
         entity.refers = resolved_refers;
+
+        // (2) FK structs → ref_schema (consumed by emit/dbml/reconcile). Keep in
+        // step with the refers resolution above so the target schema agrees.
+        if let Some(td) = entity.table_def.as_mut() {
+            for col in td.columns.iter_mut() {
+                if let Some(fk) = col.inline_fk.as_mut() {
+                    fix_fk_schema(fk, &default_schema, &search_path, &known_names);
+                }
+            }
+            for constraint in td.constraints.iter_mut() {
+                if let TableConstraint::ForeignKey(fk) = constraint {
+                    fix_fk_schema(fk, &default_schema, &search_path, &known_names);
+                }
+            }
+        }
+    }
+}
+
+/// If `schema.table` is unknown but `schema` is the table's default schema (the
+/// parser's bare-qualification marker), return the first schema on `search_path`
+/// that has `<s>.table` among `known`. `None` = leave the reference as written
+/// (either it resolves already, or it was deliberately qualified elsewhere).
+fn recover_bare_target(
+    schema: &str,
+    table: &str,
+    default_schema: &str,
+    search_path: &[String],
+    known: &HashSet<String>,
+) -> Option<String> {
+    if schema != default_schema {
+        return None;
+    }
+    search_path
+        .iter()
+        .find(|s| known.contains(&format!("{s}.{table}")))
+        .cloned()
+}
+
+/// Re-point a bare-qualified FK at the schema that actually holds its target,
+/// resolved along the referencing table's search_path. No-op when the FK already
+/// resolves as written or was explicitly qualified to a non-default schema.
+fn fix_fk_schema(
+    fk: &mut ForeignKey,
+    default_schema: &str,
+    search_path: &[String],
+    known: &HashSet<String>,
+) {
+    let cur_schema = fk.ref_schema.as_deref().unwrap_or(default_schema);
+    if known.contains(&format!("{cur_schema}.{}", fk.ref_table)) {
+        return; // resolves as written
+    }
+    if let Some(sch) = recover_bare_target(cur_schema, &fk.ref_table, default_schema, search_path, known)
+    {
+        fk.ref_schema = Some(sch);
     }
 }
 
@@ -229,6 +277,90 @@ mod tests {
         assert!(entities[0].refers.is_empty());
         assert_eq!(entities[0].warnings.len(), 1);
         assert!(entities[0].warnings[0].contains("dojo.ghost"));
+    }
+
+    #[test]
+    fn fk_ref_schema_repointed_along_search_path() {
+        use crate::entity::{ColumnDef, ForeignKey, TableConstraint, TableDef};
+
+        // A bare `REFERENCES namespaces` the parser qualified to the table's own
+        // schema (`dojo`); the real target is `sensei.namespaces`.
+        let bare_fk = |col: &str| ForeignKey {
+            columns: vec![col.to_string()],
+            ref_schema: Some("dojo".to_string()),
+            ref_table: "namespaces".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let col = ColumnDef {
+            name: "ns_inline".to_string(),
+            data_type: "int".to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            comment: None,
+            inline_fk: Some(bare_fk("ns_inline")),
+        };
+        let mut shared = entity_sp("dojo.shared_rules", &["dojo.namespaces"], &["dojo", "sensei"]);
+        shared.table_def = Some(TableDef {
+            columns: vec![col],
+            constraints: vec![TableConstraint::ForeignKey(bare_fk("ns_constraint"))],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+
+        let mut entities = vec![entity("sensei.namespaces", &[]), shared];
+        resolve_references(&mut entities, &[], &[]);
+
+        // refers AND both FK structs (inline + constraint) now point at sensei.
+        assert_eq!(entities[1].refers, vec!["sensei.namespaces"]);
+        let td = entities[1].table_def.as_ref().unwrap();
+        assert_eq!(
+            td.columns[0].inline_fk.as_ref().unwrap().ref_schema.as_deref(),
+            Some("sensei"),
+            "inline FK ref_schema should be repointed"
+        );
+        match &td.constraints[0] {
+            TableConstraint::ForeignKey(fk) => assert_eq!(
+                fk.ref_schema.as_deref(),
+                Some("sensei"),
+                "constraint FK ref_schema should be repointed"
+            ),
+            other => panic!("expected FK constraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fk_ref_schema_unchanged_when_target_is_local() {
+        use crate::entity::{ForeignKey, TableConstraint, TableDef};
+
+        // FK resolves within the default schema already → left untouched.
+        let fk = ForeignKey {
+            columns: vec!["parent_id".to_string()],
+            ref_schema: Some("app".to_string()),
+            ref_table: "parents".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let mut child = entity_sp("app.children", &["app.parents"], &["app"]);
+        child.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![TableConstraint::ForeignKey(fk)],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+
+        let mut entities = vec![entity("app.parents", &[]), child];
+        resolve_references(&mut entities, &[], &[]);
+
+        match &entities[1].table_def.as_ref().unwrap().constraints[0] {
+            TableConstraint::ForeignKey(fk) => {
+                assert_eq!(fk.ref_schema.as_deref(), Some("app"))
+            }
+            other => panic!("expected FK constraint, got {other:?}"),
+        }
     }
 
     #[test]
