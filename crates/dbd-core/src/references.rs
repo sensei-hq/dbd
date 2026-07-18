@@ -6,6 +6,14 @@ use crate::entity::Entity;
 /// view dependencies, etc. This function resolves those names against the
 /// known entity set and marks unresolved references as warnings.
 ///
+/// A bare cross-schema FK (`REFERENCES t`, no schema) is pre-qualified by the
+/// parser to `<default_schema>.t` (the referencing table's own schema). When the
+/// real target lives in another schema on the table's `search_path` (e.g. a
+/// `dojo` table referencing `sensei.t`), that guess is wrong and would drop the
+/// edge — hiding the dependency from scope-gap analysis and the topo sort. So an
+/// unresolved reference qualified with the default schema is re-resolved along
+/// the table's search_path, mirroring how Postgres itself resolves the bare name.
+///
 /// Also filters out references that match the ignore list (patterns from design.yaml).
 pub fn resolve_references(
     entities: &mut [Entity],
@@ -19,6 +27,22 @@ pub fn resolve_references(
         .collect();
 
     for entity in entities.iter_mut() {
+        // The parser qualifies bare references with the first search_path entry.
+        let default_schema = entity
+            .search_paths
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public");
+        // dbd appends `public` to every applied search_path (see
+        // `ensure_public_in_search_path`), so a bare name can resolve there too.
+        let search_path: Vec<&str> = {
+            let mut sp: Vec<&str> = entity.search_paths.iter().map(|s| s.as_str()).collect();
+            if !sp.contains(&"public") {
+                sp.push("public");
+            }
+            sp
+        };
+
         let mut resolved_refers = Vec::new();
 
         for ref_name in &entity.refers {
@@ -27,11 +51,24 @@ pub fn resolve_references(
             }
             if known_names.contains(ref_name) {
                 resolved_refers.push(ref_name.clone());
-            } else {
-                entity
-                    .warnings
-                    .push(format!("Unresolved reference: {ref_name}"));
+                continue;
             }
+            // Unresolved as written. If it carries the default schema, it may be a
+            // bare cross-schema FK the parser mis-qualified — re-resolve the bare
+            // table name along the search_path (first hit wins, as in Postgres).
+            if let Some((schema, table)) = ref_name.split_once('.')
+                && schema == default_schema
+                && let Some(found) = search_path
+                    .iter()
+                    .map(|s| format!("{s}.{table}"))
+                    .find(|cand| known_names.contains(cand))
+            {
+                resolved_refers.push(found);
+                continue;
+            }
+            entity
+                .warnings
+                .push(format!("Unresolved reference: {ref_name}"));
         }
 
         entity.refers = resolved_refers;
@@ -63,6 +100,14 @@ mod tests {
     fn entity(name: &str, refers: &[&str]) -> Entity {
         let mut e = Entity::new(EntityType::Table, name);
         e.refers = refers.iter().map(|s| s.to_string()).collect();
+        e
+    }
+
+    /// Like `entity`, but with an explicit `SET search_path` (first entry is the
+    /// schema the parser uses to qualify bare references).
+    fn entity_sp(name: &str, refers: &[&str], search_paths: &[&str]) -> Entity {
+        let mut e = entity(name, refers);
+        e.search_paths = search_paths.iter().map(|s| s.to_string()).collect();
         e
     }
 
@@ -138,6 +183,68 @@ mod tests {
 
         assert!(entities[0].refers.is_empty());
         assert!(entities[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn bare_cross_schema_fk_resolves_along_search_path() {
+        // `dojo.shared_rules` has `SET search_path TO dojo, sensei` and a bare
+        // `REFERENCES namespaces`; the parser qualified it as `dojo.namespaces`,
+        // but the real target is `sensei.namespaces`. It must resolve there — and
+        // stay in `refers` so scope-gap analysis sees the cross-scope edge.
+        let mut entities = vec![
+            entity("sensei.namespaces", &[]),
+            entity_sp("dojo.shared_rules", &["dojo.namespaces"], &["dojo", "sensei"]),
+        ];
+        resolve_references(&mut entities, &[], &[]);
+
+        assert_eq!(entities[1].refers, vec!["sensei.namespaces"]);
+        assert!(
+            entities[1].warnings.is_empty(),
+            "should not warn once resolved: {:?}",
+            entities[1].warnings
+        );
+    }
+
+    #[test]
+    fn bare_ref_resolves_to_public_fallback() {
+        // dbd appends `public` to every search_path, so a bare reference from an
+        // `app`-scoped table resolves against `public` when nothing local matches.
+        let mut entities = vec![
+            entity("public.helper", &[]),
+            entity_sp("app.widget", &["app.helper"], &["app"]),
+        ];
+        resolve_references(&mut entities, &[], &[]);
+
+        assert_eq!(entities[1].refers, vec!["public.helper"]);
+        assert!(entities[1].warnings.is_empty());
+    }
+
+    #[test]
+    fn unresolvable_bare_ref_still_warns() {
+        // No `ghost` in any schema on the search_path → genuinely unresolved,
+        // exactly as Postgres would fail. The re-resolution must not invent a hit.
+        let mut entities = vec![entity_sp("dojo.rules", &["dojo.ghost"], &["dojo", "sensei"])];
+        resolve_references(&mut entities, &[], &[]);
+
+        assert!(entities[0].refers.is_empty());
+        assert_eq!(entities[0].warnings.len(), 1);
+        assert!(entities[0].warnings[0].contains("dojo.ghost"));
+    }
+
+    #[test]
+    fn explicit_wrong_schema_ref_is_not_rewritten() {
+        // An explicitly-qualified ref whose schema is NOT the table's default
+        // schema is left unresolved (we only recover parser-defaulted bare refs,
+        // not silently redirect a deliberate `other.foo` to a different schema).
+        let mut entities = vec![
+            entity("sensei.namespaces", &[]),
+            entity_sp("dojo.rules", &["other.namespaces"], &["dojo", "sensei"]),
+        ];
+        resolve_references(&mut entities, &[], &[]);
+
+        assert!(entities[1].refers.is_empty());
+        assert_eq!(entities[1].warnings.len(), 1);
+        assert!(entities[1].warnings[0].contains("other.namespaces"));
     }
 
     #[test]
