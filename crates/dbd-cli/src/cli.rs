@@ -27,7 +27,7 @@ pub struct Cli {
     pub config: PathBuf,
 
     /// Database connection URL
-    #[arg(short, long, env = "DATABASE_URL", global = true)]
+    #[arg(short, long, env = "DATABASE_URL", global = true, hide_env_values = true)]
     pub database: Option<String>,
 
     /// Environment (dev or prod)
@@ -565,6 +565,25 @@ mod tests {
         let cli = Cli::try_parse_from(["dbd", "export", "-n", "t", "-f", "jsonl"])
             .expect("export -n t -f jsonl should parse");
         assert!(matches!(&cli.command, Commands::Export { output: None, format, .. } if format == "jsonl"));
+    }
+
+    /// `--help` must never render the resolved `$DATABASE_URL` value (which can
+    /// carry a password). clap binds the arg to the env var, so without
+    /// `hide_env_values` it would print `[env: DATABASE_URL=<the connection string>]`.
+    /// Assert the arg keeps `hide_env_values` set (introspecting the definition
+    /// avoids mutating the process env, which would race parallel tests).
+    #[test]
+    fn database_arg_hides_env_value_in_help() {
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "database")
+            .expect("global --database arg should exist");
+        assert!(
+            arg.is_hide_env_values_set(),
+            "the --database arg must set hide_env_values so `--help` never echoes \
+             the resolved $DATABASE_URL (which can carry a password)"
+        );
     }
 
     /// The global `-d/--database <url>` and `inspect --from-db` must coexist.
