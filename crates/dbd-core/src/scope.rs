@@ -377,6 +377,18 @@ mod tests {
         ]
     }
 
+    /// A dojo scope whose only table FKs across into `sensei`, transitively:
+    /// dojo.shared_rules → sensei.namespaces → sensei.scopes.
+    fn dojo_world() -> Vec<Entity> {
+        vec![
+            Entity::schema("dojo"),
+            Entity::schema("sensei"),
+            ent(EntityType::Table, "sensei.scopes", &[]),
+            ent(EntityType::Table, "sensei.namespaces", &["sensei.scopes"]),
+            ent(EntityType::Table, "dojo.shared_rules", &["sensei.namespaces"]),
+        ]
+    }
+
     fn scopes_yaml(yaml: &str) -> IndexMap<String, ScopeEntry> {
         let v: IndexMap<String, ScopeEntry> = serde_yaml::from_str(yaml).unwrap();
         v
@@ -469,6 +481,38 @@ mod tests {
         let scopes = scopes_yaml("hub:\n  includes: [config]\n  deps: report\n");
         let s = resolve(&scopes, Some("hub"), Some(DepsPolicy::Include), &world(), &[]).unwrap();
         assert_eq!(s.deps, DepsPolicy::Include);
+    }
+
+    /// A dojo-only scope whose table FK crosses into `sensei`
+    /// (shared_rules → sensei.namespaces → sensei.scopes): `report` surfaces the
+    /// full transitive chain as gaps (so `check_scope_gaps` aborts reconcile up
+    /// front with an actionable message); `include` pulls both sensei tables AND
+    /// the sensei schema entity into the closure.
+    #[test]
+    fn cross_schema_fk_chain_is_detected_and_expandable() {
+        let world = dojo_world();
+        let scopes = scopes_yaml("dojo:\n  includes: [dojo]\n");
+
+        // report → both out-of-scope tables are gaps, rooted at the in-scope table.
+        let s = resolve(&scopes, Some("dojo"), Some(DepsPolicy::Report), &world, &[]).unwrap();
+        let gaps = analyze_gaps(&s, &world, &[]);
+        let missing: HashSet<&str> = gaps.iter().map(|g| g.missing.as_str()).collect();
+        assert!(missing.contains("sensei.namespaces"), "direct FK gap missing: {gaps:?}");
+        assert!(missing.contains("sensei.scopes"), "transitive FK gap missing: {gaps:?}");
+        // The transitive gap carries the full chain back to the in-scope root.
+        let deep = gaps.iter().find(|g| g.missing == "sensei.scopes").unwrap();
+        assert_eq!(deep.required_by, "dojo.shared_rules");
+        assert_eq!(
+            deep.chain,
+            vec!["dojo.shared_rules", "sensei.namespaces", "sensei.scopes"]
+        );
+
+        // include → closure pulls both sensei tables and the sensei schema entity.
+        let s = resolve(&scopes, Some("dojo"), Some(DepsPolicy::Include), &world, &[]).unwrap();
+        let ws = closure(&s, &world, &[]).unwrap();
+        for want in ["dojo.shared_rules", "sensei.namespaces", "sensei.scopes", "sensei"] {
+            assert!(ws.contains(want), "closure must contain {want}: {ws:?}");
+        }
     }
 
     #[test]
