@@ -74,8 +74,13 @@ begin
       v_target_schema, v_target_name;
   end if;
 
+  -- p_source_table is a dbd-managed, schema-qualified staging table
+  -- (e.g. staging._dbd_import_tmp), so substitute it raw with %s — %I would
+  -- quote the dot into a single identifier, and an unqualified name would
+  -- resolve against the session search_path, which pooled connections don't
+  -- share. See sensei-hq/dbd#6.
   v_sql := format(
-    'insert into %s select %s from %I'
+    'insert into %s select %s from %s'
   , p_target_table
   , v_col_exprs
   , p_source_table
