@@ -44,6 +44,32 @@ fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
     }
 }
 
+/// Schema that owns dbd's internal jsonb-import machinery. The
+/// `import_jsonb_to_table` procedure is always created here (see
+/// [`PostgresAdapter::ensure_import_procedure`]), so the `CALL` is pinned to
+/// this schema — never the target table's schema, which has no such procedure.
+const JSONB_IMPORT_SCHEMA: &str = "staging";
+
+/// Fully-qualified, dbd-owned staging table that jsonl rows are loaded into
+/// before `import_jsonb_to_table` moves them to the target. Schema-qualified so
+/// it resolves regardless of the session `search_path`, and `_dbd_`-prefixed so
+/// it never collides with a user table. Pooled connections don't share
+/// `search_path`, so an unqualified `_temp` resolves nondeterministically — the
+/// same failure mode fixed for `_dbd_meta` (see [`PostgresAdapter::bookkeeping_schema`]).
+/// See sensei-hq/dbd#6.
+const JSONB_IMPORT_TMP: &str = "staging._dbd_import_tmp";
+
+/// `CALL` that moves staged rows into `target` via the internal import
+/// procedure. Both the procedure schema and the source table are pinned and
+/// fully-qualified so resolution never depends on the session `search_path`.
+/// `target` must be the schema-qualified destination table.
+fn jsonb_import_call_sql(target: &str) -> String {
+    format!(
+        "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{JSONB_IMPORT_TMP}', '{}')",
+        target.replace('\'', "''")
+    )
+}
+
 /// PostgreSQL adapter using sqlx connection pool.
 pub struct PostgresAdapter {
     pool: PgPool,
@@ -981,10 +1007,14 @@ impl DatabaseAdapter for PostgresAdapter {
                     .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
             }
             "json" | "jsonl" => {
-                // JSONL: create temp table, load lines, call import procedure
-                let schema = entity.schema.as_deref().unwrap_or("staging");
-                self.execute_script("CREATE TABLE IF NOT EXISTS _temp (data jsonb)").await?;
-                self.execute_script("TRUNCATE _temp").await?;
+                // JSONL: stage rows in dbd's schema-qualified temp table, then hand
+                // them to the internal import procedure. The temp table, the procedure,
+                // and the CALL are all fully-qualified against `staging` — pooled
+                // connections don't share `search_path`, so unqualified names (a bare
+                // `_temp`, or a CALL qualified with the target's own schema) resolve
+                // nondeterministically and fail. See sensei-hq/dbd#6.
+                self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)")).await?;
+                self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
 
                 // Insert each line as a JSONB row
                 for line in data.lines() {
@@ -993,19 +1023,16 @@ impl DatabaseAdapter for PostgresAdapter {
                         continue;
                     }
                     let insert = format!(
-                        "INSERT INTO _temp (data) VALUES ('{}'::jsonb)",
+                        "INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ('{}'::jsonb)",
                         line.replace('\'', "''")
                     );
                     self.execute_script(&insert).await?;
                 }
 
-                // Call the import procedure to move data from _temp to the target
-                let proc_call = format!(
-                    "CALL {schema}.import_jsonb_to_table('_temp', '{}')",
-                    entity.name.replace('\'', "''")
-                );
-                self.execute_script(&proc_call).await?;
-                self.execute_script("DROP TABLE IF EXISTS _temp").await?;
+                // Move data from the temp table to the target. `entity.name` is the
+                // schema-qualified destination; the procedure always lives in `staging`.
+                self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
+                self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}")).await?;
             }
             _ => {
                 return Err(DbdError::Config(format!(
@@ -1573,5 +1600,63 @@ impl DatabaseAdapter for PostgresAdapter {
             let _ = tx.rollback().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression tests for sensei-hq/dbd#6: the dbd-managed jsonb-import
+    // machinery must be schema-qualified so it resolves independently of the
+    // session `search_path` (which pooled connections don't share).
+
+    #[test]
+    fn jsonb_call_pins_procedure_to_staging_regardless_of_target_schema() {
+        // Targeted imports resolve the target to its own schema (e.g. `activity`).
+        // The procedure only ever exists in `staging`, so the CALL must be pinned
+        // there — not to `activity`, which has no such procedure (Defect A).
+        let sql = jsonb_import_call_sql("activity.assistant_events");
+        assert!(
+            sql.contains("CALL staging.import_jsonb_to_table("),
+            "CALL must target the staging procedure, got: {sql}"
+        );
+        assert!(
+            !sql.contains("activity.import_jsonb_to_table"),
+            "CALL must not use the target table's schema, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn jsonb_call_passes_schema_qualified_source_table() {
+        // The source (staging temp) table must be fully-qualified so the
+        // procedure's `from <source>` resolves regardless of search_path (Defect B).
+        let sql = jsonb_import_call_sql("staging.assistant_events");
+        assert!(
+            sql.contains(&format!("'{JSONB_IMPORT_TMP}'")),
+            "source must be the qualified temp table, got: {sql}"
+        );
+        assert!(
+            !sql.contains("'_temp'"),
+            "source must not be a bare unqualified _temp, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn jsonb_temp_table_is_schema_qualified_and_dbd_namespaced() {
+        assert!(
+            JSONB_IMPORT_TMP.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
+            "temp table must be qualified with the import schema: {JSONB_IMPORT_TMP}"
+        );
+        assert!(
+            JSONB_IMPORT_TMP.contains("_dbd_"),
+            "temp table must be dbd-namespaced to avoid clobbering user tables: {JSONB_IMPORT_TMP}"
+        );
+    }
+
+    #[test]
+    fn jsonb_call_escapes_single_quotes_in_target() {
+        let sql = jsonb_import_call_sql("weird.o'brien");
+        assert!(sql.contains("weird.o''brien"), "single quotes must be escaped: {sql}");
     }
 }
