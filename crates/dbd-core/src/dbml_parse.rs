@@ -1071,10 +1071,9 @@ fn parse_single_line_string(s: &str) -> Option<String> {
     let s = s.trim();
     let inner = if let Some(rest) = s.strip_prefix('\'') {
         rest.strip_suffix('\'')?
-    } else if let Some(rest) = s.strip_prefix('"') {
-        rest.strip_suffix('"')?
     } else {
-        return None;
+        let rest = s.strip_prefix('"')?;
+        rest.strip_suffix('"')?
     };
     Some(inner.replace("\\'", "'"))
 }
