@@ -13,25 +13,41 @@ jobs:
     name: test + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          toolchain: stable
+          components: clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
+        with:
+          tool: cargo-llvm-cov
       # Mirrors the local gate (.githooks/pre-commit and `make bump`):
       # default features (postgres + sqlite + deploy), no live database needed.
-      - name: cargo test
-        run: cargo test --workspace
+      # llvm-cov runs the unit + integration suite under instrumentation and
+      # writes target/lcov.info; doctests run separately since llvm-cov skips
+      # them on stable, keeping the gate equal to `cargo test --workspace`.
+      - name: cargo test + coverage
+        run: cargo llvm-cov --workspace --lcov --output-path target/lcov.info
+      - name: cargo test (doctests)
+        run: cargo test --workspace --doc
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: upload coverage to qlty
+        uses: qltysh/qlty-action/coverage@08a0a862c159eae9b9003081da6663d96efef637 # v2.3.0
+        with:
+          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          files: target/lcov.info
 
   embedded-tests:
     name: embedded postgres integration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # `postgresql_embedded` downloads and runs its own PostgreSQL, so no
       # service container or DATABASE_URL is required. Run serially: each test
       # boots its own instance, and concurrent setup() races on the shared
