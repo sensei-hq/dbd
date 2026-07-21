@@ -7,7 +7,6 @@ use dbd_core::Design;
 use super::{format_apply_summary, get_adapter, safe_read, safe_write};
 use crate::output::{self, Verbosity};
 
-#[allow(clippy::collapsible_if)]
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_inspect(
     config: &Path,
@@ -23,6 +22,45 @@ pub async fn cmd_inspect(
 ) -> Result<()> {
     let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
+    resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
+
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let report = design.report(name, Some(&resolved));
+
+    report_scope_gaps(&resolved, &report, verbosity)?;
+
+    let total_entities = design.entities().len();
+
+    if verbosity.is_verbose()
+        && let Some(entity) = &report.entity
+    {
+        output::always(&serde_json::to_string_pretty(entity)?);
+    }
+
+    print_report_findings(&report, verbosity);
+
+    // Auto-format DDL files when --fix is passed
+    if fix {
+        fix_format_ddl(config, project_dir, verbosity)?;
+    }
+
+    // Report unresolved data.sql TODOs across all migration directories
+    let todos = design.data_sql_todos();
+    print_data_sql_todos(&todos);
+
+    output::summary(report.issues.len() + todos.len(), report.warnings.len(), total_entities);
+    Ok(())
+}
+
+/// Resolve unknown references against the live DB (persisting a refcache) or,
+/// offline, against the project-local cache.
+async fn resolve_inspect_refs(
+    design: &mut Design,
+    config: &Path,
+    database_url: Option<&str>,
+    use_database: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
     if use_database {
         let adapter = get_adapter(config, database_url).await?;
         let dropped = design
@@ -54,44 +92,46 @@ pub async fn cmd_inspect(
             Err(e) => output::detail(verbosity, &format!("  refcache read skipped: {e}")),
         }
     }
+    Ok(())
+}
 
-    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let report = design.report(name, Some(&resolved));
-
-    if !resolved.is_all {
-        output::info(verbosity, &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()));
-        for gap in &report.gaps {
-            output::always(&format!(
-                "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-                gap.required_by,
-                gap.missing,
-                gap.chain.join(" → ")
-            ));
-        }
-        if !report.gaps.is_empty() {
-            match resolved.deps {
-                dbd_core::config::DepsPolicy::Report => {
-                    anyhow::bail!(
-                        "{} dependency gap(s) in scope '{}' — add them to the scope, or run with --deps include",
-                        report.gaps.len(),
-                        resolved.name
-                    );
-                }
-                dbd_core::config::DepsPolicy::Include => {
-                    output::info(verbosity, &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()));
-                }
-            }
-        }
+/// Print out-of-scope dependency gaps; bail when the deps policy is `Report`.
+fn report_scope_gaps(
+    resolved: &dbd_core::ResolvedScope,
+    report: &dbd_core::design::Report,
+    verbosity: Verbosity,
+) -> Result<()> {
+    if resolved.is_all {
+        return Ok(());
     }
 
-    let total_entities = design.entities().len();
-
-    if verbosity.is_verbose() {
-        if let Some(entity) = &report.entity {
-            output::always(&serde_json::to_string_pretty(entity)?);
+    output::info(verbosity, &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()));
+    for gap in &report.gaps {
+        output::always(&format!(
+            "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
+            gap.required_by,
+            gap.missing,
+            gap.chain.join(" → ")
+        ));
+    }
+    if report.gaps.is_empty() {
+        return Ok(());
+    }
+    match resolved.deps {
+        dbd_core::config::DepsPolicy::Report => anyhow::bail!(
+            "{} dependency gap(s) in scope '{}' — add them to the scope, or run with --deps include",
+            report.gaps.len(),
+            resolved.name
+        ),
+        dbd_core::config::DepsPolicy::Include => {
+            output::info(verbosity, &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()));
         }
     }
+    Ok(())
+}
 
+/// Print entity errors and warnings, or an all-clear message when there's neither.
+fn print_report_findings(report: &dbd_core::design::Report, verbosity: Verbosity) {
     if !report.issues.is_empty() {
         output::always("Errors:");
         for entity in &report.issues {
@@ -125,46 +165,45 @@ pub async fn cmd_inspect(
     if report.issues.is_empty() && report.warnings.is_empty() {
         output::info(verbosity, "Everything looks ok");
     }
+}
 
-    // Auto-format DDL files when --fix is passed
-    if fix {
-        let format_config = if config.exists() {
-            let design_config = dbd_core::config::read(config)?;
-            design_config.format
-        } else {
-            dbd_core::config::FormatConfig::default()
-        };
+/// Auto-format every DDL file under `project_dir` in place (the `--fix` path).
+fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Result<()> {
+    let format_config = if config.exists() {
+        dbd_core::config::read(config)?.format
+    } else {
+        dbd_core::config::FormatConfig::default()
+    };
 
-        let files = dbd_core::scanner::scan_ddl(project_dir);
-        let mut changed = 0;
-        for file in &files {
-            let content = safe_read(project_dir, file)?;
-            let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
-            if content != formatted {
-                changed += 1;
-                safe_write(project_dir, file, &formatted)?;
-                output::info(verbosity, &format!("  formatted: {}", file.display()));
-            }
-        }
-        if changed > 0 {
-            output::info(verbosity, &format!("Formatted {changed} file(s)."));
+    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let mut changed = 0;
+    for file in &files {
+        let content = safe_read(project_dir, file)?;
+        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
+        if content != formatted {
+            changed += 1;
+            safe_write(project_dir, file, &formatted)?;
+            output::info(verbosity, &format!("  formatted: {}", file.display()));
         }
     }
-
-    // Report unresolved data.sql TODOs across all migration directories
-    let todos = design.data_sql_todos();
-    if !todos.is_empty() {
-        output::always("\ndata.sql TODOs (resolve before applying):");
-        for todo in &todos {
-            output::always(&format!("  {} (v{}):", todo.file.display(), todo.version));
-            for line in &todo.lines {
-                output::always(&format!("    {line}"));
-            }
-        }
+    if changed > 0 {
+        output::info(verbosity, &format!("Formatted {changed} file(s)."));
     }
-
-    output::summary(report.issues.len() + todos.len(), report.warnings.len(), total_entities);
     Ok(())
+}
+
+/// Print unresolved `data.sql` TODOs across all migration directories.
+fn print_data_sql_todos(todos: &[dbd_core::DataSqlTodo]) {
+    if todos.is_empty() {
+        return;
+    }
+    output::always("\ndata.sql TODOs (resolve before applying):");
+    for todo in todos {
+        output::always(&format!("  {} (v{}):", todo.file.display(), todo.version));
+        for line in &todo.lines {
+            output::always(&format!("    {line}"));
+        }
+    }
 }
 
 pub fn cmd_combine(

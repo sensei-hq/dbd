@@ -124,18 +124,7 @@ fn generate_field_sql(
         // ── Column ──────────────────────────────────────
         (FieldType::Column, ChangeAction::Add(detail)) => {
             if let FieldDetail::Column(col) = detail.as_ref() {
-                let mut stmt = format!(
-                    "ALTER TABLE {} ADD COLUMN {} {}",
-                    entity_name, col.name, col.data_type
-                );
-                if !col.nullable {
-                    stmt.push_str(" NOT NULL");
-                }
-                if let Some(ref default) = col.default_value {
-                    stmt.push_str(&format!(" DEFAULT {default}"));
-                }
-                stmt.push(';');
-                lines.push(stmt);
+                lines.push(column_add_sql(entity_name, col));
             }
         }
         (FieldType::Column, ChangeAction::Drop) => {
@@ -148,41 +137,7 @@ fn generate_field_sql(
             if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
                 (old.as_ref(), new.as_ref())
             {
-                if old_col.data_type != new_col.data_type {
-                    lines.push(format!(
-                        "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
-                        entity_name, new_col.name, new_col.data_type
-                    ));
-                }
-                if old_col.nullable != new_col.nullable {
-                    if new_col.nullable {
-                        lines.push(format!(
-                            "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
-                            entity_name, new_col.name
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-                            entity_name, new_col.name
-                        ));
-                    }
-                }
-                if old_col.default_value != new_col.default_value {
-                    match &new_col.default_value {
-                        Some(val) => {
-                            lines.push(format!(
-                                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                                entity_name, new_col.name, val
-                            ));
-                        }
-                        None => {
-                            lines.push(format!(
-                                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
-                                entity_name, new_col.name
-                            ));
-                        }
-                    }
-                }
+                push_column_alter_sql(entity_name, old_col, new_col, lines);
             }
         }
 
@@ -203,22 +158,7 @@ fn generate_field_sql(
         // ── Index ───────────────────────────────────────
         (FieldType::Index, ChangeAction::Add(detail)) => {
             if let FieldDetail::Index(idx) = detail.as_ref() {
-                let unique_str = if idx.unique { "UNIQUE " } else { "" };
-                let idx_name = idx.name.as_deref().unwrap_or("unnamed");
-                let cols: Vec<String> = idx.columns.iter().map(|c| {
-                    match c.order {
-                        Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
-                        Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
-                        None => c.name.clone(),
-                    }
-                }).collect();
-                lines.push(format!(
-                    "CREATE {}INDEX {} ON {} ({});",
-                    unique_str,
-                    idx_name,
-                    entity_name,
-                    cols.join(", ")
-                ));
+                lines.push(index_add_sql(entity_name, idx));
             }
         }
         (FieldType::Index, ChangeAction::Drop) => {
@@ -241,6 +181,82 @@ fn generate_field_sql(
         // Catch-all for any unexpected combinations
         _ => {}
     }
+}
+
+/// `ALTER TABLE … ADD COLUMN …` for a newly added column.
+fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
+    let mut stmt = format!(
+        "ALTER TABLE {} ADD COLUMN {} {}",
+        entity_name, col.name, col.data_type
+    );
+    if !col.nullable {
+        stmt.push_str(" NOT NULL");
+    }
+    if let Some(ref default) = col.default_value {
+        stmt.push_str(&format!(" DEFAULT {default}"));
+    }
+    stmt.push(';');
+    stmt
+}
+
+/// Push the `ALTER TABLE … ALTER COLUMN …` statements for a column whose type,
+/// nullability, or default value changed.
+fn push_column_alter_sql(
+    entity_name: &str,
+    old_col: &crate::entity::ColumnDef,
+    new_col: &crate::entity::ColumnDef,
+    lines: &mut Vec<String>,
+) {
+    if old_col.data_type != new_col.data_type {
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
+            entity_name, new_col.name, new_col.data_type
+        ));
+    }
+    if old_col.nullable != new_col.nullable {
+        if new_col.nullable {
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                entity_name, new_col.name
+            ));
+        } else {
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                entity_name, new_col.name
+            ));
+        }
+    }
+    if old_col.default_value != new_col.default_value {
+        match &new_col.default_value {
+            Some(val) => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                entity_name, new_col.name, val
+            )),
+            None => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                entity_name, new_col.name
+            )),
+        }
+    }
+}
+
+/// `CREATE [UNIQUE] INDEX …` for a newly added index.
+fn index_add_sql(entity_name: &str, idx: &crate::entity::IndexDef) -> String {
+    let unique_str = if idx.unique { "UNIQUE " } else { "" };
+    let idx_name = idx.name.as_deref().unwrap_or("unnamed");
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|c| match c.order {
+            Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
+            Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
+            None => c.name.clone(),
+        })
+        .collect();
+    format!(
+        "CREATE {}INDEX {} ON {} ({});",
+        unique_str, idx_name, entity_name, cols.join(", ")
+    )
 }
 
 /// Convert an FkAction to its SQL keyword.
