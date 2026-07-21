@@ -75,36 +75,21 @@ fn extract_comments(sql: &str) -> Vec<String> {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            // Skip $$-quoted bodies and string literals — `--`/`/*` inside them
+            // are not comments.
             b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'$' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'$' && bytes[i + 1] == b'$') {
-                    i += 1;
-                }
-                i += 2;
+                i = scan_dollar_quote(bytes, i);
             }
             b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
+                i = scan_single_quoted(bytes, i);
             }
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                let text = sql[start..i].trim_end().trim_start_matches('-').trim();
+                let end = scan_line_comment(bytes, i);
+                let text = sql[i..end].trim_end().trim_start_matches('-').trim();
                 if !text.is_empty() {
                     out.push(text.to_string());
                 }
+                i = end;
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
                 let start = i + 2;
@@ -131,6 +116,81 @@ fn dollar_bodies_preserved(original: &str, formatted: &str) -> bool {
         s.split("$$").skip(1).step_by(2).collect()
     }
     bodies(original) == bodies(formatted)
+}
+
+/// Return the index just past a single-quoted string literal starting at
+/// `start` (handling `''` escapes; a lone `'` closes it).
+fn scan_single_quoted(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // `''` escape stays inside the string; a lone `'` closes it.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Return the index at the newline (or EOF) ending a `-- …` line comment.
+fn scan_line_comment(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Return the index just past a `/* … */` block comment starting at `start`.
+fn scan_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    while i < bytes.len() {
+        if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Return the index just past a `$$ … $$` body starting at `start`. If the
+/// closing `$$` is missing, returns an index past the end (the caller's
+/// `while i < len` loop then terminates).
+fn scan_dollar_quote(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    while i + 1 < bytes.len() && !(bytes[i] == b'$' && bytes[i + 1] == b'$') {
+        i += 1;
+    }
+    i + 2
+}
+
+/// Return the index just past an identifier-like token starting at `start`.
+fn scan_identifier(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    i
+}
+
+/// True when the accumulated block (still holding its trailing `;`) ends with a
+/// standalone `END` token — i.e. the `;` closes a trigger body rather than an
+/// inner statement or a CASE expression.
+fn trigger_body_ends(current: &str) -> bool {
+    let head = current[..current.len() - 1].trim_end();
+    if head.len() < 3 || !head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"END") {
+        return false;
+    }
+    head.len() == 3 || {
+        let b = head.as_bytes()[head.len() - 4];
+        !(b.is_ascii_alphanumeric() || b == b'_')
+    }
 }
 
 /// Split input SQL into statement blocks.
@@ -164,64 +224,38 @@ fn split_statements(input: &str) -> Vec<String> {
             continue;
         }
 
-        // Single-quoted string literal — copy verbatim (incl. `''` escapes); a
-        // `;` inside a string is not a statement boundary. Pushed as a slice so
-        // multi-byte UTF-8 is preserved.
+        // Single-quoted string literal — copy verbatim; a `;` inside is not a
+        // statement boundary. Sliced so multi-byte UTF-8 is preserved.
         if c == '\'' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    // `''` escape stays inside the string; a lone `'` closes it.
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            current.push_str(&input[start..i]);
+            let end = scan_single_quoted(bytes, i);
+            current.push_str(&input[i..end]);
+            i = end;
             continue;
         }
 
-        // Line comment `-- … ` to end of line — inner `;` is not a boundary.
+        // Line comment `-- …` to end of line — inner `;` is not a boundary.
         if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            current.push_str(&input[start..i]);
+            let end = scan_line_comment(bytes, i);
+            current.push_str(&input[i..end]);
+            i = end;
             continue;
         }
 
         // Block comment `/* … */` — inner `;` is not a boundary.
         if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            let start = i;
-            i += 2;
-            while i < bytes.len() {
-                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            current.push_str(&input[start..i]);
+            let end = scan_block_comment(bytes, i);
+            current.push_str(&input[i..end]);
+            i = end;
             continue;
         }
 
         // Identifier-like token: consume atomically so we can spot keywords
         // at word boundaries without false positives mid-name.
         if c.is_ascii_alphabetic() || c == '_' {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
-                i += 1;
-            }
-            let word = &input[start..i];
+            let end = scan_identifier(bytes, i);
+            let word = &input[i..end];
             current.push_str(word);
+            i = end;
             match word.to_ascii_uppercase().as_str() {
                 "TRIGGER" if !in_trigger_body => seen_trigger = true,
                 "BEGIN" if seen_trigger && !in_trigger_body => in_trigger_body = true,
@@ -238,25 +272,13 @@ fn split_statements(input: &str) -> Vec<String> {
         }
 
         if in_trigger_body {
-            // Does this `;` close the trigger body? Only if it follows a
-            // standalone `END` token (ignoring whitespace/comments). CASE
-            // expressions also use END, but those are inside expressions
-            // and aren't immediately followed by `;`.
-            let head = current[..current.len() - 1].trim_end();
-            if head.len() >= 3 && head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"END") {
-                let prev_is_boundary = head.len() == 3
-                    || !{
-                        let b = head.as_bytes()[head.len() - 4];
-                        b.is_ascii_alphanumeric() || b == b'_'
-                    };
-                if prev_is_boundary {
-                    in_trigger_body = false;
-                    seen_trigger = false;
-                    blocks.push(std::mem::take(&mut current));
-                    continue;
-                }
+            // A `;` only closes the trigger body when it follows a standalone
+            // `END`; inner separators keep accumulating.
+            if trigger_body_ends(&current) {
+                in_trigger_body = false;
+                seen_trigger = false;
+                blocks.push(std::mem::take(&mut current));
             }
-            // Inner statement separator — keep accumulating.
             continue;
         }
 
@@ -373,10 +395,7 @@ fn format_dollar_quoted(block: &str, config: &FormatConfig) -> String {
 
 // ── CREATE TABLE formatter ──────────────────────────────
 
-fn format_create_table(
-    ct: &sqlparser::ast::CreateTable,
-    config: &FormatConfig,
-) -> String {
+fn format_create_table(ct: &sqlparser::ast::CreateTable, config: &FormatConfig) -> String {
     let mut out = String::new();
 
     // Header: create table [if not exists] <name>
@@ -392,80 +411,99 @@ fn format_create_table(
     }
     out.push_str(&format!(" {} (\n", ct.name.to_string().to_lowercase()));
 
-    let indent = " ".repeat(config.indent);
-    let type_col = config.type_alignment;
-
-    // Format columns
+    let has_constraints = !ct.constraints.is_empty();
     for (i, col) in ct.columns.iter().enumerate() {
-        let col_name = col.name.value.to_lowercase();
-        let type_str = format_column_type(&col.data_type, config);
-        let constraints_str = format_column_constraints(&col.options, config);
-
-        let line = if i == 0 {
-            match config.comma_style {
-                CommaStyle::Leading => {
-                    format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col)
-                }
-                CommaStyle::Trailing => {
-                    let base = format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col);
-                    if i < ct.columns.len() - 1 || !ct.constraints.is_empty() {
-                        format!("{base},")
-                    } else {
-                        base
-                    }
-                }
-            }
-        } else {
-            match config.comma_style {
-                CommaStyle::Leading => {
-                    // Leading comma: ", name   type"
-                    let prefix = format!("{}, ", &indent[..indent.len().saturating_sub(2)]);
-                    // The column name starts after ", " which is at indent position
-                    let name_with_pad = pad_to_width(&col_name, type_col - config.indent);
-                    format!("{prefix}{name_with_pad}{type_str}{constraints_str}")
-                }
-                CommaStyle::Trailing => {
-                    let base = format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col);
-                    if i < ct.columns.len() - 1 || !ct.constraints.is_empty() {
-                        format!("{base},")
-                    } else {
-                        base
-                    }
-                }
-            }
-        };
-
+        let line = format_table_column(
+            col,
+            i == 0,
+            i == ct.columns.len() - 1,
+            has_constraints,
+            config,
+        );
         out.push_str(&line);
         out.push('\n');
     }
 
-    // Format table-level constraints
     for (i, constraint) in ct.constraints.iter().enumerate() {
-        let constraint_str = format_table_constraint(constraint, config);
-        let line = match config.comma_style {
-            CommaStyle::Leading => {
-                if ct.columns.is_empty() && i == 0 {
-                    format!("{indent}{constraint_str}")
-                } else {
-                    let prefix = format!("{}, ", &indent[..indent.len().saturating_sub(2)]);
-                    format!("{prefix}{constraint_str}")
-                }
-            }
-            CommaStyle::Trailing => {
-                let base = format!("{indent}{constraint_str}");
-                if i < ct.constraints.len() - 1 {
-                    format!("{base},")
-                } else {
-                    base
-                }
-            }
-        };
+        let line = format_table_constraint_line(
+            constraint,
+            i == 0,
+            i == ct.constraints.len() - 1,
+            ct.columns.is_empty(),
+            config,
+        );
         out.push_str(&line);
         out.push('\n');
     }
 
     out.push_str(");");
     out
+}
+
+/// Render one column line for CREATE TABLE, applying the configured comma style.
+/// A trailing comma is added unless this is the last column and there are no
+/// following table-level constraints.
+fn format_table_column(
+    col: &sqlparser::ast::ColumnDef,
+    is_first: bool,
+    is_last: bool,
+    has_trailing_constraints: bool,
+    config: &FormatConfig,
+) -> String {
+    let indent = " ".repeat(config.indent);
+    let type_col = config.type_alignment;
+    let col_name = col.name.value.to_lowercase();
+    let type_str = format_column_type(&col.data_type, config);
+    let constraints_str = format_column_constraints(&col.options, config);
+
+    match config.comma_style {
+        CommaStyle::Trailing => {
+            let base =
+                format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col);
+            if !is_last || has_trailing_constraints {
+                format!("{base},")
+            } else {
+                base
+            }
+        }
+        CommaStyle::Leading if is_first => {
+            format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col)
+        }
+        CommaStyle::Leading => {
+            // Leading comma: ", name   type" — the name starts after ", ".
+            let prefix = format!("{}, ", &indent[..indent.len().saturating_sub(2)]);
+            let name_with_pad = pad_to_width(&col_name, type_col - config.indent);
+            format!("{prefix}{name_with_pad}{type_str}{constraints_str}")
+        }
+    }
+}
+
+/// Render one table-level constraint line for CREATE TABLE, applying comma style.
+fn format_table_constraint_line(
+    constraint: &sqlparser::ast::TableConstraint,
+    is_first: bool,
+    is_last: bool,
+    no_columns: bool,
+    config: &FormatConfig,
+) -> String {
+    let indent = " ".repeat(config.indent);
+    let constraint_str = format_table_constraint(constraint, config);
+    match config.comma_style {
+        // First constraint with no preceding columns: no leading comma.
+        CommaStyle::Leading if no_columns && is_first => format!("{indent}{constraint_str}"),
+        CommaStyle::Leading => {
+            let prefix = format!("{}, ", &indent[..indent.len().saturating_sub(2)]);
+            format!("{prefix}{constraint_str}")
+        }
+        CommaStyle::Trailing => {
+            let base = format!("{indent}{constraint_str}");
+            if !is_last {
+                format!("{base},")
+            } else {
+                base
+            }
+        }
+    }
 }
 
 fn format_column_line(
@@ -711,6 +749,59 @@ fn sql_keywords() -> HashSet<&'static str> {
 /// Apply keyword case transformation to a SQL string.
 ///
 /// Preserves quoted identifiers and string literals.
+/// Copy the rest of a single-quoted literal (opening quote already emitted),
+/// honoring `\`-escapes, into `result`.
+fn copy_single_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, result: &mut String) {
+    let mut escaped = false;
+    for ch in chars.by_ref() {
+        result.push(ch);
+        if ch == '\'' && !escaped {
+            break;
+        }
+        escaped = ch == '\\';
+    }
+}
+
+/// Copy the rest of a double-quoted identifier (opening quote already emitted).
+fn copy_quoted_ident(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, result: &mut String) {
+    for ch in chars.by_ref() {
+        result.push(ch);
+        if ch == '"' {
+            break;
+        }
+    }
+}
+
+/// Copy the rest of a `$$ … $$` body (opening `$$` already emitted).
+fn copy_dollar_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, result: &mut String) {
+    loop {
+        match chars.next() {
+            Some('$') if chars.peek() == Some(&'$') => {
+                result.push('$');
+                result.push(chars.next().unwrap());
+                break;
+            }
+            Some(ch) => result.push(ch),
+            None => break,
+        }
+    }
+}
+
+/// Read an identifier-like word beginning with `first`, consuming trailing
+/// alphanumeric/underscore characters from `chars`.
+fn read_word(first: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut word = String::new();
+    word.push(first);
+    while let Some(&next) = chars.peek() {
+        if next.is_ascii_alphanumeric() || next == '_' {
+            word.push(chars.next().unwrap());
+        } else {
+            break;
+        }
+    }
+    word
+}
+
 fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
     if matches!(case, KeywordCase::Preserve) {
         return sql.to_string();
@@ -724,61 +815,29 @@ fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
         // Skip string literals (single quotes)
         if c == '\'' {
             result.push(c);
-            let mut escaped = false;
-            for ch in chars.by_ref() {
-                result.push(ch);
-                if ch == '\'' && !escaped {
-                    break;
-                }
-                escaped = ch == '\\';
-            }
+            copy_single_quoted(&mut chars, &mut result);
             continue;
         }
 
         // Skip quoted identifiers (double quotes)
         if c == '"' {
             result.push(c);
-            for ch in chars.by_ref() {
-                result.push(ch);
-                if ch == '"' {
-                    break;
-                }
-            }
+            copy_quoted_ident(&mut chars, &mut result);
             continue;
         }
 
-        // Skip $$ quoted bodies (but we shouldn't reach here for function bodies
-        // since format_dollar_quoted handles them separately)
+        // Skip $$ quoted bodies (format_dollar_quoted normally handles these
+        // for function bodies, so we shouldn't usually reach here).
         if c == '$' && chars.peek() == Some(&'$') {
             result.push(c);
             result.push(chars.next().unwrap());
-            // Copy everything until next $$
-            loop {
-                match chars.next() {
-                    Some('$') if chars.peek() == Some(&'$') => {
-                        result.push('$');
-                        result.push(chars.next().unwrap());
-                        break;
-                    }
-                    Some(ch) => result.push(ch),
-                    None => break,
-                }
-            }
+            copy_dollar_body(&mut chars, &mut result);
             continue;
         }
 
-        // Collect a word
+        // Collect a word and re-case it when it is a keyword.
         if c.is_ascii_alphabetic() || c == '_' {
-            let mut word = String::new();
-            word.push(c);
-            while let Some(&next) = chars.peek() {
-                if next.is_ascii_alphanumeric() || next == '_' {
-                    word.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
-            }
-
+            let word = read_word(c, &mut chars);
             if keywords.contains(word.to_uppercase().as_str()) {
                 match case {
                     KeywordCase::Lower => result.push_str(&word.to_lowercase()),
@@ -947,7 +1006,49 @@ fn river_lines_from_select(
 
     let mut lines: Vec<String> = Vec::new();
 
-    // ── SELECT list ───────────────────────────────────────
+    river_emit_select_list(select, config, &mut lines);
+    river_emit_from_joins(select, config, &mut lines);
+
+    // ── WHERE ─────────────────────────────────────────────
+    if let Some(selection) = &select.selection {
+        let (conds, cont) = split_boolean_conditions(selection);
+        emit_aligned_conditions(&conds, &kw("where"), &kw(cont), g, config, &mut lines);
+    }
+
+    // ── GROUP BY ──────────────────────────────────────────
+    let group_exprs: Vec<String> = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => {
+            exprs.iter().map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case)).collect()
+        }
+        GroupByExpr::All(_) => vec![kw("all")],
+    };
+    if !group_exprs.is_empty() {
+        lines.push(river_line(g, &kw("group by"), &group_exprs.join(", ")));
+    }
+
+    // ── HAVING ────────────────────────────────────────────
+    if let Some(having) = &select.having {
+        let (conds, cont) = split_boolean_conditions(having);
+        emit_aligned_conditions(&conds, &kw("having"), &kw(cont), g, config, &mut lines);
+    }
+
+    river_emit_order_by(query, config, &mut lines);
+    river_emit_limit(query, config, &mut lines);
+
+    lines
+}
+
+/// Append the river-formatted SELECT projection list to `lines`.
+fn river_emit_select_list(
+    select: &sqlparser::ast::Select,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    use sqlparser::ast::*;
+
+    let g = config.gutter;
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
     let select_kw = if select.distinct.is_some() {
         kw("select distinct")
     } else {
@@ -955,8 +1056,10 @@ fn river_lines_from_select(
     };
 
     // Collect (rendered_expr, alias) pairs for alias-column alignment.
-    let items: Vec<(String, Option<String>)> = select.projection.iter().map(|item| {
-        match item {
+    let items: Vec<(String, Option<String>)> = select
+        .projection
+        .iter()
+        .map(|item| match item {
             SelectItem::ExprWithAlias { expr, alias } => {
                 let e = apply_keyword_case(&expr.to_string(), &config.keyword_case);
                 (e, Some(alias.value.to_lowercase()))
@@ -966,13 +1069,12 @@ fn river_lines_from_select(
             }
             SelectItem::Wildcard(_) => ("*".to_string(), None),
             SelectItem::QualifiedWildcard(kind, _) => {
-                // `kind` already renders the trailing `.*` (e.g. `l.*`); don't
-                // append another. Keyword-case keeps identifier case like the
-                // expression arms above.
+                // `kind` already renders the trailing `.*` (e.g. `l.*`); keyword-
+                // case keeps identifier case like the expression arms above.
                 (apply_keyword_case(&kind.to_string(), &config.keyword_case), None)
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     // Max expression width across ALL items (not just aliased) so that
     // both aliased and non-aliased columns indent consistently.
@@ -1003,11 +1105,23 @@ fn river_lines_from_select(
             lines.push(river_comma_line(g, &content));
         }
     }
+}
 
-    // ── FROM / JOIN — compute max table-name length for alias alignment ───
+/// Append the river-formatted FROM/JOIN clause to `lines`.
+fn river_emit_from_joins(
+    select: &sqlparser::ast::Select,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    use sqlparser::ast::*;
+
+    let g = config.gutter;
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
+    // Compute max table-name length for alias alignment (only when at least one
+    // table in the clause has an alias).
     let max_table_name_len: usize = {
         let mut max = 0usize;
-        // Only align when at least one table in the clause has an alias
         let any_alias = select.from.iter().any(|twj| {
             table_factor_has_alias(&twj.relation)
                 || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
@@ -1053,68 +1167,61 @@ fn river_lines_from_select(
             lines.push(river_line(g, &join_kw, &join_table));
             if let Some(on) = on_expr {
                 let (on_conds, cont) = split_boolean_conditions(on);
-                emit_aligned_conditions(&on_conds, &kw("on"), &kw(cont), g, config, &mut lines);
+                emit_aligned_conditions(&on_conds, &kw("on"), &kw(cont), g, config, lines);
             }
         }
     }
+}
 
-    // ── WHERE ─────────────────────────────────────────────
-    if let Some(selection) = &select.selection {
-        let (conds, cont) = split_boolean_conditions(selection);
-        emit_aligned_conditions(&conds, &kw("where"), &kw(cont), g, config, &mut lines);
-    }
+/// Append the river-formatted ORDER BY clause to `lines`.
+fn river_emit_order_by(
+    query: &sqlparser::ast::Query,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    let g = config.gutter;
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
 
-    // ── GROUP BY ──────────────────────────────────────────
-    let group_exprs: Vec<String> = match &select.group_by {
-        GroupByExpr::Expressions(exprs, _) => {
-            exprs.iter().map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case)).collect()
-        }
-        GroupByExpr::All(_) => vec![kw("all")],
-    };
-    if !group_exprs.is_empty() {
-        lines.push(river_line(g, &kw("group by"), &group_exprs.join(", ")));
-    }
-
-    // ── HAVING ────────────────────────────────────────────
-    if let Some(having) = &select.having {
-        let (conds, cont) = split_boolean_conditions(having);
-        emit_aligned_conditions(&conds, &kw("having"), &kw(cont), g, config, &mut lines);
-    }
-
-    // ── ORDER BY ──────────────────────────────────────────
     if let Some(order_by) = &query.order_by
         && let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind
         && !exprs.is_empty()
     {
-        let order_items: Vec<String> = exprs.iter().map(|o| {
-            let e = apply_keyword_case(&o.expr.to_string(), &config.keyword_case);
-            match o.options.asc {
-                Some(false) => format!("{} {}", e, kw("desc")),
-                _ => e,
-            }
-        }).collect();
+        let order_items: Vec<String> = exprs
+            .iter()
+            .map(|o| {
+                let e = apply_keyword_case(&o.expr.to_string(), &config.keyword_case);
+                match o.options.asc {
+                    Some(false) => format!("{} {}", e, kw("desc")),
+                    _ => e,
+                }
+            })
+            .collect();
         lines.push(river_line(g, &kw("order by"), &order_items.join(", ")));
     }
+}
 
-    // ── LIMIT / OFFSET ────────────────────────────────────
-    if let Some(limit_clause) = &query.limit_clause {
-        match limit_clause {
-            sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
-                if let Some(lim) = limit {
-                    lines.push(river_line(g, &kw("limit"), &lim.to_string()));
-                }
-                if let Some(off) = offset {
-                    lines.push(river_line(g, &kw("offset"), &off.value.to_string()));
-                }
+/// Append the river-formatted LIMIT/OFFSET clause to `lines`.
+fn river_emit_limit(query: &sqlparser::ast::Query, config: &FormatConfig, lines: &mut Vec<String>) {
+    let g = config.gutter;
+    let kw = |s: &str| kw_case(s, &config.keyword_case);
+
+    let Some(limit_clause) = &query.limit_clause else {
+        return;
+    };
+    match limit_clause {
+        sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+            if let Some(lim) = limit {
+                lines.push(river_line(g, &kw("limit"), &lim.to_string()));
             }
-            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                lines.push(river_line(g, &kw("limit"), &limit.to_string()));
-                lines.push(river_line(g, &kw("offset"), &offset.to_string()));
+            if let Some(off) = offset {
+                lines.push(river_line(g, &kw("offset"), &off.value.to_string()));
             }
         }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            lines.push(river_line(g, &kw("limit"), &limit.to_string()));
+            lines.push(river_line(g, &kw("offset"), &offset.to_string()));
+        }
     }
-
-    lines
 }
 
 /// Emit a group of conditions (WHERE / HAVING / ON) with operator alignment.
