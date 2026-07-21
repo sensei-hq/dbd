@@ -114,18 +114,7 @@ pub fn migrate_config(content: &str) -> Result<String> {
 
     // ── project ────────────────────────────────────────
     let old_project = doc.get("project").and_then(|v| v.as_mapping());
-    let mut project = serde_yaml::Mapping::new();
-
-    if let Some(op) = old_project {
-        if let Some(name) = op.get(val("name")) {
-            project.insert(val("name"), name.clone());
-        }
-        if let Some(note) = op.get(val("note"))
-            && !note.is_null() {
-                project.insert(val("note"), note.clone());
-            }
-    }
-    new_doc.insert(val("project"), serde_yaml::Value::Mapping(project));
+    new_doc.insert(val("project"), migrate_project_section(old_project));
 
     // ── source ─────────────────────────────────────────
     let dialect = old_project
@@ -159,26 +148,8 @@ pub fn migrate_config(content: &str) -> Result<String> {
         .and_then(|p| p.get(val("extensionSchema")))
         .and_then(|v| v.as_str())
         .unwrap_or("public");
-
-    if let Some(extensions) = doc.get("extensions").and_then(|v| v.as_sequence()) {
-        let migrated_extensions: Vec<serde_yaml::Value> = extensions
-            .iter()
-            .map(|ext| {
-                if ext.is_string() && extension_schema != "public" {
-                    // Convert "uuid-ossp" → { name: "uuid-ossp", schema: "extensions" }
-                    let mut map = serde_yaml::Mapping::new();
-                    map.insert(val("name"), ext.clone());
-                    map.insert(val("schema"), val(extension_schema));
-                    serde_yaml::Value::Mapping(map)
-                } else {
-                    ext.clone()
-                }
-            })
-            .collect();
-        target_config.insert(
-            val("extensions"),
-            serde_yaml::Value::Sequence(migrated_extensions),
-        );
+    if let Some(extensions) = migrate_extensions(&doc, extension_schema) {
+        target_config.insert(val("extensions"), extensions);
     }
 
     // Roles
@@ -193,21 +164,9 @@ pub fn migrate_config(content: &str) -> Result<String> {
         }
 
         // Extract grants from schema entries
-        if let Some(schemas) = doc.get("schemas").and_then(|v| v.as_sequence()) {
-            let mut grants = serde_yaml::Mapping::new();
-            for entry in schemas {
-                if let Some(map) = entry.as_mapping() {
-                    for (key, value) in map {
-                        if let Some(schema_config) = value.as_mapping()
-                            && let Some(grant_config) = schema_config.get(val("grants")) {
-                                grants.insert(key.clone(), grant_config.clone());
-                            }
-                    }
-                }
-            }
-            if !grants.is_empty() {
-                target_config.insert(val("grants"), serde_yaml::Value::Mapping(grants));
-            }
+        let grants = extract_supabase_grants(&doc);
+        if !grants.is_empty() {
+            target_config.insert(val("grants"), serde_yaml::Value::Mapping(grants));
         }
     }
 
@@ -216,23 +175,8 @@ pub fn migrate_config(content: &str) -> Result<String> {
     new_doc.insert(val("target"), serde_yaml::Value::Mapping(targets));
 
     // ── schemas (strip grants, keep names only) ────────
-    if let Some(schemas) = doc.get("schemas").and_then(|v| v.as_sequence()) {
-        let clean_schemas: Vec<serde_yaml::Value> = schemas
-            .iter()
-            .map(|entry| {
-                if let Some(map) = entry.as_mapping() {
-                    // Extract just the schema name from { name: { grants: ... } }
-                    if let Some((key, _)) = map.iter().next() {
-                        return key.clone();
-                    }
-                }
-                entry.clone()
-            })
-            .collect();
-        new_doc.insert(
-            val("schemas"),
-            serde_yaml::Value::Sequence(clean_schemas),
-        );
+    if let Some(schemas) = migrate_schemas_section(&doc) {
+        new_doc.insert(val("schemas"), schemas);
     }
 
     // ── external ───────────────────────────────────────
@@ -242,52 +186,7 @@ pub fn migrate_config(content: &str) -> Result<String> {
 
     // ── import ─────────────────────────────────────────
     if let Some(import) = doc.get("import").and_then(|v| v.as_mapping()) {
-        let mut new_import = serde_yaml::Mapping::new();
-
-        // Move project.staging to import.staging
-        if let Some(staging) = old_project.and_then(|p| p.get(val("staging"))) {
-            new_import.insert(val("staging"), staging.clone());
-        }
-
-        // Migrate options (rename nullValue → null_value)
-        if let Some(options) = import.get(val("options")).and_then(|v| v.as_mapping()) {
-            let mut new_options = serde_yaml::Mapping::new();
-            for (key, value) in options {
-                let key_str = key.as_str().unwrap_or("");
-                let new_key = match key_str {
-                    "nullValue" => "null_value",
-                    other => other,
-                };
-                new_options.insert(val(new_key), value.clone());
-            }
-            new_import.insert(val("options"), serde_yaml::Value::Mapping(new_options));
-        }
-
-        // tables, after — pass through (skip nulls, convert to empty sequences)
-        if let Some(tables) = import.get(val("tables"))
-            && !tables.is_null() {
-                new_import.insert(val("tables"), tables.clone());
-            }
-        if let Some(after) = import.get(val("after")) {
-            if after.is_null() {
-                // Skip null values — the default empty vec handles this
-            } else {
-                new_import.insert(val("after"), after.clone());
-            }
-        }
-
-        // Pass through any other import keys (env-specific after, schemas, etc.)
-        for (key, value) in import {
-            let key_str = key.as_str().unwrap_or("");
-            if ["options", "tables", "after", "staging"].contains(&key_str) {
-                continue; // Already handled
-            }
-            if !value.is_null() {
-                new_import.insert(key.clone(), value.clone());
-            }
-        }
-
-        new_doc.insert(val("import"), serde_yaml::Value::Mapping(new_import));
+        new_doc.insert(val("import"), migrate_import_section(import, old_project));
     }
 
     // ── export ─────────────────────────────────────────
@@ -311,6 +210,135 @@ pub fn migrate_config(content: &str) -> Result<String> {
 
 fn val(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
+}
+
+/// Build the migrated `project` mapping — keep `name` and any non-null `note`.
+fn migrate_project_section(old_project: Option<&serde_yaml::Mapping>) -> serde_yaml::Value {
+    let mut project = serde_yaml::Mapping::new();
+    if let Some(op) = old_project {
+        if let Some(name) = op.get(val("name")) {
+            project.insert(val("name"), name.clone());
+        }
+        if let Some(note) = op.get(val("note"))
+            && !note.is_null()
+        {
+            project.insert(val("note"), note.clone());
+        }
+    }
+    serde_yaml::Value::Mapping(project)
+}
+
+/// Migrate the top-level `extensions` sequence, expanding plain-string entries
+/// to `{ name, schema }` when a non-`public` `extensionSchema` was configured.
+/// Returns `None` when there is no `extensions` sequence to migrate.
+fn migrate_extensions(doc: &serde_yaml::Value, extension_schema: &str) -> Option<serde_yaml::Value> {
+    let extensions = doc.get("extensions").and_then(|v| v.as_sequence())?;
+    let migrated: Vec<serde_yaml::Value> = extensions
+        .iter()
+        .map(|ext| {
+            if ext.is_string() && extension_schema != "public" {
+                // Convert "uuid-ossp" → { name: "uuid-ossp", schema: "extensions" }
+                let mut map = serde_yaml::Mapping::new();
+                map.insert(val("name"), ext.clone());
+                map.insert(val("schema"), val(extension_schema));
+                serde_yaml::Value::Mapping(map)
+            } else {
+                ext.clone()
+            }
+        })
+        .collect();
+    Some(serde_yaml::Value::Sequence(migrated))
+}
+
+/// Extract per-schema `grants` from old-format `schemas` entries into a mapping.
+fn extract_supabase_grants(doc: &serde_yaml::Value) -> serde_yaml::Mapping {
+    let mut grants = serde_yaml::Mapping::new();
+    let Some(schemas) = doc.get("schemas").and_then(|v| v.as_sequence()) else {
+        return grants;
+    };
+    for entry in schemas {
+        if let Some(map) = entry.as_mapping() {
+            for (key, value) in map {
+                if let Some(schema_config) = value.as_mapping()
+                    && let Some(grant_config) = schema_config.get(val("grants"))
+                {
+                    grants.insert(key.clone(), grant_config.clone());
+                }
+            }
+        }
+    }
+    grants
+}
+
+/// Strip grants from old-format `schemas` entries, keeping just the names.
+/// Returns `None` when there is no `schemas` sequence.
+fn migrate_schemas_section(doc: &serde_yaml::Value) -> Option<serde_yaml::Value> {
+    let schemas = doc.get("schemas").and_then(|v| v.as_sequence())?;
+    let clean: Vec<serde_yaml::Value> = schemas
+        .iter()
+        .map(|entry| {
+            // Extract just the schema name from { name: { grants: ... } }
+            if let Some(map) = entry.as_mapping()
+                && let Some((key, _)) = map.iter().next()
+            {
+                return key.clone();
+            }
+            entry.clone()
+        })
+        .collect();
+    Some(serde_yaml::Value::Sequence(clean))
+}
+
+/// Build the migrated `import` mapping: move `project.staging` in, rename
+/// `nullValue` → `null_value`, and pass the rest through, skipping nulls.
+fn migrate_import_section(
+    import: &serde_yaml::Mapping,
+    old_project: Option<&serde_yaml::Mapping>,
+) -> serde_yaml::Value {
+    let mut new_import = serde_yaml::Mapping::new();
+
+    // Move project.staging to import.staging
+    if let Some(staging) = old_project.and_then(|p| p.get(val("staging"))) {
+        new_import.insert(val("staging"), staging.clone());
+    }
+
+    // Migrate options (rename nullValue → null_value)
+    if let Some(options) = import.get(val("options")).and_then(|v| v.as_mapping()) {
+        let mut new_options = serde_yaml::Mapping::new();
+        for (key, value) in options {
+            let new_key = match key.as_str().unwrap_or("") {
+                "nullValue" => "null_value",
+                other => other,
+            };
+            new_options.insert(val(new_key), value.clone());
+        }
+        new_import.insert(val("options"), serde_yaml::Value::Mapping(new_options));
+    }
+
+    // tables, after — pass through, skipping nulls
+    if let Some(tables) = import.get(val("tables"))
+        && !tables.is_null()
+    {
+        new_import.insert(val("tables"), tables.clone());
+    }
+    if let Some(after) = import.get(val("after"))
+        && !after.is_null()
+    {
+        new_import.insert(val("after"), after.clone());
+    }
+
+    // Pass through any other import keys (env-specific after, schemas, etc.)
+    for (key, value) in import {
+        let key_str = key.as_str().unwrap_or("");
+        if ["options", "tables", "after", "staging"].contains(&key_str) {
+            continue; // Already handled
+        }
+        if !value.is_null() {
+            new_import.insert(key.clone(), value.clone());
+        }
+    }
+
+    serde_yaml::Value::Mapping(new_import)
 }
 
 // ── Plural DDL folder migration ────────────────────────────────────────────
