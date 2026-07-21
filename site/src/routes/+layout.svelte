@@ -54,7 +54,10 @@
 -->
 <svelte:body use:themable={{ theme: vibe, storageKey: 'dbd-theme' }} />
 
-<div class="flex min-h-screen flex-col">
+<!-- `page-grid` paints one continuous grid lattice behind the marketing pages;
+	the full-bleed app shell (/diagram, /projects) owns its own backdrop, so skip
+	it there. -->
+<div class="flex min-h-screen flex-col {isApp ? '' : 'page-grid'}">
 	{#if !isApp}<Nav />{/if}
 	<main class="flex-1">
 		{@render children()}

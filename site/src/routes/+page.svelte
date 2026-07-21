@@ -44,7 +44,6 @@
 
 <!-- Hero -->
 <section id="top" class="relative overflow-hidden">
-	<div class="pointer-events-none absolute inset-0 bg-grid mask-fade-b opacity-60"></div>
 	<div
 		class="relative mx-auto grid max-w-content items-center gap-12 px-6 pb-section pt-16 lg:grid-cols-[1.05fr_0.95fr] lg:pt-24"
 	>
@@ -77,33 +76,26 @@
 </section>
 
 <!-- Overview -->
-<section id="overview" class="grid-section bg-paper-soft">
+<section id="overview" class="tint-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={overview.eyebrow} title={overview.title} lede={overview.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-			{#each overview.features as f (f.tag)}
-				<FeatureCard tag={f.tag} title={f.title} body={f.body} />
+			{#each overview.features as f (f.title)}
+				<FeatureCard title={f.title} body={f.body} />
 			{/each}
 		</div>
 	</div>
 </section>
 
 <!-- Concepts -->
-<section id="concepts" class="grid-section">
+<section id="concepts">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={concepts.eyebrow} title={concepts.title} align="center" />
 		<div class="mt-14 flex flex-col gap-16">
 			{#each concepts.items as item, i (item.id)}
 				<div class="grid items-center gap-8 lg:grid-cols-2 lg:gap-14">
 					<div class="flex flex-col gap-4 {i % 2 === 1 ? 'lg:order-2' : ''}">
-						<div class="flex items-center gap-3">
-							<span
-								class="grid h-7 w-7 place-items-center rounded-md border border-accent bg-accent-soft font-mono text-xs text-primary"
-							>
-								{String(i + 1).padStart(2, '0')}
-							</span>
-							<span class="font-mono text-label uppercase text-ink-soft">{item.kicker}</span>
-						</div>
+						<span class="font-mono text-label uppercase text-ink-soft">{item.kicker}</span>
 						<h3 class="font-display font-semibold text-h3 text-ink text-balance">{item.title}</h3>
 						<p class="text-base text-ink-mute text-pretty">{item.body}</p>
 					</div>
@@ -117,7 +109,7 @@
 </section>
 
 <!-- Targets -->
-<section id="targets" class="grid-section bg-paper-soft">
+<section id="targets" class="tint-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={targets.eyebrow} title={targets.title} lede={targets.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -129,7 +121,7 @@
 </section>
 
 <!-- Commands -->
-<section id="commands" class="grid-section">
+<section id="commands">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={commands.eyebrow} title={commands.title} lede={commands.lede} />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2">
@@ -141,7 +133,7 @@
 </section>
 
 <!-- Audience -->
-<section id="audience" class="grid-section bg-paper-soft">
+<section id="audience" class="tint-soft">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<SectionHead eyebrow={audience.eyebrow} title={audience.title} align="center" />
 		<div class="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -156,7 +148,7 @@
 </section>
 
 <!-- Get started -->
-<section id="start" class="grid-section">
+<section id="start">
 	<div class="mx-auto max-w-content px-6 py-section">
 		<div class="overflow-hidden rounded-xl border border-accent bg-paper-mute">
 			<div class="grid gap-10 p-8 lg:grid-cols-[1fr_1.1fr] lg:p-12">

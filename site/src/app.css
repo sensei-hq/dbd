@@ -87,36 +87,60 @@ section[id],
 	max-width: var(--content);
 }
 
-/* ---- Grid backdrop (hero + alternating sections) ---- */
-.grid-section {
+/* ---- Grid backdrop --------------------------------------------------------
+   ONE continuous 64px lattice painted behind the whole marketing page, so grid
+   lines never restart per-section. Previously each `.grid-section` drew its own
+   grid from its own top-left origin; since section heights aren't multiples of
+   64px, the horizontal lines never lined up across a boundary — that was the
+   seam/offset at every section edge.
+
+   `.page-grid` goes on the layout content wrapper; its ::before spans the full
+   document from a single origin (z-index:-1, so it sits above the page's paper
+   background but behind all content). Opaque `bg-paper-soft` sections paint
+   over it (hiding the grid there); transparent sections let it bleed through —
+   an alternating rhythm with zero seams, because every visible run is the same
+   lattice. */
+.page-grid {
 	position: relative;
 	isolation: isolate;
 }
-.grid-section::before {
+.page-grid::before {
 	content: '';
 	position: absolute;
 	inset: 0;
-	z-index: 0;
+	z-index: -1;
 	pointer-events: none;
 	background-image:
 		linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
 		linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
 	background-size: 64px 64px;
-	opacity: 0.85;
 }
-.grid-section > * {
-	position: relative;
-	z-index: 1;
+/* Alternating-section tint that lets the page grid BLEED THROUGH. The tint
+   alone gives enough section separation now, so no divider borders are needed.
+
+   Base colour is `--paper-2` (the design's *elevated* surface: light 0.978 /
+   dark 0.27), NOT `--paper-soft`: in dark mode paper-soft (0.225) equals the
+   page colour, so a paper-soft tint was invisible there. paper-2 separates from
+   the page in both modes. Translucent (color-mix with transparent) so the one
+   grid still reads underneath. Tune the mix % to trade tint strength vs how
+   strongly the grid shows through. */
+.tint-soft {
+	background: color-mix(in oklch, var(--paper-2) 62%, transparent);
 }
-.bg-grid {
-	background-image:
-		linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-		linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-	background-size: 64px 64px;
+/* Outline/ghost buttons on the marketing pages sit directly over the page grid;
+   their transparent face let grid lines run straight through the control, which
+   looked broken. Give the RESTING state a solid paper fill so the interior is
+   clean while the outline still defines it. `:not(:hover)` leaves rokkit's
+   hover/active fill untouched. Scoped to `.page-grid` so the app shell's buttons
+   are unaffected. */
+.page-grid [data-button][data-style='outline']:not(:hover):not(:active) {
+	background-color: var(--paper);
 }
-.mask-fade-b {
-	-webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
-	mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
+/* Terminal / code-box window dots. `bg-paper-mute` reads fine on the light card,
+   but in dark mode paper-mute (0.27) equals the paper-2 card colour, so the dots
+   vanished. Lift them to `--edge` (0.42) in dark only; light stays untouched. */
+[data-mode='dark'] .terminal-dot {
+	background-color: var(--edge);
 }
 
 /* ---- Entrance animation ---- */
