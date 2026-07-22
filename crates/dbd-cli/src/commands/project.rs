@@ -109,13 +109,43 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         return Ok(());
     }
 
+    report_doctor_issues(&config_issues, &stale_files, &plural_dirs);
+
+    if !fix {
+        output::always("\nRun with --fix to resolve automatically.");
+        output::summary(total_issues, 0, 0);
+        return Ok(());
+    }
+
+    let mut fixed = 0;
+    if !config_issues.is_empty() {
+        fix_config_migration(config, project_dir, &content, verbosity)?;
+        fixed += config_issues.len();
+    }
+    if !stale_files.is_empty() {
+        fixed += fix_stale_files(&stale_files, verbosity);
+    }
+    if !plural_dirs.is_empty() {
+        fixed += fix_plural_dirs(&plural_dirs, verbosity);
+    }
+    output::summary(0, 0, fixed);
+
+    Ok(())
+}
+
+/// Print the config / stale-file / plural-folder issues doctor detected.
+fn report_doctor_issues(
+    config_issues: &[String],
+    stale_files: &[dbd_core::doctor::StaleFile],
+    plural_dirs: &[dbd_core::doctor::PluralDdlDir],
+) {
     if !config_issues.is_empty() {
         output::always(&format!(
             "Found {} config issue{}:",
             config_issues.len(),
             if config_issues.len() != 1 { "s" } else { "" }
         ));
-        for issue in &config_issues {
+        for issue in config_issues {
             output::always(&format!("  - {issue}"));
         }
     }
@@ -126,7 +156,7 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             stale_files.len(),
             if stale_files.len() != 1 { "s" } else { "" }
         ));
-        for f in &stale_files {
+        for f in stale_files {
             output::always(&format!("  - {} — {}", f.path.display(), f.reason));
         }
     }
@@ -137,83 +167,85 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             plural_dirs.len(),
             if plural_dirs.len() != 1 { "s" } else { "" }
         ));
-        for d in &plural_dirs {
+        for d in plural_dirs {
             output::always(&format!("  - {} → {}", d.plural.display(), d.singular.display()));
         }
     }
+}
 
-    if fix {
-        let mut fixed = 0;
+/// Migrate an old-format config in place, validating the result and backing up
+/// the original to a `.yaml.bak` sibling first.
+fn fix_config_migration(
+    config: &Path,
+    project_dir: &Path,
+    content: &str,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let migrated = dbd_core::doctor::migrate_config(content).context("Config migration failed")?;
 
-        if !config_issues.is_empty() {
-            let migrated = dbd_core::doctor::migrate_config(&content)
-                .context("Config migration failed")?;
+    let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
+        .context("Migrated config failed to parse — please report this as a bug")?;
 
-            let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
-                .context("Migrated config failed to parse — please report this as a bug")?;
+    let backup = config.with_extension("yaml.bak");
+    safe_copy(project_dir, config, &backup)?;
+    output::info(verbosity, &format!("Backup saved to {}", backup.display()));
 
-            let backup = config.with_extension("yaml.bak");
-            safe_copy(project_dir, config, &backup)?;
-            output::info(verbosity, &format!("Backup saved to {}", backup.display()));
-
-            safe_write(project_dir, config, &migrated)?;
-            output::info(verbosity, &format!("Migrated {}", config.display()));
-            fixed += config_issues.len();
-        }
-
-        if !stale_files.is_empty() {
-            let results = dbd_core::doctor::remove_stale_files(&stale_files);
-            for (path, err) in &results {
-                match err {
-                    None => {
-                        output::info(verbosity, &format!("Removed {}", path.display()));
-                        fixed += 1;
-                    }
-                    Some(e) => {
-                        output::always(&format!("Failed to remove {}: {e}", path.display()));
-                    }
-                }
-            }
-        }
-
-        if !plural_dirs.is_empty() {
-            use dbd_core::doctor::DdlMoveOutcome;
-            for d in &plural_dirs {
-                for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
-                    match outcome {
-                        DdlMoveOutcome::RenamedDir { from, to } => {
-                            output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
-                            fixed += 1;
-                        }
-                        DdlMoveOutcome::MovedFile { from, to } => {
-                            output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
-                            fixed += 1;
-                        }
-                        DdlMoveOutcome::BackedUp { winner, loser, final_path, backup } => {
-                            output::always(&format!(
-                                "Collision at {}: kept newer (from {}), backed up older (from {}) → {}",
-                                final_path.display(),
-                                winner.display(),
-                                loser.display(),
-                                backup.display()
-                            ));
-                            fixed += 1;
-                        }
-                        DdlMoveOutcome::Error { path, error } => {
-                            output::always(&format!("Failed to migrate {}: {error}", path.display()));
-                        }
-                    }
-                }
-            }
-        }
-
-        output::summary(0, 0, fixed);
-    } else {
-        output::always("\nRun with --fix to resolve automatically.");
-        output::summary(total_issues, 0, 0);
-    }
-
+    safe_write(project_dir, config, &migrated)?;
+    output::info(verbosity, &format!("Migrated {}", config.display()));
     Ok(())
+}
+
+/// Remove stale internally-managed files, returning how many were removed.
+fn fix_stale_files(stale_files: &[dbd_core::doctor::StaleFile], verbosity: Verbosity) -> usize {
+    let mut fixed = 0;
+    let results = dbd_core::doctor::remove_stale_files(stale_files);
+    for (path, err) in &results {
+        match err {
+            None => {
+                output::info(verbosity, &format!("Removed {}", path.display()));
+                fixed += 1;
+            }
+            Some(e) => {
+                output::always(&format!("Failed to remove {}: {e}", path.display()));
+            }
+        }
+    }
+    fixed
+}
+
+/// Migrate plural DDL folders to their singular canonical form, returning how
+/// many moves succeeded.
+fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Verbosity) -> usize {
+    use dbd_core::doctor::DdlMoveOutcome;
+    let mut fixed = 0;
+    for d in plural_dirs {
+        for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
+            match outcome {
+                DdlMoveOutcome::RenamedDir { from, to } => {
+                    output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
+                    fixed += 1;
+                }
+                DdlMoveOutcome::MovedFile { from, to } => {
+                    output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
+                    fixed += 1;
+                }
+                DdlMoveOutcome::BackedUp { winner, loser, final_path, backup } => {
+                    output::always(&format!(
+                        "Collision at {}: kept newer (from {}), backed up older (from {}) → {}",
+                        final_path.display(),
+                        winner.display(),
+                        loser.display(),
+                        backup.display()
+                    ));
+                    fixed += 1;
+                }
+                DdlMoveOutcome::Error { path, error } => {
+                    output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    fixed
 }
 
 pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosity) -> Result<()> {
