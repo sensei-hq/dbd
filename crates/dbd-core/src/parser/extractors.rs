@@ -327,23 +327,33 @@ fn extract_proc_refs_via_ast(
 
         parsed_any = true;
         for body_stmt in &body_stmts {
-            let targets = proc_write_targets(body_stmt, default_schema);
-            for reference in collect_table_refs(body_stmt, default_schema) {
-                if targets.contains(&reference.name) {
-                    push_unique(&mut writes, reference.name);
-                } else {
-                    push_unique(&mut reads, reference.name);
-                }
-            }
-            // A write target may not surface as a visited relation (e.g. an
-            // INSERT target); make sure it's recorded.
-            for target in targets {
-                push_unique(&mut writes, target);
-            }
+            classify_body_refs(body_stmt, default_schema, &mut reads, &mut writes);
         }
     }
 
     parsed_any.then_some((reads, writes))
+}
+
+/// Sort one body statement's table references into `reads`/`writes` (a reference
+/// that is also a write target counts as a write), and record write targets that
+/// never surface as a visited relation (e.g. an INSERT target).
+fn classify_body_refs(
+    body_stmt: &Statement,
+    default_schema: &str,
+    reads: &mut Vec<String>,
+    writes: &mut Vec<String>,
+) {
+    let targets = proc_write_targets(body_stmt, default_schema);
+    for reference in collect_table_refs(body_stmt, default_schema) {
+        if targets.contains(&reference.name) {
+            push_unique(writes, reference.name);
+        } else {
+            push_unique(reads, reference.name);
+        }
+    }
+    for target in targets {
+        push_unique(writes, target);
+    }
 }
 
 /// Extract the raw SQL text of a function body (dollar-quoted or string literal).
