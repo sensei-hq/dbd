@@ -22,62 +22,77 @@ pub fn migration_warnings(diffs: &[MigrationDiff]) -> Vec<String> {
             continue;
         };
 
-        // Detect column type changes
-        for change in changes {
-            if change.field_type == FieldType::Column
-                && let ChangeAction::Alter { ref old, ref new } = change.action
-                && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
-                    (old.as_ref(), new.as_ref())
-                && old_col.data_type != new_col.data_type
+        warnings.extend(type_change_warnings(&d.entity_name, changes));
+        warnings.extend(rename_warnings(&d.entity_name, changes));
+        warnings.extend(enum_value_drop_warnings(&d.entity_name, changes));
+    }
+
+    warnings
+}
+
+/// Warn about column type changes (suggest a two-snapshot split).
+fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        if change.field_type == FieldType::Column
+            && let ChangeAction::Alter { ref old, ref new } = change.action
+            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                (old.as_ref(), new.as_ref())
+            && old_col.data_type != new_col.data_type
+        {
+            warnings.push(format!(
+                "{}.{}: type change {} -> {} — consider splitting across two snapshots \
+                 (v(N): add new column + data correction, v(N+1): drop old column)",
+                entity_name, change.field_name, old_col.data_type, new_col.data_type
+            ));
+        }
+    }
+    warnings
+}
+
+/// Warn about a column dropped + column added in the same table (possible rename).
+fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let dropped: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
+        .collect();
+    let added: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Add(_)))
+        .collect();
+
+    let mut warnings = Vec::new();
+    for drop_col in &dropped {
+        for add_col in &added {
+            if let ChangeAction::Add(ref detail) = add_col.action
+                && matches!(**detail, FieldDetail::Column(_))
             {
                 warnings.push(format!(
-                    "{}.{}: type change {} -> {} — consider splitting across two snapshots \
-                     (v(N): add new column + data correction, v(N+1): drop old column)",
-                    d.entity_name, change.field_name, old_col.data_type, new_col.data_type
-                ));
-            }
-        }
-
-        // Detect possible renames: column dropped + column added with same type in same table
-        let dropped: Vec<&FieldChange> = changes
-            .iter()
-            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
-            .collect();
-        let added: Vec<&FieldChange> = changes
-            .iter()
-            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Add(_)))
-            .collect();
-
-        for drop_col in &dropped {
-            for add_col in &added {
-                if let ChangeAction::Add(ref detail) = add_col.action
-                    && matches!(**detail, FieldDetail::Column(_))
-                {
-                    warnings.push(format!(
-                        "{}: column '{}' dropped and '{}' added — if this is a rename, \
-                         consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
-                        d.entity_name,
-                        drop_col.field_name,
-                        add_col.field_name,
-                        add_col.field_name,
-                        drop_col.field_name,
-                    ));
-                }
-            }
-        }
-
-        // Detect enum value drops
-        for change in changes {
-            if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop)
-            {
-                warnings.push(format!(
-                    "{}: enum value '{}' dropped — ensure no rows reference this value",
-                    d.entity_name, change.field_name
+                    "{}: column '{}' dropped and '{}' added — if this is a rename, \
+                     consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
+                    entity_name,
+                    drop_col.field_name,
+                    add_col.field_name,
+                    add_col.field_name,
+                    drop_col.field_name,
                 ));
             }
         }
     }
+    warnings
+}
 
+/// Warn about dropped enum values (rows may still reference them).
+fn enum_value_drop_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop) {
+            warnings.push(format!(
+                "{}: enum value '{}' dropped — ensure no rows reference this value",
+                entity_name, change.field_name
+            ));
+        }
+    }
     warnings
 }
 
