@@ -213,16 +213,7 @@ impl<'a> Parser<'a> {
 
     fn parse_table(&mut self) -> Result<()> {
         let header = strip_comment(self.lines[self.pos]).trim().to_string();
-        let after_kw = header
-            .get(first_word(&header).len()..)
-            .unwrap_or("")
-            .trim();
-        let name_part = after_kw.split('{').next().unwrap_or("").trim();
-        // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
-        // strip a trailing settings group from the name part.
-        let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
-        let (schema, base) = parse_qualified_name(name_only)?;
-        self.note_schema(&schema);
+        let (schema, base) = self.parse_table_header(&header)?;
         let qualified = format!("{schema}.{base}");
 
         if !header.contains('{') {
@@ -278,16 +269,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let mut comments = crate::entity::TableComments {
-            table: table_note,
-            ..Default::default()
-        };
-        // Surface column notes into TableComments too (mirrors introspection).
-        for col in &columns {
-            if let Some(ref c) = col.comment {
-                comments.columns.insert(col.name.clone(), c.clone());
-            }
-        }
+        let comments = Self::table_comments_from(table_note, &columns);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
         entity.schema = Some(schema);
@@ -299,6 +281,40 @@ impl<'a> Parser<'a> {
         });
         self.tables.push(entity);
         Ok(())
+    }
+
+    /// Parse a table header line into `(schema, base)`, stripping the leading
+    /// keyword, an inline `{`, and any trailing `[settings]`; notes the schema.
+    fn parse_table_header(&mut self, header: &str) -> Result<(String, String)> {
+        let after_kw = header
+            .get(first_word(header).len()..)
+            .unwrap_or("")
+            .trim();
+        let name_part = after_kw.split('{').next().unwrap_or("").trim();
+        // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
+        // strip a trailing settings group from the name part.
+        let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
+        let (schema, base) = parse_qualified_name(name_only)?;
+        self.note_schema(&schema);
+        Ok((schema, base))
+    }
+
+    /// Assemble a table's `TableComments` from its `note` plus per-column notes
+    /// (mirrors what introspection surfaces).
+    fn table_comments_from(
+        table_note: Option<String>,
+        columns: &[ColumnDef],
+    ) -> crate::entity::TableComments {
+        let mut comments = crate::entity::TableComments {
+            table: table_note,
+            ..Default::default()
+        };
+        for col in columns {
+            if let Some(ref c) = col.comment {
+                comments.columns.insert(col.name.clone(), c.clone());
+            }
+        }
+        comments
     }
 
     /// Parse an `indexes { … }` block. `header` is the line beginning with
