@@ -213,16 +213,7 @@ impl<'a> Parser<'a> {
 
     fn parse_table(&mut self) -> Result<()> {
         let header = strip_comment(self.lines[self.pos]).trim().to_string();
-        let after_kw = header
-            .get(first_word(&header).len()..)
-            .unwrap_or("")
-            .trim();
-        let name_part = after_kw.split('{').next().unwrap_or("").trim();
-        // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
-        // strip a trailing settings group from the name part.
-        let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
-        let (schema, base) = parse_qualified_name(name_only)?;
-        self.note_schema(&schema);
+        let (schema, base) = self.parse_table_header(&header)?;
         let qualified = format!("{schema}.{base}");
 
         if !header.contains('{') {
@@ -278,16 +269,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let mut comments = crate::entity::TableComments {
-            table: table_note,
-            ..Default::default()
-        };
-        // Surface column notes into TableComments too (mirrors introspection).
-        for col in &columns {
-            if let Some(ref c) = col.comment {
-                comments.columns.insert(col.name.clone(), c.clone());
-            }
-        }
+        let comments = Self::table_comments_from(table_note, &columns);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
         entity.schema = Some(schema);
@@ -301,6 +283,40 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parse a table header line into `(schema, base)`, stripping the leading
+    /// keyword, an inline `{`, and any trailing `[settings]`; notes the schema.
+    fn parse_table_header(&mut self, header: &str) -> Result<(String, String)> {
+        let after_kw = header
+            .get(first_word(header).len()..)
+            .unwrap_or("")
+            .trim();
+        let name_part = after_kw.split('{').next().unwrap_or("").trim();
+        // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
+        // strip a trailing settings group from the name part.
+        let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
+        let (schema, base) = parse_qualified_name(name_only)?;
+        self.note_schema(&schema);
+        Ok((schema, base))
+    }
+
+    /// Assemble a table's `TableComments` from its `note` plus per-column notes
+    /// (mirrors what introspection surfaces).
+    fn table_comments_from(
+        table_note: Option<String>,
+        columns: &[ColumnDef],
+    ) -> crate::entity::TableComments {
+        let mut comments = crate::entity::TableComments {
+            table: table_note,
+            ..Default::default()
+        };
+        for col in columns {
+            if let Some(ref c) = col.comment {
+                comments.columns.insert(col.name.clone(), c.clone());
+            }
+        }
+        comments
+    }
+
     /// Parse an `indexes { … }` block. `header` is the line beginning with
     /// `indexes`; the `{` may be on that line or a following one.
     fn parse_indexes_block(
@@ -309,26 +325,7 @@ impl<'a> Parser<'a> {
         table: &str,
         out: &mut Vec<IndexDef>,
     ) -> Result<()> {
-        // Find the opening brace.
-        if !header.contains('{') {
-            // Brace on a following line: advance to it.
-            self.pos += 1;
-            while self.pos < self.lines.len() {
-                let l = strip_comment(self.lines[self.pos]).trim().to_string();
-                self.pos += 1;
-                if l.is_empty() {
-                    continue;
-                }
-                if l.contains('{') {
-                    break;
-                }
-                return Err(parse_err(format!(
-                    "indexes block in `{table}` is missing `{{`"
-                )));
-            }
-        } else {
-            self.pos += 1;
-        }
+        self.advance_to_indexes_brace(header, table)?;
 
         loop {
             if self.pos >= self.lines.len() {
@@ -345,6 +342,31 @@ impl<'a> Parser<'a> {
                 break;
             }
             out.push(parse_index_line(&line, table)?);
+        }
+        Ok(())
+    }
+
+    /// Advance the cursor just past the `{` that opens an `indexes` block —
+    /// whether the brace is on the header line or a following line.
+    fn advance_to_indexes_brace(&mut self, header: &str, table: &str) -> Result<()> {
+        if header.contains('{') {
+            self.pos += 1;
+            return Ok(());
+        }
+        // Brace on a following line: advance to it.
+        self.pos += 1;
+        while self.pos < self.lines.len() {
+            let l = strip_comment(self.lines[self.pos]).trim().to_string();
+            self.pos += 1;
+            if l.is_empty() {
+                continue;
+            }
+            if l.contains('{') {
+                return Ok(());
+            }
+            return Err(parse_err(format!(
+                "indexes block in `{table}` is missing `{{`"
+            )));
         }
         Ok(())
     }
@@ -1071,10 +1093,9 @@ fn parse_single_line_string(s: &str) -> Option<String> {
     let s = s.trim();
     let inner = if let Some(rest) = s.strip_prefix('\'') {
         rest.strip_suffix('\'')?
-    } else if let Some(rest) = s.strip_prefix('"') {
-        rest.strip_suffix('"')?
     } else {
-        return None;
+        let rest = s.strip_prefix('"')?;
+        rest.strip_suffix('"')?
     };
     Some(inner.replace("\\'", "'"))
 }

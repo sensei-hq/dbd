@@ -120,33 +120,54 @@ pub fn build_execution_plan(
 
     // Fresh: db_version == 0 → apply everything + set version
     if db_version == 0 {
-        let mut steps: Vec<ExecutionStep> = valid_entities
-            .iter()
-            .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
-            .collect();
-        steps.push(ExecutionStep::SetVersion(latest_version));
-        return ExecutionPlan {
-            strategy: ApplyStrategy::Fresh,
-            steps,
-        };
+        return plan_fresh(&valid_entities, latest_version);
     }
 
     // Current: no pending migrations or already at latest
     if db_version >= latest_version || pending_migrations.is_empty() {
-        let steps: Vec<ExecutionStep> = valid_entities
-            .iter()
-            .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
-            .collect();
-        return ExecutionPlan {
-            strategy: ApplyStrategy::Current,
-            steps,
-        };
+        return plan_current(&valid_entities);
     }
 
     // Migrate: db_version < latest and there are pending migrations
+    plan_migrate(&valid_entities, pending_migrations, latest_version, scope_names)
+}
+
+/// Fresh install: apply every entity's DDL, then stamp the latest version.
+fn plan_fresh(valid_entities: &[&Entity], latest_version: u32) -> ExecutionPlan {
+    let mut steps: Vec<ExecutionStep> = valid_entities
+        .iter()
+        .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
+        .collect();
+    steps.push(ExecutionStep::SetVersion(latest_version));
+    ExecutionPlan {
+        strategy: ApplyStrategy::Fresh,
+        steps,
+    }
+}
+
+/// Up to date: (re)apply current DDL for every entity, no version change.
+fn plan_current(valid_entities: &[&Entity]) -> ExecutionPlan {
+    let steps: Vec<ExecutionStep> = valid_entities
+        .iter()
+        .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
+        .collect();
+    ExecutionPlan {
+        strategy: ApplyStrategy::Current,
+        steps,
+    }
+}
+
+/// Migrate forward: create/alter/apply in-scope entities, run drop scripts,
+/// record each pending migration, and stamp the latest version.
+fn plan_migrate(
+    valid_entities: &[&Entity],
+    pending_migrations: &[PendingMigration],
+    latest_version: u32,
+    scope_names: Option<&std::collections::HashSet<String>>,
+) -> ExecutionPlan {
     let in_scope = |n: &str| scope_names.is_none_or(|s| s.contains(n));
 
-    // Collect all added/altered/dropped across all pending migrations
+    // Collect all added/altered across all pending migrations
     let all_added: std::collections::HashSet<&str> = pending_migrations
         .iter()
         .flat_map(|m| m.added.iter().map(|s| s.as_str()))
@@ -158,50 +179,18 @@ pub fn build_execution_plan(
 
     let mut steps: Vec<ExecutionStep> = Vec::new();
 
-    // For each entity, determine what to do
-    for entity in &valid_entities {
+    for entity in valid_entities {
         if !in_scope(entity.name.as_str()) {
             continue;
         }
-
         if all_added.contains(entity.name.as_str()) {
             steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
         }
-
         if all_altered.contains(entity.name.as_str()) {
-            // Run migration SQL for each pending migration that alters this entity
-            for migration in pending_migrations {
-                if migration.altered.contains(&entity.name) {
-                    let parts: Vec<&str> = entity.name.split('.').collect();
-                    let (schema, table_name) = if parts.len() > 1 {
-                        (Some(parts[0]), parts[1])
-                    } else {
-                        (None, parts[0])
-                    };
-                    let sql_path = match schema {
-                        Some(s) => migration
-                            .migration_dir
-                            .join(s)
-                            .join(format!("{table_name}.sql")),
-                        None => migration.migration_dir.join(format!("{table_name}.sql")),
-                    };
-                    steps.push(ExecutionStep::MigrateEntity {
-                        entity_name: entity.name.clone(),
-                        migration_sql_path: sql_path,
-                        migration_version: migration.to_version,
-                    });
-                }
-            }
+            push_migrate_steps_for(&entity.name, pending_migrations, &mut steps);
         }
-
-        // Always apply the current DDL (unless it's being dropped — handled below)
-        if !all_added.contains(entity.name.as_str()) || all_altered.contains(entity.name.as_str()) {
-            // Regular entities and altered entities get ApplyEntity
-            steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
-        } else {
-            // Added entities also get ApplyEntity (CreateEntity is just a marker)
-            steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
-        }
+        // Every in-scope entity (added, altered, or unchanged) re-applies its DDL.
+        steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
     }
 
     // Handle dropped entities
@@ -210,22 +199,13 @@ pub fn build_execution_plan(
             if !in_scope(table_name) {
                 continue;
             }
-            let parts: Vec<&str> = table_name.split('.').collect();
-            let (schema, tbl) = if parts.len() > 1 {
-                (Some(parts[0]), parts[1])
-            } else {
-                (None, parts[0])
-            };
-            let sql_path = match schema {
-                Some(s) => migration
-                    .migration_dir
-                    .join(s)
-                    .join(format!("{tbl}.drop.sql")),
-                None => migration.migration_dir.join(format!("{tbl}.drop.sql")),
-            };
             steps.push(ExecutionStep::DropEntity {
                 entity_name: table_name.clone(),
-                drop_sql_path: sql_path,
+                drop_sql_path: migration_entity_sql_path(
+                    &migration.migration_dir,
+                    table_name,
+                    ".drop.sql",
+                ),
                 migration_version: migration.to_version,
             });
         }
@@ -247,6 +227,121 @@ pub fn build_execution_plan(
         steps,
     }
 }
+
+/// Push a `MigrateEntity` step for every pending migration that alters `entity_name`.
+fn push_migrate_steps_for(
+    entity_name: &str,
+    pending_migrations: &[PendingMigration],
+    steps: &mut Vec<ExecutionStep>,
+) {
+    for migration in pending_migrations {
+        if migration.altered.iter().any(|a| a == entity_name) {
+            steps.push(ExecutionStep::MigrateEntity {
+                entity_name: entity_name.to_string(),
+                migration_sql_path: migration_entity_sql_path(
+                    &migration.migration_dir,
+                    entity_name,
+                    ".sql",
+                ),
+                migration_version: migration.to_version,
+            });
+        }
+    }
+}
+
+/// Path to a per-entity migration SQL file: `<dir>/<schema>/<table><suffix>`
+/// (or `<dir>/<table><suffix>` when the entity name is unqualified).
+fn migration_entity_sql_path(migration_dir: &Path, entity_name: &str, suffix: &str) -> PathBuf {
+    let parts: Vec<&str> = entity_name.split('.').collect();
+    let (schema, table) = if parts.len() > 1 {
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, parts[0])
+    };
+    match schema {
+        Some(s) => migration_dir.join(s).join(format!("{table}{suffix}")),
+        None => migration_dir.join(format!("{table}{suffix}")),
+    }
+}
+
+/// Refuse to apply while any pending migration still has unresolved `-- TODO:`
+/// lines in its `data.sql` files.
+fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
+    let todos = snapshot::pending_data_sql_todos(pending);
+    if todos.is_empty() {
+        return Ok(());
+    }
+    let details: String = todos
+        .iter()
+        .map(|t| format!("  {} (v{})", t.file.display(), t.version))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(DbdError::Config(format!(
+        "Unresolved TODO(s) in data.sql — resolve before applying:\n{details}\n\
+         Edit the file(s) above and replace each -- TODO comment with working SQL."
+    )))
+}
+
+/// Refuse a destructive reconcile (dropped columns/constraints) unless the
+/// caller explicitly opted in with `allow_destructive`.
+fn ensure_reconcile_not_destructive(
+    plan: &crate::reconcile::ReconcilePlan,
+    allow_destructive: bool,
+) -> Result<()> {
+    if !plan.destructive || allow_destructive {
+        return Ok(());
+    }
+    let details: String = plan
+        .altered
+        .iter()
+        .map(|s| format!("  {}", s.entity_name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(DbdError::Config(format!(
+        "reconcile would make destructive changes (dropped columns/constraints) on:\n{details}\n\
+         Re-run with --allow-destructive to proceed."
+    )))
+}
+
+/// Build a `SET search_path` prelude covering every managed schema plus public,
+/// so bare references in generated ALTERs resolve like the project's DDL files.
+fn search_path_prelude(managed_schemas: &std::collections::HashSet<String>) -> String {
+    let mut schemas: Vec<&str> = managed_schemas.iter().map(|s| s.as_str()).collect();
+    schemas.sort_unstable();
+    if !schemas.contains(&"public") {
+        schemas.push("public");
+    }
+    let list = schemas
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SET search_path TO {list};\n")
+}
+
+/// Restrict a live snapshot to only the tables/enums in the managed schemas
+/// (reconcile never diffs or prunes objects in schemas the project doesn't own).
+fn restrict_snapshot_to_schemas(
+    full: crate::snapshot::Snapshot,
+    managed_schemas: &std::collections::HashSet<String>,
+) -> crate::snapshot::Snapshot {
+    crate::snapshot::Snapshot {
+        version: 0,
+        description: String::new(),
+        timestamp: String::new(),
+        tables: full
+            .tables
+            .into_iter()
+            .filter(|t| managed_schemas.contains(&t.schema))
+            .collect(),
+        enums: full
+            .enums
+            .into_iter()
+            .filter(|e| managed_schemas.contains(&e.schema))
+            .collect(),
+    }
+}
+
 
 /// Whether an import plan entry runs under a scope's working set.
 /// An entry with write-targets is kept only if ALL targets are in scope;
@@ -878,18 +973,7 @@ impl Design {
         let pending = snapshot::pending_migrations(db_version, &self.project_dir);
 
         // Block apply if any pending migration has unresolved data.sql TODOs.
-        let todos = snapshot::pending_data_sql_todos(&pending);
-        if !todos.is_empty() {
-            let details: String = todos
-                .iter()
-                .map(|t| format!("  {} (v{})", t.file.display(), t.version))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(DbdError::Config(format!(
-                "Unresolved TODO(s) in data.sql — resolve before applying:\n{details}\n\
-                 Edit the file(s) above and replace each -- TODO comment with working SQL."
-            )));
-        }
+        ensure_no_pending_todos(&pending)?;
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
@@ -972,7 +1056,8 @@ impl Design {
                                 adapter.execute_script(&sql).await?;
                             }
                             Ok(())
-                        }.await;
+                        }
+                        .await;
                         report_step_result(&desc, &mut on_done, result)?;
                         count_migrated += 1;
                     }
@@ -988,7 +1073,8 @@ impl Design {
                                 adapter.execute_script(&sql).await?;
                             }
                             Ok(())
-                        }.await;
+                        }
+                        .await;
                         report_step_result(&desc, &mut on_done, result)?;
                         count_dropped += 1;
                     }
@@ -1127,21 +1213,7 @@ impl Design {
         // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
         let live_entities = adapter.introspect().await?;
         let live_full = snapshot_from_entities(&live_entities);
-        let live = crate::snapshot::Snapshot {
-            version: 0,
-            description: String::new(),
-            timestamp: String::new(),
-            tables: live_full
-                .tables
-                .into_iter()
-                .filter(|t| managed_schemas.contains(&t.schema))
-                .collect(),
-            enums: live_full
-                .enums
-                .into_iter()
-                .filter(|e| managed_schemas.contains(&e.schema))
-                .collect(),
-        };
+        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
         let plan = plan_reconcile(&live, &desired);
 
@@ -1149,18 +1221,7 @@ impl Design {
             return Ok(plan);
         }
 
-        if plan.destructive && !allow_destructive {
-            let details: String = plan
-                .altered
-                .iter()
-                .map(|s| format!("  {}", s.entity_name))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(DbdError::Config(format!(
-                "reconcile would make destructive changes (dropped columns/constraints) on:\n{details}\n\
-                 Re-run with --allow-destructive to proceed."
-            )));
-        }
+        ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
         let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
         let alter_sql: HashMap<&str, &str> = plan
@@ -1204,19 +1265,7 @@ impl Design {
         // files. Prepend one covering every managed schema (+ public) so bare
         // references — e.g. an enum type or a default calling a managed function —
         // resolve the same way they do when the DDL file runs.
-        let search_path = {
-            let mut schemas: Vec<&str> = managed_schemas.iter().map(|s| s.as_str()).collect();
-            schemas.sort_unstable();
-            if !schemas.contains(&"public") {
-                schemas.push("public");
-            }
-            let list = schemas
-                .iter()
-                .map(|s| format!("\"{s}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("SET search_path TO {list};\n")
-        };
+        let search_path = search_path_prelude(&managed_schemas);
 
         // Pass B — ALTER existing tables/enums, in dependency order.
         for e in &desired_entities {

@@ -261,35 +261,47 @@ pub fn generate_schema_ts(entities: &[&Entity]) -> String {
         if entity.entity_type != EntityType::Table {
             continue;
         }
-        let convex_name = convex_table_name(&entity.name);
-        out.push_str(&format!("  {convex_name}: defineTable({{\n"));
-        if let Some(td) = &entity.table_def {
-            let fk_targets = fk_columns_for_table(td, &tables);
-            for col in &td.columns {
-                // Convex auto-supplies _id and _creationTime; skip these so
-                // user columns don't collide with the platform.
-                if matches!(col.name.as_str(), "_id" | "_creationTime") {
-                    continue;
-                }
-                out.push_str(&render_column(col, &enums, &tables, &fk_targets));
-                out.push('\n');
-            }
-        }
-        out.push_str("  })");
-        if let Some(td) = &entity.table_def
-            && !td.indexes.is_empty()
-        {
-            out.push('\n');
-            out.push_str(&render_indexes(td));
-            // strip trailing newline before comma
-            if out.ends_with('\n') {
-                out.pop();
-            }
-        }
-        out.push_str(",\n");
+        out.push_str(&render_table_def(entity, &enums, &tables));
     }
 
     out.push_str("});\n");
+    out
+}
+
+/// Render one `<name>: defineTable({ … }).index(…),` block for a table entity.
+fn render_table_def(
+    entity: &Entity,
+    enums: &HashMap<String, String>,
+    tables: &HashMap<String, String>,
+) -> String {
+    let convex_name = convex_table_name(&entity.name);
+    let mut out = format!("  {convex_name}: defineTable({{\n");
+
+    if let Some(td) = &entity.table_def {
+        let fk_targets = fk_columns_for_table(td, tables);
+        for col in &td.columns {
+            // Convex auto-supplies _id and _creationTime; skip these so user
+            // columns don't collide with the platform.
+            if matches!(col.name.as_str(), "_id" | "_creationTime") {
+                continue;
+            }
+            out.push_str(&render_column(col, enums, tables, &fk_targets));
+            out.push('\n');
+        }
+    }
+    out.push_str("  })");
+
+    if let Some(td) = &entity.table_def
+        && !td.indexes.is_empty()
+    {
+        out.push('\n');
+        out.push_str(&render_indexes(td));
+        // strip trailing newline before comma
+        if out.ends_with('\n') {
+            out.pop();
+        }
+    }
+    out.push_str(",\n");
     out
 }
 

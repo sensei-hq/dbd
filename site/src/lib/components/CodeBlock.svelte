@@ -6,12 +6,12 @@
 	const lines = $derived(highlight(code.source));
 </script>
 
-<div class="overflow-hidden rounded-xl border border-paper-edge bg-paper-soft {className}">
+<div class="overflow-hidden rounded-xl border border-line bg-paper-2 {className}">
 	<div class="flex items-center justify-between border-b border-paper-edge px-4 py-2.5">
 		<div class="flex items-center gap-1.5">
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
-			<span class="h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
+			<span class="terminal-dot h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
+			<span class="terminal-dot h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
+			<span class="terminal-dot h-2.5 w-2.5 rounded-full bg-paper-mute"></span>
 		</div>
 		<span class="font-mono text-xs text-ink-soft">{code.label}</span>
 	</div>

@@ -534,28 +534,14 @@ fn emit_external_stubs(entities: &[Entity]) -> String {
         // Inline FKs from columns
         for col in &table_def.columns {
             if let Some(ref fk) = col.inline_fk {
-                let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
-                let qualified = format!("{}.{}", ref_schema, fk.ref_table);
-                if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
-                    let entry = external_refs.entry(ext_name).or_default();
-                    for rc in &fk.ref_columns {
-                        entry.insert(rc.clone());
-                    }
-                }
+                record_external_fk(fk, &external_names, &mut external_refs);
             }
         }
 
         // Table-level FK constraints
         for constraint in &table_def.constraints {
             if let TableConstraint::ForeignKey(fk) = constraint {
-                let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
-                let qualified = format!("{}.{}", ref_schema, fk.ref_table);
-                if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
-                    let entry = external_refs.entry(ext_name).or_default();
-                    for rc in &fk.ref_columns {
-                        entry.insert(rc.clone());
-                    }
-                }
+                record_external_fk(fk, &external_names, &mut external_refs);
             }
         }
     }
@@ -570,25 +556,50 @@ fn emit_external_stubs(entities: &[Entity]) -> String {
 
     for ext_name in sorted_names {
         let cols = external_refs.get(ext_name).unwrap();
-        let (schema, table_name) = match ext_name.split_once('.') {
-            Some((s, t)) => (s, t),
-            None => ("public", *ext_name),
-        };
-
-        let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, table_name)];
-        let mut sorted_cols: Vec<&String> = cols.iter().collect();
-        sorted_cols.sort();
-        for col_name in sorted_cols {
-            // Stub columns use a generic type — we don't know the actual type
-            lines.push(format!("  \"{}\" varchar", col_name));
-        }
-        lines.push(String::new());
-        lines.push("  Note: 'External entity — managed outside this project'".to_string());
-        lines.push("}\n".to_string());
-        blocks.push(lines.join("\n"));
+        blocks.push(emit_external_stub_block(ext_name, cols));
     }
 
     blocks.join("\n")
+}
+
+/// If `fk` targets a known external entity, record its referenced columns under
+/// that entity's name in `external_refs`.
+fn record_external_fk<'a>(
+    fk: &crate::entity::ForeignKey,
+    external_names: &std::collections::HashSet<&'a str>,
+    external_refs: &mut std::collections::HashMap<&'a str, std::collections::HashSet<String>>,
+) {
+    let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
+    let qualified = format!("{}.{}", ref_schema, fk.ref_table);
+    if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
+        let entry = external_refs.entry(ext_name).or_default();
+        for rc in &fk.ref_columns {
+            entry.insert(rc.clone());
+        }
+    }
+}
+
+/// Render a DBML stub `Table` block for one external entity and its referenced
+/// columns (typed generically as `varchar`, since the real types are unknown).
+fn emit_external_stub_block(
+    ext_name: &str,
+    cols: &std::collections::HashSet<String>,
+) -> String {
+    let (schema, table_name) = match ext_name.split_once('.') {
+        Some((s, t)) => (s, t),
+        None => ("public", ext_name),
+    };
+
+    let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, table_name)];
+    let mut sorted_cols: Vec<&String> = cols.iter().collect();
+    sorted_cols.sort();
+    for col_name in sorted_cols {
+        lines.push(format!("  \"{}\" varchar", col_name));
+    }
+    lines.push(String::new());
+    lines.push("  Note: 'External entity — managed outside this project'".to_string());
+    lines.push("}\n".to_string());
+    lines.join("\n")
 }
 
 fn fk_action_str(action: &FkAction) -> &'static str {
