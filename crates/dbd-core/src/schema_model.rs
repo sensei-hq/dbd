@@ -129,61 +129,8 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
 
     for e in entities.iter().filter(|e| e.entity_type == EntityType::Table) {
         let Some(def) = &e.table_def else { continue };
-        let schema = e.schema.clone().unwrap_or_default();
-        let name = e.name.rsplit('.').next().unwrap_or(&e.name).to_string();
-
-        let pk_cols: std::collections::HashSet<&str> = def
-            .constraints
-            .iter()
-            .filter_map(|c| match c {
-                TableConstraint::PrimaryKey { columns, .. } => Some(columns.iter().map(|s| s.as_str())),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-
-        let columns = def
-            .columns
-            .iter()
-            .map(|c| Column {
-                name: c.name.clone(),
-                ty: c.data_type.clone(),
-                pk: c.is_pk || pk_cols.contains(c.name.as_str()),
-                nn: !c.nullable,
-                en: enum_names.contains(&c.data_type),
-                def: c.default_value.clone(),
-                note: c.comment.clone().or_else(|| def.comments.columns.get(&c.name).cloned()),
-            })
-            .collect();
-
-        tables.push(TableNode {
-            schema,
-            name,
-            kind: "table".into(),
-            note: note_first_line(def),
-            note_md: def.comments.table.clone(),
-            columns,
-            indexes: collect_indexes(def),
-        });
-
-        for fk in collect_fks(def) {
-            let to_schema = fk.ref_schema.clone().unwrap_or_else(|| e.schema.clone().unwrap_or_default());
-            let to_id = format!("{to_schema}.{}", fk.ref_table);
-            if !table_ids.contains(&to_id) {
-                continue;
-            }
-            let action = fk.on_delete.map(fk_action_str);
-            let from_schema = e.schema.clone().unwrap_or_default();
-            let from_table = e.name.rsplit('.').next().unwrap_or(&e.name).to_string();
-            for (i, local) in fk.columns.iter().enumerate() {
-                let remote = fk.ref_columns.get(i).cloned().unwrap_or_default();
-                refs.push(Ref {
-                    from: RefEnd { s: from_schema.clone(), t: from_table.clone(), c: local.clone() },
-                    to: RefEnd { s: to_schema.clone(), t: fk.ref_table.clone(), c: remote },
-                    action: action.clone(),
-                });
-            }
-        }
+        tables.push(build_table_node(e, def, &enum_names));
+        refs.extend(collect_table_refs(e, def, &table_ids));
     }
 
     let mut schema_set: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
@@ -212,6 +159,82 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         tables,
         refs,
     }
+}
+
+/// Build the diagram `TableNode` for one table entity (columns + indexes + notes).
+fn build_table_node(
+    e: &crate::entity::Entity,
+    def: &crate::entity::TableDef,
+    enum_names: &std::collections::HashSet<String>,
+) -> TableNode {
+    let schema = e.schema.clone().unwrap_or_default();
+    let name = e.name.rsplit('.').next().unwrap_or(&e.name).to_string();
+
+    let pk_cols: std::collections::HashSet<&str> = def
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::PrimaryKey { columns, .. } => Some(columns.iter().map(|s| s.as_str())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    let columns = def
+        .columns
+        .iter()
+        .map(|c| Column {
+            name: c.name.clone(),
+            ty: c.data_type.clone(),
+            pk: c.is_pk || pk_cols.contains(c.name.as_str()),
+            nn: !c.nullable,
+            en: enum_names.contains(&c.data_type),
+            def: c.default_value.clone(),
+            note: c.comment.clone().or_else(|| def.comments.columns.get(&c.name).cloned()),
+        })
+        .collect();
+
+    TableNode {
+        schema,
+        name,
+        kind: "table".into(),
+        note: note_first_line(def),
+        note_md: def.comments.table.clone(),
+        columns,
+        indexes: collect_indexes(def),
+    }
+}
+
+/// Collect the diagram `Ref`s for a table's foreign keys whose target is an
+/// in-model table (one `Ref` per referencing column).
+fn collect_table_refs(
+    e: &crate::entity::Entity,
+    def: &crate::entity::TableDef,
+    table_ids: &std::collections::HashSet<String>,
+) -> Vec<Ref> {
+    let mut refs = Vec::new();
+    for fk in collect_fks(def) {
+        let to_schema = fk
+            .ref_schema
+            .clone()
+            .unwrap_or_else(|| e.schema.clone().unwrap_or_default());
+        let to_id = format!("{to_schema}.{}", fk.ref_table);
+        if !table_ids.contains(&to_id) {
+            continue;
+        }
+        let action = fk.on_delete.map(fk_action_str);
+        let from_schema = e.schema.clone().unwrap_or_default();
+        let from_table = e.name.rsplit('.').next().unwrap_or(&e.name).to_string();
+        for (i, local) in fk.columns.iter().enumerate() {
+            let remote = fk.ref_columns.get(i).cloned().unwrap_or_default();
+            refs.push(Ref {
+                from: RefEnd { s: from_schema.clone(), t: from_table.clone(), c: local.clone() },
+                to: RefEnd { s: to_schema.clone(), t: fk.ref_table.clone(), c: remote },
+                action: action.clone(),
+            });
+        }
+    }
+    refs
 }
 
 /// First non-empty first line of a table comment → the short `note` (or None).
