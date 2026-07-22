@@ -382,10 +382,7 @@ impl PostgresAdapter {
     }
 
     async fn introspect_tables(&self) -> crate::error::Result<Vec<Entity>> {
-        use crate::entity::{
-            ColumnDef, ForeignKey, IndexColumn, IndexDef, TableComments, TableConstraint,
-            TableDef,
-        };
+        use crate::entity::{TableComments, TableDef};
 
         let ns_filter = Self::schema_filter_column("c.table_schema");
 
@@ -411,311 +408,14 @@ impl PostgresAdapter {
             let schema: String = trow.get("table_schema");
             let table: String = trow.get("table_name");
 
-            // ── Columns ──────────────────────────────────────────────────────
-            // Reads, per column:
-            //   - `attidentity` ('a'=ALWAYS, 'd'=BY DEFAULT, ''=none) → identity.
-            //   - `col_type` (format_type with typmod) → the declared type.
-            //   - `underlying_type` (atttypid::regtype) → base int type for serial mapping.
-            //   - `owns_default_seq`: whether the column's DEFAULT nextval(...) targets a
-            //     sequence OWNED BY this column (pg_depend deptype 'a'). Only those become
-            //     `serial`; a nextval default on a standalone sequence is kept verbatim.
-            let cols_sql =
-                "SELECT a.attname AS column_name, \
-                        a.attnotnull, \
-                        a.attidentity::text AS attidentity, \
-                        pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
-                        format_type(a.atttypid, a.atttypmod) AS col_type, \
-                        a.atttypid::regtype::text AS underlying_type, \
-                        col_description(a.attrelid, a.attnum) AS col_comment, \
-                        EXISTS ( \
-                          SELECT 1 FROM pg_depend d \
-                          WHERE d.refclassid = 'pg_class'::regclass \
-                            AND d.refobjid = a.attrelid \
-                            AND d.refobjsubid = a.attnum \
-                            AND d.classid = 'pg_class'::regclass \
-                            AND d.deptype = 'a' \
-                            AND (SELECT relkind FROM pg_class WHERE oid = d.objid) = 'S' \
-                        ) AS owns_default_seq \
-                 FROM pg_attribute a \
-                 JOIN pg_class cls ON cls.oid = a.attrelid \
-                 JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
-                 LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
-                 WHERE ns.nspname = $1 AND cls.relname = $2 \
-                   AND a.attnum > 0 AND NOT a.attisdropped \
-                 ORDER BY a.attnum";
+            let columns = self.introspect_columns(&schema, &table).await?;
+            let (constraints, constraint_index_oids) =
+                self.introspect_constraints(&schema, &table).await?;
+            let indexes = self
+                .introspect_indexes(&schema, &table, &constraint_index_oids)
+                .await?;
 
-            let col_rows = sqlx::query(cols_sql)
-                .bind(&schema)
-                .bind(&table)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    DbdError::Config(format!("introspect_tables columns {schema}.{table}: {e}"))
-                })?;
-
-            let columns: Vec<ColumnDef> = col_rows
-                .iter()
-                .map(|row| {
-                    let name: String = row.get("column_name");
-                    let col_type: String = row.get("col_type");
-                    let attnotnull: bool = row.get("attnotnull");
-                    let default_value: Option<String> = row.get("column_default");
-                    let attidentity: String = row.get("attidentity");
-                    let underlying_type: String = row.get("underlying_type");
-                    let owns_default_seq: bool = row.get("owns_default_seq");
-                    let comment: Option<String> = row.get("col_comment");
-
-                    // Identity ('a' = ALWAYS, 'd' = BY DEFAULT, '' = none). Identity
-                    // columns carry no user default.
-                    let identity = match attidentity.as_str() {
-                        "a" => Some(crate::entity::IdentityKind::Always),
-                        "d" => Some(crate::entity::IdentityKind::ByDefault),
-                        _ => None,
-                    };
-
-                    // Serial detection: a `nextval('…'::regclass)` default whose sequence is
-                    // OWNED BY this column (deptype 'a') is the `serial`/`bigserial`/
-                    // `smallserial` sugar — map to the serial type per the underlying int
-                    // width and CLEAR the default (Postgres re-creates the owned sequence).
-                    // A nextval default on a STANDALONE sequence (not owned) is left intact;
-                    // that sequence is emitted separately as EntityType::Sequence.
-                    let is_serial = identity.is_none()
-                        && owns_default_seq
-                        && default_value
-                            .as_deref()
-                            .is_some_and(|d| d.contains("nextval("));
-
-                    let (data_type, default_value) = if is_serial {
-                        let serial = match underlying_type.as_str() {
-                            "smallint" | "int2" => "smallserial",
-                            "bigint" | "int8" => "bigserial",
-                            // integer / int4 (and any other int alias) → serial
-                            _ => "serial",
-                        };
-                        (serial.to_string(), None)
-                    } else if identity.is_some() {
-                        // Identity columns: keep the declared type, drop any default.
-                        (col_type, None)
-                    } else {
-                        (col_type, default_value)
-                    };
-
-                    ColumnDef {
-                        name,
-                        data_type,
-                        nullable: !attnotnull,
-                        default_value,
-                        is_pk: false,        // filled from constraints
-                        is_unique: false,    // filled from constraints
-                        identity,
-                        comment,
-                        inline_fk: None,
-                    }
-                })
-                .collect();
-
-            // ── Constraints ───────────────────────────────────────────────────
-            let cons_sql =
-                "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
-                        c.conindid::int8 AS conindid, \
-                        pg_get_constraintdef(c.oid, true) AS condef, \
-                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
-                         FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
-                         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = pos.attnum \
-                        ) AS col_names, \
-                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
-                         FROM unnest(c.confkey) WITH ORDINALITY AS pos(attnum, ord) \
-                         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = pos.attnum \
-                        ) AS ref_col_names, \
-                        ref_ns.nspname AS ref_schema, \
-                        ref_cls.relname AS ref_table \
-                 FROM pg_constraint c \
-                 JOIN pg_class cls ON cls.oid = c.conrelid \
-                 JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
-                 LEFT JOIN pg_class ref_cls ON ref_cls.oid = c.confrelid \
-                 LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
-                 WHERE ns.nspname = $1 AND cls.relname = $2 \
-                   AND c.contype IN ('p', 'u', 'f', 'c') \
-                 ORDER BY c.contype, c.conname";
-
-            let con_rows = sqlx::query(cons_sql)
-                .bind(&schema)
-                .bind(&table)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    DbdError::Config(format!(
-                        "introspect_tables constraints {schema}.{table}: {e}"
-                    ))
-                })?;
-
-            let mut constraints: Vec<TableConstraint> = Vec::new();
-            let mut constraint_index_oids: std::collections::HashSet<i64> =
-                std::collections::HashSet::new();
-
-            for con in &con_rows {
-                let conname: String = con.get("conname");
-                let contype: String = con.get("contype");
-                let col_names: Vec<String> = con
-                    .try_get::<Vec<String>, _>("col_names")
-                    .unwrap_or_default();
-                let conindid: Option<i64> = con.try_get("conindid").ok();
-
-                match contype.as_str() {
-                    "p" => {
-                        if let Some(oid) = conindid
-                            && oid != 0 {
-                                constraint_index_oids.insert(oid);
-                            }
-                        constraints.push(TableConstraint::PrimaryKey {
-                            name: Some(conname),
-                            columns: col_names,
-                        });
-                    }
-                    "u" => {
-                        if let Some(oid) = conindid
-                            && oid != 0 {
-                                constraint_index_oids.insert(oid);
-                            }
-                        constraints.push(TableConstraint::Unique {
-                            name: Some(conname),
-                            columns: col_names,
-                        });
-                    }
-                    "f" => {
-                        let ref_col_names: Vec<String> = con
-                            .try_get::<Vec<String>, _>("ref_col_names")
-                            .unwrap_or_default();
-                        let ref_schema: Option<String> = con.try_get("ref_schema").ok();
-                        let ref_table: String =
-                            con.try_get("ref_table").unwrap_or_default();
-                        let confdeltype: Option<String> =
-                            con.try_get("confdeltype").ok();
-                        let confupdtype: Option<String> =
-                            con.try_get("confupdtype").ok();
-
-                        let on_delete = confdeltype.as_deref().and_then(pg_conf_action);
-                        let on_update = confupdtype.as_deref().and_then(pg_conf_action);
-
-                        constraints.push(TableConstraint::ForeignKey(ForeignKey {
-                            name: Some(conname),
-                            columns: col_names,
-                            ref_schema,
-                            ref_table,
-                            ref_columns: ref_col_names,
-                            on_delete,
-                            on_update,
-                        }));
-                    }
-                    "c" => {
-                        let condef: String = con.get("condef");
-                        // pg_get_constraintdef returns "CHECK (expr)"
-                        let expression = condef
-                            .strip_prefix("CHECK (")
-                            .and_then(|s| s.strip_suffix(')'))
-                            .unwrap_or(&condef)
-                            .to_string();
-                        constraints.push(TableConstraint::Check {
-                            name: Some(conname),
-                            expression,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            // ── Indexes ───────────────────────────────────────────────────────
-            // Exclude indexes that back a PK or UNIQUE constraint.
-            // Also skip expression indexes (indexprs IS NOT NULL), partial indexes
-            // (indpred IS NOT NULL), and any index whose indkey contains a 0
-            // (expression column) — IndexDef cannot represent these, and emitting
-            // an empty column list would produce invalid DDL.
-            let idx_sql =
-                "SELECT i.relname AS index_name, \
-                        ix.indexrelid::int8 AS index_oid, \
-                        ix.indisunique, \
-                        ix.indisprimary, \
-                        am.amname AS index_type, \
-                        (SELECT array_agg(a.attname ORDER BY pos.ord) \
-                         FROM unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, ord) \
-                         JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = pos.attnum \
-                         WHERE pos.attnum > 0 \
-                        ) AS col_names \
-                 FROM pg_index ix \
-                 JOIN pg_class t ON t.oid = ix.indrelid \
-                 JOIN pg_class i ON i.oid = ix.indexrelid \
-                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
-                 JOIN pg_am am ON am.oid = i.relam \
-                 WHERE ns.nspname = $1 AND t.relname = $2 \
-                   AND ix.indexprs IS NULL \
-                   AND ix.indpred IS NULL \
-                   AND NOT (0 = ANY(ix.indkey::int2[])) \
-                 ORDER BY i.relname";
-
-            let idx_rows = sqlx::query(idx_sql)
-                .bind(&schema)
-                .bind(&table)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    DbdError::Config(format!(
-                        "introspect_tables indexes {schema}.{table}: {e}"
-                    ))
-                })?;
-
-            let mut indexes: Vec<IndexDef> = Vec::new();
-            for ix in &idx_rows {
-                let index_oid: i64 = ix.get("index_oid");
-                let indisprimary: bool = ix.get("indisprimary");
-                // Skip if it backs a PK/UNIQUE constraint
-                if indisprimary || constraint_index_oids.contains(&index_oid) {
-                    continue;
-                }
-
-                let index_name: String = ix.get("index_name");
-                let indisunique: bool = ix.get("indisunique");
-                let index_type_str: String = ix.get("index_type");
-                let col_names: Vec<String> = ix
-                    .try_get::<Vec<String>, _>("col_names")
-                    .unwrap_or_default();
-
-                use crate::entity::IndexType;
-                let index_type = match index_type_str.as_str() {
-                    "hash" => Some(IndexType::Hash),
-                    "gin" => Some(IndexType::Gin),
-                    "gist" => Some(IndexType::Gist),
-                    "brin" => Some(IndexType::Brin),
-                    "spgist" => Some(IndexType::SpGist),
-                    _ => None, // btree is the default — represent as None (no USING clause)
-                };
-
-                indexes.push(IndexDef {
-                    name: Some(index_name),
-                    columns: col_names
-                        .into_iter()
-                        .map(|c| IndexColumn { name: c, order: None })
-                        .collect(),
-                    unique: indisunique,
-                    index_type,
-                });
-            }
-
-            // ── Table comment ─────────────────────────────────────────────────
-            let tc_sql = "SELECT obj_description((SELECT oid FROM pg_class \
-                           WHERE relname = $2 \
-                           AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
-                          , 'pg_class') AS tbl_comment";
-            let tc_row = sqlx::query(tc_sql)
-                .bind(&schema)
-                .bind(&table)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| {
-                    DbdError::Config(format!(
-                        "introspect_tables table_comment {schema}.{table}: {e}"
-                    ))
-                })?;
-            let table_comment: Option<String> = tc_row.try_get("tbl_comment").ok().flatten();
+            let table_comment = self.introspect_table_comment(&schema, &table).await?;
 
             // Assemble TableComments: table-level + per-column (already in ColumnDef.comment)
             let mut col_comments = std::collections::HashMap::new();
@@ -742,6 +442,347 @@ impl PostgresAdapter {
         }
 
         Ok(entities)
+    }
+
+    /// Introspect a table's columns.
+    ///
+    /// Reads, per column:
+    ///   - `attidentity` ('a'=ALWAYS, 'd'=BY DEFAULT, ''=none) → identity.
+    ///   - `col_type` (format_type with typmod) → the declared type.
+    ///   - `underlying_type` (atttypid::regtype) → base int type for serial mapping.
+    ///   - `owns_default_seq`: whether the column's DEFAULT nextval(...) targets a
+    ///     sequence OWNED BY this column (pg_depend deptype 'a'). Only those become
+    ///     `serial`; a nextval default on a standalone sequence is kept verbatim.
+    async fn introspect_columns(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> crate::error::Result<Vec<crate::entity::ColumnDef>> {
+        use crate::entity::ColumnDef;
+
+        let cols_sql =
+            "SELECT a.attname AS column_name, \
+                    a.attnotnull, \
+                    a.attidentity::text AS attidentity, \
+                    pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
+                    format_type(a.atttypid, a.atttypmod) AS col_type, \
+                    a.atttypid::regtype::text AS underlying_type, \
+                    col_description(a.attrelid, a.attnum) AS col_comment, \
+                    EXISTS ( \
+                      SELECT 1 FROM pg_depend d \
+                      WHERE d.refclassid = 'pg_class'::regclass \
+                        AND d.refobjid = a.attrelid \
+                        AND d.refobjsubid = a.attnum \
+                        AND d.classid = 'pg_class'::regclass \
+                        AND d.deptype = 'a' \
+                        AND (SELECT relkind FROM pg_class WHERE oid = d.objid) = 'S' \
+                    ) AS owns_default_seq \
+             FROM pg_attribute a \
+             JOIN pg_class cls ON cls.oid = a.attrelid \
+             JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+             LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             WHERE ns.nspname = $1 AND cls.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum";
+
+        let col_rows = sqlx::query(cols_sql)
+            .bind(schema)
+            .bind(table)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                DbdError::Config(format!("introspect_tables columns {schema}.{table}: {e}"))
+            })?;
+
+        let columns: Vec<ColumnDef> = col_rows
+            .iter()
+            .map(|row| {
+                let name: String = row.get("column_name");
+                let col_type: String = row.get("col_type");
+                let attnotnull: bool = row.get("attnotnull");
+                let default_value: Option<String> = row.get("column_default");
+                let attidentity: String = row.get("attidentity");
+                let underlying_type: String = row.get("underlying_type");
+                let owns_default_seq: bool = row.get("owns_default_seq");
+                let comment: Option<String> = row.get("col_comment");
+
+                // Identity ('a' = ALWAYS, 'd' = BY DEFAULT, '' = none). Identity
+                // columns carry no user default.
+                let identity = match attidentity.as_str() {
+                    "a" => Some(crate::entity::IdentityKind::Always),
+                    "d" => Some(crate::entity::IdentityKind::ByDefault),
+                    _ => None,
+                };
+
+                // Serial detection: a `nextval('…'::regclass)` default whose sequence is
+                // OWNED BY this column (deptype 'a') is the `serial`/`bigserial`/
+                // `smallserial` sugar — map to the serial type per the underlying int
+                // width and CLEAR the default (Postgres re-creates the owned sequence).
+                // A nextval default on a STANDALONE sequence (not owned) is left intact;
+                // that sequence is emitted separately as EntityType::Sequence.
+                let is_serial = identity.is_none()
+                    && owns_default_seq
+                    && default_value
+                        .as_deref()
+                        .is_some_and(|d| d.contains("nextval("));
+
+                let (data_type, default_value) = if is_serial {
+                    let serial = match underlying_type.as_str() {
+                        "smallint" | "int2" => "smallserial",
+                        "bigint" | "int8" => "bigserial",
+                        // integer / int4 (and any other int alias) → serial
+                        _ => "serial",
+                    };
+                    (serial.to_string(), None)
+                } else if identity.is_some() {
+                    // Identity columns: keep the declared type, drop any default.
+                    (col_type, None)
+                } else {
+                    (col_type, default_value)
+                };
+
+                ColumnDef {
+                    name,
+                    data_type,
+                    nullable: !attnotnull,
+                    default_value,
+                    is_pk: false,     // filled from constraints
+                    is_unique: false, // filled from constraints
+                    identity,
+                    comment,
+                    inline_fk: None,
+                }
+            })
+            .collect();
+
+        Ok(columns)
+    }
+
+    /// Introspect a table's PK/UNIQUE/FK/CHECK constraints. Also returns the set
+    /// of index OIDs that back a PK/UNIQUE constraint, so `introspect_indexes`
+    /// can skip re-emitting them as standalone indexes.
+    async fn introspect_constraints(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> crate::error::Result<(
+        Vec<crate::entity::TableConstraint>,
+        std::collections::HashSet<i64>,
+    )> {
+        use crate::entity::{ForeignKey, TableConstraint};
+
+        let cons_sql =
+            "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
+                    c.conindid::int8 AS conindid, \
+                    pg_get_constraintdef(c.oid, true) AS condef, \
+                    (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                     FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
+                     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = pos.attnum \
+                    ) AS col_names, \
+                    (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                     FROM unnest(c.confkey) WITH ORDINALITY AS pos(attnum, ord) \
+                     JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = pos.attnum \
+                    ) AS ref_col_names, \
+                    ref_ns.nspname AS ref_schema, \
+                    ref_cls.relname AS ref_table \
+             FROM pg_constraint c \
+             JOIN pg_class cls ON cls.oid = c.conrelid \
+             JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+             LEFT JOIN pg_class ref_cls ON ref_cls.oid = c.confrelid \
+             LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
+             WHERE ns.nspname = $1 AND cls.relname = $2 \
+               AND c.contype IN ('p', 'u', 'f', 'c') \
+             ORDER BY c.contype, c.conname";
+
+        let con_rows = sqlx::query(cons_sql)
+            .bind(schema)
+            .bind(table)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                DbdError::Config(format!("introspect_tables constraints {schema}.{table}: {e}"))
+            })?;
+
+        let mut constraints: Vec<TableConstraint> = Vec::new();
+        let mut constraint_index_oids: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
+
+        for con in &con_rows {
+            let conname: String = con.get("conname");
+            let contype: String = con.get("contype");
+            let col_names: Vec<String> = con
+                .try_get::<Vec<String>, _>("col_names")
+                .unwrap_or_default();
+            let conindid: Option<i64> = con.try_get("conindid").ok();
+
+            match contype.as_str() {
+                "p" => {
+                    if let Some(oid) = conindid
+                        && oid != 0 {
+                            constraint_index_oids.insert(oid);
+                        }
+                    constraints.push(TableConstraint::PrimaryKey {
+                        name: Some(conname),
+                        columns: col_names,
+                    });
+                }
+                "u" => {
+                    if let Some(oid) = conindid
+                        && oid != 0 {
+                            constraint_index_oids.insert(oid);
+                        }
+                    constraints.push(TableConstraint::Unique {
+                        name: Some(conname),
+                        columns: col_names,
+                    });
+                }
+                "f" => {
+                    let ref_col_names: Vec<String> = con
+                        .try_get::<Vec<String>, _>("ref_col_names")
+                        .unwrap_or_default();
+                    let ref_schema: Option<String> = con.try_get("ref_schema").ok();
+                    let ref_table: String = con.try_get("ref_table").unwrap_or_default();
+                    let confdeltype: Option<String> = con.try_get("confdeltype").ok();
+                    let confupdtype: Option<String> = con.try_get("confupdtype").ok();
+
+                    let on_delete = confdeltype.as_deref().and_then(pg_conf_action);
+                    let on_update = confupdtype.as_deref().and_then(pg_conf_action);
+
+                    constraints.push(TableConstraint::ForeignKey(ForeignKey {
+                        name: Some(conname),
+                        columns: col_names,
+                        ref_schema,
+                        ref_table,
+                        ref_columns: ref_col_names,
+                        on_delete,
+                        on_update,
+                    }));
+                }
+                "c" => {
+                    let condef: String = con.get("condef");
+                    // pg_get_constraintdef returns "CHECK (expr)"
+                    let expression = condef
+                        .strip_prefix("CHECK (")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .unwrap_or(&condef)
+                        .to_string();
+                    constraints.push(TableConstraint::Check {
+                        name: Some(conname),
+                        expression,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok((constraints, constraint_index_oids))
+    }
+
+    /// Introspect a table's standalone indexes.
+    ///
+    /// Excludes indexes that back a PK or UNIQUE constraint (`constraint_index_oids`
+    /// / `indisprimary`). Also skips expression indexes (indexprs IS NOT NULL),
+    /// partial indexes (indpred IS NOT NULL), and any index whose indkey contains
+    /// a 0 (expression column) — IndexDef cannot represent these, and emitting an
+    /// empty column list would produce invalid DDL.
+    async fn introspect_indexes(
+        &self,
+        schema: &str,
+        table: &str,
+        constraint_index_oids: &std::collections::HashSet<i64>,
+    ) -> crate::error::Result<Vec<crate::entity::IndexDef>> {
+        use crate::entity::{IndexColumn, IndexDef};
+
+        let idx_sql =
+            "SELECT i.relname AS index_name, \
+                    ix.indexrelid::int8 AS index_oid, \
+                    ix.indisunique, \
+                    ix.indisprimary, \
+                    am.amname AS index_type, \
+                    (SELECT array_agg(a.attname ORDER BY pos.ord) \
+                     FROM unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, ord) \
+                     JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = pos.attnum \
+                     WHERE pos.attnum > 0 \
+                    ) AS col_names \
+             FROM pg_index ix \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+             JOIN pg_am am ON am.oid = i.relam \
+             WHERE ns.nspname = $1 AND t.relname = $2 \
+               AND ix.indexprs IS NULL \
+               AND ix.indpred IS NULL \
+               AND NOT (0 = ANY(ix.indkey::int2[])) \
+             ORDER BY i.relname";
+
+        let idx_rows = sqlx::query(idx_sql)
+            .bind(schema)
+            .bind(table)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                DbdError::Config(format!("introspect_tables indexes {schema}.{table}: {e}"))
+            })?;
+
+        let mut indexes: Vec<IndexDef> = Vec::new();
+        for ix in &idx_rows {
+            let index_oid: i64 = ix.get("index_oid");
+            let indisprimary: bool = ix.get("indisprimary");
+            // Skip if it backs a PK/UNIQUE constraint
+            if indisprimary || constraint_index_oids.contains(&index_oid) {
+                continue;
+            }
+
+            let index_name: String = ix.get("index_name");
+            let indisunique: bool = ix.get("indisunique");
+            let index_type_str: String = ix.get("index_type");
+            let col_names: Vec<String> = ix
+                .try_get::<Vec<String>, _>("col_names")
+                .unwrap_or_default();
+
+            use crate::entity::IndexType;
+            let index_type = match index_type_str.as_str() {
+                "hash" => Some(IndexType::Hash),
+                "gin" => Some(IndexType::Gin),
+                "gist" => Some(IndexType::Gist),
+                "brin" => Some(IndexType::Brin),
+                "spgist" => Some(IndexType::SpGist),
+                _ => None, // btree is the default — represent as None (no USING clause)
+            };
+
+            indexes.push(IndexDef {
+                name: Some(index_name),
+                columns: col_names
+                    .into_iter()
+                    .map(|c| IndexColumn { name: c, order: None })
+                    .collect(),
+                unique: indisunique,
+                index_type,
+            });
+        }
+
+        Ok(indexes)
+    }
+
+    /// Introspect a table's `COMMENT ON TABLE` text, if any.
+    async fn introspect_table_comment(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let tc_sql = "SELECT obj_description((SELECT oid FROM pg_class \
+                       WHERE relname = $2 \
+                       AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
+                      , 'pg_class') AS tbl_comment";
+        let tc_row = sqlx::query(tc_sql)
+            .bind(schema)
+            .bind(table)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| {
+                DbdError::Config(format!("introspect_tables table_comment {schema}.{table}: {e}"))
+            })?;
+        Ok(tc_row.try_get("tbl_comment").ok().flatten())
     }
 
     async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
