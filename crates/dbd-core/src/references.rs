@@ -28,58 +28,82 @@ pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ig
         .collect();
 
     for entity in entities.iter_mut() {
-        // The parser qualifies bare references with the first search_path entry.
-        // dbd appends `public` to every applied search_path (see
-        // `ensure_public_in_search_path`), so a bare name can resolve there too.
-        let default_schema = entity
-            .search_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
-        let search_path: Vec<String> = {
-            let mut sp = entity.search_paths.clone();
-            if !sp.iter().any(|s| s == "public") {
-                sp.push("public".to_string());
-            }
-            sp
-        };
+        resolve_entity_references(entity, &known_names, ignore);
+    }
+}
 
-        // (1) String references → refers (FK targets, view/proc deps).
-        let mut resolved_refers = Vec::new();
-        for ref_name in &entity.refers {
-            if is_ignored(ref_name, ignore) {
-                continue;
-            }
-            if known_names.contains(ref_name) {
-                resolved_refers.push(ref_name.clone());
-                continue;
-            }
-            if let Some((schema, table)) = ref_name.split_once('.')
-                && let Some(sch) =
-                    recover_bare_target(schema, table, &default_schema, &search_path, &known_names)
-            {
-                resolved_refers.push(format!("{sch}.{table}"));
-                continue;
-            }
-            entity
-                .warnings
-                .push(format!("Unresolved reference: {ref_name}"));
+/// Resolve one entity's references against the known entity names.
+fn resolve_entity_references(entity: &mut Entity, known: &HashSet<String>, ignore: &[String]) {
+    // The parser qualifies bare references with the first search_path entry.
+    // dbd appends `public` to every applied search_path (see
+    // `ensure_public_in_search_path`), so a bare name can resolve there too.
+    let default_schema = entity
+        .search_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "public".to_string());
+    let search_path: Vec<String> = {
+        let mut sp = entity.search_paths.clone();
+        if !sp.iter().any(|s| s == "public") {
+            sp.push("public".to_string());
         }
-        entity.refers = resolved_refers;
+        sp
+    };
 
-        // (2) FK structs → ref_schema (consumed by emit/dbml/reconcile). Keep in
-        // step with the refers resolution above so the target schema agrees.
-        if let Some(td) = entity.table_def.as_mut() {
-            for col in td.columns.iter_mut() {
-                if let Some(fk) = col.inline_fk.as_mut() {
-                    fix_fk_schema(fk, &default_schema, &search_path, &known_names);
-                }
-            }
-            for constraint in td.constraints.iter_mut() {
-                if let TableConstraint::ForeignKey(fk) = constraint {
-                    fix_fk_schema(fk, &default_schema, &search_path, &known_names);
-                }
-            }
+    resolve_entity_refers(entity, &default_schema, &search_path, known, ignore);
+    resolve_entity_fks(entity, &default_schema, &search_path, known);
+}
+
+/// (1) String references → `refers` (FK targets, view/proc deps). Recovers
+/// bare-qualified schemas along the search_path; warns on the unresolvable.
+fn resolve_entity_refers(
+    entity: &mut Entity,
+    default_schema: &str,
+    search_path: &[String],
+    known: &HashSet<String>,
+    ignore: &[String],
+) {
+    let mut resolved_refers = Vec::new();
+    for ref_name in &entity.refers {
+        if is_ignored(ref_name, ignore) {
+            continue;
+        }
+        if known.contains(ref_name) {
+            resolved_refers.push(ref_name.clone());
+            continue;
+        }
+        if let Some((schema, table)) = ref_name.split_once('.')
+            && let Some(sch) = recover_bare_target(schema, table, default_schema, search_path, known)
+        {
+            resolved_refers.push(format!("{sch}.{table}"));
+            continue;
+        }
+        entity
+            .warnings
+            .push(format!("Unresolved reference: {ref_name}"));
+    }
+    entity.refers = resolved_refers;
+}
+
+/// (2) FK structs → `ref_schema` (consumed by emit/dbml/reconcile). Kept in
+/// step with the `refers` resolution above so the target schema agrees.
+fn resolve_entity_fks(
+    entity: &mut Entity,
+    default_schema: &str,
+    search_path: &[String],
+    known: &HashSet<String>,
+) {
+    let Some(td) = entity.table_def.as_mut() else {
+        return;
+    };
+    for col in td.columns.iter_mut() {
+        if let Some(fk) = col.inline_fk.as_mut() {
+            fix_fk_schema(fk, default_schema, search_path, known);
+        }
+    }
+    for constraint in td.constraints.iter_mut() {
+        if let TableConstraint::ForeignKey(fk) = constraint {
+            fix_fk_schema(fk, default_schema, search_path, known);
         }
     }
 }
