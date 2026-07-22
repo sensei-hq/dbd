@@ -122,48 +122,7 @@ pub fn build_reset_script(
     drop_extensions: bool,
     schemas: &[String],
 ) -> Result<Option<String>, String> {
-    let mut lines = Vec::new();
-
-    // ── Entity DROPs in reverse dependency order ──────────────
-    // functions/procedures → views → tables → sequences → enums
-    let mut funcs = Vec::new();
-    let mut views = Vec::new();
-    let mut tables = Vec::new();
-    let mut sequences = Vec::new();
-    let mut enums = Vec::new();
-    for e in entities {
-        match e.entity_type {
-            EntityType::Function | EntityType::Procedure => funcs.push(*e),
-            EntityType::View => views.push(*e),
-            EntityType::Table => tables.push(*e),
-            EntityType::Sequence => sequences.push(*e),
-            EntityType::Enum => enums.push(*e),
-            _ => {}
-        }
-    }
-
-    // Function/procedure: one DO-block per schema.name (collapse overloads,
-    // which share a name → dedupe on (schema, bare name)).
-    let mut seen_funcs = std::collections::HashSet::new();
-    for e in &funcs {
-        let schema = entity_schema(e);
-        let (_, bare) = crate::entity::split_qualified_name(&e.name);
-        if seen_funcs.insert((schema.to_string(), bare.clone())) {
-            lines.push(function_drop_block(schema, &bare));
-        }
-    }
-    for e in &views {
-        lines.push(drop_object("VIEW", e));
-    }
-    for e in &tables {
-        lines.push(drop_object("TABLE", e));
-    }
-    for e in &sequences {
-        lines.push(drop_object("SEQUENCE", e));
-    }
-    for e in &enums {
-        lines.push(drop_object("TYPE", e));
-    }
+    let mut lines = entity_drop_lines(entities);
 
     // ── Optional schema DROPs (filtered by protected rules) ───
     if drop_schemas {
@@ -193,6 +152,50 @@ pub fn build_reset_script(
         return Ok(None);
     }
     Ok(Some(lines.join("\n")))
+}
+
+/// Entity DROPs in reverse dependency order:
+/// functions/procedures → views → tables → sequences → enums. Function/procedure
+/// overloads share a name, so they collapse to one DO-block per (schema, name).
+fn entity_drop_lines(entities: &[&Entity]) -> Vec<String> {
+    let mut funcs = Vec::new();
+    let mut views = Vec::new();
+    let mut tables = Vec::new();
+    let mut sequences = Vec::new();
+    let mut enums = Vec::new();
+    for e in entities {
+        match e.entity_type {
+            EntityType::Function | EntityType::Procedure => funcs.push(*e),
+            EntityType::View => views.push(*e),
+            EntityType::Table => tables.push(*e),
+            EntityType::Sequence => sequences.push(*e),
+            EntityType::Enum => enums.push(*e),
+            _ => {}
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut seen_funcs = std::collections::HashSet::new();
+    for e in &funcs {
+        let schema = entity_schema(e);
+        let (_, bare) = crate::entity::split_qualified_name(&e.name);
+        if seen_funcs.insert((schema.to_string(), bare.clone())) {
+            lines.push(function_drop_block(schema, &bare));
+        }
+    }
+    for e in &views {
+        lines.push(drop_object("VIEW", e));
+    }
+    for e in &tables {
+        lines.push(drop_object("TABLE", e));
+    }
+    for e in &sequences {
+        lines.push(drop_object("SEQUENCE", e));
+    }
+    for e in &enums {
+        lines.push(drop_object("TYPE", e));
+    }
+    lines
 }
 
 /// `DROP <KIND> IF EXISTS "schema"."name" CASCADE;` using the entity's bare name.

@@ -43,30 +43,15 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         return Vec::new();
     }
 
-    let entity_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
     let entity_map: HashMap<String, Entity> =
         entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
-
-    // Build in-group dependency map (only track deps that exist in this set).
-    // Exclude self-references (e.g., folders.parent_id → folders.id).
-    let mut remaining: HashMap<String, HashSet<String>> = entities
-        .iter()
-        .map(|e| {
-            let deps: HashSet<String> = e
-                .refers
-                .iter()
-                .filter(|dep| entity_names.contains(*dep) && **dep != e.name)
-                .cloned()
-                .collect();
-            (e.name.clone(), deps)
-        })
-        .collect();
-
+    let mut remaining = build_dependency_map(entities);
     let mut sorted = Vec::with_capacity(entities.len());
 
-    // Iteratively extract entities with no remaining in-group dependencies
+    // Kahn's algorithm: iteratively extract entities with no remaining in-group
+    // dependencies, in deterministic (sorted) batches.
     loop {
-        let ready: Vec<String> = remaining
+        let mut ready: Vec<String> = remaining
             .iter()
             .filter(|(_, deps)| deps.is_empty())
             .map(|(name, _)| name.clone())
@@ -75,9 +60,6 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         if ready.is_empty() {
             break;
         }
-
-        // Sort ready batch for deterministic output
-        let mut ready = ready;
         ready.sort();
 
         for name in &ready {
@@ -95,28 +77,20 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         }
     }
 
-    // Anything left is cyclic — mark with error and append
+    // Anything left is cyclic — mark with error and append.
     if !remaining.is_empty() {
-        let mut cyclic_names: Vec<String> = remaining.keys().cloned().collect();
-        cyclic_names.sort();
-
-        for name in cyclic_names {
-            if let Some(mut entity) = entity_map.get(&name).cloned() {
-                entity
-                    .errors
-                    .push("Cyclic dependency detected".to_string());
-                sorted.push(entity);
-            }
-        }
+        append_cyclic(&remaining, &entity_map, &mut sorted);
     }
 
     sorted
 }
 
-/// Group entities by dependency level (layer 0 = no deps, layer 1 = depends on layer 0, etc.)
-pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
+/// Build the in-group dependency map: entity name → the subset of its `refers`
+/// that are also in this set, excluding self-references (e.g. a `folders.parent_id`
+/// → `folders.id` back-reference).
+fn build_dependency_map(entities: &[Entity]) -> HashMap<String, HashSet<String>> {
     let entity_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
-    let mut remaining: HashMap<String, HashSet<String>> = entities
+    entities
         .iter()
         .map(|e| {
             let deps: HashSet<String> = e
@@ -127,7 +101,32 @@ pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
                 .collect();
             (e.name.clone(), deps)
         })
-        .collect();
+        .collect()
+}
+
+/// Append the entities still in `remaining` (a dependency cycle) to `sorted`,
+/// each flagged with a cyclic-dependency error, in deterministic name order.
+fn append_cyclic(
+    remaining: &HashMap<String, HashSet<String>>,
+    entity_map: &HashMap<String, Entity>,
+    sorted: &mut Vec<Entity>,
+) {
+    let mut cyclic_names: Vec<String> = remaining.keys().cloned().collect();
+    cyclic_names.sort();
+
+    for name in cyclic_names {
+        if let Some(mut entity) = entity_map.get(&name).cloned() {
+            entity
+                .errors
+                .push("Cyclic dependency detected".to_string());
+            sorted.push(entity);
+        }
+    }
+}
+
+/// Group entities by dependency level (layer 0 = no deps, layer 1 = depends on layer 0, etc.)
+pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
+    let mut remaining = build_dependency_map(entities);
 
     let mut layers = Vec::new();
 

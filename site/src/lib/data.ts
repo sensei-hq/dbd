@@ -52,62 +52,50 @@ export const overview = {
 	lede: 'Point dbd at a folder of DDL files and a single manifest. It works out ordering, diffs, data loading, docs and deployment for you.',
 	features: [
 		{
-			tag: '01',
 			title: 'Dependency ordering',
 			body: 'Tables with foreign keys are applied after the tables they reference. No manual sequencing.'
 		},
 		{
-			tag: '02',
 			title: 'Schema migrations',
 			body: 'Versioned snapshots with auto-generated ALTER scripts. Change a file, snapshot the diff.'
 		},
 		{
-			tag: '03',
 			title: 'Data loading',
 			body: 'CSV, TSV and JSONL files loaded into staging tables with automatic procedure calls.'
 		},
 		{
-			tag: '04',
 			title: 'Documentation',
 			body: 'DBML generation for dbdocs.io and dbdiagram.io, straight from your schema.'
 		},
 		{
-			tag: '05',
 			title: 'Multi-target deploy',
 			body: 'PostgreSQL, Supabase, SQLite and Convex — the same parsed schema, different adapters.'
 		},
 		{
-			tag: '06',
 			title: 'Scoped deployments',
 			body: 'Deploy a named subset of the schema to different databases, with dependency-gap checking.'
 		},
 		{
-			tag: '07',
 			title: 'Formatter + pre-commit',
 			body: 'dbd format keeps DDL tidy (river-style); dbd format --check drops into pre-commit and CI.'
 		},
 		{
-			tag: '08',
 			title: 'Row-level security',
 			body: 'Manage Postgres/Supabase RLS policies as code in policies/ and apply them with dbd policies.'
 		},
 		{
-			tag: '09',
 			title: 'Reverse-engineer a database',
 			body: 'Run dbd init --from-db to generate a fresh project from an existing database, or dbd merge to sync live tables into a project you already have.'
 		},
 		{
-			tag: '10',
 			title: 'Interactive schema diagram',
 			body: 'dbd diagram opens a live, explorable view of your schema — tables, columns and foreign-key relationships.'
 		},
 		{
-			tag: '11',
 			title: 'Deploy straight from GitHub',
 			body: 'dbd deploy fetches a schema from a directory or GitHub repo (-s owner/repo/path), then applies and imports it — no local checkout.'
 		},
 		{
-			tag: '12',
 			title: 'Environment-scoped data',
 			body: 'Seed data is environment-aware: files under import/<env>/<schema>/ load only when you pass -e <env>. Ship dev fixtures that never touch production.'
 		}

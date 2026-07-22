@@ -22,62 +22,77 @@ pub fn migration_warnings(diffs: &[MigrationDiff]) -> Vec<String> {
             continue;
         };
 
-        // Detect column type changes
-        for change in changes {
-            if change.field_type == FieldType::Column
-                && let ChangeAction::Alter { ref old, ref new } = change.action
-                && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
-                    (old.as_ref(), new.as_ref())
-                && old_col.data_type != new_col.data_type
+        warnings.extend(type_change_warnings(&d.entity_name, changes));
+        warnings.extend(rename_warnings(&d.entity_name, changes));
+        warnings.extend(enum_value_drop_warnings(&d.entity_name, changes));
+    }
+
+    warnings
+}
+
+/// Warn about column type changes (suggest a two-snapshot split).
+fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        if change.field_type == FieldType::Column
+            && let ChangeAction::Alter { ref old, ref new } = change.action
+            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
+                (old.as_ref(), new.as_ref())
+            && old_col.data_type != new_col.data_type
+        {
+            warnings.push(format!(
+                "{}.{}: type change {} -> {} — consider splitting across two snapshots \
+                 (v(N): add new column + data correction, v(N+1): drop old column)",
+                entity_name, change.field_name, old_col.data_type, new_col.data_type
+            ));
+        }
+    }
+    warnings
+}
+
+/// Warn about a column dropped + column added in the same table (possible rename).
+fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let dropped: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
+        .collect();
+    let added: Vec<&FieldChange> = changes
+        .iter()
+        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Add(_)))
+        .collect();
+
+    let mut warnings = Vec::new();
+    for drop_col in &dropped {
+        for add_col in &added {
+            if let ChangeAction::Add(ref detail) = add_col.action
+                && matches!(**detail, FieldDetail::Column(_))
             {
                 warnings.push(format!(
-                    "{}.{}: type change {} -> {} — consider splitting across two snapshots \
-                     (v(N): add new column + data correction, v(N+1): drop old column)",
-                    d.entity_name, change.field_name, old_col.data_type, new_col.data_type
-                ));
-            }
-        }
-
-        // Detect possible renames: column dropped + column added with same type in same table
-        let dropped: Vec<&FieldChange> = changes
-            .iter()
-            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
-            .collect();
-        let added: Vec<&FieldChange> = changes
-            .iter()
-            .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Add(_)))
-            .collect();
-
-        for drop_col in &dropped {
-            for add_col in &added {
-                if let ChangeAction::Add(ref detail) = add_col.action
-                    && matches!(**detail, FieldDetail::Column(_))
-                {
-                    warnings.push(format!(
-                        "{}: column '{}' dropped and '{}' added — if this is a rename, \
-                         consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
-                        d.entity_name,
-                        drop_col.field_name,
-                        add_col.field_name,
-                        add_col.field_name,
-                        drop_col.field_name,
-                    ));
-                }
-            }
-        }
-
-        // Detect enum value drops
-        for change in changes {
-            if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop)
-            {
-                warnings.push(format!(
-                    "{}: enum value '{}' dropped — ensure no rows reference this value",
-                    d.entity_name, change.field_name
+                    "{}: column '{}' dropped and '{}' added — if this is a rename, \
+                     consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
+                    entity_name,
+                    drop_col.field_name,
+                    add_col.field_name,
+                    add_col.field_name,
+                    drop_col.field_name,
                 ));
             }
         }
     }
+    warnings
+}
 
+/// Warn about dropped enum values (rows may still reference them).
+fn enum_value_drop_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop) {
+            warnings.push(format!(
+                "{}: enum value '{}' dropped — ensure no rows reference this value",
+                entity_name, change.field_name
+            ));
+        }
+    }
     warnings
 }
 
@@ -124,18 +139,7 @@ fn generate_field_sql(
         // ── Column ──────────────────────────────────────
         (FieldType::Column, ChangeAction::Add(detail)) => {
             if let FieldDetail::Column(col) = detail.as_ref() {
-                let mut stmt = format!(
-                    "ALTER TABLE {} ADD COLUMN {} {}",
-                    entity_name, col.name, col.data_type
-                );
-                if !col.nullable {
-                    stmt.push_str(" NOT NULL");
-                }
-                if let Some(ref default) = col.default_value {
-                    stmt.push_str(&format!(" DEFAULT {default}"));
-                }
-                stmt.push(';');
-                lines.push(stmt);
+                lines.push(column_add_sql(entity_name, col));
             }
         }
         (FieldType::Column, ChangeAction::Drop) => {
@@ -148,41 +152,7 @@ fn generate_field_sql(
             if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
                 (old.as_ref(), new.as_ref())
             {
-                if old_col.data_type != new_col.data_type {
-                    lines.push(format!(
-                        "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
-                        entity_name, new_col.name, new_col.data_type
-                    ));
-                }
-                if old_col.nullable != new_col.nullable {
-                    if new_col.nullable {
-                        lines.push(format!(
-                            "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
-                            entity_name, new_col.name
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-                            entity_name, new_col.name
-                        ));
-                    }
-                }
-                if old_col.default_value != new_col.default_value {
-                    match &new_col.default_value {
-                        Some(val) => {
-                            lines.push(format!(
-                                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
-                                entity_name, new_col.name, val
-                            ));
-                        }
-                        None => {
-                            lines.push(format!(
-                                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
-                                entity_name, new_col.name
-                            ));
-                        }
-                    }
-                }
+                push_column_alter_sql(entity_name, old_col, new_col, lines);
             }
         }
 
@@ -203,22 +173,7 @@ fn generate_field_sql(
         // ── Index ───────────────────────────────────────
         (FieldType::Index, ChangeAction::Add(detail)) => {
             if let FieldDetail::Index(idx) = detail.as_ref() {
-                let unique_str = if idx.unique { "UNIQUE " } else { "" };
-                let idx_name = idx.name.as_deref().unwrap_or("unnamed");
-                let cols: Vec<String> = idx.columns.iter().map(|c| {
-                    match c.order {
-                        Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
-                        Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
-                        None => c.name.clone(),
-                    }
-                }).collect();
-                lines.push(format!(
-                    "CREATE {}INDEX {} ON {} ({});",
-                    unique_str,
-                    idx_name,
-                    entity_name,
-                    cols.join(", ")
-                ));
+                lines.push(index_add_sql(entity_name, idx));
             }
         }
         (FieldType::Index, ChangeAction::Drop) => {
@@ -241,6 +196,82 @@ fn generate_field_sql(
         // Catch-all for any unexpected combinations
         _ => {}
     }
+}
+
+/// `ALTER TABLE … ADD COLUMN …` for a newly added column.
+fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
+    let mut stmt = format!(
+        "ALTER TABLE {} ADD COLUMN {} {}",
+        entity_name, col.name, col.data_type
+    );
+    if !col.nullable {
+        stmt.push_str(" NOT NULL");
+    }
+    if let Some(ref default) = col.default_value {
+        stmt.push_str(&format!(" DEFAULT {default}"));
+    }
+    stmt.push(';');
+    stmt
+}
+
+/// Push the `ALTER TABLE … ALTER COLUMN …` statements for a column whose type,
+/// nullability, or default value changed.
+fn push_column_alter_sql(
+    entity_name: &str,
+    old_col: &crate::entity::ColumnDef,
+    new_col: &crate::entity::ColumnDef,
+    lines: &mut Vec<String>,
+) {
+    if old_col.data_type != new_col.data_type {
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
+            entity_name, new_col.name, new_col.data_type
+        ));
+    }
+    if old_col.nullable != new_col.nullable {
+        if new_col.nullable {
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                entity_name, new_col.name
+            ));
+        } else {
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                entity_name, new_col.name
+            ));
+        }
+    }
+    if old_col.default_value != new_col.default_value {
+        match &new_col.default_value {
+            Some(val) => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
+                entity_name, new_col.name, val
+            )),
+            None => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                entity_name, new_col.name
+            )),
+        }
+    }
+}
+
+/// `CREATE [UNIQUE] INDEX …` for a newly added index.
+fn index_add_sql(entity_name: &str, idx: &crate::entity::IndexDef) -> String {
+    let unique_str = if idx.unique { "UNIQUE " } else { "" };
+    let idx_name = idx.name.as_deref().unwrap_or("unnamed");
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|c| match c.order {
+            Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
+            Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
+            None => c.name.clone(),
+        })
+        .collect();
+    format!(
+        "CREATE {}INDEX {} ON {} ({});",
+        unique_str, idx_name, entity_name, cols.join(", ")
+    )
 }
 
 /// Convert an FkAction to its SQL keyword.

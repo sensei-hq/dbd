@@ -136,62 +136,72 @@ pub fn canonicalize(snap: &mut Snapshot) {
     }
 
     for t in &mut snap.tables {
-        // Collect PK/UNIQUE from inline column flags + existing table constraints,
-        // strip names, dedup by structure. FK/CHECK are intentionally excluded.
-        let mut kept: Vec<TableConstraint> = Vec::new();
-        let mut seen: HashSet<(char, String)> = HashSet::new();
-        let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
-            let key = match &c {
-                TableConstraint::PrimaryKey { columns, .. } => ('p', columns.join(",")),
-                TableConstraint::Unique { columns, .. } => ('u', columns.join(",")),
-                _ => return,
-            };
-            if seen.insert(key) {
-                kept.push(c);
-            }
-        };
-        let mut has_table_pk = false;
-        for con in std::mem::take(&mut t.table_constraints) {
-            match con {
-                TableConstraint::PrimaryKey { columns, .. } => {
-                    has_table_pk = true;
-                    push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
-                }
-                TableConstraint::Unique { columns, .. } => {
-                    push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
-                }
-                _ => {} // FK / CHECK excluded
-            }
-        }
-        for c in &t.columns {
-            // A column's is_pk flag restates the table's single primary key. When a
-            // table-level PRIMARY KEY is already present — e.g. a composite
-            // `primary key (a, b)`, which the SQL parser emits BOTH as a table
-            // constraint AND as an is_pk flag on each member column — lifting the
-            // per-column flags would fabricate spurious single-column PKs (pk(a),
-            // pk(b)) that no live table has, producing bogus `ADD CONSTRAINT …
-            // PRIMARY KEY` reconcile steps (and "multiple primary keys" errors). A
-            // table has exactly one PK, so only synthesize one from a column flag
-            // when no table-level PK exists (the inline single-column PK case).
-            if c.is_pk && !has_table_pk {
-                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
-            }
-            if c.is_unique {
-                push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
-            }
-        }
-        t.table_constraints = kept;
+        lift_pk_unique_constraints(t);
         // Indexes are not reconciled (introspect/parse forms diverge).
         t.indexes.clear();
-        // Normalize column types and defaults; clear inline flags and comments.
-        for c in &mut t.columns {
-            c.data_type = canonical_type(&c.data_type, &enum_types);
-            c.default_value = c.default_value.as_deref().map(canonical_default);
-            c.is_pk = false;
-            c.is_unique = false;
-            c.inline_fk = None;
-            c.comment = None;
+        normalize_columns(t, &enum_types);
+    }
+}
+
+/// Collapse a table's PK/UNIQUE (from inline column flags + table constraints)
+/// into name-stripped, structurally-deduped table constraints. FK/CHECK are
+/// intentionally excluded — reconcile does not manage them on existing tables.
+fn lift_pk_unique_constraints(t: &mut snapshot::TableSnapshot) {
+    let mut kept: Vec<TableConstraint> = Vec::new();
+    let mut seen: HashSet<(char, String)> = HashSet::new();
+    let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
+        let key = match &c {
+            TableConstraint::PrimaryKey { columns, .. } => ('p', columns.join(",")),
+            TableConstraint::Unique { columns, .. } => ('u', columns.join(",")),
+            _ => return,
+        };
+        if seen.insert(key) {
+            kept.push(c);
         }
+    };
+    let mut has_table_pk = false;
+    for con in std::mem::take(&mut t.table_constraints) {
+        match con {
+            TableConstraint::PrimaryKey { columns, .. } => {
+                has_table_pk = true;
+                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
+            }
+            TableConstraint::Unique { columns, .. } => {
+                push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
+            }
+            _ => {} // FK / CHECK excluded
+        }
+    }
+    for c in &t.columns {
+        // A column's is_pk flag restates the table's single primary key. When a
+        // table-level PRIMARY KEY is already present — e.g. a composite
+        // `primary key (a, b)`, which the SQL parser emits BOTH as a table
+        // constraint AND as an is_pk flag on each member column — lifting the
+        // per-column flags would fabricate spurious single-column PKs (pk(a),
+        // pk(b)) that no live table has, producing bogus `ADD CONSTRAINT …
+        // PRIMARY KEY` reconcile steps (and "multiple primary keys" errors). A
+        // table has exactly one PK, so only synthesize one from a column flag
+        // when no table-level PK exists (the inline single-column PK case).
+        if c.is_pk && !has_table_pk {
+            push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
+        }
+        if c.is_unique {
+            push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
+        }
+    }
+    t.table_constraints = kept;
+}
+
+/// Normalize each column's type + default to the introspection-comparable form,
+/// and clear inline flags/FK/comments (not compared during reconcile).
+fn normalize_columns(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<String, String>) {
+    for c in &mut t.columns {
+        c.data_type = canonical_type(&c.data_type, enum_types);
+        c.default_value = c.default_value.as_deref().map(canonical_default);
+        c.is_pk = false;
+        c.is_unique = false;
+        c.inline_fk = None;
+        c.comment = None;
     }
 }
 
