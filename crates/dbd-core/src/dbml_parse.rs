@@ -309,26 +309,7 @@ impl<'a> Parser<'a> {
         table: &str,
         out: &mut Vec<IndexDef>,
     ) -> Result<()> {
-        // Find the opening brace.
-        if !header.contains('{') {
-            // Brace on a following line: advance to it.
-            self.pos += 1;
-            while self.pos < self.lines.len() {
-                let l = strip_comment(self.lines[self.pos]).trim().to_string();
-                self.pos += 1;
-                if l.is_empty() {
-                    continue;
-                }
-                if l.contains('{') {
-                    break;
-                }
-                return Err(parse_err(format!(
-                    "indexes block in `{table}` is missing `{{`"
-                )));
-            }
-        } else {
-            self.pos += 1;
-        }
+        self.advance_to_indexes_brace(header, table)?;
 
         loop {
             if self.pos >= self.lines.len() {
@@ -345,6 +326,31 @@ impl<'a> Parser<'a> {
                 break;
             }
             out.push(parse_index_line(&line, table)?);
+        }
+        Ok(())
+    }
+
+    /// Advance the cursor just past the `{` that opens an `indexes` block —
+    /// whether the brace is on the header line or a following line.
+    fn advance_to_indexes_brace(&mut self, header: &str, table: &str) -> Result<()> {
+        if header.contains('{') {
+            self.pos += 1;
+            return Ok(());
+        }
+        // Brace on a following line: advance to it.
+        self.pos += 1;
+        while self.pos < self.lines.len() {
+            let l = strip_comment(self.lines[self.pos]).trim().to_string();
+            self.pos += 1;
+            if l.is_empty() {
+                continue;
+            }
+            if l.contains('{') {
+                return Ok(());
+            }
+            return Err(parse_err(format!(
+                "indexes block in `{table}` is missing `{{`"
+            )));
         }
         Ok(())
     }
