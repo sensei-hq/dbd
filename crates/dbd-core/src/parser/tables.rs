@@ -24,32 +24,16 @@ pub fn extract_table(
     for stmt in statements {
         match stmt {
             Statement::CreateTable(create_table) => {
-                for col_def in &create_table.columns {
-                    let (col, col_refs) = extract_column(col_def, default_schema);
-                    columns.push(col);
-                    references.extend(col_refs);
-                }
-
-                for constraint in &create_table.constraints {
-                    if let Some((tc, tc_refs)) = extract_table_constraint(constraint, default_schema)
-                    {
-                        // Mark columns as PK if part of a table-level PRIMARY KEY
-                        if let TableConstraint::PrimaryKey { columns: ref pk_cols, .. } = tc {
-                            for col in &mut columns {
-                                if pk_cols.contains(&col.name) {
-                                    col.is_pk = true;
-                                    col.nullable = false;
-                                }
-                            }
-                        }
-                        constraints.push(tc);
-                        references.extend(tc_refs);
-                    }
-                }
+                process_create_table(
+                    create_table,
+                    default_schema,
+                    &mut columns,
+                    &mut constraints,
+                    &mut references,
+                );
             }
             Statement::CreateIndex(create_index) => {
-                let idx = extract_index(create_index);
-                indexes.push(idx);
+                indexes.push(extract_index(create_index));
             }
             Statement::Comment {
                 object_type,
@@ -57,21 +41,7 @@ pub fn extract_table(
                 comment: Some(comment_text),
                 ..
             } => {
-                    let parts: Vec<&str> = object_name.0.iter().filter_map(|part| part.as_ident()).map(|i| i.value.as_str()).collect();
-                    match object_type {
-                        sqlparser::ast::CommentObject::Table => {
-                            comments.table = Some(comment_text.clone());
-                        }
-                        sqlparser::ast::CommentObject::Column => {
-                            // Column comment: last part is column name
-                            if let Some(col_name) = parts.last() {
-                                comments
-                                    .columns
-                                    .insert(col_name.to_string(), comment_text.clone());
-                            }
-                        }
-                        _ => {}
-                    }
+                record_comment(object_type, object_name, comment_text, &mut comments);
             }
             _ => {}
         }
@@ -92,6 +62,72 @@ pub fn extract_table(
     };
 
     (table_def, references)
+}
+
+/// Extract a `CREATE TABLE`'s columns and constraints into the accumulators,
+/// flagging PK columns from any table-level `PRIMARY KEY`.
+fn process_create_table(
+    create_table: &sqlparser::ast::CreateTable,
+    default_schema: &str,
+    columns: &mut Vec<ColumnDef>,
+    constraints: &mut Vec<TableConstraint>,
+    references: &mut Vec<Reference>,
+) {
+    for col_def in &create_table.columns {
+        let (col, col_refs) = extract_column(col_def, default_schema);
+        columns.push(col);
+        references.extend(col_refs);
+    }
+
+    for constraint in &create_table.constraints {
+        if let Some((tc, tc_refs)) = extract_table_constraint(constraint, default_schema) {
+            // Mark columns as PK if part of a table-level PRIMARY KEY
+            if let TableConstraint::PrimaryKey { columns: ref pk_cols, .. } = tc {
+                mark_pk_columns(columns, pk_cols);
+            }
+            constraints.push(tc);
+            references.extend(tc_refs);
+        }
+    }
+}
+
+/// Flag the named columns as primary-key members (implicitly NOT NULL).
+fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
+    for col in columns {
+        if pk_cols.contains(&col.name) {
+            col.is_pk = true;
+            col.nullable = false;
+        }
+    }
+}
+
+/// Record a `COMMENT ON TABLE`/`COLUMN` into `comments`.
+fn record_comment(
+    object_type: &sqlparser::ast::CommentObject,
+    object_name: &sqlparser::ast::ObjectName,
+    comment_text: &str,
+    comments: &mut TableComments,
+) {
+    match object_type {
+        sqlparser::ast::CommentObject::Table => {
+            comments.table = Some(comment_text.to_string());
+        }
+        sqlparser::ast::CommentObject::Column => {
+            // Column comment: the last name part is the column name.
+            let parts: Vec<&str> = object_name
+                .0
+                .iter()
+                .filter_map(|part| part.as_ident())
+                .map(|i| i.value.as_str())
+                .collect();
+            if let Some(col_name) = parts.last() {
+                comments
+                    .columns
+                    .insert(col_name.to_string(), comment_text.to_string());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Extract a column definition from a sqlparser ColumnDef.

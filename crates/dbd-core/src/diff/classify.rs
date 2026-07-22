@@ -156,10 +156,54 @@ fn classify_table_changes(
     simple_diffs: &mut Vec<MigrationDiff>,
     complex_changes: &mut Vec<ComplexChange>,
 ) {
-    let mut remaining_changes: Vec<FieldChange> = Vec::new();
+    // First pass: column type changes (Alter where data_type changed).
+    let type_change_indices = detect_type_changes(diff, changes, complex_changes);
 
-    // First pass: detect column type changes (Alter where data_type changed)
-    let mut type_change_indices = std::collections::HashSet::new();
+    // Collect drops/adds (excluding type changes) for rename detection.
+    let mut column_drops: Vec<(usize, &FieldChange)> = Vec::new();
+    let mut column_adds: Vec<(usize, &FieldChange)> = Vec::new();
+    for (i, change) in changes.iter().enumerate() {
+        if type_change_indices.contains(&i) {
+            continue;
+        }
+        if change.field_type == FieldType::Column {
+            match &change.action {
+                ChangeAction::Drop => column_drops.push((i, change)),
+                ChangeAction::Add(_) => column_adds.push((i, change)),
+                _ => {}
+            }
+        }
+    }
+
+    // Detect a column rename: exactly 1 drop + 1 add with the same data_type.
+    let rename_indices =
+        detect_column_rename(diff, &column_drops, &column_adds, old_snapshot, complex_changes);
+
+    // Everything not consumed above is a simple change.
+    let remaining_changes: Vec<FieldChange> = changes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !type_change_indices.contains(i) && !rename_indices.contains(i))
+        .map(|(_, change)| change.clone())
+        .collect();
+
+    if !remaining_changes.is_empty() {
+        simple_diffs.push(MigrationDiff {
+            entity_name: diff.entity_name.clone(),
+            entity_type: diff.entity_type,
+            action: DiffAction::Change(remaining_changes),
+        });
+    }
+}
+
+/// Record each column type change as a `ComplexChange::ColumnTypeChange`,
+/// returning the indices of the changes it consumed.
+fn detect_type_changes(
+    diff: &MigrationDiff,
+    changes: &[FieldChange],
+    complex_changes: &mut Vec<ComplexChange>,
+) -> std::collections::HashSet<usize> {
+    let mut indices = std::collections::HashSet::new();
     for (i, change) in changes.iter().enumerate() {
         if change.field_type == FieldType::Column
             && let ChangeAction::Alter { ref old, ref new } = change.action
@@ -175,88 +219,57 @@ fn classify_table_changes(
                 old_col: Box::new(old_col.clone()),
                 new_col: Box::new(new_col.clone()),
             });
-            type_change_indices.insert(i);
+            indices.insert(i);
         }
     }
+    indices
+}
 
-    // Collect drops and adds for rename detection
-    let mut column_drops: Vec<(usize, &FieldChange)> = Vec::new();
-    let mut column_adds: Vec<(usize, &FieldChange)> = Vec::new();
-
-    for (i, change) in changes.iter().enumerate() {
-        if type_change_indices.contains(&i) {
-            continue;
-        }
-        if change.field_type == FieldType::Column {
-            match &change.action {
-                ChangeAction::Drop => column_drops.push((i, change)),
-                ChangeAction::Add(_) => column_adds.push((i, change)),
-                _ => {}
-            }
-        }
+/// Detect a 1-drop + 1-add column rename (same type). On a match, pushes a
+/// `ComplexChange::ColumnRename` and returns the consumed change indices.
+fn detect_column_rename(
+    diff: &MigrationDiff,
+    column_drops: &[(usize, &FieldChange)],
+    column_adds: &[(usize, &FieldChange)],
+    old_snapshot: &Snapshot,
+    complex_changes: &mut Vec<ComplexChange>,
+) -> std::collections::HashSet<usize> {
+    let mut indices = std::collections::HashSet::new();
+    if column_drops.len() != 1 || column_adds.len() != 1 {
+        return indices;
     }
+    let (drop_idx, drop_change) = column_drops[0];
+    let (add_idx, add_change) = column_adds[0];
 
-    // Detect column renames: exactly 1 drop + 1 add with same data_type
-    let mut rename_indices = std::collections::HashSet::new();
-    if column_drops.len() == 1 && column_adds.len() == 1 {
-        let (drop_idx, drop_change) = column_drops[0];
-        let (add_idx, add_change) = column_adds[0];
+    let old_col_type =
+        find_column_type_in_snapshot(&diff.entity_name, &drop_change.field_name, old_snapshot);
+    let added_col = added_column_def(add_change);
+    let new_col_type = added_col.map(|cd| cd.data_type.clone());
 
-        // Get the old column's type from old_snapshot
-        let old_col_type = find_column_type_in_snapshot(
-            &diff.entity_name,
-            &drop_change.field_name,
-            old_snapshot,
-        );
-
-        // Get the new column's type from the Add detail
-        let new_col_type = if let ChangeAction::Add(ref detail) = add_change.action {
-            if let FieldDetail::Column(ref col_def) = **detail {
-                Some(col_def.data_type.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let (Some(old_type), Some(new_type)) = (old_col_type, new_col_type)
-            && old_type == new_type
-        {
-            let col_def = if let ChangeAction::Add(ref detail) = add_change.action {
-                if let FieldDetail::Column(ref cd) = **detail {
-                    cd.clone()
-                } else {
-                    unreachable!()
-                }
-            } else {
-                unreachable!()
-            };
-
-            complex_changes.push(ComplexChange::ColumnRename {
-                table_name: diff.entity_name.clone(),
-                old_name: drop_change.field_name.clone(),
-                new_name: add_change.field_name.clone(),
-                col_def: Box::new(col_def),
-            });
-            rename_indices.insert(drop_idx);
-            rename_indices.insert(add_idx);
-        }
-    }
-
-    // Collect remaining simple changes
-    for (i, change) in changes.iter().enumerate() {
-        if !type_change_indices.contains(&i) && !rename_indices.contains(&i) {
-            remaining_changes.push(change.clone());
-        }
-    }
-
-    if !remaining_changes.is_empty() {
-        simple_diffs.push(MigrationDiff {
-            entity_name: diff.entity_name.clone(),
-            entity_type: diff.entity_type,
-            action: DiffAction::Change(remaining_changes),
+    if let (Some(old_type), Some(new_type)) = (old_col_type, new_col_type)
+        && old_type == new_type
+        && let Some(col_def) = added_col
+    {
+        complex_changes.push(ComplexChange::ColumnRename {
+            table_name: diff.entity_name.clone(),
+            old_name: drop_change.field_name.clone(),
+            new_name: add_change.field_name.clone(),
+            col_def: Box::new(col_def.clone()),
         });
+        indices.insert(drop_idx);
+        indices.insert(add_idx);
+    }
+    indices
+}
+
+/// The `ColumnDef` carried by an `Add` change, when it is a column add.
+fn added_column_def(change: &FieldChange) -> Option<&crate::entity::ColumnDef> {
+    if let ChangeAction::Add(ref detail) = change.action
+        && let FieldDetail::Column(ref col_def) = **detail
+    {
+        Some(col_def)
+    } else {
+        None
     }
 }
 
