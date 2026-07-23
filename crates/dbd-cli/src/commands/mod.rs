@@ -308,6 +308,50 @@ pub(super) fn safe_copy(root: &Path, src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Shared fixtures for the per-command test modules. Read-only handlers point
+/// directly at the in-repo fixture; mutating handlers (snapshot, release,
+/// dbml, format) run against a throwaway copy via [`copy_fixture_project`].
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+
+    /// The shared `tests/fixtures` project (`design.yaml` + `ddl/` + `import/`).
+    pub(crate) fn fixtures() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+    }
+
+    /// The fixture project's `design.yaml`.
+    pub(crate) fn fixture_config() -> PathBuf {
+        fixtures().join("design.yaml")
+    }
+
+    fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        // Test-only helper copying the compile-time fixtures tree into a tempdir — no untrusted input.
+        let entries = std::fs::read_dir(src)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        for entry in entries {
+            let entry = entry?;
+            let to = dst.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir(&entry.path(), &to)?;
+            } else {
+                std::fs::copy(entry.path(), &to)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the fixture project into a fresh tempdir so mutating handlers never
+    /// dirty the repo. The returned guard must be kept alive for the test's
+    /// duration; its `path()` is the project dir and `path()/design.yaml` the
+    /// config.
+    pub(crate) fn copy_fixture_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        copy_dir(&fixtures(), tmp.path()).unwrap();
+        tmp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

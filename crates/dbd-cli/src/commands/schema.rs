@@ -412,3 +412,61 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::testutil;
+
+    /// Offline `inspect` (no `--from-db`) validates the fixture against the
+    /// project-local cache — no DB connection.
+    #[tokio::test]
+    async fn inspect_offline_on_fixture() {
+        cmd_inspect(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            /*name*/ None, /*fix*/ false, /*use_database*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `combine` writes a single concatenated SQL file (target may live outside
+    /// the project, per the core API).
+    #[test]
+    fn combine_writes_sql_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("combined.sql");
+        cmd_combine(&testutil::fixture_config(), "dev", &testutil::fixtures(), &out, None, None, Verbosity::Normal).unwrap();
+        assert!(out.exists());
+    }
+
+    /// `apply --dry-run` lists the entities it would apply and returns before
+    /// constructing an adapter.
+    #[tokio::test]
+    async fn apply_dry_run_lists_entities() {
+        cmd_apply(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `policies --dry-run` on a project with no `policies/` dir takes the
+    /// "no policy files" path without touching a DB.
+    #[tokio::test]
+    async fn policies_dry_run_without_policy_dir() {
+        cmd_policies(&testutil::fixture_config(), &testutil::fixtures(), None, /*dry_run*/ true, Verbosity::Normal)
+            .await
+            .unwrap();
+    }
+
+    /// `format` (write mode) rewrites DDL in place; run against a copy and with
+    /// `check=false` so it never hits the `process::exit` in check mode.
+    #[test]
+    fn format_write_mode_on_temp_copy() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
+    }
+}
