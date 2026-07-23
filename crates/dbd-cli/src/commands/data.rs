@@ -263,4 +263,55 @@ mod tests {
         assert_eq!(format_from_ext(&PathBuf::from("USERS.JSONL")), "jsonl");
         assert_eq!(format_from_ext(&PathBuf::from("Users.Tsv")), "tsv");
     }
+
+    use crate::commands::testutil;
+    use std::path::Path;
+
+    /// A bare table name resolves to its schema-qualified form; an unknown name
+    /// falls back verbatim.
+    #[test]
+    fn resolve_table_name_matches_and_falls_back() {
+        let design = Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        assert!(resolve_table_name(&design, "lookups").ends_with("lookups"));
+        assert_eq!(resolve_table_name(&design, "nope_not_here"), "nope_not_here");
+    }
+
+    /// Full-plan dry-run against the fixture: resolves scope, builds the import
+    /// plan, prints it, writes nothing.
+    #[test]
+    fn import_dry_run_full_plan_on_fixture() {
+        cmd_import_dry_run(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, None, None, None, Verbosity::Verbose).unwrap();
+    }
+
+    /// Ad-hoc single-file dry-run prints one line for the resolved target.
+    #[test]
+    fn import_dry_run_adhoc_file() {
+        cmd_import_dry_run(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            Some("lookups"), Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+        )
+        .unwrap();
+    }
+
+    /// `--file` without `--name` is an actionable error (both dry-run and real).
+    #[test]
+    fn import_dry_run_file_without_name_bails() {
+        let err = cmd_import_dry_run(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            None, Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--file requires --name"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn import_file_without_name_bails_before_db() {
+        let err = cmd_import(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            None, Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--file requires --name"), "got: {err}");
+    }
 }
