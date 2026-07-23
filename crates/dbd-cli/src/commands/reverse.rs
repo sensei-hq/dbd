@@ -714,4 +714,77 @@ mod tests {
     fn db_name_from_conn_trailing_slash_returns_none() {
         assert_eq!(db_name_from_conn("postgres://host/"), None);
     }
+
+    // ── DBML init/merge paths (no DB connection) ──────────────────────────────
+
+    use crate::commands::testutil;
+
+    /// Write a minimal, schema-qualified DBML file and return its path.
+    fn write_dbml(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("schema.dbml");
+        std::fs::write(&p, "Table \"config\".\"widgets\" {\n  \"id\" int [pk]\n  \"name\" text\n}\n").unwrap();
+        p
+    }
+
+    fn all_schemas() -> SchemaSelect {
+        SchemaSelect { only: vec![], exclude: vec![], all: true }
+    }
+
+    /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.
+    #[test]
+    fn init_from_dbml_creates_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbml = write_dbml(tmp.path());
+        let cfg = tmp.path().join("design.yaml");
+        cmd_init_from_dbml(tmp.path(), &dbml, "dev", &cfg, Some("proj"), 1, all_schemas(), false).unwrap();
+        assert!(cfg.exists());
+    }
+
+    /// `--dry-run` previews and writes nothing.
+    #[test]
+    fn init_from_dbml_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbml = write_dbml(tmp.path());
+        let cfg = tmp.path().join("design.yaml");
+        cmd_init_from_dbml(tmp.path(), &dbml, "dev", &cfg, Some("proj"), 1, all_schemas(), true).unwrap();
+        assert!(!cfg.exists(), "dry-run must not write design.yaml");
+    }
+
+    /// `init` refuses when a project already exists (points at `merge`).
+    #[test]
+    fn init_from_dbml_refuses_when_project_exists() {
+        let proj = testutil::copy_fixture_project();
+        let dbml = write_dbml(proj.path());
+        let cfg = proj.path().join("design.yaml");
+        let err = cmd_init_from_dbml(proj.path(), &dbml, "dev", &cfg, None, 1, all_schemas(), false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+
+    /// `merge --from-dbml` refuses when there's no project (points at `init`).
+    #[test]
+    fn merge_from_dbml_refuses_without_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbml = write_dbml(tmp.path());
+        let cfg = tmp.path().join("design.yaml"); // does not exist
+        let err = cmd_merge_from_dbml(tmp.path(), &dbml, "dev", &cfg, all_schemas(), false).unwrap_err();
+        assert!(err.to_string().contains("no design.yaml"), "got: {err}");
+    }
+
+    /// `merge --from-dbml --dry-run` previews the plan against an existing project.
+    #[test]
+    fn merge_from_dbml_dry_run_previews() {
+        let proj = testutil::copy_fixture_project();
+        let dbml = write_dbml(proj.path());
+        let cfg = proj.path().join("design.yaml");
+        cmd_merge_from_dbml(proj.path(), &dbml, "dev", &cfg, all_schemas(), true).unwrap();
+    }
+
+    /// `merge --from-dbml` applies (overwrite + snapshot) into an existing project.
+    #[test]
+    fn merge_from_dbml_applies_into_project() {
+        let proj = testutil::copy_fixture_project();
+        let dbml = write_dbml(proj.path());
+        let cfg = proj.path().join("design.yaml");
+        cmd_merge_from_dbml(proj.path(), &dbml, "dev", &cfg, all_schemas(), false).unwrap();
+    }
 }
