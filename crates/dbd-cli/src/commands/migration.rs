@@ -158,3 +158,44 @@ pub fn cmd_snapshot_create(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::testutil;
+
+    /// An empty project has no snapshots — the listing takes the early return.
+    #[test]
+    fn snapshot_list_empty_dir_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        cmd_snapshot_list(tmp.path(), Verbosity::Normal);
+    }
+
+    /// Listing against the real fixture exercises the print-each-snapshot path.
+    #[test]
+    fn snapshot_list_on_fixture_project() {
+        cmd_snapshot_list(&testutil::fixtures(), Verbosity::Verbose);
+    }
+
+    /// `--dry-run` builds the reset script and returns before any DB adapter is
+    /// constructed, so it runs without a live connection.
+    #[tokio::test]
+    async fn reset_dry_run_needs_no_database() {
+        cmd_reset(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            "dev", /*dry_run*/ true, /*force*/ false, /*drop_schemas*/ false,
+            /*drop_extensions*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Creating the first snapshot against a fresh copy writes a baseline and
+    /// bumps the config version — run against a throwaway copy, never the repo.
+    #[test]
+    fn snapshot_create_writes_into_temp_project() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("test snapshot"), Verbosity::Normal).unwrap();
+    }
+}

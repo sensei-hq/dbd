@@ -545,3 +545,75 @@ pub fn cmd_release(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::testutil;
+
+    /// `graph` loads the fixture design and emits the node/edge/layer JSON.
+    #[test]
+    fn graph_emits_json_from_fixture() {
+        cmd_graph(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, None, None, Verbosity::Verbose).unwrap();
+    }
+
+    /// `dbml` writes generated document(s) under the project — run against a
+    /// copy so the repo fixture is never touched.
+    #[test]
+    fn dbml_writes_into_temp_project() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("schema.dbml");
+        cmd_dbml(&cfg, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
+    }
+
+    /// A missing config bails with an actionable "not found" error.
+    #[test]
+    fn doctor_bails_when_config_missing() {
+        let missing = std::path::Path::new("/definitely/not/here/design.yaml");
+        let err = cmd_doctor(missing, false, Verbosity::Normal).unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    /// Doctor is read-only without `--fix` and returns Ok on the fixture.
+    #[test]
+    fn doctor_runs_read_only_on_fixture() {
+        cmd_doctor(&testutil::fixture_config(), false, Verbosity::Normal).unwrap();
+    }
+
+    /// `init` scaffolds a project into an empty directory.
+    #[test]
+    fn init_creates_project_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        cmd_init(tmp.path(), "demo", "postgres", Verbosity::Normal).unwrap();
+        assert!(tmp.path().join("design.yaml").exists());
+    }
+
+    /// `deploy --dry-run` resolves a local source and reports without applying,
+    /// so it never opens a DB connection.
+    #[tokio::test]
+    async fn deploy_dry_run_from_local_source() {
+        let src = testutil::fixtures();
+        cmd_deploy(
+            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Releasing writes a baseline snapshot and flips the released flag; a second
+    /// release is then refused. Runs against a throwaway copy.
+    #[test]
+    fn release_writes_baseline_then_refuses_second() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_release(&cfg, "dev", proj.path(), Some("v1"), Verbosity::Normal).unwrap();
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already released") || msg.contains("Snapshots already exist"),
+            "expected a released/snapshot guard, got: {msg}"
+        );
+    }
+}

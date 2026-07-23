@@ -67,3 +67,21 @@ pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter
         "No adapter compiled in for URL: {url}"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    /// The `convex:` scheme routes to the codegen adapter (no server needed).
+    #[tokio::test]
+    async fn connect_convex_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("convex://{}", tmp.path().display());
+        assert!(super::connect(&url, "proj").await.is_ok());
+    }
+
+    /// The `sqlite:` scheme routes to the in-memory SQLite adapter.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn connect_sqlite_in_memory() {
+        assert!(super::connect("sqlite::memory:", "proj").await.is_ok());
+    }
+}
