@@ -387,4 +387,55 @@ mod tests {
         let err = safe_write(&root, &outside, "x").unwrap_err();
         assert!(err.to_string().contains("path traversal"), "got: {err}");
     }
+
+    fn apply_complete(strategy: ApplyStrategy) -> ApplyComplete {
+        ApplyComplete { strategy, from_version: 1, to_version: 2, applied: 3, migrated: 1, created: 2, dropped: 0 }
+    }
+
+    /// Each apply strategy renders its own distinct summary line.
+    #[test]
+    fn format_apply_summary_covers_all_strategies() {
+        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Fresh)).contains("Fresh"));
+        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Current)).contains("up to date"));
+        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Migrate)).contains("Migrated"));
+    }
+
+    #[test]
+    fn format_import_summary_reports_counts() {
+        let s = ImportComplete { tables: 3, procedures: 2, after_scripts: 1 };
+        assert!(format_import_summary(&s).contains("3 table"));
+    }
+
+    #[test]
+    fn format_deploy_summary_combines_apply_and_import() {
+        let s = dbd_core::design::DeployComplete {
+            apply: apply_complete(ApplyStrategy::Fresh),
+            import: ImportComplete { tables: 2, procedures: 1, after_scripts: 0 },
+        };
+        let out = format_deploy_summary(&s);
+        assert!(out.contains("Fresh") && out.contains("table"));
+    }
+
+    /// `$VAR` is looked up (falling back to the literal when unset); a plain
+    /// value passes through untouched.
+    #[test]
+    fn resolve_env_vars_passthrough_and_fallback() {
+        assert_eq!(resolve_env_vars("postgres://x/db"), "postgres://x/db");
+        assert_eq!(resolve_env_vars("$definitely_unset_var_xyz"), "$definitely_unset_var_xyz");
+    }
+
+    /// The `run` dispatcher routes a non-DB command (Doctor) to its handler.
+    #[tokio::test]
+    async fn run_dispatches_non_db_command() {
+        use crate::cli::Commands;
+        use crate::commands::testutil;
+        let cmd = Commands::Doctor { fix: false };
+        let fixtures = testutil::fixtures();
+        run(
+            &cmd, &testutil::fixture_config(), "dev", None, &fixtures,
+            fixtures.to_str().unwrap(), None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
 }
