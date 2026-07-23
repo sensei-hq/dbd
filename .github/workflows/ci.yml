@@ -10,7 +10,7 @@ env:
 
 jobs:
   test:
-    name: test + clippy
+    name: test + clippy + coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -23,12 +23,24 @@ jobs:
         with:
           tool: cargo-llvm-cov
       # Mirrors the local gate (.githooks/pre-commit and `make bump`):
-      # default features (postgres + sqlite + deploy), no live database needed.
-      # llvm-cov runs the unit + integration suite under instrumentation and
-      # writes target/lcov.info; doctests run separately since llvm-cov skips
-      # them on stable, keeping the gate equal to `cargo test --workspace`.
-      - name: cargo test + coverage
-        run: cargo llvm-cov --workspace --lcov --output-path target/lcov.info
+      # default features (postgres + sqlite + deploy). Doctests run separately
+      # (llvm-cov skips them on stable), keeping the gate equal to
+      # `cargo test --workspace`.
+      # main.rs is excluded: it's the binary entry point (clap wiring + error
+      # print) that the test harness never executes, so it can only ever report
+      # 0% and would drag the metric down as unreachable noise.
+      #
+      # Coverage is collected across two instrumented runs and merged so the
+      # PostgreSQL adapter's real coverage is reflected: the default workspace
+      # suite, then the embedded-PostgreSQL integration suite (feature-gated and
+      # serial — each test boots its own in-process postgres). `--no-report`
+      # accumulates raw profiles; the final `report` merges them into one lcov.
+      - name: cargo test + coverage (workspace + embedded, merged)
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report --workspace
+          cargo llvm-cov --no-report -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
+          cargo llvm-cov report --lcov --output-path target/lcov.info --ignore-filename-regex 'dbd-cli/src/main\.rs'
       - name: cargo test (doctests)
         run: cargo test --workspace --doc
       - name: cargo clippy
@@ -38,19 +50,3 @@ jobs:
         with:
           token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
           files: target/lcov.info
-
-  embedded-tests:
-    name: embedded postgres integration
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # `postgresql_embedded` downloads and runs its own PostgreSQL, so no
-      # service container or DATABASE_URL is required. Run serially: each test
-      # boots its own instance, and concurrent setup() races on the shared
-      # binary-install/cache dir.
-      - name: cargo test (embedded-tests)
-        run: cargo test -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
