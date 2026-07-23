@@ -65,4 +65,28 @@ mod tests {
         assert_eq!(resolve_site(Some("http://localhost:5173")), "http://localhost:5173");
         assert_eq!(resolve_site(None), DEFAULT_SITE);
     }
+
+    use crate::commands::testutil;
+
+    /// `--json` builds the schema model and writes it under the project.
+    #[test]
+    fn diagram_json_writes_model_file() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("model.json");
+        cmd_diagram(&cfg, "dev", proj.path(), true, &out, false, None, None, None, Verbosity::Normal).unwrap();
+        assert!(out.exists());
+    }
+
+    /// URL mode with `print_url = true` encodes + prints the URL and skips the
+    /// browser-open (so it's safe and DB-free in tests).
+    #[test]
+    fn diagram_url_prints_without_opening_browser() {
+        cmd_diagram(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            false, std::path::Path::new("unused.json"), /*print_url*/ true,
+            Some("http://localhost:5173"), None, None, Verbosity::Normal,
+        )
+        .unwrap();
+    }
 }
