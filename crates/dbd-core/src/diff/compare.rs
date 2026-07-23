@@ -17,45 +17,53 @@ fn qualified_name(t: &TableSnapshot) -> String {
     format!("{}.{}", t.schema, t.name)
 }
 
-/// Diff tables between two snapshots by qualified name.
-fn diff_tables(old: &[TableSnapshot], new: &[TableSnapshot]) -> Vec<MigrationDiff> {
-    let old_map: HashMap<String, &TableSnapshot> =
-        old.iter().map(|t| (qualified_name(t), t)).collect();
-    let new_map: HashMap<String, &TableSnapshot> =
-        new.iter().map(|t| (qualified_name(t), t)).collect();
+/// Diff two keyed entity lists into Add/Drop/Change migration diffs.
+///
+/// Shared by [`diff_tables`] and [`diff_enums`]: entries only in `new` are
+/// Adds, entries only in `old` are Drops, and entries present in both with a
+/// non-empty `field_changes` result are Changes.
+fn diff_by_qualified_name<T>(
+    old: &[T],
+    new: &[T],
+    entity_type: EntityType,
+    qualified_name: impl Fn(&T) -> String,
+    field_changes: impl Fn(&T, &T) -> Vec<FieldChange>,
+) -> Vec<MigrationDiff> {
+    let old_map: HashMap<String, &T> = old.iter().map(|t| (qualified_name(t), t)).collect();
+    let new_map: HashMap<String, &T> = new.iter().map(|t| (qualified_name(t), t)).collect();
 
     let mut diffs = Vec::new();
 
-    // Tables in new but not in old → Add
+    // In new but not in old → Add
     for name in new_map.keys() {
         if !old_map.contains_key(name) {
             diffs.push(MigrationDiff {
                 entity_name: name.clone(),
-                entity_type: EntityType::Table,
+                entity_type,
                 action: DiffAction::Add,
             });
         }
     }
 
-    // Tables in old but not in new → Drop
+    // In old but not in new → Drop
     for name in old_map.keys() {
         if !new_map.contains_key(name) {
             diffs.push(MigrationDiff {
                 entity_name: name.clone(),
-                entity_type: EntityType::Table,
+                entity_type,
                 action: DiffAction::Drop,
             });
         }
     }
 
-    // Tables in both → check for field-level changes
-    for (name, old_t) in &old_map {
-        if let Some(new_t) = new_map.get(name) {
-            let changes = diff_table_fields(old_t, new_t);
+    // In both → check for field-level changes
+    for (name, &old_t) in &old_map {
+        if let Some(&new_t) = new_map.get(name) {
+            let changes = field_changes(old_t, new_t);
             if !changes.is_empty() {
                 diffs.push(MigrationDiff {
                     entity_name: name.clone(),
-                    entity_type: EntityType::Table,
+                    entity_type,
                     action: DiffAction::Change(changes),
                 });
             }
@@ -63,6 +71,11 @@ fn diff_tables(old: &[TableSnapshot], new: &[TableSnapshot]) -> Vec<MigrationDif
     }
 
     diffs
+}
+
+/// Diff tables between two snapshots by qualified name.
+fn diff_tables(old: &[TableSnapshot], new: &[TableSnapshot]) -> Vec<MigrationDiff> {
+    diff_by_qualified_name(old, new, EntityType::Table, qualified_name, diff_table_fields)
 }
 
 /// Diff all fields within a single table pair.
@@ -259,50 +272,7 @@ fn enum_qualified_name(e: &EnumSnapshot) -> String {
 
 /// Diff enums between two snapshots by qualified name.
 fn diff_enums(old: &[EnumSnapshot], new: &[EnumSnapshot]) -> Vec<MigrationDiff> {
-    let old_map: HashMap<String, &EnumSnapshot> =
-        old.iter().map(|e| (enum_qualified_name(e), e)).collect();
-    let new_map: HashMap<String, &EnumSnapshot> =
-        new.iter().map(|e| (enum_qualified_name(e), e)).collect();
-
-    let mut diffs = Vec::new();
-
-    // Enums in new but not in old → Add
-    for name in new_map.keys() {
-        if !old_map.contains_key(name) {
-            diffs.push(MigrationDiff {
-                entity_name: name.clone(),
-                entity_type: EntityType::Enum,
-                action: DiffAction::Add,
-            });
-        }
-    }
-
-    // Enums in old but not in new → Drop
-    for name in old_map.keys() {
-        if !new_map.contains_key(name) {
-            diffs.push(MigrationDiff {
-                entity_name: name.clone(),
-                entity_type: EntityType::Enum,
-                action: DiffAction::Drop,
-            });
-        }
-    }
-
-    // Enums in both → check for value-level changes
-    for (name, old_e) in &old_map {
-        if let Some(new_e) = new_map.get(name) {
-            let changes = diff_enum_values(old_e, new_e);
-            if !changes.is_empty() {
-                diffs.push(MigrationDiff {
-                    entity_name: name.clone(),
-                    entity_type: EntityType::Enum,
-                    action: DiffAction::Change(changes),
-                });
-            }
-        }
-    }
-
-    diffs
+    diff_by_qualified_name(old, new, EntityType::Enum, enum_qualified_name, diff_enum_values)
 }
 
 /// Diff enum values between two versions of the same enum.

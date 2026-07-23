@@ -1140,25 +1140,34 @@ pub fn create_snapshot(
         std::fs::write(&snap_file, serde_json::to_string_pretty(&snap_result.snapshot)?)?;
 
         // Write migration files
-        if let Some(ref graph) = snap_result.graph {
-            let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(version));
-            std::fs::create_dir_all(&migration_dir)?;
-            std::fs::write(
-                migration_dir.join("graph.json"),
-                serde_json::to_string_pretty(graph)?,
-            )?;
-            for file in &snap_result.migration_files {
-                let full_path = migration_dir.join(&file.relative_path);
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&full_path, &file.content)?;
-            }
-        }
+        write_migration_files(project_dir, snap_result, version)?;
     }
 
     crate::config::update_version(config_path, final_version)?;
     Ok(result)
+}
+
+/// Write a snapshot's migration graph (`graph.json`) plus its migration files
+/// under `migrations/{version}/`. A no-op when the snapshot carries no graph
+/// (e.g. a baseline).
+fn write_migration_files(project_dir: &Path, snap_result: &SnapshotResult, version: u32) -> Result<()> {
+    let Some(ref graph) = snap_result.graph else {
+        return Ok(());
+    };
+    let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(version));
+    std::fs::create_dir_all(&migration_dir)?;
+    std::fs::write(
+        migration_dir.join("graph.json"),
+        serde_json::to_string_pretty(graph)?,
+    )?;
+    for file in &snap_result.migration_files {
+        let full_path = migration_dir.join(&file.relative_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full_path, &file.content)?;
+    }
+    Ok(())
 }
 
 /// Create a **baseline** snapshot at an explicit `version`, writing all files to disk.
@@ -1196,23 +1205,9 @@ pub fn create_baseline_snapshot(
         let snap_file = snapshots_dir.join(format!("{}.json", pad_version(v)));
         std::fs::write(&snap_file, serde_json::to_string_pretty(&snap_result.snapshot)?)?;
 
-        // A baseline has no migration graph, but mirror create_snapshot's write loop
+        // A baseline has no migration graph, but mirror create_snapshot's write
         // so any (unexpected) staged result is still persisted consistently.
-        if let Some(ref graph) = snap_result.graph {
-            let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(v));
-            std::fs::create_dir_all(&migration_dir)?;
-            std::fs::write(
-                migration_dir.join("graph.json"),
-                serde_json::to_string_pretty(graph)?,
-            )?;
-            for file in &snap_result.migration_files {
-                let full_path = migration_dir.join(&file.relative_path);
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&full_path, &file.content)?;
-            }
-        }
+        write_migration_files(project_dir, snap_result, v)?;
     }
 
     crate::config::update_version(config_path, final_version)?;

@@ -47,70 +47,65 @@ fn load_design() -> Design {
         .expect("failed to load embedded fixture design")
 }
 
-/// Assert that a table exists; panics with a clear message if it doesn't.
-async fn assert_table_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str) {
+/// Run a catalog existence assertion via an anonymous `DO` block. Raises (and
+/// so fails the test) when `predicate` matches in the wrong direction:
+/// `should_exist == true` fails when it finds nothing, `false` fails when it
+/// finds something. `subject` is the human label, e.g. "table config.lookups".
+async fn assert_catalog(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    should_exist: bool,
+    predicate: &str,
+    subject: &str,
+) {
+    let (guard, verb) = if should_exist {
+        ("NOT EXISTS", "does not exist")
+    } else {
+        ("EXISTS", "unexpectedly exists")
+    };
     let sql = format!(
         "DO $$ BEGIN \
-           IF NOT EXISTS ( \
-             SELECT 1 FROM pg_catalog.pg_tables \
-             WHERE schemaname = '{schema}' AND tablename = '{table}' \
-           ) THEN RAISE EXCEPTION 'table {schema}.{table} does not exist'; \
+           IF {guard} ( {predicate} ) \
+           THEN RAISE EXCEPTION '{subject} {verb}'; \
            END IF; \
          END $$"
     );
     adapter
         .execute_script(&sql)
         .await
-        .unwrap_or_else(|e| panic!("assert_table_exists({schema}.{table}) failed: {e}"));
+        .unwrap_or_else(|e| panic!("assert_catalog({subject}) failed: {e}"));
+}
+
+fn table_predicate(schema: &str, table: &str) -> String {
+    format!("SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = '{schema}' AND tablename = '{table}'")
+}
+
+fn column_predicate(schema: &str, table: &str, column: &str) -> String {
+    format!(
+        "SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = '{schema}' AND table_name = '{table}' AND column_name = '{column}'"
+    )
+}
+
+/// Assert that a table exists; panics with a clear message if it doesn't.
+async fn assert_table_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str) {
+    assert_catalog(adapter, true, &table_predicate(schema, table), &format!("table {schema}.{table}")).await;
 }
 
 /// Assert that a table does NOT exist; panics if it does.
 async fn assert_table_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str) {
-    let sql = format!(
-        "DO $$ BEGIN \
-           IF EXISTS ( \
-             SELECT 1 FROM pg_catalog.pg_tables \
-             WHERE schemaname = '{schema}' AND tablename = '{table}' \
-           ) THEN RAISE EXCEPTION 'table {schema}.{table} unexpectedly exists'; \
-           END IF; \
-         END $$"
-    );
-    adapter
-        .execute_script(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("assert_table_absent({schema}.{table}) failed: {e}"));
+    assert_catalog(adapter, false, &table_predicate(schema, table), &format!("table {schema}.{table}")).await;
 }
 
 /// Assert that a schema exists; panics if it doesn't.
 async fn assert_schema_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str) {
-    let sql = format!(
-        "DO $$ BEGIN \
-           IF NOT EXISTS ( \
-             SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}' \
-           ) THEN RAISE EXCEPTION 'schema {schema} does not exist'; \
-           END IF; \
-         END $$"
-    );
-    adapter
-        .execute_script(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("assert_schema_exists({schema}) failed: {e}"));
+    let pred = format!("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}'");
+    assert_catalog(adapter, true, &pred, &format!("schema {schema}")).await;
 }
 
 /// Assert that a schema is absent; panics if it exists.
 async fn assert_schema_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str) {
-    let sql = format!(
-        "DO $$ BEGIN \
-           IF EXISTS ( \
-             SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}' \
-           ) THEN RAISE EXCEPTION 'schema {schema} unexpectedly exists'; \
-           END IF; \
-         END $$"
-    );
-    adapter
-        .execute_script(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("assert_schema_absent({schema}) failed: {e}"));
+    let pred = format!("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = '{schema}'");
+    assert_catalog(adapter, false, &pred, &format!("schema {schema}")).await;
 }
 
 /// Assert that a column exists on a table; panics if it doesn't.
@@ -120,20 +115,8 @@ async fn assert_column_exists(
     table: &str,
     column: &str,
 ) {
-    let sql = format!(
-        "DO $$ BEGIN \
-           IF NOT EXISTS ( \
-             SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = '{schema}' AND table_name = '{table}' \
-               AND column_name = '{column}' \
-           ) THEN RAISE EXCEPTION 'column {schema}.{table}.{column} does not exist'; \
-           END IF; \
-         END $$"
-    );
-    adapter
-        .execute_script(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("assert_column_exists({schema}.{table}.{column}) failed: {e}"));
+    let pred = column_predicate(schema, table, column);
+    assert_catalog(adapter, true, &pred, &format!("column {schema}.{table}.{column}")).await;
 }
 
 /// Assert that a column does NOT exist on a table; panics if it does.
@@ -143,20 +126,8 @@ async fn assert_column_absent(
     table: &str,
     column: &str,
 ) {
-    let sql = format!(
-        "DO $$ BEGIN \
-           IF EXISTS ( \
-             SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = '{schema}' AND table_name = '{table}' \
-               AND column_name = '{column}' \
-           ) THEN RAISE EXCEPTION 'column {schema}.{table}.{column} unexpectedly exists'; \
-           END IF; \
-         END $$"
-    );
-    adapter
-        .execute_script(&sql)
-        .await
-        .unwrap_or_else(|e| panic!("assert_column_absent({schema}.{table}.{column}) failed: {e}"));
+    let pred = column_predicate(schema, table, column);
+    assert_catalog(adapter, false, &pred, &format!("column {schema}.{table}.{column}")).await;
 }
 
 // ── Test 1: Fresh deploy ──────────────────────────────────────────────────────

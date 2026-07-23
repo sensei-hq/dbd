@@ -444,45 +444,30 @@ fn emit_all_refs(entities: &[Entity]) -> String {
     }
 }
 
+/// Render a DBML column reference: `"schema"."table"."col"` for a single
+/// column, or `"schema"."table".("c1", "c2")` for a composite key.
+fn qualify_columns(schema: &str, table: &str, cols: &[String]) -> String {
+    if cols.len() == 1 {
+        format!("\"{}\".\"{}\".\"{}\"", schema, table, cols[0])
+    } else {
+        format!(
+            "\"{}\".\"{}\".({})",
+            schema,
+            table,
+            cols.iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String {
     let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
     let ref_table = &fk.ref_table;
 
-    let source_cols = if fk.columns.len() == 1 {
-        format!(
-            "\"{}\".\"{}\".\"{}\"",
-            source_schema, source_table, fk.columns[0]
-        )
-    } else {
-        format!(
-            "\"{}\".\"{}\".({})",
-            source_schema,
-            source_table,
-            fk.columns
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    let target_cols = if fk.ref_columns.len() == 1 {
-        format!(
-            "\"{}\".\"{}\".\"{}\"",
-            ref_schema, ref_table, fk.ref_columns[0]
-        )
-    } else {
-        format!(
-            "\"{}\".\"{}\".({})",
-            ref_schema,
-            ref_table,
-            fk.ref_columns
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+    let source_cols = qualify_columns(source_schema, source_table, &fk.columns);
+    let target_cols = qualify_columns(ref_schema, ref_table, &fk.ref_columns);
 
     let mut settings = Vec::new();
     if let Some(action) = &fk.on_delete {
