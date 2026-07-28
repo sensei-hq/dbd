@@ -187,7 +187,7 @@ Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.17
+  rev: v0.8.18
   hooks:
     - id: dbd-format
 ```
@@ -216,7 +216,10 @@ async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
     )?;
 
     let adapter = PostgresAdapter::new(database_url, &design.config().project.name).await?;
-    design.apply(&adapter, None, false).await?;
+
+    // apply(adapter, name, dry_run, scope, on_start, on_done, on_complete)
+    let scope = design.resolve_scope(None, None)?;
+    design.apply(&adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
     Ok(())
 }
 ```
