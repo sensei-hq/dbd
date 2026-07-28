@@ -106,6 +106,7 @@ target:
   supabase:
     url: $SUPABASE_DB_URL
     schemas: [public, config]
+    skip_schemas: [auth, storage]      # Supabase owns these — dbd won't manage their entities
     extensions: [postgis]
     grants:
       config:
@@ -200,7 +201,7 @@ ignore:
 | `external` | `roles` (Postgres/Supabase) |
 | `import` / `export` | `grants` (Supabase) |
 | `dbml` / `scopes` | `url` (connection / output) |
-| `ignore` | — |
+| `ignore` | `skip_schemas` (leave a target's own schemas unmanaged) |
 
 ### Scopes — subset deploys from one design
 
@@ -629,7 +630,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.18
+  rev: v0.8.19
   hooks:
     - id: dbd-format
 ```
