@@ -190,6 +190,7 @@ ignore:
 | `dbml` | DBML generation filters | no |
 | `scopes` | Named entity selections for subset deploys | no |
 | `ignore` | Reference classification overrides | no |
+| `format` | DDL formatter options (see `dbd format`) | no |
 
 ### Universal vs target-specific config
 
@@ -251,7 +252,7 @@ targets (and `combine` keeps roles + the scope's allowed extensions); `reset` is
 entity-level (drops the scope's own objects individually; `--schemas` additionally
 restricts the dropped schemas to those the scope occupies, roles dropped only on a
 full reset). The shared primitive is
-`Design::scoped_entities(&ResolvedScope) -> Vec<Entity>` (closure under `include`,
+`Design::scoped_entities(&ResolvedScope) -> Result<Vec<Entity>>` (closure under `include`,
 plain set under `report`, everything for the all-scope).
 
 ---
@@ -266,6 +267,7 @@ plain set under `report`, everything for the all-scope).
 | `--database` | `-d` | `$DATABASE_URL` | Database URL (overrides config) |
 | `--environment` | `-e` | `prod` | Environment (dev or prod) |
 | `--source` | `-s` | `.` | Source directory or GitHub repo |
+| `--verbose` | `-v` | | Verbose output (show all details) |
 | `--scope` | | full set | Scope name from design.yaml (entity subset) |
 | `--deps` | | scope's own | Gap policy override: `report` or `include` |
 
@@ -376,6 +378,7 @@ cannot express functions, procedures, views, standalone sequences, roles, or che
 dbd inspect
 dbd inspect -n config.lookups
 dbd inspect --verbose
+dbd inspect --fix              # auto-format DDL files in place while validating
 dbd inspect --scope hub        # report dependency gaps for a scope (exit 1 under report policy)
 ```
 
@@ -626,7 +629,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.17
+  rev: v0.8.18
   hooks:
     - id: dbd-format
 ```
@@ -647,8 +650,13 @@ dbd reset --dry-run
 dbd reset --schemas          # also DROP SCHEMA for managed schemas
 dbd reset --extensions       # also DROP EXTENSION for configured extensions
 dbd reset --clean            # = --schemas --extensions
+dbd reset --target supabase  # protected-schema set for the target (default: postgres)
 dbd reset --scope hub --dry-run   # only the objects the 'hub' scope occupies
 ```
+
+`--target <postgres|supabase>` (default `postgres`) selects which schemas are protected from
+`DROP SCHEMA` under `--schemas`: on `supabase` the managed set (`auth`, `storage`, …, `public`)
+is skipped; on `postgres` `public` is dropped.
 
 `--schemas` additionally `DROP SCHEMA … CASCADE`s the managed schemas, always skipping
 `pg_catalog`/`information_schema`/`pg_toast`; on a `supabase` target also skipping the
@@ -694,25 +702,39 @@ Set `GITHUB_TOKEN` for private repositories.
 ## Library usage
 
 ```rust
-use dbd_core::Design;
+use dbd_core::{connect, Design};
 use std::path::Path;
 
-// Full deploy
-let design = Design::from_config(
-    Path::new("design.yaml"),
-    Some("postgres://localhost/mydb"),
-    "prod",
-).await?;
-design.apply(None, false).await?;
-design.import_data(None, false).await?;
+// Load the declarative design for an environment (sync; scans ddl/ next to the config).
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
-// Inspection
-let report = design.report(None);
-// report.issues: entities with errors
+// Inspection — offline, no database. (`report` takes &mut self: it caches validation.)
+let report = design.report(None, None);
+// report.issues:   entities with errors
 // report.warnings: entities with warnings
+// report.gaps:     out-of-scope dependency gaps (when a scope is passed)
 
-// Dependency graph (for visualization)
-let graph = design.graph(None);
+// Connect an adapter — Postgres/SQLite/Convex is chosen from the URL scheme.
+let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;
+
+// Resolve the scope once (None, None ⇒ full design, the scope's default deps policy).
+let scope = design.resolve_scope(None, None)?;
+
+// apply / import_data / deploy all take: (&*adapter, name, dry_run, scope,
+// on_start(&str), on_done(&str, Option<&str>), on_complete(summary)).
+design
+    .apply(&*adapter, None, /*dry_run*/ false, Some(&scope),
+        |desc| println!("→ {desc}"),
+        |desc, err| if let Some(e) = err { eprintln!("✗ {desc}: {e}") },
+        |s| println!("applied {} entities", s.applied))
+    .await?;
+design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
+
+// Or apply + import in one call:
+// design.deploy(&*adapter, false, Some(&scope), |s| println!("v{}", s.apply.to_version)).await?;
+
+// Dependency graph (for visualization) — returns Result.
+let graph = design.graph(None, None)?;
 // graph.nodes, graph.edges, graph.layers
 ```
 

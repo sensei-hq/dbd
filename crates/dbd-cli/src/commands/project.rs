@@ -320,6 +320,10 @@ pub async fn cmd_deploy(
             report.issues.len(),
             report.warnings.len(),
         ));
+        let policy_files = dbd_core::scanner::scan_policies(&project_dir);
+        if !policy_files.is_empty() {
+            output::info(verbosity, &format!("{} policy file(s) would be applied.", policy_files.len()));
+        }
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
@@ -367,6 +371,20 @@ pub async fn cmd_deploy(
             .await;
         spinner.finish();
         result.context("Import failed")?;
+    }
+
+    // RLS policies from policies/ are part of a full deploy — applied
+    // unconditionally (unlike `apply`, which gates them behind --with-policies)
+    // because `deploy` means "bring the DB fully up from source". No-op when the
+    // project has no policies/ dir.
+    let policy_report = dbd_core::design::apply_policies(&*adapter, &project_dir, false)
+        .await
+        .context("Policy apply failed")?;
+    if !policy_report.applied.is_empty() {
+        output::info(verbosity, &format!("Applied {} policy file(s).", policy_report.applied.len()));
+    }
+    for (file, err) in &policy_report.failed {
+        output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
     }
 
     let summary = dbd_core::design::DeployComplete {
@@ -596,6 +614,23 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Deploy treats `policies/` as part of the deploy: a project with a policy
+    /// file makes `deploy --dry-run` walk the policy step (scan + report) without
+    /// error. Guards against the regression where deploy silently skipped RLS.
+    #[tokio::test]
+    async fn deploy_dry_run_includes_policies() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::create_dir_all(proj.path().join("policies")).unwrap();
+        std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
+        let cfg = proj.path().join("design.yaml");
+        cmd_deploy(
+            proj.path().to_str().unwrap(), &cfg, "dev", None,
             /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
         )
         .await

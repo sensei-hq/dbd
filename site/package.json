@@ -1,7 +1,7 @@
 {
 	"name": "site",
 	"private": true,
-	"version": "0.8.17",
+	"version": "0.8.18",
 	"type": "module",
 	"scripts": {
 		"sync:content": "node scripts/copy-content.mjs",

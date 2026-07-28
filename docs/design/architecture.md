@@ -229,10 +229,13 @@ The library exposes a layered API — consumers pick the level they need:
 // High-level: one-call operations (deploy, apply, inspect)
 use dbd_core::Design;
 
-let design = Design::from_config(Path::new("design.yaml"), Some(db_url), "prod").await?;
-design.apply(None, false).await?;          // Apply all entities + migrations
-design.import_data(None, false).await?;    // Import staging data
-let report = design.report(None);          // Inspect: get errors/warnings
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;   // sync; scans ddl/
+let adapter = dbd_core::connect(db_url, &design.config().project.name).await?;
+let scope = design.resolve_scope(None, None)?;
+// apply/import_data: (&*adapter, name, dry_run, scope, on_start, on_done, on_complete)
+design.apply(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;        // entities + migrations
+design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;  // staging data
+let report = design.report(None, None);    // inspect: errors/warnings
 
 // Mid-level: individual subsystems
 use dbd_core::config;
@@ -241,10 +244,10 @@ use dbd_core::snapshot;
 
 let config = config::read(Path::new("design.yaml"))?;
 let sorted = dependency::sort_by_dependencies(&entities);
-let pending = snapshot::pending_migrations(db_version, Path::new("."))?;
+let pending = snapshot::pending_migrations(db_version, Path::new("."));   // -> Vec<PendingMigration>
 
 // Low-level: parser, adapter trait, entity types
-use dbd_core::parser::PostgresParser;
+use dbd_core::parser::parse_entity;   // parse one DDL file's SQL → Entity
 use dbd_core::adapter::DatabaseAdapter;
 use dbd_core::entity::{Entity, EntityType};
 ```
@@ -256,13 +259,11 @@ use dbd_core::entity::{Entity, EntityType};
 use dbd_core::Design;
 
 async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
-    let design = Design::from_config(
-        Path::new("database/design.yaml"),
-        Some(database_url),
-        "prod",
-    ).await?;
-    design.apply(None, false).await?;
-    design.import_data(None, false).await?;
+    let design = Design::from_config(Path::new("database/design.yaml"), "prod")?;
+    let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+    let scope = design.resolve_scope(None, None)?;
+    design.apply(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
+    design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
     Ok(())
 }
 ```
@@ -276,19 +277,19 @@ use dbd_core::Design;
 use dbd_core::dependency::GraphResult;
 
 // Get dependency graph for visualization
-let graph: GraphResult = design.graph(None);
+let graph: GraphResult = design.graph(None, None)?;
 // graph.nodes: Vec<{name, type, schema}>
 // graph.edges: Vec<{from, to}>
 // graph.layers: Vec<Vec<String>>
 
 // Get validation report for dashboard
-let report = design.report(None);
+let report = design.report(None, None);
 // report.issues: Vec<Entity>   (entities with errors)
 // report.warnings: Vec<Entity> (entities with warnings)
 
 // Get snapshot diff for migration preview
 use dbd_core::snapshot;
-let pending = snapshot::pending_migrations(db_version, project_dir)?;
+let pending = snapshot::pending_migrations(db_version, project_dir);   // -> Vec<PendingMigration>
 // Each migration: { from_version, to_version, altered, dropped }
 ```
 
@@ -1127,22 +1128,31 @@ pub enum DbdError {
 
 ### Builder pattern for Design
 
-The `Design` struct mirrors the Node.js `Design` class but uses Rust builder conventions:
+`Design` is loaded synchronously from the config, then queried or driven against an adapter:
 
 ```rust
 impl Design {
-    pub async fn from_config(
-        config_path: &Path,
-        database_url: Option<&str>,
-        env: &str,
-    ) -> Result<Self> { ... }
+    // Load + parse ddl/ (sync). `from_config_with_dir` overrides the project root.
+    pub fn from_config(config_path: &Path, env: &str) -> Result<Self> { ... }
+    pub fn from_config_with_dir(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> { ... }
 
+    pub fn config(&self) -> &DesignConfig { ... }
+    pub fn resolve_scope(&self, scope: Option<&str>, deps: Option<DepsPolicy>) -> Result<ResolvedScope> { ... }
     pub fn validate(&mut self) -> &mut Self { ... }
-    pub fn report(&self, name: Option<&str>) -> Report { ... }
-    pub async fn apply(&self, name: Option<&str>, dry_run: bool) -> Result<()> { ... }
-    pub async fn import_data(&self, name: Option<&str>, dry_run: bool) -> Result<()> { ... }
-    pub fn combine(&self, file: &Path) -> Result<()> { ... }
-    pub fn graph(&self, name: Option<&str>) -> GraphResult { ... }
+    pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report { ... }
+    pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<GraphResult> { ... }
+    pub fn combine(&self, file: &Path, scope: Option<&ResolvedScope>) -> Result<()> { ... }
+
+    // Write paths take an adapter, a scope, and 3 progress callbacks:
+    //   on_start(&str), on_done(&str, Option<&str>), on_complete(summary).
+    pub async fn apply(&self, adapter: &dyn DatabaseAdapter, name: Option<&str>, dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        on_start: impl FnMut(&str), on_done: impl FnMut(&str, Option<&str>),
+        on_complete: impl FnMut(ApplyComplete)) -> Result<()> { ... }
+    pub async fn import_data(&self, adapter: &dyn DatabaseAdapter, name: Option<&str>, dry_run: bool,
+        scope: Option<&ResolvedScope>, /* on_start, on_done, on_complete */) -> Result<()> { ... }
+    pub async fn deploy(&self, adapter: &dyn DatabaseAdapter, dry_run: bool,
+        scope: Option<&ResolvedScope>, on_complete: impl FnMut(DeployComplete)) -> Result<()> { ... }
 }
 ```
 
@@ -1478,8 +1488,7 @@ Test the full parse pipeline using real DDL fixture files. Verifies that `sqlpar
 #[test]
 fn parses_table_with_fk_and_actions() {
     let sql = include_str!("../fixtures/ddl/table/config/lookup_values.ddl");
-    let parser = PostgresParser::new();
-    let entity = parser.parse_entity(Path::new("ddl/table/config/lookup_values.ddl"), sql).unwrap();
+    let entity = parse_entity(Path::new("ddl/table/config/lookup_values.ddl"), sql).unwrap();
 
     assert_eq!(entity.name, "config.lookup_values");
     assert_eq!(entity.entity_type, EntityType::Table);
@@ -1501,8 +1510,7 @@ fn parses_table_with_fk_and_actions() {
 #[test]
 fn parses_enum_with_values() {
     let sql = include_str!("../fixtures/ddl/enum/config/status.sql");
-    let parser = PostgresParser::new();
-    let entity = parser.parse_entity(Path::new("ddl/enum/config/status.sql"), sql).unwrap();
+    let entity = parse_entity(Path::new("ddl/enum/config/status.sql"), sql).unwrap();
 
     assert_eq!(entity.entity_type, EntityType::Enum);
     assert!(entity.enum_values.iter().any(|v| v.name == "active"));
@@ -1511,8 +1519,7 @@ fn parses_enum_with_values() {
 #[test]
 fn parses_procedure_reads_and_writes() {
     let sql = include_str!("../fixtures/ddl/procedure/staging/import_lookups.ddl");
-    let parser = PostgresParser::new();
-    let entity = parser.parse_entity(
+    let entity = parse_entity(
         Path::new("ddl/procedure/staging/import_lookups.ddl"), sql
     ).unwrap();
 
