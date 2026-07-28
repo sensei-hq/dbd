@@ -28,6 +28,7 @@ target:
     extensions: [uuid-ossp]
     roles:
       - name: app_user
+    skip_schemas: [auth]       # target owns these schemas — exclude their entities from the design
 
 schemas: [config, staging]
 
