@@ -75,9 +75,14 @@ pub async fn cmd_diff(
     Ok(())
 }
 
-/// TEMPORARY stub — real terraform-style logic lands in Task 8 with its own test.
-fn diff_exit_code(_is_empty: bool, _flag: bool) -> Option<i32> {
-    None
+/// terraform-`plan` style exit codes for `--exit-code`: `Some(0)` in sync,
+/// `Some(2)` when differences exist, `None` when the flag is off (caller keeps
+/// the normal `0`). Errors are handled separately by the caller (exit 1).
+pub(crate) fn diff_exit_code(is_empty: bool, exit_code_flag: bool) -> Option<i32> {
+    if !exit_code_flag {
+        return None;
+    }
+    Some(if is_empty { 0 } else { 2 })
 }
 
 #[cfg(test)]
@@ -106,5 +111,13 @@ mod tests {
         let out = diff_report_lines(&d).join("\n");
         assert!(out.contains("+ create public.audit_log"), "got: {out}");
         assert!(out.contains("advisory"), "advisory must render; got: {out}");
+    }
+
+    #[test]
+    fn exit_code_semantics() {
+        assert_eq!(diff_exit_code(true, false), None);   // flag off → no forced exit
+        assert_eq!(diff_exit_code(false, false), None);  // flag off → no forced exit
+        assert_eq!(diff_exit_code(true, true), Some(0));  // --exit-code, in sync
+        assert_eq!(diff_exit_code(false, true), Some(2)); // --exit-code, drift
     }
 }
