@@ -1,0 +1,16 @@
+/* Fonts, declared once. Self-hosted via Fontsource — see dbd/uno.config.js `fonts`.
+   Space Grotesk 400/500/600/700 -> font-display
+   IBM Plex Sans 400/500/600     -> font-sans
+   IBM Plex Mono 400/500/600     -> font-mono
+   In the app repo, replace these @imports with the equivalent npm imports:
+     import '@fontsource/space-grotesk/400.css'  … etc. */
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/latin-400.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/latin-500.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/latin-600.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/latin-700.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5/latin-400.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5/latin-500.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5/latin-600.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5/latin-400.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5/latin-500.css");
+@import url("https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5/latin-600.css");

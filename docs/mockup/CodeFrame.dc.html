@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<div class="frame">
+  <div class="flex items-center justify-between border-b border-line-soft px-4 py-2.5">
+    <div class="flex gap-1.5">
+      <span class="size-2.5 rounded-full bg-line"></span>
+      <span class="size-2.5 rounded-full bg-line"></span>
+      <span class="size-2.5 rounded-full bg-line"></span>
+    </div>
+    <span class="font-mono text-caption text-faint">{{ label }}</span>
+  </div>
+  <div class="overflow-x-auto p-4 font-mono text-code [font-variant-ligatures:none]">
+    <sc-for list="{{ rows }}" as="row" hint-placeholder-count="5">
+      <div class="flex whitespace-pre">
+        <sc-if value="{{ gutter }}" hint-placeholder-val="{{ false }}">
+          <span class="mr-2 {{ row.gutterCls }}">$</span>
+        </sc-if>
+        <sc-for list="{{ row.tokens }}" as="tk" hint-placeholder-count="1">
+          <span class="{{ tk.cls }}">{{ tk.t }}</span>
+        </sc-for>
+      </div>
+    </sc-for>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:520,&quot;height&quot;:240},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;design.yaml&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;mode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;code&quot;,&quot;terminal&quot;],&quot;default&quot;:&quot;code&quot;,&quot;tsType&quot;:&quot;'code' | 'terminal'&quot;},&quot;lang&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;text&quot;,&quot;yaml&quot;,&quot;sh&quot;,&quot;rust&quot;],&quot;default&quot;:&quot;yaml&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;source&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;project:\n  name: MyProject&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;lines&quot;:{&quot;editor&quot;:null,&quot;tsType&quot;:&quot;Array&lt;{ type: 'cmd' | 'out' | 'ok'; text: string }&gt;&quot;}}">
+// Window-chrome frame around code or a terminal transcript.
+// mode="code":     pass source + lang, highlighted by dbd/highlight.js
+// mode="terminal": pass lines [{type:'cmd'|'out'|'ok', text}], gets a $ gutter
+class Component extends DCLogic {
+  renderVals() {
+    const p = this.props;
+    const hl = (typeof window !== "undefined" && window.DBD_HL) || null;
+    const terminal = p.mode === "terminal";
+    let rows = [];
+    if (hl) {
+      rows = terminal ? hl.transcript(p.lines || []) : hl.tokenize(p.source || "", p.lang || "text");
+    }
+    return {
+      label: p.label ?? "",
+      gutter: terminal,
+      rows,
+    };
+  }
+}
+
+</script>
+</body>
+</html>
