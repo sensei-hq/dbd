@@ -701,4 +701,222 @@ mod tests {
             "expected a released/snapshot guard, got: {msg}"
         );
     }
+
+    /// A project with a `snapshots/` dir but no `released` flag set is already
+    /// on the migration track — `release` refuses even before checking for
+    /// entity errors.
+    #[test]
+    fn release_refuses_when_snapshots_exist_without_released_flag() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::create_dir_all(proj.path().join("snapshots")).unwrap();
+        std::fs::write(proj.path().join("snapshots").join("001.json"), "{}").unwrap();
+        let cfg = proj.path().join("design.yaml");
+
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
+        assert!(err.to_string().contains("Snapshots already exist"), "got: {err}");
+    }
+
+    /// A design with an entity parse error refuses to release — releasing a
+    /// broken design would bake the error into the baseline snapshot.
+    #[test]
+    fn release_refuses_when_an_entity_has_errors() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::write(
+            proj.path().join("ddl/table/config/broken.ddl"),
+            "create table config.broken (!!! not valid sql !!!);\n",
+        )
+        .unwrap();
+        let cfg = proj.path().join("design.yaml");
+
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
+        assert!(err.to_string().contains("entity error"), "got: {err}");
+    }
+
+    /// `reconcile` is disabled once a project is released — this must be
+    /// refused before ever touching a DB adapter.
+    #[tokio::test]
+    async fn reconcile_refuses_when_project_released() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_release(&cfg, "dev", proj.path(), Some("v1"), Verbosity::Normal).unwrap();
+
+        let err = cmd_reconcile(
+            &cfg, "dev", proj.path(), None, /*dry_run*/ true, /*allow_destructive*/ false,
+            /*prune*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("released"), "got: {err}");
+    }
+
+    /// `deploy --clear-cache` clears the local download cache before the rest
+    /// of the (local, no-DB) dry-run flow proceeds.
+    #[tokio::test]
+    async fn deploy_clears_cache_before_dry_run() {
+        let src = testutil::fixtures();
+        cmd_deploy(
+            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ true, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A source directory that exists but has no `design.yaml` is a clear,
+    /// actionable error — resolved entirely from the local filesystem.
+    #[tokio::test]
+    async fn deploy_bails_when_source_has_no_design_yaml() {
+        let empty = tempfile::tempdir().unwrap();
+        let err = cmd_deploy(
+            empty.path().to_str().unwrap(), &testutil::fixture_config(), "dev", None,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("No design.yaml found"), "got: {err}");
+    }
+
+    /// A scope with `deps: include` doesn't block on its dependency gap (that's
+    /// the whole point of `include`), but `deploy --dry-run` still surfaces the
+    /// gap as an FYI — exercising the gap-reporting loop that a `Report`-policy
+    /// gap never reaches (it bails earlier, in `check_scope_gaps`).
+    #[tokio::test]
+    async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
+        let src = testutil::fixtures();
+        cmd_deploy(
+            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, Some("incomplete_auto"), None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A design.yaml with old-format markers, a stale internally-managed file,
+    /// and a plural DDL folder all get reported (not touched) without `--fix`.
+    fn write_legacy_project(dir: &std::path::Path) -> std::path::PathBuf {
+        let config = dir.join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: legacy\n  database: postgresql\nroles:\n  - name: admin\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("ddl/procedure/staging")).unwrap();
+        std::fs::write(dir.join("ddl/procedure/staging/import_jsonb_to_table.ddl"), "-- stale\n").unwrap();
+        std::fs::create_dir_all(dir.join("ddl/tables/public")).unwrap();
+        std::fs::write(dir.join("ddl/tables/public/thing.ddl"), "create table public.thing (id int);\n").unwrap();
+        config
+    }
+
+    #[test]
+    fn doctor_reports_issues_without_fix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_legacy_project(tmp.path());
+        let original = std::fs::read_to_string(&config).unwrap();
+
+        cmd_doctor(&config, /*fix*/ false, Verbosity::Normal).unwrap();
+
+        // Report-only: nothing on disk changes.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+        assert!(tmp.path().join("ddl/tables").exists());
+    }
+
+    #[test]
+    fn doctor_fix_migrates_backs_up_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_legacy_project(tmp.path());
+        let original = std::fs::read_to_string(&config).unwrap();
+
+        cmd_doctor(&config, /*fix*/ true, Verbosity::Normal).unwrap();
+
+        // Backup preserves the original content.
+        let backup = tmp.path().join("design.yaml.bak");
+        assert!(backup.exists(), "expected a .yaml.bak backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        // The migrated config is valid new-format and parses cleanly.
+        dbd_core::config::read(&config).expect("migrated config should parse as DesignConfig");
+
+        // The stale file is gone.
+        assert!(!tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+
+        // The plural folder was renamed to its singular form.
+        assert!(!tmp.path().join("ddl/tables").exists());
+        assert!(tmp.path().join("ddl/table/public/thing.ddl").exists());
+    }
+
+    /// `dbml` writes one file per configured document when more than one is
+    /// declared, using each doc's own filter/output settings.
+    #[test]
+    fn dbml_writes_one_file_per_configured_document() {
+        let proj = testutil::copy_fixture_project();
+        let cfg_path = proj.path().join("design.yaml");
+        let original = std::fs::read_to_string(&cfg_path).unwrap();
+        let needle = "dbml:\n  base:\n    exclude:\n      schemas:\n        - staging\n        - extensions\n";
+        assert!(original.contains(needle), "fixture dbml block shape changed — update this test's patch");
+        let patched = original.replace(
+            needle,
+            "dbml:\n  base:\n    exclude:\n      schemas:\n        - staging\n        - extensions\n  extra:\n    output: extra.dbml\n    include:\n      schemas:\n        - config\n",
+        );
+        std::fs::write(&cfg_path, patched).unwrap();
+
+        let out = proj.path().join("schema.dbml"); // filename ignored in the multi-doc branch; only its dir matters
+        cmd_dbml(&cfg_path, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
+
+        assert!(proj.path().join("base.dbml").exists());
+        let extra_path = proj.path().join("extra.dbml");
+        assert!(extra_path.exists());
+        let extra_content = std::fs::read_to_string(&extra_path).unwrap();
+        assert!(extra_content.contains("config"), "extra.dbml should contain the config-schema tables");
+        assert!(!extra_content.contains("staging"), "extra.dbml should be filtered to the config schema only");
+    }
+
+    /// `reconcile_plan_lines` on an empty plan reports the in-sync message —
+    /// the early-return branch the other reconcile tests never take.
+    #[test]
+    fn reconcile_plan_lines_empty_plan_reports_in_sync() {
+        let plan = dbd_core::ReconcilePlan::default();
+        let out = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        assert_eq!(out, "Already in sync — no changes.");
+    }
+
+    /// Added/dropped entities, warnings, and the destructive-change notice all
+    /// render — dropped entities render differently depending on `--prune`.
+    #[test]
+    fn reconcile_plan_lines_covers_added_dropped_warnings_and_destructive() {
+        let plan = dbd_core::ReconcilePlan {
+            added: vec!["public.new_table".to_string()],
+            altered: vec![ReconcileStatement {
+                entity_name: "public.users".to_string(),
+                sql: "ALTER TABLE public.users ADD COLUMN email text;".to_string(),
+            }],
+            dropped: vec![ReconcileStatement {
+                entity_name: "public.orphan".to_string(),
+                sql: "DROP TABLE public.orphan CASCADE;".to_string(),
+            }],
+            warnings: vec!["enum value dropped".to_string()],
+            destructive: true,
+        };
+
+        let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");
+        assert!(pruned.contains("+ create public.new_table"), "got: {pruned}");
+        assert!(pruned.contains("~ alter  public.users"), "got: {pruned}");
+        assert!(pruned.contains("- prune  public.orphan"), "got: {pruned}");
+        assert!(pruned.contains("⚠ enum value dropped"), "got: {pruned}");
+        assert!(pruned.contains("--allow-destructive"), "got: {pruned}");
+
+        let unpruned = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        assert!(
+            unpruned.contains("· orphan public.orphan (use --prune to drop)"),
+            "got: {unpruned}"
+        );
+    }
+
+    /// `print_reconcile_plan` is the thin `output::always`-per-line wrapper
+    /// around `reconcile_plan_lines` — just needs to run without panicking.
+    #[test]
+    fn print_reconcile_plan_runs_for_a_populated_plan() {
+        print_reconcile_plan(&altered_plan(), false, Verbosity::Normal);
+    }
 }
