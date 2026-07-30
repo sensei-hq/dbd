@@ -30,6 +30,10 @@ impl SchemaDiff {
         let mut advisories = Vec::new();
         normalize_for_diff(&mut live, &mut advisories);
         normalize_for_diff(&mut desired, &mut advisories);
+        // Both sides normalize the same table/constraint, so an unparseable CHECK
+        // yields an identical advisory twice — collapse duplicates, keeping order.
+        let mut seen = std::collections::HashSet::new();
+        advisories.retain(|a| seen.insert(a.clone()));
         let changes = diff::diff(&live, &desired);
         let warnings = diff::migration_warnings(&changes);
         SchemaDiff { changes, warnings, advisories }
@@ -46,8 +50,6 @@ impl SchemaDiff {
 /// comments so they compare cleanly. `advisories` collects best-effort notes.
 pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
     normalize_common(snap);
-    // CHECK normalization (Task 5) added next.
-    let _ = advisories;
 
     for t in &mut snap.tables {
         // Lift any inline column FK into a table constraint (introspection form).
@@ -73,7 +75,36 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
             let cols: Vec<String> = i.columns.iter().map(|c| c.name.clone()).collect();
             !constraint_cols.contains(&cols)
         });
+
+        // Canonicalize CHECK expressions so equivalent spellings (extra parens,
+        // casts introduced by `pg_get_constraintdef`) don't read as drift. An
+        // expression we can't parse is left raw and flagged, never silently hidden.
+        for con in &mut t.table_constraints {
+            if let TableConstraint::Check { name, expression } = con {
+                match canonicalize_check_expr(expression) {
+                    Some(canon) => *expression = canon,
+                    None => advisories.push(format!(
+                        "CHECK {} on {}.{} couldn't be normalized — shown as changed; verify manually",
+                        name.as_deref().unwrap_or("(unnamed)"), t.schema, t.name
+                    )),
+                }
+            }
+        }
     }
+}
+
+/// Canonicalize a CHECK expression by parsing `SELECT 1 WHERE (<expr>)` with
+/// libpg_query and re-deparsing, so equivalent spellings (extra parens, casts)
+/// converge. Returns the bare canonical predicate (the `SELECT 1 WHERE `
+/// wrapper is stripped so the stored expression stays valid for SQL/JSON
+/// render). Returns `None` if the expression can't be parsed OR the deparse
+/// doesn't have the expected wrapper shape — caller records an advisory and
+/// leaves the raw text, so a real diff is never hidden or corrupted.
+fn canonicalize_check_expr(expr: &str) -> Option<String> {
+    let wrapped = format!("SELECT 1 WHERE ({expr})");
+    let parsed = pg_query::parse(&wrapped).ok()?;
+    let deparsed = parsed.deparse().ok()?;
+    deparsed.strip_prefix("SELECT 1 WHERE ").map(str::to_string)
 }
 
 /// Normalize a foreign key so a parsed (design) and an introspected (live) form
@@ -128,6 +159,53 @@ mod tests {
     fn fk(name: &str, col: &str, reft: &str, refc: &str, on_delete: Option<FkAction>) -> ForeignKey {
         ForeignKey { name: Some(name.into()), columns: vec![col.into()], ref_schema: None,
             ref_table: reft.into(), ref_columns: vec![refc.into()], on_delete, on_update: None }
+    }
+
+    fn check(name: &str, expr: &str) -> TableConstraint {
+        TableConstraint::Check { name: Some(name.into()), expression: expr.into() }
+    }
+
+    /// The same CHECK written with different (but equivalent) parenthesization
+    /// canonicalizes to the same form → no diff.
+    #[test]
+    fn equivalent_check_exprs_do_not_diff() {
+        let live = snap(TableSnapshot { table_constraints: vec![check("ck_total", "((total > 0))")], ..table(vec![col("total", "integer")]) });
+        let desired = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total > 0")], ..table(vec![col("total", "integer")]) });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(d.is_empty(), "equivalent CHECK exprs must not diff, got {:?}", d.changes);
+    }
+
+    /// A genuinely different CHECK predicate is still detected.
+    #[test]
+    fn changed_check_expr_is_detected() {
+        let live = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total > 0")], ..table(vec![col("total", "integer")]) });
+        let desired = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total >= 0")], ..table(vec![col("total", "integer")]) });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(!d.is_empty(), "changed CHECK predicate must surface");
+    }
+
+    /// An unparseable CHECK is surfaced with an advisory rather than hidden.
+    #[test]
+    fn unparseable_check_records_advisory() {
+        let mut adv = Vec::new();
+        let mut s = snap(TableSnapshot { table_constraints: vec![check("ck", "%%% not sql %%%")], ..table(vec![col("x", "integer")]) });
+        normalize_for_diff(&mut s, &mut adv);
+        assert!(!adv.is_empty(), "unparseable CHECK must record an advisory");
+    }
+
+    /// The canonicalized CHECK stored back into the snapshot is the BARE predicate,
+    /// not the `SELECT 1 WHERE ...` parse wrapper (which would corrupt generated
+    /// SQL and --json output).
+    #[test]
+    fn canonicalized_check_is_bare_predicate() {
+        let mut adv = Vec::new();
+        let mut s = snap(TableSnapshot { table_constraints: vec![check("ck", "((total > 0))")], ..table(vec![col("total", "integer")]) });
+        normalize_for_diff(&mut s, &mut adv);
+        match &s.tables[0].table_constraints[0] {
+            TableConstraint::Check { expression, .. } =>
+                assert_eq!(expression, "total > 0", "must store bare predicate, got: {expression}"),
+            other => panic!("expected a CHECK, got {other:?}"),
+        }
     }
 
     /// Live = introspected: FK as a NAMED table constraint, schema-qualified,
