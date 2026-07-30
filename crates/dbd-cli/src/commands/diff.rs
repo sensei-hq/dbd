@@ -1,0 +1,110 @@
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use dbd_core::design::Design;
+use dbd_core::SchemaDiff;
+
+use crate::output::{self, Verbosity};
+
+use super::get_adapter;
+
+/// Build the human-readable lines for a schema diff. Pure so it can be
+/// unit-tested. Each changed entity gets one summary line and, for alters, the
+/// generated SQL indented beneath; advisories and warnings follow.
+pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
+    use dbd_core::diff::{self, DiffAction};
+    if d.is_empty() {
+        return vec!["Live database is in sync with the design — no differences.".to_string()];
+    }
+    let mut lines = Vec::new();
+    for c in &d.changes {
+        match &c.action {
+            DiffAction::Add => lines.push(format!("  + create {}", c.entity_name)),
+            DiffAction::Drop => lines.push(format!("  - drop   {}", c.entity_name)),
+            DiffAction::Change(_) => {
+                lines.push(format!("  ~ alter  {}", c.entity_name));
+                let sql = diff::generate_migration_sql(std::slice::from_ref(c));
+                for l in sql.lines().filter(|l| !l.trim().is_empty()) {
+                    lines.push(format!("      {l}"));
+                }
+            }
+        }
+    }
+    for w in &d.warnings {
+        lines.push(format!("  ⚠ {w}"));
+    }
+    for a in &d.advisories {
+        lines.push(format!("  ⚠ advisory: {a}"));
+    }
+    lines
+}
+
+/// `dbd diff` — read-only full diff of the live database against the design.
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_diff(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+    json: bool,
+    exit_code: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))
+        .context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let adapter = get_adapter(config, database_url).await?;
+
+    let diff = design.diff_live(&*adapter, Some(&resolved)).await.context("Diff failed")?;
+
+    if json {
+        let doc = serde_json::to_string_pretty(&diff).context("Failed to serialize diff")?;
+        output::always(&doc);
+    } else {
+        for line in diff_report_lines(&diff) {
+            output::always(&line);
+        }
+    }
+
+    if let Some(code) = diff_exit_code(diff.is_empty(), exit_code) {
+        std::process::exit(code);
+    }
+    let _ = verbosity;
+    Ok(())
+}
+
+/// TEMPORARY stub — real terraform-style logic lands in Task 8 with its own test.
+fn diff_exit_code(_is_empty: bool, _flag: bool) -> Option<i32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbd_core::diff::{DiffAction, MigrationDiff};
+    use dbd_core::entity::EntityType;
+
+    fn add(name: &str) -> MigrationDiff {
+        MigrationDiff { entity_name: name.into(), entity_type: EntityType::Table, action: DiffAction::Add }
+    }
+
+    /// In-sync diff renders the friendly "no differences" line.
+    #[test]
+    fn renders_in_sync() {
+        let d = SchemaDiff::default();
+        let out = diff_report_lines(&d).join("\n");
+        assert!(out.contains("in sync"), "got: {out}");
+    }
+
+    /// A create shows a `+ create` line and advisories are surfaced.
+    #[test]
+    fn renders_changes_and_advisories() {
+        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![],
+            advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()] };
+        let out = diff_report_lines(&d).join("\n");
+        assert!(out.contains("+ create public.audit_log"), "got: {out}");
+        assert!(out.contains("advisory"), "advisory must render; got: {out}");
+    }
+}

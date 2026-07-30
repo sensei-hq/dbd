@@ -261,6 +261,17 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show the complete difference between the live database and the design
+    /// (read-only). Covers columns, PK/unique, foreign keys, CHECK constraints,
+    /// indexes, comments and enums — everything `reconcile --dry-run` omits.
+    Diff {
+        /// Emit the diff as JSON for tooling/CI
+        #[arg(long)]
+        json: bool,
+        /// Exit 2 when differences exist, 0 when in sync (errors exit 1)
+        #[arg(long)]
+        exit_code: bool,
+    },
     /// Reconcile the live database to the design in place (pre-release, declarative)
     ///
     /// Diffs the live schema against the design and applies ALTER/CREATE
@@ -308,7 +319,7 @@ mod tests {
         let cmds = [
             "inspect", "apply", "combine", "import", "graph", "dbml", "diagram", "deploy",
             "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
-            "policies", "reconcile", "release",
+            "policies", "diff", "reconcile", "release",
         ];
         for c in cmds {
             Cli::try_parse_from(["dbd", c])
@@ -377,6 +388,15 @@ mod tests {
             matches!(&cli.command, Commands::Deploy { no_cache: true, clear_cache: true, .. }),
             "expected deploy cache flags == true when present"
         );
+    }
+
+    /// `dbd diff` flags default to false and flip to true when present.
+    #[test]
+    fn diff_flags_parse() {
+        let cli = Cli::try_parse_from(["dbd", "diff"]).expect("diff parses");
+        assert!(matches!(&cli.command, Commands::Diff { json: false, exit_code: false }));
+        let cli = Cli::try_parse_from(["dbd", "diff", "--json", "--exit-code"]).expect("diff flags parse");
+        assert!(matches!(&cli.command, Commands::Diff { json: true, exit_code: true }));
     }
 
     /// `dbd reconcile` flags default to false and flip to true when present.
