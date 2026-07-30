@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<a href="{{ href }}" class="{{ cls }}">{{ label }}<sc-if value="{{ arrow }}" hint-placeholder-val="{{ true }}"><svg viewBox="0 0 16 16" class="size-3.5 flex-none" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8h10M9 4l4 4-4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></sc-if></a>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:200,&quot;height&quot;:60},&quot;label&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;Get started&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;href&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;#start&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;variant&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;accent&quot;,&quot;ghost&quot;],&quot;default&quot;:&quot;accent&quot;,&quot;tsType&quot;:&quot;'accent' | 'ghost'&quot;},&quot;size&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;sm&quot;,&quot;md&quot;,&quot;lg&quot;],&quot;default&quot;:&quot;md&quot;,&quot;tsType&quot;:&quot;'sm' | 'md' | 'lg'&quot;},&quot;arrow&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;}}">
+// The only button in the design. Variants and sizes come from uno shortcuts,
+// so every call site stays consistent — never hand-style a button.
+class Component extends DCLogic {
+  renderVals() {
+    const p = this.props;
+    const variant = p.variant || "accent";
+    const size = p.size || "md";
+    const base = variant === "ghost" ? "btn-ghost" : "btn-accent";
+    const pad = size === "sm" ? "px-5 py-2.5 text-body"
+      : size === "lg" ? "px-6 py-3 text-base"
+      : "px-5 py-3 text-base";
+    return {
+      cls: base + " " + pad,
+      href: p.href || "#",
+      label: p.label ?? "Get started",
+      arrow: p.arrow !== false,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

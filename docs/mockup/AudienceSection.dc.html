@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/content.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<section id="audience" class="section-plain">
+  <div class="shell relative z-1 py-section">
+    <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" align="center" hint-size="100%,140px"></dc-import>
+    <div class="mt-12 grid-4">
+      <sc-for list="{{ items }}" as="a" hint-placeholder-count="4">
+        <dc-import name="InfoCard" title="{{ a.title }}" body="{{ a.body }}" variant="compact" hint-size="100%,140px"></dc-import>
+      </sc-for>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const C = (typeof window !== "undefined" && window.DBD_CONTENT) || { audience: { items: [] } };
+    const a = C.audience;
+    return { eyebrow: a.eyebrow, title: a.title, items: a.items };
+  }
+}
+
+</script>
+</body>
+</html>

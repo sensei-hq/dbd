@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/content.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<section id="targets" class="section-band">
+  <div class="shell relative z-1 py-section">
+    <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" lede="{{ lede }}" hint-size="100%,200px"></dc-import>
+    <div class="mt-12 grid-4">
+      <sc-for list="{{ items }}" as="t" hint-placeholder-count="4">
+        <div class="card gap-4">
+          <h3 class="h3">{{ t.name }}</h3>
+          <code class="chip">{{ t.scheme }}</code>
+          <p class="copy">{{ t.body }}</p>
+          <ul class="mt-1 mb-0 flex flex-col gap-2 border-t border-line-soft px-0 pb-0 pt-4 list-none">
+            <sc-for list="{{ t.notes }}" as="n" hint-placeholder-count="3">
+              <li class="flex items-center gap-2.5 text-body text-muted"><span class="size-1 flex-none rounded-full bg-accent"></span>{{ n }}</li>
+            </sc-for>
+          </ul>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const C = (typeof window !== "undefined" && window.DBD_CONTENT) || { targets: { items: [] } };
+    const t = C.targets;
+    return { eyebrow: t.eyebrow, title: t.title, lede: t.lede, items: t.items };
+  }
+}
+
+</script>
+</body>
+</html>

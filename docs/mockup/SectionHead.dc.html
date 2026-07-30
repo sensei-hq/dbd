@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<div class="{{ wrapCls }}">
+  <div class="eyebrow"><span class="dot"></span>{{ eyebrow }}</div>
+  <h2 class="{{ titleCls }}">{{ title }}</h2>
+  <sc-if value="{{ lede }}" hint-placeholder-val="{{ true }}">
+    <p class="{{ ledeCls }}">{{ lede }}</p>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:760,&quot;height&quot;:220},&quot;eyebrow&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;What dbd handles&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;title&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;One SQL source. Everything else automated.&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;lede&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;align&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;start&quot;,&quot;center&quot;],&quot;default&quot;:&quot;start&quot;,&quot;tsType&quot;:&quot;'start' | 'center'&quot;},&quot;width&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;prose&quot;,&quot;full&quot;],&quot;default&quot;:&quot;prose&quot;,&quot;tsType&quot;:&quot;'prose' | 'full'&quot;}}">
+// Eyebrow + h2 + optional lede. Every section opens with one of these.
+class Component extends DCLogic {
+  renderVals() {
+    const p = this.props;
+    const centered = p.align === "center";
+    const width = p.width === "full" ? "" : " max-w-prose";
+    return {
+      wrapCls: centered ? "head-center" : "head-start",
+      titleCls: "h2" + width,
+      ledeCls: "lede" + width,
+      eyebrow: p.eyebrow ?? "Section",
+      title: p.title ?? "Section title",
+      lede: p.lede || null,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

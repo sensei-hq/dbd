@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/content.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<section id="start" class="section-band">
+  <div class="shell relative z-1 py-section">
+    <div class="overflow-hidden rounded-card border border-accent-line bg-surface">
+      <div class="grid gap-10 p-12 grid-cols-[1fr_1.1fr] lt-md:grid-cols-1 lt-md:gap-8 lt-sm:p-7">
+        <div class="head-start">
+          <div class="eyebrow"><span class="dot"></span>{{ eyebrow }}</div>
+          <h2 class="h2">{{ title }}</h2>
+          <p class="lede">{{ lede }}</p>
+          <div class="pt-2">
+            <dc-import name="Button" label="{{ ctaLabel }}" href="{{ ctaHref }}" size="lg" hint-size="180px,46px"></dc-import>
+          </div>
+        </div>
+        <div class="flex flex-col gap-3">
+          <sc-for list="{{ steps }}" as="s" hint-placeholder-count="3">
+            <div class="flex items-center gap-4 rounded-lg border border-line bg-code-bg px-5 py-4">
+              <span class="badge text-body">{{ s.n }}</span>
+              <div class="flex flex-col">
+                <span class="text-caption text-faint">{{ s.text }}</span>
+                <code class="font-mono text-body text-fg"><span class="text-accent">$ </span>{{ s.code }}</code>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const C = (typeof window !== "undefined" && window.DBD_CONTENT) || { start: { steps: [], cta: {} } };
+    const s = C.start;
+    return {
+      eyebrow: s.eyebrow, title: s.title, lede: s.lede, steps: s.steps,
+      ctaLabel: s.cta.label, ctaHref: s.cta.href,
+    };
+  }
+}
+
+</script>
+</body>
+</html>
