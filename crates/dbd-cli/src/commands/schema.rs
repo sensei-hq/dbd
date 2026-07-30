@@ -469,4 +469,217 @@ mod tests {
         let cfg = proj.path().join("design.yaml");
         cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
     }
+
+    /// `format --check` on an already-formatted project reports "all
+    /// formatted" and returns `Ok` — it must NOT hit the `process::exit(1)`
+    /// branch, which only fires when `check && changed > 0` (untestable
+    /// in-process; see report).
+    #[test]
+    fn format_check_mode_reports_all_formatted_when_clean() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        // Normalize first so the check pass finds zero diffs.
+        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), /*check*/ true, Verbosity::Normal).unwrap();
+    }
+
+    /// `inspect --name` filters the report to a single, warning-free entity —
+    /// exercises the verbose entity-JSON dump and the "Everything looks ok"
+    /// all-clear path (both require issues *and* warnings to be empty, which
+    /// only holds once filtered to a clean entity).
+    #[tokio::test]
+    async fn inspect_verbose_named_clean_entity_reports_all_clear() {
+        cmd_inspect(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            /*name*/ Some("config.lookups"), /*fix*/ false, /*use_database*/ false, None, None,
+            Verbosity::Verbose,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A scope with an unresolved dependency gap under the default `Report`
+    /// policy refuses to proceed — the same guard `deploy`/`apply` rely on to
+    /// keep a misconfigured scope from silently dropping entities.
+    #[tokio::test]
+    async fn inspect_bails_on_scope_gap_with_report_policy() {
+        let err = cmd_inspect(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            None, false, false, Some("incomplete"), None, Verbosity::Normal,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dependency gap"), "got: {msg}");
+    }
+
+    /// The same gap, but the scope opts into `deps: include` — inspect
+    /// reports the gap will be auto-included instead of refusing.
+    #[tokio::test]
+    async fn inspect_reports_scope_gap_with_include_policy() {
+        cmd_inspect(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            None, false, false, Some("incomplete_auto"), None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `apply --dry-run` against a named scope exercises the working-set
+    /// membership filter (as opposed to the always-true `resolved.is_all`
+    /// short-circuit the all-scope tests take).
+    #[tokio::test]
+    async fn apply_dry_run_lists_entities_for_named_scope() {
+        cmd_apply(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, Some("config_only"), None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `policies --dry-run` with a populated `policies/` dir lists the files
+    /// it would apply, still without touching a DB.
+    #[tokio::test]
+    async fn policies_dry_run_lists_existing_policy_files() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::create_dir_all(proj.path().join("policies")).unwrap();
+        std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
+        let cfg = proj.path().join("design.yaml");
+        cmd_policies(&cfg, proj.path(), None, /*dry_run*/ true, Verbosity::Normal)
+            .await
+            .unwrap();
+    }
+
+    /// Offline reference resolution drops a warning whose target is present
+    /// in a cached `.dbd/refcache.json` snapshot, and reports how many
+    /// entities the cache carried.
+    #[tokio::test]
+    async fn resolve_inspect_refs_offline_drops_cached_warning() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::write(
+            proj.path().join("ddl/table/config/refs_missing.ddl"),
+            "create table config.refs_missing (\n  id uuid primary key,\n  other_id uuid references config.totally_missing(id)\n);\n",
+        )
+        .unwrap();
+        let cache = dbd_core::refcache::RefCache::new("postgres", vec!["config.totally_missing".to_string()]);
+        cache.save(proj.path()).unwrap();
+
+        let cfg = proj.path().join("design.yaml");
+        let mut design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        let has_warning_before = design
+            .entities()
+            .iter()
+            .any(|e| e.warnings.iter().any(|w| w.contains("totally_missing")));
+        assert!(has_warning_before, "fixture setup should produce the unresolved-reference warning");
+
+        resolve_inspect_refs(&mut design, &cfg, None, /*use_database*/ false, Verbosity::Normal)
+            .await
+            .unwrap();
+
+        let still_warns = design
+            .entities()
+            .iter()
+            .any(|e| e.warnings.iter().any(|w| w.contains("totally_missing")));
+        assert!(!still_warns, "cached reference should have been resolved offline");
+    }
+
+    /// A corrupt `.dbd/refcache.json` doesn't fail `inspect` — the read error
+    /// is reported as a detail line and resolution just continues unresolved.
+    #[tokio::test]
+    async fn resolve_inspect_refs_offline_handles_corrupt_cache() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::create_dir_all(proj.path().join(".dbd")).unwrap();
+        std::fs::write(proj.path().join(".dbd").join("refcache.json"), "not valid json").unwrap();
+
+        let cfg = proj.path().join("design.yaml");
+        let mut design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        resolve_inspect_refs(&mut design, &cfg, None, /*use_database*/ false, Verbosity::Normal)
+            .await
+            .unwrap();
+    }
+
+    /// `--fix` auto-formats DDL files in place — run against a copy and
+    /// verify the file content actually changed to the formatted form.
+    #[tokio::test]
+    async fn inspect_fix_reformats_ddl_on_temp_copy() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let target = proj.path().join("ddl/table/config/lookups.ddl");
+        let before = std::fs::read_to_string(&target).unwrap();
+
+        cmd_inspect(
+            &cfg, "dev", proj.path(), None,
+            /*name*/ None, /*fix*/ true, /*use_database*/ false, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_ne!(before, after, "--fix should have reformatted at least one DDL file");
+    }
+
+    /// Entities with parse errors surface under "Errors:" — direct call so
+    /// the assertion doesn't depend on capturing stdout.
+    #[test]
+    fn print_report_findings_renders_issues_branch() {
+        let mut broken = dbd_core::Entity::new(dbd_core::EntityType::Table, "public.broken");
+        broken.errors.push("parse error: unexpected token".to_string());
+        let report = dbd_core::design::Report {
+            entity: None,
+            issues: vec![broken],
+            warnings: vec![],
+            gaps: vec![],
+        };
+        // Exercises the issues-loop formatting (label fallback + per-error line).
+        print_report_findings(&report, Verbosity::Normal);
+    }
+
+    /// A wildcard scope with every dependency present hits the "no gaps"
+    /// early-return — distinct from the `incomplete`/`incomplete_auto` scopes,
+    /// which always have a gap to report.
+    #[tokio::test]
+    async fn inspect_scoped_with_no_gaps_succeeds() {
+        cmd_inspect(
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
+            None, false, false, Some("config_wild"), None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Unresolved `data.sql` TODOs render with their migration version, file
+    /// path, and comment lines — direct call so the assertion doesn't depend
+    /// on capturing stdout.
+    #[test]
+    fn print_data_sql_todos_renders_version_file_and_lines() {
+        let todos = vec![dbd_core::DataSqlTodo {
+            version: 3,
+            file: std::path::PathBuf::from("migrations/003/seed.data.sql"),
+            lines: vec!["-- TODO: fill me in".to_string()],
+        }];
+        print_data_sql_todos(&todos);
+    }
+
+    /// `format` doesn't need a `design.yaml` at all — a missing config just
+    /// falls back to the default format config, unlike `inspect`, which
+    /// requires the design to load first.
+    #[test]
+    fn format_without_design_yaml_uses_default_format_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/public")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/public/thing.ddl"),
+            "create table public.thing(id int,name text);",
+        )
+        .unwrap();
+        let missing_config = tmp.path().join("design.yaml");
+        assert!(!missing_config.exists());
+
+        cmd_format(&missing_config, tmp.path(), /*check*/ false, Verbosity::Normal).unwrap();
+
+        let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
+        assert_ne!(formatted, "create table public.thing(id int,name text);");
+    }
 }

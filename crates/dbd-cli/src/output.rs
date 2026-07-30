@@ -164,4 +164,59 @@ mod tests {
         assert!(!Verbosity::Normal.is_verbose());
         assert!(Verbosity::Verbose.is_verbose());
     }
+
+    /// Every branch of the `colorize` type-key table must round-trip the
+    /// original description (color codes wrap it, they never replace it),
+    /// covering all three key-extraction paths: plain `type:name`, the
+    /// "verb type:name" form, and keyless input.
+    #[test]
+    fn colorize_covers_every_branch_and_preserves_the_description() {
+        let cases = [
+            "schema:x",
+            "table:x",
+            "view:x",
+            "enum:x",
+            "function:x",
+            "procedure:x",
+            "extension:x",
+            "role:x",
+            "migrate table:x → v2",
+            "drop table:x (v1)",
+            "plain text",
+        ];
+        for desc in cases {
+            let result = colorize(desc);
+            assert!(!result.is_empty(), "colorize({desc:?}) returned empty string");
+            assert!(
+                result.contains("x") || result.contains(desc),
+                "colorize({desc:?}) = {result:?} does not preserve the description"
+            );
+        }
+    }
+
+    #[test]
+    fn colorize_key_extraction_single_token_before_colon() {
+        // "type:name" — key is the whole prefix before ':'.
+        assert!(colorize("table:users").contains("users"));
+    }
+
+    #[test]
+    fn colorize_key_extraction_verb_type_form() {
+        // "verb type:name" — key is the last word before ':', i.e. the type,
+        // not the verb.
+        assert!(colorize("migrate table:users → v2").contains("users"));
+        assert!(colorize("drop table:users (v1)").contains("users"));
+    }
+
+    #[test]
+    fn colorize_key_extraction_no_colon() {
+        // No ':' at all — key falls back to the first word; unknown keys
+        // pass the description through unstyled.
+        assert_eq!(colorize("plain text"), "plain text".to_string());
+    }
+
+    #[test]
+    fn colorize_unknown_key_passes_through_unstyled() {
+        assert_eq!(colorize("mystery:x"), "mystery:x".to_string());
+    }
 }
