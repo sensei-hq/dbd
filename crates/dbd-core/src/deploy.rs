@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "deploy")]
 use async_trait::async_trait;
+#[cfg(feature = "deploy")]
+use std::path::Component;
 
 use crate::error::{DbdError, Result};
 use crate::github;
@@ -173,11 +175,21 @@ fn extract_tarball(bytes: &[u8], cache_dir: &Path) -> Result<()> {
             continue;
         }
 
-        // Validate no path traversal
-        let dest = cache_dir.join(&stripped);
-        if !dest.starts_with(cache_dir) {
+        // Reject path traversal: a stripped path made only of `Normal`
+        // (and `CurDir`) components cannot escape `cache_dir` once joined.
+        // Checking `dest.starts_with(cache_dir)` *after* joining does not
+        // work — `Path::join`/`Path::starts_with` don't resolve `..`, so a
+        // joined path always lexically "starts with" its base regardless of
+        // any `..` components inside it. The check has to happen on the
+        // pre-join relative path instead.
+        if stripped
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
             continue; // Skip paths that would escape cache dir
         }
+
+        let dest = cache_dir.join(&stripped);
 
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&dest)?;
@@ -360,12 +372,18 @@ mod tests {
         enc.finish().expect("gzip finish to Vec")
     }
 
-    /// Build a `.tar.gz` with a single entry whose raw path bytes are
-    /// written directly (bypassing `tar::Header::set_path`'s own `".."`
-    /// rejection), simulating a hand-crafted/malicious tarball rather than
-    /// one produced by this crate's own `tar::Builder` usage.
+    /// Build a `.tar.gz` with one entry whose raw path bytes are written
+    /// directly (bypassing `tar::Header::set_path`'s own `".."` rejection),
+    /// simulating a hand-crafted/malicious tarball rather than one produced
+    /// by this crate's own `tar::Builder` usage, plus normal `benign_files`
+    /// appended the ordinary way — so a test can confirm the malicious
+    /// entry is skipped while its neighbors still extract.
     #[cfg(feature = "deploy")]
-    fn build_malicious_tarball(raw_entry_path: &str, contents: &[u8]) -> Vec<u8> {
+    fn build_malicious_tarball(
+        raw_entry_path: &str,
+        contents: &[u8],
+        benign_files: &[(&str, &[u8])],
+    ) -> Vec<u8> {
         let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
 
@@ -376,6 +394,14 @@ mod tests {
         header.as_old_mut().name[..name_bytes.len()].copy_from_slice(name_bytes);
         header.set_cksum();
         builder.append(&header, contents).unwrap();
+
+        for (rel_path, data) in benign_files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, format!("repo-main/{rel_path}"), *data).unwrap();
+        }
 
         let enc = builder.into_inner().expect("write tarball to Vec");
         enc.finish().expect("gzip finish to Vec")
@@ -464,42 +490,39 @@ mod tests {
         }
 
         #[test]
-        fn extract_tarball_traversal_guard_matches_current_behavior() {
-            // KNOWN GAP, pre-existing and NOT introduced by this refactor:
+        fn extract_tarball_rejects_parent_dir_traversal() {
+            // Regression test for a real arbitrary-file-write (CWE-22):
             // `dest = cache_dir.join(stripped)` followed by
-            // `dest.starts_with(cache_dir)` can never reject a relative
-            // ".." escape on Unix. `Path::join(x)` only re-roots onto `x`
-            // when `x` itself is absolute; otherwise it *always* appends
-            // `x`'s components after `cache_dir`'s, so the result trivially
-            // starts_with `cache_dir` regardless of ".." components inside
-            // `x` — `Path::starts_with` is a lexical component-prefix
-            // check, it does not resolve "..". And since `stripped` is
-            // built by `.skip(1)`-ing a `Components` iterator, it can never
-            // itself become absolute (`RootDir` can only ever be the first
-            // component). So the `continue` guard branch is unreachable
-            // dead code as currently written: this check cannot fire for
-            // ANY input on Unix. (Independently confirmed by this session's
-            // semgrep "Path Traversal" finding on this exact line.)
-            //
-            // This test is a characterization test: it locks in *today's*
-            // observed behavior unchanged by the refactor, per the task's
-            // instruction to keep the guard's logic verbatim. It is not an
-            // assertion that the behavior is safe — a follow-up fix should
-            // reject any `stripped` path containing a `Component::ParentDir`
-            // (or canonicalize `dest`/`cache_dir` before comparing) instead
-            // of relying on `starts_with` alone.
+            // `dest.starts_with(cache_dir)` could never reject a relative
+            // ".." escape on Unix — `Path::join`/`Path::starts_with` don't
+            // resolve "..", so a joined path always lexically "starts with"
+            // its base regardless of ".." components inside it. The fix
+            // rejects any stripped path containing a non-`Normal`/`CurDir`
+            // component *before* joining, which this test verifies: the
+            // malicious entry (raw header bytes, bypassing `tar::Header::
+            // set_path`'s own ".." rejection, to simulate a hand-crafted
+            // tarball) must be skipped entirely — not extracted outside
+            // `cache_dir`, nor smuggled inside it — while a benign entry in
+            // the same tarball is still extracted normally.
             let tmp = TempDir::new().unwrap();
             let dest = tmp.path().join("dest");
-            let bytes = build_malicious_tarball("repo-main/../escaped.txt", b"pwned");
+            let bytes = build_malicious_tarball(
+                "repo-main/../escaped.txt",
+                b"pwned",
+                &[("design.yaml", b"project:\n  name: test\n")],
+            );
 
             extract_tarball(&bytes, &dest).unwrap();
 
-            let escaped = tmp.path().join("escaped.txt");
-            assert!(
-                escaped.exists(),
-                "documents current guard behavior: this entry is not rejected"
-            );
+            // Rejected: lands neither outside cache_dir nor inside it.
+            assert!(!tmp.path().join("escaped.txt").exists());
             assert!(!dest.join("escaped.txt").exists());
+
+            // Only the malicious entry is skipped — its neighbor still extracts.
+            assert_eq!(
+                std::fs::read_to_string(dest.join("design.yaml")).unwrap(),
+                "project:\n  name: test\n"
+            );
         }
     }
 
