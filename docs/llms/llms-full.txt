@@ -475,6 +475,26 @@ diffed on existing tables (introspected vs parsed forms diverge) — change thos
 via `dbd snapshot`. Generated ALTERs run with the managed schemas on
 `search_path`, mirroring the DDL files.
 
+### dbd diff
+
+Read-only. Show the complete difference between the live database and the
+design — columns, PK/unique, foreign keys, CHECK constraints, indexes, column
+comments and enums: everything `reconcile --dry-run` omits. Never writes, and
+available even after `dbd release`.
+
+```sh
+dbd diff -d $DATABASE_URL              # human report (summary + SQL)
+dbd diff -d $DATABASE_URL --json       # structured diff for tooling/CI
+dbd diff -d $DATABASE_URL --exit-code  # 0 in sync, 2 on drift, 1 on error
+```
+
+The desired schema is parsed from DDL, the live schema introspected; dbd
+normalizes representation noise (type aliases, default casts, enum
+qualification, PK/UNIQUE-backing indexes, FK `NO ACTION`/auto-generated names,
+CHECK-expression parenthesization via libpg_query) so only real drift shows. An
+unparseable CHECK is shown flagged `advisory`. Covers tables + enums only
+(views/functions/roles/sequences are not structurally diffed).
+
 ### dbd release (alias: dbd baseline)
 
 Cut the first version: write a **baseline snapshot** at the current
