@@ -46,7 +46,7 @@ impl SchemaDiff {
 /// comments so they compare cleanly. `advisories` collects best-effort notes.
 pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
     normalize_common(snap);
-    // Index (Task 4) + CHECK (Task 5) normalization added next.
+    // CHECK normalization (Task 5) added next.
     let _ = advisories;
 
     for t in &mut snap.tables {
@@ -60,6 +60,19 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
                 normalize_fk(fk);
             }
         }
+
+        // Drop indexes that merely back a PK/UNIQUE constraint — introspection
+        // reports them, the parsed design does not. Match by covered columns.
+        let constraint_cols: std::collections::HashSet<Vec<String>> = t.table_constraints.iter()
+            .filter_map(|c| match c {
+                TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => Some(columns.clone()),
+                _ => None,
+            })
+            .collect();
+        t.indexes.retain(|i| {
+            let cols: Vec<String> = i.columns.iter().map(|c| c.name.clone()).collect();
+            !constraint_cols.contains(&cols)
+        });
     }
 }
 
@@ -92,12 +105,18 @@ fn normalize_fk_action(a: &mut Option<FkAction>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, FkAction, ForeignKey, TableConstraint};
+    use crate::entity::{ColumnDef, FkAction, ForeignKey, IndexColumn, IndexDef, TableConstraint};
     use crate::snapshot::{Snapshot, TableSnapshot};
 
     fn col(name: &str, ty: &str) -> ColumnDef {
         ColumnDef { name: name.into(), data_type: ty.into(), nullable: true, default_value: None,
             is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None }
+    }
+
+    fn idx(name: &str, cols: &[&str], unique: bool) -> IndexDef {
+        IndexDef { name: Some(name.into()),
+            columns: cols.iter().map(|c| IndexColumn { name: (*c).into(), order: None }).collect(),
+            unique, index_type: None }
     }
     fn table(cols: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot { name: "users".into(), schema: "public".into(), columns: cols, indexes: vec![], table_constraints: vec![] }
@@ -164,5 +183,32 @@ mod tests {
         let desired = snap(table(vec![ColumnDef { comment: Some("new".into()), ..col("id", "integer") }]));
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "comment change must surface");
+    }
+
+    /// The implicit index backing a PK (live-only, from introspection) is not a
+    /// real drift and must be suppressed.
+    #[test]
+    fn pk_backing_index_is_suppressed() {
+        let live = snap(TableSnapshot {
+            table_constraints: vec![TableConstraint::PrimaryKey { name: Some("users_pkey".into()), columns: vec!["id".into()] }],
+            indexes: vec![idx("users_pkey", &["id"], true)], // introspection reports the backing index
+            ..table(vec![ColumnDef { nullable: false, is_pk: true, ..col("id", "integer") }])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![],
+            indexes: vec![],
+            ..table(vec![ColumnDef { nullable: false, is_pk: true, ..col("id", "integer") }])
+        });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(d.is_empty(), "PK-backing index must not surface as a diff, got {:?}", d.changes);
+    }
+
+    /// A genuine secondary index add is still detected.
+    #[test]
+    fn secondary_index_add_is_detected() {
+        let live = snap(table(vec![col("email", "text")]));
+        let desired = snap(TableSnapshot { indexes: vec![idx("users_email_idx", &["email"], false)], ..table(vec![col("email", "text")]) });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(!d.is_empty(), "new index must surface");
     }
 }
