@@ -113,6 +113,26 @@ mod tests {
         assert!(out.contains("advisory"), "advisory must render; got: {out}");
     }
 
+    /// Locks the top-level `--json` shape (keys tooling depends on) plus the
+    /// per-change `entity_name`/`entity_type`/`action` discriminant so a
+    /// rename or a switch away from serde's default enum representation
+    /// trips this test instead of silently breaking downstream tooling.
+    #[test]
+    fn json_shape_is_stable() {
+        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![], advisories: vec![] };
+        let json = serde_json::to_string(&d).unwrap();
+        // Top-level keys tooling depends on.
+        assert!(json.contains("\"changes\""), "got: {json}");
+        assert!(json.contains("\"warnings\""), "got: {json}");
+        assert!(json.contains("\"advisories\""), "got: {json}");
+        assert!(json.contains("public.audit_log"), "got: {json}");
+        // Per-change fields and the `Add` unit-variant discriminant, so a
+        // field rename or enum-representation change fails this test.
+        assert!(json.contains("\"entity_name\":\"public.audit_log\""), "got: {json}");
+        assert!(json.contains("\"entity_type\":\"table\""), "got: {json}");
+        assert!(json.contains("\"action\":\"Add\""), "got: {json}");
+    }
+
     #[test]
     fn exit_code_semantics() {
         assert_eq!(diff_exit_code(true, false), None);   // flag off → no forced exit
