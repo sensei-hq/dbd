@@ -256,11 +256,16 @@ and no version bump**. Ideal while the schema is still churning and cutting a sn
 overkill.
 
 ```sh
-dbd reconcile --dry-run -d $DATABASE_URL              # Preview the plan
+dbd reconcile --dry-run -d $DATABASE_URL              # Preview the plan (entity summary)
+dbd reconcile --dry-run -v -d $DATABASE_URL           # Preview + show the column-level ALTER SQL
 dbd reconcile -d $DATABASE_URL                        # Apply (create + alter)
 dbd reconcile --allow-destructive -d $DATABASE_URL    # Also drop columns/constraints
 dbd reconcile --prune -d $DATABASE_URL                # Also drop orphaned tables
 ```
+
+The plan lists one line per changed entity (`+ create`, `~ alter`, `- prune`). Add `-v` to a
+`--dry-run` to print the generated `ALTER` SQL beneath each altered entity, so you can review the
+exact column-level change before applying.
 
 The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
 schemas. Two kinds of destruction each need an explicit opt-in:
@@ -585,7 +590,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.19
+  rev: v0.8.20
   hooks:
     - id: dbd-format
 ```
