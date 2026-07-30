@@ -88,6 +88,11 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
                         name.as_deref().unwrap_or("(unnamed)"), t.schema, t.name
                     )),
                 }
+                // Postgres auto-names every CHECK; the parser leaves inline CHECKs
+                // unnamed. Compare by (canonicalized) expression, not name — mirrors
+                // normalize_fk. constraint_key then falls back to `ck:{expr}` on both
+                // sides. (advisory above is built first, so it keeps the real name.)
+                *name = None;
             }
         }
     }
@@ -191,6 +196,24 @@ mod tests {
         let mut s = snap(TableSnapshot { table_constraints: vec![check("ck", "%%% not sql %%%")], ..table(vec![col("x", "integer")]) });
         normalize_for_diff(&mut s, &mut adv);
         assert!(!adv.is_empty(), "unparseable CHECK must record an advisory");
+    }
+
+    /// Introspection names every CHECK (e.g. `items_total_check`); the parser leaves
+    /// an inline CHECK unnamed. They must match by canonicalized expression, not name
+    /// — otherwise every unnamed CHECK shows as phantom drift and `dbd diff
+    /// --exit-code` falsely reports drift on an in-sync DB.
+    #[test]
+    fn unnamed_check_matches_named_introspected_check() {
+        let live = snap(TableSnapshot {
+            table_constraints: vec![check("items_total_check", "((total > 0))")],
+            ..table(vec![col("total", "integer")])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![TableConstraint::Check { name: None, expression: "total > 0".into() }],
+            ..table(vec![col("total", "integer")])
+        });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(d.is_empty(), "unnamed CHECK must match named introspected CHECK, got {:?}", d.changes);
     }
 
     /// The canonicalized CHECK stored back into the snapshot is the BARE predicate,
