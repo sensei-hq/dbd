@@ -1,7 +1,7 @@
 {
 	"name": "site",
 	"private": true,
-	"version": "0.8.22",
+	"version": "0.8.23",
 	"type": "module",
 	"scripts": {
 		"sync:content": "node scripts/copy-content.mjs",
@@ -13,6 +13,7 @@
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"test": "vitest run",
 		"test:viewer": "vitest run src/lib/viewer"
 	},
 	"devDependencies": {

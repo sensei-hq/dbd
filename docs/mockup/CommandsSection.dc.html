@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/content.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<section id="commands" class="section-band">
+  <div class="shell relative z-1 py-section">
+    <dc-import name="SectionHead" eyebrow="{{ eyebrow }}" title="{{ title }}" lede="{{ lede }}" hint-size="100%,200px"></dc-import>
+    <div class="mt-10 grid-2">
+      <sc-for list="{{ items }}" as="c" hint-placeholder-count="8">
+        <div class="flex items-baseline gap-4 rounded-xl border border-line bg-surface px-5 py-4">
+          <code class="flex-none font-mono text-cmd text-accent">{{ c.cmd }}</code>
+          <p class="text-body leading-[1.55] text-muted text-pretty m-0">{{ c.body }}</p>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const C = (typeof window !== "undefined" && window.DBD_CONTENT) || { commands: { items: [] } };
+    const c = C.commands;
+    return { eyebrow: c.eyebrow, title: c.title, lede: c.lede, items: c.items };
+  }
+}
+
+</script>
+</body>
+</html>

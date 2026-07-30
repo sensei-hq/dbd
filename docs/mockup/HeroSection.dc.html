@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="dbd/fonts.css">
+<script src="dbd/uno.config.js"></script>
+<script src="dbd/content.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@unocss/runtime@0.61.9/uno.global.js"></script>
+</helmet>
+<section id="top" class="section-plain overflow-hidden">
+  <div class="shell relative grid items-center gap-12 pt-16 pb-section grid-cols-[1.15fr_0.85fr] lt-lg:grid-cols-1 lt-lg:gap-10 lt-lg:pt-10">
+    <div class="animate-rise flex flex-col items-start gap-6">
+      <div class="eyebrow"><span class="dot"></span>{{ eyebrow }}</div>
+      <h1 class="h1">{{ titleA }}<br><span class="text-accent">{{ titleB }}</span></h1>
+      <p class="max-w-copy text-lede text-muted text-pretty m-0">{{ lede }}</p>
+      <div class="flex items-center gap-3 pt-1 lt-sm:flex-wrap">
+        <dc-import name="Button" label="{{ primaryLabel }}" href="{{ primaryHref }}" hint-size="150px,46px"></dc-import>
+        <dc-import name="Button" label="{{ secondaryLabel }}" href="{{ secondaryHref }}" variant="ghost" arrow="{{ false }}" hint-size="180px,46px"></dc-import>
+        <div class="inline-flex flex-none items-center gap-2.5 rounded-lg border border-line bg-surface px-3.5 py-2.5 font-mono text-body whitespace-nowrap">
+          <span class="text-accent">$</span><span class="text-fg">{{ install }}</span>
+        </div>
+      </div>
+    </div>
+    <div class="min-w-0 animate-rise [animation-delay:120ms]">
+      <dc-import name="CodeFrame" mode="terminal" label="{{ terminalFile }}" lines="{{ terminalLines }}" hint-size="100%,260px"></dc-import>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;titleA&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;Your database schema,&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;titleB&quot;:{&quot;editor&quot;:&quot;text&quot;,&quot;default&quot;:&quot;managed like source code.&quot;,&quot;tsType&quot;:&quot;string&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const C = (typeof window !== "undefined" && window.DBD_CONTENT) || { hero: { primaryCta: {}, secondaryCta: {}, terminal: {} } };
+    const h = C.hero;
+    return {
+      eyebrow: h.eyebrow,
+      titleA: this.props.titleA ?? h.titleA,
+      titleB: this.props.titleB ?? h.titleB,
+      lede: h.lede,
+      install: h.install,
+      primaryLabel: h.primaryCta.label,
+      primaryHref: h.primaryCta.href,
+      secondaryLabel: h.secondaryCta.label,
+      secondaryHref: h.secondaryCta.href,
+      terminalFile: h.terminal.file,
+      terminalLines: h.terminal.lines,
+    };
+  }
+}
+
+</script>
+</body>
+</html>
