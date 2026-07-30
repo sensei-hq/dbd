@@ -290,6 +290,36 @@ reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`
 
 ---
 
+## `dbd diff`
+
+Read-only. Show the complete difference between the live database and the design —
+**everything `reconcile --dry-run` omits**: foreign keys, CHECK constraints, indexes,
+and column comments, in addition to columns, PK/unique, and enums. Never writes, and
+available even after `dbd release`.
+
+```sh
+dbd diff -d $DATABASE_URL                 # Human report (summary + SQL)
+dbd diff -d $DATABASE_URL --json          # Structured diff for tooling/CI
+dbd diff -d $DATABASE_URL --exit-code     # Exit 0 in sync, 2 on drift, 1 on error
+dbd diff --scope hub -d $HUB_URL          # Restrict to a scope's working set
+```
+
+The desired schema is parsed from your DDL; the live schema is introspected. dbd normalizes
+representation noise (type aliases, default casts, enum qualification, PK/UNIQUE-backing
+indexes, FK `NO ACTION` defaults and auto-generated FK names, and CHECK-expression
+parenthesization via the Postgres parser) so only real drift is reported. A CHECK expression
+that can't be parsed is still shown, flagged `advisory` so you verify it by hand.
+
+**Scope:** diff covers **tables and enums** and all their attributes;
+views/functions/roles/sequences are not structurally diffed.
+
+**Best-effort edges** (reported, but may need a human glance): a foreign key that references a
+table in the *same non-public schema* without qualifying it can read as drift; a standalone
+index whose columns exactly match a PK/UNIQUE constraint is treated as that constraint's
+backing index and suppressed; an unparseable CHECK is shown with an `advisory`.
+
+---
+
 ## `dbd release` (alias `dbd baseline`)
 
 Cut the first version: write a **baseline snapshot** at the current `project.version` (the anchor
@@ -590,7 +620,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.20
+  rev: v0.8.21
   hooks:
     - id: dbd-format
 ```

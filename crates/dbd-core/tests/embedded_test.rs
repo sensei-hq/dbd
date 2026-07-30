@@ -1317,6 +1317,41 @@ async fn reconcile_dry_run_is_read_only() {
     assert_table_absent(&*adapter, "app", "items").await; // nothing created
 }
 
+/// `diff_live` reports drift against a live database and writes nothing.
+#[tokio::test]
+async fn diff_live_reports_drift_and_writes_nothing() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "diff_live_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: diff_live_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id uuid primary key);\n",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+    let diff = design.diff_live(&*adapter, None).await.expect("diff_live failed");
+
+    assert!(!diff.is_empty(), "a design table absent from the live DB must show drift");
+    assert!(
+        diff.changes.iter().any(|c| c.entity_name == "app.items"),
+        "drift should name the missing table, got {:?}",
+        diff.changes
+    );
+    assert_table_absent(&*adapter, "app", "items").await; // diff wrote nothing
+}
+
 // ── Batch transaction (atomic apply) ──────────────────────────────────────────
 
 #[tokio::test]

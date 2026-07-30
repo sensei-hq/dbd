@@ -1317,6 +1317,74 @@ impl Design {
         Ok(plan)
     }
 
+    /// Read-only: introspect the live database and return the complete
+    /// difference against the design. Never writes. Unlike `reconcile`, this is
+    /// available even after the project is released.
+    pub async fn diff_live(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<crate::SchemaDiff> {
+        use crate::reconcile::{snapshot_from_entities, DEFAULT_SCHEMA};
+        use std::collections::HashSet;
+
+        // Batch adapters (e.g. Convex) have no live SQL schema to diff.
+        if adapter.prefers_batch_apply() {
+            return Err(DbdError::Config(
+                "diff is not supported for this target (no live SQL schema to diff)".to_string(),
+            ));
+        }
+
+        // Resolve scope → working set, gap-gate under `report` (abort before writes).
+        let working_set: Option<HashSet<String>> = match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                Some(self.working_set(s)?)
+            }
+            _ => None,
+        };
+
+        // Desired entities: valid, non-external, in scope — in dependency order.
+        let desired_entities: Vec<&Entity> = self
+            .entities
+            .iter()
+            .filter(|e| e.errors.is_empty())
+            .filter(|e| e.entity_type != EntityType::External)
+            .filter(|e| match (&working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
+            .collect();
+
+        // Desired snapshot (tables + enums, schema-normalized).
+        let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
+        let desired = snapshot_from_entities(&desired_owned);
+
+        // Schemas the design manages. The diff is scoped to these, so it never
+        // reports drift for tables in schemas the project doesn't own.
+        let managed_schemas: HashSet<String> = desired_entities
+            .iter()
+            .map(|e| match e.entity_type {
+                EntityType::Schema => e.name.clone(),
+                _ => {
+                    let s = e.schema.clone().unwrap_or_default();
+                    if s.is_empty() {
+                        DEFAULT_SCHEMA.to_string()
+                    } else {
+                        s
+                    }
+                }
+            })
+            .collect();
+
+        // Live snapshot, restricted to managed schemas.
+        let live_entities = adapter.introspect().await?;
+        let live_full = snapshot_from_entities(&live_entities);
+        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
+
+        Ok(crate::SchemaDiff::compute(live, desired))
+    }
+
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
     /// Procedure matching is based on reads/writes analysis, not naming convention:
@@ -1939,6 +2007,23 @@ mod tests {
 
         design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
         assert!(!mock.applied_names().is_empty());
+    }
+
+    // ── diff_live (read-only) ──────────────────────────────
+
+    /// diff_live is read-only and reports drift: an empty live DB (MockAdapter's
+    /// introspect() returns no entities) against a non-empty design yields a
+    /// non-empty diff, and applies/executes nothing.
+    #[tokio::test]
+    async fn diff_live_reports_drift_read_only() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new(); // empty live DB
+
+        let d = design.diff_live(&mock, None).await.unwrap();
+        assert!(!d.is_empty(), "empty live DB vs a non-empty design must show drift");
+        assert!(mock.applied_names().is_empty(), "diff_live must not apply anything");
+        assert_eq!(mock.script_count(), 0, "diff_live must not execute any script");
     }
 
     // ── Transactional apply (atomic batch) ───────────────
