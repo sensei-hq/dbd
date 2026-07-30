@@ -50,29 +50,33 @@ export function buildEdges(data: LayoutData, cards: Cards): Edge[] {
   return edges;
 }
 
-export function edgePath(e: Edge, style: EdgeStyle): string {
+/** Right-angle route: opposite sides join at the x-midpoint, same-side (stacked) sweeps around the right. */
+function orthogonalPath(e: Edge): string {
   const { x1, y1, x2, y2, s1, s2 } = e;
-  if (e.self) {
-    const bow = 46;
-    return `M ${x1} ${y1} C ${x1 + bow} ${y1}, ${x2 + bow} ${y2}, ${x2} ${y2}`;
+  if (s1 !== s2) {
+    const mid = (x1 + x2) / 2;
+    return `M ${x1} ${y1} H ${mid} V ${y2} H ${x2}`;
   }
-  if (style === 'orthogonal') {
-    if (s1 === 1 && s2 === -1) {
-      const mid = (x1 + x2) / 2;
-      return `M ${x1} ${y1} H ${mid} V ${y2} H ${x2}`;
-    }
-    if (s1 === -1 && s2 === 1) {
-      const mid = (x1 + x2) / 2;
-      return `M ${x1} ${y1} H ${mid} V ${y2} H ${x2}`;
-    }
-    const out = Math.max(x1, x2) + 52;
-    return `M ${x1} ${y1} H ${out} V ${y2} H ${x2}`;
-  }
-  // curved
+  const out = Math.max(x1, x2) + 52;
+  return `M ${x1} ${y1} H ${out} V ${y2} H ${x2}`;
+}
+
+/** Bezier route: same-side bows outward by a fixed amount, opposite-side bows by half the x distance (clamped). */
+function curvedPath(e: Edge): string {
+  const { x1, y1, x2, y2, s1, s2 } = e;
   if (s1 === s2) {
     const bow = 64;
     return `M ${x1} ${y1} C ${x1 + bow * s1} ${y1}, ${x2 + bow * s2} ${y2}, ${x2} ${y2}`;
   }
   const dx = Math.max(46, Math.min(170, Math.abs(x2 - x1) / 2));
   return `M ${x1} ${y1} C ${x1 + dx * s1} ${y1}, ${x2 + dx * s2} ${y2}, ${x2} ${y2}`;
+}
+
+export function edgePath(e: Edge, style: EdgeStyle): string {
+  if (e.self) {
+    const { x1, y1, x2, y2 } = e;
+    const bow = 46;
+    return `M ${x1} ${y1} C ${x1 + bow} ${y1}, ${x2 + bow} ${y2}, ${x2} ${y2}`;
+  }
+  return style === 'orthogonal' ? orthogonalPath(e) : curvedPath(e);
 }

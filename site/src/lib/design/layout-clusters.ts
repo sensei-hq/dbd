@@ -42,6 +42,13 @@ export function buildClusters(bySchema: Record<string, LayoutTable[]>): Cluster[
   }));
 }
 
+/** Index of the shortest column so far (first one wins on a tie). */
+function shortestColumn(colH: number[]): number {
+  let ci = 0;
+  for (let i = 1; i < colH.length; i++) if (colH[i] < colH[ci]) ci = i;
+  return ci;
+}
+
 /** Masonry-pack one cluster from its current list order (sets c.pos/w/h). */
 export function pack(c: Cluster, cards: Cards): void {
   const n = c.list.length;
@@ -50,8 +57,7 @@ export function pack(c: Cluster, cards: Cards): void {
   c.pos = [];
   for (const t of c.list) {
     const card = cards[c.name + '.' + t.name];
-    let ci = 0;
-    for (let i = 1; i < ncols; i++) if (colH[i] < colH[ci]) ci = i;
+    const ci = shortestColumn(colH);
     c.pos.push({ key: c.name + '.' + t.name, dx: ci * (CARD_W + GAP_X), dy: colH[ci] });
     colH[ci] += card.h + GAP_Y;
   }
@@ -61,6 +67,29 @@ export function pack(c: Cluster, cards: Cards): void {
 
 const byArea = (a: Cluster, b: Cluster) => (b.w ?? 0) * (b.h ?? 0) - (a.w ?? 0) * (a.h ?? 0);
 
+/** Count inter-schema ref links (symmetric), keyed 'schemaA|schemaB'. */
+function countSchemaLinks(data: LayoutData): Record<string, number> {
+  const links: Record<string, number> = {};
+  for (const r of data.refs) {
+    if (r.from.s === r.to.s) continue;
+    links[r.from.s + '|' + r.to.s] = (links[r.from.s + '|' + r.to.s] || 0) + 1;
+    links[r.to.s + '|' + r.from.s] = (links[r.to.s + '|' + r.from.s] || 0) + 1;
+  }
+  return links;
+}
+
+/** Remove + return the `left` cluster most strongly linked to the already-`ordered` ones. */
+function pickNextLinked(left: Cluster[], ordered: Cluster[], links: Record<string, number>): Cluster {
+  const lk = (a: Cluster, b: Cluster) => links[a.name + '|' + b.name] || 0;
+  let best = 0, bestScore = -1;
+  for (let i = 0; i < left.length; i++) {
+    let score = 0;
+    for (let j = 0; j < ordered.length; j++) score += lk(left[i], ordered[j]) * (j + 1);
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  return left.splice(best, 1)[0];
+}
+
 /**
  * Order clusters. 'untangle' greedily chains schemas so heavily-linked ones stay
  * adjacent (seeded by the largest cluster); otherwise sort by area, biggest first.
@@ -69,45 +98,38 @@ export function orderClusters(clusters: Cluster[], data: LayoutData, arrange: Ar
   if (arrange !== 'untangle' || clusters.length <= 1) {
     return clusters.sort(byArea);
   }
-  const links: Record<string, number> = {};
-  for (const r of data.refs) {
-    if (r.from.s === r.to.s) continue;
-    links[r.from.s + '|' + r.to.s] = (links[r.from.s + '|' + r.to.s] || 0) + 1;
-    links[r.to.s + '|' + r.from.s] = (links[r.to.s + '|' + r.from.s] || 0) + 1;
-  }
-  const lk = (a: Cluster, b: Cluster) => links[a.name + '|' + b.name] || 0;
+  const links = countSchemaLinks(data);
   const left = clusters.slice().sort(byArea);
   const ordered: Cluster[] = [left.shift()!];
-  while (left.length) {
-    let best = 0, bestScore = -1;
-    for (let i = 0; i < left.length; i++) {
-      let score = 0;
-      for (let j = 0; j < ordered.length; j++) score += lk(left[i], ordered[j]) * (j + 1);
-      if (score > bestScore) { bestScore = score; best = i; }
-    }
-    ordered.push(left.splice(best, 1)[0]);
-  }
+  while (left.length) ordered.push(pickNextLinked(left, ordered, links));
   return ordered;
+}
+
+type FlowCursor = { x: number; y: number; rowH: number };
+
+/** Place one cluster's origin (wrapping the row first if it would overflow), then its cards. */
+function placeCluster(c: Cluster, cursor: FlowCursor, cards: Cards): void {
+  if (cursor.x > 0 && cursor.x + (c.w ?? 0) > MAX_ROW_W) {
+    cursor.x = 0; cursor.y += cursor.rowH + CL_GAP_Y; cursor.rowH = 0;
+  }
+  c.x = cursor.x; c.y = cursor.y;
+  cursor.x += (c.w ?? 0) + CL_GAP_X;
+  cursor.rowH = Math.max(cursor.rowH, c.h ?? 0);
+  for (const p of (c.pos ?? [])) {
+    const card = cards[p.key];
+    card.x = c.x + CL_PAD + p.dx;
+    card.y = c.y + CL_PAD + CL_TITLE + p.dy;
+    card.hue = c.hue;
+  }
 }
 
 /** Flow clusters into rows (wrapping at MAX_ROW_W), place each card, return canvas size. */
 export function flow(clusters: Cluster[], cards: Cards): Size {
-  let x = 0, y = 0, rowH = 0;
-  for (const c of clusters) {
-    if (x > 0 && x + (c.w ?? 0) > MAX_ROW_W) { x = 0; y += rowH + CL_GAP_Y; rowH = 0; }
-    c.x = x; c.y = y;
-    x += (c.w ?? 0) + CL_GAP_X;
-    rowH = Math.max(rowH, c.h ?? 0);
-    for (const p of (c.pos ?? [])) {
-      const card = cards[p.key];
-      card.x = c.x + CL_PAD + p.dx;
-      card.y = c.y + CL_PAD + CL_TITLE + p.dy;
-      card.hue = c.hue;
-    }
-  }
+  const cursor: FlowCursor = { x: 0, y: 0, rowH: 0 };
+  for (const c of clusters) placeCluster(c, cursor, cards);
   return {
     w: Math.max(...clusters.map((c) => c.x + (c.w ?? 0))) + 60,
-    h: y + rowH + 60,
+    h: cursor.y + cursor.rowH + 60,
   };
 }
 
@@ -121,16 +143,19 @@ function barycenter(key: string, nbrs: Record<string, string[]>, cards: Cards): 
   return sum / ns.length;
 }
 
+/** Reorder one cluster's tables toward their neighbors' barycenters, then re-pack it. */
+function reorderTowardNeighbors(c: Cluster, cards: Cards, nbrs: Record<string, string[]>): void {
+  const score: Record<string, number> = {};
+  for (const t of c.list) score[c.name + '.' + t.name] = barycenter(c.name + '.' + t.name, nbrs, cards);
+  c.list = c.list.slice().sort((a, b) => score[c.name + '.' + a.name] - score[c.name + '.' + b.name]);
+  pack(c, cards);
+}
+
 /** Two barycenter passes: reorder each cluster's tables toward neighbors, re-pack, re-flow. */
 export function barycenterPasses(clusters: Cluster[], cards: Cards, nbrs: Record<string, string[]>): Size {
   let size: Size = { w: 0, h: 0 };
   for (let iter = 0; iter < 2; iter++) {
-    for (const c of clusters) {
-      const score: Record<string, number> = {};
-      for (const t of c.list) score[c.name + '.' + t.name] = barycenter(c.name + '.' + t.name, nbrs, cards);
-      c.list = c.list.slice().sort((a, b) => score[c.name + '.' + a.name] - score[c.name + '.' + b.name]);
-      pack(c, cards);
-    }
+    for (const c of clusters) reorderTowardNeighbors(c, cards, nbrs);
     size = flow(clusters, cards);
   }
   return size;
