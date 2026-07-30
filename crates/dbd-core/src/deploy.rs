@@ -175,6 +175,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_subpath_with_empty_string_is_base() {
+        // An empty subpath should behave like `None` — joining "" onto a path
+        // must not change which directory it refers to.
+        let base = PathBuf::from("/cache/owner-repo-HEAD");
+        assert_eq!(resolve_subpath(&base, Some("")), base);
+    }
+
+    #[test]
+    fn resolve_subpath_with_nested_segments() {
+        let base = PathBuf::from("/cache/owner-repo-HEAD");
+        assert_eq!(
+            resolve_subpath(&base, Some("src/db/schema")),
+            PathBuf::from("/cache/owner-repo-HEAD/src/db/schema")
+        );
+    }
+
     #[tokio::test]
     async fn resolve_local_path() {
         let tmp = TempDir::new().unwrap();
@@ -187,6 +204,52 @@ mod tests {
         let result = resolve_source("/nonexistent/path/to/project", false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_local_path_ignores_no_cache() {
+        // Doc contract: "Local sources ignore no_cache." Passing `true` must
+        // not change behavior for a local directory — it should still
+        // resolve directly without attempting any cache/download logic.
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_source(tmp.path().to_str().unwrap(), true).await.unwrap();
+        assert_eq!(result, tmp.path());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_path_current_dir_shorthand() {
+        // "." is explicitly documented as a local-path indicator and always
+        // exists, so it should resolve as-is rather than being treated as a
+        // (invalid, single-segment) GitHub shorthand.
+        let result = resolve_source(".", false).await.unwrap();
+        assert_eq!(result, PathBuf::from("."));
+    }
+
+    #[tokio::test]
+    async fn resolve_local_path_that_is_a_regular_file() {
+        // resolve_source only checks existence, not directory-ness — a path
+        // to an existing file is returned as-is, matching the documented
+        // "local path ... exists on disk: return as-is" contract.
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("design.yaml");
+        std::fs::write(&file_path, "project:\n  name: test\n").unwrap();
+
+        let result = resolve_source(file_path.to_str().unwrap(), false).await.unwrap();
+        assert_eq!(result, file_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_source_invalid_github_shorthand_propagates_parse_error() {
+        // A two-segment string that isn't a local path is treated as GitHub
+        // shorthand; if the repo segment has unsafe characters,
+        // parse_github_source's error must propagate through resolve_source.
+        let result = resolve_source("owner/repo;rm", false).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Invalid repo"),
+            "expected an 'Invalid repo' error, got: {msg}"
+        );
     }
 
     #[tokio::test]
