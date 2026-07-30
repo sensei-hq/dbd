@@ -494,29 +494,47 @@ pub async fn cmd_reconcile(
 
 /// Print a reconcile plan (used by `--dry-run`).
 fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) {
-    if plan.is_empty() && plan.dropped.is_empty() {
-        output::info(verbosity, "Already in sync — no changes.");
-        return;
+    for line in reconcile_plan_lines(plan, prune, verbosity) {
+        output::always(&line);
     }
+}
+
+/// Build the display lines for a reconcile plan. Pure so it can be unit-tested.
+///
+/// In verbose mode each altered entity's ALTER SQL is emitted (indented) beneath
+/// its summary line; normal mode shows only the one-line-per-entity summary,
+/// matching the CLI convention that SQL is a `-v` detail.
+fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) -> Vec<String> {
+    if plan.is_empty() && plan.dropped.is_empty() {
+        return vec!["Already in sync — no changes.".to_string()];
+    }
+    let mut lines = Vec::new();
     for name in &plan.added {
-        output::always(&format!("  + create {name}"));
+        lines.push(format!("  + create {name}"));
     }
     for s in &plan.altered {
-        output::always(&format!("  ~ alter  {}", s.entity_name));
+        lines.push(format!("  ~ alter  {}", s.entity_name));
+        // Verbose surfaces the column-level ALTER SQL beneath the summary line.
+        if verbosity.is_verbose() {
+            for sql_line in s.sql.lines() {
+                lines.push(format!("      {sql_line}"));
+            }
+        }
     }
     for s in &plan.dropped {
         if prune {
-            output::always(&format!("  - prune  {}", s.entity_name));
+            lines.push(format!("  - prune  {}", s.entity_name));
         } else {
-            output::always(&format!("  · orphan {} (use --prune to drop)", s.entity_name));
+            lines.push(format!("  · orphan {} (use --prune to drop)", s.entity_name));
         }
     }
     for w in &plan.warnings {
-        output::always(&format!("  ⚠ {w}"));
+        lines.push(format!("  ⚠ {w}"));
     }
     if plan.destructive && !plan.altered.is_empty() {
-        output::always("This plan drops columns/constraints — re-run with --allow-destructive to apply.");
+        lines.push("This plan drops columns/constraints — re-run with --allow-destructive to apply.".to_string());
     }
+    lines
 }
 
 /// Release the current version: write a baseline snapshot and set the released
@@ -568,6 +586,38 @@ pub fn cmd_release(
 mod tests {
     use super::*;
     use crate::commands::testutil;
+    use dbd_core::reconcile::ReconcileStatement;
+
+    /// A plan with one altered table carrying column-level ALTER SQL.
+    fn altered_plan() -> dbd_core::ReconcilePlan {
+        dbd_core::ReconcilePlan {
+            altered: vec![ReconcileStatement {
+                entity_name: "public.users".to_string(),
+                sql: "ALTER TABLE public.users ADD COLUMN email text;".to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Verbose `--dry-run` surfaces the column-level ALTER SQL under each altered
+    /// entity — the detail a plain summary omits.
+    #[test]
+    fn reconcile_plan_verbose_emits_alter_sql() {
+        let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Verbose).join("\n");
+        assert!(out.contains("~ alter") && out.contains("public.users"), "summary line missing:\n{out}");
+        assert!(
+            out.contains("ADD COLUMN email text"),
+            "verbose output must include the ALTER SQL; got:\n{out}"
+        );
+    }
+
+    /// Normal `--dry-run` stays a terse summary: entity names, no SQL.
+    #[test]
+    fn reconcile_plan_normal_hides_alter_sql() {
+        let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Normal).join("\n");
+        assert!(out.contains("~ alter") && out.contains("public.users"), "summary line missing:\n{out}");
+        assert!(!out.contains("ADD COLUMN"), "normal output must NOT include ALTER SQL; got:\n{out}");
+    }
 
     /// `graph` loads the fixture design and emits the node/edge/layer JSON.
     #[test]
