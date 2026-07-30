@@ -23,6 +23,9 @@ pub struct MockAdapter {
     pub supports_txn: bool,
     /// If set, `apply_entity` errors for this entity name (fault injection).
     pub fail_on: Arc<Mutex<Option<String>>>,
+    /// Entities `introspect()` reports as the live database state. Empty by
+    /// default, i.e. an empty live DB.
+    pub introspected: Arc<Mutex<Vec<Entity>>>,
 }
 
 impl Default for MockAdapter {
@@ -43,6 +46,7 @@ impl MockAdapter {
             txn: Arc::new(Mutex::new(Vec::new())),
             supports_txn: false,
             fail_on: Arc::new(Mutex::new(None)),
+            introspected: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -138,6 +142,10 @@ impl DatabaseAdapter for MockAdapter {
 
     fn supports_transactional_apply(&self) -> bool {
         self.supports_txn
+    }
+
+    async fn introspect(&self) -> Result<Vec<Entity>> {
+        Ok(self.introspected.lock().unwrap().clone())
     }
 
     async fn begin_batch(&self) -> Result<()> {

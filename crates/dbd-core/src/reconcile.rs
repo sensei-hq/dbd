@@ -104,8 +104,10 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
     snap
 }
 
-/// Canonicalize a snapshot so a **parsed** (desired) table and an **introspected**
-/// (live) table of the same shape compare equal. The two representations diverge:
+/// Representation normalization shared by reconcile's `canonicalize` and (in a
+/// future task) the read-only `dbd diff`'s `schema_diff::normalize_for_diff`.
+/// Makes a **parsed** (desired) and an **introspected** (live) form of the
+/// *same* table compare equal for the attributes both paths care about:
 ///
 /// - Introspection decomposes inline `PRIMARY KEY`/`UNIQUE` into named table-level
 ///   constraints and never sets column `is_pk`/`is_unique`; the parser keeps them
@@ -117,11 +119,10 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
 ///   alias-normalize type spellings (`INT4` → `integer`, `timestamptz` →
 ///   `timestamp with time zone`).
 ///
-/// Foreign keys, check constraints and indexes are **dropped from the diff
-/// entirely** — their introspected/parsed forms differ too much to compare
-/// reliably, so reconcile does not manage them on existing tables (create them via
-/// the initial `CREATE`, or use snapshots). Column comments are cleared too.
-pub fn canonicalize(snap: &mut Snapshot) {
+/// Foreign keys, check constraints, indexes and column comments are left
+/// **untouched** — callers that don't want them (reconcile's `canonicalize`)
+/// strip them afterward; callers that do want them (the diff path) keep them.
+pub(crate) fn normalize_common(snap: &mut Snapshot) {
     // short enum name (lowercased) → canonical column-type spelling. Mirrors what
     // Postgres `format_type` emits: bare for `public`, `schema.name` otherwise.
     let mut enum_types: HashMap<String, String> = HashMap::new();
@@ -136,17 +137,37 @@ pub fn canonicalize(snap: &mut Snapshot) {
     }
 
     for t in &mut snap.tables {
-        lift_pk_unique_constraints(t);
-        // Indexes are not reconciled (introspect/parse forms diverge).
+        lift_pk_unique_keep_others(t);
+        normalize_column_types(t, &enum_types);
+    }
+}
+
+/// Canonicalize a snapshot so a **parsed** (desired) table and an **introspected**
+/// (live) table of the same shape compare equal for what reconcile manages.
+///
+/// Reconcile does not manage foreign keys, check constraints or indexes on
+/// existing tables — their introspected/parsed forms differ too much to compare
+/// reliably (create them via the initial `CREATE`, or use snapshots) — so after
+/// the shared [`normalize_common`] pass this also drops them from the diff
+/// entirely, along with column comments and inline FK.
+pub fn canonicalize(snap: &mut Snapshot) {
+    normalize_common(snap);
+    for t in &mut snap.tables {
         t.indexes.clear();
-        normalize_columns(t, &enum_types);
+        t.table_constraints
+            .retain(|c| matches!(c, TableConstraint::PrimaryKey { .. } | TableConstraint::Unique { .. }));
+        for c in &mut t.columns {
+            c.inline_fk = None;
+            c.comment = None;
+        }
     }
 }
 
 /// Collapse a table's PK/UNIQUE (from inline column flags + table constraints)
-/// into name-stripped, structurally-deduped table constraints. FK/CHECK are
-/// intentionally excluded — reconcile does not manage them on existing tables.
-fn lift_pk_unique_constraints(t: &mut snapshot::TableSnapshot) {
+/// into name-stripped, structurally-deduped table constraints, leaving any
+/// FK/CHECK constraints already present untouched (reconcile's `canonicalize`
+/// strips those afterward; the diff path keeps them).
+fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
     let mut kept: Vec<TableConstraint> = Vec::new();
     let mut seen: HashSet<(char, String)> = HashSet::new();
     let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
@@ -160,6 +181,7 @@ fn lift_pk_unique_constraints(t: &mut snapshot::TableSnapshot) {
         }
     };
     let mut has_table_pk = false;
+    let mut others: Vec<TableConstraint> = Vec::new();
     for con in std::mem::take(&mut t.table_constraints) {
         match con {
             TableConstraint::PrimaryKey { columns, .. } => {
@@ -169,7 +191,7 @@ fn lift_pk_unique_constraints(t: &mut snapshot::TableSnapshot) {
             TableConstraint::Unique { columns, .. } => {
                 push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
             }
-            _ => {} // FK / CHECK excluded
+            other => others.push(other), // FK / CHECK preserved
         }
     }
     for c in &t.columns {
@@ -189,19 +211,19 @@ fn lift_pk_unique_constraints(t: &mut snapshot::TableSnapshot) {
             push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
         }
     }
+    kept.extend(others);
     t.table_constraints = kept;
 }
 
-/// Normalize each column's type + default to the introspection-comparable form,
-/// and clear inline flags/FK/comments (not compared during reconcile).
-fn normalize_columns(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<String, String>) {
+/// Normalize each column's type + default to the introspection-comparable form
+/// and clear the inline PK/unique flags (now lifted into constraints). Leaves
+/// `inline_fk` and `comment` intact — callers that don't want them strip them.
+fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<String, String>) {
     for c in &mut t.columns {
         c.data_type = canonical_type(&c.data_type, enum_types);
         c.default_value = c.default_value.as_deref().map(canonical_default);
         c.is_pk = false;
         c.is_unique = false;
-        c.inline_fk = None;
-        c.comment = None;
     }
 }
 
@@ -700,6 +722,44 @@ mod tests {
         );
         assert_eq!(canonical_default("0::numeric(10,2)"), "0");
         assert_eq!(canonical_default("  'x' :: text "), "'x'");
+    }
+
+    /// `normalize_common` does the representation normalization (types, defaults,
+    /// enum qualification, PK/unique lifting) but must PRESERVE the attributes
+    /// reconcile later strips: FK/CHECK constraints, indexes, and column comments.
+    #[test]
+    fn normalize_common_preserves_fk_check_index_comment() {
+        use crate::entity::{ForeignKey, IndexColumn, IndexDef};
+        let mut snap = snap(vec![TableSnapshot {
+            name: "orders".to_string(),
+            schema: "public".to_string(),
+            columns: vec![ColumnDef { comment: Some("the total".to_string()), ..col("total", "int4") }],
+            indexes: vec![IndexDef {
+                name: Some("orders_total_idx".to_string()),
+                columns: vec![IndexColumn { name: "total".to_string(), order: None }],
+                unique: false,
+                index_type: None,
+            }],
+            table_constraints: vec![
+                TableConstraint::ForeignKey(ForeignKey {
+                    name: Some("orders_cust_fk".to_string()),
+                    columns: vec!["cust_id".to_string()],
+                    ref_schema: None,
+                    ref_table: "customers".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: None,
+                    on_update: None,
+                }),
+                TableConstraint::Check { name: Some("ck".to_string()), expression: "total > 0".to_string() },
+            ],
+        }]);
+        normalize_common(&mut snap);
+        let t = &snap.tables[0];
+        assert_eq!(t.columns[0].data_type, "integer", "types must still be normalized");
+        assert_eq!(t.columns[0].comment.as_deref(), Some("the total"), "comment preserved");
+        assert_eq!(t.indexes.len(), 1, "indexes preserved");
+        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::ForeignKey(_))), "FK preserved");
+        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::Check { .. })), "CHECK preserved");
     }
 
     #[test]

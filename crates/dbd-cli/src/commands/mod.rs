@@ -1,5 +1,6 @@
 mod data;
 mod diagram;
+mod diff;
 mod migration;
 mod project;
 mod reverse;
@@ -170,6 +171,10 @@ pub async fn run(
 
         Commands::Policies { dry_run } => {
             schema::cmd_policies(config, project_dir, database_url, *dry_run, verbosity).await
+        }
+
+        Commands::Diff { json, exit_code } => {
+            diff::cmd_diff(config, env, project_dir, database_url, *json, *exit_code, scope, deps, verbosity).await
         }
 
         Commands::Reconcile { dry_run, allow_destructive, prune } => {
