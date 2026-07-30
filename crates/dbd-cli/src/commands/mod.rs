@@ -397,18 +397,36 @@ mod tests {
         ApplyComplete { strategy, from_version: 1, to_version: 2, applied: 3, migrated: 1, created: 2, dropped: 0 }
     }
 
-    /// Each apply strategy renders its own distinct summary line.
+    /// Each apply strategy renders its own distinct summary line, and every
+    /// strategy's message reflects the relevant counts (not just the label).
     #[test]
     fn format_apply_summary_covers_all_strategies() {
-        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Fresh)).contains("Fresh"));
-        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Current)).contains("up to date"));
-        assert!(format_apply_summary(&apply_complete(ApplyStrategy::Migrate)).contains("Migrated"));
+        let fresh = format_apply_summary(&apply_complete(ApplyStrategy::Fresh));
+        assert!(fresh.contains("Fresh"));
+        assert!(fresh.contains("v2"), "expected to_version in: {fresh}");
+        assert!(fresh.contains("3 entities"), "expected applied count in: {fresh}");
+
+        let current = format_apply_summary(&apply_complete(ApplyStrategy::Current));
+        assert!(current.contains("up to date"));
+        assert!(current.contains("v1"), "expected from_version in: {current}");
+        assert!(current.contains("3 entities"), "expected applied count in: {current}");
+
+        let migrate = format_apply_summary(&apply_complete(ApplyStrategy::Migrate));
+        assert!(migrate.contains("Migrated"));
+        assert!(migrate.contains("v1") && migrate.contains("v2"), "expected version range in: {migrate}");
+        assert!(migrate.contains("3 applied"), "expected applied count in: {migrate}");
+        assert!(migrate.contains("1 migrated"), "expected migrated count in: {migrate}");
+        assert!(migrate.contains("2 created"), "expected created count in: {migrate}");
+        assert!(migrate.contains("0 dropped"), "expected dropped count in: {migrate}");
     }
 
     #[test]
     fn format_import_summary_reports_counts() {
         let s = ImportComplete { tables: 3, procedures: 2, after_scripts: 1 };
-        assert!(format_import_summary(&s).contains("3 table"));
+        let out = format_import_summary(&s);
+        assert!(out.contains("3 table"), "expected table count in: {out}");
+        assert!(out.contains("2 procedure"), "expected procedure count in: {out}");
+        assert!(out.contains("1 after script"), "expected after-script count in: {out}");
     }
 
     #[test]
