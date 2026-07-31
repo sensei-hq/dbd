@@ -137,6 +137,21 @@ fn scan_single_quoted(bytes: &[u8], start: usize) -> usize {
     i
 }
 
+/// Return the index just past a double-quoted identifier starting at `start`.
+/// (Postgres has no `""` escape at the lexer level that we need to model here —
+/// a lone `"` closes it.)
+fn scan_double_quoted(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
 /// Return the index at the newline (or EOF) ending a `-- …` line comment.
 fn scan_line_comment(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
@@ -332,7 +347,7 @@ fn format_parsed_statements(
     if statements.len() == 1 {
         match &statements[0] {
             Statement::CreateTable(ct) => {
-                return format_create_table(ct, config);
+                return format_create_table(ct, original, config);
             }
             Statement::CreateIndex(ci) => {
                 return format_create_index(ci, config);
@@ -395,7 +410,11 @@ fn format_dollar_quoted(block: &str, config: &FormatConfig) -> String {
 
 // ── CREATE TABLE formatter ──────────────────────────────
 
-fn format_create_table(ct: &sqlparser::ast::CreateTable, config: &FormatConfig) -> String {
+fn format_create_table(
+    ct: &sqlparser::ast::CreateTable,
+    original: &str,
+    config: &FormatConfig,
+) -> String {
     let mut out = String::new();
 
     // Header: create table [if not exists] <name>
@@ -411,33 +430,214 @@ fn format_create_table(ct: &sqlparser::ast::CreateTable, config: &FormatConfig) 
     }
     out.push_str(&format!(" {} (\n", ct.name.to_string().to_lowercase()));
 
+    // Build each column/constraint line (in source-emit order: columns first),
+    // then interleave the inline comments sqlparser discarded.
     let has_constraints = !ct.constraints.is_empty();
+    let mut item_lines: Vec<String> = Vec::with_capacity(ct.columns.len() + ct.constraints.len());
     for (i, col) in ct.columns.iter().enumerate() {
-        let line = format_table_column(
+        item_lines.push(format_table_column(
             col,
             i == 0,
             i == ct.columns.len() - 1,
             has_constraints,
             config,
-        );
-        out.push_str(&line);
-        out.push('\n');
+        ));
     }
-
     for (i, constraint) in ct.constraints.iter().enumerate() {
-        let line = format_table_constraint_line(
+        item_lines.push(format_table_constraint_line(
             constraint,
             i == 0,
             i == ct.constraints.len() - 1,
             ct.columns.is_empty(),
             config,
-        );
-        out.push_str(&line);
-        out.push('\n');
+        ));
+    }
+
+    let indent = " ".repeat(config.indent);
+    // Re-attach comments only when the parsed body's item count lines up 1:1 with
+    // the AST's columns+constraints. On any mismatch (interleaved constraints,
+    // exotic layout), emit lines bare — the round-trip guard then keeps the
+    // original text, so a comment is never dropped.
+    match extract_item_comments(original).filter(|c| c.len() == item_lines.len()) {
+        Some(comments) => {
+            for (line, ic) in item_lines.iter().zip(comments.iter()) {
+                for lead in &ic.leading {
+                    out.push_str(&indent);
+                    out.push_str(lead);
+                    out.push('\n');
+                }
+                out.push_str(line);
+                for (k, trailing) in ic.trailing.iter().enumerate() {
+                    if k == 0 {
+                        out.push_str("  ");
+                        out.push_str(trailing);
+                    } else {
+                        out.push('\n');
+                        out.push_str(&indent);
+                        out.push_str(trailing);
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        None => {
+            for line in &item_lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
     }
 
     out.push_str(");");
     out
+}
+
+// ── CREATE TABLE inline-comment preservation ────────────
+
+/// Inline comments captured for one top-level column-list item (column or
+/// table constraint), in source order.
+#[derive(Default)]
+struct ItemComments {
+    /// Standalone comment lines that preceded the item's code (own lines above it).
+    leading: Vec<String>,
+    /// Comments after the item's code (trailing — usually end-of-line).
+    trailing: Vec<String>,
+}
+
+/// Extract inline comments from a `CREATE TABLE` column list, one [`ItemComments`]
+/// per top-level (comma-separated) item, in source order. Returns `None` if the
+/// column-list parentheses can't be located. sqlparser discards comments, so this
+/// recovers them from the raw text; the caller only uses the result when it lines
+/// up 1:1 with the parsed items and otherwise keeps the original text verbatim.
+fn extract_item_comments(original: &str) -> Option<Vec<ItemComments>> {
+    Some(segment_item_comments(table_body(original)?))
+}
+
+/// The text inside a `CREATE TABLE`'s outermost `( … )` column list (exclusive of
+/// the parentheses), or `None` if it can't be located. Skips string literals,
+/// quoted identifiers, and comments while finding the opener and its match.
+fn table_body(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    // Find the column-list opener: the first top-level '(' that is not inside a
+    // string/identifier/comment (a table name carries no parens).
+    let open = loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'\'' => i = scan_single_quoted(bytes, i),
+            b'"' => i = scan_double_quoted(bytes, i),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => i = scan_line_comment(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = scan_block_comment(bytes, i),
+            b'(' => break i,
+            _ => i += 1,
+        }
+    };
+
+    // Scan to the matching close paren, tracking depth (and skipping the same
+    // string/comment regions so a ')' inside them doesn't close early).
+    let mut depth = 0i32;
+    let mut j = open;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\'' => {
+                j = scan_single_quoted(bytes, j);
+                continue;
+            }
+            b'"' => {
+                j = scan_double_quoted(bytes, j);
+                continue;
+            }
+            b'-' if bytes.get(j + 1) == Some(&b'-') => {
+                j = scan_line_comment(bytes, j);
+                continue;
+            }
+            b'/' if bytes.get(j + 1) == Some(&b'*') => {
+                j = scan_block_comment(bytes, j);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&sql[open + 1..j]);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Split a column-list body into per-item comments at top-level commas. Within
+/// each item, a comment before any code is `leading`; one after code is
+/// `trailing`. Skips string literals and quoted identifiers so a `--`/`,` inside
+/// them is not mistaken for a comment or an item boundary.
+fn segment_item_comments(body: &str) -> Vec<ItemComments> {
+    let bytes = body.as_bytes();
+    let mut items: Vec<ItemComments> = Vec::new();
+    let mut cur = ItemComments::default();
+    let mut seen_code = false;
+    let mut depth = 0i32;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                seen_code = true;
+                i = scan_single_quoted(bytes, i);
+            }
+            b'"' => {
+                seen_code = true;
+                i = scan_double_quoted(bytes, i);
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let end = scan_line_comment(bytes, i);
+                let text = body[i..end].trim_end().to_string();
+                if seen_code {
+                    cur.trailing.push(text);
+                } else {
+                    cur.leading.push(text);
+                }
+                i = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let end = scan_block_comment(bytes, i);
+                let text = body[i..end].trim().to_string();
+                if seen_code {
+                    cur.trailing.push(text);
+                } else {
+                    cur.leading.push(text);
+                }
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                seen_code = true;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                seen_code = true;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                items.push(std::mem::take(&mut cur));
+                seen_code = false;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            _ => {
+                seen_code = true;
+                i += 1;
+            }
+        }
+    }
+    items.push(cur);
+    items
 }
 
 /// Render one column line for CREATE TABLE, applying the configured comma style.
@@ -1798,12 +1998,91 @@ mod tests {
 
     #[test]
     fn table_inline_comments_preserved() {
-        // CREATE TABLE rebuilt from the AST drops comments; the guard must fall
-        // back so column comments survive.
+        // CREATE TABLE rebuilt from the AST drops comments; they must survive —
+        // now re-attached to the reformatted table rather than falling back.
         let input = "create table t (\n  a int  -- the primary key\n, b text -- a label\n);";
         let result = format_ddl(input, &FormatConfig::default());
         assert!(result.contains("the primary key"), "comment 1 kept: {result}");
         assert!(result.contains("a label"), "comment 2 kept: {result}");
+    }
+
+    /// Trailing column comments survive a REFORMAT (not just the verbatim
+    /// fallback): the columns are aligned and each comment re-attached.
+    #[test]
+    fn table_trailing_comments_are_reformatted() {
+        let input = "create table t (a int -- c1\n, b text -- c2\n);";
+        let result = format_ddl(input, &FormatConfig::default());
+        // Reformatted: each column on its own indented line (verbatim fallback,
+        // which keeps `(a int`, would not produce this).
+        assert!(result.contains("\n  a"), "column a reformatted onto its own line: {result}");
+        assert!(result.contains("\n, b"), "leading-comma style applied: {result}");
+        // Comments preserved and re-attached.
+        assert!(result.contains("-- c1"), "trailing comment 1 kept: {result}");
+        assert!(result.contains("-- c2"), "trailing comment 2 kept: {result}");
+        // Still faithful: re-parses to the same AST.
+        let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
+        let b = Parser::parse_sql(&PostgreSqlDialect {}, &result).unwrap();
+        assert_eq!(a, b, "reformatted table must preserve semantics: {result}");
+    }
+
+    /// The issue's own example: a comment-bearing table reformats, preserves
+    /// every comment (including one containing `|` and `;`), stays faithful, and
+    /// is idempotent (formatting the result again is a no-op).
+    #[test]
+    fn table_realistic_comments_reformat_faithfully_and_idempotently() {
+        let input = "create table if not exists knowledge_sources (\
+             id uuid primary key default gen_random_uuid()\
+             , kind text not null -- hive_mind | mcp | rest | webhook\n\
+             , credential_ref text not null -- Keychain entry id; the key lives in the OS keychain\n\
+             );";
+        let cfg = FormatConfig::default();
+        let out = format_ddl(input, &cfg);
+
+        // Reformatted, not the verbatim fallback.
+        assert!(out.contains("\n  id"), "reformatted onto aligned lines: {out}");
+        // Every comment preserved verbatim.
+        assert!(out.contains("-- hive_mind | mcp | rest | webhook"), "comment 1: {out}");
+        assert!(
+            out.contains("-- Keychain entry id; the key lives in the OS keychain"),
+            "comment 2: {out}"
+        );
+        // Faithful (same AST) and idempotent.
+        let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
+        let b = Parser::parse_sql(&PostgreSqlDialect {}, &out).unwrap();
+        assert_eq!(a, b, "semantics preserved: {out}");
+        assert_eq!(out, format_ddl(&out, &cfg), "formatting must be idempotent");
+    }
+
+    /// A standalone comment line above a column is preserved on its own line —
+    /// through a reformat (input is single-line so the verbatim fallback can't
+    /// satisfy the layout asserts).
+    #[test]
+    fn table_standalone_comment_is_reformatted() {
+        let input = "create table t (-- identity\n id uuid, name text);";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(result.contains("-- identity"), "standalone comment kept: {result}");
+        assert!(result.contains("\n  id"), "id reformatted onto its own line: {result}");
+        assert!(result.contains("\n, name"), "reformatted with leading comma: {result}");
+        let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
+        let b = Parser::parse_sql(&PostgreSqlDialect {}, &result).unwrap();
+        assert_eq!(a, b, "must preserve semantics: {result}");
+    }
+
+    /// A `--` sequence inside a string default is NOT a comment and must not be
+    /// mistaken for a trailing comment when re-attaching.
+    #[test]
+    fn table_comment_marker_inside_string_default_is_not_a_comment() {
+        let input = "create table t (a text default 'x -- y' -- real\n, b int);";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(result.contains("\n  a"), "table reformatted: {result}");
+        assert!(result.contains("'x -- y'"), "string default preserved intact: {result}");
+        assert!(result.contains("-- real"), "the real trailing comment kept: {result}");
+        // The string's inner `-- y` must not have leaked out as a second comment
+        // onto its own line.
+        assert!(!result.contains("\n  -- y"), "string content must not become a comment: {result}");
+        let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
+        let b = Parser::parse_sql(&PostgreSqlDialect {}, &result).unwrap();
+        assert_eq!(a, b, "must preserve semantics: {result}");
     }
 
     #[test]
