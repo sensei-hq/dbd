@@ -61,7 +61,11 @@ impl ReconcilePlan {
 /// the live→desired diff to line up by qualified name.
 pub const DEFAULT_SCHEMA: &str = "public";
 
-/// Build a diff-able snapshot (tables + enums only) from a set of entities.
+/// Build a diff-able snapshot (tables + enums only) from a set of entities,
+/// WITHOUT canonicalizing — so FK/CHECK constraints, indexes, inline FKs and
+/// column comments are retained. This is the raw form the read-only `dbd diff`
+/// needs: it applies its own [`crate::schema_diff::normalize_for_diff`] which
+/// *normalizes* those attributes instead of stripping them.
 ///
 /// Symmetric for live (introspected) and desired (project) entities. The other
 /// entity types (schemas, extensions, sequences, functions, views, roles) are
@@ -70,7 +74,7 @@ pub const DEFAULT_SCHEMA: &str = "public";
 ///
 /// Empty schemas are normalized to [`DEFAULT_SCHEMA`] so an unqualified project
 /// table (`""`) matches its introspected counterpart (`"public"`).
-pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
+pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
     let tables = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
@@ -93,13 +97,21 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
             e
         })
         .collect();
-    let mut snap = Snapshot {
+    Snapshot {
         version: 0,
         description: String::new(),
         timestamp: String::new(),
         tables,
         enums,
-    };
+    }
+}
+
+/// Build a diff-able snapshot (tables + enums only) from a set of entities,
+/// then [`canonicalize`] it for reconcile's apply-path diff — which strips
+/// FK/CHECK/indexes/comments (see `canonicalize`). For the read-only diff that
+/// keeps those attributes, use [`raw_snapshot_from_entities`].
+pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
+    let mut snap = raw_snapshot_from_entities(entities);
     canonicalize(&mut snap);
     snap
 }
@@ -460,6 +472,35 @@ mod tests {
         let plan = plan_reconcile(&live, &desired);
         assert!(plan.is_empty());
         assert!(!plan.destructive);
+    }
+
+    /// Issue #8: the read-only diff builder retains foreign keys; the reconcile
+    /// (canonicalize) builder strips them. This split is why `dbd diff` can now
+    /// see FK drift while reconcile's apply-path diff still ignores it.
+    #[test]
+    fn raw_builder_keeps_fk_while_canonicalize_builder_strips_it() {
+        use crate::entity::{ColumnDef, ForeignKey, TableComments, TableDef};
+
+        let fk = ForeignKey {
+            columns: vec!["org_id".to_string()],
+            ref_table: "org".to_string(),
+            ref_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let mut entity = Entity::new(EntityType::Table, "public.users");
+        entity.table_def = Some(TableDef {
+            columns: vec![ColumnDef { inline_fk: Some(fk), ..col("org_id", "uuid") }],
+            constraints: vec![],
+            indexes: vec![],
+            comments: TableComments::default(),
+        });
+        let entities = vec![entity];
+
+        let raw = raw_snapshot_from_entities(&entities);
+        assert!(raw.tables[0].columns[0].inline_fk.is_some(), "raw builder must retain the inline FK");
+
+        let canon = snapshot_from_entities(&entities);
+        assert!(canon.tables[0].columns[0].inline_fk.is_none(), "canonicalize builder must strip the inline FK");
     }
 
     #[test]
