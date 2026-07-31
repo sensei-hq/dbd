@@ -308,16 +308,23 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             )
         }
         TableConstraint::ForeignKey(fk) => {
-            let con_name = fk.name.as_deref().unwrap_or("unnamed");
             let ref_schema = fk
                 .ref_schema
                 .as_deref()
                 .map(|s| format!("{}.", s))
                 .unwrap_or_default();
+            // An unnamed FK (e.g. the design's inline `references …`) is emitted
+            // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
+            // rather than literally naming the constraint "unnamed".
+            let con_clause = fk
+                .name
+                .as_deref()
+                .map(|n| format!("CONSTRAINT {n} "))
+                .unwrap_or_default();
             let mut sql = format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{}({})",
+                "ALTER TABLE {} ADD {}FOREIGN KEY ({}) REFERENCES {}{}({})",
                 entity_name,
-                con_name,
+                con_clause,
                 fk.columns.join(", "),
                 ref_schema,
                 fk.ref_table,
