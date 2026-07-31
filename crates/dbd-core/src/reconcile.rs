@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diff::{self, ChangeAction, DiffAction, MigrationDiff};
-use crate::entity::{Entity, EntityType, TableConstraint};
-use crate::snapshot::{self, Snapshot};
+use crate::entity::{Entity, EntityType, FkAction, ForeignKey, TableConstraint};
+use crate::snapshot::{self, Snapshot, TableSnapshot};
 
 /// A single entity that will be altered or dropped, paired with its DDL.
 #[derive(Debug, Clone)]
@@ -155,13 +155,15 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
 }
 
 /// Canonicalize a snapshot so a **parsed** (desired) table and an **introspected**
-/// (live) table of the same shape compare equal for what reconcile manages.
+/// (live) table of the same shape compare equal for the column/PK/unique diff.
 ///
-/// Reconcile does not manage foreign keys, check constraints or indexes on
-/// existing tables — their introspected/parsed forms differ too much to compare
-/// reliably (create them via the initial `CREATE`, or use snapshots) — so after
-/// the shared [`normalize_common`] pass this also drops them from the diff
-/// entirely, along with column comments and inline FK.
+/// Reconcile does not diff check constraints or indexes on existing tables here —
+/// their introspected/parsed forms differ too much to compare reliably (create
+/// them via the initial `CREATE`, or use snapshots) — so after the shared
+/// [`normalize_common`] pass this drops them from the diff entirely, along with
+/// column comments and inline FK. **Foreign keys are handled separately** by
+/// [`plan_fk_convergence`] from the raw (un-canonicalized) snapshots, so they are
+/// stripped here too — keeping this column/PK/unique diff free of FK noise.
 pub fn canonicalize(snap: &mut Snapshot) {
     normalize_common(snap);
     for t in &mut snap.tables {
@@ -411,6 +413,155 @@ fn has_column_drop(d: &MigrationDiff) -> bool {
         if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop)))
 }
 
+// ── Foreign-key convergence (issue #8) ──────────────────────
+
+/// A foreign key's comparable shape — everything that defines it EXCEPT its
+/// constraint name. Used to match a live FK (auto-named by Postgres) against the
+/// design's inline/unnamed FK. Mirrors `schema_diff::normalize_fk`: `NO ACTION`
+/// collapses to the default (`None`), and a `public` ref schema is treated the
+/// same as an unqualified one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FkShape {
+    columns: Vec<String>,
+    ref_schema: Option<String>,
+    ref_table: String,
+    ref_columns: Vec<String>,
+    on_delete: Option<FkAction>,
+    on_update: Option<FkAction>,
+}
+
+/// The name-agnostic shape of an FK for cross-representation matching.
+fn fk_shape(fk: &ForeignKey) -> FkShape {
+    let norm_action = |a: Option<FkAction>| match a {
+        Some(FkAction::NoAction) => None,
+        other => other,
+    };
+    let ref_schema = match fk.ref_schema.as_deref() {
+        None | Some(DEFAULT_SCHEMA) => None,
+        Some(s) => Some(s.to_lowercase()),
+    };
+    FkShape {
+        columns: fk.columns.clone(),
+        ref_schema,
+        ref_table: fk.ref_table.clone(),
+        ref_columns: fk.ref_columns.clone(),
+        on_delete: norm_action(fk.on_delete),
+        on_update: norm_action(fk.on_update),
+    }
+}
+
+/// All foreign keys on a table snapshot: inline column FKs + table-level FK
+/// constraints (raw snapshots keep both; canonicalized ones have neither).
+fn table_fks(t: &TableSnapshot) -> Vec<ForeignKey> {
+    let mut out: Vec<ForeignKey> = t.columns.iter().filter_map(|c| c.inline_fk.clone()).collect();
+    for con in &t.table_constraints {
+        if let TableConstraint::ForeignKey(fk) = con {
+            out.push(fk.clone());
+        }
+    }
+    out
+}
+
+/// Converge foreign keys into an existing reconcile `plan` (issue #8).
+///
+/// Reconcile's [`canonicalize`] strips FKs from the snapshots the main diff
+/// sees, so FK drift is handled here from the RAW (un-canonicalized) `live` and
+/// `desired` snapshots. For every table present in BOTH sides:
+/// - an FK the design declares but the live DB lacks is **added**
+///   (`ADD FOREIGN KEY …`, non-destructive), and
+/// - an FK the live DB has but the design dropped is **removed**
+///   (`DROP CONSTRAINT <live-name>`, which sets `plan.destructive` so it is
+///   gated behind `--allow-destructive`).
+///
+/// FKs match by [`FkShape`] (name-agnostic), so a live auto-named FK and the
+/// design's inline unnamed FK of the same shape reconcile to no change — the
+/// same matching the read-only `dbd diff` uses. An FK whose shape changed
+/// (e.g. a different `ON DELETE`) is a drop of the old plus an add of the new.
+/// Newly-added and pruned tables are skipped: their FKs ride along with the
+/// `CREATE`/`DROP TABLE`.
+pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    use crate::diff::{FieldChange, FieldDetail, FieldType};
+
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        // Only tables present in both sides — new/pruned tables carry their FKs
+        // via the full CREATE/DROP.
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+
+        let desired_fks = table_fks(dt);
+        let live_fks = table_fks(lt);
+        let desired_shapes: HashSet<FkShape> = desired_fks.iter().map(fk_shape).collect();
+        let live_shapes: HashSet<FkShape> = live_fks.iter().map(fk_shape).collect();
+
+        let mut changes: Vec<FieldChange> = Vec::new();
+
+        // Drops first (destructive): a live FK the design no longer declares.
+        // Use the live constraint's real name — that's what `DROP CONSTRAINT`
+        // needs, and it's why FKs can't simply be name-stripped before diffing.
+        for fk in live_fks.iter().filter(|fk| !desired_shapes.contains(&fk_shape(fk))) {
+            let name = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("fk:{}", fk.columns.join(",")));
+            changes.push(FieldChange {
+                field_name: name,
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Drop,
+            });
+            plan.destructive = true;
+        }
+
+        // Adds: a design FK missing from the live DB (unnamed → Postgres auto-names).
+        for fk in desired_fks.iter().filter(|fk| !live_shapes.contains(&fk_shape(fk))) {
+            changes.push(FieldChange {
+                field_name: format!("fk:{}", fk.columns.join(",")),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::ForeignKey(fk.clone()),
+                ))),
+            });
+        }
+
+        if changes.is_empty() {
+            continue;
+        }
+
+        let diff = MigrationDiff {
+            entity_name: qname.clone(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(changes),
+        };
+        let sql = diff::generate_migration_sql(std::slice::from_ref(&diff));
+        if sql.trim().is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, sql);
+    }
+}
+
+/// Append `sql` to the `altered` statement for `entity_name`, appending after any
+/// existing ALTER SQL (so an FK add runs after the `ADD COLUMN` that created its
+/// column), or pushing a new statement when the table had no other changes.
+fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
+    if let Some(stmt) = plan.altered.iter_mut().find(|s| s.entity_name == entity_name) {
+        stmt.sql.push('\n');
+        stmt.sql.push_str(&sql);
+    } else {
+        plan.altered.push(ReconcileStatement {
+            entity_name: entity_name.to_string(),
+            sql,
+        });
+    }
+}
+
 /// Summary of an executed reconcile, passed to the `on_complete` callback.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileComplete {
@@ -501,6 +652,148 @@ mod tests {
 
         let canon = snapshot_from_entities(&entities);
         assert!(canon.tables[0].columns[0].inline_fk.is_none(), "canonicalize builder must strip the inline FK");
+    }
+
+    // ── Foreign-key convergence (issue #8) ──────────────────
+
+    fn ref_fk(name: Option<&str>, col: &str, ref_schema: Option<&str>, ref_table: &str, on_delete: Option<FkAction>) -> ForeignKey {
+        ForeignKey {
+            name: name.map(str::to_string),
+            columns: vec![col.to_string()],
+            ref_schema: ref_schema.map(str::to_string),
+            ref_table: ref_table.to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete,
+            on_update: None,
+        }
+    }
+
+    /// The design declares an inline FK the live DB lacks → non-destructive
+    /// `ADD FOREIGN KEY` (Postgres auto-names it). This is the issue's core case:
+    /// an FK dropped out from under the design, or added alongside a new column.
+    #[test]
+    fn fk_convergence_adds_missing_fk() {
+        let desired = snap(vec![TableSnapshot {
+            columns: vec![ColumnDef {
+                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", None)),
+                ..col("parent_id", "uuid")
+            }],
+            ..table("app", "children", vec![])
+        }]);
+        let live = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_fk_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "expected one altered table; got {plan:?}");
+        assert_eq!(plan.altered[0].entity_name, "app.children");
+        assert!(
+            plan.altered[0].sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id)"),
+            "expected unnamed ADD FOREIGN KEY; got: {}",
+            plan.altered[0].sql
+        );
+        assert!(!plan.destructive, "adding an FK is not destructive");
+    }
+
+    /// The live DB has an FK the design dropped → `DROP CONSTRAINT <live-name>`,
+    /// gated as destructive.
+    #[test]
+    fn fk_convergence_drops_extra_fk_is_destructive() {
+        let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
+        live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
+            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+        )));
+        let live = snap(vec![live_t]);
+        let desired = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_fk_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        assert!(
+            plan.altered[0].sql.contains("DROP CONSTRAINT children_parent_id_fkey"),
+            "expected DROP CONSTRAINT with the live name; got: {}",
+            plan.altered[0].sql
+        );
+        assert!(plan.destructive, "dropping an FK is destructive");
+    }
+
+    /// A live auto-named FK and the design's inline unnamed FK of the same shape
+    /// reconcile to no change — no phantom drop/add churn on an in-sync DB.
+    #[test]
+    fn fk_convergence_in_sync_is_no_change() {
+        let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
+        live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
+            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", Some(FkAction::NoAction),
+        )));
+        let live = snap(vec![live_t]);
+        let desired = snap(vec![TableSnapshot {
+            columns: vec![ColumnDef {
+                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", None)),
+                ..col("parent_id", "uuid")
+            }],
+            ..table("app", "children", vec![])
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_fk_convergence(&mut plan, &live, &desired);
+
+        assert!(plan.is_empty() && !plan.destructive, "in-sync FK must reconcile to no change; got {plan:?}");
+    }
+
+    /// A changed FK action (design adds `ON DELETE CASCADE`) drops the old and
+    /// adds the new — Postgres can't alter FK actions in place.
+    #[test]
+    fn fk_convergence_changed_action_replaces() {
+        let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
+        live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
+            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+        )));
+        let live = snap(vec![live_t]);
+        let desired = snap(vec![TableSnapshot {
+            columns: vec![ColumnDef {
+                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", Some(FkAction::Cascade))),
+                ..col("parent_id", "uuid")
+            }],
+            ..table("app", "children", vec![])
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_fk_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP CONSTRAINT children_parent_id_fkey"), "must drop old FK; got: {sql}");
+        assert!(sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id) ON DELETE CASCADE"),
+            "must add the new FK with the action; got: {sql}");
+        assert!(plan.destructive, "replacing an FK drops the old one → destructive");
+    }
+
+    /// FK add SQL is appended AFTER any existing ALTER (e.g. the `ADD COLUMN`
+    /// that created the FK's column), so the column exists before the FK is added.
+    #[test]
+    fn fk_convergence_appends_after_existing_alter() {
+        let desired = snap(vec![TableSnapshot {
+            columns: vec![ColumnDef {
+                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", None)),
+                ..col("parent_id", "uuid")
+            }],
+            ..table("app", "children", vec![])
+        }]);
+        let live = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan.altered.push(ReconcileStatement {
+            entity_name: "app.children".to_string(),
+            sql: "ALTER TABLE app.children ADD COLUMN parent_id uuid;".to_string(),
+        });
+        plan_fk_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "FK merges into the existing statement");
+        let sql = &plan.altered[0].sql;
+        let col_pos = sql.find("ADD COLUMN parent_id").expect("ADD COLUMN present");
+        let fk_pos = sql.find("ADD FOREIGN KEY").expect("ADD FOREIGN KEY present");
+        assert!(col_pos < fk_pos, "ADD COLUMN must precede ADD FOREIGN KEY; got: {sql}");
     }
 
     #[test]

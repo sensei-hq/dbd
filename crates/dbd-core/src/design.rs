@@ -1154,8 +1154,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_reconcile, qualified_entity_name, snapshot_from_entities, ReconcileComplete,
-            DEFAULT_SCHEMA,
+            plan_fk_convergence, plan_reconcile, qualified_entity_name, raw_snapshot_from_entities,
+            snapshot_from_entities, ReconcileComplete, DEFAULT_SCHEMA,
         };
         use std::collections::{HashMap, HashSet};
 
@@ -1215,7 +1215,15 @@ impl Design {
         let live_full = snapshot_from_entities(&live_entities);
         let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
-        let plan = plan_reconcile(&live, &desired);
+        let mut plan = plan_reconcile(&live, &desired);
+
+        // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
+        // above, so converge them from the RAW snapshots — adding declared FKs
+        // the live DB lacks and dropping (destructive) ones the design removed.
+        let desired_raw = raw_snapshot_from_entities(&desired_owned);
+        let live_raw =
+            restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
+        plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
 
         if dry_run {
             return Ok(plan);
