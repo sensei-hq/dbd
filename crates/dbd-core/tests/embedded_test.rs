@@ -1352,6 +1352,86 @@ async fn diff_live_reports_drift_and_writes_nothing() {
     assert_table_absent(&*adapter, "app", "items").await; // diff wrote nothing
 }
 
+/// Issue #8, end-to-end: `dbd diff` must see foreign keys with REAL Postgres
+/// introspection. Apply a design whose child table carries an inline FK, then:
+///   1. an in-sync live DB (real, named FK) shows NO FK drift vs the design's
+///      inline unnamed FK — the cross-representation match works through the
+///      full pipeline, and
+///   2. dropping the live FK out from under the design surfaces as drift.
+/// Before the fix, `diff_live` stripped FKs before comparing, so neither the
+/// match nor the drift was ever computed.
+#[tokio::test]
+async fn diff_live_sees_foreign_keys_with_real_introspection() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    use dbd_core::SchemaDiff;
+
+    /// Whether the diff reports any constraint-level change on `table`.
+    fn constraint_change_on(d: &SchemaDiff, table: &str) -> bool {
+        d.changes.iter().any(|c| {
+            c.entity_name == table
+                && matches!(&c.action, DiffAction::Change(fcs)
+                    if fcs.iter().any(|f| f.field_type == FieldType::Constraint))
+        })
+    }
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "diff_fk_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: diff_fk_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/parents.ddl"),
+        "set search_path to app;\n\
+         create table if not exists parents (id uuid primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/children.ddl"),
+        "set search_path to app;\n\
+         create table if not exists children (\n\
+           id uuid primary key\n\
+         , parent_id uuid references parents(id)\n\
+         );\n",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+
+    // Apply the design → the live DB now has the FK (named children_parent_id_fkey).
+    design
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("apply failed");
+
+    // 1. In-sync: the real named live FK must match the design's inline unnamed FK.
+    let d = design.diff_live(&*adapter, None).await.expect("diff_live failed");
+    assert!(
+        !constraint_change_on(&d, "app.children"),
+        "in-sync FK must not surface as drift; got {:?}",
+        d.changes
+    );
+
+    // 2. Drop the FK out from under the design → drift must be reported.
+    adapter
+        .execute_script("ALTER TABLE app.children DROP CONSTRAINT children_parent_id_fkey;")
+        .await
+        .expect("drop fk failed");
+    let d = design.diff_live(&*adapter, None).await.expect("diff_live failed");
+    assert!(
+        constraint_change_on(&d, "app.children"),
+        "a live FK dropped out from under the design must surface as drift; got {:?}",
+        d.changes
+    );
+}
+
 // ── Batch transaction (atomic apply) ──────────────────────────────────────────
 
 #[tokio::test]
