@@ -279,12 +279,16 @@ Reconcile is **disabled once the project is released** (`project.released: true`
 `--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
 
 **What reconcile compares** (against the introspected live schema): columns
-(name, type, nullability, default, identity) and primary-key / unique constraints. Bare enum types
-are schema-qualified to match introspection, and common type aliases are normalized (`int4` →
-`integer`, `timestamptz` → `timestamp with time zone`). **Not** reconciled on existing tables:
-foreign keys, check constraints, and indexes — their introspected and parsed forms differ too much
-to diff reliably, so change those via `dbd snapshot` (they're still created with the initial
-`CREATE`). Because introspected and hand-written DDL can spell a default or exotic type differently,
+(name, type, nullability, default, identity), primary-key / unique constraints, and **foreign
+keys**. Bare enum types are schema-qualified to match introspection, and common type aliases are
+normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
+matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
+and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
+added (`ADD FOREIGN KEY …`, Postgres auto-names it), and an FK the design dropped is removed
+(`DROP CONSTRAINT …`, gated behind `--allow-destructive`). **Not** reconciled on existing tables:
+check constraints and indexes — their introspected and parsed forms differ too much to diff
+reliably, so change those via `dbd snapshot` (they're still created with the initial `CREATE`).
+Because introspected and hand-written DDL can spell a default or exotic type differently,
 reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
 `--dry-run` first.
 
@@ -293,8 +297,8 @@ reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`
 ## `dbd diff`
 
 Read-only. Show the complete difference between the live database and the design —
-**everything `reconcile --dry-run` omits**: foreign keys, CHECK constraints, indexes,
-and column comments, in addition to columns, PK/unique, and enums. Never writes, and
+**everything `reconcile --dry-run` omits**: CHECK constraints, indexes, and column
+comments, in addition to columns, PK/unique, foreign keys, and enums. Never writes, and
 available even after `dbd release`.
 
 ```sh

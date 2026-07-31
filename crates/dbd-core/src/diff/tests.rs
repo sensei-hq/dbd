@@ -862,6 +862,38 @@
         );
     }
 
+    // ── S10b: Unnamed FK add omits the CONSTRAINT clause ────
+    // The design's inline `references …` FK carries no name; emit `ADD FOREIGN
+    // KEY …` so Postgres auto-names it, instead of literally naming it "unnamed".
+
+    #[test]
+    fn s10b_unnamed_fk_add_sql_omits_constraint_name() {
+        let fk_diff = MigrationDiff {
+            entity_name: "public.orders".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "fk:user_id".to_string(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
+                    TableConstraint::ForeignKey(ForeignKey {
+                        name: None,
+                        columns: vec!["user_id".to_string()],
+                        ref_schema: None,
+                        ref_table: "users".to_string(),
+                        ref_columns: vec!["id".to_string()],
+                        on_delete: Some(FkAction::Cascade),
+                        on_update: None,
+                    }),
+                ))),
+            }]),
+        };
+        let sql = generate_migration_sql(&[fk_diff]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.orders ADD FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;"
+        );
+    }
+
     // ── S11: Constraint drop SQL ────────────────────────────
 
     #[test]

@@ -1432,6 +1432,117 @@ async fn diff_live_sees_foreign_keys_with_real_introspection() {
     );
 }
 
+/// Issue #8, end-to-end: `dbd reconcile` must MANAGE foreign keys against a real
+/// database — add a declared FK the live DB lacks (non-destructive), leave an
+/// in-sync FK alone, and drop a removed FK only under `--allow-destructive`.
+#[tokio::test]
+async fn reconcile_converges_foreign_keys() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_fk_test").await.unwrap();
+
+    // Design with an inline FK on the child table.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_fk_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/parents.ddl"),
+        "set search_path to app;\ncreate table if not exists parents (id uuid primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/children.ddl"),
+        "set search_path to app;\n\
+         create table if not exists children (\n\
+           id uuid primary key\n\
+         , parent_id uuid references parents(id)\n\
+         );\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+
+    let fk_pred = "SELECT 1 FROM pg_constraint c \
+         JOIN pg_class cls ON cls.oid = c.conrelid \
+         JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+         WHERE c.contype = 'f' AND ns.nspname = 'app' AND cls.relname = 'children'";
+
+    // Apply → the live DB has the FK.
+    design
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("apply failed");
+    assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
+
+    // In-sync: reconcile must not churn the FK.
+    let plan = design
+        .reconcile(&*adapter, true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("dry-run reconcile failed");
+    assert!(
+        !plan.altered.iter().any(|s| s.sql.contains("FOREIGN KEY")),
+        "in-sync FK must not produce reconcile churn; got {:?}",
+        plan.altered
+    );
+
+    // Drop the FK out from under the design.
+    adapter
+        .execute_script("ALTER TABLE app.children DROP CONSTRAINT children_parent_id_fkey;")
+        .await
+        .expect("drop fk failed");
+    assert_catalog(&*adapter, false, fk_pred, "FK on app.children").await;
+
+    // Reconcile (non-destructive) must re-add the declared FK.
+    design
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile re-adding FK failed");
+    assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
+
+    // A second design without the FK: dropping it is destructive.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let dir2 = tmp2.path();
+    std::fs::create_dir_all(dir2.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir2.join("design.yaml"),
+        "project:\n  name: reconcile_fk_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.join("ddl/table/app/parents.ddl"),
+        "set search_path to app;\ncreate table if not exists parents (id uuid primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.join("ddl/table/app/children.ddl"),
+        "set search_path to app;\n\
+         create table if not exists children (id uuid primary key, parent_id uuid);\n",
+    )
+    .unwrap();
+    let design2 = Design::from_config_with_dir(&dir2.join("design.yaml"), "dev", Some(dir2))
+        .expect("load design2");
+
+    // Without --allow-destructive → refused, FK untouched.
+    let refused = design2
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await;
+    assert!(refused.is_err(), "dropping an FK without --allow-destructive must be refused");
+    assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
+
+    // With --allow-destructive → the FK is dropped.
+    design2
+        .reconcile(&*adapter, false, true, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("destructive reconcile failed");
+    assert_catalog(&*adapter, false, fk_pred, "FK on app.children").await;
+}
+
 // ── Batch transaction (atomic apply) ──────────────────────────────────────────
 
 #[tokio::test]
