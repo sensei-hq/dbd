@@ -1154,8 +1154,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_reconcile, qualified_entity_name, snapshot_from_entities, ReconcileComplete,
-            DEFAULT_SCHEMA,
+            plan_fk_convergence, plan_reconcile, qualified_entity_name, raw_snapshot_from_entities,
+            snapshot_from_entities, ReconcileComplete, DEFAULT_SCHEMA,
         };
         use std::collections::{HashMap, HashSet};
 
@@ -1215,7 +1215,15 @@ impl Design {
         let live_full = snapshot_from_entities(&live_entities);
         let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
-        let plan = plan_reconcile(&live, &desired);
+        let mut plan = plan_reconcile(&live, &desired);
+
+        // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
+        // above, so converge them from the RAW snapshots — adding declared FKs
+        // the live DB lacks and dropping (destructive) ones the design removed.
+        let desired_raw = raw_snapshot_from_entities(&desired_owned);
+        let live_raw =
+            restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
+        plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
 
         if dry_run {
             return Ok(plan);
@@ -1325,7 +1333,7 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<crate::SchemaDiff> {
-        use crate::reconcile::{snapshot_from_entities, DEFAULT_SCHEMA};
+        use crate::reconcile::{raw_snapshot_from_entities, DEFAULT_SCHEMA};
         use std::collections::HashSet;
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -1356,9 +1364,10 @@ impl Design {
             })
             .collect();
 
-        // Desired snapshot (tables + enums, schema-normalized).
+        // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)
+        // so FK/CHECK/indexes/comments survive for `SchemaDiff` to compare.
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
-        let desired = snapshot_from_entities(&desired_owned);
+        let desired = raw_snapshot_from_entities(&desired_owned);
 
         // Schemas the design manages. The diff is scoped to these, so it never
         // reports drift for tables in schemas the project doesn't own.
@@ -1377,9 +1386,10 @@ impl Design {
             })
             .collect();
 
-        // Live snapshot, restricted to managed schemas.
+        // Live snapshot, restricted to managed schemas. Raw so introspected
+        // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
         let live_entities = adapter.introspect().await?;
-        let live_full = snapshot_from_entities(&live_entities);
+        let live_full = raw_snapshot_from_entities(&live_entities);
         let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
         Ok(crate::SchemaDiff::compute(live, desired))
@@ -2024,6 +2034,54 @@ mod tests {
         assert!(!d.is_empty(), "empty live DB vs a non-empty design must show drift");
         assert!(mock.applied_names().is_empty(), "diff_live must not apply anything");
         assert_eq!(mock.script_count(), 0, "diff_live must not execute any script");
+    }
+
+    /// Regression (issue #8): a foreign key the design declares but the live DB
+    /// is missing must surface in `dbd diff`. The read-only diff builds its
+    /// snapshots with a NON-stripping builder, so inline/table FKs reach the
+    /// comparison — unlike reconcile, whose `canonicalize` strips them. Before
+    /// the fix, `diff_live` built both sides via `snapshot_from_entities`
+    /// (canonicalize) and the FK was silently stripped from both, so drift went
+    /// unreported.
+    #[tokio::test]
+    async fn diff_live_detects_missing_foreign_key() {
+        use crate::diff::{DiffAction, FieldType};
+
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        // Live = the design's own table entities, but with config.lookup_values'
+        // inline FKs removed — the "FK dropped out from under the design" case.
+        let live: Vec<Entity> = design
+            .entities()
+            .iter()
+            .filter(|e| {
+                matches!(e.entity_type, EntityType::Table | EntityType::Enum) && e.errors.is_empty()
+            })
+            .cloned()
+            .map(|mut e| {
+                if e.name == "config.lookup_values"
+                    && let Some(td) = e.table_def.as_mut()
+                {
+                    for c in &mut td.columns {
+                        c.inline_fk = None;
+                    }
+                }
+                e
+            })
+            .collect();
+
+        let mock = MockAdapter::new();
+        *mock.introspected.lock().unwrap() = live;
+
+        let d = design.diff_live(&mock, None).await.unwrap();
+        assert!(
+            d.changes.iter().any(|c| c.entity_name == "config.lookup_values"
+                && matches!(&c.action, DiffAction::Change(changes)
+                    if changes.iter().any(|f| f.field_type == FieldType::Constraint))),
+            "a design FK missing from the live DB must surface as a constraint change; got {:?}",
+            d.changes
+        );
     }
 
     // ── Transactional apply (atomic batch) ───────────────

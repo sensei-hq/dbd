@@ -469,18 +469,21 @@ canonicalizes the two representations first: it lifts inline PK/UNIQUE to
 structural constraints, strips constraint names, schema-qualifies bare enum types
 (`status` → `config.status`) to match introspection, and normalizes type aliases
 (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). It reconciles
-**columns** (name/type/nullability/default/identity) and **PK/UNIQUE**
-constraints only. Foreign keys, check constraints, and indexes are **not**
-diffed on existing tables (introspected vs parsed forms diverge) — change those
-via `dbd snapshot`. Generated ALTERs run with the managed schemas on
-`search_path`, mirroring the DDL files.
+**columns** (name/type/nullability/default/identity), **PK/UNIQUE** constraints,
+and **foreign keys** — FKs are matched by shape, so a declared FK the live DB
+lacks is added and a removed one is dropped (`DROP CONSTRAINT`, gated behind
+`--allow-destructive`). Check constraints and indexes are **not** diffed on
+existing tables (introspected vs parsed forms diverge) — change those via
+`dbd snapshot`. Generated ALTERs run with the managed schemas on `search_path`,
+mirroring the DDL files.
 
 ### dbd diff
 
 Read-only. Show the complete difference between the live database and the
 design — columns, PK/unique, foreign keys, CHECK constraints, indexes, column
-comments and enums: everything `reconcile --dry-run` omits. Never writes, and
-available even after `dbd release`.
+comments and enums: everything `reconcile --dry-run` omits (reconcile also now
+handles FKs; diff additionally covers CHECK, indexes, and comments). Never
+writes, and available even after `dbd release`.
 
 ```sh
 dbd diff -d $DATABASE_URL              # human report (summary + SQL)
@@ -654,7 +657,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.23
+  rev: v0.8.24
   hooks:
     - id: dbd-format
 ```

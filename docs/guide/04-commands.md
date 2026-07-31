@@ -279,12 +279,16 @@ Reconcile is **disabled once the project is released** (`project.released: true`
 `--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
 
 **What reconcile compares** (against the introspected live schema): columns
-(name, type, nullability, default, identity) and primary-key / unique constraints. Bare enum types
-are schema-qualified to match introspection, and common type aliases are normalized (`int4` →
-`integer`, `timestamptz` → `timestamp with time zone`). **Not** reconciled on existing tables:
-foreign keys, check constraints, and indexes — their introspected and parsed forms differ too much
-to diff reliably, so change those via `dbd snapshot` (they're still created with the initial
-`CREATE`). Because introspected and hand-written DDL can spell a default or exotic type differently,
+(name, type, nullability, default, identity), primary-key / unique constraints, and **foreign
+keys**. Bare enum types are schema-qualified to match introspection, and common type aliases are
+normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
+matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
+and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
+added (`ADD FOREIGN KEY …`, Postgres auto-names it), and an FK the design dropped is removed
+(`DROP CONSTRAINT …`, gated behind `--allow-destructive`). **Not** reconciled on existing tables:
+check constraints and indexes — their introspected and parsed forms differ too much to diff
+reliably, so change those via `dbd snapshot` (they're still created with the initial `CREATE`).
+Because introspected and hand-written DDL can spell a default or exotic type differently,
 reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
 `--dry-run` first.
 
@@ -293,8 +297,8 @@ reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`
 ## `dbd diff`
 
 Read-only. Show the complete difference between the live database and the design —
-**everything `reconcile --dry-run` omits**: foreign keys, CHECK constraints, indexes,
-and column comments, in addition to columns, PK/unique, and enums. Never writes, and
+**everything `reconcile --dry-run` omits**: CHECK constraints, indexes, and column
+comments, in addition to columns, PK/unique, foreign keys, and enums. Never writes, and
 available even after `dbd release`.
 
 ```sh
@@ -594,7 +598,7 @@ format:
   gutter: 10                 # river keyword-gutter width (fits "inner join")
 ```
 
-Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted).
+Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Inline column comments (`-- …` / `/* … */`) survive a CREATE TABLE reformat — they're recovered from the source and re-attached to the column they documented (trailing comments end-of-line, standalone comments on their own line above the column). Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted). A round-trip guard keeps the original text untouched for any statement the reformatter can't reproduce faithfully (same parsed AST, every comment retained), so formatting never changes what your SQL means or drops a comment.
 
 **River style** is the **default** `query_style` (set `query_style: none` to disable). It right-aligns SQL keywords at the `gutter` column so the clause keywords form a "river" down the left edge, with leading-comma SELECT lists, alias alignment, and one condition per line in WHERE/HAVING/ON. It applies to `CREATE VIEW` bodies and standalone SELECTs. A query the river renderer can't reproduce faithfully (e.g. one using a CTE) is automatically left in plain keyword-cased form rather than risk altering it — so river formatting never changes what your SQL means:
 
@@ -620,7 +624,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.8.23
+  rev: v0.8.24
   hooks:
     - id: dbd-format
 ```
