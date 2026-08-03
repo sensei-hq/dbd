@@ -1292,6 +1292,62 @@ impl Design {
             restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
         plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
 
+        // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
+        // so `--dry-run` previews matview creates AND drift warnings. Postgres has
+        // no `CREATE OR REPLACE MATERIALIZED VIEW`, and dbd deliberately never
+        // auto-drops one (a DROP … CASCADE would repopulate it and drop its
+        // dependents — unacceptable in a dev-loop reconcile). So: CREATE an absent
+        // matview (stamping a `dbd:hash` sentinel), SKIP one whose stored hash
+        // matches the design, and for one that drifted (or carries no sentinel)
+        // WARN and leave it untouched. Only the CREATE *writes* run after the
+        // return; here we merely record the decisions into the plan and a local
+        // `mv_to_create` list the write pass reuses (no second states fetch).
+        use crate::reconcile::{decide_matview_action, matview_create_sql, matview_hash, MatviewAction};
+        let matviews: Vec<&Entity> = desired_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        let mut mv_to_create: Vec<(&Entity, String)> = Vec::new();
+        if !matviews.is_empty() {
+            let states = adapter.matview_states().await?;
+            for &e in &matviews {
+                let want = matview_hash(e);
+                match decide_matview_action(&want, states.get(&e.name).cloned()) {
+                    MatviewAction::Skip => {}
+                    MatviewAction::Create => {
+                        plan.matview_creates.push(e.name.clone());
+                        mv_to_create.push((e, want));
+                    }
+                    MatviewAction::Warn => {
+                        // Detected drift, but dbd never auto-recreates a matview.
+                        // Surface it through the plan's warnings (the same channel
+                        // `dbd reconcile` prints for risky-change advisories).
+                        let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
+                        plan.warnings.push(if has_sentinel {
+                            format!(
+                                "materialized view {name}: definition differs from the deployed object \
+                                 (dbd does not auto-recreate materialized views because that would \
+                                 DROP … CASCADE and lose data/dependents). To apply the new \
+                                 definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
+                                 and re-run `dbd apply` to recreate it.",
+                                name = e.name,
+                                schema = e.schema.as_deref().unwrap_or("public"),
+                                bare = e.name.rsplit('.').next().unwrap_or(&e.name),
+                            )
+                        } else {
+                            format!(
+                                "materialized view {}: exists but is not stamped by dbd (cannot \
+                                 verify its definition); recreate it under dbd management to enable \
+                                 drift detection.",
+                                e.name
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
         if dry_run {
             return Ok(plan);
         }
@@ -1370,63 +1426,19 @@ impl Design {
             summary.reapplied += 1;
         }
 
-        // Pass C-mv — materialized views. Postgres has no `CREATE OR REPLACE
-        // MATERIALIZED VIEW`, and dbd deliberately never auto-drops one (a DROP …
-        // CASCADE would repopulate it and drop its dependents — unacceptable in a
-        // dev-loop reconcile). So: CREATE an absent matview (stamping a `dbd:hash`
-        // sentinel), SKIP one whose stored hash matches the design, and for one
-        // that drifted (or carries no sentinel) WARN and leave it untouched — the
-        // user drops it deliberately, then `apply`/reconcile recreates it.
-        // The CREATE carries the same `search_path` prelude the ALTERs use, since
-        // the emitted `CREATE` (unlike a DDL file) has no `set search_path`.
-        let matviews: Vec<&Entity> = desired_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        if !matviews.is_empty() {
-            use crate::reconcile::{decide_matview_action, matview_create_sql, matview_hash, MatviewAction};
-            let states = adapter.matview_states().await?;
-            for &e in &matviews {
-                let want = matview_hash(e);
-                match decide_matview_action(&want, states.get(&e.name).cloned()) {
-                    MatviewAction::Skip => {}
-                    MatviewAction::Create => {
-                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-                        on_start(&desc);
-                        let result = adapter
-                            .execute_script(&format!("{search_path}{}", matview_create_sql(e, &want)))
-                            .await;
-                        report_step_result(&desc, &mut on_done, result)?;
-                        summary.reapplied += 1;
-                    }
-                    MatviewAction::Warn => {
-                        // Detected drift, but dbd never auto-recreates a matview.
-                        // Surface it through the plan's warnings (the same channel
-                        // `dbd reconcile` prints for risky-change advisories).
-                        let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
-                        plan.warnings.push(if has_sentinel {
-                            format!(
-                                "materialized view {name}: definition differs from the deployed object \
-                                 (dbd does not auto-recreate materialized views because that would \
-                                 DROP … CASCADE and lose data/dependents). To apply the new \
-                                 definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
-                                 and re-run `dbd apply` to recreate it.",
-                                name = e.name,
-                                schema = e.schema.as_deref().unwrap_or("public"),
-                                bare = e.name.rsplit('.').next().unwrap_or(&e.name),
-                            )
-                        } else {
-                            format!(
-                                "materialized view {}: exists but is not stamped by dbd (cannot \
-                                 verify its definition); recreate it under dbd management to enable \
-                                 drift detection.",
-                                e.name
-                            )
-                        });
-                    }
-                }
-            }
+        // Pass C-mv (WRITES) — CREATE the matviews the detection pass (above the
+        // dry_run return) found absent. Reuses the pre-computed `mv_to_create`, so
+        // there is no second `matview_states()` fetch. Each CREATE carries the same
+        // `search_path` prelude the ALTERs use, since the emitted `CREATE` (unlike
+        // a DDL file) has no `set search_path`.
+        for (e, want) in &mv_to_create {
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter
+                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
+                .await;
+            report_step_result(&desc, &mut on_done, result)?;
+            summary.reapplied += 1;
         }
 
         // Pass D — prune orphaned tables (in managed schemas, gone from the
@@ -1532,7 +1544,65 @@ impl Design {
         let live_full = raw_snapshot_from_entities(&live_entities);
         let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
-        Ok(crate::SchemaDiff::compute(live, desired))
+        let mut diff = crate::SchemaDiff::compute(live, desired);
+
+        // Materialized-view drift (read-only). Matviews aren't in the tables/enums
+        // snapshots above, so `compute` never reports them — categorize them here.
+        // Mirrors reconcile's create/skip/warn decision, but splits the two "warn"
+        // cases into Drifted (stamped, hash mismatch) vs Unstamped (no dbd
+        // sentinel), and adds Orphan (live matview in a managed schema, gone from
+        // the design).
+        use crate::reconcile::matview_hash;
+        use crate::schema_diff::{MatviewDrift, MatviewDriftKind};
+
+        let design_matviews: Vec<&Entity> = desired_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        let design_mv_names: HashSet<&str> =
+            design_matviews.iter().map(|e| e.name.as_str()).collect();
+
+        let mut matview_drift: Vec<MatviewDrift> = Vec::new();
+
+        // Design matviews: compare each design hash to the live sentinel. Only
+        // fetch `matview_states()` when the design actually has a matview — an
+        // orphan-only diff never needs it (orphans are found from `live_entities`).
+        if !design_matviews.is_empty() {
+            let states = adapter.matview_states().await?;
+            for e in &design_matviews {
+                let want = matview_hash(e);
+                let kind = match states.get(&e.name) {
+                    None => MatviewDriftKind::Missing,
+                    Some(Some(h)) if *h == want => continue, // in sync — emit nothing
+                    Some(Some(_)) => MatviewDriftKind::Drifted,
+                    Some(None) => MatviewDriftKind::Unstamped,
+                };
+                matview_drift.push(MatviewDrift { name: e.name.clone(), kind });
+            }
+        }
+
+        // Orphans: live matviews in a managed schema, absent from the design. No
+        // hash needed, so this reuses the already-fetched `live_entities` and adds
+        // no query. Schema derivation mirrors `managed_schemas` above.
+        for e in &live_entities {
+            if e.entity_type != EntityType::MaterializedView {
+                continue;
+            }
+            let schema = {
+                let s = e.schema.clone().unwrap_or_default();
+                if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
+            };
+            if managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str()) {
+                matview_drift.push(MatviewDrift { name: e.name.clone(), kind: MatviewDriftKind::Orphan });
+            }
+        }
+
+        // Deterministic order for stable output and tests.
+        matview_drift.sort_by(|a, b| a.name.cmp(&b.name));
+        diff.matview_drift = matview_drift;
+
+        Ok(diff)
     }
 
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.

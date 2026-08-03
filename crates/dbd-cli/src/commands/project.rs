@@ -505,12 +505,18 @@ fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
 /// its summary line; normal mode shows only the one-line-per-entity summary,
 /// matching the CLI convention that SQL is a `-v` detail.
 fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) -> Vec<String> {
-    if plan.is_empty() && plan.dropped.is_empty() {
+    // `is_empty()` already covers added/altered/dropped/matview_creates, but
+    // warnings live in their own channel — a plan whose ONLY content is a matview
+    // drift warning must still print it rather than falsely claiming "in sync".
+    if plan.is_empty() && plan.dropped.is_empty() && plan.warnings.is_empty() {
         return vec!["Already in sync — no changes.".to_string()];
     }
     let mut lines = Vec::new();
     for name in &plan.added {
         lines.push(format!("  + create {name}"));
+    }
+    for name in &plan.matview_creates {
+        lines.push(format!("  + create materialized view {name}"));
     }
     for s in &plan.altered {
         lines.push(format!("  ~ alter  {}", s.entity_name));
@@ -887,6 +893,7 @@ mod tests {
     fn reconcile_plan_lines_covers_added_dropped_warnings_and_destructive() {
         let plan = dbd_core::ReconcilePlan {
             added: vec!["public.new_table".to_string()],
+            matview_creates: vec!["analytics.daily_sales".to_string()],
             altered: vec![ReconcileStatement {
                 entity_name: "public.users".to_string(),
                 sql: "ALTER TABLE public.users ADD COLUMN email text;".to_string(),
@@ -901,6 +908,10 @@ mod tests {
 
         let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");
         assert!(pruned.contains("+ create public.new_table"), "got: {pruned}");
+        assert!(
+            pruned.contains("+ create materialized view analytics.daily_sales"),
+            "got: {pruned}"
+        );
         assert!(pruned.contains("~ alter  public.users"), "got: {pruned}");
         assert!(pruned.contains("- prune  public.orphan"), "got: {pruned}");
         assert!(pruned.contains("⚠ enum value dropped"), "got: {pruned}");
@@ -910,6 +921,26 @@ mod tests {
         assert!(
             unpruned.contains("· orphan public.orphan (use --prune to drop)"),
             "got: {unpruned}"
+        );
+    }
+
+    /// A plan whose ONLY content is a matview drift warning must NOT report
+    /// "Already in sync" — it renders the `⚠` line so real drift is surfaced
+    /// rather than hidden (warnings live outside `is_empty()`).
+    #[test]
+    fn reconcile_plan_lines_warning_only_is_not_in_sync() {
+        let plan = dbd_core::ReconcilePlan {
+            warnings: vec!["materialized view app.mv: definition differs from the deployed object".to_string()],
+            ..Default::default()
+        };
+        let out = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        assert!(
+            !out.contains("Already in sync"),
+            "a drift-only plan must not claim in-sync; got: {out}"
+        );
+        assert!(
+            out.contains("⚠ materialized view app.mv: definition differs"),
+            "the warning must render; got: {out}"
         );
     }
 

@@ -279,9 +279,11 @@ dbd reconcile --allow-destructive -d $DATABASE_URL    # Also drop columns/constr
 dbd reconcile --prune -d $DATABASE_URL                # Also drop orphaned tables
 ```
 
-The plan lists one line per changed entity (`+ create`, `~ alter`, `- prune`). Add `-v` to a
-`--dry-run` to print the generated `ALTER` SQL beneath each altered entity, so you can review the
-exact column-level change before applying.
+The plan lists one line per changed entity (`+ create`, `~ alter`, `- prune`). Materialized views
+appear too: `+ create materialized view <name>` for one reconcile would create, and a `⚠` warning
+for a matview whose deployed definition has drifted (dbd never auto-recreates a matview). Add `-v`
+to a `--dry-run` to print the generated `ALTER` SQL beneath each altered entity, so you can review
+the exact column-level change before applying.
 
 The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
 schemas. Two kinds of destruction each need an explicit opt-in:
@@ -330,8 +332,13 @@ indexes, FK `NO ACTION` defaults and auto-generated FK names, and CHECK-expressi
 parenthesization via the Postgres parser) so only real drift is reported. A CHECK expression
 that can't be parsed is still shown, flagged `advisory` so you verify it by hand.
 
-**Scope:** diff covers **tables and enums** and all their attributes;
-views/functions/roles/sequences are not structurally diffed.
+**Scope:** diff covers **tables and enums** (all their attributes) plus
+**materialized-view drift** — each matview is reported as `missing` (in the
+design, not the DB), `drifted` (deployed definition differs from the design, by
+`dbd:hash` sentinel), `unstamped` (in the DB but not managed by dbd), or `orphan`
+(in a managed schema, not in the design). Matview drift counts toward
+`--exit-code` and appears in `--json` (`matview_drift`). Views/functions/roles/
+sequences are not structurally diffed.
 
 **Best-effort edges** (reported, but may need a human glance): a foreign key that references a
 table in the *same non-public schema* without qualifying it can read as drift; a standalone
@@ -642,7 +649,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.9.0
+  rev: v0.9.1
   hooks:
     - id: dbd-format
 ```
