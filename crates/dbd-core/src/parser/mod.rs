@@ -45,13 +45,14 @@ fn preprocess_sql(sql: &str) -> String {
 
     // WORKAROUND: sqlparser-comment-on-object-types
     // Limitation: sqlparser only supports COMMENT ON TABLE and COMMENT ON COLUMN.
-    //             COMMENT ON VIEW, FUNCTION, PROCEDURE, TRIGGER, INDEX, etc. fail.
+    //             COMMENT ON VIEW, MATERIALIZED VIEW, FUNCTION, PROCEDURE, TRIGGER,
+    //             INDEX, etc. fail.
     // Impact:     Parse error on any DDL file with non-table/column comments.
     // Check:      Parser::parse_sql("COMMENT ON VIEW foo IS 'bar';")
     // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
     {
         let re = regex::Regex::new(
-            r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
+            r"(?is)\bcomment\s+on\s+(?:materialized\s+view|view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
         ).unwrap();
         if re.is_match(&result) {
             result = std::borrow::Cow::Owned(re.replace_all(&result, "").to_string());
@@ -374,5 +375,13 @@ mod tests {
             "bare-identifier grant not parsed; refers: {:?}",
             parsed.refers
         );
+    }
+
+    #[test]
+    fn comment_on_materialized_view_is_stripped() {
+        let sql = "COMMENT ON MATERIALIZED VIEW analytics.daily_sales IS 'daily rollup';";
+        let cleaned = super::preprocess_sql(sql);
+        assert!(!cleaned.to_lowercase().contains("comment on materialized view"),
+            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}");
     }
 }
