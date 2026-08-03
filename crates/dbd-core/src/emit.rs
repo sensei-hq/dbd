@@ -246,6 +246,28 @@ pub fn emit_view(entity: &Entity) -> String {
     format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
 }
 
+/// `CREATE MATERIALIZED VIEW "schema"."name" AS <definition> WITH DATA;`
+/// Body is carried in `entity.writes[0]` (same contract as `emit_view`); the
+/// parser stores it without a `WITH DATA` clause, which we re-add here.
+/// Trailing index statements (if any) are appended from `entity.table_def`,
+/// rendered via the same `emit_index_sql` helper `emit_table` uses.
+pub fn emit_matview(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+    let name = bare(&entity.name);
+    let qname = format!("{}.{}", q(schema), q(name));
+    let body = entity.writes.first().map(String::as_str).unwrap_or("SELECT 1");
+    let body = body.trim().trim_end_matches(';');
+    let mut out = format!("CREATE MATERIALIZED VIEW {qname} AS {body} WITH DATA;");
+
+    if let Some(def) = &entity.table_def {
+        for ix in &def.indexes {
+            out.push('\n');
+            out.push_str(&emit_index_sql(ix, &qname, name));
+        }
+    }
+    out
+}
+
 /// `CREATE OR REPLACE FUNCTION|PROCEDURE …;` for each overload, joined by a
 /// blank line.
 ///
@@ -285,6 +307,7 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
         EntityType::Enum => Some(emit_enum(entity)),
         EntityType::Table => Some(emit_table(entity)),
         EntityType::View => Some(emit_view(entity)),
+        EntityType::MaterializedView => Some(emit_matview(entity)),
         EntityType::Function | EntityType::Procedure => Some(emit_routine(entity)),
         _ => None,
     }
@@ -437,6 +460,58 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
+        );
+    }
+
+    #[test]
+    fn emits_materialized_view() {
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        let sql = emit_matview(&e);
+        assert_eq!(
+            sql,
+            "CREATE MATERIALIZED VIEW \"analytics\".\"daily_sales\" AS SELECT 1 AS x WITH DATA;"
+        );
+    }
+
+    #[test]
+    fn emit_entity_dispatches_matview() {
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        let sql = emit_entity(&e).expect("matview should emit");
+        assert!(sql.starts_with("CREATE MATERIALIZED VIEW"));
+    }
+
+    #[test]
+    fn emits_materialized_view_with_index() {
+        use crate::entity::{IndexColumn, IndexDef, TableDef};
+
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        e.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![IndexDef {
+                name: Some("daily_sales_x_idx".into()),
+                columns: vec![IndexColumn { name: "x".into(), order: None }],
+                unique: true,
+                index_type: None,
+            }],
+            comments: Default::default(),
+        });
+
+        let sql = emit_matview(&e);
+        assert!(
+            sql.contains(
+                "CREATE MATERIALIZED VIEW \"analytics\".\"daily_sales\" AS SELECT 1 AS x WITH DATA;"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "CREATE UNIQUE INDEX \"daily_sales_x_idx\" ON \"analytics\".\"daily_sales\" (\"x\");"
+            ),
+            "got:\n{sql}"
         );
     }
 
