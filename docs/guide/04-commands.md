@@ -50,6 +50,8 @@ dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live 
 
 **`--from-db`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums), using the `-d`/`--database` connection — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
 
+**Suggestions (advisory).** On a Postgres/Supabase project, `inspect` prints a `Suggestions:` section when it finds a `CHECK` constraint that pins a column to a fixed set of string literals (`status IN ('active','inactive')`, `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — a Postgres `enum` (`ddl/enum/<schema>/<name>.ddl`) models that with type safety and cleaner introspection. Suggestions are **advisory only**: they never count as errors and never affect the exit code.
+
 ---
 
 ## `dbd apply`
