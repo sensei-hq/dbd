@@ -35,6 +35,10 @@ pub async fn run(
             schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity)
         }
 
+        Commands::Refresh { name } => {
+            schema::cmd_refresh(config, env, project_dir, database_url, name.as_deref(), verbosity).await
+        }
+
         Commands::Graph { name } => {
             project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
         }
