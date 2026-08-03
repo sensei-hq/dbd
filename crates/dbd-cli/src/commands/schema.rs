@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dbd_core::design::ApplyComplete;
-use dbd_core::Design;
+use dbd_core::{Design, Entity, EntityType};
 
 use super::{format_apply_summary, get_adapter, safe_read, safe_write};
 use crate::output::{self, Verbosity};
@@ -370,6 +370,59 @@ pub async fn cmd_apply(
     Ok(())
 }
 
+/// Select the materialized views a `refresh` invocation should target, in
+/// `entities` order (already dependency-sorted, matviews contiguous).
+///
+/// - `None` → every materialized view.
+/// - `Some("schema.*")` → every materialized view in that schema.
+/// - `Some("schema.name")` → that one materialized view (by qualified name).
+fn select_matviews<'a>(entities: &'a [Entity], name: Option<&str>) -> Vec<&'a Entity> {
+    entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::MaterializedView)
+        .filter(|e| match name {
+            None => true,
+            Some(sel) if sel.ends_with(".*") => {
+                let schema = sel.trim_end_matches(".*");
+                e.schema.as_deref() == Some(schema)
+            }
+            Some(sel) => e.name == sel,
+        })
+        .collect()
+}
+
+/// Refresh materialized views: `REFRESH MATERIALIZED VIEW [CONCURRENTLY] …`,
+/// honoring each view's resolved `concurrently` setting, in dependency order.
+pub async fn cmd_refresh(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+
+    let selected = select_matviews(design.entities(), name);
+    if selected.is_empty() {
+        output::info(verbosity, "No materialized views to refresh.");
+        return Ok(());
+    }
+
+    let adapter = get_adapter(config, database_url).await?;
+
+    for entity in selected {
+        let resolved = design.config().materialized_views.resolve(&entity.name);
+        output::info(verbosity, &format!("Refreshing {} ...", entity.name));
+        adapter
+            .refresh_matview(&entity.name, resolved.concurrently)
+            .await
+            .with_context(|| format!("Failed to refresh {}", entity.name))?;
+    }
+
+    Ok(())
+}
+
 pub async fn cmd_policies(
     config: &Path,
     project_dir: &Path,
@@ -727,5 +780,57 @@ mod tests {
 
         let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
         assert_ne!(formatted, "create table public.thing(id int,name text);");
+    }
+
+    /// Mixed fixture for `select_matviews`: two matviews in `analytics`, one
+    /// in `reporting`, plus a non-matview table — so the None/`schema.*`/name
+    /// cases are all distinguishable from each other.
+    fn matview_fixture() -> Vec<Entity> {
+        vec![
+            Entity::new(EntityType::MaterializedView, "analytics.daily_sales"),
+            Entity::new(EntityType::MaterializedView, "analytics.weekly_sales"),
+            Entity::new(EntityType::MaterializedView, "reporting.monthly_totals"),
+            Entity::new(EntityType::Table, "analytics.raw_events"),
+        ]
+    }
+
+    /// `None` selects every materialized view, in entities() order, and
+    /// excludes the plain table.
+    #[test]
+    fn select_matviews_none_selects_all_matviews() {
+        let entities = matview_fixture();
+        let selected = select_matviews(&entities, None);
+        let names: Vec<&str> = selected.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["analytics.daily_sales", "analytics.weekly_sales", "reporting.monthly_totals"]
+        );
+    }
+
+    /// `schema.*` selects only that schema's matviews.
+    #[test]
+    fn select_matviews_wildcard_selects_schema_only() {
+        let entities = matview_fixture();
+        let selected = select_matviews(&entities, Some("analytics.*"));
+        let names: Vec<&str> = selected.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["analytics.daily_sales", "analytics.weekly_sales"]);
+    }
+
+    /// A fully-qualified name selects just that one matview.
+    #[test]
+    fn select_matviews_named_selects_single_entity() {
+        let entities = matview_fixture();
+        let selected = select_matviews(&entities, Some("analytics.daily_sales"));
+        let names: Vec<&str> = selected.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["analytics.daily_sales"]);
+    }
+
+    /// A name that isn't a materialized view (the table, or an unknown name)
+    /// selects nothing — it never falls back to matching non-matview entities.
+    #[test]
+    fn select_matviews_non_matview_name_selects_nothing() {
+        let entities = matview_fixture();
+        assert!(select_matviews(&entities, Some("analytics.raw_events")).is_empty());
+        assert!(select_matviews(&entities, Some("nonexistent.thing")).is_empty());
     }
 }

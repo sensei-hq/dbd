@@ -97,6 +97,12 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Refresh materialized views (REFRESH MATERIALIZED VIEW [CONCURRENTLY])
+    Refresh {
+        /// Refresh a specific materialized view (or `schema.*` wildcard). Omit to refresh all.
+        #[arg(short, long)]
+        name: Option<String>,
+    },
     /// Output dependency graph as JSON
     Graph {
         /// Scope to a specific entity's subgraph
@@ -317,7 +323,7 @@ mod tests {
     #[test]
     fn every_subcommand_parses() {
         let cmds = [
-            "inspect", "apply", "combine", "import", "graph", "dbml", "diagram", "deploy",
+            "inspect", "apply", "combine", "import", "refresh", "graph", "dbml", "diagram", "deploy",
             "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
             "policies", "diff", "reconcile", "release",
         ];
@@ -568,6 +574,20 @@ mod tests {
         // back-compat: just -n
         let cli = Cli::try_parse_from(["dbd", "import", "-n", "t"]).expect("import -n t should parse");
         assert!(matches!(&cli.command, Commands::Import { name: Some(n), file: None, .. } if n == "t"));
+    }
+
+    /// `dbd refresh` with no `--name` parses to `name == None` (refresh all).
+    #[test]
+    fn parses_refresh_all() {
+        let cli = Cli::try_parse_from(["dbd", "refresh"]).unwrap();
+        assert!(matches!(&cli.command, Commands::Refresh { name: None }));
+    }
+
+    /// `dbd refresh -n <qualified-name>` captures the selector.
+    #[test]
+    fn parses_refresh_named() {
+        let cli = Cli::try_parse_from(["dbd", "refresh", "-n", "analytics.daily_sales"]).unwrap();
+        assert!(matches!(&cli.command, Commands::Refresh { name: Some(n) } if n == "analytics.daily_sales"));
     }
 
     /// `export -o/--output` parses alongside `-f/--format`, and the back-compat
