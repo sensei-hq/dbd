@@ -70,7 +70,7 @@ materialized_views:
   options:
     refresh: "0 2 * * *"      # shared cron schedule for ALL matviews
     concurrently: true        # shared default
-  views:
+  overrides:
     analytics.top_products:
       refresh: "*/30 * * * *" # override just this one
     analytics.realtime:
@@ -78,7 +78,7 @@ materialized_views:
 ```
 
 - A matview with **no** resolved schedule (no global `options.refresh` and no override) gets **no** cron job — it is create-only and refreshed manually via `dbd refresh`.
-- Effective settings = `options` defaults overlaid by the per-view entry in `views:`.
+- Effective settings = `options` defaults overlaid by the per-view entry in `overrides:`.
 
 **Ownership model** — dbd manages a cron job per scheduled matview, named with a reserved prefix so user jobs are never touched:
 
