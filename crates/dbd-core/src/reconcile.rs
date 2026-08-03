@@ -584,7 +584,8 @@ pub struct ReconcileComplete {
 // dev-loop `reconcile` must never silently lose data or dependent objects.
 // Instead reconcile CREATEs an absent matview, and for one that already exists it
 // only *detects* drift and WARNS — leaving the live object untouched so the user
-// can drop+recreate it deliberately (manually, or via snapshot/migrate).
+// drops it deliberately, after which `apply`/reconcile recreates it (snapshots
+// exclude matviews, so migrations can't recreate one).
 //
 // Drift is detected by stamping a deterministic hash of the DESIGN onto the live
 // object as a `dbd:hash=…` comment sentinel (matview comments are otherwise
