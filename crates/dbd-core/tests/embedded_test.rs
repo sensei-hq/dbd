@@ -557,6 +557,23 @@ async fn introspect_captures_materialized_views() {
         .expect("failed to drop schema mvtest");
 }
 
+/// `sync_refresh_jobs(&[])` against a real Postgres WITHOUT pg_cron must be a
+/// no-op that returns `Ok` — proving the pg_cron-presence guard keeps `apply`
+/// from touching `cron.job` on databases that lack the extension. The embedded
+/// PG has no pg_cron, so this exercises `pg_cron_present()` -> false and
+/// `plan_cron_sync(empty, false)` -> `Ok(vec![])` end-to-end on a live DB. (An
+/// end-to-end `cron.schedule` test isn't possible here — the embedded PG cannot
+/// load pg_cron — so the scheduling SQL is covered by the pure unit tests.)
+#[tokio::test]
+async fn sync_refresh_jobs_is_noop_without_pg_cron() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "cron_noop_test").await.unwrap();
+    adapter
+        .sync_refresh_jobs(&[])
+        .await
+        .expect("sync_refresh_jobs must be a no-op on a DB without pg_cron");
+}
+
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
 
 /// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a

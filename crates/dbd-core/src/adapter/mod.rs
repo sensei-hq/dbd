@@ -104,6 +104,24 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(())
     }
 
+    // ── Materialized-view refresh scheduling ────────────
+
+    /// Sync pg_cron refresh jobs for the given (qualified_name, ResolvedMatview)
+    /// set. Default: no-op (targets without pg_cron support).
+    async fn sync_refresh_jobs(
+        &self,
+        _jobs: &[(String, crate::config::ResolvedMatview)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Refresh one matview now. Default: unsupported.
+    async fn refresh_matview(&self, _qualified: &str, _concurrently: bool) -> Result<()> {
+        Err(crate::error::DbdError::Config(
+            "REFRESH MATERIALIZED VIEW is not supported by this target".into(),
+        ))
+    }
+
     // ── Data operations ────────────────────────────────
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()>;
