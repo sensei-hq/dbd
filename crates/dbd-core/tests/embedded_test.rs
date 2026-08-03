@@ -1551,6 +1551,122 @@ async fn reconcile_dry_run_previews_matview_create_without_writing() {
     );
 }
 
+/// End-to-end materialized-view drift reporting in the READ-ONLY `diff_live`:
+/// after a matview is created + stamped by reconcile, `diff_live` reports
+/// Drifted (design definition changed), Missing (design matview absent from the
+/// DB) and Orphan (DB matview absent from the design), in name-sorted order —
+/// and writes NOTHING (proven by the drifted matview's oid being unchanged, the
+/// Missing matview still not existing, and the Orphan still existing afterward).
+#[tokio::test]
+async fn diff_live_reports_matview_drift_read_only() {
+    use dbd_core::schema_diff::MatviewDriftKind;
+
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "diff_mv_drift_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: diff_mv_drift_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    let write_mv = |select: &str| {
+        std::fs::write(
+            dir.join("ddl/materialized_view/app/mv.ddl"),
+            format!("create materialized view app.mv as {select} with data;\n"),
+        )
+        .unwrap();
+    };
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+    };
+
+    // ── Setup: reconcile creates + stamps app.mv (and its source table). ──
+    write_mv("select id from app.items");
+    load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile (create matview) failed");
+
+    // ── (a) SAME design → no matview drift (stored hash matches the design). ──
+    let d = load().diff_live(&*adapter, None).await.expect("diff (in sync) failed");
+    assert!(
+        d.matview_drift.is_empty(),
+        "an in-sync matview must not report drift; got {:?}",
+        d.matview_drift
+    );
+
+    // ── Introduce all three drift kinds at once: ──
+    // Drifted: change app.mv's definition in the design.
+    write_mv("select id, name from app.items");
+    // Missing: a second design matview the DB doesn't have.
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv2.ddl"),
+        "create materialized view app.mv2 as select id from app.items with data;\n",
+    )
+    .unwrap();
+    // Orphan: a DB matview with no design counterpart (created directly here).
+    adapter
+        .execute_script("create materialized view app.orphan as select id from app.items with data;")
+        .await
+        .expect("create orphan matview failed");
+
+    // Snapshot app.mv's oid so we can prove diff_live never recreated it.
+    adapter
+        .execute_script(
+            "DROP TABLE IF EXISTS _mv_oid; \
+             CREATE TABLE _mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
+        )
+        .await
+        .expect("stash oid failed");
+
+    // ── Run the read-only diff. ──
+    let d = load().diff_live(&*adapter, None).await.expect("diff (drift) failed");
+
+    let kind_of = |name: &str| d.matview_drift.iter().find(|m| m.name == name).map(|m| m.kind);
+    assert_eq!(kind_of("app.mv"), Some(MatviewDriftKind::Drifted), "got {:?}", d.matview_drift);
+    assert_eq!(kind_of("app.mv2"), Some(MatviewDriftKind::Missing), "got {:?}", d.matview_drift);
+    assert_eq!(kind_of("app.orphan"), Some(MatviewDriftKind::Orphan), "got {:?}", d.matview_drift);
+    assert!(!d.is_empty(), "matview drift must make the diff non-empty");
+    // Deterministic (name-sorted) order.
+    let names: Vec<&str> = d.matview_drift.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["app.mv", "app.mv2", "app.orphan"], "matview drift must be name-sorted");
+
+    // ── Read-only proof: diff wrote nothing. ──
+    // The drifted matview was NOT recreated (oid unchanged).
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF (SELECT oid FROM _mv_oid) <> 'app.mv'::regclass::oid \
+               THEN RAISE EXCEPTION 'diff_live recreated app.mv but it must be read-only'; END IF; END $$;",
+        )
+        .await
+        .expect("oid-unchanged assertion failed");
+    // The Missing matview was NOT created; the Orphan was NOT dropped.
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF to_regclass('app.mv2') IS NOT NULL \
+               THEN RAISE EXCEPTION 'diff_live created app.mv2 but it must be read-only'; END IF; \
+               IF to_regclass('app.orphan') IS NULL \
+               THEN RAISE EXCEPTION 'diff_live dropped app.orphan but it must be read-only'; END IF; \
+             END $$;",
+        )
+        .await
+        .expect("read-only existence assertions failed");
+}
+
 /// Applying a matview's DDL TWICE (as `dbd apply` does when it re-applies the
 /// current design) must be idempotent. Postgres has no `CREATE OR REPLACE
 /// MATERIALIZED VIEW`, so authored matview DDL uses `CREATE MATERIALIZED VIEW
