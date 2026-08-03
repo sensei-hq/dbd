@@ -238,6 +238,32 @@ Two choices worth understanding:
 
 List of tables to export (string or `{name: options}`). Writes to `export/<schema>/<name>.<format>`.
 
+### `materialized_views`
+
+Refresh scheduling for materialized views (entities under `ddl/materialized_view/`). A shared `options` block applies to every matview; `overrides` tweaks individual ones by qualified name. dbd compiles this into **pg_cron** jobs (named `dbd:refresh:<schema>.<name>`) synced on `apply`/`deploy`.
+
+```yaml
+materialized_views:
+  options:
+    refresh: "0 2 * * *"       # shared cron schedule for every matview (omit ⇒ no scheduled refresh)
+    concurrently: true         # shared default; REFRESH … CONCURRENTLY needs a unique index
+  overrides:
+    analytics.top_products:
+      refresh: "*/30 * * * *"  # override just this matview's schedule
+    analytics.realtime:
+      concurrently: false      # override just the concurrently flag (schedule inherited)
+```
+
+| Field | Type | Effect |
+|-------|------|--------|
+| `options.refresh` | cron string | Shared 5-field cron schedule; a matview with no resolved schedule gets no pg_cron job (refresh it on demand with `dbd refresh`) |
+| `options.concurrently` | bool | Shared default for `REFRESH … CONCURRENTLY` (requires a unique index on the matview) |
+| `overrides.<schema>.<name>` | `{refresh?, concurrently?}` | Per-matview overlay onto `options` (each field falls back to the shared default) |
+
+**Requirements & validation.** Scheduling requires the `pg_cron` extension in `target.postgres.extensions`; `concurrently: true` requires the matview to declare a unique index. `dbd inspect` reports both, offline. PostgreSQL/Supabase only.
+
+**Reconcile.** `dbd reconcile` creates an absent matview (stamping a `dbd:hash` sentinel) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it.
+
 ### `dbml`
 
 Each key becomes a separate DBML output file. `dbd dbml` writes them all into the parent directory of the `-f` argument.

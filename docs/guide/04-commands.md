@@ -64,7 +64,23 @@ dbd apply -v                       # Show entity list then execute
 dbd apply -d postgres://...        # Explicit database URL
 ```
 
-**Apply order:** schemas → extensions → roles → enums → tables → views → functions/procedures.
+**Apply order:** schemas → extensions → roles → enums → tables → views → materialized views → functions/procedures.
+
+**Materialized views.** After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any matview it just created and **syncs pg_cron refresh jobs** to match the `materialized_views:` config (jobs named `dbd:refresh:<schema>.<name>`; requires the `pg_cron` extension when a schedule is set). Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`) so a re-`apply` is safe.
+
+---
+
+## `dbd refresh`
+
+Refresh materialized views now — `REFRESH MATERIALIZED VIEW [CONCURRENTLY]`, honoring each matview's resolved `concurrently` setting.
+
+```sh
+dbd refresh                        # Refresh every materialized view
+dbd refresh -n analytics.daily_sales   # Refresh one matview
+dbd refresh -n analytics.*         # Refresh all matviews in the analytics schema
+```
+
+Useful for the initial populate after a data load, or in CI — independent of the pg_cron schedule. Scheduled (recurring) refresh is managed in-database via pg_cron and configured under `materialized_views:` in design.yaml (see [design.yaml reference](03-design-yaml.md#materialized_views)). PostgreSQL/Supabase only.
 
 ---
 
@@ -184,7 +200,7 @@ dbd reset --clean                  # Shorthand for --schemas --extensions
 dbd reset --scope hub --dry-run    # Only the objects the 'hub' scope occupies
 ```
 
-**Entity-level by default.** `reset` drops the project's own objects individually — functions/procedures (every overload, via a `DROP ROUTINE` block), views, tables, sequences and enums — in reverse dependency order. It does **not** `DROP SCHEMA` or `DROP EXTENSION`, so `public`, custom schemas, and installed extensions (e.g. `pgvector`) survive untouched; the next `dbd apply` repopulates the schemas. This avoids churning extensions and never aborts on `public`.
+**Entity-level by default.** `reset` drops the project's own objects individually — functions/procedures (every overload, via a `DROP ROUTINE` block), materialized views (`DROP MATERIALIZED VIEW … CASCADE`, before the views/tables they read), views, tables, sequences and enums — in reverse dependency order. It does **not** `DROP SCHEMA` or `DROP EXTENSION`, so `public`, custom schemas, and installed extensions (e.g. `pgvector`) survive untouched; the next `dbd apply` repopulates the schemas. This avoids churning extensions and never aborts on `public`.
 
 **Opt-in wider drops:**
 
@@ -465,6 +481,8 @@ its own project safely.
 **What's captured (and what isn't).** Reverse-engineering covers the **data model**:
 schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
 constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments), views,
+**materialized views** (definition + indexes from `pg_matviews`, written to
+`ddl/materialized_view/<schema>/<name>.ddl`),
 and **functions & procedures** (full bodies, captured verbatim via `pg_get_functiondef`;
 overloads of the same name share one file; extension-provided routines are excluded).
 

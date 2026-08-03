@@ -59,7 +59,7 @@ myproject/
 Schema-scoped types: `ddl/<type>/<schema>/<name>.<ext>`
 Non-schema types: `ddl/<type>/<name>.<ext>`
 
-`<type>` ∈ `table` | `view` | `function` | `procedure` | `enum` | `role`. Extensions: `.ddl` or `.sql`. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
+`<type>` ∈ `table` | `view` | `materialized_view` | `function` | `procedure` | `enum` | `role`. Extensions: `.ddl` or `.sql`. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
 
 ---
 
@@ -151,6 +151,13 @@ export:
   - config.lookups
   - config.lookup_values:
       format: jsonl
+
+materialized_views:             # pg_cron refresh scheduling for ddl/materialized_view/ entities
+  options:
+    refresh: "0 2 * * *"        # shared cron schedule (omit ⇒ no scheduled refresh)
+    concurrently: true          # REFRESH … CONCURRENTLY needs a unique index on the matview
+  overrides:                    # per-matview overlay onto options (by qualified name)
+    analytics.top_products: { refresh: "*/30 * * * *" }
 
 dbml:
   base:
@@ -359,7 +366,9 @@ has no `_dbd_meta`, so the gate never engages — it always takes the snapshot p
 
 Captured from a **live database** (`init --from-db` / `merge`): schemas, extensions, enums, tables
 (columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. `USING gin/gist/brin/hash`,
-table + column comments, `serial`/identity columns reproduced through the column), views, functions
+table + column comments, `serial`/identity columns reproduced through the column), views,
+materialized views (definition + indexes from `pg_matviews`, written to `ddl/materialized_view/`),
+functions
 & procedures (full bodies, verbatim via `pg_get_functiondef`; overloads share one file;
 extension-provided routines excluded), roles (opt-in `--roles`; cluster-global, name + memberships
 only, never passwords; superusers/`pg_*`/cloud/Supabase platform roles filtered), and standalone
@@ -393,7 +402,19 @@ dbd apply -n config.lookups
 dbd apply --dry-run
 ```
 
-Apply order: schemas → extensions → roles → enums → tables (with interleaved migrations) → views → functions → procedures.
+Apply order: schemas → extensions → roles → enums → tables (with interleaved migrations) → views → materialized views → functions → procedures.
+
+After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any materialized view it just created and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
+
+### dbd refresh
+
+Runs `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now, honoring each matview's resolved `concurrently`. `-n <entity>` or `-n <schema>.*` targets a subset; omit for all. For the initial populate or CI, independent of the pg_cron schedule. Recurring refresh is scheduled in-database via pg_cron (configured under `materialized_views:`). PostgreSQL/Supabase only.
+
+```sh
+dbd refresh
+dbd refresh -n analytics.daily_sales
+dbd refresh -n analytics.*
+```
 
 ### dbd import
 
@@ -666,8 +687,9 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 Guarded by `_dbd_meta` environment check. **Entity-level by default**: drops the
 project's own objects individually — functions/procedures (every overload via a
-`DROP ROUTINE` DO-block), views, tables, sequences, enums — in reverse dependency
-order. Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
+`DROP ROUTINE` DO-block), materialized views (`DROP MATERIALIZED VIEW … CASCADE`,
+before the views/tables they read), views, tables, sequences, enums — in reverse
+dependency order. Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
 and extensions (e.g. pgvector) survive and never abort on `public`; the next `apply`
 repopulates the schemas.
 
