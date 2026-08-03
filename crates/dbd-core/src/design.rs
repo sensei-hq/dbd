@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::adapter::DatabaseAdapter;
 use crate::config::{self, DesignConfig, DepsPolicy, MaterializedViewsConfig};
 use crate::dependency;
-use crate::entity::{Entity, EntityType};
+use crate::entity::{Entity, EntityType, TableConstraint};
 use crate::error::{DbdError, Result};
 use crate::parser;
 use crate::references;
@@ -2199,10 +2199,223 @@ fn is_valid_cron_expression(expr: &str) -> bool {
             .all(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c)))
 }
 
+/// A CHECK constraint that constrains one column to a fixed set of string
+/// literals — a candidate for a Postgres `ENUM` type. Advisory only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumHint {
+    pub entity: String,
+    pub column: String,
+    pub values: Vec<String>,
+}
+
+/// Flag single-column, string-literal-set CHECK constraints as enum candidates.
+///
+/// Postgres/Supabase only (`dialect == "postgresql"`); advisory, never an error.
+/// Recognizes three equivalent shapes: `col IN ('a', 'b')`,
+/// `col = ANY(ARRAY['a', 'b'])`, and `col = 'a' OR col = 'b'`.
+pub fn suggest_enum_candidates(entities: &[Entity], dialect: &str) -> Vec<EnumHint> {
+    if dialect != "postgresql" {
+        return Vec::new();
+    }
+    let mut hints = Vec::new();
+    for e in entities.iter().filter(|e| e.entity_type == EntityType::Table) {
+        let Some(td) = &e.table_def else { continue };
+        for c in &td.constraints {
+            let TableConstraint::Check { expression, .. } = c else {
+                continue;
+            };
+            if let Some((column, values)) = string_set_check(expression) {
+                let h = EnumHint {
+                    entity: e.name.clone(),
+                    column,
+                    values,
+                };
+                if !hints.contains(&h) {
+                    hints.push(h);
+                }
+            }
+        }
+    }
+    hints
+}
+
+/// Parse a CHECK expression and, if it constrains a single column to a set of
+/// string literals, return `(column, values)`. Returns `None` for anything
+/// else — numeric sets, subqueries, mixed lists, casts/functions on the column,
+/// multiple columns, or a negated (`NOT IN`) set.
+fn string_set_check(expr: &str) -> Option<(String, Vec<String>)> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let parsed = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(expr)
+        .ok()
+        .and_then(|mut p| p.parse_expr().ok());
+
+    match parsed {
+        Some(ast) => string_set_from_ast(&ast),
+        // Parse failure: conservative regex for `col IN ('a', 'b', …)` only.
+        None => string_set_from_regex(expr),
+    }
+}
+
+/// Match the three enum-candidate AST shapes against a parsed CHECK expression.
+fn string_set_from_ast(ast: &sqlparser::ast::Expr) -> Option<(String, Vec<String>)> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    match ast {
+        // col IN ('a', 'b', …)  — reject NOT IN.
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let col = ident_name(expr)?;
+            let vals = all_string_lits(list)?;
+            Some((col, vals))
+        }
+        // col = ANY(ARRAY['a', 'b', …])
+        Expr::AnyOp {
+            left,
+            compare_op: BinaryOperator::Eq,
+            right,
+            ..
+        } => {
+            let col = ident_name(left)?;
+            let Expr::Array(array) = right.as_ref() else {
+                return None;
+            };
+            let vals = all_string_lits(&array.elem)?;
+            Some((col, vals))
+        }
+        // col = 'a' OR col = 'b' OR …  — every leaf must be `<same col> = <string>`.
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        } => {
+            let mut col: Option<String> = None;
+            let mut vals = Vec::new();
+            if collect_or_equalities(ast, &mut col, &mut vals) {
+                Some((col?, vals))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Walk an `OR` tree, collecting `<col> = <string literal>` leaves. Fails (returns
+/// `false`) if any leaf is a different column or not a column-equals-string test.
+fn collect_or_equalities(
+    expr: &sqlparser::ast::Expr,
+    col: &mut Option<String>,
+    vals: &mut Vec<String>,
+) -> bool {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => collect_or_equalities(left, col, vals) && collect_or_equalities(right, col, vals),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let Some(name) = ident_name(left) else {
+                return false;
+            };
+            let Some(val) = string_lit(right) else {
+                return false;
+            };
+            match col {
+                Some(existing) if *existing != name => return false,
+                Some(_) => {}
+                None => *col = Some(name),
+            }
+            vals.push(val);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Collect the string-literal values of a list, or `None` if any element is not
+/// a single-quoted string.
+fn all_string_lits(list: &[sqlparser::ast::Expr]) -> Option<Vec<String>> {
+    if list.is_empty() {
+        return None;
+    }
+    list.iter().map(string_lit).collect()
+}
+
+/// The name of a bare column reference (`Identifier` or `CompoundIdentifier`),
+/// or `None` for casts, functions, or any other expression.
+fn ident_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+        _ => None,
+    }
+}
+
+/// The value of a single-quoted string literal, or `None` for any other expression.
+fn string_lit(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(vws) => match &vws.value {
+            Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Conservative fallback for when the expression does not parse: match a single
+/// column `IN ('a', 'b', …)` of all single-quoted literals.
+fn string_set_from_regex(expr: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = expr.trim();
+    let open = trimmed.find('(')?;
+    let head = trimmed[..open].trim();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+
+    // Head must be `"?col"? IN` (case-insensitive keyword), single identifier.
+    let (col_raw, kw) = head.rsplit_once(char::is_whitespace)?;
+    if !kw.eq_ignore_ascii_case("in") {
+        return None;
+    }
+    let col = col_raw.trim().trim_matches('"');
+    if col.is_empty() || !col.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    // Body items must each be `'…'` single-quoted literals.
+    let body = &trimmed[open + 1..trimmed.len() - 1];
+    let mut vals = Vec::new();
+    for part in body.split(',') {
+        let item = part.trim();
+        if item.len() < 2 || !item.starts_with('\'') || !item.ends_with('\'') {
+            return None;
+        }
+        vals.push(item[1..item.len() - 1].to_string());
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    Some((col.to_string(), vals))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapter::mock::MockAdapter;
+    use crate::entity::TableDef;
     use std::path::PathBuf;
 
     fn fixture_dir() -> PathBuf {
@@ -3845,5 +4058,69 @@ mod tests {
         let all_pre: HashSet<String> =
             ["app.m1".to_string(), "app.m2".to_string()].into_iter().collect();
         assert!(matviews_to_stamp(&applied, &all_pre).is_empty());
+    }
+
+    fn tbl_with_check(name: &str, expr: &str) -> Entity {
+        let mut e = Entity::new(EntityType::Table, name);
+        e.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![TableConstraint::Check {
+                name: None,
+                expression: expr.to_string(),
+            }],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        e
+    }
+
+    #[test]
+    fn enum_hint_for_in_list_of_strings() {
+        let ents = vec![tbl_with_check("config.lookups", "status IN ('active', 'inactive')")];
+        let hints = suggest_enum_candidates(&ents, "postgresql");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].entity, "config.lookups");
+        assert_eq!(hints[0].column, "status");
+        assert_eq!(hints[0].values, vec!["active".to_string(), "inactive".to_string()]);
+    }
+
+    #[test]
+    fn enum_hint_for_any_array_of_strings() {
+        let ents = vec![tbl_with_check("s.t", "kind = ANY(ARRAY['a','b'])")];
+        assert_eq!(suggest_enum_candidates(&ents, "postgresql").len(), 1);
+    }
+
+    #[test]
+    fn enum_hint_for_or_chain_same_column() {
+        let ents = vec![tbl_with_check("s.t", "role = 'admin' OR role = 'user'")];
+        let hints = suggest_enum_candidates(&ents, "postgresql");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].column, "role");
+    }
+
+    #[test]
+    fn no_hint_for_numeric_range_subquery_mixed_multicol_notin() {
+        let cases = [
+            "n IN (1, 2, 3)",
+            "x > 0 AND x < 10",
+            "char_length(name) < 5",
+            "status IN (SELECT s FROM other)",
+            "status IN ('a', other_col)",
+            "a = 'x' OR b = 'y'",
+            "status NOT IN ('a','b')",
+        ];
+        for c in cases {
+            let ents = vec![tbl_with_check("s.t", c)];
+            assert!(
+                suggest_enum_candidates(&ents, "postgresql").is_empty(),
+                "unexpected hint for: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_hint_for_non_postgres_dialect() {
+        let ents = vec![tbl_with_check("s.t", "status IN ('a','b')")];
+        assert!(suggest_enum_candidates(&ents, "sqlite").is_empty());
     }
 }
