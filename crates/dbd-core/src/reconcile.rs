@@ -40,6 +40,12 @@ pub struct ReconcilePlan {
     /// Only executed when the caller opts into pruning; otherwise reported and
     /// left untouched. Carries the `DROP TABLE … CASCADE` SQL.
     pub dropped: Vec<ReconcileStatement>,
+    /// Materialized views present in the design but absent from the DB. Reconcile
+    /// CREATEs these (Postgres has no `CREATE OR REPLACE MATERIALIZED VIEW`);
+    /// carried separately from `added` because they use a different code path
+    /// (`matview_create_sql` + hash sentinel) and are detected during `--dry-run`
+    /// so the preview can list them.
+    pub matview_creates: Vec<String>,
     /// Risky-change advisories (type changes, possible renames, enum value drops,
     /// orphaned enums that are not auto-dropped).
     pub warnings: Vec<String>,
@@ -52,7 +58,10 @@ pub struct ReconcilePlan {
 impl ReconcilePlan {
     /// No structural changes to make.
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.altered.is_empty() && self.dropped.is_empty()
+        self.added.is_empty()
+            && self.altered.is_empty()
+            && self.dropped.is_empty()
+            && self.matview_creates.is_empty()
     }
 }
 
@@ -1364,5 +1373,16 @@ mod tests {
         );
         // Present, no dbd sentinel → Warn (cannot verify).
         assert_eq!(decide_matview_action("h", Some(None)), MatviewAction::Warn);
+    }
+
+    /// A plan carrying only a matview create is NOT empty — otherwise the CLI's
+    /// "Already in sync" guard would hide a pending matview CREATE in `--dry-run`.
+    #[test]
+    fn is_empty_false_when_only_matview_creates() {
+        let plan = ReconcilePlan {
+            matview_creates: vec!["analytics.daily_sales".to_string()],
+            ..Default::default()
+        };
+        assert!(!plan.is_empty());
     }
 }
