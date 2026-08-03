@@ -576,20 +576,21 @@ impl Design {
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
         // Sort by type priority then dependencies
-        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → functions/procedures → externals
+        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → materialized views → functions/procedures → externals
         // Sequences are placed before tables so a column `DEFAULT nextval('seq')`
         // referencing a standalone sequence finds the sequence already created.
-        let (schemas, extensions, roles, sequences, enums, tables, views, functions, externals) =
+        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
             partition_entities(entities);
         let sorted_roles = dependency::sort_by_dependencies(&roles);
         let sorted_enums = dependency::sort_by_dependencies(&enums);
         let sorted_tables = dependency::sort_by_dependencies(&tables);
         let sorted_views = dependency::sort_by_dependencies(&views);
+        let sorted_matviews = dependency::sort_by_dependencies(&matviews);
         let sorted_functions = dependency::sort_by_dependencies(&functions);
 
         let entities = [
             schemas, extensions, sorted_roles, sequences, sorted_enums,
-            sorted_tables, sorted_views, sorted_functions, externals,
+            sorted_tables, sorted_views, sorted_matviews, sorted_functions, externals,
         ]
         .concat();
 
@@ -1861,7 +1862,7 @@ impl Design {
 }
 
 /// Partition entities by type for ordered apply.
-/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, functions/procedures, externals)
+/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions/procedures, externals)
 ///
 /// Sequences are emitted before tables so a column `DEFAULT nextval('seq')`
 /// referencing a standalone sequence finds the sequence already created.
@@ -1869,6 +1870,7 @@ impl Design {
 fn partition_entities(
     entities: Vec<Entity>,
 ) -> (
+    Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
@@ -1886,6 +1888,7 @@ fn partition_entities(
     let mut enums = Vec::new();
     let mut tables = Vec::new();
     let mut views = Vec::new();
+    let mut matviews = Vec::new();
     let mut functions = Vec::new(); // functions + procedures
     let mut externals = Vec::new();
 
@@ -1898,13 +1901,14 @@ fn partition_entities(
             EntityType::Enum => enums.push(entity),
             EntityType::Table => tables.push(entity),
             EntityType::View => views.push(entity),
+            EntityType::MaterializedView => matviews.push(entity),
             EntityType::Function | EntityType::Procedure => functions.push(entity),
             EntityType::External => externals.push(entity),
             _ => tables.push(entity), // Default to tables group
         }
     }
 
-    (schemas, extensions, roles, sequences, enums, tables, views, functions, externals)
+    (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals)
 }
 
 #[cfg(test)]
@@ -3382,5 +3386,32 @@ mod tests {
         let ws_table: HashSet<String> = ["staging.lookups".to_string()].into_iter().collect();
         assert!(import_entry_in_scope(&procless, &ws_table, false));
         assert!(!import_entry_in_scope(&procless, &HashSet::new(), false));
+    }
+
+    // ── Apply-order tests ───────────────────────
+
+    /// Mirrors the real partition + concat apply order from `Design::from_config`,
+    /// minus the `sort_by_dependencies` calls, so type-bucket ordering can be
+    /// exercised without a DB / full `Design::from_config`.
+    fn order_entities_for_test(entities: Vec<Entity>) -> Vec<Entity> {
+        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
+            partition_entities(entities);
+        [schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals].concat()
+    }
+
+    #[test]
+    fn matview_applied_after_views_before_functions() {
+        use crate::entity::EntityType;
+        let ents = vec![
+            Entity::new(EntityType::Function, "app.f"),
+            Entity::new(EntityType::MaterializedView, "app.mv"),
+            Entity::new(EntityType::View, "app.v"),
+            Entity::new(EntityType::Table, "app.t"),
+        ];
+        let ordered = order_entities_for_test(ents);
+        let pos = |name: &str| ordered.iter().position(|e| e.name == name).unwrap();
+        assert!(pos("app.t") < pos("app.v"));
+        assert!(pos("app.v") < pos("app.mv"));
+        assert!(pos("app.mv") < pos("app.f"));
     }
 }
