@@ -27,6 +27,7 @@ pub fn generate_init_files(name: &str, target: &str) -> Vec<InitFile> {
     let dirs = [
         "ddl/table",
         "ddl/view",
+        "ddl/materialized_view",
         "ddl/function",
         "ddl/procedure",
         "ddl/enum",
@@ -172,7 +173,7 @@ mod tests {
     fn generates_directory_gitkeeps() {
         let files = generate_init_files("test", "postgres");
         let gitkeeps: Vec<&InitFile> = files.iter().filter(|f| f.path.ends_with(".gitkeep")).collect();
-        assert_eq!(gitkeeps.len(), 6); // table, view, function, procedure, enum, import
+        assert_eq!(gitkeeps.len(), 7); // table, view, materialized_view, function, procedure, enum, import
     }
 
     #[test]

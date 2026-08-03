@@ -155,10 +155,13 @@ pub fn build_reset_script(
 }
 
 /// Entity DROPs in reverse dependency order:
-/// functions/procedures → views → tables → sequences → enums. Function/procedure
-/// overloads share a name, so they collapse to one DO-block per (schema, name).
+/// functions/procedures → materialized views → views → tables → sequences →
+/// enums. Materialized views come before plain views/tables because a matview
+/// reads them. Function/procedure overloads share a name, so they collapse to
+/// one DO-block per (schema, name).
 fn entity_drop_lines(entities: &[&Entity]) -> Vec<String> {
     let mut funcs = Vec::new();
+    let mut matviews = Vec::new();
     let mut views = Vec::new();
     let mut tables = Vec::new();
     let mut sequences = Vec::new();
@@ -166,6 +169,7 @@ fn entity_drop_lines(entities: &[&Entity]) -> Vec<String> {
     for e in entities {
         match e.entity_type {
             EntityType::Function | EntityType::Procedure => funcs.push(*e),
+            EntityType::MaterializedView => matviews.push(*e),
             EntityType::View => views.push(*e),
             EntityType::Table => tables.push(*e),
             EntityType::Sequence => sequences.push(*e),
@@ -182,6 +186,9 @@ fn entity_drop_lines(entities: &[&Entity]) -> Vec<String> {
         if seen_funcs.insert((schema.to_string(), bare.clone())) {
             lines.push(function_drop_block(schema, &bare));
         }
+    }
+    for e in &matviews {
+        lines.push(drop_object("MATERIALIZED VIEW", e));
     }
     for e in &views {
         lines.push(drop_object("VIEW", e));
@@ -378,6 +385,27 @@ mod tests {
         assert!(view < table, "views before tables");
         assert!(table < seq, "tables before sequences");
         assert!(seq < enm, "sequences before enums");
+    }
+
+    #[test]
+    fn reset_drops_materialized_view_before_its_deps() {
+        let mut entities = sample_entities();
+        // A matview reads config.genders (a view) — it must be dropped first.
+        entities.push(ent(EntityType::MaterializedView, "config.genders_mv"));
+        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", false, false, &[])
+            .unwrap()
+            .unwrap();
+        assert!(
+            script.contains("DROP MATERIALIZED VIEW IF EXISTS \"config\".\"genders_mv\" CASCADE"),
+            "reset must drop the materialized view; got:\n{script}"
+        );
+        // `find("DROP VIEW")` matches only the plain view — "DROP MATERIALIZED
+        // VIEW" has no "DROP VIEW" substring.
+        let mv = script.find("DROP MATERIALIZED VIEW").unwrap();
+        let view = script.find("DROP VIEW").unwrap();
+        let table = script.find("DROP TABLE").unwrap();
+        assert!(mv < view, "materialized view dropped before plain views");
+        assert!(mv < table, "materialized view dropped before tables");
     }
 
     #[test]

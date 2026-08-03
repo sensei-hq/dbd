@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::DatabaseAdapter;
-use crate::config::{self, DesignConfig, DepsPolicy};
+use crate::config::{self, DesignConfig, DepsPolicy, MaterializedViewsConfig};
 use crate::dependency;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
@@ -465,6 +465,25 @@ fn report_step_result(
     }
 }
 
+/// Which of the just-applied materialized views need a `dbd:hash` sentinel
+/// stamped by `apply`: exactly those NOT present before the apply ran. Pure so
+/// the "only newly-created" rule is unit-testable without a live database.
+///
+/// `apply` runs `CREATE MATERIALIZED VIEW IF NOT EXISTS`, so a matview that
+/// already existed is a no-op and its deployed definition may differ from the
+/// design; stamping a "current" hash onto it would mask that drift from
+/// `reconcile`. Pre-existing matviews are therefore deliberately excluded.
+fn matviews_to_stamp<'a>(
+    applied_matviews: &[&'a Entity],
+    pre_existing: &std::collections::HashSet<String>,
+) -> Vec<&'a Entity> {
+    applied_matviews
+        .iter()
+        .copied()
+        .filter(|e| !pre_existing.contains(&e.name))
+        .collect()
+}
+
 /// The Design orchestrator — main entry point for all operations.
 ///
 /// Loads configuration, discovers and parses entities, resolves dependencies,
@@ -576,20 +595,21 @@ impl Design {
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
         // Sort by type priority then dependencies
-        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → functions/procedures → externals
+        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → materialized views → functions/procedures → externals
         // Sequences are placed before tables so a column `DEFAULT nextval('seq')`
         // referencing a standalone sequence finds the sequence already created.
-        let (schemas, extensions, roles, sequences, enums, tables, views, functions, externals) =
+        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
             partition_entities(entities);
         let sorted_roles = dependency::sort_by_dependencies(&roles);
         let sorted_enums = dependency::sort_by_dependencies(&enums);
         let sorted_tables = dependency::sort_by_dependencies(&tables);
         let sorted_views = dependency::sort_by_dependencies(&views);
+        let sorted_matviews = dependency::sort_by_dependencies(&matviews);
         let sorted_functions = dependency::sort_by_dependencies(&functions);
 
         let entities = [
             schemas, extensions, sorted_roles, sequences, sorted_enums,
-            sorted_tables, sorted_views, sorted_functions, externals,
+            sorted_tables, sorted_views, sorted_matviews, sorted_functions, externals,
         ]
         .concat();
 
@@ -1003,6 +1023,22 @@ impl Design {
             .map(|e| (e.name.as_str(), e))
             .collect();
 
+        // Materialized views this run applies (respecting the scope + name
+        // filter). Capture which of them ALREADY exist before applying, so that
+        // afterwards we stamp the `dbd:hash` sentinel only on the ones this run
+        // newly creates. Skip the state query entirely when there are none.
+        let applied_matviews: Vec<&Entity> = valid_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty()
+        {
+            std::collections::HashSet::new()
+        } else {
+            adapter.matview_states().await?.into_keys().collect()
+        };
+
         // Wrap the whole plan in one transaction when the backend supports it,
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
@@ -1105,6 +1141,37 @@ impl Design {
                 return Err(e);
             }
         }
+
+        // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
+        // created (absent from `pre_existing_matviews`), so a later `dbd
+        // reconcile` recognizes them as dbd-managed instead of warning "exists
+        // but is not stamped by dbd". An already-existing matview is left
+        // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
+        // hash onto one whose deployed definition may have drifted would mask
+        // that drift. Runs after commit, so the object exists for the COMMENT.
+        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
+            adapter
+                .execute_script(&crate::reconcile::matview_hash_comment_sql(
+                    &e.name,
+                    &crate::reconcile::matview_hash(e),
+                ))
+                .await?;
+        }
+
+        // Sync pg_cron refresh jobs across the WHOLE design (not the scoped
+        // subset): `sync_refresh_jobs` unschedules every `dbd:refresh:%` job
+        // absent from the set it is given, so a scoped run fed only its subset
+        // would unschedule out-of-scope matviews' jobs. Centralized here (rather
+        // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
+        // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
+        // databases (and non-Postgres targets) without the extension.
+        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect();
+        adapter.sync_refresh_jobs(&mv_jobs).await?;
 
         on_complete(ApplyComplete {
             strategy: plan.strategy,
@@ -1303,6 +1370,65 @@ impl Design {
             summary.reapplied += 1;
         }
 
+        // Pass C-mv — materialized views. Postgres has no `CREATE OR REPLACE
+        // MATERIALIZED VIEW`, and dbd deliberately never auto-drops one (a DROP …
+        // CASCADE would repopulate it and drop its dependents — unacceptable in a
+        // dev-loop reconcile). So: CREATE an absent matview (stamping a `dbd:hash`
+        // sentinel), SKIP one whose stored hash matches the design, and for one
+        // that drifted (or carries no sentinel) WARN and leave it untouched — the
+        // user drops it deliberately, then `apply`/reconcile recreates it.
+        // The CREATE carries the same `search_path` prelude the ALTERs use, since
+        // the emitted `CREATE` (unlike a DDL file) has no `set search_path`.
+        let matviews: Vec<&Entity> = desired_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        if !matviews.is_empty() {
+            use crate::reconcile::{decide_matview_action, matview_create_sql, matview_hash, MatviewAction};
+            let states = adapter.matview_states().await?;
+            for &e in &matviews {
+                let want = matview_hash(e);
+                match decide_matview_action(&want, states.get(&e.name).cloned()) {
+                    MatviewAction::Skip => {}
+                    MatviewAction::Create => {
+                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                        on_start(&desc);
+                        let result = adapter
+                            .execute_script(&format!("{search_path}{}", matview_create_sql(e, &want)))
+                            .await;
+                        report_step_result(&desc, &mut on_done, result)?;
+                        summary.reapplied += 1;
+                    }
+                    MatviewAction::Warn => {
+                        // Detected drift, but dbd never auto-recreates a matview.
+                        // Surface it through the plan's warnings (the same channel
+                        // `dbd reconcile` prints for risky-change advisories).
+                        let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
+                        plan.warnings.push(if has_sentinel {
+                            format!(
+                                "materialized view {name}: definition differs from the deployed object \
+                                 (dbd does not auto-recreate materialized views because that would \
+                                 DROP … CASCADE and lose data/dependents). To apply the new \
+                                 definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
+                                 and re-run `dbd apply` to recreate it.",
+                                name = e.name,
+                                schema = e.schema.as_deref().unwrap_or("public"),
+                                bare = e.name.rsplit('.').next().unwrap_or(&e.name),
+                            )
+                        } else {
+                            format!(
+                                "materialized view {}: exists but is not stamped by dbd (cannot \
+                                 verify its definition); recreate it under dbd management to enable \
+                                 drift detection.",
+                                e.name
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
         // Pass D — prune orphaned tables (in managed schemas, gone from the
         // design), only when explicitly requested. Otherwise they are reported
         // via the returned plan and left untouched.
@@ -1315,6 +1441,20 @@ impl Design {
                 summary.dropped += 1;
             }
         }
+
+        // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
+        // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
+        // unschedules every `dbd:refresh:%` job absent from the set it is given, so
+        // a scoped reconcile fed only its subset would unschedule out-of-scope
+        // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
+        // no-op on databases (and non-Postgres targets) without the extension.
+        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect();
+        adapter.sync_refresh_jobs(&mv_jobs).await?;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);
@@ -1703,6 +1843,7 @@ impl Design {
                 e.entity_type,
                 EntityType::Table
                     | EntityType::View
+                    | EntityType::MaterializedView
                     | EntityType::Function
                     | EntityType::Procedure
                     | EntityType::Enum
@@ -1817,6 +1958,7 @@ impl Design {
                 e.entity_type,
                 EntityType::Table
                     | EntityType::View
+                    | EntityType::MaterializedView
                     | EntityType::Function
                     | EntityType::Procedure
                     | EntityType::Enum
@@ -1861,7 +2003,7 @@ impl Design {
 }
 
 /// Partition entities by type for ordered apply.
-/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, functions/procedures, externals)
+/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions/procedures, externals)
 ///
 /// Sequences are emitted before tables so a column `DEFAULT nextval('seq')`
 /// referencing a standalone sequence finds the sequence already created.
@@ -1869,6 +2011,7 @@ impl Design {
 fn partition_entities(
     entities: Vec<Entity>,
 ) -> (
+    Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
@@ -1886,6 +2029,7 @@ fn partition_entities(
     let mut enums = Vec::new();
     let mut tables = Vec::new();
     let mut views = Vec::new();
+    let mut matviews = Vec::new();
     let mut functions = Vec::new(); // functions + procedures
     let mut externals = Vec::new();
 
@@ -1898,13 +2042,91 @@ fn partition_entities(
             EntityType::Enum => enums.push(entity),
             EntityType::Table => tables.push(entity),
             EntityType::View => views.push(entity),
+            EntityType::MaterializedView => matviews.push(entity),
             EntityType::Function | EntityType::Procedure => functions.push(entity),
             EntityType::External => externals.push(entity),
             _ => tables.push(entity), // Default to tables group
         }
     }
 
-    (schemas, extensions, roles, sequences, enums, tables, views, functions, externals)
+    (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals)
+}
+
+/// Validate materialized-view refresh configuration against the resolved
+/// entities and the target's declared extension names. Pure and offline —
+/// used by `dbd inspect` so misconfigured refresh settings surface without a
+/// database connection. Returns human-readable error strings; empty = valid.
+///
+/// Checks, per materialized view (resolved via `mv_config.resolve`):
+///   - `concurrently: true` requires the view to have a UNIQUE index —
+///     `REFRESH MATERIALIZED VIEW CONCURRENTLY` fails in Postgres without one.
+///   - a resolved `refresh` schedule must be a valid 5-field cron expression.
+///
+/// And once, across all matviews:
+///   - if any matview resolves a `refresh` schedule, `pg_cron` must be among
+///     `extensions` (scheduling is implemented via pg_cron jobs).
+pub fn validate_materialized_views(
+    entities: &[Entity],
+    mv_config: &MaterializedViewsConfig,
+    extensions: &[String],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut any_scheduled = false;
+
+    for entity in entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::MaterializedView)
+    {
+        let resolved = mv_config.resolve(&entity.name);
+
+        if resolved.refresh.is_some() {
+            any_scheduled = true;
+        }
+
+        if resolved.concurrently {
+            let has_unique_index = entity
+                .table_def
+                .as_ref()
+                .is_some_and(|t| t.indexes.iter().any(|i| i.unique));
+            if !has_unique_index {
+                errors.push(format!(
+                    "materialized view {}: REFRESH ... CONCURRENTLY requires a unique index",
+                    entity.name
+                ));
+            }
+        }
+
+        if let Some(schedule) = &resolved.refresh
+            && !is_valid_cron_expression(schedule)
+        {
+            errors.push(format!(
+                "materialized view {}: invalid cron expression '{schedule}'",
+                entity.name
+            ));
+        }
+    }
+
+    if any_scheduled && !extensions.iter().any(|e| e == "pg_cron") {
+        errors.push(
+            "materialized view refresh scheduling requires the pg_cron extension \
+             (add 'pg_cron' under target.postgres.extensions)"
+                .to_string(),
+        );
+    }
+
+    errors
+}
+
+/// Minimal validation for a pg_cron 5-field schedule expression: exactly five
+/// whitespace-separated fields, each made up only of digits and `* / , -`.
+/// Not a full cron parser — just enough to flag obviously malformed input
+/// offline (e.g. wrong field count, stray words).
+fn is_valid_cron_expression(expr: &str) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    fields.len() == 5
+        && fields
+            .iter()
+            .all(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c)))
 }
 
 #[cfg(test)]
@@ -1984,6 +2206,17 @@ mod tests {
 
         assert!(!graph.nodes.is_empty());
         assert!(!graph.layers.is_empty());
+    }
+
+    #[test]
+    fn graph_includes_materialized_views() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let graph = design.graph(None, None).unwrap();
+        assert!(
+            graph.nodes.iter().any(|n| n.name == "config.genders_mv"),
+            "materialized view should appear as a graph node"
+        );
     }
 
     #[test]
@@ -3251,7 +3484,7 @@ mod tests {
         use std::collections::HashSet;
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
-        // Sanity: the fixture declares two extensions, by bare name.
+        // Sanity: the fixture declares its extensions by bare name.
         let all_exts: Vec<&str> = design
             .entities()
             .iter()
@@ -3382,5 +3615,165 @@ mod tests {
         let ws_table: HashSet<String> = ["staging.lookups".to_string()].into_iter().collect();
         assert!(import_entry_in_scope(&procless, &ws_table, false));
         assert!(!import_entry_in_scope(&procless, &HashSet::new(), false));
+    }
+
+    // ── Apply-order tests ───────────────────────
+
+    /// Mirrors the real partition + concat apply order from `Design::from_config`,
+    /// minus the `sort_by_dependencies` calls, so type-bucket ordering can be
+    /// exercised without a DB / full `Design::from_config`.
+    fn order_entities_for_test(entities: Vec<Entity>) -> Vec<Entity> {
+        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
+            partition_entities(entities);
+        [schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals].concat()
+    }
+
+    #[test]
+    fn matview_applied_after_views_before_functions() {
+        use crate::entity::EntityType;
+        let ents = vec![
+            Entity::new(EntityType::Function, "app.f"),
+            Entity::new(EntityType::MaterializedView, "app.mv"),
+            Entity::new(EntityType::View, "app.v"),
+            Entity::new(EntityType::Table, "app.t"),
+        ];
+        let ordered = order_entities_for_test(ents);
+        let pos = |name: &str| ordered.iter().position(|e| e.name == name).unwrap();
+        assert!(pos("app.t") < pos("app.v"));
+        assert!(pos("app.v") < pos("app.mv"));
+        assert!(pos("app.mv") < pos("app.f"));
+    }
+
+    // ── Materialized-view validation ────────────────────────
+
+    /// A matview with a unique index, so only the flag under test can fire.
+    fn matview_with_unique_index() -> Entity {
+        let mut e = Entity::new(EntityType::MaterializedView, "a.m");
+        e.table_def = Some(crate::entity::TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![crate::entity::IndexDef {
+                name: Some("m_idx".to_string()),
+                columns: vec![],
+                unique: true,
+                index_type: None,
+            }],
+            comments: Default::default(),
+        });
+        e
+    }
+
+    /// A matview with no indexes at all.
+    fn matview_without_unique_index() -> Entity {
+        let mut e = Entity::new(EntityType::MaterializedView, "a.m");
+        e.table_def = Some(crate::entity::TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        e
+    }
+
+    #[test]
+    fn matview_concurrently_requires_unique_index() {
+        let entities = vec![matview_without_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: true,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("unique index"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn matview_schedule_requires_pg_cron_extension() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: false,
+            },
+            overrides: Default::default(),
+        };
+        let extensions: Vec<String> = vec![];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("pg_cron"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn matview_invalid_cron_expression_flagged() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("not a cron".to_string()),
+                concurrently: false,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("invalid cron"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn valid_matview_config_has_no_errors() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: true,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    // ── Apply's "stamp only newly-created matviews" rule ─────
+
+    /// `apply` must stamp the `dbd:hash` sentinel ONLY on matviews this run
+    /// creates — i.e. those absent before it ran. An already-existing matview is
+    /// excluded: `CREATE MATERIALIZED VIEW IF NOT EXISTS` is a no-op on it, so
+    /// its deployed definition may differ from the design, and stamping a
+    /// "current" hash would mask that drift from `reconcile`.
+    #[test]
+    fn matviews_to_stamp_excludes_pre_existing() {
+        use std::collections::HashSet;
+        let m1 = Entity::new(EntityType::MaterializedView, "app.m1");
+        let m2 = Entity::new(EntityType::MaterializedView, "app.m2");
+        let applied = vec![&m1, &m2];
+
+        // Only m1 already existed → only m2 gets stamped.
+        let pre_existing: HashSet<String> = ["app.m1".to_string()].into_iter().collect();
+        let stamp: Vec<&str> = matviews_to_stamp(&applied, &pre_existing)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(stamp, vec!["app.m2"], "only the newly-created matview is stamped");
+
+        // Nothing existed → both are newly created, both stamped.
+        let both: Vec<&str> = matviews_to_stamp(&applied, &HashSet::new())
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(both, vec!["app.m1", "app.m2"]);
+
+        // Both already existed → nothing stamped (no drift masked).
+        let all_pre: HashSet<String> =
+            ["app.m1".to_string(), "app.m2".to_string()].into_iter().collect();
+        assert!(matviews_to_stamp(&applied, &all_pre).is_empty());
     }
 }

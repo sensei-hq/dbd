@@ -45,13 +45,14 @@ fn preprocess_sql(sql: &str) -> String {
 
     // WORKAROUND: sqlparser-comment-on-object-types
     // Limitation: sqlparser only supports COMMENT ON TABLE and COMMENT ON COLUMN.
-    //             COMMENT ON VIEW, FUNCTION, PROCEDURE, TRIGGER, INDEX, etc. fail.
+    //             COMMENT ON VIEW, MATERIALIZED VIEW, FUNCTION, PROCEDURE, TRIGGER,
+    //             INDEX, etc. fail.
     // Impact:     Parse error on any DDL file with non-table/column comments.
     // Check:      Parser::parse_sql("COMMENT ON VIEW foo IS 'bar';")
     // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
     {
         let re = regex::Regex::new(
-            r"(?is)\bcomment\s+on\s+(?:view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
+            r"(?is)\bcomment\s+on\s+(?:materialized\s+view|view|function|procedure|trigger|index|schema|extension|type)\s+\S+\s+is\s+'[^']*(?:''[^']*)*'\s*;"
         ).unwrap();
         if re.is_match(&result) {
             result = std::borrow::Cow::Owned(re.replace_all(&result, "").to_string());
@@ -72,6 +73,26 @@ fn preprocess_sql(sql: &str) -> String {
         ).unwrap();
         if re.is_match(&result) {
             result = std::borrow::Cow::Owned(re.replace_all(&result, "${1}FUNCTION").to_string());
+        }
+    }
+
+    // WORKAROUND: sqlparser-materialized-view-with-data
+    // Limitation: sqlparser parses CREATE MATERIALIZED VIEW into
+    //             CreateView { materialized: true, .. }, but rejects the trailing
+    //             PostgreSQL `WITH [NO] DATA` clause ("Expected: end of statement,
+    //             found: WITH").
+    // Impact:     Parse error on any materialized-view DDL file with a WITH [NO] DATA clause.
+    // Fix:        Drop the trailing WITH [NO] DATA for AST extraction only; it
+    //             carries no structure we read (the emitter writes the real
+    //             clause). Scoped to files that declare a materialized view so a
+    //             stray `WITH DATA` elsewhere is left untouched.
+    // Check:      Parser::parse_sql("CREATE MATERIALIZED VIEW v AS SELECT 1 WITH DATA;")
+    // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
+    {
+        let re = regex::Regex::new(r"(?is)\bcreate\s+materialized\s+view\b").unwrap();
+        if re.is_match(&result) {
+            let with_data = regex::Regex::new(r"(?is)\s+with\s+(?:no\s+)?data\s*(;|$)").unwrap();
+            result = std::borrow::Cow::Owned(with_data.replace_all(&result, "$1").to_string());
         }
     }
 
@@ -170,6 +191,25 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
         EntityType::View => {
             let (refs, _columns) = extractors::extract_view_info(&statements, &entity.search_paths);
             entity.references = refs;
+        }
+        EntityType::MaterializedView => {
+            // Body + references like a view: the SELECT definition is stashed in
+            // writes[0] (matching the introspector's view contract), and the
+            // tables it reads from become references.
+            //
+            // Unlike the View arm, capture the body into writes[0]: emit_matview
+            // (and reconcile) reconstruct the CREATE from writes[0], so a
+            // file→emit round-trip needs it here.
+            if let Some(body) = extractors::extract_view_body(&statements) {
+                entity.writes = vec![body];
+            }
+            let (refs, _columns) = extractors::extract_view_info(&statements, &entity.search_paths);
+            entity.references = refs;
+            // Trailing CREATE INDEX statements land in table_def.indexes, exactly
+            // like a table's indexes — reuse the table/index extractor (there is
+            // no CREATE TABLE here, so only its indexes are populated).
+            let (table_def, _refs) = tables::extract_table(&statements, &entity.search_paths);
+            entity.table_def = Some(table_def);
         }
         EntityType::Enum => {
             entity.enum_values = extractors::extract_enum_values(&statements);
@@ -374,5 +414,42 @@ mod tests {
             "bare-identifier grant not parsed; refers: {:?}",
             parsed.refers
         );
+    }
+
+    #[test]
+    fn extracts_matview_body_and_indexes() {
+        let sql = "CREATE MATERIALIZED VIEW analytics.daily_sales AS\n\
+                   SELECT date_trunc('day', created_at) AS day, sum(total) AS revenue\n\
+                   FROM shop.orders GROUP BY 1 WITH DATA;\n\
+                   CREATE UNIQUE INDEX daily_sales_day_uidx ON analytics.daily_sales(day);";
+        let entity =
+            parse_entity(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"), sql).unwrap();
+
+        assert_eq!(entity.entity_type, EntityType::MaterializedView);
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+
+        // Body captured the same way a view's body is (verbatim in writes[0]).
+        let body = entity.writes.first().expect("matview body should be captured");
+        assert!(
+            body.to_lowercase().contains("from shop.orders"),
+            "body missing source table: {body}"
+        );
+
+        // Trailing CREATE INDEX captured like a table's indexes.
+        let indexes = &entity
+            .table_def
+            .as_ref()
+            .expect("matview should have a table_def")
+            .indexes;
+        assert_eq!(indexes.len(), 1, "expected exactly one index: {indexes:?}");
+        assert!(indexes[0].unique, "expected a UNIQUE index");
+    }
+
+    #[test]
+    fn comment_on_materialized_view_is_stripped() {
+        let sql = "COMMENT ON MATERIALIZED VIEW analytics.daily_sales IS 'daily rollup';";
+        let cleaned = super::preprocess_sql(sql);
+        assert!(!cleaned.to_lowercase().contains("comment on materialized view"),
+            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}");
     }
 }

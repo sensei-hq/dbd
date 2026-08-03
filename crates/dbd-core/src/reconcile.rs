@@ -576,6 +576,141 @@ pub struct ReconcileComplete {
     pub reapplied: u32,
 }
 
+// ── Materialized-view convergence (Task 13) ──────────────────
+//
+// Postgres has no `CREATE OR REPLACE MATERIALIZED VIEW`, so converging a changed
+// definition would mean DROP … CASCADE + recreate — which repopulates the matview
+// and drops its dependents. dbd deliberately does NOT do that automatically: a
+// dev-loop `reconcile` must never silently lose data or dependent objects.
+// Instead reconcile CREATEs an absent matview, and for one that already exists it
+// only *detects* drift and WARNS — leaving the live object untouched so the user
+// drops it deliberately, after which `apply`/reconcile recreates it (snapshots
+// exclude matviews, so migrations can't recreate one).
+//
+// Drift is detected by stamping a deterministic hash of the DESIGN onto the live
+// object as a `dbd:hash=…` comment sentinel (matview comments are otherwise
+// unused) at CREATE time, then comparing the stored hash to a freshly computed
+// one on later runs. The hash is over the design, not Postgres's deparsed
+// `pg_matviews.definition`, so it is exact and deparser-independent.
+
+/// What a reconcile should do with one design materialized view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatviewAction {
+    /// Absent live → create it and stamp the hash sentinel.
+    Create,
+    /// Live hash matches the design → nothing to do.
+    Skip,
+    /// Exists but the design differs (or it carries no dbd sentinel) → warn and
+    /// leave it untouched. dbd never auto-drops a materialized view.
+    Warn,
+}
+
+/// Decide the action for a design matview from its wanted hash and the live
+/// sentinel state:
+/// - `None` — the matview does not exist live → **Create**.
+/// - `Some(Some(h))` — it exists with stored hash `h`; **Skip** iff `h == want`,
+///   else **Warn** (definition drifted).
+/// - `Some(None)` — it exists but carries no `dbd:hash` sentinel (created outside
+///   dbd, or before this feature) → **Warn** (cannot verify its definition).
+pub(crate) fn decide_matview_action(
+    want_hash: &str,
+    live: Option<Option<String>>,
+) -> MatviewAction {
+    match live {
+        None => MatviewAction::Create,
+        Some(Some(h)) if h == want_hash => MatviewAction::Skip,
+        Some(_) => MatviewAction::Warn,
+    }
+}
+
+/// Deterministic content hash of a design materialized view — the drift
+/// sentinel. Covers exactly what would need a recreate: the normalized SELECT
+/// body and the name-agnostic index key set. Uses SHA-256 (the codebase's
+/// established persisted-hash algorithm — see [`crate::snapshot::checksum_of`]),
+/// NOT `DefaultHasher`, so the stamped value is stable across toolchain versions
+/// and never triggers spurious drift warnings after a Rust upgrade. Truncated to
+/// a 16-hex-char prefix — ample to distinguish definitions for a drift signal.
+pub(crate) fn matview_hash(entity: &Entity) -> String {
+    use sha2::{Digest, Sha256};
+    // Serialize the sorted index key set unambiguously so distinct sets can't
+    // collide via concatenation (delimiters that can't occur in identifiers).
+    let indexes = matview_index_keys(entity)
+        .into_iter()
+        .map(|(unique, cols)| format!("{unique}:{}", cols.join(",")))
+        .collect::<Vec<_>>()
+        .join(";");
+    let mut hasher = Sha256::new();
+    hasher.update(normalize_matview_body(entity).as_bytes());
+    hasher.update(b"\x00indexes\x00");
+    hasher.update(indexes.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=<hash>';` for the sentinel.
+/// `qualified` is `schema.name` (unqualified → `public`); single quotes in the
+/// payload are doubled so the literal stays well-formed.
+pub(crate) fn matview_hash_comment_sql(qualified: &str, hash: &str) -> String {
+    let (schema, name) = qualified.split_once('.').unwrap_or((DEFAULT_SCHEMA, qualified));
+    let payload = format!("dbd:hash={hash}").replace('\'', "''");
+    format!("COMMENT ON MATERIALIZED VIEW \"{schema}\".\"{name}\" IS '{payload}';")
+}
+
+/// Extract the hash from a `dbd:hash=<hex>` comment, or `None` when the comment
+/// is absent or carries no such sentinel. Inverse of [`matview_hash_comment_sql`]'s
+/// payload; tolerant of trailing text after the hash token.
+pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<String> {
+    let rest = comment?.split("dbd:hash=").nth(1)?;
+    let hash: String = rest.chars().take_while(char::is_ascii_alphanumeric).collect();
+    (!hash.is_empty()).then_some(hash)
+}
+
+/// `CREATE MATERIALIZED VIEW … WITH DATA;` (+ any index statements, via
+/// [`crate::emit::emit_entity`]) followed by the hash-sentinel comment.
+pub(crate) fn matview_create_sql(entity: &Entity, hash: &str) -> String {
+    let create = crate::emit::emit_entity(entity).unwrap_or_default();
+    let comment = matview_hash_comment_sql(&qualified_matview_name(entity), hash);
+    format!("{create}\n{comment}")
+}
+
+/// `schema.name` for an entity, defaulting the schema to `public`.
+fn qualified_matview_name(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
+    let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
+    format!("{schema}.{name}")
+}
+
+/// Normalize a matview's `SELECT` body for a stable hash input: first `writes`
+/// entry, trimmed, a single trailing `;` removed, internal whitespace collapsed
+/// to single spaces, lowercased.
+fn normalize_matview_body(e: &Entity) -> String {
+    let raw = e.writes.first().map(String::as_str).unwrap_or_default();
+    raw.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// A matview's index set as name-agnostic `(unique, [lowercased columns])` keys.
+/// `table_def = None` (introspected, index-less) and `Some { indexes: [] }`
+/// (parsed, index-less) both yield the empty set, so that Task 8 asymmetry does
+/// not perturb the hash.
+fn matview_index_keys(e: &Entity) -> std::collections::BTreeSet<(bool, Vec<String>)> {
+    e.table_def
+        .as_ref()
+        .map(|d| d.indexes.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|ix| {
+            (
+                ix.unique,
+                ix.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,5 +1244,125 @@ mod tests {
         );
         // `::` embedded in a string literal must not be treated as a cast.
         assert_eq!(canonical_default("'a::b'"), "'a::b'");
+    }
+
+    // ── Materialized-view convergence (Task 13) ──────────────
+
+    fn mv(name: &str, body: &str) -> Entity {
+        let mut e = Entity::new(EntityType::MaterializedView, name);
+        e.writes = vec![body.into()];
+        e
+    }
+
+    /// The hash is deterministic: the same design entity hashes identically on
+    /// repeated calls (SHA-256, so it is also stable across processes and
+    /// toolchain versions — the property the on-disk sentinel relies on).
+    #[test]
+    fn matview_hash_is_deterministic() {
+        let e = mv("a.m", "SELECT 1 AS x");
+        assert_eq!(matview_hash(&e), matview_hash(&e));
+    }
+
+    /// A changed body yields a different hash.
+    #[test]
+    fn matview_hash_changes_with_body() {
+        assert_ne!(
+            matview_hash(&mv("a.m", "SELECT 1 AS x")),
+            matview_hash(&mv("a.m", "SELECT 2 AS x")),
+        );
+    }
+
+    /// Adding an index yields a different hash.
+    #[test]
+    fn matview_hash_changes_with_index() {
+        use crate::entity::{IndexColumn, IndexDef, TableDef};
+        let plain = mv("a.m", "SELECT 1 AS x");
+        let mut indexed = mv("a.m", "SELECT 1 AS x");
+        indexed.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![IndexDef {
+                name: Some("m_x_idx".into()),
+                columns: vec![IndexColumn { name: "x".into(), order: None }],
+                unique: true,
+                index_type: None,
+            }],
+            comments: Default::default(),
+        });
+        assert_ne!(matview_hash(&plain), matview_hash(&indexed));
+    }
+
+    /// Task 8 asymmetry: an index-less matview parsed as
+    /// `Some(TableDef { indexes: [] })` and introspected as `table_def = None`
+    /// must hash IDENTICALLY (bodies equal) — else every reconcile would recreate.
+    #[test]
+    fn matview_hash_indexless_none_and_some_empty_are_equal() {
+        use crate::entity::TableDef;
+        let mut some_empty = mv("a.m", "SELECT 1 AS x");
+        some_empty.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        let none = mv("a.m", "SELECT 1 AS x"); // table_def = None
+        assert_eq!(
+            matview_hash(&some_empty),
+            matview_hash(&none),
+            "None and Some(indexes:[]) must produce the same hash"
+        );
+    }
+
+    /// The sentinel comment SQL and `parse_dbd_hash` round-trip: the payload
+    /// stored (`dbd:hash=<hex>`) parses back to the same hash.
+    #[test]
+    fn matview_hash_comment_sql_roundtrips() {
+        let sql = matview_hash_comment_sql("a.m", "deadbeefcafe0001");
+        assert!(
+            sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=deadbeefcafe0001';"),
+            "got: {sql}"
+        );
+        // obj_description returns the payload (without the surrounding quotes).
+        assert_eq!(
+            parse_dbd_hash(Some("dbd:hash=deadbeefcafe0001")),
+            Some("deadbeefcafe0001".to_string())
+        );
+    }
+
+    /// `parse_dbd_hash` returns `None` for a missing comment or a non-sentinel one.
+    #[test]
+    fn parse_dbd_hash_none_cases() {
+        assert_eq!(parse_dbd_hash(None), None);
+        assert_eq!(parse_dbd_hash(Some("just a user comment")), None);
+        assert_eq!(parse_dbd_hash(Some("dbd:hash=")), None, "empty hash → None");
+    }
+
+    /// A create carries both the `CREATE MATERIALIZED VIEW … WITH DATA` and the
+    /// hash sentinel comment.
+    #[test]
+    fn matview_create_sql_has_create_and_comment() {
+        let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
+        assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
+        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=abc123';"));
+    }
+
+    /// The decision core, hash-based, over all four states: dbd never auto-drops,
+    /// so a drifted or unstamped matview is **Warn**, not recreate.
+    #[test]
+    fn decide_matview_action_covers_all_branches() {
+        // Absent → Create.
+        assert_eq!(decide_matview_action("h", None), MatviewAction::Create);
+        // Present, matching hash → Skip.
+        assert_eq!(
+            decide_matview_action("h", Some(Some("h".into()))),
+            MatviewAction::Skip
+        );
+        // Present, different hash → Warn (definition drifted).
+        assert_eq!(
+            decide_matview_action("h", Some(Some("other".into()))),
+            MatviewAction::Warn
+        );
+        // Present, no dbd sentinel → Warn (cannot verify).
+        assert_eq!(decide_matview_action("h", Some(None)), MatviewAction::Warn);
     }
 }

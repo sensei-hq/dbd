@@ -83,7 +83,7 @@ pub fn emit_table(entity: &Entity) -> String {
     // not here.
     for ix in &def.indexes {
         out.push('\n');
-        out.push_str(&emit_index_sql(ix, &qname, name));
+        out.push_str(&emit_index_sql(ix, &qname, name, false));
     }
 
     // Comments
@@ -168,10 +168,17 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
     }
 }
 
-/// Render a `CREATE [UNIQUE] INDEX … ON <qname> [USING method] (cols);` line.
+/// Render a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] … ON <qname> [USING method] (cols);` line.
 /// `table_name` is the bare table name used to synthesize an index name when
-/// the index has none.
-fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &str) -> String {
+/// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
+/// statement is idempotent on re-apply — matviews set it (their whole DDL is
+/// re-applied by `dbd apply`); tables keep their existing exact output.
+fn emit_index_sql(
+    ix: &crate::entity::IndexDef,
+    qname: &str,
+    table_name: &str,
+    if_not_exists: bool,
+) -> String {
     let cols = ix
         .columns
         .iter()
@@ -193,9 +200,11 @@ fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &str) -
         // btree (Some(Btree) or None) is the default — no USING clause.
         _ => "",
     };
-    // Postgres grammar: CREATE [UNIQUE] INDEX name ON table [USING method] (cols)
-    // — the access method goes AFTER the table, before the column list.
-    format!("CREATE {unique}INDEX {} ON {qname}{using} ({cols});", q(&idx_name))
+    let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    // Postgres grammar: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table
+    // [USING method] (cols) — the access method goes AFTER the table, before
+    // the column list.
+    format!("CREATE {unique}INDEX {ine}{} ON {qname}{using} ({cols});", q(&idx_name))
 }
 
 fn quote_cols(cols: &[String]) -> String {
@@ -246,6 +255,34 @@ pub fn emit_view(entity: &Entity) -> String {
     format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
 }
 
+/// `CREATE MATERIALIZED VIEW IF NOT EXISTS "schema"."name" AS <definition> WITH DATA;`
+/// Body is carried in `entity.writes[0]` (same contract as `emit_view`); the
+/// parser stores it without a `WITH DATA` clause, which we re-add here.
+/// Trailing index statements (if any) are appended from `entity.table_def`,
+/// rendered via the same `emit_index_sql` helper `emit_table` uses.
+///
+/// `IF NOT EXISTS` (on the matview and each index) keeps the emitted DDL
+/// idempotent: unlike tables (`CREATE TABLE IF NOT EXISTS`) and views
+/// (`CREATE OR REPLACE VIEW`), Postgres has no `CREATE OR REPLACE MATERIALIZED
+/// VIEW`, so without it a second `dbd apply` of the same DDL errors with
+/// `42P07 relation already exists`.
+pub fn emit_matview(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+    let name = bare(&entity.name);
+    let qname = format!("{}.{}", q(schema), q(name));
+    let body = entity.writes.first().map(String::as_str).unwrap_or("SELECT 1");
+    let body = body.trim().trim_end_matches(';');
+    let mut out = format!("CREATE MATERIALIZED VIEW IF NOT EXISTS {qname} AS {body} WITH DATA;");
+
+    if let Some(def) = &entity.table_def {
+        for ix in &def.indexes {
+            out.push('\n');
+            out.push_str(&emit_index_sql(ix, &qname, name, true));
+        }
+    }
+    out
+}
+
 /// `CREATE OR REPLACE FUNCTION|PROCEDURE …;` for each overload, joined by a
 /// blank line.
 ///
@@ -285,6 +322,7 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
         EntityType::Enum => Some(emit_enum(entity)),
         EntityType::Table => Some(emit_table(entity)),
         EntityType::View => Some(emit_view(entity)),
+        EntityType::MaterializedView => Some(emit_matview(entity)),
         EntityType::Function | EntityType::Procedure => Some(emit_routine(entity)),
         _ => None,
     }
@@ -437,6 +475,58 @@ mod tests {
         assert_eq!(
             sql,
             "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
+        );
+    }
+
+    #[test]
+    fn emits_materialized_view() {
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        let sql = emit_matview(&e);
+        assert_eq!(
+            sql,
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS \"analytics\".\"daily_sales\" AS SELECT 1 AS x WITH DATA;"
+        );
+    }
+
+    #[test]
+    fn emit_entity_dispatches_matview() {
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        let sql = emit_entity(&e).expect("matview should emit");
+        assert!(sql.starts_with("CREATE MATERIALIZED VIEW"));
+    }
+
+    #[test]
+    fn emits_materialized_view_with_index() {
+        use crate::entity::{IndexColumn, IndexDef, TableDef};
+
+        let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        e.writes = vec!["SELECT 1 AS x".to_string()];
+        e.table_def = Some(TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![IndexDef {
+                name: Some("daily_sales_x_idx".into()),
+                columns: vec![IndexColumn { name: "x".into(), order: None }],
+                unique: true,
+                index_type: None,
+            }],
+            comments: Default::default(),
+        });
+
+        let sql = emit_matview(&e);
+        assert!(
+            sql.contains(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS \"analytics\".\"daily_sales\" AS SELECT 1 AS x WITH DATA;"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "CREATE UNIQUE INDEX IF NOT EXISTS \"daily_sales_x_idx\" ON \"analytics\".\"daily_sales\" (\"x\");"
+            ),
+            "got:\n{sql}"
         );
     }
 

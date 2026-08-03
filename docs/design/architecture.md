@@ -328,6 +328,7 @@ pub enum EntityType {
     Enum,
     Table,
     View,
+    MaterializedView,
     Function,
     Procedure,
     External,

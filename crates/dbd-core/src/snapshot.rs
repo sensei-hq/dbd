@@ -1805,6 +1805,20 @@ mod tests {
         assert_eq!(result.snapshot.tables[0].name, "users");
     }
 
+    // M3.3b: MaterializedView entity excluded from snapshot (same as View)
+    #[test]
+    fn sc_materialized_view_entity_excluded_from_snapshot() {
+        let mut matview = Entity::new(EntityType::MaterializedView, "config.active_users_mv");
+        matview.table_def = None;
+        let table_entity = make_table_entity("config.users", vec![col("id", "int")]);
+        let entities = vec![matview, table_entity];
+
+        let result = prepare_snapshot(&entities, None, 1, "test");
+        // Only Table entities with table_def are included
+        assert_eq!(result.snapshot.tables.len(), 1);
+        assert_eq!(result.snapshot.tables[0].name, "users");
+    }
+
     // M3.4: Table without table_def excluded
     #[test]
     fn sc_table_without_table_def_excluded() {
