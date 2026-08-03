@@ -593,6 +593,7 @@ impl DatabaseAdapter for ConvexAdapter {
             EntityType::Extension
             | EntityType::Role
             | EntityType::Sequence
+            | EntityType::MaterializedView
             | EntityType::Function
             | EntityType::Procedure => Err(DbdError::Config(format!(
                 "Convex adapter does not support {:?} entities ({})",
