@@ -124,7 +124,7 @@ use std::path::PathBuf;
 /// reconciles against) the files already on disk rather than creating `.sql`
 /// duplicates. The scanner accepts both `.ddl` and `.sql`.
 pub fn entity_path(entity: &Entity) -> PathBuf {
-    let kind = entity.entity_type.tag(); // "table", "enum", "view", "schema", "extension"
+    let kind = entity.entity_type.folder_name(); // "table", "enum", "view", "schema", "extension", "materialized_view"
     let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
     let mut p = PathBuf::from("ddl");
     p.push(&kind);
@@ -138,7 +138,7 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 /// The entity kinds this command generates (used to scope orphan detection).
 pub const MANAGED_KINDS: &[EntityType] = &[
     EntityType::Schema, EntityType::Extension, EntityType::Role, EntityType::Sequence,
-    EntityType::Enum, EntityType::Table, EntityType::View,
+    EntityType::Enum, EntityType::Table, EntityType::View, EntityType::MaterializedView,
     EntityType::Function, EntityType::Procedure,
 ];
 
@@ -194,7 +194,7 @@ pub fn build_plan(
             continue; // schema/extension live flat; skip orphan scan for them in v1
         }
         for schema in selected_schemas {
-            let dir = root.join("ddl").join(kind.tag()).join(schema);
+            let dir = root.join("ddl").join(kind.folder_name()).join(schema);
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -406,6 +406,13 @@ mod tests {
     }
 
     #[test]
+    fn matview_reverse_path_uses_underscored_folder() {
+        let e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
+        let p = entity_path(&e);
+        assert_eq!(p, std::path::PathBuf::from("ddl/materialized_view/analytics/daily_sales.ddl"));
+    }
+
+    #[test]
     fn build_plan_classifies_files() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
@@ -441,6 +448,24 @@ mod tests {
         ]);
         // trigger file is unmanaged → never an orphan
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
+    }
+
+    #[test]
+    fn stale_matview_file_is_detected_as_orphan() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Stale matview file on disk, but no generated matview entity below —
+        // the orphan scan must find it under the real `materialized_view` folder.
+        fs::create_dir_all(root.join("ddl/materialized_view/analytics")).unwrap();
+        fs::write(root.join("ddl/materialized_view/analytics/stale.ddl"), "STALE").unwrap();
+
+        let plan = build_plan(root, vec![], &["analytics".to_string()]);
+
+        assert_eq!(
+            plan.orphans,
+            vec![PathBuf::from("ddl/materialized_view/analytics/stale.ddl")]
+        );
     }
 
     fn item(p: &str, c: &str, a: FileAction) -> PlanItem {
