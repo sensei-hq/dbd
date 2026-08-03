@@ -262,7 +262,7 @@ materialized_views:
 
 **Requirements & validation.** Scheduling requires the `pg_cron` extension in `target.postgres.extensions`; `concurrently: true` requires the matview to declare a unique index. `dbd inspect` reports both, offline. PostgreSQL/Supabase only.
 
-**Reconcile.** `dbd reconcile` creates an absent matview (stamping a `dbd:hash` sentinel) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it.
+**Reconcile & diff.** `dbd reconcile` creates an absent matview (stamping a `dbd:hash` sentinel) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it. `reconcile --dry-run` previews these creates and drift warnings, and read-only `dbd diff` reports each matview as `missing`/`drifted`/`unstamped`/`orphan` (in `--json` and `--exit-code`).
 
 ### `dbml`
 
