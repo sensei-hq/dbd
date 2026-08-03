@@ -41,6 +41,7 @@ fn is_scopable(e: &Entity) -> bool {
         EntityType::Enum
             | EntityType::Table
             | EntityType::View
+            | EntityType::MaterializedView
             | EntityType::Function
             | EntityType::Procedure
     )
@@ -435,6 +436,24 @@ mod tests {
         assert!(s.entities.contains("config")); // schema re-added
         assert!(!s.entities.contains("app.orders"));
         assert!(!s.entities.contains("app"));
+    }
+
+    #[test]
+    fn scope_wildcard_includes_materialized_views() {
+        // A materialized view under `analytics` must be scope-eligible, just
+        // like tables/views, so `analytics.*` selects it too.
+        let world = vec![
+            Entity::schema("analytics"),
+            ent(EntityType::Table, "analytics.orders", &[]),
+            ent(EntityType::MaterializedView, "analytics.daily_sales", &[]),
+        ];
+        let scopes = scopes_yaml("hub:\n  includes: [analytics.*]\n");
+        let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
+        assert!(
+            s.entities.contains("analytics.daily_sales"),
+            "matview should be included by the analytics.* wildcard"
+        );
+        assert!(s.entities.contains("analytics.orders"));
     }
 
     #[test]
