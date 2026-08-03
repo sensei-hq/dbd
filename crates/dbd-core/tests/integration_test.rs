@@ -106,6 +106,40 @@ fn auto_discovers_schemas_from_entity_paths() {
     assert!(schemas.contains(&"config"));
 }
 
+// ── Scenario: Materialized views (end-to-end) ───────────
+
+#[test]
+fn discovers_and_emits_materialized_view_from_fixture() {
+    let d = design();
+
+    // Discovered from ddl/materialized_view/config/genders_mv.ddl with the
+    // MaterializedView type inferred from its folder.
+    let mv = d
+        .entities()
+        .iter()
+        .find(|e| e.name == "config.genders_mv")
+        .expect("matview discovered from ddl/materialized_view/");
+    assert_eq!(mv.entity_type, EntityType::MaterializedView);
+
+    // Its SELECT source is a real fixture entity, so dependency resolution is
+    // realistic (the matview reads from the config.genders view).
+    assert!(
+        mv.refers.iter().any(|r| r == "config.genders"),
+        "matview should depend on its source view, got: {:?}",
+        mv.refers
+    );
+
+    // Emits a CREATE MATERIALIZED VIEW statement carrying its unique index.
+    let sql = dbd_core::emit::emit_entity(mv).expect("matview emits DDL");
+    assert!(sql.contains("CREATE MATERIALIZED VIEW"));
+    assert!(sql.contains("CREATE UNIQUE INDEX"), "index carried through emit: {sql}");
+
+    // Config resolution honours the per-view override and inherits global options.
+    let r = d.config().materialized_views.resolve("config.genders_mv");
+    assert_eq!(r.refresh.as_deref(), Some("*/15 * * * *")); // per-view override
+    assert!(r.concurrently); // inherited from global options
+}
+
 // ── Scenario: Entity ordering ───────────────────────────
 
 #[test]

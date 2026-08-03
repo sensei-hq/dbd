@@ -25,6 +25,7 @@ fn ensure_public_in_search_path(sql: &str) -> String {
     })
     .to_string()
 }
+use crate::config::ResolvedMatview;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
@@ -68,6 +69,103 @@ fn jsonb_import_call_sql(target: &str) -> String {
         "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{JSONB_IMPORT_TMP}', '{}')",
         target.replace('\'', "''")
     )
+}
+
+// ── pg_cron refresh-job planning (pure, unit-tested) ──────────────────────────
+//
+// dbd owns the set of `dbd:refresh:<schema>.<name>` cron jobs that refresh
+// scheduled materialized views. These free functions build the SQL and decide
+// the sync plan WITHOUT a live connection, so the decision logic is fully
+// unit-testable. `sync_refresh_jobs` below wires them to a real database, guarded
+// by a pg_cron-presence check (pg_cron is optional — querying `cron.job` on a DB
+// without it would error).
+
+/// Split a `schema.name` reference on its FIRST `.` into (schema, name),
+/// falling back to the `public` schema when unqualified.
+fn split_qualified(qualified: &str) -> (&str, &str) {
+    match qualified.split_once('.') {
+        Some((schema, name)) => (schema, name),
+        None => ("public", qualified),
+    }
+}
+
+/// Build the `SELECT cron.schedule(...)` statement that (re)schedules a matview
+/// refresh. `cron.schedule(name, sched, cmd)` upserts by job name, so this
+/// doubles as the update path. Single quotes are escaped in every SQL literal
+/// and double quotes in the schema/name identifiers.
+fn refresh_job_sql(qualified: &str, schedule: &str, concurrently: bool) -> String {
+    let (schema, name) = split_qualified(qualified);
+    let job_name = format!("dbd:refresh:{qualified}");
+    let concurrent = if concurrently { "CONCURRENTLY " } else { "" };
+    let command = format!(
+        "REFRESH MATERIALIZED VIEW {concurrent}\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+    format!(
+        "SELECT cron.schedule('{}', '{}', '{}');",
+        job_name.replace('\'', "''"),
+        schedule.replace('\'', "''"),
+        command.replace('\'', "''"),
+    )
+}
+
+/// Build the statement that unschedules every `dbd:refresh:%` job NOT in
+/// `keep_job_names`. An empty keep list still yields valid SQL via an explicitly
+/// typed empty array (`ARRAY[]::text[]`).
+fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
+    let array = if keep_job_names.is_empty() {
+        "ARRAY[]::text[]".to_string()
+    } else {
+        let items = keep_job_names
+            .iter()
+            .map(|n| format!("'{}'", n.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("ARRAY[{items}]")
+    };
+    format!(
+        "SELECT cron.unschedule(jobid) FROM cron.job \
+         WHERE jobname LIKE 'dbd:refresh:%' AND jobname <> ALL({array});"
+    )
+}
+
+/// Decide the cron-sync plan for a set of `(qualified_name, ResolvedMatview)`.
+///
+/// - No scheduled matviews and no pg_cron → `Ok(vec![])` (safe no-op for DBs
+///   without the extension).
+/// - Scheduled matviews but no pg_cron → `Err` (misconfiguration).
+/// - pg_cron present → one `refresh_job_sql` per scheduled matview (sorted by
+///   name for determinism) followed by ONE `unschedule_stale_sql` keeping exactly
+///   the scheduled jobs (so a matview whose schedule was removed gets its stale
+///   dbd-owned job dropped).
+fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
+    let mut scheduled: Vec<&(String, ResolvedMatview)> =
+        jobs.iter().filter(|(_, mv)| mv.refresh.is_some()).collect();
+
+    if scheduled.is_empty() && !pg_cron_present {
+        return Ok(vec![]);
+    }
+    if !scheduled.is_empty() && !pg_cron_present {
+        return Err(DbdError::Config(
+            "materialized view refresh scheduling requires the pg_cron extension \
+             (add 'pg_cron' under target.postgres.extensions)"
+                .into(),
+        ));
+    }
+
+    // pg_cron present: build schedule statements (stable order) + one unschedule.
+    scheduled.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut stmts = Vec::with_capacity(scheduled.len() + 1);
+    let mut keep = Vec::with_capacity(scheduled.len());
+    for (name, mv) in &scheduled {
+        let schedule = mv.refresh.as_deref().expect("filtered to Some above");
+        stmts.push(refresh_job_sql(name, schedule, mv.concurrently));
+        keep.push(format!("dbd:refresh:{name}"));
+    }
+    stmts.push(unschedule_stale_sql(&keep));
+    Ok(stmts)
 }
 
 /// PostgreSQL adapter using sqlx connection pool.
@@ -180,6 +278,17 @@ impl PostgresAdapter {
         }
         // Idempotent: creates `public.<table>` on a fresh DB, no-op once present.
         self.exec_raw(create_public_sql).await
+    }
+
+    /// True if the pg_cron extension is installed (its `cron.job` relation
+    /// exists). Uses `to_regclass`, which returns NULL for a missing relation
+    /// instead of erroring — so this is safe to run on databases WITHOUT pg_cron.
+    async fn pg_cron_present(&self) -> Result<bool> {
+        let row = sqlx::query("SELECT to_regclass('cron.job') IS NOT NULL AS present")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("pg_cron presence check failed: {e}")))?;
+        Ok(row.get::<bool, _>("present"))
     }
 
     /// Static pattern matching for reference classification (offline fallback).
@@ -812,6 +921,57 @@ impl PostgresAdapter {
         Ok(entities)
     }
 
+    /// Reverse-engineer materialized views from `pg_matviews`.
+    ///
+    /// Mirrors [`Self::introspect_views`]: the SELECT body is captured verbatim in
+    /// `writes[0]` (the parser/emitter contract — `emit_matview` re-adds the
+    /// `WITH DATA` clause). Additionally, a matview's indexes live in `pg_index`
+    /// exactly like a table's, so they are read with the SAME index reader the
+    /// table path uses ([`Self::introspect_indexes`]) and attached via a
+    /// columns-empty `TableDef`. Matviews cannot own PK/UNIQUE *constraints* (only
+    /// standalone indexes), so there are no constraint-backed index OIDs to skip —
+    /// an empty set is passed. `emit_matview` re-creates the indexes from there.
+    async fn introspect_matviews(&self) -> crate::error::Result<Vec<Entity>> {
+        use crate::entity::TableDef;
+
+        let ns_filter = Self::schema_filter_column("schemaname");
+        let sql = format!(
+            "SELECT schemaname, matviewname, definition \
+             FROM pg_matviews \
+             WHERE {ns_filter} \
+             ORDER BY schemaname, matviewname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_matviews failed: {e}")))?;
+
+        let mut entities: Vec<Entity> = Vec::new();
+        for row in &rows {
+            let schema: String = row.get("schemaname");
+            let matviewname: String = row.get("matviewname");
+            let definition: String = row.get("definition");
+
+            let indexes = self
+                .introspect_indexes(&schema, &matviewname, &std::collections::HashSet::new())
+                .await?;
+
+            let mut e =
+                Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
+            e.writes = vec![definition];
+            if !indexes.is_empty() {
+                e.table_def = Some(TableDef {
+                    columns: Vec::new(),
+                    constraints: Vec::new(),
+                    indexes,
+                    comments: Default::default(),
+                });
+            }
+            entities.push(e);
+        }
+        Ok(entities)
+    }
+
     /// Reverse-engineer **standalone** sequences as `EntityType::Sequence`.
     ///
     /// A sequence is `pg_class.relkind = 'S'`. Column-owned sequences (those backing
@@ -1353,6 +1513,7 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_enums().await?);
         out.extend(self.introspect_tables().await?);
         out.extend(self.introspect_views().await?);
+        out.extend(self.introspect_matviews().await?);
         out.extend(self.introspect_functions().await?);
         Ok(out)
     }
@@ -1642,6 +1803,63 @@ impl DatabaseAdapter for PostgresAdapter {
         }
         Ok(())
     }
+
+    // ── Materialized-view refresh scheduling ────────────
+
+    /// Live matview drift state: every materialized view (`pg_class.relkind =
+    /// 'm'`) in a managed schema mapped to the `dbd:hash` sentinel parsed from its
+    /// object comment. Distinct from [`Self::introspect_matviews`] (which
+    /// reconstructs the full entity for merge/init) — this reads only what
+    /// reconcile's create/skip/recreate decision needs.
+    async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
+            "SELECT n.nspname AS schema, c.relname AS name, \
+                    obj_description(c.oid, 'pg_class') AS comment \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'm' AND {ns_filter}"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("matview_states failed: {e}")))?;
+
+        let mut states = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let schema: String = row.get("schema");
+            let name: String = row.get("name");
+            let comment: Option<String> = row.get("comment");
+            states.insert(
+                format!("{schema}.{name}"),
+                crate::reconcile::parse_dbd_hash(comment.as_deref()),
+            );
+        }
+        Ok(states)
+    }
+
+    async fn sync_refresh_jobs(&self, jobs: &[(String, ResolvedMatview)]) -> Result<()> {
+        // Guard: never touch `cron.job` on a database without pg_cron (it would
+        // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled
+        // and pg_cron is absent, or errors when scheduling is requested without it.
+        let present = self.pg_cron_present().await?;
+        let stmts = plan_cron_sync(jobs, present)?;
+        for s in stmts {
+            self.execute_script(&s).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_matview(&self, qualified: &str, concurrently: bool) -> Result<()> {
+        let (schema, name) = split_qualified(qualified);
+        let concurrent = if concurrently { "CONCURRENTLY " } else { "" };
+        let sql = format!(
+            "REFRESH MATERIALIZED VIEW {concurrent}\"{}\".\"{}\";",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+        );
+        self.execute_script(&sql).await
+    }
 }
 
 #[cfg(test)]
@@ -1699,5 +1917,132 @@ mod tests {
     fn jsonb_call_escapes_single_quotes_in_target() {
         let sql = jsonb_import_call_sql("weird.o'brien");
         assert!(sql.contains("weird.o''brien"), "single quotes must be escaped: {sql}");
+    }
+
+    // ── pg_cron refresh-job planning ──────────────────────────────────────────
+
+    fn mv(refresh: Option<&str>, concurrently: bool) -> ResolvedMatview {
+        ResolvedMatview {
+            refresh: refresh.map(str::to_string),
+            concurrently,
+        }
+    }
+
+    #[test]
+    fn refresh_job_sql_concurrent_contains_expected_parts() {
+        let sql = refresh_job_sql("analytics.daily_sales", "0 2 * * *", true);
+        assert!(sql.contains("dbd:refresh:analytics.daily_sales"), "job name: {sql}");
+        assert!(
+            sql.contains("REFRESH MATERIALIZED VIEW CONCURRENTLY \"analytics\".\"daily_sales\""),
+            "concurrent refresh command: {sql}"
+        );
+        assert!(sql.contains("'0 2 * * *'"), "schedule literal: {sql}");
+    }
+
+    #[test]
+    fn refresh_job_sql_non_concurrent_omits_concurrently() {
+        let sql = refresh_job_sql("analytics.x", "0 3 * * *", false);
+        assert!(
+            sql.contains("REFRESH MATERIALIZED VIEW \"analytics\".\"x\""),
+            "non-concurrent refresh command: {sql}"
+        );
+        assert!(!sql.contains("CONCURRENTLY"), "must not include CONCURRENTLY: {sql}");
+    }
+
+    #[test]
+    fn refresh_job_sql_escapes_single_quotes() {
+        // Contrived name/schedule carrying single quotes — all literals escaped.
+        let sql = refresh_job_sql("analytics.o'brien", "0 2 * * *'; DROP", true);
+        assert!(sql.contains("dbd:refresh:analytics.o''brien"), "job name escaped: {sql}");
+        assert!(sql.contains("\"analytics\".\"o''brien\""), "identifier escaped in command: {sql}");
+        assert!(sql.contains("0 2 * * *''; DROP"), "schedule literal escaped: {sql}");
+    }
+
+    #[test]
+    fn refresh_job_sql_unqualified_falls_back_to_public() {
+        let sql = refresh_job_sql("solo", "0 0 * * *", false);
+        assert!(sql.contains("\"public\".\"solo\""), "unqualified name uses public: {sql}");
+    }
+
+    #[test]
+    fn unschedule_stale_sql_with_keep_list_is_valid() {
+        let keep = vec!["dbd:refresh:a.one".to_string(), "dbd:refresh:b.two".to_string()];
+        let sql = unschedule_stale_sql(&keep);
+        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
+        assert!(sql.contains("'dbd:refresh:a.one'"), "keeps a.one: {sql}");
+        assert!(sql.contains("'dbd:refresh:b.two'"), "keeps b.two: {sql}");
+        assert!(sql.contains("<> ALL(ARRAY["), "uses <> ALL(ARRAY[...]): {sql}");
+    }
+
+    #[test]
+    fn unschedule_stale_sql_empty_keep_list_is_valid() {
+        let sql = unschedule_stale_sql(&[]);
+        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
+        // Empty list must still produce valid SQL via a typed empty array.
+        assert!(sql.contains("ARRAY[]::text[]"), "typed empty array: {sql}");
+    }
+
+    #[test]
+    fn plan_cron_sync_empty_scheduled_no_pg_cron_is_noop() {
+        // No matviews scheduled and no pg_cron → nothing to do (safe on non-cron DBs).
+        let jobs = vec![("analytics.x".to_string(), mv(None, false))];
+        let plan = plan_cron_sync(&jobs, false).unwrap();
+        assert!(plan.is_empty(), "expected empty plan, got: {plan:?}");
+    }
+
+    #[test]
+    fn plan_cron_sync_scheduled_without_pg_cron_errors() {
+        let jobs = vec![("analytics.x".to_string(), mv(Some("0 2 * * *"), false))];
+        let err = plan_cron_sync(&jobs, false).unwrap_err();
+        assert!(
+            err.to_string().contains("pg_cron"),
+            "error should mention pg_cron: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_cron_sync_present_builds_schedules_and_one_unschedule_in_order() {
+        // Two scheduled (one concurrent, one not) + one unscheduled. Deliberately
+        // unsorted input to prove deterministic name-sorted output.
+        let jobs = vec![
+            ("analytics.daily_sales".to_string(), mv(Some("0 2 * * *"), true)),
+            ("analytics.unscheduled".to_string(), mv(None, false)),
+            ("analytics.abc".to_string(), mv(Some("*/5 * * * *"), false)),
+        ];
+        let plan = plan_cron_sync(&jobs, true).unwrap();
+
+        // 2 schedule statements + 1 unschedule statement.
+        assert_eq!(plan.len(), 3, "expected 2 schedules + 1 unschedule: {plan:?}");
+
+        // Sorted by name: "analytics.abc" before "analytics.daily_sales".
+        assert!(plan[0].contains("dbd:refresh:analytics.abc"), "first (sorted): {}", plan[0]);
+        assert!(!plan[0].contains("CONCURRENTLY"), "abc is non-concurrent: {}", plan[0]);
+        assert!(plan[1].contains("dbd:refresh:analytics.daily_sales"), "second (sorted): {}", plan[1]);
+        assert!(plan[1].contains("CONCURRENTLY"), "daily_sales is concurrent: {}", plan[1]);
+
+        // Last statement is the single unschedule; its keep list has both scheduled
+        // jobs and NOT the unscheduled one.
+        let unschedule = &plan[2];
+        assert!(unschedule.contains("cron.unschedule"), "last is unschedule: {unschedule}");
+        assert!(unschedule.contains("'dbd:refresh:analytics.abc'"), "keeps abc: {unschedule}");
+        assert!(
+            unschedule.contains("'dbd:refresh:analytics.daily_sales'"),
+            "keeps daily_sales: {unschedule}"
+        );
+        assert!(
+            !unschedule.contains("analytics.unscheduled"),
+            "must NOT keep the unscheduled matview: {unschedule}"
+        );
+    }
+
+    #[test]
+    fn plan_cron_sync_present_but_none_scheduled_emits_only_unschedule() {
+        // pg_cron present, nothing scheduled → still emit the cleanup unschedule so
+        // previously-scheduled dbd jobs get dropped.
+        let jobs = vec![("analytics.x".to_string(), mv(None, false))];
+        let plan = plan_cron_sync(&jobs, true).unwrap();
+        assert_eq!(plan.len(), 1, "expected only the unschedule statement: {plan:?}");
+        assert!(plan[0].contains("cron.unschedule"), "the one statement is unschedule: {}", plan[0]);
+        assert!(plan[0].contains("ARRAY[]::text[]"), "empty keep list: {}", plan[0]);
     }
 }

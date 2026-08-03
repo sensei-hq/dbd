@@ -6,9 +6,10 @@ dbd parses SQL DDL files, resolves dependencies, generates migrations, loads dat
 
 ## Core concept
 
-SQL files are the source of truth. Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema): `<type>` ∈ table|view|function|procedure|enum|role, ext `.ddl`|`.sql`. Folder = type, parent = schema, filename = entity name. Singular type folder is canonical (plural accepted but `dbd doctor --fix` migrates it to singular).
+SQL files are the source of truth. Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema): `<type>` ∈ table|view|materialized_view|function|procedure|enum|role, ext `.ddl`|`.sql`. Folder = type, parent = schema, filename = entity name. Singular type folder is canonical (plural accepted but `dbd doctor --fix` migrates it to singular).
 - `ddl/table/config/lookups.ddl` → entity `config.lookups` (table)
 - `ddl/view/config/genders.ddl` → entity `config.genders` (view)
+- `ddl/materialized_view/analytics/daily_sales.ddl` → entity `analytics.daily_sales` (materialized view; write `create materialized view if not exists …` + trailing `create [unique] index …`)
 - `ddl/procedure/staging/import_lookups.ddl` → entity `staging.import_lookups` (procedure)
 
 Files are parsed once into a rich internal representation (Entity + TableDef). That same structure drives every feature: dependency graph, apply, migrations, DBML generation, data import.
@@ -38,6 +39,13 @@ import:
 
 export:
   - config.lookups
+
+materialized_views:            # refresh scheduling for ddl/materialized_view/ entities (pg_cron)
+  options:                     # shared defaults for every matview
+    refresh: "0 2 * * *"       # cron expression; omit ⇒ no scheduled refresh
+    concurrently: true         # needs a unique index on the matview
+  overrides:                   # per-matview overrides (by qualified name)
+    analytics.top_products: { refresh: "*/30 * * * *" }
 
 dbml:
   base:
@@ -71,8 +79,9 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd apply` — apply schemas + entities + pending migrations (blocks while migration TODOs remain); `--with-policies` also applies RLS
 - `dbd import` — load staging data (CSV/TSV/JSONL) from the `import/` convention; env-specific files under `import/<env>/<schema>/` load only when `-e <env>` matches. `-n <table> -f <file>` loads one explicit file (format from extension)
 - `dbd export` — export table data (scope-aware) to `export/<schema>/<name>.<fmt>`; `-f/--format` sets the format, `-o/--output <dir>` the destination dir (`<dir>/<name>.<fmt>`, e.g. straight into `import/` for a round-trip)
+- `dbd refresh` — run `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (honoring each matview's resolved `concurrently`); `-n <entity>` or `-n <schema>.*` targets a subset, omit for all. Scheduled refresh is otherwise managed in-database via pg_cron (jobs named `dbd:refresh:<schema>.<name>`, synced on `apply`/`deploy`; needs the `pg_cron` extension)
 - `dbd deploy --source owner/repo/path` — fetch + apply + import from GitHub; GitHub sources cache under `~/.cache/dbd` — `--no-cache` re-downloads this source, `--clear-cache` wipes the whole cache first
-- `dbd reconcile` — pre-release (pre-v1) **declarative** apply: diff the live DB against the design and apply `CREATE`/`ALTER` in place, no snapshots/version bump; scoped to managed schemas. `--allow-destructive` drops columns/constraints on managed tables; `--prune` drops orphaned tables (in a managed schema, gone from the design); orphaned enums are only warned. Disabled once `project.released`
+- `dbd reconcile` — pre-release (pre-v1) **declarative** apply: diff the live DB against the design and apply `CREATE`/`ALTER` in place, no snapshots/version bump; scoped to managed schemas. `--allow-destructive` drops columns/constraints on managed tables; `--prune` drops orphaned tables (in a managed schema, gone from the design); orphaned enums are only warned. Materialized views: create-if-absent (stamped with a `dbd:hash` sentinel comment); a drifted definition is only **warned**, never auto-dropped (a matview recreate is `DROP … CASCADE`, losing data/dependents — drop it manually, then `apply`/reconcile recreates it). Disabled once `project.released`
 - `dbd diff` — read-only: show the complete live-DB↔design difference (columns, PK/unique, FK, CHECK, indexes, column comments, enums) — everything `reconcile --dry-run` omits. `--json` for tooling, `--exit-code` (0 in sync / 2 drift / 1 error). Tables+enums only; always available (even after release)
 - `dbd release` (alias `dbd baseline`) — cut v1: write a baseline snapshot at the current `project.version` and set `project.released: true`, locking in the snapshot/migration workflow (disables `reconcile`). Refuses if already released, snapshots exist, or the design has errors
 - `dbd combine` — combine DDL into single SQL file (scope-aware)
@@ -83,10 +92,10 @@ Scopes are orthogonal to `target` (DB platform) and the connection: pair them at
 - `dbd migrate` — show migration status (read-only; `--status`). Pending migrations are run by `dbd apply`, not here
 - `dbd policies` — apply RLS policies from `policies/<schema>/<table>.sql` (idempotent, fail-forward)
 - `dbd doctor` — audit/migrate config + layout: old-format design.yaml, stale files, and plural DDL folders → singular (`ddl/functions/`→`ddl/function/`; collision keeps newer, backs up older as `.bkp`)
-- `dbd reset` — drop the project's own objects entity-level (functions/views/tables/sequences/enums, reverse order); keeps schemas + extensions by default. `--schemas`/`--extensions`/`--clean` opt into DROP SCHEMA/EXTENSION; `--target <postgres|supabase>` (default `postgres`) sets the protected-schema set. Guarded by _dbd_meta env check; `--scope` restricts to the scope's objects
+- `dbd reset` — drop the project's own objects entity-level (functions/materialized views/views/tables/sequences/enums, reverse order; matviews `DROP MATERIALIZED VIEW … CASCADE` before the views/tables they read); keeps schemas + extensions by default. `--schemas`/`--extensions`/`--clean` opt into DROP SCHEMA/EXTENSION; `--target <postgres|supabase>` (default `postgres`) sets the protected-schema set. Guarded by _dbd_meta env check; `--scope` restricts to the scope's objects
 - `dbd format [--check]` — DDL formatter; river-style SELECT/VIEW bodies on by default (`query_style: river`/`none`, `gutter`); river output is AST-verified and falls back to keyword-case-only if it can't reproduce a query faithfully (CTEs, etc.). `--check` exits 1 if any file would change (drop-in for pre-commit; `.pre-commit-hooks.yaml` ships `dbd-format` + `dbd-format-system`)
 
-Reverse-engineering coverage (`init --from-db`/`merge`): schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. gin/gist/brin/hash, comments, serial/identity columns), views, functions & procedures (verbatim), roles (opt-in `--roles`), standalone sequences. Not captured: partial/expression indexes, triggers. A DBML source (`--from-dbml`) = schemas/enums/tables/FKs only. A SQLite source (`--from-db sqlite://…`) = tables/views/user-indexes captured verbatim from `sqlite_master` (CHECK/affinity/AUTOINCREMENT/WITHOUT ROWID preserved; no schemas/enums/functions/sequences/roles; triggers skipped). The reverse dialect (postgres vs sqlite target) is taken from the connection URL scheme.
+Reverse-engineering coverage (`init --from-db`/`merge`): schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check constraints, indexes incl. gin/gist/brin/hash, comments, serial/identity columns), views, materialized views (definition + indexes from `pg_matviews`, written to `ddl/materialized_view/`), functions & procedures (verbatim), roles (opt-in `--roles`), standalone sequences. Not captured: partial/expression indexes, triggers. A DBML source (`--from-dbml`) = schemas/enums/tables/FKs only. A SQLite source (`--from-db sqlite://…`) = tables/views/user-indexes captured verbatim from `sqlite_master` (CHECK/affinity/AUTOINCREMENT/WITHOUT ROWID preserved; no schemas/enums/functions/sequences/roles; triggers skipped). The reverse dialect (postgres vs sqlite target) is taken from the connection URL scheme.
 
 Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report|include` overrides that scope's gap policy for one run. Honored by `inspect`/`apply`/`import`/`deploy`/`reconcile` (gap-gated writes) and `dbml`/`combine`/`graph`/`export`/`reset` (filter-only — they don't gate on gaps; `inspect --scope` is where gaps surface). All filter to the entity working set (`reset` drops those entities; `--schemas` additionally restricts the dropped schemas to the scope's).
 
@@ -106,7 +115,7 @@ Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report
 
 - `Entity` — central type for all DDL objects
 - `TableDef` — parsed table structure (columns, FKs with actions, indexes, constraints, comments)
-- `EntityType` — Schema, Extension, Role, Sequence, Enum, Table, View, Function, Procedure, External, Import, Export
+- `EntityType` — Schema, Extension, Role, Sequence, Enum, Table, View, MaterializedView, Function, Procedure, External, Import, Export
 - `DatabaseAdapter` trait — connect, apply (single + batch, incl. transactional begin/commit/rollback batch), import/export, classify_reference, resolve_entity, list_entities, introspect (reverse-engineer), migration + meta tracking
 - `RefCache` — JSON snapshot of remote entity names for offline `inspect`
 

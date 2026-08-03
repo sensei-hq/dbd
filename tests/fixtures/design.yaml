@@ -12,6 +12,7 @@ target:
       - uuid-ossp
       - name: postgis
         schema: extensions
+      - pg_cron
     roles:
       - name: advanced
         refers:
@@ -48,6 +49,14 @@ export:
   - config.lookups
   - config.lookup_values:
       format: jsonl
+
+materialized_views:
+  options:
+    refresh: "0 3 * * *"
+    concurrently: true
+  overrides:
+    config.genders_mv:
+      refresh: "*/15 * * * *"
 
 dbml:
   base:

@@ -593,6 +593,7 @@ impl DatabaseAdapter for ConvexAdapter {
             EntityType::Extension
             | EntityType::Role
             | EntityType::Sequence
+            | EntityType::MaterializedView
             | EntityType::Function
             | EntityType::Procedure => Err(DbdError::Config(format!(
                 "Convex adapter does not support {:?} entities ({})",
@@ -881,6 +882,15 @@ mod tests {
             let e = Entity::new(t, "x");
             assert!(adapter.apply_entity(&e).await.is_err(), "{t:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn cv19_convex_rejects_materialized_view() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let e = Entity::new(EntityType::MaterializedView, "app.mv");
+        let err = adapter.apply_entity(&e).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("materialized"));
     }
 
     #[tokio::test]

@@ -104,6 +104,33 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(())
     }
 
+    // ── Materialized-view refresh scheduling ────────────
+
+    /// Live materialized-view drift state: `"schema.name"` → the `dbd:hash`
+    /// sentinel parsed from the object's comment (`None` when it carries no such
+    /// sentinel). An ABSENT key means the matview does not exist. Reconcile uses
+    /// this to decide create / skip / recreate per matview. Default: an empty map
+    /// (targets that don't expose materialized views).
+    async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Sync pg_cron refresh jobs for the given (qualified_name, ResolvedMatview)
+    /// set. Default: no-op (targets without pg_cron support).
+    async fn sync_refresh_jobs(
+        &self,
+        _jobs: &[(String, crate::config::ResolvedMatview)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Refresh one matview now. Default: unsupported.
+    async fn refresh_matview(&self, _qualified: &str, _concurrently: bool) -> Result<()> {
+        Err(crate::error::DbdError::Config(
+            "REFRESH MATERIALIZED VIEW is not supported by this target".into(),
+        ))
+    }
+
     // ── Data operations ────────────────────────────────
 
     async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()>;
