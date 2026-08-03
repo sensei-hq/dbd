@@ -465,6 +465,25 @@ fn report_step_result(
     }
 }
 
+/// Which of the just-applied materialized views need a `dbd:hash` sentinel
+/// stamped by `apply`: exactly those NOT present before the apply ran. Pure so
+/// the "only newly-created" rule is unit-testable without a live database.
+///
+/// `apply` runs `CREATE MATERIALIZED VIEW IF NOT EXISTS`, so a matview that
+/// already existed is a no-op and its deployed definition may differ from the
+/// design; stamping a "current" hash onto it would mask that drift from
+/// `reconcile`. Pre-existing matviews are therefore deliberately excluded.
+fn matviews_to_stamp<'a>(
+    applied_matviews: &[&'a Entity],
+    pre_existing: &std::collections::HashSet<String>,
+) -> Vec<&'a Entity> {
+    applied_matviews
+        .iter()
+        .copied()
+        .filter(|e| !pre_existing.contains(&e.name))
+        .collect()
+}
+
 /// The Design orchestrator — main entry point for all operations.
 ///
 /// Loads configuration, discovers and parses entities, resolves dependencies,
@@ -1004,6 +1023,22 @@ impl Design {
             .map(|e| (e.name.as_str(), e))
             .collect();
 
+        // Materialized views this run applies (respecting the scope + name
+        // filter). Capture which of them ALREADY exist before applying, so that
+        // afterwards we stamp the `dbd:hash` sentinel only on the ones this run
+        // newly creates. Skip the state query entirely when there are none.
+        let applied_matviews: Vec<&Entity> = valid_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty()
+        {
+            std::collections::HashSet::new()
+        } else {
+            adapter.matview_states().await?.into_keys().collect()
+        };
+
         // Wrap the whole plan in one transaction when the backend supports it,
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
@@ -1106,6 +1141,37 @@ impl Design {
                 return Err(e);
             }
         }
+
+        // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
+        // created (absent from `pre_existing_matviews`), so a later `dbd
+        // reconcile` recognizes them as dbd-managed instead of warning "exists
+        // but is not stamped by dbd". An already-existing matview is left
+        // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
+        // hash onto one whose deployed definition may have drifted would mask
+        // that drift. Runs after commit, so the object exists for the COMMENT.
+        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
+            adapter
+                .execute_script(&crate::reconcile::matview_hash_comment_sql(
+                    &e.name,
+                    &crate::reconcile::matview_hash(e),
+                ))
+                .await?;
+        }
+
+        // Sync pg_cron refresh jobs across the WHOLE design (not the scoped
+        // subset): `sync_refresh_jobs` unschedules every `dbd:refresh:%` job
+        // absent from the set it is given, so a scoped run fed only its subset
+        // would unschedule out-of-scope matviews' jobs. Centralized here (rather
+        // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
+        // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
+        // databases (and non-Postgres targets) without the extension.
+        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect();
+        adapter.sync_refresh_jobs(&mv_jobs).await?;
 
         on_complete(ApplyComplete {
             strategy: plan.strategy,
@@ -3659,5 +3725,40 @@ mod tests {
 
         let errors = validate_materialized_views(&entities, &mv_config, &extensions);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    // ── Apply's "stamp only newly-created matviews" rule ─────
+
+    /// `apply` must stamp the `dbd:hash` sentinel ONLY on matviews this run
+    /// creates — i.e. those absent before it ran. An already-existing matview is
+    /// excluded: `CREATE MATERIALIZED VIEW IF NOT EXISTS` is a no-op on it, so
+    /// its deployed definition may differ from the design, and stamping a
+    /// "current" hash would mask that drift from `reconcile`.
+    #[test]
+    fn matviews_to_stamp_excludes_pre_existing() {
+        use std::collections::HashSet;
+        let m1 = Entity::new(EntityType::MaterializedView, "app.m1");
+        let m2 = Entity::new(EntityType::MaterializedView, "app.m2");
+        let applied = vec![&m1, &m2];
+
+        // Only m1 already existed → only m2 gets stamped.
+        let pre_existing: HashSet<String> = ["app.m1".to_string()].into_iter().collect();
+        let stamp: Vec<&str> = matviews_to_stamp(&applied, &pre_existing)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(stamp, vec!["app.m2"], "only the newly-created matview is stamped");
+
+        // Nothing existed → both are newly created, both stamped.
+        let both: Vec<&str> = matviews_to_stamp(&applied, &HashSet::new())
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(both, vec!["app.m1", "app.m2"]);
+
+        // Both already existed → nothing stamped (no drift masked).
+        let all_pre: HashSet<String> =
+            ["app.m1".to_string(), "app.m2".to_string()].into_iter().collect();
+        assert!(matviews_to_stamp(&applied, &all_pre).is_empty());
     }
 }
