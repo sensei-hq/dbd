@@ -131,7 +131,8 @@ impl DatabaseAdapter for SqliteAdapter {
             | EntityType::Sequence
             | EntityType::Enum
             | EntityType::Function
-            | EntityType::Procedure => Err(DbdError::Config(format!(
+            | EntityType::Procedure
+            | EntityType::MaterializedView => Err(DbdError::Config(format!(
                 "SQLite adapter does not support {:?} entities ({})",
                 entity.entity_type, entity.name
             ))),
@@ -779,6 +780,14 @@ mod tests {
             let e = Entity::new(t, "x");
             assert!(a.apply_entity(&e).await.is_err(), "{t:?} should error");
         }
+    }
+
+    #[tokio::test]
+    async fn s17_sqlite_rejects_materialized_view() {
+        let a = mem().await;
+        let e = Entity::new(EntityType::MaterializedView, "app.mv");
+        let err = a.apply_entity(&e).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("materialized"));
     }
 
     #[tokio::test]

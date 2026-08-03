@@ -885,6 +885,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cv19_convex_rejects_materialized_view() {
+        let tmp = tempdir().unwrap();
+        let adapter = ConvexAdapter::new(tmp.path(), "test");
+        let e = Entity::new(EntityType::MaterializedView, "app.mv");
+        let err = adapter.apply_entity(&e).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("materialized"));
+    }
+
+    #[tokio::test]
     async fn cv8_meta_and_migrations_roundtrip_via_sidecar() {
         let tmp = tempdir().unwrap();
         let adapter = ConvexAdapter::new(tmp.path(), "test");
