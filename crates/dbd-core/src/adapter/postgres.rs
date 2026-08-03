@@ -1806,6 +1806,38 @@ impl DatabaseAdapter for PostgresAdapter {
 
     // ── Materialized-view refresh scheduling ────────────
 
+    /// Live matview drift state: every materialized view (`pg_class.relkind =
+    /// 'm'`) in a managed schema mapped to the `dbd:hash` sentinel parsed from its
+    /// object comment. Distinct from [`Self::introspect_matviews`] (which
+    /// reconstructs the full entity for merge/init) — this reads only what
+    /// reconcile's create/skip/recreate decision needs.
+    async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
+            "SELECT n.nspname AS schema, c.relname AS name, \
+                    obj_description(c.oid, 'pg_class') AS comment \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'm' AND {ns_filter}"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("matview_states failed: {e}")))?;
+
+        let mut states = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let schema: String = row.get("schema");
+            let name: String = row.get("name");
+            let comment: Option<String> = row.get("comment");
+            states.insert(
+                format!("{schema}.{name}"),
+                crate::reconcile::parse_dbd_hash(comment.as_deref()),
+            );
+        }
+        Ok(states)
+    }
+
     async fn sync_refresh_jobs(&self, jobs: &[(String, ResolvedMatview)]) -> Result<()> {
         // Guard: never touch `cron.job` on a database without pg_cron (it would
         // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled

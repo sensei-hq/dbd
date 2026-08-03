@@ -1304,6 +1304,63 @@ impl Design {
             summary.reapplied += 1;
         }
 
+        // Pass C-mv — materialized views. Postgres has no `CREATE OR REPLACE
+        // MATERIALIZED VIEW`, and dbd deliberately never auto-drops one (a DROP …
+        // CASCADE would repopulate it and drop its dependents — unacceptable in a
+        // dev-loop reconcile). So: CREATE an absent matview (stamping a `dbd:hash`
+        // sentinel), SKIP one whose stored hash matches the design, and for one
+        // that drifted (or carries no sentinel) WARN and leave it untouched — the
+        // user drops+recreates deliberately (manually, or via snapshot/migrate).
+        // The CREATE carries the same `search_path` prelude the ALTERs use, since
+        // the emitted `CREATE` (unlike a DDL file) has no `set search_path`.
+        let matviews: Vec<&Entity> = desired_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        if !matviews.is_empty() {
+            use crate::reconcile::{decide_matview_action, matview_create_sql, matview_hash, MatviewAction};
+            let states = adapter.matview_states().await?;
+            for &e in &matviews {
+                let want = matview_hash(e);
+                match decide_matview_action(&want, states.get(&e.name).cloned()) {
+                    MatviewAction::Skip => {}
+                    MatviewAction::Create => {
+                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                        on_start(&desc);
+                        let result = adapter
+                            .execute_script(&format!("{search_path}{}", matview_create_sql(e, &want)))
+                            .await;
+                        report_step_result(&desc, &mut on_done, result)?;
+                        summary.reapplied += 1;
+                    }
+                    MatviewAction::Warn => {
+                        // Detected drift, but dbd never auto-recreates a matview.
+                        // Surface it through the plan's warnings (the same channel
+                        // `dbd reconcile` prints for risky-change advisories).
+                        let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
+                        plan.warnings.push(if has_sentinel {
+                            format!(
+                                "materialized view {}: definition differs from the deployed object \
+                                 (dbd does not auto-recreate materialized views because that would \
+                                 DROP … CASCADE and lose data/dependents). To apply the new \
+                                 definition, drop and recreate it manually or via the \
+                                 snapshot/migrate workflow.",
+                                e.name
+                            )
+                        } else {
+                            format!(
+                                "materialized view {}: exists but is not stamped by dbd (cannot \
+                                 verify its definition); recreate it under dbd management to enable \
+                                 drift detection.",
+                                e.name
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
         // Pass D — prune orphaned tables (in managed schemas, gone from the
         // design), only when explicitly requested. Otherwise they are reported
         // via the returned plan and left untouched.
@@ -1316,6 +1373,20 @@ impl Design {
                 summary.dropped += 1;
             }
         }
+
+        // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
+        // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
+        // unschedules every `dbd:refresh:%` job absent from the set it is given, so
+        // a scoped reconcile fed only its subset would unschedule out-of-scope
+        // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
+        // no-op on databases (and non-Postgres targets) without the extension.
+        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect();
+        adapter.sync_refresh_jobs(&mv_jobs).await?;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);

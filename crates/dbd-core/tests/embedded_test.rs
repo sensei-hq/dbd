@@ -1369,6 +1369,111 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     assert_table_absent(&*adapter, "app", "notes").await;
 }
 
+/// Source-hash drift handling for materialized views, end to end:
+/// 1. First reconcile CREATEs the matview and stamps a `dbd:hash=` comment.
+/// 2. Reconciling the SAME design SKIPs (no warning; oid unchanged).
+/// 3. Reconciling a CHANGED definition WARNs and LEAVES THE MATVIEW UNTOUCHED —
+///    proven by the `pg_class` oid being UNCHANGED (a drop+recreate would change
+///    it). dbd never auto-drops a materialized view. This oid-unchanged-on-drift
+///    check is the key proof of the warn-only behavior.
+#[tokio::test]
+async fn reconcile_warns_on_matview_definition_change() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_mv_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_mv_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    let write_mv = |select: &str| {
+        std::fs::write(
+            dir.join("ddl/materialized_view/app/mv.ddl"),
+            format!("create materialized view app.mv as {select} with data;\n"),
+        )
+        .unwrap();
+    };
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+            .expect("load design")
+    };
+    // Persist the current matview oid in a table (survives across pooled
+    // connections) so a later DO block can compare against it. A drop+recreate
+    // changes the oid; an untouched matview keeps it.
+    async fn stash_oid(adapter: &dyn dbd_core::DatabaseAdapter) {
+        adapter
+            .execute_script(
+                "DROP TABLE IF EXISTS _mv_oid; \
+                 CREATE TABLE _mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
+            )
+            .await
+            .expect("stash oid failed");
+    }
+    async fn assert_oid_unchanged(adapter: &dyn dbd_core::DatabaseAdapter, msg: &str) {
+        adapter
+            .execute_script(&format!(
+                "DO $$ BEGIN \
+                   IF (SELECT oid FROM _mv_oid) <> 'app.mv'::regclass::oid \
+                   THEN RAISE EXCEPTION '{msg}'; END IF; END $$;"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("oid-unchanged assertion failed: {e}"));
+    }
+
+    // ── Phase 1: create the matview + sentinel comment; no warning. ──
+    write_mv("select id from app.items");
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile phase 1 (create matview) failed");
+    assert_table_exists(&*adapter, "app", "items").await;
+    assert!(plan.warnings.is_empty(), "create must not warn; got {:?}", plan.warnings);
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF obj_description('app.mv'::regclass, 'pg_class') NOT LIKE 'dbd:hash=%' \
+               THEN RAISE EXCEPTION 'matview app.mv is missing its dbd:hash sentinel comment'; \
+               END IF; END $$;",
+        )
+        .await
+        .expect("sentinel-comment assertion failed");
+
+    // ── Phase 2: SAME design → SKIP. No warning; oid unchanged. ──
+    stash_oid(&*adapter).await;
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile phase 2 (no-change) failed");
+    assert!(plan.warnings.is_empty(), "unchanged matview must not warn; got {:?}", plan.warnings);
+    assert_oid_unchanged(&*adapter, "matview app.mv oid changed but an unchanged design must not touch it").await;
+
+    // ── Phase 3: change the definition → WARN, matview left untouched (oid same). ──
+    stash_oid(&*adapter).await;
+    write_mv("select id, name from app.items");
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile phase 3 (drift) failed");
+    assert_oid_unchanged(&*adapter, "matview app.mv was recreated on drift but dbd must only warn").await;
+    assert!(
+        plan.warnings.iter().any(|w| w.contains("app.mv") && w.contains("differs")),
+        "a drifted matview must produce a warning; got {:?}",
+        plan.warnings
+    );
+}
+
 /// A dry-run reconcile computes a plan but writes nothing.
 #[tokio::test]
 async fn reconcile_dry_run_is_read_only() {
