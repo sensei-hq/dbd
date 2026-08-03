@@ -48,7 +48,26 @@ pub async fn cmd_inspect(
     let todos = design.data_sql_todos();
     print_data_sql_todos(&todos);
 
-    output::summary(report.issues.len() + todos.len(), report.warnings.len(), total_entities);
+    // Validate materialized-view refresh config (concurrently/unique-index,
+    // pg_cron presence, cron expression syntax) — offline, no DB required.
+    let declared_extensions: Vec<String> = design
+        .entities()
+        .iter()
+        .filter(|e| e.entity_type == dbd_core::EntityType::Extension)
+        .map(|e| e.name.clone())
+        .collect();
+    let matview_errors = dbd_core::design::validate_materialized_views(
+        design.entities(),
+        &design.config().materialized_views,
+        &declared_extensions,
+    );
+    print_matview_errors(&matview_errors);
+
+    output::summary(
+        report.issues.len() + todos.len() + matview_errors.len(),
+        report.warnings.len(),
+        total_entities,
+    );
     Ok(())
 }
 
@@ -203,6 +222,18 @@ fn print_data_sql_todos(todos: &[dbd_core::DataSqlTodo]) {
         for line in &todo.lines {
             output::always(&format!("    {line}"));
         }
+    }
+}
+
+/// Print materialized-view refresh-config validation errors (concurrently
+/// without a unique index, missing pg_cron, invalid cron expression).
+fn print_matview_errors(errors: &[String]) {
+    if errors.is_empty() {
+        return;
+    }
+    output::always("\nMaterialized view errors:");
+    for err in errors {
+        output::always(&format!("  {err}"));
     }
 }
 
