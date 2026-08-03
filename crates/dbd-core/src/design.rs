@@ -1955,6 +1955,7 @@ impl Design {
                 e.entity_type,
                 EntityType::Table
                     | EntityType::View
+                    | EntityType::MaterializedView
                     | EntityType::Function
                     | EntityType::Procedure
                     | EntityType::Enum
