@@ -516,8 +516,11 @@ The desired schema is parsed from DDL, the live schema introspected; dbd
 normalizes representation noise (type aliases, default casts, enum
 qualification, PK/UNIQUE-backing indexes, FK `NO ACTION`/auto-generated names,
 CHECK-expression parenthesization via libpg_query) so only real drift shows. An
-unparseable CHECK is shown flagged `advisory`. Covers tables + enums only
-(views/functions/roles/sequences are not structurally diffed).
+unparseable CHECK is shown flagged `advisory`. Covers tables + enums
+structurally, plus **materialized-view drift** (each matview reported
+`missing`/`drifted`/`unstamped`/`orphan` via its `dbd:hash` sentinel; in `--json`
+as `matview_drift`, and counts toward `--exit-code`). Views/functions/roles/
+sequences are not structurally diffed.
 
 ### dbd release (alias: dbd baseline)
 
