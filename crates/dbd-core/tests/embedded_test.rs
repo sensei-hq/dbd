@@ -1474,6 +1474,88 @@ async fn reconcile_warns_on_matview_definition_change() {
     );
 }
 
+/// Applying a matview's DDL TWICE (as `dbd apply` does when it re-applies the
+/// current design) must be idempotent. Postgres has no `CREATE OR REPLACE
+/// MATERIALIZED VIEW`, so authored matview DDL uses `CREATE MATERIALIZED VIEW
+/// IF NOT EXISTS` + `CREATE UNIQUE INDEX IF NOT EXISTS` (see the fixture and
+/// README). Without those clauses the second apply errors `42P07 relation
+/// already exists`; this test drives the real `apply_entity` path (which reads
+/// the DDL file verbatim) twice and asserts the second succeeds.
+#[tokio::test]
+async fn matview_ddl_reapply_is_idempotent() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "matview_idem_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: matview_idem_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    // Authored per the documented idempotent convention: both the matview and
+    // its unique index carry IF NOT EXISTS so a second apply of the same DDL is
+    // a clean no-op rather than a 42P07 error.
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view if not exists app.mv as \
+         select id from app.items with data;\n\
+         create unique index if not exists mv_id_uidx on app.mv(id);\n",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+
+    // Prerequisites: the schema and the table the matview selects from.
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app")
+        .await
+        .expect("create schema failed");
+    let items = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.items")
+        .expect("table entity discovered");
+    adapter.apply_entity(items).await.expect("apply table failed");
+
+    let mv = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.mv")
+        .expect("matview entity discovered");
+
+    // First apply CREATEs the matview + its unique index.
+    adapter
+        .apply_entity(mv)
+        .await
+        .expect("first matview apply failed");
+    // Second apply re-runs the SAME DDL — must be a clean no-op, not 42P07.
+    adapter
+        .apply_entity(mv)
+        .await
+        .expect("second matview apply must succeed (IF NOT EXISTS idempotency)");
+
+    // The matview still exists after both applies.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mv'",
+        "materialized view app.mv",
+    )
+    .await;
+}
+
 /// A dry-run reconcile computes a plan but writes nothing.
 #[tokio::test]
 async fn reconcile_dry_run_is_read_only() {

@@ -191,14 +191,14 @@ Materialized views are a first-class entity type, discovered from
 
 ```sql
 -- ddl/materialized_view/analytics/daily_sales.ddl
-create materialized view daily_sales as
+create materialized view if not exists daily_sales as
 select date_trunc('day', created_at) as day, sum(total) as revenue
 from shop.orders
 group by 1
 with data;
 
 -- indexes are declared as trailing statements, exactly like a table's
-create unique index daily_sales_day_uidx on daily_sales(day);
+create unique index if not exists daily_sales_day_uidx on daily_sales(day);
 ```
 
 They apply after views (a matview may read tables and views) and are

@@ -1341,7 +1341,7 @@ mod tests {
     #[test]
     fn matview_create_sql_has_create_and_comment() {
         let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
-        assert!(sql.contains("CREATE MATERIALIZED VIEW \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
+        assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
         assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=abc123';"));
     }
 
