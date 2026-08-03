@@ -20,6 +20,34 @@ pub struct SchemaDiff {
     pub warnings: Vec<String>,
     /// Best-effort normalization notes (e.g. an unparseable CHECK shown as changed).
     pub advisories: Vec<String>,
+    /// Materialized-view drift. Matviews aren't in the tables/enums snapshots the
+    /// diff engine compares, so [`Self::compute`] leaves this empty; `diff_live`
+    /// populates it (see [`crate::design::Design::diff_live`]). `#[serde(default)]`
+    /// is defensive: `SchemaDiff` is only ever serialized today (`dbd diff --json`).
+    #[serde(default)]
+    pub matview_drift: Vec<MatviewDrift>,
+}
+
+/// One drifted materialized view: its qualified `schema.name` and how it drifted.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MatviewDrift {
+    pub name: String,
+    pub kind: MatviewDriftKind,
+}
+
+/// How a materialized view differs between the design and the live database.
+/// Serializes PascalCase (no `rename_all`) to match `DiffAction` in the same
+/// `dbd diff --json` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum MatviewDriftKind {
+    /// In the design, absent from the database — a `dbd apply`/reconcile would create it.
+    Missing,
+    /// In both, but the deployed definition differs from the design (hash mismatch).
+    Drifted,
+    /// In the database but not stamped by dbd — its definition can't be verified.
+    Unstamped,
+    /// In the database (managed schema) but not in the design.
+    Orphan,
 }
 
 impl SchemaDiff {
@@ -36,11 +64,12 @@ impl SchemaDiff {
         advisories.retain(|a| seen.insert(a.clone()));
         let changes = diff::diff(&live, &desired);
         let warnings = diff::migration_warnings(&changes);
-        SchemaDiff { changes, warnings, advisories }
+        // `compute` only sees tables+enums; matview drift is filled in by `diff_live`.
+        SchemaDiff { changes, warnings, advisories, matview_drift: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.changes.is_empty() && self.matview_drift.is_empty()
     }
 }
 
@@ -311,5 +340,20 @@ mod tests {
         let desired = snap(TableSnapshot { indexes: vec![idx("users_email_idx", &["email"], false)], ..table(vec![col("email", "text")]) });
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "new index must surface");
+    }
+
+    /// `is_empty()` accounts for matview drift: a diff with no table/enum changes
+    /// but a drifted matview is NOT in sync (so `--exit-code` / the "in sync"
+    /// message key off it correctly); a fully empty diff is.
+    #[test]
+    fn is_empty_accounts_for_matview_drift() {
+        let empty = SchemaDiff::default();
+        assert!(empty.is_empty(), "a fully empty diff must be in sync");
+
+        let drift_only = SchemaDiff {
+            matview_drift: vec![MatviewDrift { name: "analytics.daily".into(), kind: MatviewDriftKind::Drifted }],
+            ..SchemaDiff::default()
+        };
+        assert!(!drift_only.is_empty(), "matview-drift-only diff must not be in sync");
     }
 }

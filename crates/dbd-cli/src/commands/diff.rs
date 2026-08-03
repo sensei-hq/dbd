@@ -10,9 +10,11 @@ use super::get_adapter;
 
 /// Build the human-readable lines for a schema diff. Pure so it can be
 /// unit-tested. Each changed entity gets one summary line and, for alters, the
-/// generated SQL indented beneath; advisories and warnings follow.
+/// generated SQL indented beneath; warnings, advisories, and materialized-view
+/// drift follow.
 pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
     use dbd_core::diff::{self, DiffAction};
+    use dbd_core::schema_diff::MatviewDriftKind;
     if d.is_empty() {
         return vec!["Live database is in sync with the design — no differences.".to_string()];
     }
@@ -35,6 +37,14 @@ pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
     }
     for a in &d.advisories {
         lines.push(format!("  ⚠ advisory: {a}"));
+    }
+    for m in &d.matview_drift {
+        match m.kind {
+            MatviewDriftKind::Missing => lines.push(format!("  + create materialized view {}", m.name)),
+            MatviewDriftKind::Drifted => lines.push(format!("  ~ matview  {} (definition differs — drop + re-apply to update)", m.name)),
+            MatviewDriftKind::Unstamped => lines.push(format!("  ⚠ materialized view {}: not stamped by dbd (definition unverifiable)", m.name)),
+            MatviewDriftKind::Orphan => lines.push(format!("  - materialized view {} (only in database)", m.name)),
+        }
     }
     lines
 }
@@ -90,9 +100,14 @@ mod tests {
     use super::*;
     use dbd_core::diff::{DiffAction, MigrationDiff};
     use dbd_core::entity::EntityType;
+    use dbd_core::schema_diff::{MatviewDrift, MatviewDriftKind};
 
     fn add(name: &str) -> MigrationDiff {
         MigrationDiff { entity_name: name.into(), entity_type: EntityType::Table, action: DiffAction::Add }
+    }
+
+    fn mv(name: &str, kind: MatviewDriftKind) -> MatviewDrift {
+        MatviewDrift { name: name.into(), kind }
     }
 
     /// In-sync diff renders the friendly "no differences" line.
@@ -107,7 +122,8 @@ mod tests {
     #[test]
     fn renders_changes_and_advisories() {
         let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![],
-            advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()] };
+            advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()],
+            matview_drift: vec![] };
         let out = diff_report_lines(&d).join("\n");
         assert!(out.contains("+ create public.audit_log"), "got: {out}");
         assert!(out.contains("advisory"), "advisory must render; got: {out}");
@@ -119,7 +135,7 @@ mod tests {
     /// trips this test instead of silently breaking downstream tooling.
     #[test]
     fn json_shape_is_stable() {
-        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![], advisories: vec![] };
+        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![], advisories: vec![], matview_drift: vec![] };
         let json = serde_json::to_string(&d).unwrap();
         // Top-level keys tooling depends on.
         assert!(json.contains("\"changes\""), "got: {json}");
@@ -131,6 +147,45 @@ mod tests {
         assert!(json.contains("\"entity_name\":\"public.audit_log\""), "got: {json}");
         assert!(json.contains("\"entity_type\":\"table\""), "got: {json}");
         assert!(json.contains("\"action\":\"Add\""), "got: {json}");
+    }
+
+    /// A diff carrying ONLY matview drift is not "in sync": it renders the
+    /// per-kind drift lines, never the in-sync message, and `--exit-code`
+    /// reports drift (exit 2).
+    #[test]
+    fn renders_matview_drift_missing_and_drifted() {
+        let d = SchemaDiff {
+            changes: vec![],
+            warnings: vec![],
+            advisories: vec![],
+            matview_drift: vec![
+                mv("analytics.daily", MatviewDriftKind::Drifted),
+                mv("analytics.new", MatviewDriftKind::Missing),
+            ],
+        };
+        assert!(!d.is_empty(), "matview-drift-only diff must not be in sync");
+        let out = diff_report_lines(&d).join("\n");
+        assert!(!out.contains("in sync"), "must not print the in-sync line; got: {out}");
+        assert!(out.contains("+ create materialized view analytics.new"), "got: {out}");
+        assert!(out.contains("~ matview  analytics.daily"), "got: {out}");
+        assert_eq!(diff_exit_code(d.is_empty(), true), Some(2), "drift → exit 2");
+    }
+
+    /// Unstamped and Orphan kinds render their own lines.
+    #[test]
+    fn renders_matview_drift_unstamped_and_orphan() {
+        let d = SchemaDiff {
+            changes: vec![],
+            warnings: vec![],
+            advisories: vec![],
+            matview_drift: vec![
+                mv("analytics.legacy", MatviewDriftKind::Unstamped),
+                mv("analytics.stale", MatviewDriftKind::Orphan),
+            ],
+        };
+        let out = diff_report_lines(&d).join("\n");
+        assert!(out.contains("materialized view analytics.legacy: not stamped by dbd"), "got: {out}");
+        assert!(out.contains("- materialized view analytics.stale (only in database)"), "got: {out}");
     }
 
     #[test]
