@@ -26,6 +26,8 @@ pub struct DesignConfig {
     #[serde(default)]
     pub export: Vec<ExportEntry>,
     #[serde(default)]
+    pub materialized_views: MaterializedViewsConfig,
+    #[serde(default)]
     pub dbml: HashMap<String, DbmlDocConfig>,
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -318,6 +320,57 @@ impl ExportEntry {
 #[derive(Debug, Deserialize)]
 pub struct ExportOptions {
     pub format: Option<String>,
+}
+
+// ── Materialized views ───────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MaterializedViewsConfig {
+    #[serde(default)]
+    pub options: MatviewOptions,
+    #[serde(default)]
+    pub overrides: HashMap<String, MatviewOverride>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MatviewOptions {
+    /// Shared cron schedule applied to every matview (pg_cron 5-field expression).
+    #[serde(default)]
+    pub refresh: Option<String>,
+    /// Shared default for REFRESH ... CONCURRENTLY.
+    #[serde(default)]
+    pub concurrently: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MatviewOverride {
+    #[serde(default)]
+    pub refresh: Option<String>,
+    #[serde(default)]
+    pub concurrently: Option<bool>,
+}
+
+/// Effective, resolved refresh settings for a single materialized view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMatview {
+    pub refresh: Option<String>,
+    pub concurrently: bool,
+}
+
+impl MaterializedViewsConfig {
+    /// Resolve effective settings for a matview by qualified name
+    /// (`schema.name`): a per-view override overlays the global `options`.
+    pub fn resolve(&self, name: &str) -> ResolvedMatview {
+        let ov = self.overrides.get(name);
+        ResolvedMatview {
+            refresh: ov
+                .and_then(|o| o.refresh.clone())
+                .or_else(|| self.options.refresh.clone()),
+            concurrently: ov
+                .and_then(|o| o.concurrently)
+                .unwrap_or(self.options.concurrently),
+        }
+    }
 }
 
 // ── DBML ────────────────────────────────────────────────
@@ -803,5 +856,47 @@ scopes:
         let yaml = "project:\n  name: t\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.scopes.is_empty());
+    }
+
+    // ── Materialized views ────────────────────────────────
+
+    #[test]
+    fn resolves_matview_refresh_settings() {
+        let yaml = r#"
+project:
+  name: t
+materialized_views:
+  options:
+    refresh: "0 2 * * *"
+    concurrently: true
+  overrides:
+    analytics.top_products:
+      refresh: "*/30 * * * *"
+    analytics.realtime:
+      concurrently: false
+"#;
+        let cfg: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let mv = &cfg.materialized_views;
+
+        let d = mv.resolve("analytics.daily_sales");
+        assert_eq!(d.refresh.as_deref(), Some("0 2 * * *"));
+        assert!(d.concurrently);
+
+        let t = mv.resolve("analytics.top_products");
+        assert_eq!(t.refresh.as_deref(), Some("*/30 * * * *"));
+        assert!(t.concurrently); // inherited
+
+        let r = mv.resolve("analytics.realtime");
+        assert_eq!(r.refresh.as_deref(), Some("0 2 * * *")); // inherited
+        assert!(!r.concurrently);
+    }
+
+    #[test]
+    fn matview_without_global_schedule_has_no_refresh() {
+        let yaml = "project:\n  name: t\n";
+        let cfg: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let d = cfg.materialized_views.resolve("analytics.x");
+        assert!(d.refresh.is_none());
+        assert!(!d.concurrently);
     }
 }
