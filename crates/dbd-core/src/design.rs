@@ -1376,7 +1376,7 @@ impl Design {
         // dev-loop reconcile). So: CREATE an absent matview (stamping a `dbd:hash`
         // sentinel), SKIP one whose stored hash matches the design, and for one
         // that drifted (or carries no sentinel) WARN and leave it untouched — the
-        // user drops+recreates deliberately (manually, or via snapshot/migrate).
+        // user drops it deliberately, then `apply`/reconcile recreates it.
         // The CREATE carries the same `search_path` prelude the ALTERs use, since
         // the emitted `CREATE` (unlike a DDL file) has no `set search_path`.
         let matviews: Vec<&Entity> = desired_entities
@@ -1407,12 +1407,14 @@ impl Design {
                         let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
                         plan.warnings.push(if has_sentinel {
                             format!(
-                                "materialized view {}: definition differs from the deployed object \
+                                "materialized view {name}: definition differs from the deployed object \
                                  (dbd does not auto-recreate materialized views because that would \
                                  DROP … CASCADE and lose data/dependents). To apply the new \
-                                 definition, drop and recreate it manually or via the \
-                                 snapshot/migrate workflow.",
-                                e.name
+                                 definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
+                                 and re-run `dbd apply` to recreate it.",
+                                name = e.name,
+                                schema = e.schema.as_deref().unwrap_or("public"),
+                                bare = e.name.rsplit('.').next().unwrap_or(&e.name),
                             )
                         } else {
                             format!(
@@ -1841,6 +1843,7 @@ impl Design {
                 e.entity_type,
                 EntityType::Table
                     | EntityType::View
+                    | EntityType::MaterializedView
                     | EntityType::Function
                     | EntityType::Procedure
                     | EntityType::Enum
@@ -2203,6 +2206,17 @@ mod tests {
 
         assert!(!graph.nodes.is_empty());
         assert!(!graph.layers.is_empty());
+    }
+
+    #[test]
+    fn graph_includes_materialized_views() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let graph = design.graph(None, None).unwrap();
+        assert!(
+            graph.nodes.iter().any(|n| n.name == "config.genders_mv"),
+            "materialized view should appear as a graph node"
+        );
     }
 
     #[test]
