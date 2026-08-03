@@ -489,6 +489,74 @@ async fn introspect_returns_fixture_entities() {
     );
 }
 
+// ── Test: Materialized-view introspection ─────────────────────────────────────
+
+/// Reverse-engineer a materialized view from `pg_matviews`. Creates a schema, a
+/// `CREATE MATERIALIZED VIEW … WITH DATA`, and a UNIQUE INDEX on it, then asserts
+/// `introspect` captures it as `EntityType::MaterializedView` with its SELECT body
+/// in `writes[0]` and its index attached via `table_def` (matviews carry indexes
+/// in `pg_index` exactly like tables). Drops the schema (CASCADE) at the end.
+#[tokio::test]
+async fn introspect_captures_materialized_views() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "introspect_mv_test").await.unwrap();
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA mvtest; \
+             CREATE MATERIALIZED VIEW mvtest.mv AS SELECT 1 AS x WITH DATA; \
+             CREATE UNIQUE INDEX mv_x_uidx ON mvtest.mv(x);",
+        )
+        .await
+        .expect("fixture DDL failed");
+
+    let entities = adapter.introspect().await.expect("introspect failed");
+
+    // Captured as a MaterializedView entity named "mvtest.mv".
+    let mv = entities
+        .iter()
+        .find(|e| e.name == "mvtest.mv")
+        .expect("materialized view 'mvtest.mv' not found in introspect output");
+    assert_eq!(
+        mv.entity_type,
+        dbd_core::EntityType::MaterializedView,
+        "mvtest.mv should be a MaterializedView"
+    );
+
+    // Body carried in writes[0] (same contract as views); contains the SELECT.
+    let body = mv
+        .writes
+        .first()
+        .expect("matview should carry its body in writes[0]");
+    assert!(
+        body.to_lowercase().contains("select"),
+        "matview body should contain SELECT (case-insensitive), got: {body}"
+    );
+
+    // The UNIQUE INDEX is attached via table_def — exactly one index, and unique.
+    let td = mv
+        .table_def
+        .as_ref()
+        .expect("matview should have a table_def carrying its index");
+    assert_eq!(
+        td.indexes.len(),
+        1,
+        "matview should have exactly one index, got {:?}",
+        td.indexes
+    );
+    assert!(
+        td.indexes[0].unique,
+        "the captured index should be UNIQUE, got {:?}",
+        td.indexes[0]
+    );
+
+    // Clean up the ephemeral schema.
+    adapter
+        .execute_script("DROP SCHEMA mvtest CASCADE;")
+        .await
+        .expect("failed to drop schema mvtest");
+}
+
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
 
 /// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
