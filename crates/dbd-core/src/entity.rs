@@ -13,6 +13,7 @@ pub enum EntityType {
     Enum,
     Table,
     View,
+    MaterializedView,
     Function,
     Procedure,
     External,
@@ -26,6 +27,7 @@ pub const TYPES_WITH_SCHEMA: &[EntityType] = &[
     EntityType::Enum,
     EntityType::Table,
     EntityType::View,
+    EntityType::MaterializedView,
     EntityType::Function,
     EntityType::Procedure,
 ];
@@ -43,6 +45,9 @@ impl EntityType {
         match name {
             "table" | "tables" => Some(Self::Table),
             "view" | "views" => Some(Self::View),
+            "materialized_view" | "materialized_views" | "matview" | "matviews" => {
+                Some(Self::MaterializedView)
+            }
             "function" | "functions" => Some(Self::Function),
             "procedure" | "procedures" => Some(Self::Procedure),
             "enum" | "enums" => Some(Self::Enum),
@@ -60,6 +65,16 @@ impl EntityType {
     /// Lowercase tag for display, e.g. `EntityType::Table` → `"table"`.
     pub fn tag(&self) -> String {
         format!("{self:?}").to_lowercase()
+    }
+
+    /// On-disk DDL folder name for this type (e.g. `materialized_view`).
+    /// Differs from `tag()` only where the lowercased variant name is not a
+    /// readable folder (currently just `MaterializedView`).
+    pub fn folder_name(&self) -> String {
+        match self {
+            EntityType::MaterializedView => "materialized_view".to_string(),
+            other => other.tag(),
+        }
     }
 }
 
@@ -550,5 +565,28 @@ mod tests {
         assert_eq!(entity.entity_type, EntityType::Import);
         assert_eq!(entity.name, "staging.data");
         assert_eq!(entity.format, Some("tsv".to_string()));
+    }
+
+    #[test]
+    fn entity_type_from_folder_name_matview() {
+        assert_eq!(EntityType::from_folder_name("materialized_view"), Some(EntityType::MaterializedView));
+        assert_eq!(EntityType::from_folder_name("materialized_views"), Some(EntityType::MaterializedView));
+        assert_eq!(EntityType::from_folder_name("matview"), Some(EntityType::MaterializedView));
+        assert_eq!(EntityType::from_folder_name("matviews"), Some(EntityType::MaterializedView));
+    }
+
+    #[test]
+    fn matview_has_schema_and_folder_name() {
+        assert!(EntityType::MaterializedView.has_schema());
+        assert_eq!(EntityType::MaterializedView.folder_name(), "materialized_view");
+        assert_eq!(EntityType::Table.folder_name(), "table");
+    }
+
+    #[test]
+    fn entity_from_matview_file() {
+        let e = Entity::from_file(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"));
+        assert_eq!(e.entity_type, EntityType::MaterializedView);
+        assert_eq!(e.name, "analytics.daily_sales");
+        assert_eq!(e.schema, Some("analytics".to_string()));
     }
 }
