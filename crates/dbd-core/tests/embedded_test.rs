@@ -1556,6 +1556,180 @@ async fn matview_ddl_reapply_is_idempotent() {
     .await;
 }
 
+/// Coherence proof for `apply` + `reconcile` on materialized views (Gap 2):
+/// `Design::apply` must stamp the `dbd:hash` sentinel on a matview it creates,
+/// so a subsequent `reconcile` of the SAME unchanged design recognizes it as
+/// dbd-managed and does NOT warn "exists but is not stamped by dbd".
+///
+/// Before the fix, `apply` ran the DDL verbatim without stamping, so reconcile
+/// warned about the unstamped matview forever; this test is red then. It also
+/// structurally proves `apply` now invokes `sync_refresh_jobs`: the run
+/// completes `Ok` against embedded PG (which has no pg_cron), so the sync
+/// must have no-op'd rather than errored.
+#[tokio::test]
+async fn apply_stamps_matview_so_later_reconcile_does_not_warn() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "apply_stamp_mv_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: apply_stamp_mv_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    // Idempotent-apply convention (IF NOT EXISTS) so re-applies are clean no-ops.
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view if not exists app.mv as \
+         select id from app.items with data;\n\
+         create unique index if not exists mv_id_uidx on app.mv(id);\n",
+    )
+    .unwrap();
+
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+            .expect("load design")
+    };
+
+    // ── apply the whole design (creates the matview + stamps the sentinel). ──
+    load()
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("apply failed (sync_refresh_jobs must no-op without pg_cron)");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mv'",
+        "materialized view app.mv",
+    )
+    .await;
+    // apply must have stamped the dbd:hash sentinel onto the matview's comment.
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF obj_description('app.mv'::regclass, 'pg_class') NOT LIKE 'dbd:hash=%' \
+               THEN RAISE EXCEPTION 'apply did not stamp app.mv with a dbd:hash sentinel'; \
+               END IF; END $$;",
+        )
+        .await
+        .expect("apply should have stamped the dbd:hash sentinel");
+
+    // ── reconcile the SAME unchanged design: matview is recognized, no warning. ──
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile after apply failed");
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("app.mv")),
+        "apply-created matview must not warn on the next reconcile; got {:?}",
+        plan.warnings
+    );
+}
+
+/// Newly-created-only correctness (Gap 2), end to end: a matview that ALREADY
+/// exists (stamped with an OLD hash) must NOT be re-stamped by `apply` — `apply`
+/// uses `CREATE MATERIALIZED VIEW IF NOT EXISTS`, a no-op on it, so its deployed
+/// definition may be stale. Re-stamping a "current" hash would mask that drift.
+/// Here the design's matview definition changes between the first and second
+/// apply; the second apply must leave the ORIGINAL sentinel in place so a later
+/// reconcile still detects the drift and warns.
+#[tokio::test]
+async fn apply_does_not_restamp_pre_existing_matview() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "apply_no_restamp_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: apply_no_restamp_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    // Same object name, IF NOT EXISTS so the 2nd apply is a no-op on the object;
+    // only the SELECT body differs between the two writes.
+    let write_mv = |select: &str| {
+        std::fs::write(
+            dir.join("ddl/materialized_view/app/mv.ddl"),
+            format!("create materialized view if not exists app.mv as {select} with data;\n"),
+        )
+        .unwrap();
+    };
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+            .expect("load design")
+    };
+
+    // ── First apply: create + stamp the v1 hash. ──
+    write_mv("select id from app.items");
+    load()
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("first apply failed");
+    // Capture the stamped hash for later comparison.
+    let hash_after_first = adapter
+        .matview_states()
+        .await
+        .expect("matview_states failed")
+        .get("app.mv")
+        .cloned()
+        .flatten()
+        .expect("first apply must have stamped a hash");
+
+    // ── Second apply with a DIFFERENT definition: IF NOT EXISTS makes the object
+    //    a no-op, and the pre-existing matview must NOT be re-stamped. ──
+    write_mv("select id, name from app.items");
+    load()
+        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("second apply failed");
+    let hash_after_second = adapter
+        .matview_states()
+        .await
+        .expect("matview_states failed")
+        .get("app.mv")
+        .cloned()
+        .flatten()
+        .expect("matview should still carry the original sentinel");
+
+    assert_eq!(
+        hash_after_first, hash_after_second,
+        "apply must NOT re-stamp an already-existing matview (would mask drift)"
+    );
+
+    // A reconcile of the changed design still detects the drift and warns —
+    // proving the un-restamped sentinel preserved drift detection.
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile failed");
+    assert!(
+        plan.warnings.iter().any(|w| w.contains("app.mv") && w.contains("differs")),
+        "drift on a pre-existing matview must still warn; got {:?}",
+        plan.warnings
+    );
+}
+
 /// A dry-run reconcile computes a plan but writes nothing.
 #[tokio::test]
 async fn reconcile_dry_run_is_read_only() {
