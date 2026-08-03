@@ -598,10 +598,11 @@ mod tests {
     fn parses_extensions() {
         let config = read(&fixture("design.yaml")).unwrap();
         let target = config.get_target(Some("postgres")).unwrap();
-        assert_eq!(target.extensions.len(), 2);
+        assert_eq!(target.extensions.len(), 3);
         assert_eq!(target.extensions[0].name(), "uuid-ossp");
         assert_eq!(target.extensions[1].name(), "postgis");
         assert_eq!(target.extensions[1].schema(), Some("extensions"));
+        assert_eq!(target.extensions[2].name(), "pg_cron");
     }
 
     #[test]
