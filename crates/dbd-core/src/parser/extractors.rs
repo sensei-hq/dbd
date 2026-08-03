@@ -52,6 +52,19 @@ pub fn extract_view_info(
     (references, columns)
 }
 
+/// Extract the SELECT body text of a `CREATE [MATERIALIZED] VIEW`.
+///
+/// Returns the query verbatim (as `Display`-rendered SQL), matching the
+/// `writes[0]` contract the introspector uses for views (see `emit::emit_view`).
+pub fn extract_view_body(statements: &[Statement]) -> Option<String> {
+    for stmt in statements {
+        if let Statement::CreateView(create_view) = stmt {
+            return Some(create_view.query.to_string());
+        }
+    }
+    None
+}
+
 /// Extract every table reference from a query, anywhere it appears.
 ///
 /// Uses sqlparser's AST visitor to walk the *entire* query, so it sees table
