@@ -287,6 +287,21 @@ pub async fn cmd_apply(
         output::info(verbosity, &format_apply_summary(&s));
     }
 
+    // Sync pg_cron refresh jobs for materialized views. The adapter guards this
+    // on pg_cron presence, so it is a safe no-op on databases (and non-Postgres
+    // targets) without the extension. Skipped entirely on --dry-run (which
+    // returns above before an adapter is even constructed).
+    let mv_jobs: Vec<(String, dbd_core::config::ResolvedMatview)> = design
+        .entities()
+        .iter()
+        .filter(|e| e.entity_type == dbd_core::EntityType::MaterializedView)
+        .map(|e| (e.name.clone(), design.config().materialized_views.resolve(&e.name)))
+        .collect();
+    adapter
+        .sync_refresh_jobs(&mv_jobs)
+        .await
+        .context("Failed to sync materialized-view refresh jobs")?;
+
     // Run grants if target has grants config
     if let Some((target_name, target_config)) = design.config().target.iter().next()
         && let Some(ref grants) = target_config.grants
