@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::DatabaseAdapter;
-use crate::config::{self, DesignConfig, DepsPolicy};
+use crate::config::{self, DesignConfig, DepsPolicy, MaterializedViewsConfig};
 use crate::dependency;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
@@ -1911,6 +1911,83 @@ fn partition_entities(
     (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals)
 }
 
+/// Validate materialized-view refresh configuration against the resolved
+/// entities and the target's declared extension names. Pure and offline —
+/// used by `dbd inspect` so misconfigured refresh settings surface without a
+/// database connection. Returns human-readable error strings; empty = valid.
+///
+/// Checks, per materialized view (resolved via `mv_config.resolve`):
+///   - `concurrently: true` requires the view to have a UNIQUE index —
+///     `REFRESH MATERIALIZED VIEW CONCURRENTLY` fails in Postgres without one.
+///   - a resolved `refresh` schedule must be a valid 5-field cron expression.
+///
+/// And once, across all matviews:
+///   - if any matview resolves a `refresh` schedule, `pg_cron` must be among
+///     `extensions` (scheduling is implemented via pg_cron jobs).
+pub fn validate_materialized_views(
+    entities: &[Entity],
+    mv_config: &MaterializedViewsConfig,
+    extensions: &[String],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut any_scheduled = false;
+
+    for entity in entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::MaterializedView)
+    {
+        let resolved = mv_config.resolve(&entity.name);
+
+        if resolved.refresh.is_some() {
+            any_scheduled = true;
+        }
+
+        if resolved.concurrently {
+            let has_unique_index = entity
+                .table_def
+                .as_ref()
+                .is_some_and(|t| t.indexes.iter().any(|i| i.unique));
+            if !has_unique_index {
+                errors.push(format!(
+                    "materialized view {}: REFRESH ... CONCURRENTLY requires a unique index",
+                    entity.name
+                ));
+            }
+        }
+
+        if let Some(schedule) = &resolved.refresh
+            && !is_valid_cron_expression(schedule)
+        {
+            errors.push(format!(
+                "materialized view {}: invalid cron expression '{schedule}'",
+                entity.name
+            ));
+        }
+    }
+
+    if any_scheduled && !extensions.iter().any(|e| e == "pg_cron") {
+        errors.push(
+            "materialized view refresh scheduling requires the pg_cron extension \
+             (add 'pg_cron' under target.postgres.extensions)"
+                .to_string(),
+        );
+    }
+
+    errors
+}
+
+/// Minimal validation for a pg_cron 5-field schedule expression: exactly five
+/// whitespace-separated fields, each made up only of digits and `* / , -`.
+/// Not a full cron parser — just enough to flag obviously malformed input
+/// offline (e.g. wrong field count, stray words).
+fn is_valid_cron_expression(expr: &str) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    fields.len() == 5
+        && fields
+            .iter()
+            .all(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3413,5 +3490,103 @@ mod tests {
         assert!(pos("app.t") < pos("app.v"));
         assert!(pos("app.v") < pos("app.mv"));
         assert!(pos("app.mv") < pos("app.f"));
+    }
+
+    // ── Materialized-view validation ────────────────────────
+
+    /// A matview with a unique index, so only the flag under test can fire.
+    fn matview_with_unique_index() -> Entity {
+        let mut e = Entity::new(EntityType::MaterializedView, "a.m");
+        e.table_def = Some(crate::entity::TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![crate::entity::IndexDef {
+                name: Some("m_idx".to_string()),
+                columns: vec![],
+                unique: true,
+                index_type: None,
+            }],
+            comments: Default::default(),
+        });
+        e
+    }
+
+    /// A matview with no indexes at all.
+    fn matview_without_unique_index() -> Entity {
+        let mut e = Entity::new(EntityType::MaterializedView, "a.m");
+        e.table_def = Some(crate::entity::TableDef {
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        e
+    }
+
+    #[test]
+    fn matview_concurrently_requires_unique_index() {
+        let entities = vec![matview_without_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: true,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("unique index"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn matview_schedule_requires_pg_cron_extension() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: false,
+            },
+            overrides: Default::default(),
+        };
+        let extensions: Vec<String> = vec![];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("pg_cron"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn matview_invalid_cron_expression_flagged() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("not a cron".to_string()),
+                concurrently: false,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert_eq!(errors.len(), 1, "expected exactly one error, got: {errors:?}");
+        assert!(errors[0].contains("invalid cron"), "got: {}", errors[0]);
+    }
+
+    #[test]
+    fn valid_matview_config_has_no_errors() {
+        let entities = vec![matview_with_unique_index()];
+        let mv_config = MaterializedViewsConfig {
+            options: crate::config::MatviewOptions {
+                refresh: Some("0 2 * * *".to_string()),
+                concurrently: true,
+            },
+            overrides: Default::default(),
+        };
+        let extensions = vec!["pg_cron".to_string()];
+
+        let errors = validate_materialized_views(&entities, &mv_config, &extensions);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }
 }
