@@ -1474,6 +1474,83 @@ async fn reconcile_warns_on_matview_definition_change() {
     );
 }
 
+/// `reconcile --dry-run` must PREVIEW a materialized-view create WITHOUT writing:
+/// the returned plan lists the matview under `matview_creates`, yet the object is
+/// NOT created in the database (a dry run writes nothing). A follow-up
+/// `dry_run=false` reconcile then actually creates it. This is the key proof that
+/// matview detection was hoisted *before* the dry-run early-return — previously
+/// `--dry-run` returned before detection ran, so it showed nothing about matviews.
+#[tokio::test]
+async fn reconcile_dry_run_previews_matview_create_without_writing() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_mv_dryrun_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_mv_dryrun_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\n\
+         create table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view app.mv as select id from app.items with data;\n",
+    )
+    .unwrap();
+    let load = || {
+        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+    };
+
+    // ── Dry-run: the plan PREVIEWS the matview create, but writes nothing. ──
+    let plan = load()
+        .reconcile(&*adapter, /*dry_run*/ true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("dry-run reconcile failed");
+    assert!(
+        plan.matview_creates.iter().any(|n| n == "app.mv"),
+        "dry-run plan must preview the matview create; got {:?}",
+        plan.matview_creates
+    );
+    // A dry run writes nothing: neither the matview nor its source table exists.
+    assert!(
+        !adapter.matview_states().await.unwrap().contains_key("app.mv"),
+        "dry-run must NOT create the matview"
+    );
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF to_regclass('app.mv') IS NOT NULL \
+               THEN RAISE EXCEPTION 'app.mv must not exist after a dry-run'; END IF; END $$;",
+        )
+        .await
+        .expect("post-dry-run existence check failed");
+
+    // ── Real reconcile: now the matview is actually created. ──
+    let plan = load()
+        .reconcile(&*adapter, /*dry_run*/ false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .await
+        .expect("reconcile (create matview) failed");
+    assert!(
+        plan.matview_creates.iter().any(|n| n == "app.mv"),
+        "the real reconcile plan should still list the matview create; got {:?}",
+        plan.matview_creates
+    );
+    assert!(
+        adapter.matview_states().await.unwrap().contains_key("app.mv"),
+        "reconcile with dry_run=false must create the matview"
+    );
+}
+
 /// Applying a matview's DDL TWICE (as `dbd apply` does when it re-applies the
 /// current design) must be idempotent. Postgres has no `CREATE OR REPLACE
 /// MATERIALIZED VIEW`, so authored matview DDL uses `CREATE MATERIALIZED VIEW
