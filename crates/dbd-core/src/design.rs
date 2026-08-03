@@ -3403,7 +3403,7 @@ mod tests {
         use std::collections::HashSet;
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
-        // Sanity: the fixture declares two extensions, by bare name.
+        // Sanity: the fixture declares its extensions by bare name.
         let all_exts: Vec<&str> = design
             .entities()
             .iter()

@@ -38,6 +38,8 @@ myproject/
       lookup_values.ddl
     view/config/
       genders.ddl
+    materialized_view/config/
+      genders_mv.ddl
     procedure/staging/
       import_lookups.ddl
   import/              # Staging data (CSV, TSV, JSONL)
@@ -59,6 +61,7 @@ myproject/
 | `dbd apply` | Apply schemas, entities, and pending migrations |
 | `dbd import` | Load staging data from CSV/TSV/JSONL files |
 | `dbd export` | Export table data to csv/tsv/jsonl files |
+| `dbd refresh` | Refresh materialized views now (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`); `--name <entity>` or `<schema>.*` to target a subset. Scheduled refresh is managed via pg_cron |
 | `dbd deploy` | Fetch from GitHub or local path + apply + import |
 | `dbd combine` | Combine all DDL into a single SQL file |
 | `dbd graph` | Output dependency graph as JSON |
@@ -86,7 +89,7 @@ myproject/
 
 - **SQLite** has no schemas, enums, roles, extensions, or stored procedures.
   `Schema` entities are a no-op; `Enum` / `Function` / `Procedure` / `Role` /
-  `Extension` entities error on apply. Entity names like `auth.users` are
+  `Extension` / `MaterializedView` entities error on apply. Entity names like `auth.users` are
   resolved as the bare table `users`. Imports use multi-row `INSERT … VALUES (?,?), …`
   batches inside one transaction (≤500 rows or 32k binds per batch). The DDL
   formatter knows about SQLite `CREATE TRIGGER … BEGIN … END;` blocks and
@@ -180,6 +183,63 @@ scope 'hub': 7 entities
     chain: app.sessions → app.tenants
 Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with --deps include
 ```
+
+## Materialized views
+
+Materialized views are a first-class entity type, discovered from
+`ddl/materialized_view/<schema>/<name>.ddl` just like tables and views:
+
+```sql
+-- ddl/materialized_view/analytics/daily_sales.ddl
+create materialized view daily_sales as
+select date_trunc('day', created_at) as day, sum(total) as revenue
+from shop.orders
+group by 1
+with data;
+
+-- indexes are declared as trailing statements, exactly like a table's
+create unique index daily_sales_day_uidx on daily_sales(day);
+```
+
+They apply after views (a matview may read tables and views) and are
+reverse-engineered by `dbd merge` / `init --from-db` from `pg_matviews`.
+**PostgreSQL and Supabase only** — SQLite and Convex error on apply.
+
+### Scheduled refresh (pg_cron)
+
+Refresh is handled in-database by [pg_cron](https://github.com/citusdata/pg_cron).
+Declare a shared schedule and optional per-view overrides in `design.yaml`:
+
+```yaml
+materialized_views:
+  options:
+    refresh: "0 2 * * *"       # shared cron schedule for every matview
+    concurrently: true         # shared default
+  overrides:
+    analytics.top_products:
+      refresh: "*/30 * * * *"  # override just this one
+    analytics.realtime:
+      concurrently: false
+```
+
+On `apply`, dbd syncs one pg_cron job per scheduled matview, named
+`dbd:refresh:<schema>.<name>`, running `REFRESH MATERIALIZED VIEW
+[CONCURRENTLY] …`. dbd only ever touches jobs with that reserved prefix —
+hand-authored cron jobs are left alone. A matview with no resolved schedule
+gets no job; refresh it on demand with `dbd refresh`.
+
+`dbd inspect` validates the config offline: scheduling requires `pg_cron` in
+`target.postgres.extensions`, and `concurrently: true` requires the matview
+to declare a unique index (Postgres needs one for `REFRESH … CONCURRENTLY`).
+
+### Reconcile
+
+`dbd reconcile` **creates** a matview that's missing, and stamps a content
+hash (`COMMENT ON MATERIALIZED VIEW … IS 'dbd:hash=…'`). When a matview's
+definition later differs from the design, reconcile **warns** rather than
+auto-recreating — dropping a matview means `DROP … CASCADE` (losing the
+cached data, dependents, and grants), so applying a changed definition is
+left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ## Pre-commit integration
 

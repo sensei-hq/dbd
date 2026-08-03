@@ -59,7 +59,10 @@ Two changes, both localized to `preprocess_sql` in `parser/mod.rs` and the table
 
 - **Apply order** (`design.rs:579`): insert matviews **after views**, before functions/procedures — a matview may read tables and views. The apply tuple/sort in `design.rs:582` grows one slot.
 - **Clean apply**: `CREATE MATERIALIZED VIEW IF NOT EXISTS … WITH DATA;` + indexes.
-- **Reconcile / drift**: a matview definition cannot be `CREATE OR REPLACE`d. On definition drift, reconcile does `DROP MATERIALIZED VIEW … CASCADE` + recreate (repopulates). Like views, matviews are otherwise re-applied idempotently rather than ALTER-diffed. Index drift is handled by the same drop/recreate.
+- **Reconcile / drift (warn, don't recreate)**: a matview definition cannot be `CREATE OR REPLACE`d, and a `DROP … CASCADE` + recreate would destroy the cached data and any dependent objects/grants (reconcile has no grants pass). Because matview drift also can't be detected reliably from `pg_matviews.definition` (Postgres stores a *deparsed* form — columns table-qualified, `*` expanded, reformatted), reconcile does **not** auto-recreate. Instead:
+  - On create, dbd stamps a stable content hash as a `COMMENT ON MATERIALIZED VIEW … IS 'dbd:hash=<sha256-prefix>'` sentinel (hash of the normalized body + index-key set).
+  - On reconcile: **absent** → `CREATE MATERIALIZED VIEW … WITH DATA` + stamp; **hash matches** → skip; **hash differs or no sentinel** → emit a **warning** (via the reconcile plan's warnings) telling the user the deployed definition differs and to drop+recreate manually or via the snapshot/migrate workflow. No automatic drop.
+  - Index drift is folded into the same content hash (so it surfaces as a warning too).
 
 ### 5. Scheduled refresh via pg_cron
 
@@ -137,7 +140,7 @@ Jobs without the `dbd:refresh:` prefix are ignored entirely.
 - `adapter/sqlite.rs`, `adapter/convex.rs` — error on matview apply.
 - `design.rs` — apply-order slot; load & resolve `materialized_views` config (options + overrides).
 - `config.rs` — `materialized_views` config structs (serde).
-- `reconcile.rs` — drop+recreate on matview definition/index drift; run cron sync.
+- `reconcile.rs` — content-hash sentinel + warn-on-drift (create-if-absent, skip-if-unchanged, warn-if-drifted; never auto-drop); run cron sync over all matviews.
 - `reverse.rs` — map type to `materialized_view` folder; keep user `cron` objects ignored.
 - `scope.rs` — include matviews in scope resolution/wildcards.
 - `dbd-cli` — new `refresh` subcommand; `inspect` validations (pg_cron present, unique index for concurrently, cron syntax).

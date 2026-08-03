@@ -1254,8 +1254,8 @@ mod tests {
     }
 
     /// The hash is deterministic: the same design entity hashes identically on
-    /// repeated calls (fixed-seed `DefaultHasher`, so it is also stable across
-    /// processes — the property the on-disk sentinel relies on).
+    /// repeated calls (SHA-256, so it is also stable across processes and
+    /// toolchain versions — the property the on-disk sentinel relies on).
     #[test]
     fn matview_hash_is_deterministic() {
         let e = mv("a.m", "SELECT 1 AS x");
