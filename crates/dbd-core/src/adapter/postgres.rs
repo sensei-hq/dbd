@@ -812,6 +812,57 @@ impl PostgresAdapter {
         Ok(entities)
     }
 
+    /// Reverse-engineer materialized views from `pg_matviews`.
+    ///
+    /// Mirrors [`Self::introspect_views`]: the SELECT body is captured verbatim in
+    /// `writes[0]` (the parser/emitter contract — `emit_matview` re-adds the
+    /// `WITH DATA` clause). Additionally, a matview's indexes live in `pg_index`
+    /// exactly like a table's, so they are read with the SAME index reader the
+    /// table path uses ([`Self::introspect_indexes`]) and attached via a
+    /// columns-empty `TableDef`. Matviews cannot own PK/UNIQUE *constraints* (only
+    /// standalone indexes), so there are no constraint-backed index OIDs to skip —
+    /// an empty set is passed. `emit_matview` re-creates the indexes from there.
+    async fn introspect_matviews(&self) -> crate::error::Result<Vec<Entity>> {
+        use crate::entity::TableDef;
+
+        let ns_filter = Self::schema_filter_column("schemaname");
+        let sql = format!(
+            "SELECT schemaname, matviewname, definition \
+             FROM pg_matviews \
+             WHERE {ns_filter} \
+             ORDER BY schemaname, matviewname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_matviews failed: {e}")))?;
+
+        let mut entities: Vec<Entity> = Vec::new();
+        for row in &rows {
+            let schema: String = row.get("schemaname");
+            let matviewname: String = row.get("matviewname");
+            let definition: String = row.get("definition");
+
+            let indexes = self
+                .introspect_indexes(&schema, &matviewname, &std::collections::HashSet::new())
+                .await?;
+
+            let mut e =
+                Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
+            e.writes = vec![definition];
+            if !indexes.is_empty() {
+                e.table_def = Some(TableDef {
+                    columns: Vec::new(),
+                    constraints: Vec::new(),
+                    indexes,
+                    comments: Default::default(),
+                });
+            }
+            entities.push(e);
+        }
+        Ok(entities)
+    }
+
     /// Reverse-engineer **standalone** sequences as `EntityType::Sequence`.
     ///
     /// A sequence is `pg_class.relkind = 'S'`. Column-owned sequences (those backing
@@ -1353,6 +1404,7 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_enums().await?);
         out.extend(self.introspect_tables().await?);
         out.extend(self.introspect_views().await?);
+        out.extend(self.introspect_matviews().await?);
         out.extend(self.introspect_functions().await?);
         Ok(out)
     }
