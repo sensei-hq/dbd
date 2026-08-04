@@ -7,7 +7,7 @@
  *
  * Keeps a single source of truth in docs/ — the site never forks the content.
  */
-import { mkdirSync, copyFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, copyFileSync, readdirSync, existsSync, rmSync, cpSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,6 +41,27 @@ if (existsSync(guideSrc)) {
 	}
 } else {
 	console.warn(`  ! missing ${guideSrc}`);
+}
+
+// 3. skills + agents + manifest → static/ (served as raw files at the site root,
+//    so the library is installable via sensei.library.json from the site and GitHub).
+const staticDir = join(here, '..', 'static');
+const skillsSrc = join(docs, 'skills');
+const agentsSrc = join(docs, 'agents');
+if (existsSync(skillsSrc)) {
+	rmSync(join(staticDir, 'skills'), { recursive: true, force: true });
+	cpSync(skillsSrc, join(staticDir, 'skills'), { recursive: true });
+	console.log(`  copied docs/skills → ${join(staticDir, 'skills').replace(repo + '/', '')}`);
+}
+if (existsSync(agentsSrc)) {
+	rmSync(join(staticDir, 'agents'), { recursive: true, force: true });
+	cpSync(agentsSrc, join(staticDir, 'agents'), { recursive: true });
+	console.log(`  copied docs/agents → ${join(staticDir, 'agents').replace(repo + '/', '')}`);
+}
+const manifest = join(repo, 'sensei.library.json');
+if (existsSync(manifest)) {
+	copyInto(manifest, join(staticDir, 'sensei.library.json'));
+	copyInto(manifest, join(staticDir, '.well-known', 'sensei.library.json'));
 }
 
 console.log('content sync complete.');

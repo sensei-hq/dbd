@@ -392,6 +392,11 @@ dbd inspect --fix              # auto-format DDL files in place while validating
 dbd inspect --scope hub        # report dependency gaps for a scope (exit 1 under report policy)
 ```
 
+On a Postgres/Supabase project, `inspect` also prints an advisory **`Suggestions:`** section for
+`CHECK` constraints that pin a column to a fixed set of string literals (`col IN ('a','b')`,
+`= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — better modeled as a Postgres `enum`. Advisory
+only: never an error, never affects the exit code.
+
 ### dbd apply
 
 Applies all entities in dependency order. Handles pending migrations automatically.
@@ -681,7 +686,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.9.1
+  rev: v0.10.0
   hooks:
     - id: dbd-format
 ```

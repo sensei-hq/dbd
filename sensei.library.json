@@ -1,0 +1,23 @@
+{
+  "library": "dbd",
+  "version": ">=0.10",
+  "repo": "https://github.com/sensei-hq/dbd",
+  "branch": "main",
+  "site": "https://dbd.sensei-hq.com",
+  "skills": [
+    {
+      "name": "dbd",
+      "focus": "schema-as-code",
+      "path": "docs/skills/dbd/SKILL.md",
+      "url": "/skills/dbd/SKILL.md"
+    }
+  ],
+  "agents": [
+    {
+      "name": "dbd-pattern-verifier",
+      "focus": "pattern-review",
+      "path": "docs/agents/dbd-pattern-verifier.md",
+      "url": "/agents/dbd-pattern-verifier.md"
+    }
+  ]
+}
