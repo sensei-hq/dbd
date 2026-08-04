@@ -253,6 +253,62 @@ fn push_column_alter_sql(
             )),
         }
     }
+    if old_col.comment != new_col.comment {
+        match &new_col.comment {
+            Some(c) => lines.push(format!(
+                "COMMENT ON COLUMN {}.{} IS '{}';",
+                entity_name, new_col.name, esc(c)
+            )),
+            None => lines.push(format!(
+                "COMMENT ON COLUMN {}.{} IS NULL;",
+                entity_name, new_col.name
+            )),
+        }
+    }
+    if old_col.identity != new_col.identity {
+        match (&old_col.identity, &new_col.identity) {
+            (None, Some(kind)) => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} ADD GENERATED {} AS IDENTITY;",
+                entity_name, new_col.name, identity_kind_sql(kind)
+            )),
+            (Some(_), None) => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP IDENTITY;",
+                entity_name, new_col.name
+            )),
+            (Some(_), Some(kind)) => lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET GENERATED {};",
+                entity_name, new_col.name, identity_kind_sql(kind)
+            )),
+            (None, None) => {} // unreachable: guarded by the inequality above
+        }
+    }
+    // PK / unique / inline-FK are also modelled as table constraints, whose real
+    // ADD/DROP DDL the constraint diff emits. Surface the column-flag change as an
+    // advisory comment so it is never a silent blank alter, without risking DDL
+    // that duplicates or conflicts with the constraint diff.
+    if old_col.is_pk != new_col.is_pk {
+        lines.push(format!(
+            "-- {}.{}: primary-key flag changed ({} -> {}); manage as a table PRIMARY KEY constraint",
+            entity_name, new_col.name, old_col.is_pk, new_col.is_pk
+        ));
+    }
+    if old_col.is_unique != new_col.is_unique {
+        lines.push(format!(
+            "-- {}.{}: unique flag changed ({} -> {}); manage as a table UNIQUE constraint",
+            entity_name, new_col.name, old_col.is_unique, new_col.is_unique
+        ));
+    }
+    if old_col.inline_fk != new_col.inline_fk {
+        let verb = match (&old_col.inline_fk, &new_col.inline_fk) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "dropped",
+            _ => "changed",
+        };
+        lines.push(format!(
+            "-- {}.{}: inline foreign key {}; manage as a table FOREIGN KEY constraint",
+            entity_name, new_col.name, verb
+        ));
+    }
 }
 
 /// `CREATE [UNIQUE] INDEX …` for a newly added index.
@@ -272,6 +328,21 @@ fn index_add_sql(entity_name: &str, idx: &crate::entity::IndexDef) -> String {
         "CREATE {}INDEX {} ON {} ({});",
         unique_str, idx_name, entity_name, cols.join(", ")
     )
+}
+
+/// Escape single quotes for a SQL string literal (doubling), matching `emit.rs`.
+fn esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// The `GENERATED { ALWAYS | BY DEFAULT }` keyword for an identity column,
+/// shared by the `ADD … AS IDENTITY` and `SET GENERATED …` alter forms.
+fn identity_kind_sql(kind: &crate::entity::IdentityKind) -> &'static str {
+    use crate::entity::IdentityKind;
+    match kind {
+        IdentityKind::Always => "ALWAYS",
+        IdentityKind::ByDefault => "BY DEFAULT",
+    }
 }
 
 /// Convert an FkAction to its SQL keyword.
