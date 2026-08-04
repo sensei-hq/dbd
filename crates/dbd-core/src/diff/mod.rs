@@ -48,6 +48,22 @@ mod tests {
         }
     }
 
+    /// A single-column `Alter` change wrapped as a table `MigrationDiff`.
+    fn alter_col(entity: &str, field: &str, old: ColumnDef, new: ColumnDef) -> MigrationDiff {
+        MigrationDiff {
+            entity_name: entity.to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: field.to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Alter {
+                    old: Box::new(FieldDetail::Column(old)),
+                    new: Box::new(FieldDetail::Column(new)),
+                },
+            }]),
+        }
+    }
+
     /// Build a TableSnapshot with given columns (no indexes/constraints).
     fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot {

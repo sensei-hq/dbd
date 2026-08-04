@@ -383,6 +383,72 @@ pub enum DdlMoveOutcome {
     Error { path: PathBuf, error: String },
 }
 
+/// A DDL file whose folder disagrees with the object its `CREATE` statement
+/// declares — e.g. a materialized view stored under `ddl/view/`. dbd classifies
+/// entities by folder, so a misfiled matview is dropped as a plain view
+/// (`DROP VIEW` → "is not a view") and emitted with the wrong DDL. This is a
+/// detection-only check: the fix is to move the file, which doctor reports
+/// rather than performs, so the human sees the misfiling.
+#[derive(Debug, Clone)]
+pub struct DdlTypeMismatch {
+    /// The misfiled DDL file.
+    pub path: PathBuf,
+    /// Folder the file currently lives under, e.g. `"view"`.
+    pub folder: String,
+    /// Folder its `CREATE` statement says it belongs in, e.g. `"materialized_view"`.
+    pub declared: String,
+    /// Where it should live: the same path with the type folder corrected.
+    pub suggested_path: PathBuf,
+}
+
+/// Detect view / materialized-view DDL files whose folder disagrees with their
+/// `CREATE` statement. Only the view ↔ materialized_view pair is checked: they
+/// share `CREATE … VIEW` syntax and are the folder/content confusion that makes
+/// `reset` emit the wrong `DROP`. Returns one entry per misfiled file.
+pub fn detect_ddl_type_mismatches(project_dir: &Path) -> Vec<DdlTypeMismatch> {
+    let ddl = project_dir.join("ddl");
+    // Materialized-view syntax contains "VIEW", so test it first.
+    let matview_re =
+        regex::Regex::new(r"(?is)\bcreate\s+(?:or\s+replace\s+)?materialized\s+view\b").unwrap();
+    let view_re = regex::Regex::new(r"(?is)\bcreate\s+(?:or\s+replace\s+)?view\b").unwrap();
+
+    let mut out = Vec::new();
+    for folder in ["view", "materialized_view"] {
+        let dir = ddl.join(folder);
+        if !dir.is_dir() {
+            continue;
+        }
+        for file in collect_files(&dir) {
+            if file.extension().and_then(|e| e.to_str()) != Some("ddl") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let declared = if matview_re.is_match(&content) {
+                "materialized_view"
+            } else if view_re.is_match(&content) {
+                "view"
+            } else {
+                continue; // not a recognizable view-family object — leave it be
+            };
+            if declared == folder {
+                continue;
+            }
+            let Ok(rel) = file.strip_prefix(&dir) else {
+                continue;
+            };
+            out.push(DdlTypeMismatch {
+                suggested_path: ddl.join(declared).join(rel),
+                path: file,
+                folder: folder.to_string(),
+                declared: declared.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// Detect `ddl/<plural>/` folders (e.g. `ddl/functions`) that should use the
 /// canonical singular form (`ddl/function`).
 pub fn detect_plural_ddl_dirs(project_dir: &Path) -> Vec<PluralDdlDir> {
@@ -781,5 +847,66 @@ schemas:
         let bkp = root.join("ddl/function/config/foo.ddl.bkp");
         assert_eq!(std::fs::read_to_string(&bkp).unwrap(), "OLD-PLURAL"); // loser backed up
         assert!(!root.join("ddl/functions").exists());
+    }
+
+    // ── View / materialized-view folder mismatch ───────────
+
+    #[test]
+    fn ddl_mismatch_flags_matview_under_view_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(
+            &root.join("ddl/view/analytics/model_mix_daily.ddl"),
+            "CREATE MATERIALIZED VIEW analytics.model_mix_daily AS SELECT 1;",
+        );
+        let found = detect_ddl_type_mismatches(root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].folder, "view");
+        assert_eq!(found[0].declared, "materialized_view");
+        assert!(
+            found[0].suggested_path.ends_with("ddl/materialized_view/analytics/model_mix_daily.ddl"),
+            "got: {}",
+            found[0].suggested_path.display()
+        );
+    }
+
+    #[test]
+    fn ddl_mismatch_flags_plain_view_under_matview_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(
+            &root.join("ddl/materialized_view/config/genders.ddl"),
+            "CREATE OR REPLACE VIEW config.genders AS SELECT 1;",
+        );
+        let found = detect_ddl_type_mismatches(root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].folder, "materialized_view");
+        assert_eq!(found[0].declared, "view");
+        assert!(found[0].suggested_path.ends_with("ddl/view/config/genders.ddl"));
+    }
+
+    #[test]
+    fn ddl_mismatch_ignores_correctly_filed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("ddl/view/config/v.ddl"), "CREATE VIEW config.v AS SELECT 1;");
+        write_file(
+            &root.join("ddl/materialized_view/config/m.ddl"),
+            "create materialized view config.m as select 1 with no data;",
+        );
+        assert!(detect_ddl_type_mismatches(root).is_empty());
+    }
+
+    #[test]
+    fn ddl_mismatch_is_case_and_whitespace_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(
+            &root.join("ddl/view/a/x.ddl"),
+            "create   materialized\n   view a.x as select 1;",
+        );
+        let found = detect_ddl_type_mismatches(root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].declared, "materialized_view");
     }
 }
