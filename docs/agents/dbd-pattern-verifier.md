@@ -6,9 +6,11 @@ description: >-
   wrong workflow for the project's release state (running/advising `dbd
   reconcile` on a released project, or hand-writing migrations on a pre-release
   one) — plus non-idempotent DDL, hardcoded secrets in design.yaml, wrong/plural
-  type folders, string-set CHECK constraints that should be Postgres enums, and
-  materialized-view drift misuse. Reviews from the files (no DB needed);
-  corroborates with `dbd inspect`/`dbd diff` only if the binary is present.
+  type folders, misfiled view/matview DDL (a matview under ddl/view/ that makes
+  reset emit DROP VIEW), string-set CHECK constraints that should be Postgres
+  enums, and materialized-view drift misuse. Reviews from the files (no DB
+  needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only if the
+  binary is present.
 
   <example>
   Context: A developer changed some DDL in a dbd project and is about to apply it.
@@ -61,7 +63,10 @@ judging the workflow, and state which one you concluded and why (the file eviden
    password instead of `$ENV_VAR`.
 4. **Wrong layout** — plural type folders (`ddl/tables/`, `ddl/views/`, …) instead of singular;
    a file whose folder/schema path doesn't match its intended entity name; a schema-scoped type
-   placed without its `<schema>/` dir.
+   placed without its `<schema>/` dir; or a **folder/content mismatch** — a `CREATE MATERIALIZED
+   VIEW` filed under `ddl/view/` (or a plain `CREATE VIEW` under `ddl/materialized_view/`). dbd
+   types by folder, so a misfiled matview makes `dbd reset` emit `DROP VIEW` on it (`"… is not a
+   view"`). `dbd doctor` detects this; the fix is to move the file (not auto-fixed).
 5. **String-set `CHECK` → enum** — a `CHECK (col IN ('a','b',…))` (or `= ANY(ARRAY[…])`, or an
    `OR`-chain of `col = '…'`) on a fixed set of string literals is better modeled as a Postgres
    `enum` (`ddl/enum/<schema>/<name>.ddl`). Advisory (same rule `dbd inspect` suggests).
@@ -74,8 +79,10 @@ judging the workflow, and state which one you concluded and why (the file eviden
 1. Read `design.yaml` (release state, targets/secrets, `materialized_views:`), then glob `ddl/**`
    and `snapshots/**`.
 2. Grep the DDL for the idempotency, folder, secret, CHECK, and matview patterns above.
-3. If `dbd` is on PATH, optionally run `dbd inspect` (and `dbd diff` when a DB URL is available)
-   and fold its findings/suggestions in.
+3. If `dbd` is on PATH, run `dbd doctor` to verify layout (it surfaces old-format config, stale
+   files, plural folders, and **misfiled view/matview DDL**; `--fix` repairs all but the
+   misfilings, which it reports with a move hint). Optionally also run `dbd inspect` (and `dbd
+   diff` when a DB URL is available) and fold their findings/suggestions in.
 4. Report. For each finding: **severity**, one-line **what**, the **evidence** (`file:line`), and
    the **fix** (cite the `dbd` skill's rule). End with a one-line verdict. If the project is
    conformant, say so explicitly: **"conformant — no issues found."** Do not invent findings to
