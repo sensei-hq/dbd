@@ -68,6 +68,14 @@ pub async fn cmd_inspect(
         report.warnings.len(),
         total_entities,
     );
+
+    // Advisory only — string-set CHECK constraints that could be a Postgres enum.
+    // Report-only: NOT added to the summary error count, never affects the exit code.
+    let enum_hints = dbd_core::design::suggest_enum_candidates(
+        design.entities(),
+        &design.config().source.dialect,
+    );
+    print_enum_hints(&enum_hints);
     Ok(())
 }
 
@@ -234,6 +242,40 @@ fn print_matview_errors(errors: &[String]) {
     output::always("\nMaterialized view errors:");
     for err in errors {
         output::always(&format!("  {err}"));
+    }
+}
+
+/// Render one advisory line per enum-candidate hint (pure, so it's unit-testable).
+fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
+    hints
+        .iter()
+        .map(|h| {
+            let set = h
+                .values
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let schema = h.entity.split_once('.').map(|(s, _)| s).unwrap_or("public");
+            format!(
+                "  {entity}.{column}: CHECK constrains to a fixed string set {{{set}}} — a \
+                 Postgres enum (ddl/enum/{schema}/{column}.ddl) gives type safety + cleaner \
+                 introspection. Not required.",
+                entity = h.entity,
+                column = h.column,
+            )
+        })
+        .collect()
+}
+
+/// Print the advisory `Suggestions:` section (enum candidates). Report-only.
+fn print_enum_hints(hints: &[dbd_core::design::EnumHint]) {
+    if hints.is_empty() {
+        return;
+    }
+    output::always("\nSuggestions:");
+    for line in render_enum_hints(hints) {
+        output::always(&line);
     }
 }
 
@@ -505,6 +547,22 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
 mod tests {
     use super::*;
     use crate::commands::testutil;
+
+    #[test]
+    fn render_enum_hints_renders_advisory_line() {
+        let hints = vec![dbd_core::design::EnumHint {
+            entity: "config.lookups".into(),
+            column: "status".into(),
+            values: vec!["active".into(), "inactive".into()],
+        }];
+        let out = render_enum_hints(&hints);
+        assert!(
+            out.iter().any(|l| l.contains("config.lookups.status")
+                && l.contains("'active'")
+                && l.contains("enum")),
+            "got: {out:?}"
+        );
+    }
 
     /// Offline `inspect` (no `--from-db`) validates the fixture against the
     /// project-local cache — no DB connection.

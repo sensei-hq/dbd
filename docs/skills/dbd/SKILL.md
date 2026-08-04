@@ -21,12 +21,14 @@ Full reference (exhaustive, always current): **https://dbd.sensei-hq.com/llms-fu
 ## Mental model — files are the source of truth
 
 Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema).
-`<type>` ∈ `table|view|function|procedure|enum|role`; ext `.ddl` or `.sql`.
-Folder = type, parent dir = schema, filename = entity name. **Singular** type
-folder is canonical (`dbd doctor --fix` migrates plural → singular).
+`<type>` ∈ `table|view|materialized_view|function|procedure|enum|role`; ext
+`.ddl` or `.sql`. Folder = type, parent dir = schema, filename = entity name.
+**Singular** type folder is canonical (`dbd doctor --fix` migrates plural →
+singular).
 
 - `ddl/table/config/lookups.ddl` → entity `config.lookups` (table)
 - `ddl/view/public/genders.ddl` → entity `public.genders` (view)
+- `ddl/materialized_view/analytics/daily_sales.ddl` → `analytics.daily_sales` (matview)
 - `ddl/procedure/staging/import_lookups.ddl` → `staging.import_lookups`
 
 Each file is parsed once into `Entity` + `TableDef`; that structure drives every
@@ -50,6 +52,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd snapshot` | Diff vs latest snapshot → migration SQL (smart multi-stage for renames/type changes) |
 | `dbd migrate --status` | Show migration status (read-only; `apply` runs them) |
 | `dbd import` / `export` | Load / dump table data (CSV/TSV/JSONL) via the `import/` & `export/` conventions |
+| `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
 | `dbd doctor` | Audit/migrate config + layout (old design.yaml, stale files, plural dirs) |
@@ -71,6 +74,52 @@ the **raw .ddl text** straight to the database. So a missing/renamed **column**
 referenced by an index or constraint passes `inspect` cleanly and only fails at
 `apply`, as a database error. Column-level correctness is the database's job, not
 `inspect`'s.
+
+## Workflow — pre-release vs upgrades (read this before changing a schema)
+
+dbd has **two** schema-change workflows and using the wrong one corrupts the
+project's history. Decide which you're in **first**:
+
+**Which am I in?** The project is **released** iff `design.yaml` has
+`project.released: true` **or** `snapshots/` contains a baseline snapshot.
+Otherwise it is **pre-release**.
+
+| | Pre-release (still iterating, pre-v1) | Released (upgrades) |
+|---|---|---|
+| Signal | no `project.released`, no snapshots | `project.released: true` **or** `snapshots/` exists |
+| Change a schema | edit DDL, then **`dbd reconcile`** (diffs live↔design, applies `CREATE`/`ALTER` in place — no snapshot, no version bump) | edit DDL, then **`dbd snapshot`** (writes the migration) → **`dbd apply`** (runs it) |
+| Fresh DB | `dbd apply` | `dbd apply` (runs all migrations) |
+| `dbd reconcile` | ✅ the whole point | ❌ **disabled** — do not use |
+| Drops | `reconcile --allow-destructive` (columns) / `--prune` (orphan tables) | expressed as migrations via `dbd snapshot` |
+
+- **Pre-release example:** you renamed a column in `ddl/table/app/orders.ddl`; run
+  `dbd reconcile -d $DATABASE_URL` to converge the dev DB. No snapshot is written.
+- **Released example:** same rename after `dbd release`; run `dbd snapshot --name "rename …"`
+  (dbd generates the migration, splitting a rename into safe stages) then `dbd apply`.
+- **Never** hand-write SQL against a released database, and never run `reconcile` on one —
+  `dbd release` disables it precisely to force changes through the migration trail.
+
+## Self-check before you touch a dbd project
+
+- **Right workflow for the release state** (above) — the #1 mistake is `reconcile` on a released project or hand-migrations on a pre-release one.
+- **Singular type folder**: `ddl/table/…` not `ddl/tables/…` (`dbd doctor --fix` migrates plural).
+- **Idempotent DDL** so re-`apply` is safe: `create table if not exists`, `create or replace view`, `create materialized view if not exists` (+ `create [unique] index if not exists`). Postgres has no `create or replace materialized view`.
+- **Secrets via `$ENV_VAR`** in `design.yaml` target URLs — never a literal connection string.
+- **String-set `CHECK` → consider an enum**: `check (status in ('a','b'))` is better modeled as a Postgres `enum` (`ddl/enum/…`) for type safety + introspection. `dbd inspect` suggests these.
+- **`inspect` doesn't check column-level refs** (index/CHECK/FK column lists) — those fail at `apply` as DB errors, not at `inspect`.
+
+## Materialized views
+
+`ddl/materialized_view/<schema>/<name>.ddl` holds `create materialized view if
+not exists … with data;` + trailing `create [unique] index if not exists …`.
+Scheduled refresh is declared under `materialized_views:` in design.yaml
+(shared `options` + per-view `overrides`) and runs in-database via **pg_cron**
+(synced on `apply`/`deploy`; needs the `pg_cron` extension; `concurrently`
+needs a unique index). `dbd refresh` refreshes on demand. **Reconcile only
+*warns* on a drifted matview definition — it never auto-drops one** (a recreate
+is `DROP … CASCADE`, losing data/dependents); to apply a changed definition,
+drop it manually, then `apply`/reconcile recreates it. `dbd diff` reports matview
+drift (`missing`/`drifted`/`unstamped`/`orphan`). PostgreSQL/Supabase only.
 
 ## Library usage (dbd-core)
 
