@@ -651,7 +651,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.1
+  rev: v0.10.2
   hooks:
     - id: dbd-format
 ```
@@ -702,6 +702,27 @@ Removes stale files that dbd now manages internally, and migrates **plural DDL t
 
 ---
 
+## `dbd install`
+
+Install dbd's Claude Code assets — the `dbd` skill and the `dbd-pattern-verifier`
+agent — so an AI assistant working in your project understands the schema-as-code
+conventions. The assets are embedded in the binary, so this needs no repo checkout
+or network access.
+
+```sh
+dbd install                # Install globally into ~/.claude (skills/ + agents/)
+dbd install --project      # Install into the current project's ./.claude instead
+dbd install --dry-run      # Preview what would be written, touch nothing
+```
+
+Writes `skills/dbd/SKILL.md` and `agents/dbd-pattern-verifier.md` under the target
+`.claude` directory, reporting each asset as created, updated, or unchanged (so an
+overwrite on upgrade is never silent). Re-run after upgrading dbd to refresh them.
+The global target honours `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Restart
+Claude Code afterwards to load the new skill/agent.
+
+---
+
 ## Environment variables
 
 | Variable | Used by |
@@ -709,3 +730,4 @@ Removes stale files that dbd now manages internally, and migrates **plural DDL t
 | `DATABASE_URL` | Default database connection |
 | `GITHUB_TOKEN` | Private GitHub repository access |
 | `DBD_CATALOG_TTL` | Catalog cache TTL in hours (default: 24) |
+| `CLAUDE_CONFIG_DIR` | Global target dir for `dbd install` (default: `~/.claude`) |

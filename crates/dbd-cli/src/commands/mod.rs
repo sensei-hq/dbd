@@ -1,6 +1,7 @@
 mod data;
 mod diagram;
 mod diff;
+mod install;
 mod migration;
 mod project;
 mod reverse;
@@ -187,6 +188,10 @@ pub async fn run(
 
         Commands::Release { name } => {
             project::cmd_release(config, env, project_dir, name.as_deref(), verbosity)
+        }
+
+        Commands::Install { project, dry_run } => {
+            install::cmd_install(*project, *dry_run, project_dir, verbosity)
         }
     }
 }

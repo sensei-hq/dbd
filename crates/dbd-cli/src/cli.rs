@@ -302,6 +302,23 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Install dbd's Claude Code skill + agent so an AI assistant understands
+    /// this project's schema-as-code conventions.
+    ///
+    /// Global (~/.claude, or $CLAUDE_CONFIG_DIR) is personal to your machine and
+    /// applies to every project you open. `--project` writes ./.claude instead,
+    /// which is shared with the team only once you commit that directory. Assets
+    /// are embedded in the binary — no repo checkout or network needed.
+    Install {
+        /// Install into ./.claude instead of ~/.claude. Commit that directory to
+        /// share the skill + agent with everyone who clones the repo; gitignore
+        /// it to keep the install local to your checkout.
+        #[arg(long)]
+        project: bool,
+        /// Preview what would be written without touching the filesystem
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
@@ -325,7 +342,7 @@ mod tests {
         let cmds = [
             "inspect", "apply", "combine", "import", "refresh", "graph", "dbml", "diagram", "deploy",
             "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
-            "policies", "diff", "reconcile", "release",
+            "policies", "diff", "reconcile", "release", "install",
         ];
         for c in cmds {
             Cli::try_parse_from(["dbd", c])
@@ -623,6 +640,25 @@ mod tests {
             arg.is_hide_env_values_set(),
             "the --database arg must set hide_env_values so `--help` never echoes \
              the resolved $DATABASE_URL (which can carry a password)"
+        );
+    }
+
+    /// `dbd install` flags default to false and flip to true when present; the
+    /// global default (no `--project`) is the intended shape.
+    #[test]
+    fn install_flags_parse() {
+        // bare install → global, not a dry run
+        let cli = Cli::try_parse_from(["dbd", "install"]).expect("install should parse");
+        assert!(
+            matches!(&cli.command, Commands::Install { project: false, dry_run: false }),
+            "expected install project == false, dry_run == false by default"
+        );
+        // --project --dry-run
+        let cli = Cli::try_parse_from(["dbd", "install", "--project", "--dry-run"])
+            .expect("install --project --dry-run should parse");
+        assert!(
+            matches!(&cli.command, Commands::Install { project: true, dry_run: true }),
+            "expected install project == true, dry_run == true when present"
         );
     }
 

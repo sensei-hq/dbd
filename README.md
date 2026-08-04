@@ -75,6 +75,7 @@ myproject/
 | `dbd policies` | Apply RLS policies from `policies/` |
 | `dbd doctor` | Audit/migrate design.yaml + DDL layout |
 | `dbd reset` | Drop project schemas (with safety guards) |
+| `dbd install` | Install dbd's Claude Code skill + agent into `~/.claude` (or `./.claude` with `--project`) |
 
 ## Targets
 
@@ -247,7 +248,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.1
+  rev: v0.10.2
   hooks:
     - id: dbd-format
 ```
