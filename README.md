@@ -75,6 +75,7 @@ myproject/
 | `dbd policies` | Apply RLS policies from `policies/` |
 | `dbd doctor` | Audit/migrate design.yaml + DDL layout |
 | `dbd reset` | Drop project schemas (with safety guards) |
+| `dbd install` | Install dbd's Claude Code skill + agent into `~/.claude` (or `./.claude` with `--project`) |
 
 ## Targets
 
