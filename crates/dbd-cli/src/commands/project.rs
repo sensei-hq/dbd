@@ -100,8 +100,11 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let config_issues = dbd_core::doctor::detect_old_format(&content);
     let stale_files = dbd_core::doctor::detect_stale_files(project_dir);
     let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
+    // Misfiled view/matview DDL — detection only; the fix is a manual move.
+    let mismatches = dbd_core::doctor::detect_ddl_type_mismatches(project_dir);
 
-    let total_issues = config_issues.len() + stale_files.len() + plural_dirs.len();
+    let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
+    let total_issues = auto_fixable + mismatches.len();
 
     if total_issues == 0 {
         output::info(verbosity, "No issues found — project is up to date.");
@@ -109,10 +112,15 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         return Ok(());
     }
 
-    report_doctor_issues(&config_issues, &stale_files, &plural_dirs);
+    report_doctor_issues(&config_issues, &stale_files, &plural_dirs, &mismatches);
 
     if !fix {
-        output::always("\nRun with --fix to resolve automatically.");
+        if auto_fixable > 0 {
+            output::always("\nRun with --fix to resolve automatically.");
+        }
+        if !mismatches.is_empty() {
+            output::always("Misfiled DDL files must be moved manually (see above).");
+        }
         output::summary(total_issues, 0, 0);
         return Ok(());
     }
@@ -128,7 +136,19 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     if !plural_dirs.is_empty() {
         fixed += fix_plural_dirs(&plural_dirs, verbosity);
     }
-    output::summary(0, 0, fixed);
+    // Misfiled DDL is not auto-fixed: report it as remaining so the summary is
+    // honest, and reset stays broken until the file is moved.
+    if !mismatches.is_empty() {
+        output::always(&format!(
+            "\n{} misfiled DDL file{} left unchanged — move manually:",
+            mismatches.len(),
+            if mismatches.len() != 1 { "s" } else { "" }
+        ));
+        for m in &mismatches {
+            output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
+        }
+    }
+    output::summary(mismatches.len(), 0, fixed);
 
     Ok(())
 }
@@ -138,6 +158,7 @@ fn report_doctor_issues(
     config_issues: &[String],
     stale_files: &[dbd_core::doctor::StaleFile],
     plural_dirs: &[dbd_core::doctor::PluralDdlDir],
+    mismatches: &[dbd_core::doctor::DdlTypeMismatch],
 ) {
     if !config_issues.is_empty() {
         output::always(&format!(
@@ -169,6 +190,23 @@ fn report_doctor_issues(
         ));
         for d in plural_dirs {
             output::always(&format!("  - {} → {}", d.plural.display(), d.singular.display()));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        output::always(&format!(
+            "\nFound {} misfiled DDL file{} (folder disagrees with the CREATE statement):",
+            mismatches.len(),
+            if mismatches.len() != 1 { "s" } else { "" }
+        ));
+        for m in mismatches {
+            output::always(&format!(
+                "  - {} declares CREATE {} but lives in ddl/{}/",
+                m.path.display(),
+                m.declared.replace('_', " ").to_uppercase(),
+                m.folder
+            ));
+            output::always(&format!("      → move to {}", m.suggested_path.display()));
         }
     }
 }

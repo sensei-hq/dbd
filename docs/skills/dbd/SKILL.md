@@ -55,7 +55,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
-| `dbd doctor` | Audit/migrate config + layout (old design.yaml, stale files, plural dirs) |
+| `dbd doctor [--fix]` | Audit/repair config + layout: old design.yaml, stale files, plural dirs (`--fix` migrates these). Also flags **misfiled view/matview DDL** (a `CREATE MATERIALIZED VIEW` under `ddl/view/`, or a plain view under `ddl/materialized_view/`) — reported with a move hint, **not** auto-fixed. Run it to verify layout before `reset`/`apply` |
 | `dbd reset` | Drop the project's own objects (guarded by `_dbd_meta` env check; blocked in prod / post-v1) |
 | `dbd format [--check]` | DDL formatter (river-style SELECT bodies; `--check` for pre-commit) |
 
@@ -107,6 +107,7 @@ Otherwise it is **pre-release**.
 - **Secrets via `$ENV_VAR`** in `design.yaml` target URLs — never a literal connection string.
 - **String-set `CHECK` → consider an enum**: `check (status in ('a','b'))` is better modeled as a Postgres `enum` (`ddl/enum/…`) for type safety + introspection. `dbd inspect` suggests these.
 - **`inspect` doesn't check column-level refs** (index/CHECK/FK column lists) — those fail at `apply` as DB errors, not at `inspect`.
+- **Run `dbd doctor` to verify layout** before `reset`/`apply`. Beyond old-format config, stale files, and plural folders (all `--fix`-able), it flags **misfiled view/matview DDL**: dbd types an entity by its folder, so a `CREATE MATERIALIZED VIEW` sitting under `ddl/view/` is treated as a plain view and `dbd reset` emits `DROP VIEW` on it → `"… is not a view"`. doctor prints the file and a move hint (`→ ddl/materialized_view/<schema>/…`); move the file to fix (not auto-fixed — folder = type is the source of truth).
 
 ## Materialized views
 
@@ -120,6 +121,11 @@ needs a unique index). `dbd refresh` refreshes on demand. **Reconcile only
 is `DROP … CASCADE`, losing data/dependents); to apply a changed definition,
 drop it manually, then `apply`/reconcile recreates it. `dbd diff` reports matview
 drift (`missing`/`drifted`/`unstamped`/`orphan`). PostgreSQL/Supabase only.
+
+**The folder is the type.** A matview MUST live under `ddl/materialized_view/<schema>/`
+— one placed under `ddl/view/` is classified as a plain view, so `dbd reset` runs
+`DROP VIEW` on it and fails (`"… is not a view"`). `dbd doctor` flags this mismatch
+with a move hint; see the self-check above.
 
 ## Library usage (dbd-core)
 
