@@ -686,7 +686,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.1
+  rev: v0.10.2
   hooks:
     - id: dbd-format
 ```
@@ -732,6 +732,20 @@ dbd doctor --fix
 ```
 
 Audits + migrates: old Node.js `design.yaml` format → new format (`--fix` writes a `.yaml.bak`); removes stale internally-managed files; migrates plural DDL type folders to singular (`ddl/functions/` → `ddl/function/`, merging into an existing singular folder, backing up the older file on a same-name collision as `<name>.ddl.bkp`).
+
+---
+
+### dbd install
+
+```sh
+dbd install                # install globally into ~/.claude (skills/ + agents/)
+dbd install --project      # install into the current project's ./.claude instead
+dbd install --dry-run      # preview what would be written, touch nothing
+```
+
+Installs dbd's Claude Code assets — the `dbd` skill (`skills/dbd/SKILL.md`) and the `dbd-pattern-verifier` agent (`agents/dbd-pattern-verifier.md`) — so an AI assistant working in the project understands the schema-as-code conventions. The assets are embedded in the binary, so this needs no repo checkout or network access.
+
+Two scopes, and neither is system-wide (all OS users): **global** (default) writes under `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`, and is personal to your machine across every project; **`--project`** writes `./.claude` (relative to `--source`), which is shared with the team only once you commit that directory (gitignore it to keep the install local to your checkout). Each asset is reported as created, updated, or unchanged — an overwrite on upgrade is never silent — and re-running is idempotent. Restart Claude Code afterwards to load the new skill/agent.
 
 ---
 
