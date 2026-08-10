@@ -1854,12 +1854,7 @@ impl Design {
             _ => plan,
         };
 
-        // Counters for on_complete summary
-        let mut count_tables: u32 = 0;
-        let mut count_procedures: u32 = 0;
-        let mut count_after_scripts: u32 = 0;
-
-        // Ensure internal dbd procedures are present before any import runs.
+        // Ensure internal dbd procedures are present before any JSONL import runs.
         // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
         if !dry_run {
             let has_jsonl = plan.iter().any(|e| {
@@ -1870,10 +1865,37 @@ impl Design {
             }
         }
 
-        // Step 1: Truncate staging tables (if configured)
-        let truncate = self.config.import.options.truncate;
-        if truncate && !dry_run {
-            for entry in &plan {
+        // Run the import phases in order, tallying each for the summary.
+        let tables = self
+            .import_load_staging(adapter, &plan, dry_run, &mut on_start, &mut on_done)
+            .await?;
+        let procedures = self
+            .import_call_procedures(adapter, &plan, dry_run, &mut on_start, &mut on_done)
+            .await?;
+        let after_scripts = self
+            .import_run_after_scripts(adapter, dry_run, &mut on_start, &mut on_done)
+            .await?;
+
+        on_complete(ImportComplete { tables, procedures, after_scripts });
+        Ok(())
+    }
+
+    /// Import phase: truncate staging tables (when configured) then load each
+    /// entry's data file. Returns the number of tables loaded.
+    async fn import_load_staging<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &[ImportPlanEntry],
+        dry_run: bool,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<u32>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        if self.config.import.options.truncate && !dry_run {
+            for entry in plan {
                 let qualified = entry.table.name.replace('.', "\".\"");
                 adapter
                     .execute_script(&format!("TRUNCATE \"{qualified}\""))
@@ -1881,30 +1903,61 @@ impl Design {
             }
         }
 
-        // Step 2: Load data into staging tables
-        for entry in &plan {
+        let mut count = 0;
+        for entry in plan {
             let fmt = entry.table.format.as_deref().unwrap_or("csv");
             let desc = format!("import {} ({})", entry.table.name, fmt);
             on_start(&desc);
             let result = if dry_run { Ok(()) } else { adapter.import_data(&entry.table, false).await };
-            report_step_result(&desc, &mut on_done, result)?;
-            count_tables += 1;
+            report_step_result(&desc, on_done, result)?;
+            count += 1;
         }
+        Ok(count)
+    }
 
-        // Step 3: Call import procedures
-        for entry in &plan {
+    /// Import phase: call each entry's import procedure. Returns the number
+    /// called.
+    async fn import_call_procedures<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &[ImportPlanEntry],
+        dry_run: bool,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<u32>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut count = 0;
+        for entry in plan {
             if let Some(ref proc_name) = entry.procedure {
                 let desc = format!("call {proc_name}()");
                 on_start(&desc);
                 let result = if dry_run { Ok(()) } else { adapter.execute_script(&format!("CALL {proc_name}();")).await };
-                report_step_result(&desc, &mut on_done, result)?;
-                count_procedures += 1;
+                report_step_result(&desc, on_done, result)?;
+                count += 1;
             }
         }
+        Ok(count)
+    }
 
-        // Step 4: Run after scripts — intentionally NOT scope-filtered; these are
-        // project-global post-import hooks, not tied to individual import entries.
-        // Scoped callers are responsible for ensuring their after-scripts are safe.
+    /// Import phase: run the project-global `import.after` scripts. These are
+    /// intentionally NOT scope-filtered — they are post-import hooks, not tied to
+    /// individual entries; scoped callers ensure their after-scripts are safe.
+    /// Returns the number of scripts run.
+    async fn import_run_after_scripts<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<u32>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut count = 0;
         for after_file in &self.config.import.after {
             let full_path = self.project_dir.join(after_file);
             let desc = format!("run {after_file}");
@@ -1915,16 +1968,10 @@ impl Design {
                 let sql = std::fs::read_to_string(&full_path)?;
                 adapter.execute_script(&sql).await
             };
-            report_step_result(&desc, &mut on_done, result)?;
-            count_after_scripts += 1;
+            report_step_result(&desc, on_done, result)?;
+            count += 1;
         }
-
-        on_complete(ImportComplete {
-            tables: count_tables,
-            procedures: count_procedures,
-            after_scripts: count_after_scripts,
-        });
-        Ok(())
+        Ok(count)
     }
 
     /// Deploy the full schema: apply DDL then import seed data.
