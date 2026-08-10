@@ -1315,6 +1315,49 @@ fn river_emit_select_list(
 }
 
 /// Append the river-formatted FROM/JOIN clause to `lines`.
+/// Max table-name length across a SELECT's FROM/JOIN relations, for alias
+/// alignment. Returns `0` unless at least one relation has an alias.
+fn from_clause_alias_width(select: &sqlparser::ast::Select) -> usize {
+    let any_alias = select.from.iter().any(|twj| {
+        table_factor_has_alias(&twj.relation)
+            || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
+    });
+    if !any_alias {
+        return 0;
+    }
+    let mut max = 0usize;
+    for twj in &select.from {
+        max = max.max(table_factor_name_len(&twj.relation));
+        for join in &twj.joins {
+            max = max.max(table_factor_name_len(&join.relation));
+        }
+    }
+    max
+}
+
+/// Emit a derived-table (subquery) relation in river style: the opening `(`, the
+/// indented sub-SELECT, then the closing `)` with an optional alias.
+fn emit_derived_relation(
+    subquery: &sqlparser::ast::Query,
+    alias: Option<&sqlparser::ast::TableAlias>,
+    from_kw: &str,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
+    let g = config.gutter;
+    lines.push(river_line(g, from_kw, "("));
+    let sub_indent = " ".repeat(g + 2);
+    for sub_line in river_select_lines(subquery, config) {
+        lines.push(format!("{sub_indent}{sub_line}"));
+    }
+    let close = if let Some(a) = alias {
+        format!("{}) {}", " ".repeat(g + 1), a.name.value.to_lowercase())
+    } else {
+        format!("{})", " ".repeat(g + 1))
+    };
+    lines.push(close);
+}
+
 fn river_emit_from_joins(
     select: &sqlparser::ast::Select,
     config: &FormatConfig,
@@ -1325,42 +1368,14 @@ fn river_emit_from_joins(
     let g = config.gutter;
     let kw = |s: &str| kw_case(s, &config.keyword_case);
 
-    // Compute max table-name length for alias alignment (only when at least one
-    // table in the clause has an alias).
-    let max_table_name_len: usize = {
-        let mut max = 0usize;
-        let any_alias = select.from.iter().any(|twj| {
-            table_factor_has_alias(&twj.relation)
-                || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
-        });
-        if any_alias {
-            for twj in &select.from {
-                max = max.max(table_factor_name_len(&twj.relation));
-                for join in &twj.joins {
-                    max = max.max(table_factor_name_len(&join.relation));
-                }
-            }
-        }
-        max
-    };
+    let max_table_name_len = from_clause_alias_width(select);
 
     for (j, twj) in select.from.iter().enumerate() {
         let from_kw = if j == 0 { kw("from") } else { kw(",") };
 
         match &twj.relation {
             TableFactor::Derived { subquery, alias, .. } => {
-                lines.push(river_line(g, &from_kw, "("));
-                let sub_lines = river_select_lines(subquery, config);
-                let sub_indent = " ".repeat(g + 2);
-                for sub_line in sub_lines {
-                    lines.push(format!("{sub_indent}{sub_line}"));
-                }
-                let close = if let Some(a) = alias {
-                    format!("{}) {}", " ".repeat(g + 1), a.name.value.to_lowercase())
-                } else {
-                    format!("{})", " ".repeat(g + 1))
-                };
-                lines.push(close);
+                emit_derived_relation(subquery, alias.as_ref(), &from_kw, config, lines);
             }
             _ => {
                 let table_str = render_table_factor_aligned(&twj.relation, max_table_name_len);
