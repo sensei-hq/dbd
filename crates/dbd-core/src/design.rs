@@ -1313,6 +1313,66 @@ impl Design {
         Ok(())
     }
 
+    /// Read-only materialized-view detection for `reconcile`: for each design
+    /// matview, decide create/skip/warn against the live `dbd:hash` sentinels,
+    /// recording creates into `plan.matview_creates` and drift/unstamped notes
+    /// into `plan.warnings`. Returns the `(entity, want-hash)` pairs the write
+    /// pass should CREATE, so no second `matview_states()` fetch is needed.
+    async fn detect_reconcile_matviews<'a>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        desired_entities: &[&'a Entity],
+        plan: &mut crate::reconcile::ReconcilePlan,
+    ) -> Result<Vec<(&'a Entity, String)>> {
+        use crate::reconcile::{decide_matview_action, matview_hash, MatviewAction};
+        let matviews: Vec<&'a Entity> = desired_entities
+            .iter()
+            .copied()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .collect();
+        let mut mv_to_create: Vec<(&'a Entity, String)> = Vec::new();
+        if matviews.is_empty() {
+            return Ok(mv_to_create);
+        }
+        let states = adapter.matview_states().await?;
+        for &e in &matviews {
+            let want = matview_hash(e);
+            match decide_matview_action(&want, states.get(&e.name).cloned()) {
+                MatviewAction::Skip => {}
+                MatviewAction::Create => {
+                    plan.matview_creates.push(e.name.clone());
+                    mv_to_create.push((e, want));
+                }
+                MatviewAction::Warn => {
+                    // Detected drift, but dbd never auto-recreates a matview.
+                    // Surface it through the plan's warnings (the same channel
+                    // `dbd reconcile` prints for risky-change advisories).
+                    let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
+                    plan.warnings.push(if has_sentinel {
+                        format!(
+                            "materialized view {name}: definition differs from the deployed object \
+                             (dbd does not auto-recreate materialized views because that would \
+                             DROP … CASCADE and lose data/dependents). To apply the new \
+                             definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
+                             and re-run `dbd apply` to recreate it.",
+                            name = e.name,
+                            schema = e.schema.as_deref().unwrap_or("public"),
+                            bare = e.name.rsplit('.').next().unwrap_or(&e.name),
+                        )
+                    } else {
+                        format!(
+                            "materialized view {}: exists but is not stamped by dbd (cannot \
+                             verify its definition); recreate it under dbd management to enable \
+                             drift detection.",
+                            e.name
+                        )
+                    });
+                }
+            }
+        }
+        Ok(mv_to_create)
+    }
+
     /// Reconcile the live database to the desired schema in place (declarative).
     ///
     /// Introspects the target, diffs its tables/enums against the project, and
@@ -1400,51 +1460,10 @@ impl Design {
         // WARN and leave it untouched. Only the CREATE *writes* run after the
         // return; here we merely record the decisions into the plan and a local
         // `mv_to_create` list the write pass reuses (no second states fetch).
-        use crate::reconcile::{decide_matview_action, matview_create_sql, matview_hash, MatviewAction};
-        let matviews: Vec<&Entity> = desired_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        let mut mv_to_create: Vec<(&Entity, String)> = Vec::new();
-        if !matviews.is_empty() {
-            let states = adapter.matview_states().await?;
-            for &e in &matviews {
-                let want = matview_hash(e);
-                match decide_matview_action(&want, states.get(&e.name).cloned()) {
-                    MatviewAction::Skip => {}
-                    MatviewAction::Create => {
-                        plan.matview_creates.push(e.name.clone());
-                        mv_to_create.push((e, want));
-                    }
-                    MatviewAction::Warn => {
-                        // Detected drift, but dbd never auto-recreates a matview.
-                        // Surface it through the plan's warnings (the same channel
-                        // `dbd reconcile` prints for risky-change advisories).
-                        let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
-                        plan.warnings.push(if has_sentinel {
-                            format!(
-                                "materialized view {name}: definition differs from the deployed object \
-                                 (dbd does not auto-recreate materialized views because that would \
-                                 DROP … CASCADE and lose data/dependents). To apply the new \
-                                 definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
-                                 and re-run `dbd apply` to recreate it.",
-                                name = e.name,
-                                schema = e.schema.as_deref().unwrap_or("public"),
-                                bare = e.name.rsplit('.').next().unwrap_or(&e.name),
-                            )
-                        } else {
-                            format!(
-                                "materialized view {}: exists but is not stamped by dbd (cannot \
-                                 verify its definition); recreate it under dbd management to enable \
-                                 drift detection.",
-                                e.name
-                            )
-                        });
-                    }
-                }
-            }
-        }
+        use crate::reconcile::matview_create_sql;
+        let mv_to_create = self
+            .detect_reconcile_matviews(adapter, &desired_entities, &mut plan)
+            .await?;
 
         if dry_run {
             return Ok(plan);
