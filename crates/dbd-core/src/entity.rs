@@ -278,10 +278,11 @@ impl Entity {
             None => &parts,
         };
 
-        let entity_type = parts
-            .first()
-            .and_then(|s| EntityType::from_folder_name(s))
-            .unwrap_or(EntityType::Table);
+        // An unrecognized folder name (typo, unsupported kind) is recorded as an
+        // error on the entity rather than silently classified as a Table.
+        let folder = parts.first().copied().unwrap_or("");
+        let recognized_type = EntityType::from_folder_name(folder);
+        let entity_type = recognized_type.unwrap_or(EntityType::Table);
 
         let stem = path
             .file_stem()
@@ -301,6 +302,13 @@ impl Entity {
             (stem.to_string(), None)
         };
 
+        let mut errors = Vec::new();
+        if recognized_type.is_none() {
+            errors.push(format!(
+                "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
+            ));
+        }
+
         Self {
             entity_type,
             name,
@@ -310,7 +318,7 @@ impl Entity {
             refers: Vec::new(),
             references: Vec::new(),
             search_paths: Vec::new(),
-            errors: Vec::new(),
+            errors,
             warnings: Vec::new(),
             reads: Vec::new(),
             writes: Vec::new(),

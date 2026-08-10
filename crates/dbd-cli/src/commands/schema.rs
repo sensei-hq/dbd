@@ -45,7 +45,7 @@ pub async fn cmd_inspect(
     }
 
     // Report unresolved data.sql TODOs across all migration directories
-    let todos = design.data_sql_todos();
+    let todos = design.data_sql_todos()?;
     print_data_sql_todos(&todos);
 
     // Validate materialized-view refresh config (concurrently/unique-index,
@@ -202,7 +202,7 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
     for file in &files {
         let content = safe_read(project_dir, file)?;
@@ -470,7 +470,7 @@ pub async fn cmd_policies(
     verbosity: Verbosity,
 ) -> Result<()> {
     if dry_run {
-        let files = dbd_core::scanner::scan_policies(project_dir);
+        let files = dbd_core::scanner::scan_policies(project_dir)?;
         if files.is_empty() {
             output::info(verbosity, "No policy files found in policies/");
             return Ok(());
@@ -521,7 +521,7 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
 
     for file in &files {

@@ -97,7 +97,7 @@ pub struct ApplyResult {
 /// Refuse to apply while any pending migration still has unresolved `-- TODO:`
 /// lines in its `data.sql` files.
 fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
-    let todos = snapshot::pending_data_sql_todos(pending);
+    let todos = snapshot::pending_data_sql_todos(pending)?;
     if todos.is_empty() {
         return Ok(());
     }
@@ -228,7 +228,7 @@ pub async fn apply_policies(
     project_dir: &Path,
     dry_run: bool,
 ) -> Result<PolicyReport> {
-    let files = crate::scanner::scan_policies(project_dir);
+    let files = crate::scanner::scan_policies(project_dir)?;
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
@@ -354,20 +354,24 @@ impl Design {
 
         let design_config = config::read(config_path)?;
 
-        // Scan and parse DDL entities
-        let ddl_files = scanner::scan_ddl(&project_dir);
-        let mut entities: Vec<Entity> = ddl_files
-            .iter()
-            .filter_map(|file| {
-                let sql = std::fs::read_to_string(file).ok()?;
-                // Use relative path for entity type/name derivation, but
-                // store the absolute path so the file is readable regardless of CWD.
-                let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-                let mut entity = parser::parse_entity(relative, &sql).ok()?;
+        // Scan and parse DDL entities. A file that fails to read must not
+        // silently vanish from the desired set — a live table could be
+        // dropped by `reconcile --prune` — so propagate the read error.
+        // `parse_entity`'s own Err (unparseable DDL) still drops the entity,
+        // unchanged from prior behavior.
+        let ddl_files = scanner::scan_ddl(&project_dir)?;
+        let mut entities: Vec<Entity> = Vec::new();
+        for file in &ddl_files {
+            let sql = std::fs::read_to_string(file)
+                .map_err(|e| DbdError::Config(format!("read DDL {}: {e}", file.display())))?;
+            // Use relative path for entity type/name derivation, but
+            // store the absolute path so the file is readable regardless of CWD.
+            let relative = file.strip_prefix(&project_dir).unwrap_or(file);
+            if let Ok(mut entity) = parser::parse_entity(relative, &sql) {
                 entity.file = Some(file.clone());
-                Some(entity)
-            })
-            .collect();
+                entities.push(entity);
+            }
+        }
 
         // Add schema entities
         for schema_name in design_config.schema_names() {
@@ -445,7 +449,7 @@ impl Design {
 
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
-        let import_files = scanner::scan_import(&project_dir, Some(env));
+        let import_files = scanner::scan_import(&project_dir, Some(env))?;
         let import_tables: Vec<Entity> = import_files
             .iter()
             .map(|file| {
@@ -493,7 +497,7 @@ impl Design {
     ///
     /// Used by `inspect` to surface outstanding data corrections.
     /// `apply` independently blocks on PENDING migrations with TODOs.
-    pub fn data_sql_todos(&self) -> Vec<snapshot::DataSqlTodo> {
+    pub fn data_sql_todos(&self) -> Result<Vec<snapshot::DataSqlTodo>> {
         snapshot::scan_data_sql_todos(&self.project_dir)
     }
 
@@ -2161,7 +2165,7 @@ mod tests {
     fn p2_empty_policies_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -2169,7 +2173,7 @@ mod tests {
     fn p3_missing_policies_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         // No policies/ dir created
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -2181,7 +2185,7 @@ mod tests {
         std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
         std::fs::write(policies_dir.join("lookups.sql"), "-- policy").unwrap();
 
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert_eq!(files.len(), 2);
         // Should be sorted alphabetically
         let names: Vec<String> = files
@@ -2200,7 +2204,7 @@ mod tests {
         std::fs::write(policies_dir.join("readme.md"), "# docs").unwrap();
         std::fs::write(policies_dir.join("notes.txt"), "notes").unwrap();
 
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert_eq!(files.len(), 1, "only .sql/.ddl files should be discovered");
     }
 

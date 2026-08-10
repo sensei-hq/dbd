@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::diff::{self, ComplexChange, DiffAction, MigrationDiff};
 use crate::entity::{ColumnDef, Entity, EntityType, IndexDef, TableConstraint};
-use crate::error::Result;
+use crate::error::{DbdError, Result};
 
 const SNAPSHOTS_DIR: &str = "snapshots";
 const MIGRATIONS_DIR: &str = "migrations";
@@ -99,41 +99,44 @@ pub struct DataSqlTodo {
 
 /// Collect `*.data.sql` files in `dir` (non-recursive within the dir tree)
 /// that still contain `-- TODO:` lines, returning one entry per file.
-fn todos_in_migration_dir(version: u32, dir: &Path) -> Vec<DataSqlTodo> {
+///
+/// Fails loud: this backs the `apply` safety gate (`ensure_no_pending_todos`),
+/// which must fail CLOSED — a file that can't be walked or read propagates an
+/// error rather than being silently skipped (which would open the gate).
+fn todos_in_migration_dir(version: u32, dir: &Path) -> Result<Vec<DataSqlTodo>> {
     if !dir.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .to_string_lossy()
-                .ends_with(".data.sql")
-        })
-        .filter_map(|e| {
-            let content = std::fs::read_to_string(e.path()).ok()?;
-            let todo_lines: Vec<String> = content
-                .lines()
-                .filter(|line| {
-                    let t = line.trim();
-                    t.starts_with("-- TODO:") || t.starts_with("--TODO:")
-                })
-                .map(|l| l.trim().to_string())
-                .collect();
-            if todo_lines.is_empty() {
-                None
-            } else {
-                Some(DataSqlTodo {
-                    version,
-                    file: e.into_path(),
-                    lines: todo_lines,
-                })
-            }
-        })
-        .collect()
+    let mut result = Vec::new();
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry =
+            entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", dir.display())))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if !entry.path().to_string_lossy().ends_with(".data.sql") {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            .map_err(|e| DbdError::Config(format!("read {}: {e}", entry.path().display())))?;
+        let todo_lines: Vec<String> = content
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                t.starts_with("-- TODO:") || t.starts_with("--TODO:")
+            })
+            .map(|l| l.trim().to_string())
+            .collect();
+        if !todo_lines.is_empty() {
+            result.push(DataSqlTodo {
+                version,
+                file: entry.into_path(),
+                lines: todo_lines,
+            });
+        }
+    }
+    Ok(result)
 }
 
 /// Scan every migration directory under `project_dir/migrations/` for
@@ -141,15 +144,15 @@ fn todos_in_migration_dir(version: u32, dir: &Path) -> Vec<DataSqlTodo> {
 ///
 /// Returns one `DataSqlTodo` per file with outstanding TODOs, sorted by
 /// version then file path. An empty vec means all data migrations are clean.
-pub fn scan_data_sql_todos(project_dir: &Path) -> Vec<DataSqlTodo> {
+pub fn scan_data_sql_todos(project_dir: &Path) -> Result<Vec<DataSqlTodo>> {
     let migrations_root = project_dir.join(MIGRATIONS_DIR);
     if !migrations_root.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
 
-    let mut entries: Vec<_> = std::fs::read_dir(&migrations_root)
+    let mut entries: Vec<_> = std::fs::read_dir(&migrations_root) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
@@ -163,27 +166,29 @@ pub fn scan_data_sql_todos(project_dir: &Path) -> Vec<DataSqlTodo> {
             .to_string_lossy()
             .parse()
             .unwrap_or(0);
-        let mut found = todos_in_migration_dir(version, &entry.path());
+        let mut found = todos_in_migration_dir(version, &entry.path())?;
         found.sort_by(|a, b| a.file.cmp(&b.file));
         result.extend(found);
     }
 
-    result
+    Ok(result)
 }
 
 /// Check only the supplied PENDING migrations for unresolved `-- TODO:`
 /// comments in their `*.data.sql` files.
 ///
 /// Used by `apply()` to block execution until the developer resolves all
-/// data corrections that the migration requires.
-pub fn pending_data_sql_todos(pending: &[PendingMigration]) -> Vec<DataSqlTodo> {
+/// data corrections that the migration requires. Fails loud (see
+/// `todos_in_migration_dir`) so a `.data.sql` that can't be read aborts
+/// `apply` instead of silently letting the safety gate open.
+pub fn pending_data_sql_todos(pending: &[PendingMigration]) -> Result<Vec<DataSqlTodo>> {
     let mut result = Vec::new();
     for migration in pending {
-        let mut found = todos_in_migration_dir(migration.to_version, &migration.migration_dir);
+        let mut found = todos_in_migration_dir(migration.to_version, &migration.migration_dir)?;
         found.sort_by(|a, b| a.file.cmp(&b.file));
         result.extend(found);
     }
-    result
+    Ok(result)
 }
 
 // ── Snapshot I/O ────────────────────────────────────────
@@ -209,14 +214,18 @@ pub fn list_snapshots(dir: &Path) -> Vec<SnapshotInfo> {
             let name = entry.file_name().to_string_lossy().to_string();
             let version: u32 = name.trim_end_matches(".json").parse().ok()?;
             let file = entry.path();
+            // Both an I/O error AND a JSON-parse failure keep the entry with
+            // blank description/timestamp — the version number and path must
+            // never be silently dropped (next_version()/has_snapshots() rely
+            // on the entry surviving even when the file body is corrupt).
             let (description, timestamp) = match std::fs::read_to_string(&file) {
-                Ok(content) => {
-                    let snap: serde_json::Value = serde_json::from_str(&content).ok()?;
-                    (
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(snap) => (
                         snap["description"].as_str().unwrap_or("").to_string(),
                         snap["timestamp"].as_str().unwrap_or("").to_string(),
-                    )
-                }
+                    ),
+                    Err(_) => (String::new(), String::new()),
+                },
                 Err(_) => (String::new(), String::new()),
             };
             Some(SnapshotInfo {
@@ -2042,14 +2051,14 @@ mod tests {
     #[test]
     fn ds1_no_migrations_dir_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(scan_data_sql_todos(tmp.path()).is_empty());
+        assert!(scan_data_sql_todos(tmp.path()).unwrap().is_empty());
     }
 
     #[test]
     fn ds2_data_sql_without_todo_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
         make_data_sql(&tmp, 1, "UPDATE config.users SET name = old_name;\n");
-        assert!(scan_data_sql_todos(tmp.path()).is_empty());
+        assert!(scan_data_sql_todos(tmp.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -2061,7 +2070,7 @@ mod tests {
             "-- TODO: Data correction required for config.users.score.\n\
              -- Column type changed from JSONB to INTEGER.\n",
         );
-        let todos = scan_data_sql_todos(tmp.path());
+        let todos = scan_data_sql_todos(tmp.path()).unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].version, 2);
         assert_eq!(todos[0].lines.len(), 1);
@@ -2078,7 +2087,7 @@ mod tests {
         // v3 — also has TODO
         make_data_sql(&tmp, 3, "-- TODO: and this\n");
 
-        let todos = scan_data_sql_todos(tmp.path());
+        let todos = scan_data_sql_todos(tmp.path()).unwrap();
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].version, 2);
         assert_eq!(todos[1].version, 3);
@@ -2106,7 +2115,7 @@ mod tests {
             },
         ];
 
-        let todos = pending_data_sql_todos(&pending);
+        let todos = pending_data_sql_todos(&pending).unwrap();
         assert_eq!(todos.len(), 1, "only v3 is pending");
         assert_eq!(todos[0].version, 3);
     }
@@ -2122,7 +2131,7 @@ mod tests {
              -- Remaining: active, inactive\n\
              UPDATE config.users SET status = '???' WHERE status = 'deleted';\n",
         );
-        let todos = scan_data_sql_todos(tmp.path());
+        let todos = scan_data_sql_todos(tmp.path()).unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].lines.len(), 1, "only the TODO line is collected");
         assert!(todos[0].lines[0].contains("Map removed enum values"));
