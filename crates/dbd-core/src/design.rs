@@ -754,6 +754,33 @@ impl Design {
         )))
     }
 
+    /// Scope guard: refuse to operate under a scope different from the one this
+    /// database was pinned to. `meta` is the stored project meta (`None` on a
+    /// fresh database), `requested` is the resolved scope name for this run, and
+    /// `allow_scope_change` bypasses the guard (the next successful write re-pins
+    /// the DB). A database with no recorded scope (`meta.scope == None`) is
+    /// unpinned and never blocks — the current run pins it. Mirrors the prod
+    /// guard in [`Design::reset`]; invoked from the CLI write handlers.
+    pub fn check_scope_guard(
+        meta: Option<&crate::adapter::ProjectMeta>,
+        requested: &str,
+        allow_scope_change: bool,
+    ) -> Result<()> {
+        if allow_scope_change {
+            return Ok(());
+        }
+        if let Some(pinned) = meta.and_then(|m| m.scope.as_deref())
+            && pinned != requested
+        {
+            return Err(DbdError::SafetyGuard(format!(
+                "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
+                 Applying a different scope would build a divergent schema.\n\
+                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'."
+            )));
+        }
+        Ok(())
+    }
+
     /// Scan all migration directories for unresolved `-- TODO:` comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
@@ -2422,6 +2449,43 @@ mod tests {
 
     fn fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+    }
+
+    fn meta_with_scope(scope: Option<&str>) -> crate::adapter::ProjectMeta {
+        crate::adapter::ProjectMeta {
+            project: "p".to_string(),
+            env: "dev".to_string(),
+            version: 1,
+            scope: scope.map(|s| s.to_string()),
+            applied_at: None,
+        }
+    }
+
+    #[test]
+    fn scope_guard_allows_matching_scope() {
+        let m = meta_with_scope(Some("public"));
+        assert!(Design::check_scope_guard(Some(&m), "public", false).is_ok());
+    }
+
+    #[test]
+    fn scope_guard_blocks_mismatch() {
+        let m = meta_with_scope(Some("public"));
+        let err = Design::check_scope_guard(Some(&m), "internal", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn scope_guard_unpinned_never_blocks() {
+        let m = meta_with_scope(None);
+        assert!(Design::check_scope_guard(Some(&m), "internal", false).is_ok());
+        assert!(Design::check_scope_guard(None, "internal", false).is_ok());
+    }
+
+    #[test]
+    fn scope_guard_allow_scope_change_bypasses() {
+        let m = meta_with_scope(Some("public"));
+        assert!(Design::check_scope_guard(Some(&m), "internal", true).is_ok());
     }
 
     #[test]
