@@ -78,6 +78,16 @@ pub struct ApplyComplete {
     pub dropped: u32,
 }
 
+/// Running tallies accumulated while executing an apply plan's steps. Folded
+/// into [`ApplyComplete`] once the plan finishes.
+#[derive(Default)]
+struct ApplyCounts {
+    applied: u32,
+    migrated: u32,
+    created: u32,
+    dropped: u32,
+}
+
 /// Summary passed to the `on_complete` callback of `import_data()`.
 #[derive(Debug, Clone)]
 pub struct ImportComplete {
@@ -1083,11 +1093,8 @@ impl Design {
             adapter.ensure_migrations_table().await?;
         }
 
-        // Counters for on_complete summary
-        let mut count_applied: u32 = 0;
-        let mut count_migrated: u32 = 0;
-        let mut count_created: u32 = 0;
-        let mut count_dropped: u32 = 0;
+        // Running tallies for the on_complete summary.
+        let mut counts = ApplyCounts::default();
 
         // Build entity lookup for ApplyEntity / CreateEntity steps
         let entity_map: std::collections::HashMap<&str, &Entity> = self
@@ -1125,78 +1132,20 @@ impl Design {
         }
 
         // Execute plan steps inside an async block so a mid-plan error routes
-        // through rollback below rather than returning early.
+        // through rollback below rather than returning early. Each step's logic
+        // lives in `execute_plan_step`, keeping this a thin driver loop.
         let exec: Result<()> = async {
             for step in &plan.steps {
-                match step {
-                    ExecutionStep::CreateEntity(entity_name) => {
-                        if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                            let desc = format!("{}:{entity_name}", entity.entity_type.tag());
-                            on_start(&desc);
-                            let result = adapter.apply_entity(entity).await;
-                            report_step_result(&desc, &mut on_done, result)?;
-                            count_created += 1;
-                            count_applied += 1;
-                        }
-                    }
-                    ExecutionStep::ApplyEntity(entity_name) => {
-                        if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                            let desc = format!("{}:{entity_name}", entity.entity_type.tag());
-                            on_start(&desc);
-                            let result = adapter.apply_entity(entity).await;
-                            report_step_result(&desc, &mut on_done, result)?;
-                            count_applied += 1;
-                        }
-                    }
-                    ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                        let type_tag = entity_map.get(entity_name.as_str())
-                            .map(|e| e.entity_type.tag())
-                            .unwrap_or_else(|| "entity".to_string());
-                        let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
-                        on_start(&desc);
-                        let result: Result<()> = async {
-                            if migration_sql_path.exists() {
-                                let sql = std::fs::read_to_string(migration_sql_path)?;
-                                adapter.execute_script(&sql).await?;
-                            }
-                            let data_path = migration_sql_path.with_extension("data.sql");
-                            if data_path.exists() {
-                                let sql = std::fs::read_to_string(&data_path)?;
-                                adapter.execute_script(&sql).await?;
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        report_step_result(&desc, &mut on_done, result)?;
-                        count_migrated += 1;
-                    }
-                    ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                        let type_tag = entity_map.get(entity_name.as_str())
-                            .map(|e| e.entity_type.tag())
-                            .unwrap_or_else(|| "entity".to_string());
-                        let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
-                        on_start(&desc);
-                        let result: Result<()> = async {
-                            if drop_sql_path.exists() {
-                                let sql = std::fs::read_to_string(drop_sql_path)?;
-                                adapter.execute_script(&sql).await?;
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        report_step_result(&desc, &mut on_done, result)?;
-                        count_dropped += 1;
-                    }
-                    ExecutionStep::RecordMigration { version, checksum } => {
-                        let desc = format!("migration to v{version}");
-                        adapter.apply_migration(*version, "", &desc, checksum).await?;
-                    }
-                    ExecutionStep::SetVersion(version) => {
-                        adapter
-                            .set_project_meta(&self.env, *version, scope.map(|s| s.name.as_str()))
-                            .await?;
-                    }
-                }
+                self.execute_plan_step(
+                    adapter,
+                    step,
+                    &entity_map,
+                    scope,
+                    &mut counts,
+                    &mut on_start,
+                    &mut on_done,
+                )
+                .await?;
             }
             Ok(())
         }
@@ -1265,11 +1214,102 @@ impl Design {
             strategy: plan.strategy,
             from_version: db_version,
             to_version: latest_version,
-            applied: count_applied,
-            migrated: count_migrated,
-            created: count_created,
-            dropped: count_dropped,
+            applied: counts.applied,
+            migrated: counts.migrated,
+            created: counts.created,
+            dropped: counts.dropped,
         });
+        Ok(())
+    }
+
+    /// Execute one step of an apply execution plan: run its DDL/meta write via
+    /// `adapter`, report progress through `on_start`/`on_done`, and update
+    /// `counts`. Factored out of [`Design::apply`] so its plan loop stays a thin
+    /// driver.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_plan_step<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        step: &ExecutionStep,
+        entity_map: &std::collections::HashMap<&str, &Entity>,
+        scope: Option<&ResolvedScope>,
+        counts: &mut ApplyCounts,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        match step {
+            ExecutionStep::CreateEntity(entity_name) => {
+                if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                    let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+                    on_start(&desc);
+                    let result = adapter.apply_entity(entity).await;
+                    report_step_result(&desc, on_done, result)?;
+                    counts.created += 1;
+                    counts.applied += 1;
+                }
+            }
+            ExecutionStep::ApplyEntity(entity_name) => {
+                if let Some(entity) = entity_map.get(entity_name.as_str()) {
+                    let desc = format!("{}:{entity_name}", entity.entity_type.tag());
+                    on_start(&desc);
+                    let result = adapter.apply_entity(entity).await;
+                    report_step_result(&desc, on_done, result)?;
+                    counts.applied += 1;
+                }
+            }
+            ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
+                let type_tag = entity_map.get(entity_name.as_str())
+                    .map(|e| e.entity_type.tag())
+                    .unwrap_or_else(|| "entity".to_string());
+                let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
+                on_start(&desc);
+                let result: Result<()> = async {
+                    if migration_sql_path.exists() {
+                        let sql = std::fs::read_to_string(migration_sql_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                    let data_path = migration_sql_path.with_extension("data.sql");
+                    if data_path.exists() {
+                        let sql = std::fs::read_to_string(&data_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                report_step_result(&desc, on_done, result)?;
+                counts.migrated += 1;
+            }
+            ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
+                let type_tag = entity_map.get(entity_name.as_str())
+                    .map(|e| e.entity_type.tag())
+                    .unwrap_or_else(|| "entity".to_string());
+                let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
+                on_start(&desc);
+                let result: Result<()> = async {
+                    if drop_sql_path.exists() {
+                        let sql = std::fs::read_to_string(drop_sql_path)?;
+                        adapter.execute_script(&sql).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                report_step_result(&desc, on_done, result)?;
+                counts.dropped += 1;
+            }
+            ExecutionStep::RecordMigration { version, checksum } => {
+                let desc = format!("migration to v{version}");
+                adapter.apply_migration(*version, "", &desc, checksum).await?;
+            }
+            ExecutionStep::SetVersion(version) => {
+                adapter
+                    .set_project_meta(&self.env, *version, scope.map(|s| s.name.as_str()))
+                    .await?;
+            }
+        }
         Ok(())
     }
 
