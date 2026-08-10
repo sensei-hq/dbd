@@ -78,13 +78,12 @@ Because every successful write persists the current resolved scope, an overridde
 
 ### 4. The guard
 
-New helper on `Design`:
+New **pure associated function** on `Design` (no `self`, so it is trivially unit-testable and does not touch the core write-method signatures):
 
 ```rust
-fn check_scope_guard(
-    &self,
+pub fn check_scope_guard(
     meta: Option<&ProjectMeta>,
-    resolved_scope_name: &str,
+    requested: &str,
     allow_scope_change: bool,
 ) -> Result<()>
 ```
@@ -92,10 +91,12 @@ fn check_scope_guard(
 Logic:
 
 1. `allow_scope_change == true` → `Ok(())` (skip).
-2. `meta.scope == Some(pinned)` and `pinned != resolved_scope_name` → `Err(DbdError::SafetyGuard(msg))`.
+2. `meta.scope == Some(pinned)` and `pinned != requested` → `Err(DbdError::SafetyGuard(msg))`.
 3. Otherwise (`meta` absent, or `scope` is `None`, or it matches) → `Ok(())`; this write pins/keeps the scope.
 
-Reuses the existing `DbdError::SafetyGuard` variant (`error.rs:15`). The resolved scope name comes from `ResolvedScope.name` (`scope.rs:14`), produced by `Design::resolve_scope` (`design.rs:668`).
+Reuses the existing `DbdError::SafetyGuard` variant (`error.rs:15`). The resolved scope name comes from `ResolvedScope.name` (`scope.rs:17`), produced by `Design::resolve_scope` (`design.rs:668`).
+
+**Invocation (all four in the CLI handlers).** The guard is called from `cmd_apply`, `cmd_deploy`, `cmd_reconcile`, and `cmd_reset` — each already resolves the scope and holds the adapter, so it fetches `adapter.get_project_meta()` and calls `Design::check_scope_guard(...)` before invoking the core operation. This keeps the guard logic in core (one source of truth, unit-tested) **without** threading a new parameter through the heavily-called `Design::apply`/`deploy`/`reconcile`/`reset` signatures (and their ~30 existing test call sites). The user's framing — "the CLI bails with a helpful message" — matches CLI-level invocation. The prod guard remains where it is, inline in core `Design::reset`.
 
 **Error message:**
 
@@ -105,22 +106,24 @@ Applying a different scope would build a divergent schema.
 → re-run with --scope public, or pass --allow-scope-change to re-point this DB to 'internal'.
 ```
 
-### 5. Call sites
+### 5. Guard call sites (CLI handlers)
 
-The guard runs before any DDL, after the scope is resolved and meta is available:
+The guard runs before any DDL, after the scope is resolved and the adapter is connected. Each handler fetches `adapter.get_project_meta()` and calls `Design::check_scope_guard(meta.as_ref(), &resolved.name, <allow>)`:
 
-| Path | Location | Notes |
-|------|----------|-------|
-| `apply` | `design.rs:931` (after scope resolve `949`) | Primary write path. |
-| `deploy` | `design.rs:1841` | Inherits the guard through its call to `apply`; only needs the flag threaded in. |
-| `reconcile` | `design.rs:1207` (near gap-gate `1238`) | Diffs against live under the resolved scope. |
-| `reset` | `design.rs:1965` (alongside the existing prod guard `1974`) | See §6. |
+| Command | Handler | `<allow>` |
+|---------|---------|-----------|
+| `apply` | `cmd_apply` (`schema.rs:299`), after `get_adapter` (`schema.rs:341`) | `allow_scope_change` |
+| `deploy` | `cmd_deploy` (`project.rs:309`), after `get_adapter` (`project.rs:369`) | `allow_scope_change` |
+| `reconcile` | `cmd_reconcile` (`project.rs:453`), after the dry-run return | `allow_scope_change` |
+| `reset` | `cmd_reset` (`migration.rs:10`), before `design.reset` (`migration.rs:37`) | `force \|\| allow_scope_change` |
+
+Placing the call after each handler's dry-run early-return means dry runs are never blocked — the guard protects real writes only. The **pin** (§3) still lives in core, so a library caller of `Design::apply` records the scope even though the CLI owns the guard.
 
 ### 6. Reset specifics
 
-`reset` runs the scope guard alongside its existing prod/version guard, so a wrong-`--scope` teardown (which would drop the wrong schemas — or, with no `--scope`, everything) is refused. Bypass rule on reset: **`force || allow_scope_change`** skips the scope check (the existing `--force` already means "override all safety").
+`cmd_reset` runs the scope guard before `design.reset`, so a wrong-`--scope` teardown (which would drop the wrong schemas — or, with no `--scope`, everything) is refused. Bypass rule: **`force || allow_scope_change`** skips the scope check (the existing `--force` already means "override all safety"). The core `Design::reset` signature is unchanged; its prod/version guard stays inline.
 
-Because `reset` takes `version` back to `0`, it also clears the pin (`scope = NULL`) so the database returns to a clean unpinned state and the next `apply` re-pins fresh.
+**Pin handling on reset: unchanged (guard-only).** `reset` does not write `_dbd_meta` today — it only drops objects and clears `_dbd_migrations`, and it already leaves `_dbd_meta.version` intact. Clearing the scope pin would therefore be a new, larger, and inconsistent write path. Leaving the pin is also safer: a reset database is still "the `public` database", so a later `apply --scope internal` is still correctly refused. (This supersedes the earlier draft's "clear the pin on reset".)
 
 ### 7. CLI
 
@@ -144,12 +147,12 @@ Flag help text: `Allow this database to be re-pointed to a different scope (bypa
 | `crates/dbd-core/src/adapter/sqlite.rs` | Same, with `PRAGMA table_info` guard for the add-column |
 | `crates/dbd-core/src/adapter/convex.rs` | Same, in the sidecar meta document |
 | `crates/dbd-core/src/adapter/mock.rs` | Track/return `scope` in mock meta |
-| `crates/dbd-core/src/design.rs` | `check_scope_guard` helper; call it in `apply`/`reconcile`/`reset`; pass resolved scope to `set_project_meta` (`SetVersion` step + `diff_live`); clear pin on `reset` |
+| `crates/dbd-core/src/design.rs` | Pure `check_scope_guard` associated fn; pass resolved scope to `set_project_meta` at the two call sites (`SetVersion` step `1122`, reconcile tail `1474`). Core write signatures unchanged. |
 | `crates/dbd-cli/src/cli.rs` | `--allow-scope-change` on `Apply`/`Deploy`/`Reconcile`/`Reset` |
-| `crates/dbd-cli/src/commands/mod.rs` | Thread the flag to each handler |
-| `crates/dbd-cli/src/commands/schema.rs` | `cmd_apply` accepts + forwards the flag |
-| `crates/dbd-cli/src/commands/project.rs` | `cmd_deploy` / `cmd_reconcile` accept + forward the flag |
-| `crates/dbd-cli/src/commands/migration.rs` | `cmd_reset` accepts + forwards the flag; `force || allow_scope_change` bypass |
+| `crates/dbd-cli/src/commands/mod.rs` | Destructure + thread the flag to each handler |
+| `crates/dbd-cli/src/commands/schema.rs` | `cmd_apply` accepts the flag; fetch meta + call the guard before `design.apply` |
+| `crates/dbd-cli/src/commands/project.rs` | `cmd_deploy` / `cmd_reconcile` accept the flag; fetch meta + call the guard before the write |
+| `crates/dbd-cli/src/commands/migration.rs` | `cmd_reset` accepts the flag; call the guard (`force \|\| allow_scope_change`) before `design.reset` |
 | `docs/skills/dbd/*` + relevant docs | Document the scope guard and the `scope` meta field |
 
 ## Test Scenarios
@@ -196,12 +199,13 @@ When:  apply resolved scope "public"
 Then:  no guard error; meta.scope pinned to "public"
 ```
 
-### T7: Reset guard + pin clear
+### T7: Reset guard (pin left intact)
 ```
 Given: non-prod, version 0 meta pinned to scope "public"
 When:  reset with --scope internal, no --force / --allow-scope-change
 Then:  DbdError::SafetyGuard (scope mismatch); nothing dropped
-And:   reset with --scope public (or --force) succeeds; meta.scope cleared to NULL
+And:   reset with --scope public (or --force / --allow-scope-change) succeeds
+And:   meta.scope is unchanged ("public") — reset does not write _dbd_meta
 ```
 
 ### T8: Adapter meta round-trip
