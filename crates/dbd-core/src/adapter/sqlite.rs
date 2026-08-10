@@ -848,6 +848,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s8_meta_scope_backfills_on_legacy_table() {
+        let a = mem().await; // project = "test"
+        // Legacy `_dbd_meta` WITHOUT the `scope` column (pre-scope-guard schema).
+        a.execute_script(
+            "CREATE TABLE _dbd_meta ( \
+                project TEXT NOT NULL PRIMARY KEY, \
+                env TEXT NOT NULL DEFAULT 'dev', \
+                version INTEGER NOT NULL DEFAULT 0, \
+                created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')) )",
+        )
+        .await
+        .unwrap();
+        a.execute_script("INSERT INTO _dbd_meta (project, env, version) VALUES ('test', 'prod', 2)")
+            .await
+            .unwrap();
+
+        // Resilient read: prod guard still sees env/version; scope = None.
+        let m = a.get_project_meta().await.unwrap().expect("legacy meta reads");
+        assert_eq!(m.env, "prod");
+        assert_eq!(m.version, 2);
+        assert_eq!(m.scope, None);
+
+        // A write backfills the column and pins the scope.
+        a.set_project_meta("prod", 3, Some("public")).await.unwrap();
+        let m2 = a.get_project_meta().await.unwrap().unwrap();
+        assert_eq!(m2.scope.as_deref(), Some("public"));
+    }
+
+    #[tokio::test]
+    async fn s9_scope_guard_fires_against_real_pin() {
+        use crate::design::Design;
+        let a = mem().await; // project = "test"
+        a.ensure_meta_table().await.unwrap();
+        // Pin the DB to scope "public" through the real adapter round-trip.
+        a.set_project_meta("dev", 1, Some("public")).await.unwrap();
+        let meta = a.get_project_meta().await.unwrap();
+        assert_eq!(meta.as_ref().unwrap().scope.as_deref(), Some("public"));
+
+        // Same scope → allowed.
+        assert!(Design::check_scope_guard(meta.as_ref(), "public", false).is_ok());
+        // Different scope → blocked, message names both scopes.
+        let err = Design::check_scope_guard(meta.as_ref(), "internal", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
+        // Bypass → allowed.
+        assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
+    }
+
+    #[tokio::test]
     async fn s7_internal_tables_excluded_from_list() {
         let a = mem().await;
         a.ensure_meta_table().await.unwrap();
