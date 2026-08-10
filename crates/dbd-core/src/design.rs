@@ -1002,6 +1002,12 @@ impl Design {
             let count = valid_entities.len() as u32;
             let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
             adapter.apply_entities(&owned).await?;
+            // Batch adapters skip the execution plan (and its SetVersion step), so
+            // pin the applied scope here. Preserve the recorded version.
+            let db_version = adapter.get_db_version().await?;
+            adapter
+                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
+                .await?;
             on_complete(ApplyComplete {
                 strategy: ApplyStrategy::Current,
                 from_version: 0,
@@ -1169,6 +1175,19 @@ impl Design {
                 }
                 return Err(e);
             }
+        }
+
+        // The Current strategy (DB already at latest) emits no SetVersion step, so
+        // the scope would never be pinned/re-pinned on an up-to-date apply. Stamp it
+        // here — post-commit, alongside the matview sentinels — so every successful
+        // `apply`/`deploy` pins the applied scope (needed for `--allow-scope-change`
+        // re-pinning and for pinning pre-existing/legacy databases). Preserve the
+        // recorded version (`db_version`) to avoid downgrading it. Fresh/Migrate
+        // already pinned via their SetVersion step, so skip to avoid a double write.
+        if !plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))) {
+            adapter
+                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
+                .await?;
         }
 
         // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
@@ -2749,6 +2768,27 @@ mod tests {
 
         let meta = mock.get_project_meta().await.unwrap().expect("apply writes meta");
         assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
+    }
+
+    #[tokio::test]
+    async fn apply_repins_scope_on_current_strategy() {
+        // A DB already at/above the latest version takes the Current strategy,
+        // whose plan has no SetVersion step. The scope must still be (re)pinned.
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        // db_version 99 >= any fixture latest_version → Current strategy.
+        let mock = MockAdapter::new().with_meta("dev", 99).with_scope("public");
+        let resolved = design.resolve_scope(None, None).unwrap();
+
+        design
+            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+
+        let meta = mock.get_project_meta().await.unwrap().expect("meta");
+        // Re-pinned to the applied scope, and the version was preserved (not downgraded).
+        assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
+        assert_eq!(meta.version, 99);
     }
 
     #[tokio::test]
