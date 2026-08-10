@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::design::ApplyComplete;
+use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
 use super::{format_apply_summary, get_adapter, safe_read, safe_write};
@@ -354,9 +354,11 @@ pub async fn cmd_apply(
             name,
             false,
             Some(&resolved),
-            |desc| spinner.start(desc),
-            |desc, err| spinner.done(desc, err),
-            |s| apply_summary = Some(s),
+            Progress {
+                on_start: |desc: &str| spinner.start(desc),
+                on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
+                on_complete: |s| apply_summary = Some(s),
+            },
         )
         .await;
     spinner.finish();
