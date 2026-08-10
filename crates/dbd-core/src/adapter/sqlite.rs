@@ -432,43 +432,76 @@ impl DatabaseAdapter for SqliteAdapter {
                 project    TEXT NOT NULL PRIMARY KEY, \
                 env        TEXT NOT NULL DEFAULT 'dev', \
                 version    INTEGER NOT NULL DEFAULT 0, \
+                scope      TEXT, \
                 created_at TEXT NOT NULL DEFAULT (datetime('now')), \
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')) \
             )",
         )
+        .await?;
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` — add `scope` only when missing.
+        let has_scope = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'",
+        )
+        .fetch_one(&self.pool)
         .await
+        .unwrap_or(0)
+            > 0;
+        if !has_scope {
+            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT").await?;
+        }
+        Ok(())
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        let result = sqlx::query(
-            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
+        let with_scope = sqlx::query(
+            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
         )
         .bind(&self.project)
         .fetch_optional(&self.pool)
         .await;
 
-        match result {
+        match with_scope {
             Ok(Some(row)) => Ok(Some(ProjectMeta {
                 project: row.get("project"),
                 env: row.get("env"),
                 version: row.get::<i64, _>("version") as u32,
+                scope: row.try_get("scope").ok(),
                 applied_at: row.try_get("applied_at").ok(),
             })),
-            Ok(None) | Err(_) => Ok(None),
+            Ok(None) => Ok(None),
+            Err(_) => {
+                let legacy = sqlx::query(
+                    "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
+                )
+                .bind(&self.project)
+                .fetch_optional(&self.pool)
+                .await;
+                match legacy {
+                    Ok(Some(row)) => Ok(Some(ProjectMeta {
+                        project: row.get("project"),
+                        env: row.get("env"),
+                        version: row.get::<i64, _>("version") as u32,
+                        scope: None,
+                        applied_at: row.try_get("applied_at").ok(),
+                    })),
+                    _ => Ok(None),
+                }
+            }
         }
     }
 
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         self.ensure_meta_table().await?;
         sqlx::query(
-            "INSERT INTO _dbd_meta (project, env, version) \
-             VALUES (?1, ?2, ?3) \
+            "INSERT INTO _dbd_meta (project, env, version, scope) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT (project) DO UPDATE \
-             SET env = excluded.env, version = excluded.version, updated_at = datetime('now')",
+             SET env = excluded.env, version = excluded.version, scope = excluded.scope, updated_at = datetime('now')",
         )
         .bind(&self.project)
         .bind(env)
         .bind(version as i64)
+        .bind(scope)
         .execute(&self.pool)
         .await
         .map_err(|e| DbdError::Config(format!("Set project meta failed: {e}")))?;
@@ -807,7 +840,7 @@ mod tests {
         let a = mem().await;
         a.ensure_meta_table().await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 0);
-        a.set_project_meta("dev", 3).await.unwrap();
+        a.set_project_meta("dev", 3, None).await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 3);
         let m = a.get_project_meta().await.unwrap().unwrap();
         assert_eq!(m.env, "dev");
@@ -1116,7 +1149,7 @@ mod tests {
         assert_eq!(a.reverse_managed_version().await.unwrap(), None);
         // After dbd's meta table + a row for this project → managed at that version.
         a.ensure_meta_table().await.unwrap();
-        a.set_project_meta("prod", 3).await.unwrap();
+        a.set_project_meta("prod", 3, None).await.unwrap();
         assert_eq!(a.reverse_managed_version().await.unwrap(), Some(3));
     }
 }

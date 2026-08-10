@@ -2302,7 +2302,7 @@ async fn meta_table_heals_from_stray_schema_into_public() {
     // A write heals the location: relocate into `public` and upsert this project
     // to v8. This is exactly what reconcile/apply do at the end of a run.
     adapter
-        .set_project_meta("prod", 8)
+        .set_project_meta("prod", 8, None)
         .await
         .expect("set_project_meta should heal + upsert");
 

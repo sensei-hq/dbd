@@ -1119,7 +1119,9 @@ impl Design {
                         adapter.apply_migration(*version, "", &desc, checksum).await?;
                     }
                     ExecutionStep::SetVersion(version) => {
-                        adapter.set_project_meta(&self.env, *version).await?;
+                        adapter
+                            .set_project_meta(&self.env, *version, scope.map(|s| s.name.as_str()))
+                            .await?;
                     }
                 }
             }
@@ -1471,7 +1473,7 @@ impl Design {
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);
         adapter.ensure_meta_table().await?;
-        adapter.set_project_meta(&self.env, version).await?;
+        adapter.set_project_meta(&self.env, version, scope.map(|s| s.name.as_str())).await?;
 
         on_complete(summary);
         Ok(plan)
@@ -2667,6 +2669,22 @@ mod tests {
         // Fresh env with latest_version=0 still calls SetVersion(0) in Fresh strategy
         // which calls set_project_meta. Meta should exist.
         assert!(meta.is_some() || design.config().project.version.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_pins_resolved_scope() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+        let mock = MockAdapter::new();
+        let resolved = design.resolve_scope(None, None).unwrap();
+
+        design
+            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .await
+            .unwrap();
+
+        let meta = mock.get_project_meta().await.unwrap().expect("apply writes meta");
+        assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
     }
 
     #[tokio::test]
