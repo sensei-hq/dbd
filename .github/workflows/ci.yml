@@ -14,6 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Don't persist the GITHUB_TOKEN in .git/config — nothing here pushes
+          # or needs git auth after checkout (coverage uploads via its own token),
+          # so persisting it only risks leaking it into artifacts (zizmor artipacked).
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
