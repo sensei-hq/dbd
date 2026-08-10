@@ -200,12 +200,7 @@ fn push_migrate_steps_for(
 /// Path to a per-entity migration SQL file: `<dir>/<schema>/<table><suffix>`
 /// (or `<dir>/<table><suffix>` when the entity name is unqualified).
 fn migration_entity_sql_path(migration_dir: &Path, entity_name: &str, suffix: &str) -> PathBuf {
-    let parts: Vec<&str> = entity_name.split('.').collect();
-    let (schema, table) = if parts.len() > 1 {
-        (Some(parts[0]), parts[1])
-    } else {
-        (None, parts[0])
-    };
+    let (schema, table) = crate::entity::split_qualified_name(entity_name);
     match schema {
         Some(s) => migration_dir.join(s).join(format!("{table}{suffix}")),
         None => migration_dir.join(format!("{table}{suffix}")),

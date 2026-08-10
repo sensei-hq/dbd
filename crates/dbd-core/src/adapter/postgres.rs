@@ -307,12 +307,7 @@ impl PostgresAdapter {
     /// PostgreSQL's CREATE TYPE fails if the type already exists.
     /// Wrap in a DO block that checks pg_type first.
     async fn apply_enum(&self, entity: &Entity, sql: &str) -> Result<()> {
-        let parts: Vec<&str> = entity.name.split('.').collect();
-        let (schema, type_name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, type_name) = split_qualified(&entity.name);
 
         // Check if the type already exists
         let exists = sqlx::query(
@@ -1177,7 +1172,7 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()> {
         if dry_run {
             return Ok(());
         }
@@ -1195,8 +1190,16 @@ impl DatabaseAdapter for PostgresAdapter {
         match format {
             "csv" | "tsv" => {
                 let delimiter = if format == "tsv" { ", DELIMITER E'\\t'" } else { "" };
+                // Postgres CSV COPY's default NULL is the empty unquoted string,
+                // which already matches today's behavior — only add the clause
+                // when a non-empty sentinel is configured.
+                let null_clause = if null_value.is_empty() {
+                    String::new()
+                } else {
+                    format!(", NULL '{}'", null_value.replace('\'', "''"))
+                };
                 let copy_sql = format!(
-                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter})"
+                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})"
                 );
                 let mut conn = self.pool.acquire().await
                     .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
@@ -1277,12 +1280,7 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         // Resolve the bare table name (strip any `schema.` prefix).
-        let parts: Vec<&str> = entity.name.split('.').collect();
-        let (schema, name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, name) = split_qualified(&entity.name);
 
         // `Some(dir)` → write `dir/<name>.<format>` (flat).
         // `None`      → folder convention `export/<schema>/<name>.<format>`.
@@ -1427,12 +1425,7 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn resolve_entity(&self, name: &str) -> Result<Option<String>> {
-        let parts: Vec<&str> = name.split('.').collect();
-        let (schema, entity_name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, entity_name) = split_qualified(name);
 
         // Check tables/views
         let result = sqlx::query(
@@ -1645,8 +1638,11 @@ impl DatabaseAdapter for PostgresAdapter {
                 let version: i32 = row.get("version");
                 Ok(version as u32)
             }
+            // `bookkeeping_schema` already confirmed the table exists, so a read
+            // error here is real (transient failure, permission) — surface it
+            // rather than masking a live DB's version as 0 and misplanning apply.
             Ok(None) => Ok(0),
-            Err(_) => Ok(0), // Table doesn't exist yet
+            Err(e) => Err(DbdError::Config(format!("read _dbd_meta version failed: {e}"))),
         }
     }
 
@@ -1804,6 +1800,10 @@ impl DatabaseAdapter for PostgresAdapter {
         .map_err(|e| DbdError::Config(format!("Set project meta failed: {e}")))?;
 
         Ok(())
+    }
+
+    fn supports_schema_grants(&self) -> bool {
+        true
     }
 
     // ── Batch transaction (atomic apply) ───────────────

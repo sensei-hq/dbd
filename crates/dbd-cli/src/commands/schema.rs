@@ -45,7 +45,7 @@ pub async fn cmd_inspect(
     }
 
     // Report unresolved data.sql TODOs across all migration directories
-    let todos = design.data_sql_todos();
+    let todos = design.data_sql_todos()?;
     print_data_sql_todos(&todos);
 
     // Validate materialized-view refresh config (concurrently/unique-index,
@@ -202,7 +202,7 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
     for file in &files {
         let content = safe_read(project_dir, file)?;
@@ -372,28 +372,46 @@ pub async fn cmd_apply(
     // `Design::apply`, so `dbd apply` and `dbd deploy` both schedule refresh
     // jobs through the shared path (no CLI-side sync call needed here).
 
-    // Run grants if target has grants config
-    if let Some((target_name, target_config)) = design.config().target.iter().next()
-        && let Some(ref grants) = target_config.grants
-    {
-            let schema_grants: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
-                grants.iter().map(|(schema, gc)| {
-                    (schema.clone(), gc.roles.clone())
-                }).collect();
+    // Grants: universal `schemas:` `WithGrants` entries apply regardless of
+    // target; the chosen target's `grants:` config merges on top of them —
+    // per schema, target role entries add to / override the universal ones
+    // for that role.
+    let mut schema_grants = design.config().schema_grants();
+    let mut supabase_schemas: Vec<String> = vec![];
+    if let Some((target_name, target_config)) = design.config().target.iter().next() {
+        if let Some(ref grants) = target_config.grants {
+            for (schema, gc) in grants {
+                schema_grants
+                    .entry(schema.clone())
+                    .or_default()
+                    .extend(gc.roles.clone());
+            }
+        }
+        // PostgREST USAGE grants ride along only when the user configured some
+        // grants, so a no-grants Supabase apply stays a no-op (as it was before
+        // universal `schemas:` grants existed).
+        if target_name == "supabase" && !schema_grants.is_empty() {
+            supabase_schemas = design.config().schema_names();
+        }
+    }
 
-            let supabase_schemas = if target_name == "supabase" {
-                design.config().schema_names()
-            } else {
-                vec![]
-            };
-
-            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
+    // Grants are Postgres/Supabase DDL. Skip cleanly on targets without a grant
+    // model (SQLite, Convex) rather than feeding them SQL they can't run — a
+    // cross-target design may declare schema grants yet apply to any target.
+    if !schema_grants.is_empty() {
+        if adapter.supports_schema_grants() {
+            if let Some(grants_sql) =
+                dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas)
+            {
                 output::info(verbosity, "Applying grants...");
                 adapter.execute_script(&grants_sql).await
                     .context("Failed to apply grants")?;
                 output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
             }
+        } else {
+            output::info(verbosity, "Skipping schema grants (target has no grant model).");
         }
+    }
 
     // Apply RLS policies if requested
     if with_policies {
@@ -470,7 +488,7 @@ pub async fn cmd_policies(
     verbosity: Verbosity,
 ) -> Result<()> {
     if dry_run {
-        let files = dbd_core::scanner::scan_policies(project_dir);
+        let files = dbd_core::scanner::scan_policies(project_dir)?;
         if files.is_empty() {
             output::info(verbosity, "No policy files found in policies/");
             return Ok(());
@@ -521,7 +539,7 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir);
+    let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
 
     for file in &files {

@@ -189,13 +189,7 @@ impl Design {
         // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
         // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
         // databases (and non-Postgres targets) without the extension.
-        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
-            .collect();
-        adapter.sync_refresh_jobs(&mv_jobs).await?;
+        adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
         (progress.on_complete)(ApplyComplete {
             strategy: plan.strategy,

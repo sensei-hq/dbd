@@ -9,7 +9,6 @@ pub use generate::{generate_migration_sql, migration_warnings};
 pub use types::*;
 
 #[cfg(test)]
-#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::entity::{ColumnDef, EntityType, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, SortOrder, TableConstraint};
