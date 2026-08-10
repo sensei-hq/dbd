@@ -372,28 +372,32 @@ pub async fn cmd_apply(
     // `Design::apply`, so `dbd apply` and `dbd deploy` both schedule refresh
     // jobs through the shared path (no CLI-side sync call needed here).
 
-    // Run grants if target has grants config
-    if let Some((target_name, target_config)) = design.config().target.iter().next()
-        && let Some(ref grants) = target_config.grants
-    {
-            let schema_grants: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
-                grants.iter().map(|(schema, gc)| {
-                    (schema.clone(), gc.roles.clone())
-                }).collect();
-
-            let supabase_schemas = if target_name == "supabase" {
-                design.config().schema_names()
-            } else {
-                vec![]
-            };
-
-            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
-                output::info(verbosity, "Applying grants...");
-                adapter.execute_script(&grants_sql).await
-                    .context("Failed to apply grants")?;
-                output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+    // Grants: universal `schemas:` `WithGrants` entries apply regardless of
+    // target; the chosen target's `grants:` config merges on top of them —
+    // per schema, target role entries add to / override the universal ones
+    // for that role.
+    let mut schema_grants = design.config().schema_grants();
+    let mut supabase_schemas: Vec<String> = vec![];
+    if let Some((target_name, target_config)) = design.config().target.iter().next() {
+        if let Some(ref grants) = target_config.grants {
+            for (schema, gc) in grants {
+                schema_grants
+                    .entry(schema.clone())
+                    .or_default()
+                    .extend(gc.roles.clone());
             }
         }
+        if target_name == "supabase" {
+            supabase_schemas = design.config().schema_names();
+        }
+    }
+
+    if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
+        output::info(verbosity, "Applying grants...");
+        adapter.execute_script(&grants_sql).await
+            .context("Failed to apply grants")?;
+        output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+    }
 
     // Apply RLS policies if requested
     if with_policies {
