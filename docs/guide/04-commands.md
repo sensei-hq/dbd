@@ -33,6 +33,17 @@ dbd inspect -s ~/projects/mydb            # Explicit local path
 dbd inspect -s sensei-hq/daemon/database  # GitHub repo
 ```
 
+### Scope guard
+
+The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of `_dbd_meta`. Any later `apply`, `deploy`, `reconcile`, or `reset` that requests a *different* scope is refused:
+
+```
+scope guard: this database is pinned to scope 'public', but you requested 'internal'.
+Applying a different scope would build a divergent schema.
+```
+
+This stops a mistyped or forgotten `--scope` from building a half-formed, divergent schema in the wrong database. To legitimately re-point a database to a new scope, pass **`--allow-scope-change`** on the write command — the run then re-pins the database to the new scope (`reset --force` also bypasses the check). To host multiple modules in one database, define a scope in `design.yaml` that includes them rather than switching back and forth. Databases created before this feature are unpinned and pin on their next write.
+
 ---
 
 ## `dbd inspect`
@@ -69,6 +80,8 @@ dbd apply -d postgres://...        # Explicit database URL
 **Apply order:** schemas → extensions → roles → enums → tables → views → materialized views → functions/procedures.
 
 **Materialized views.** After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any matview it just created and **syncs pg_cron refresh jobs** to match the `materialized_views:` config (jobs named `dbd:refresh:<schema>.<name>`; requires the `pg_cron` extension when a schedule is set). Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`) so a re-`apply` is safe.
+
+**Scope guard.** `apply` (like `deploy`/`reconcile`) refuses to run under a different scope than the database is pinned to, and pins the scope on every successful run. Pass `--allow-scope-change` to re-point the database — see [Scope guard](#scope-guard).
 
 ---
 
@@ -190,11 +203,11 @@ dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 
 ## `dbd reset`
 
-Drop the project's own managed objects so you can re-`apply` from scratch. Guarded by the `_dbd_meta` environment check.
+Drop the project's own managed objects so you can re-`apply` from scratch. Guarded by the `_dbd_meta` environment check **and** the [scope guard](#scope-guard) — a wrong-`--scope` reset (which would drop the wrong objects) is refused.
 
 ```sh
 dbd reset                          # Blocked if prod or version >= 1
-dbd reset --force                  # Override safety guard
+dbd reset --force                  # Override safety guards (env + scope)
 dbd reset --dry-run                # Show what would be dropped
 dbd reset --schemas                # Also DROP SCHEMA for managed schemas
 dbd reset --extensions             # Also DROP EXTENSION for configured extensions
@@ -210,7 +223,7 @@ dbd reset --scope hub --dry-run    # Only the objects the 'hub' scope occupies
 - `--extensions` — also `DROP EXTENSION … CASCADE` for each extension in the target's `extensions:` config.
 - `--clean` — shorthand for `--schemas --extensions`.
 
-**Scope-aware.** `--scope` restricts the reset to the objects (and, with `--schemas`, the schemas) the scope's working set occupies. Roles are dropped only on a full reset; a subset scope leaves shared roles intact.
+**Scope-aware.** `--scope` restricts the reset to the objects (and, with `--schemas`, the schemas) the scope's working set occupies. Roles are dropped only on a full reset; a subset scope leaves shared roles intact. A reset whose `--scope` differs from the database's pinned scope is refused unless you pass `--allow-scope-change` (or `--force`) — see [Scope guard](#scope-guard).
 
 ---
 
