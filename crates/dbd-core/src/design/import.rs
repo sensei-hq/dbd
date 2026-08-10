@@ -197,10 +197,22 @@ impl Design {
 
         let mut count = 0;
         for entry in plan {
-            let fmt = entry.table.format.as_deref().unwrap_or("csv");
-            let desc = format!("import {} ({})", entry.table.name, fmt);
+            // A per-table `format` override forces that parser regardless of the
+            // file extension; clone the entity only when an override applies.
+            let overridden;
+            let table = match self.config.import.table_format(&entry.table.name) {
+                Some(fmt) if entry.table.format.as_deref() != Some(fmt) => {
+                    let mut t = entry.table.clone();
+                    t.format = Some(fmt.to_string());
+                    overridden = t;
+                    &overridden
+                }
+                _ => &entry.table,
+            };
+            let fmt = table.format.as_deref().unwrap_or("csv");
+            let desc = format!("import {} ({})", table.name, fmt);
             on_start(&desc);
-            let result = if dry_run { Ok(()) } else { adapter.import_data(&entry.table, false).await };
+            let result = if dry_run { Ok(()) } else { adapter.import_data(table, false).await };
             report_step_result(&desc, on_done, result)?;
             count += 1;
         }

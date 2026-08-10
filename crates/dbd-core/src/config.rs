@@ -246,6 +246,20 @@ impl ImportConfig {
             })
             .unwrap_or(self.options.truncate)
     }
+
+    /// Per-table `format` override (`staging.x: { format: tsv }`), if set —
+    /// forces that parser regardless of the data file's extension.
+    pub fn table_format(&self, table_name: &str) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => {
+                    map.values().next().and_then(|o| o.format.as_deref())
+                }
+                ImportTableEntry::Name(_) => None,
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn import_table_truncate_override() {
+    fn import_table_overrides() {
         let yaml = r#"
 project:
   name: test
@@ -673,14 +687,20 @@ import:
     - staging.keep
     - staging.no_truncate:
         truncate: false
+    - staging.tsv:
+        format: tsv
 "#;
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
-        // A per-table `truncate: false` override wins over the global `truncate: true`.
+        // truncate: a per-table `truncate: false` wins over the global `truncate: true`;
+        // bare-name / unlisted tables inherit the global.
         assert!(!config.import.table_truncate("staging.no_truncate"));
-        // A bare-name entry inherits the global setting.
         assert!(config.import.table_truncate("staging.keep"));
-        // An unlisted table inherits the global setting.
         assert!(config.import.table_truncate("staging.other"));
+        // format: a per-table override is returned; otherwise None (fall back to the
+        // file extension at load time).
+        assert_eq!(config.import.table_format("staging.tsv"), Some("tsv"));
+        assert_eq!(config.import.table_format("staging.keep"), None);
+        assert_eq!(config.import.table_format("staging.other"), None);
     }
 
     #[test]
