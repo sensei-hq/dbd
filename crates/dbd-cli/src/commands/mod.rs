@@ -44,8 +44,8 @@ pub async fn run(
             project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
         }
 
-        Commands::Apply { name, dry_run, with_policies } => {
-            schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, scope, deps, verbosity).await
+        Commands::Apply { name, dry_run, with_policies, allow_scope_change } => {
+            schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, *allow_scope_change, scope, deps, verbosity).await
         }
 
         Commands::Import { name, file, dry_run } => {
@@ -56,10 +56,10 @@ pub async fn run(
             }
         }
 
-        Commands::Reset { target, dry_run, force, schemas, extensions, clean } => {
+        Commands::Reset { target, dry_run, force, schemas, extensions, clean, allow_scope_change } => {
             let drop_schemas = *schemas || *clean;
             let drop_extensions = *extensions || *clean;
-            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, drop_schemas, drop_extensions, scope, deps, verbosity).await
+            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, drop_schemas, drop_extensions, *allow_scope_change, scope, deps, verbosity).await
         }
 
         Commands::Snapshot { list, name } => {
@@ -79,8 +79,8 @@ pub async fn run(
             }
         }
 
-        Commands::Deploy { dry_run, no_cache, clear_cache } => {
-            project::cmd_deploy(source, config, env, database_url, *dry_run, *no_cache, *clear_cache, scope, deps, verbosity).await
+        Commands::Deploy { dry_run, no_cache, clear_cache, allow_scope_change } => {
+            project::cmd_deploy(source, config, env, database_url, *dry_run, *no_cache, *clear_cache, *allow_scope_change, scope, deps, verbosity).await
         }
 
         Commands::Export { name, format, output } => {
@@ -182,8 +182,8 @@ pub async fn run(
             diff::cmd_diff(config, env, project_dir, database_url, *json, *exit_code, scope, deps, verbosity).await
         }
 
-        Commands::Reconcile { dry_run, allow_destructive, prune } => {
-            project::cmd_reconcile(config, env, project_dir, database_url, *dry_run, *allow_destructive, *prune, scope, deps, verbosity).await
+        Commands::Reconcile { dry_run, allow_destructive, prune, allow_scope_change } => {
+            project::cmd_reconcile(config, env, project_dir, database_url, *dry_run, *allow_destructive, *prune, *allow_scope_change, scope, deps, verbosity).await
         }
 
         Commands::Release { name } => {

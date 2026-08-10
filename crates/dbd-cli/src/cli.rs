@@ -77,6 +77,10 @@ pub enum Commands {
         /// Also apply RLS policies after entities
         #[arg(long)]
         with_policies: bool,
+        /// Allow this database to be re-pointed to a different scope
+        /// (bypasses the scope guard).
+        #[arg(long)]
+        allow_scope_change: bool,
     },
     /// Combine all DDL into one file
     Combine {
@@ -142,6 +146,10 @@ pub enum Commands {
         /// Remove the entire download cache before deploying
         #[arg(long)]
         clear_cache: bool,
+        /// Allow this database to be re-pointed to a different scope
+        /// (bypasses the scope guard).
+        #[arg(long)]
+        allow_scope_change: bool,
     },
     /// Create a versioned schema snapshot
     Snapshot {
@@ -179,6 +187,10 @@ pub enum Commands {
         /// Shorthand for --schemas --extensions
         #[arg(long)]
         clean: bool,
+        /// Allow this database to be re-pointed to a different scope
+        /// (bypasses the scope guard).
+        #[arg(long)]
+        allow_scope_change: bool,
     },
     /// Audit design.yaml for stale entries
     Doctor {
@@ -293,6 +305,10 @@ pub enum Commands {
         /// Drop orphaned tables — those in a managed schema but no longer in the design
         #[arg(long)]
         prune: bool,
+        /// Allow this database to be re-pointed to a different scope
+        /// (bypasses the scope guard).
+        #[arg(long)]
+        allow_scope_change: bool,
     },
     /// Release the current version: write a baseline snapshot and lock in the
     /// snapshot/migration workflow (disables `reconcile`)
@@ -429,7 +445,7 @@ mod tests {
         assert!(
             matches!(
                 &cli.command,
-                Commands::Reconcile { dry_run: false, allow_destructive: false, prune: false }
+                Commands::Reconcile { dry_run: false, allow_destructive: false, prune: false, .. }
             ),
             "expected reconcile flags == false when absent"
         );
@@ -440,10 +456,37 @@ mod tests {
         assert!(
             matches!(
                 &cli.command,
-                Commands::Reconcile { dry_run: true, allow_destructive: true, prune: true }
+                Commands::Reconcile { dry_run: true, allow_destructive: true, prune: true, .. }
             ),
             "expected reconcile flags == true when present"
         );
+    }
+
+    /// `--allow-scope-change` parses on every write subcommand and defaults false.
+    #[test]
+    fn allow_scope_change_flag_parses() {
+        for c in ["apply", "deploy", "reconcile", "reset"] {
+            let on = Cli::try_parse_from(["dbd", c, "--allow-scope-change"])
+                .unwrap_or_else(|e| panic!("`dbd {c} --allow-scope-change` failed: {e}"));
+            let flag = match &on.command {
+                Commands::Apply { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Deploy { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Reconcile { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Reset { allow_scope_change, .. } => *allow_scope_change,
+                _ => unreachable!(),
+            };
+            assert!(flag, "{c} --allow-scope-change should be true");
+
+            let off = Cli::try_parse_from(["dbd", c]).unwrap();
+            let flag_off = match &off.command {
+                Commands::Apply { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Deploy { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Reconcile { allow_scope_change, .. } => *allow_scope_change,
+                Commands::Reset { allow_scope_change, .. } => *allow_scope_change,
+                _ => unreachable!(),
+            };
+            assert!(!flag_off, "{c} allow_scope_change should default false");
+        }
     }
 
     /// `dbd release` parses, and `dbd baseline` is accepted as a visible alias.
