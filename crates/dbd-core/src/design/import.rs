@@ -17,7 +17,7 @@ impl Design {
             .import_tables
             .iter()
             .filter(|t| t.errors.is_empty())
-            .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
+            .filter(|t| name.is_none_or(|n| t.name == n))
             .collect();
 
         // Collect all procedures that are candidates for import (in staging schemas)

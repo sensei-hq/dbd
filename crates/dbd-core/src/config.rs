@@ -261,7 +261,7 @@ pub struct ImportOptions {
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            truncate: true,
+            truncate: default_true(),
             null_value: String::new(),
             format: default_csv(),
         }
@@ -487,10 +487,10 @@ impl Default for FormatConfig {
         Self {
             keyword_case: KeywordCase::Lower,
             comma_style: CommaStyle::Leading,
-            type_alignment: 27,
-            indent: 2,
+            type_alignment: default_type_alignment(),
+            indent: default_indent(),
             query_style: QueryStyle::River,
-            gutter: 10,
+            gutter: default_gutter(),
         }
     }
 }

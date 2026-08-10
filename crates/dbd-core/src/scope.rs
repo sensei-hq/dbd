@@ -35,7 +35,7 @@ pub struct ScopeGap {
 }
 
 /// Entity types a scope can select (schemas handled separately via auto-add).
-fn is_scopable(e: &Entity) -> bool {
+pub(crate) fn is_scopable(e: &Entity) -> bool {
     matches!(
         e.entity_type,
         EntityType::Enum

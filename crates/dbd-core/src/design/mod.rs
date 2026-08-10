@@ -529,21 +529,9 @@ impl Design {
             }
         }
 
-        let mut dropped = 0usize;
-        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
-            for entity in entities {
-                entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
-                    Some(name) if resolved.contains(name) => {
-                        *dropped += 1;
-                        false
-                    }
-                    _ => true,
-                });
-            }
-        };
-        drop_in(&mut self.entities, &mut dropped);
-        drop_in(&mut self.import_tables, &mut dropped);
-        Ok(dropped)
+        Ok(Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
+            resolved.contains(name)
+        }))
     }
 
     /// Capture the full set of user-defined entities (tables, views, enums)
@@ -573,29 +561,43 @@ impl Design {
     /// (regardless of whether any warnings matched), or `Ok((0, None))`
     /// when no cache file exists.
     pub fn resolve_unknown_refs_via_cache(&mut self) -> Result<(usize, Option<usize>)> {
-        const PREFIX: &str = "Unresolved reference: ";
-
         let cache = match RefCache::load(&self.project_dir)? {
             Some(c) => c,
             None => return Ok((0, None)),
         };
         let size = cache.len();
 
+        let dropped = Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
+            cache.contains(name)
+        });
+        Ok((dropped, Some(size)))
+    }
+
+    /// Drop "Unresolved reference: NAME" warnings from `entities` and
+    /// `import_tables` whose NAME satisfies `is_resolved`. Returns the count
+    /// dropped. Shared by `resolve_unknown_refs_via_db` (live DB resolution)
+    /// and `resolve_unknown_refs_via_cache` (ref-cache snapshot).
+    fn drop_resolved_ref_warnings(
+        entities: &mut [Entity],
+        import_tables: &mut [Entity],
+        is_resolved: impl Fn(&str) -> bool,
+    ) -> usize {
+        const PREFIX: &str = "Unresolved reference: ";
         let mut dropped = 0usize;
-        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
-            for entity in entities {
+        let mut drop_in = |ents: &mut [Entity]| {
+            for entity in ents.iter_mut() {
                 entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
-                    Some(name) if cache.contains(name) => {
-                        *dropped += 1;
+                    Some(name) if is_resolved(name) => {
+                        dropped += 1;
                         false
                     }
                     _ => true,
                 });
             }
         };
-        drop_in(&mut self.entities, &mut dropped);
-        drop_in(&mut self.import_tables, &mut dropped);
-        Ok((dropped, Some(size)))
+        drop_in(entities);
+        drop_in(import_tables);
+        dropped
     }
 
     /// Validate all entities and return self for chaining.
@@ -616,6 +618,18 @@ impl Design {
         self
     }
 
+    /// Entities (main + import tables) matching `has_items`, optionally narrowed
+    /// to a single entity by `name`. Shared by `report()`'s `issues`/`warnings`
+    /// collections, which differ only in `has_items`.
+    fn filtered_entities(&self, name: Option<&str>, has_items: impl Fn(&Entity) -> bool) -> Vec<Entity> {
+        self.entities
+            .iter()
+            .chain(self.import_tables.iter())
+            .filter(|e| has_items(e) && name.is_none_or(|n| e.name == n))
+            .cloned()
+            .collect()
+    }
+
     /// Generate a validation report, optionally filtered to one entity by
     /// `name` and augmented with dependency gaps when a `scope` is supplied.
     pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report {
@@ -625,23 +639,8 @@ impl Design {
 
         let entity = name.and_then(|n| self.entities.iter().find(|e| e.name == n).cloned());
 
-        let issues: Vec<Entity> = self
-            .entities
-            .iter()
-            .chain(self.import_tables.iter())
-            .filter(|e| !e.errors.is_empty())
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .cloned()
-            .collect();
-
-        let warnings: Vec<Entity> = self
-            .entities
-            .iter()
-            .chain(self.import_tables.iter())
-            .filter(|e| !e.warnings.is_empty())
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .cloned()
-            .collect();
+        let issues = self.filtered_entities(name, |e| !e.errors.is_empty());
+        let warnings = self.filtered_entities(name, |e| !e.warnings.is_empty());
 
         let gaps = match scope {
             Some(s) => crate::scope::analyze_gaps(s, &self.entities, &self.external_names()),
@@ -684,17 +683,7 @@ impl Design {
         name: Option<&str>,
         scope: Option<&ResolvedScope>,
     ) -> Result<dependency::GraphResult> {
-        let graphable = |e: &Entity| {
-            matches!(
-                e.entity_type,
-                EntityType::Table
-                    | EntityType::View
-                    | EntityType::MaterializedView
-                    | EntityType::Function
-                    | EntityType::Procedure
-                    | EntityType::Enum
-            )
-        };
+        let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
@@ -707,6 +696,21 @@ impl Design {
             None => self.entities.iter().filter(|e| graphable(e)).cloned().collect(),
         };
         Ok(dependency::graph_from_entities(&non_meta, name))
+    }
+
+    /// Every materialized view's qualified name paired with its resolved
+    /// refresh-job config, across the WHOLE design (not scope-filtered).
+    ///
+    /// Used to feed `adapter.sync_refresh_jobs`, which unschedules every
+    /// `dbd:refresh:%` job absent from the set it is given — so callers must
+    /// pass the full set even from a scoped operation, or out-of-scope
+    /// matviews' jobs would be unscheduled. Shared by `apply` and `reconcile`.
+    pub(crate) fn all_matview_jobs(&self) -> Vec<(String, crate::config::ResolvedMatview)> {
+        self.entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect()
     }
 }
 

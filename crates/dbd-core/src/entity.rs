@@ -106,6 +106,33 @@ pub enum FkAction {
     NoAction,
 }
 
+impl FkAction {
+    /// DBML FK action keyword for this action (used in `delete:`/`update:` settings).
+    pub fn as_dbml(&self) -> &'static str {
+        match self {
+            FkAction::Cascade => "cascade",
+            FkAction::Restrict => "restrict",
+            FkAction::SetNull => "set null",
+            FkAction::SetDefault => "set default",
+            FkAction::NoAction => "no action",
+        }
+    }
+
+    /// Map a DBML FK action keyword to an [`FkAction`]. `no action` → `Some(FkAction::NoAction)`
+    /// (matches the exporter, which emits the keyword; the round-trip keeps `NoAction`
+    /// distinguishable from "no FK action specified").
+    pub fn from_dbml(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cascade" => Some(FkAction::Cascade),
+            "restrict" => Some(FkAction::Restrict),
+            "set null" => Some(FkAction::SetNull),
+            "set default" => Some(FkAction::SetDefault),
+            "no action" => Some(FkAction::NoAction),
+            _ => None,
+        }
+    }
+}
+
 /// Table-level constraint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -301,30 +328,16 @@ impl Entity {
             (stem.to_string(), None)
         };
 
-        let mut errors = Vec::new();
+        let mut entity = Self::new(entity_type, &name);
+        entity.schema = schema;
+        entity.file = Some(path.to_path_buf());
+        entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
-            errors.push(format!(
+            entity.errors.push(format!(
                 "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
             ));
         }
-
-        Self {
-            entity_type,
-            name,
-            schema,
-            file: Some(path.to_path_buf()),
-            format: Some(ext.to_string()),
-            refers: Vec::new(),
-            references: Vec::new(),
-            search_paths: Vec::new(),
-            errors,
-            warnings: Vec::new(),
-            reads: Vec::new(),
-            writes: Vec::new(),
-            table_def: None,
-            enum_values: Vec::new(),
-            raw_ddl: None,
-        }
+        entity
     }
 
     /// Create a schema entity.
@@ -381,25 +394,11 @@ impl Entity {
             (stem.to_string(), None)
         };
 
-        
-
-        Self {
-            entity_type: EntityType::Import,
-            name,
-            schema,
-            file: Some(path.to_path_buf()),
-            format: Some(ext.to_string()),
-            refers: Vec::new(),
-            references: Vec::new(),
-            search_paths: Vec::new(),
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            reads: Vec::new(),
-            writes: Vec::new(),
-            table_def: None,
-            enum_values: Vec::new(),
-            raw_ddl: None,
-        }
+        let mut entity = Self::new(EntityType::Import, &name);
+        entity.schema = schema;
+        entity.file = Some(path.to_path_buf());
+        entity.format = Some(ext.to_string());
+        entity
     }
 
     /// Whether this entity has validation errors.
