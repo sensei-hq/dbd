@@ -18,7 +18,6 @@ pub enum EntityType {
     Procedure,
     External,
     Import,
-    Export,
 }
 
 /// Entity types that live under a schema (file path: ddl/<type>/<schema>/<name>.ddl)

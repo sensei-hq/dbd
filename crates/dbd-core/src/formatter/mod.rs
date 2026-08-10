@@ -181,16 +181,8 @@ fn format_parsed_statements(
         }
     }
 
-    // For SET, COMMENT ON, and other statements: regex-based formatting
-    let upper = original.trim().to_uppercase();
-    if upper.starts_with("SET") {
-        return format_set_statement(original, config);
-    }
-    if upper.starts_with("COMMENT") {
-        return format_comment_on(original, config);
-    }
-
-    // Fallback: keyword case transformation
+    // Fallback: keyword case transformation (also covers SET and COMMENT ON,
+    // which need no special-case handling beyond this).
     let result = apply_keyword_case(original, &config.keyword_case);
     ensure_semicolon(&result)
 }

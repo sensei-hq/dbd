@@ -315,22 +315,10 @@ fn migrate_import_section(
         new_import.insert(val("options"), serde_yaml::Value::Mapping(new_options));
     }
 
-    // tables, after — pass through, skipping nulls
-    if let Some(tables) = import.get(val("tables"))
-        && !tables.is_null()
-    {
-        new_import.insert(val("tables"), tables.clone());
-    }
-    if let Some(after) = import.get(val("after"))
-        && !after.is_null()
-    {
-        new_import.insert(val("after"), after.clone());
-    }
-
-    // Pass through any other import keys (env-specific after, schemas, etc.)
+    // Pass through any other import keys (tables, after, schemas, etc.)
     for (key, value) in import {
         let key_str = key.as_str().unwrap_or("");
-        if ["options", "tables", "after", "staging"].contains(&key_str) {
+        if ["options", "staging"].contains(&key_str) {
             continue; // Already handled
         }
         if !value.is_null() {
