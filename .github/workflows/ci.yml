@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: the job only checks out, builds/tests, and uploads coverage
+# via its own token (QLTY_COVERAGE_TOKEN) — it needs no write access to the repo.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test + clippy + coverage
