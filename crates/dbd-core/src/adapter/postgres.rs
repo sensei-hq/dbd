@@ -1749,23 +1749,32 @@ impl DatabaseAdapter for PostgresAdapter {
                 applied_at: row.try_get("applied_at").ok(),
             })),
             Ok(None) => Ok(None),
-            Err(_) => {
-                let legacy = sqlx::query(&format!(
+            // A legacy `_dbd_meta` (which `bookkeeping_schema` above confirmed
+            // exists) lacks the `scope` column → SQLSTATE 42703 (undefined_column):
+            // read the legacy shape in that one case. Any OTHER error is real (a
+            // transient failure, permission issue, etc.) and must surface —
+            // swallowing it to `None` would silently disable the scope AND prod
+            // guards.
+            Err(e) => {
+                let undefined_column =
+                    e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42703");
+                if !undefined_column {
+                    return Err(DbdError::Config(format!("read _dbd_meta failed: {e}")));
+                }
+                let row = sqlx::query(&format!(
                     "SELECT project, env, version, updated_at::text as applied_at FROM \"{quoted}\"._dbd_meta WHERE project = $1"
                 ))
                 .bind(&self.project)
                 .fetch_optional(&self.pool)
-                .await;
-                match legacy {
-                    Ok(Some(row)) => Ok(Some(ProjectMeta {
-                        project: row.get("project"),
-                        env: row.get("env"),
-                        version: row.get::<i32, _>("version") as u32,
-                        scope: None,
-                        applied_at: row.try_get("applied_at").ok(),
-                    })),
-                    _ => Ok(None),
-                }
+                .await
+                .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+                Ok(row.map(|row| ProjectMeta {
+                    project: row.get("project"),
+                    env: row.get("env"),
+                    version: row.get::<i32, _>("version") as u32,
+                    scope: None,
+                    applied_at: row.try_get("applied_at").ok(),
+                }))
             }
         }
     }
