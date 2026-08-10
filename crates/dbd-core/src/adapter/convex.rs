@@ -858,6 +858,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cv_convex_has_no_grant_model() {
+        // Convex can't execute SQL; the apply path must skip grant emission for
+        // it rather than hand it Postgres GRANT DDL.
+        let tmp = tempdir().unwrap();
+        assert!(!ConvexAdapter::new(tmp.path(), "test").supports_schema_grants());
+    }
+
+    #[tokio::test]
     async fn cv6_apply_entities_writes_schema_ts() {
         let tmp = tempdir().unwrap();
         let adapter = ConvexAdapter::new(tmp.path(), "test");

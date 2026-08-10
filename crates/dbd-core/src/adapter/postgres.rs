@@ -1802,6 +1802,10 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
+    fn supports_schema_grants(&self) -> bool {
+        true
+    }
+
     // ── Batch transaction (atomic apply) ───────────────
 
     fn supports_transactional_apply(&self) -> bool {

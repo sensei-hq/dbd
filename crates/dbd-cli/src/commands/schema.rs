@@ -387,16 +387,30 @@ pub async fn cmd_apply(
                     .extend(gc.roles.clone());
             }
         }
-        if target_name == "supabase" {
+        // PostgREST USAGE grants ride along only when the user configured some
+        // grants, so a no-grants Supabase apply stays a no-op (as it was before
+        // universal `schemas:` grants existed).
+        if target_name == "supabase" && !schema_grants.is_empty() {
             supabase_schemas = design.config().schema_names();
         }
     }
 
-    if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
-        output::info(verbosity, "Applying grants...");
-        adapter.execute_script(&grants_sql).await
-            .context("Failed to apply grants")?;
-        output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+    // Grants are Postgres/Supabase DDL. Skip cleanly on targets without a grant
+    // model (SQLite, Convex) rather than feeding them SQL they can't run — a
+    // cross-target design may declare schema grants yet apply to any target.
+    if !schema_grants.is_empty() {
+        if adapter.supports_schema_grants() {
+            if let Some(grants_sql) =
+                dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas)
+            {
+                output::info(verbosity, "Applying grants...");
+                adapter.execute_script(&grants_sql).await
+                    .context("Failed to apply grants")?;
+                output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+            }
+        } else {
+            output::info(verbosity, "Skipping schema grants (target has no grant model).");
+        }
     }
 
     // Apply RLS policies if requested

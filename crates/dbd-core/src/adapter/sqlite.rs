@@ -782,6 +782,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s_sqlite_has_no_grant_model() {
+        // SQLite has no GRANT; the apply path must skip grant emission for it
+        // rather than feed it Postgres-only DDL.
+        assert!(!mem().await.supports_schema_grants());
+    }
+
+    #[tokio::test]
     async fn s1_apply_table_then_list_entities() {
         let a = mem().await;
         a.execute_script("CREATE TABLE foo (id INTEGER PRIMARY KEY, name TEXT)")
