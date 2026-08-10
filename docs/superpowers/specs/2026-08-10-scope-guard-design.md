@@ -222,7 +222,17 @@ When:  reconcile / deploy with resolved scope "internal", no override
 Then:  DbdError::SafetyGuard before any DDL
 ```
 
+## Post-review corrections
+
+Two issues found in holistic review and fixed before merge:
+
+1. **Pin on every apply strategy (not just `SetVersion`).** The pin was initially wired only into the `SetVersion` execution step, which the **Current** strategy (`plan_current`, chosen when the DB is already at the latest version) and the batch/Convex short-circuit never emit. So `apply`/`deploy` on an up-to-date DB re-applied DDL without re-pinning — meaning `--allow-scope-change` could leave a stale pin over a divergent schema. Fixed by stamping the resolved scope after a successful `apply` whenever the plan had no `SetVersion` step (preserving the existing `db_version`, not downgrading it), and in the batch branch. Fresh/Migrate still pin via `SetVersion` (guarded to avoid a double write). Regression test: `apply_repins_scope_on_current_strategy`.
+
+2. **`get_project_meta` fails closed.** The resilient read initially collapsed *any* error to `Ok(None)`, which would silently disable both the scope guard and the prod guard on a transient DB error. Now it only falls back to the legacy (no-`scope`-column) shape for the specific missing-column case — Postgres SQLSTATE `42703`; SQLite via a `pragma_table_info` probe (empty ⇒ fresh DB ⇒ `Ok(None)`) — and propagates every other error. Test: `s10_get_meta_on_fresh_db_is_none` plus the legacy-backfill tests.
+
 ## Open / Deferred
 
 - No change to the `scope` value semantics for `all` — pinning to `all` and later requesting a subset is a mismatch (intentional: forces an explicit `--allow-scope-change`).
 - `doctor` could later surface the pinned scope and warn on drift; out of scope for this change beyond documenting the field.
+- Handler signatures accumulate positional `bool`s (`cmd_reset` has five); a grouping struct would remove transposition risk on the safety-relevant `allow_scope_change`. Deferred — pre-existing style, correctly wired here.
+- `design.rs`'s large functions (`apply`, `reconcile`, `diff_live`, `import_data`) carry pre-existing high-complexity smells (flagged by `qlty smells`, present before this branch). Decomposing them is a separate effort, not bundled into this feature.
