@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::error::{DbdError, Result};
+
 /// Allowed DDL file extensions.
 const DDL_EXTENSIONS: &[&str] = &["ddl", "sql"];
 
@@ -11,32 +13,38 @@ const IMPORT_EXTENSIONS: &[&str] = &["csv", "tsv", "json", "jsonl"];
 const POLICY_EXTENSIONS: &[&str] = &["ddl", "sql"];
 
 /// Scan a directory recursively and return all file paths matching the given extensions.
-fn scan_with_extensions(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+///
+/// Fails loud: a `WalkDir` iterator error (permission denied, broken symlink, …)
+/// aborts the scan instead of silently dropping the offending file/subtree.
+fn scan_with_extensions(root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     if !root.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    WalkDir::new(root)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| extensions.contains(&ext))
-        })
-        .map(|entry| entry.into_path())
-        .collect()
+    let mut files = Vec::new();
+    for entry in WalkDir::new(root) {
+        let entry = entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", root.display())))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let matches_ext = entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| extensions.contains(&ext));
+        if matches_ext {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
 }
 
 /// Scan the `ddl/` folder for DDL files (.ddl, .sql).
-pub fn scan_ddl(root: &Path) -> Vec<PathBuf> {
+pub fn scan_ddl(root: &Path) -> Result<Vec<PathBuf>> {
     let ddl_dir = root.join("ddl");
-    let mut files = scan_with_extensions(&ddl_dir, DDL_EXTENSIONS);
+    let mut files = scan_with_extensions(&ddl_dir, DDL_EXTENSIONS)?;
     files.sort();
-    files
+    Ok(files)
 }
 
 /// Scan the `import/` folder for data files (.csv, .tsv, .json, .jsonl).
@@ -50,57 +58,62 @@ pub fn scan_ddl(root: &Path) -> Vec<PathBuf> {
 ///
 /// This lets projects keep shared seed data in `import/staging/` and
 /// environment-specific fixtures in `import/dev/staging/` or `import/prod/staging/`.
-pub fn scan_import(root: &Path, env: Option<&str>) -> Vec<PathBuf> {
+pub fn scan_import(root: &Path, env: Option<&str>) -> Result<Vec<PathBuf>> {
     let import_dir = root.join("import");
     if !import_dir.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let mut files: Vec<PathBuf> = WalkDir::new(&import_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| IMPORT_EXTENSIONS.contains(&x))
-        })
-        .filter(|e| {
-            let relative = match e.path().strip_prefix(&import_dir) {
-                Ok(r) => r,
-                Err(_) => return false,
-            };
-            // Count directories between import/ and the file.
-            let parent_depth = relative.parent().map(|p| p.components().count()).unwrap_or(0);
-            if parent_depth <= 1 {
-                // import/file or import/{schema}/file — always included
-                true
-            } else {
-                // import/{env}/{schema}/file — include only when env matches
-                match env {
-                    None => true,
-                    Some(target) => relative
-                        .iter()
-                        .next()
-                        .and_then(|c| c.to_str())
-                        .is_some_and(|first| first == target),
-                }
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&import_dir) {
+        let entry = entry
+            .map_err(|e| DbdError::Config(format!("scan {}: {e}", import_dir.display())))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let matches_ext = entry
+            .path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| IMPORT_EXTENSIONS.contains(&x));
+        if !matches_ext {
+            continue;
+        }
+        let relative = match entry.path().strip_prefix(&import_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Count directories between import/ and the file.
+        let parent_depth = relative.parent().map(|p| p.components().count()).unwrap_or(0);
+        let include = if parent_depth <= 1 {
+            // import/file or import/{schema}/file — always included
+            true
+        } else {
+            // import/{env}/{schema}/file — include only when env matches
+            match env {
+                None => true,
+                Some(target) => relative
+                    .iter()
+                    .next()
+                    .and_then(|c| c.to_str())
+                    .is_some_and(|first| first == target),
             }
-        })
-        .map(|e| e.into_path())
-        .collect();
+        };
+        if include {
+            files.push(entry.into_path());
+        }
+    }
 
     files.sort();
-    files
+    Ok(files)
 }
 
 /// Scan the `policies/` folder for policy files (.ddl, .sql).
-pub fn scan_policies(root: &Path) -> Vec<PathBuf> {
+pub fn scan_policies(root: &Path) -> Result<Vec<PathBuf>> {
     let policies_dir = root.join("policies");
-    let mut files = scan_with_extensions(&policies_dir, POLICY_EXTENSIONS);
+    let mut files = scan_with_extensions(&policies_dir, POLICY_EXTENSIONS)?;
     files.sort();
-    files
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -149,7 +162,7 @@ mod tests {
     #[test]
     fn scan_ddl_finds_all_ddl_and_sql_files() {
         let tmp = create_test_project();
-        let files = scan_ddl(tmp.path());
+        let files = scan_ddl(tmp.path()).unwrap();
 
         assert_eq!(files.len(), 6);
         let names: Vec<&str> = files
@@ -169,7 +182,7 @@ mod tests {
     #[test]
     fn scan_ddl_returns_empty_when_no_ddl_dir() {
         let tmp = TempDir::new().unwrap();
-        let files = scan_ddl(tmp.path());
+        let files = scan_ddl(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -177,7 +190,7 @@ mod tests {
     fn scan_import_finds_data_files() {
         let tmp = create_test_project();
         // No env filter: all data files returned
-        let files = scan_import(tmp.path(), None);
+        let files = scan_import(tmp.path(), None).unwrap();
 
         assert_eq!(files.len(), 3);
         let names: Vec<&str> = files
@@ -194,7 +207,7 @@ mod tests {
     #[test]
     fn scan_import_returns_empty_when_no_import_dir() {
         let tmp = TempDir::new().unwrap();
-        let files = scan_import(tmp.path(), None);
+        let files = scan_import(tmp.path(), None).unwrap();
         assert!(files.is_empty());
     }
 
@@ -202,7 +215,7 @@ mod tests {
     fn scan_import_env_includes_matching_env() {
         let tmp = create_test_project();
         // env="dev": depth-1 files + import/dev/** included; import/prod/** excluded
-        let files = scan_import(tmp.path(), Some("dev"));
+        let files = scan_import(tmp.path(), Some("dev")).unwrap();
 
         let names: Vec<&str> = files
             .iter()
@@ -220,7 +233,7 @@ mod tests {
     fn scan_import_env_excludes_other_envs() {
         let tmp = create_test_project();
         // env="prod": import/dev/** excluded, only depth-1 files returned
-        let files = scan_import(tmp.path(), Some("prod"));
+        let files = scan_import(tmp.path(), Some("prod")).unwrap();
 
         let names: Vec<&str> = files
             .iter()
@@ -235,7 +248,7 @@ mod tests {
     #[test]
     fn scan_policies_finds_policy_files() {
         let tmp = create_test_project();
-        let files = scan_policies(tmp.path());
+        let files = scan_policies(tmp.path()).unwrap();
 
         assert_eq!(files.len(), 1);
         let names: Vec<&str> = files
@@ -248,14 +261,14 @@ mod tests {
     #[test]
     fn scan_policies_returns_empty_when_no_policies_dir() {
         let tmp = TempDir::new().unwrap();
-        let files = scan_policies(tmp.path());
+        let files = scan_policies(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
     #[test]
     fn scan_results_are_sorted() {
         let tmp = create_test_project();
-        let files = scan_ddl(tmp.path());
+        let files = scan_ddl(tmp.path()).unwrap();
         let sorted: Vec<PathBuf> = {
             let mut v = files.clone();
             v.sort();
