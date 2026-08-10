@@ -1,6 +1,6 @@
 use crate::config::DbmlDocConfig;
 use crate::entity::{
-    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexDef, TableConstraint, TableDef,
+    ColumnDef, Entity, EntityType, ForeignKey, IndexDef, TableConstraint, TableDef,
 };
 
 /// Parameters for DBML generation.
@@ -471,10 +471,10 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
 
     let mut settings = Vec::new();
     if let Some(action) = &fk.on_delete {
-        settings.push(format!("delete: {}", fk_action_str(action)));
+        settings.push(format!("delete: {}", action.as_dbml()));
     }
     if let Some(action) = &fk.on_update {
-        settings.push(format!("update: {}", fk_action_str(action)));
+        settings.push(format!("update: {}", action.as_dbml()));
     }
 
     let settings_str = if settings.is_empty() {
@@ -587,16 +587,6 @@ fn emit_external_stub_block(
     lines.join("\n")
 }
 
-fn fk_action_str(action: &FkAction) -> &'static str {
-    match action {
-        FkAction::Cascade => "cascade",
-        FkAction::Restrict => "restrict",
-        FkAction::SetNull => "set null",
-        FkAction::SetDefault => "set default",
-        FkAction::NoAction => "no action",
-    }
-}
-
 fn quote_default(value: &str) -> String {
     let trimmed = value.trim();
     // Booleans
@@ -642,7 +632,7 @@ fn quote_dbml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{EnumValue, IndexColumn, TableComments};
+    use crate::entity::{EnumValue, FkAction, IndexColumn, TableComments};
 
     fn make_table_entity(name: &str, columns: Vec<ColumnDef>, constraints: Vec<TableConstraint>) -> Entity {
         let mut entity = Entity::new(EntityType::Table, name);

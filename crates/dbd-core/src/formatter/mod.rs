@@ -358,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn f10b_comment_on_escaped_quote_in_literal() {
+        // The literal contains a SQL-escaped quote (`''`); the scanner must not
+        // treat it as closing the string, or `AND` below would be seen as
+        // outside the literal and the literal itself would be corrupted.
+        let input = "COMMENT ON TABLE lookups IS\n'It''s a generic AND lookup table.';";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(
+            result.contains("comment on table"),
+            "COMMENT ON should be lowercased, got: {result}"
+        );
+        assert!(
+            result.contains("It''s a generic AND lookup table."),
+            "Literal content (including the escaped quote and the keyword-like \
+             word `AND` inside it) should be preserved verbatim, got: {result}"
+        );
+    }
+
+    #[test]
     fn f11_default_config() {
         let config = FormatConfig::default();
         assert!(matches!(config.keyword_case, KeywordCase::Lower));

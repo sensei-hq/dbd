@@ -50,16 +50,20 @@ pub(in crate::formatter) fn sql_keywords() -> HashSet<&'static str> {
 /// Apply keyword case transformation to a SQL string.
 ///
 /// Preserves quoted identifiers and string literals.
-/// Copy the rest of a single-quoted literal (opening quote already emitted),
-/// honoring `\`-escapes, into `result`.
+/// Copy the rest of a single-quoted literal (opening quote already emitted)
+/// into `result`, honoring `''` (SQL escaped-quote) the same way
+/// `split::scan_single_quoted` does — a lone `'` closes the literal.
 pub(in crate::formatter) fn copy_single_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, result: &mut String) {
-    let mut escaped = false;
-    for ch in chars.by_ref() {
+    while let Some(ch) = chars.next() {
         result.push(ch);
-        if ch == '\'' && !escaped {
+        if ch == '\'' {
+            // `''` escape stays inside the string; a lone `'` closes it.
+            if chars.peek() == Some(&'\'') {
+                result.push(chars.next().unwrap());
+                continue;
+            }
             break;
         }
-        escaped = ch == '\\';
     }
 }
 

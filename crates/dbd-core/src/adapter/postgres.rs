@@ -307,12 +307,7 @@ impl PostgresAdapter {
     /// PostgreSQL's CREATE TYPE fails if the type already exists.
     /// Wrap in a DO block that checks pg_type first.
     async fn apply_enum(&self, entity: &Entity, sql: &str) -> Result<()> {
-        let parts: Vec<&str> = entity.name.split('.').collect();
-        let (schema, type_name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, type_name) = split_qualified(&entity.name);
 
         // Check if the type already exists
         let exists = sqlx::query(
@@ -1277,12 +1272,7 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         // Resolve the bare table name (strip any `schema.` prefix).
-        let parts: Vec<&str> = entity.name.split('.').collect();
-        let (schema, name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, name) = split_qualified(&entity.name);
 
         // `Some(dir)` → write `dir/<name>.<format>` (flat).
         // `None`      → folder convention `export/<schema>/<name>.<format>`.
@@ -1427,12 +1417,7 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn resolve_entity(&self, name: &str) -> Result<Option<String>> {
-        let parts: Vec<&str> = name.split('.').collect();
-        let (schema, entity_name) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else {
-            ("public", parts[0])
-        };
+        let (schema, entity_name) = split_qualified(name);
 
         // Check tables/views
         let result = sqlx::query(
