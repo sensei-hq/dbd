@@ -17,6 +17,7 @@ pub async fn cmd_reset(
     force: bool,
     drop_schemas: bool,
     drop_extensions: bool,
+    allow_scope_change: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -34,6 +35,8 @@ pub async fn cmd_reset(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
     design.reset(&*adapter, target, force, drop_schemas, drop_extensions, Some(&resolved)).await?;
     Ok(())
 }
@@ -184,7 +187,7 @@ mod tests {
         cmd_reset(
             &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
             "dev", /*dry_run*/ true, /*force*/ false, /*drop_schemas*/ false,
-            /*drop_extensions*/ false, None, None, Verbosity::Normal,
+            /*drop_extensions*/ false, /*allow_scope_change*/ false, None, None, Verbosity::Normal,
         )
         .await
         .unwrap();

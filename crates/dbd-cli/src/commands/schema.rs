@@ -304,6 +304,7 @@ pub async fn cmd_apply(
     name: Option<&str>,
     dry_run: bool,
     with_policies: bool,
+    allow_scope_change: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -339,6 +340,11 @@ pub async fn cmd_apply(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+
+    // Scope guard: refuse an apply under a different scope than this DB was
+    // pinned to (unless the operator opted in to re-point it).
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut apply_summary: Option<ApplyComplete> = None;
@@ -592,7 +598,8 @@ mod tests {
     async fn apply_dry_run_lists_entities() {
         cmd_apply(
             &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, None, None, Verbosity::Normal,
+            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -678,8 +685,8 @@ mod tests {
     async fn apply_dry_run_lists_entities_for_named_scope() {
         cmd_apply(
             &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, Some("config_only"), None,
-            Verbosity::Normal,
+            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
+            Some("config_only"), None, Verbosity::Normal,
         )
         .await
         .unwrap();
