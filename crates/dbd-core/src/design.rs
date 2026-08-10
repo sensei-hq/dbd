@@ -730,6 +730,63 @@ impl Design {
             .collect())
     }
 
+    /// Resolve a scope to its working set, running the `report`-policy gap gate
+    /// first (aborts before any write). `None`/all-scope ⇒ `Ok(None)` (no
+    /// filtering). Shared by `apply`, `reconcile`, and `diff_live`.
+    fn scope_working_set(
+        &self,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<Option<std::collections::HashSet<String>>> {
+        match scope {
+            Some(s) if !s.is_all => {
+                self.check_scope_gaps(s)?;
+                Ok(Some(self.working_set(s)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Valid, non-external entities kept under `scope`'s working set, optionally
+    /// narrowed to a single entity `name`. Shared by `apply` (which passes a
+    /// `name`) and `reconcile`/`diff_live` (which pass `None`).
+    fn entities_in_scope(
+        &self,
+        scope: Option<&ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+        name: Option<&str>,
+    ) -> Vec<&Entity> {
+        self.entities
+            .iter()
+            .filter(|e| e.errors.is_empty())
+            .filter(|e| e.entity_type != EntityType::External)
+            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .filter(|e| match (working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
+    /// name; anything else → its `schema` (or the default schema). Shared by
+    /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
+    fn managed_schemas(desired: &[&Entity]) -> std::collections::HashSet<String> {
+        desired
+            .iter()
+            .map(|e| match e.entity_type {
+                EntityType::Schema => e.name.clone(),
+                _ => {
+                    let s = e.schema.clone().unwrap_or_default();
+                    if s.is_empty() {
+                        crate::reconcile::DEFAULT_SCHEMA.to_string()
+                    } else {
+                        s
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Under `report` policy, error if the scope has dependency gaps (an in-scope
     /// entity that references a managed entity outside the scope). No-op for the
     /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
@@ -970,28 +1027,11 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
-        // Resolve scope → working set, gap-gate under `report` (abort before any write).
-        // The gate runs even under `dry_run`: a gappy scope is misconfigured
-        // regardless of whether writes would occur.
-        let working_set: Option<std::collections::HashSet<String>> = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Some(self.working_set(s)?)
-            }
-            _ => None,
-        };
-
-        let valid_entities: Vec<&Entity> = self
-            .entities
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != EntityType::External)
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| match (&working_set, scope) {
-                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
-                _ => true,
-            })
-            .collect();
+        // Resolve scope → working set (gap-gated under `report`), then filter to
+        // the valid, in-scope, name-matching entities. The gate runs even under
+        // `dry_run`: a gappy scope is misconfigured regardless of writes.
+        let working_set = self.scope_working_set(scope)?;
+        let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
 
         if dry_run {
             return Ok(());
@@ -1270,7 +1310,7 @@ impl Design {
     {
         use crate::reconcile::{
             plan_fk_convergence, plan_reconcile, qualified_entity_name, raw_snapshot_from_entities,
-            snapshot_from_entities, ReconcileComplete, DEFAULT_SCHEMA,
+            snapshot_from_entities, ReconcileComplete,
         };
         use std::collections::{HashMap, HashSet};
 
@@ -1282,26 +1322,9 @@ impl Design {
             ));
         }
 
-        // Resolve scope → working set, gap-gate under `report` (abort before writes).
-        let working_set: Option<HashSet<String>> = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Some(self.working_set(s)?)
-            }
-            _ => None,
-        };
-
         // Desired entities: valid, non-external, in scope — in dependency order.
-        let desired_entities: Vec<&Entity> = self
-            .entities
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != EntityType::External)
-            .filter(|e| match (&working_set, scope) {
-                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
-                _ => true,
-            })
-            .collect();
+        let working_set = self.scope_working_set(scope)?;
+        let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized).
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
@@ -1309,20 +1332,7 @@ impl Design {
 
         // Schemas the design manages. Reconcile only diffs within these, so it
         // never considers (or prunes) tables in schemas the project doesn't own.
-        let managed_schemas: HashSet<String> = desired_entities
-            .iter()
-            .map(|e| match e.entity_type {
-                EntityType::Schema => e.name.clone(),
-                _ => {
-                    let s = e.schema.clone().unwrap_or_default();
-                    if s.is_empty() {
-                        DEFAULT_SCHEMA.to_string()
-                    } else {
-                        s
-                    }
-                }
-            })
-            .collect();
+        let managed_schemas = Self::managed_schemas(&desired_entities);
 
         // Live snapshot, restricted to managed schemas. Tables here but not in
         // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
@@ -1543,26 +1553,9 @@ impl Design {
             ));
         }
 
-        // Resolve scope → working set, gap-gate under `report` (abort before writes).
-        let working_set: Option<HashSet<String>> = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Some(self.working_set(s)?)
-            }
-            _ => None,
-        };
-
         // Desired entities: valid, non-external, in scope — in dependency order.
-        let desired_entities: Vec<&Entity> = self
-            .entities
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != EntityType::External)
-            .filter(|e| match (&working_set, scope) {
-                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
-                _ => true,
-            })
-            .collect();
+        let working_set = self.scope_working_set(scope)?;
+        let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)
         // so FK/CHECK/indexes/comments survive for `SchemaDiff` to compare.
@@ -1571,20 +1564,7 @@ impl Design {
 
         // Schemas the design manages. The diff is scoped to these, so it never
         // reports drift for tables in schemas the project doesn't own.
-        let managed_schemas: HashSet<String> = desired_entities
-            .iter()
-            .map(|e| match e.entity_type {
-                EntityType::Schema => e.name.clone(),
-                _ => {
-                    let s = e.schema.clone().unwrap_or_default();
-                    if s.is_empty() {
-                        DEFAULT_SCHEMA.to_string()
-                    } else {
-                        s
-                    }
-                }
-            })
-            .collect();
+        let managed_schemas = Self::managed_schemas(&desired_entities);
 
         // Live snapshot, restricted to managed schemas. Raw so introspected
         // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
