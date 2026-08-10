@@ -1602,8 +1602,7 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<crate::SchemaDiff> {
-        use crate::reconcile::{raw_snapshot_from_entities, DEFAULT_SCHEMA};
-        use std::collections::HashSet;
+        use crate::reconcile::raw_snapshot_from_entities;
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
@@ -1633,14 +1632,32 @@ impl Design {
 
         let mut diff = crate::SchemaDiff::compute(live, desired);
 
-        // Materialized-view drift (read-only). Matviews aren't in the tables/enums
-        // snapshots above, so `compute` never reports them — categorize them here.
-        // Mirrors reconcile's create/skip/warn decision, but splits the two "warn"
-        // cases into Drifted (stamped, hash mismatch) vs Unstamped (no dbd
-        // sentinel), and adds Orphan (live matview in a managed schema, gone from
-        // the design).
-        use crate::reconcile::matview_hash;
+        // Materialized-view drift (read-only) — matviews aren't in the tables/
+        // enums snapshots above, so `compute` never reports them; categorize them
+        // separately (Missing / Drifted / Unstamped / Orphan).
+        diff.matview_drift = self
+            .matview_drift(adapter, &desired_entities, &live_entities, &managed_schemas)
+            .await?;
+
+        Ok(diff)
+    }
+
+    /// Categorize materialized-view drift for [`Design::diff_live`] (read-only).
+    /// Compares each design matview's hash to the live `dbd:hash` sentinel —
+    /// Missing (absent) / Drifted (sentinel mismatch) / Unstamped (no sentinel) —
+    /// and adds Orphan for a live matview in a managed schema that's gone from the
+    /// design. Only fetches `matview_states()` when the design has a matview
+    /// (orphans come from `live_entities`). Returned sorted by name.
+    async fn matview_drift(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        desired_entities: &[&Entity],
+        live_entities: &[Entity],
+        managed_schemas: &std::collections::HashSet<String>,
+    ) -> Result<Vec<crate::schema_diff::MatviewDrift>> {
+        use crate::reconcile::{matview_hash, DEFAULT_SCHEMA};
         use crate::schema_diff::{MatviewDrift, MatviewDriftKind};
+        use std::collections::HashSet;
 
         let design_matviews: Vec<&Entity> = desired_entities
             .iter()
@@ -1650,11 +1667,8 @@ impl Design {
         let design_mv_names: HashSet<&str> =
             design_matviews.iter().map(|e| e.name.as_str()).collect();
 
-        let mut matview_drift: Vec<MatviewDrift> = Vec::new();
+        let mut drift: Vec<MatviewDrift> = Vec::new();
 
-        // Design matviews: compare each design hash to the live sentinel. Only
-        // fetch `matview_states()` when the design actually has a matview — an
-        // orphan-only diff never needs it (orphans are found from `live_entities`).
         if !design_matviews.is_empty() {
             let states = adapter.matview_states().await?;
             for e in &design_matviews {
@@ -1665,14 +1679,13 @@ impl Design {
                     Some(Some(_)) => MatviewDriftKind::Drifted,
                     Some(None) => MatviewDriftKind::Unstamped,
                 };
-                matview_drift.push(MatviewDrift { name: e.name.clone(), kind });
+                drift.push(MatviewDrift { name: e.name.clone(), kind });
             }
         }
 
         // Orphans: live matviews in a managed schema, absent from the design. No
-        // hash needed, so this reuses the already-fetched `live_entities` and adds
-        // no query. Schema derivation mirrors `managed_schemas` above.
-        for e in &live_entities {
+        // hash needed, so this reuses the already-fetched `live_entities`.
+        for e in live_entities {
             if e.entity_type != EntityType::MaterializedView {
                 continue;
             }
@@ -1681,15 +1694,12 @@ impl Design {
                 if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
             };
             if managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str()) {
-                matview_drift.push(MatviewDrift { name: e.name.clone(), kind: MatviewDriftKind::Orphan });
+                drift.push(MatviewDrift { name: e.name.clone(), kind: MatviewDriftKind::Orphan });
             }
         }
 
-        // Deterministic order for stable output and tests.
-        matview_drift.sort_by(|a, b| a.name.cmp(&b.name));
-        diff.matview_drift = matview_drift;
-
-        Ok(diff)
+        drift.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(drift)
     }
 
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
