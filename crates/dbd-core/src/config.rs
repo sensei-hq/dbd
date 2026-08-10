@@ -53,6 +53,22 @@ impl DesignConfig {
     pub fn schema_names(&self) -> Vec<String> {
         self.schemas.iter().map(|s| s.name()).collect()
     }
+
+    /// Schema→role→perms grants declared on the universal `schemas:` list via the
+    /// `{ schema: { grants: { role: [perms] } } }` form. (Target-level `grants:` are
+    /// merged in separately by the apply path.)
+    pub fn schema_grants(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
+        self.schemas
+            .iter()
+            .filter_map(|s| match s {
+                SchemaEntry::WithGrants(map) => {
+                    let (schema, cfg) = map.iter().next()?;
+                    Some((schema.clone(), cfg.grants.clone()?))
+                }
+                SchemaEntry::Name(_) => None,
+            })
+            .collect()
+    }
 }
 
 // ── Scopes ──────────────────────────────────────────────
@@ -956,5 +972,49 @@ materialized_views:
         let d = cfg.materialized_views.resolve("analytics.x");
         assert!(d.refresh.is_none());
         assert!(!d.concurrently);
+    }
+
+    // ── Schema grants ──────────────────────────────────────
+
+    #[test]
+    fn schema_grants_collects_with_grants_entries() {
+        let yaml = "\
+project:
+  name: t
+schemas:
+  - config
+  - staging:
+      grants:
+        app_user: [usage, select]
+        app_admin: [usage, select, insert]
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let grants = config.schema_grants();
+        // Plain `Name` entries (e.g. `config`) contribute nothing.
+        assert_eq!(grants.len(), 1);
+        let staging = grants.get("staging").unwrap();
+        assert_eq!(
+            staging.get("app_user"),
+            Some(&vec!["usage".to_string(), "select".to_string()])
+        );
+        assert_eq!(
+            staging.get("app_admin"),
+            Some(&vec!["usage".to_string(), "select".to_string(), "insert".to_string()])
+        );
+    }
+
+    #[test]
+    fn schema_grants_empty_when_no_with_grants_entries() {
+        let yaml = "project:\n  name: t\nschemas:\n  - config\n  - staging\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.schema_grants().is_empty());
+    }
+
+    #[test]
+    fn schema_grants_skips_entry_with_no_grants_key() {
+        // `{ schema: {} }` parses (grants: None) but contributes no map entry.
+        let yaml = "project:\n  name: t\nschemas:\n  - staging: {}\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.schema_grants().is_empty());
     }
 }
