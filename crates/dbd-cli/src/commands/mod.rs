@@ -57,9 +57,14 @@ pub async fn run(
         }
 
         Commands::Reset { target, dry_run, force, schemas, extensions, clean, allow_scope_change } => {
-            let drop_schemas = *schemas || *clean;
-            let drop_extensions = *extensions || *clean;
-            migration::cmd_reset(config, env, project_dir, database_url, target, *dry_run, *force, drop_schemas, drop_extensions, *allow_scope_change, scope, deps, verbosity).await
+            let opts = migration::ResetOptions {
+                dry_run: *dry_run,
+                force: *force,
+                drop_schemas: *schemas || *clean,
+                drop_extensions: *extensions || *clean,
+                allow_scope_change: *allow_scope_change,
+            };
+            migration::cmd_reset(config, env, project_dir, database_url, target, opts, scope, deps, verbosity).await
         }
 
         Commands::Snapshot { list, name } => {
