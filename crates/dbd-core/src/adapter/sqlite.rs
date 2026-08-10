@@ -453,41 +453,36 @@ impl DatabaseAdapter for SqliteAdapter {
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        let with_scope = sqlx::query(
-            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
-        )
-        .bind(&self.project)
-        .fetch_optional(&self.pool)
-        .await;
-
-        match with_scope {
-            Ok(Some(row)) => Ok(Some(ProjectMeta {
-                project: row.get("project"),
-                env: row.get("env"),
-                version: row.get::<i64, _>("version") as u32,
-                scope: row.try_get("scope").ok(),
-                applied_at: row.try_get("applied_at").ok(),
-            })),
-            Ok(None) => Ok(None),
-            Err(_) => {
-                let legacy = sqlx::query(
-                    "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
-                )
-                .bind(&self.project)
-                .fetch_optional(&self.pool)
-                .await;
-                match legacy {
-                    Ok(Some(row)) => Ok(Some(ProjectMeta {
-                        project: row.get("project"),
-                        env: row.get("env"),
-                        version: row.get::<i64, _>("version") as u32,
-                        scope: None,
-                        applied_at: row.try_get("applied_at").ok(),
-                    })),
-                    _ => Ok(None),
-                }
-            }
+        // Inspect the table shape via pragma (which returns zero rows for a missing
+        // table — not an error), so we pick the right SELECT and let genuine read
+        // failures surface instead of masking them as "no meta", which would
+        // silently disable the scope AND prod guards.
+        let columns: Vec<String> =
+            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
+        if columns.is_empty() {
+            return Ok(None); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
         }
+        let has_scope = columns.iter().any(|c| c == "scope");
+        let sql = if has_scope {
+            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
+        } else {
+            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
+        };
+        let row = sqlx::query(sql)
+            .bind(&self.project)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        Ok(row.map(|row| ProjectMeta {
+            project: row.get("project"),
+            env: row.get("env"),
+            version: row.get::<i64, _>("version") as u32,
+            scope: if has_scope { row.try_get("scope").ok() } else { None },
+            applied_at: row.try_get("applied_at").ok(),
+        }))
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
@@ -895,6 +890,15 @@ mod tests {
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
         // Bypass → allowed.
         assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
+    }
+
+    /// A fresh DB with no `_dbd_meta` reads as `None` (not an error) — the pragma
+    /// probe returns no columns, so the resilient read short-circuits cleanly
+    /// rather than erroring on the absent table.
+    #[tokio::test]
+    async fn s10_get_meta_on_fresh_db_is_none() {
+        let a = mem().await; // no `_dbd_meta` created
+        assert!(a.get_project_meta().await.unwrap().is_none());
     }
 
     #[tokio::test]
