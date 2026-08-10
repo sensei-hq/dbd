@@ -331,6 +331,8 @@ struct ConvexState {
     project: String,
     env: String,
     version: u32,
+    #[serde(default)]
+    scope: Option<String>,
     updated_at: String,
     migrations: Vec<MigrationRecord>,
 }
@@ -732,15 +734,17 @@ impl DatabaseAdapter for ConvexAdapter {
             project: state.project,
             env: state.env,
             version: state.version,
+            scope: state.scope,
             applied_at: Some(state.updated_at),
         }))
     }
 
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         let mut state = load_state(&self.output_dir);
         state.project = self.project.clone();
         state.env = env.to_string();
         state.version = version;
+        state.scope = scope.map(|s| s.to_string());
         state.updated_at = chrono::Utc::now().to_rfc3339();
         save_state(&self.output_dir, &state)
     }
@@ -898,7 +902,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let adapter = ConvexAdapter::new(tmp.path(), "test");
         assert_eq!(adapter.get_db_version().await.unwrap(), 0);
-        adapter.set_project_meta("dev", 4).await.unwrap();
+        adapter.set_project_meta("dev", 4, None).await.unwrap();
         assert_eq!(adapter.get_db_version().await.unwrap(), 4);
         let m = adapter.get_project_meta().await.unwrap().unwrap();
         assert_eq!(m.env, "dev");

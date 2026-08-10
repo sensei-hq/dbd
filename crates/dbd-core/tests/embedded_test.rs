@@ -2302,7 +2302,7 @@ async fn meta_table_heals_from_stray_schema_into_public() {
     // A write heals the location: relocate into `public` and upsert this project
     // to v8. This is exactly what reconcile/apply do at the end of a run.
     adapter
-        .set_project_meta("prod", 8)
+        .set_project_meta("prod", 8, None)
         .await
         .expect("set_project_meta should heal + upsert");
 
@@ -2321,4 +2321,39 @@ async fn meta_table_heals_from_stray_schema_into_public() {
     assert_eq!(meta.version, 8);
     assert_eq!(meta.env, "prod");
     assert_eq!(meta.project, "meta_heal_test");
+}
+
+#[tokio::test]
+async fn legacy_meta_without_scope_reads_and_backfills() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "legacy_scope_test").await.unwrap();
+
+    // Legacy `public._dbd_meta` WITHOUT the `scope` column, prod row.
+    adapter
+        .execute_script(
+            "CREATE TABLE public._dbd_meta ( \
+                project varchar NOT NULL PRIMARY KEY, \
+                env varchar NOT NULL DEFAULT 'dev', \
+                version integer NOT NULL DEFAULT 0, \
+                created_at timestamptz NOT NULL DEFAULT now(), \
+                updated_at timestamptz NOT NULL DEFAULT now() ); \
+             INSERT INTO public._dbd_meta (project, env, version) \
+                VALUES ('legacy_scope_test', 'prod', 4)",
+        )
+        .await
+        .expect("seed legacy public._dbd_meta");
+
+    // Resilient read: prod guard still sees env/version; scope is None.
+    let m = adapter.get_project_meta().await.unwrap().expect("legacy meta reads");
+    assert_eq!(m.env, "prod");
+    assert_eq!(m.version, 4);
+    assert_eq!(m.scope, None);
+
+    // A write backfills the `scope` column and pins the scope.
+    adapter
+        .set_project_meta("prod", 5, Some("public"))
+        .await
+        .expect("set_project_meta backfills the scope column");
+    let m2 = adapter.get_project_meta().await.unwrap().unwrap();
+    assert_eq!(m2.scope.as_deref(), Some("public"));
 }

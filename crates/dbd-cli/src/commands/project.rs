@@ -314,6 +314,7 @@ pub async fn cmd_deploy(
     dry_run: bool,
     no_cache: bool,
     clear_cache: bool,
+    allow_scope_change: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -367,6 +368,8 @@ pub async fn cmd_deploy(
     }
 
     let adapter = get_adapter(&config_path, database_url).await?;
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
     output::info(verbosity, "Applying schema...");
     let mut apply_summary: Option<ApplyComplete> = None;
     {
@@ -458,6 +461,7 @@ pub async fn cmd_reconcile(
     dry_run: bool,
     allow_destructive: bool,
     prune: bool,
+    allow_scope_change: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -484,6 +488,9 @@ pub async fn cmd_reconcile(
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
+
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
     output::info(verbosity, "Reconciling schema to design...");
     let mut summary = None;
@@ -708,7 +715,8 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -725,7 +733,8 @@ mod tests {
         let cfg = proj.path().join("design.yaml");
         cmd_deploy(
             proj.path().to_str().unwrap(), &cfg, "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -786,7 +795,7 @@ mod tests {
 
         let err = cmd_reconcile(
             &cfg, "dev", proj.path(), None, /*dry_run*/ true, /*allow_destructive*/ false,
-            /*prune*/ false, None, None, Verbosity::Normal,
+            /*prune*/ false, /*allow_scope_change*/ false, None, None, Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -800,7 +809,8 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ true, None, None, Verbosity::Normal,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ true, /*allow_scope_change*/ false,
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -813,7 +823,8 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = cmd_deploy(
             empty.path().to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, None, None, Verbosity::Normal,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -829,8 +840,8 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, Some("incomplete_auto"), None,
-            Verbosity::Normal,
+            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
+            Some("incomplete_auto"), None, Verbosity::Normal,
         )
         .await
         .unwrap();

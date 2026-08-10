@@ -45,9 +45,9 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd init` | Scaffold a project; or reverse-engineer one with `--from-db <conn>` / `--from-dbml <file>` (refuses over a dbd-managed DB — use `merge`) |
 | `dbd merge` | Sync a live DB / DBML back into the project (reverse + reconcile; never edits `design.yaml`) |
 | `dbd inspect` | **Validate**: report entity errors/warnings + scope gaps. `--from-db` resolves refs against the live catalog and caches to `.dbd/refcache.json`. **Offline & no SQL execution** |
-| `dbd apply` | Apply schemas + entities + pending migrations (blocks on migration TODOs). `--with-policies` also applies RLS |
-| `dbd deploy --source owner/repo/path` | Fetch (GitHub) → apply → import → **apply RLS policies**. `--no-cache` / `--clear-cache` |
-| `dbd reconcile` | Pre-release declarative diff+`CREATE`/`ALTER` in place (no snapshots). `--allow-destructive`, `--prune`. Disabled after `release` |
+| `dbd apply` | Apply schemas + entities + pending migrations (blocks on migration TODOs). `--with-policies` also applies RLS. Scope-guarded — `--allow-scope-change` to re-pin |
+| `dbd deploy --source owner/repo/path` | Fetch (GitHub) → apply → import → **apply RLS policies**. `--no-cache` / `--clear-cache`. Scope-guarded — `--allow-scope-change` to re-pin |
+| `dbd reconcile` | Pre-release declarative diff+`CREATE`/`ALTER` in place (no snapshots). `--allow-destructive`, `--prune`, `--allow-scope-change`. Disabled after `release` |
 | `dbd release` (`baseline`) | Cut v1: baseline snapshot + `project.released: true` (locks in snapshot/migration flow) |
 | `dbd snapshot` | Diff vs latest snapshot → migration SQL (smart multi-stage for renames/type changes) |
 | `dbd migrate --status` | Show migration status (read-only; `apply` runs them) |
@@ -56,13 +56,26 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
 | `dbd doctor [--fix]` | Audit/repair config + layout: old design.yaml, stale files, plural dirs (`--fix` migrates these). Also flags **misfiled view/matview DDL** (a `CREATE MATERIALIZED VIEW` under `ddl/view/`, or a plain view under `ddl/materialized_view/`) — reported with a move hint, **not** auto-fixed. Run it to verify layout before `reset`/`apply` |
-| `dbd reset` | Drop the project's own objects (guarded by `_dbd_meta` env check; blocked in prod / post-v1) |
+| `dbd reset` | Drop the project's own objects (guarded by `_dbd_meta` env check; blocked in prod / post-v1). Also scope-guarded — `--force` or `--allow-scope-change` bypasses |
 | `dbd format [--check]` | DDL formatter (river-style SELECT bodies; `--check` for pre-commit) |
 
 **Global scope flags** (honored by `inspect`/`apply`/`import`/`deploy`/`reconcile`
 and the filter-only `dbml`/`combine`/`graph`/`export`/`reset`):
 `--scope <name>` selects a `scopes:` subset; `--deps report|include` overrides
 its gap policy. One design → many DBs: `dbd deploy --scope hub --database $HUB_URL`.
+
+**Scope guard**: `_dbd_meta` records the scope a database was built with (nullable
+`scope` column; `NULL` = unpinned). `apply`/`deploy`/`reconcile`/`reset` refuse to
+run under a different scope than the one the database is pinned to:
+`scope guard: this database is pinned to scope 'X', but you requested 'Y'.
+Applying a different scope would build a divergent schema.` Pass `--scope X` to
+match the pin, or `--allow-scope-change` to override — a successful write then
+re-pins the database to the new scope (`reset --force` also bypasses the check).
+Databases created before this feature are unpinned and aren't blocked until their
+next write pins them; a missing `--scope` resolves to the `default` scope (or
+`all`) and pins on first write. To legitimately host multiple modules in one
+database, define a named scope in `design.yaml` that includes them, rather than
+re-pinning back and forth.
 
 ## Critical gotcha — inspect ≠ apply
 
