@@ -169,8 +169,9 @@ impl Design {
         Ok(())
     }
 
-    /// Import phase: truncate staging tables (when configured) then load each
-    /// entry's data file. Returns the number of tables loaded.
+    /// Import phase: truncate staging tables (per-table override wins over the
+    /// global setting) then load each entry's data file. Returns the number of
+    /// tables loaded.
     async fn import_load_staging<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -183,12 +184,14 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        if self.config.import.options.truncate && !dry_run {
+        if !dry_run {
             for entry in plan {
-                let qualified = entry.table.name.replace('.', "\".\"");
-                adapter
-                    .execute_script(&format!("TRUNCATE \"{qualified}\""))
-                    .await?;
+                if self.config.import.table_truncate(&entry.table.name) {
+                    let qualified = entry.table.name.replace('.', "\".\"");
+                    adapter
+                        .execute_script(&format!("TRUNCATE \"{qualified}\""))
+                        .await?;
+                }
             }
         }
 
