@@ -53,6 +53,22 @@ impl DesignConfig {
     pub fn schema_names(&self) -> Vec<String> {
         self.schemas.iter().map(|s| s.name()).collect()
     }
+
+    /// Schema→role→perms grants declared on the universal `schemas:` list via the
+    /// `{ schema: { grants: { role: [perms] } } }` form. (Target-level `grants:` are
+    /// merged in separately by the apply path.)
+    pub fn schema_grants(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
+        self.schemas
+            .iter()
+            .filter_map(|s| match s {
+                SchemaEntry::WithGrants(map) => {
+                    let (schema, cfg) = map.iter().next()?;
+                    Some((schema.clone(), cfg.grants.clone()?))
+                }
+                SchemaEntry::Name(_) => None,
+            })
+            .collect()
+    }
 }
 
 // ── Scopes ──────────────────────────────────────────────
@@ -232,6 +248,51 @@ pub struct ImportConfig {
     pub after: Vec<String>,
 }
 
+impl ImportConfig {
+    /// Whether a staging table should be truncated before load. A per-table
+    /// `tables:` override (`staging.x: { truncate: false }`) wins over the global
+    /// `options.truncate`.
+    pub fn table_truncate(&self, table_name: &str) -> bool {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.truncate),
+                ImportTableEntry::Name(_) => None,
+            })
+            .unwrap_or(self.options.truncate)
+    }
+
+    /// Per-table `format` override (`staging.x: { format: tsv }`), if set —
+    /// forces that parser regardless of the data file's extension.
+    pub fn table_format(&self, table_name: &str) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => {
+                    map.values().next().and_then(|o| o.format.as_deref())
+                }
+                ImportTableEntry::Name(_) => None,
+            })
+    }
+
+    /// The null sentinel for a table's data load. A per-table `null_value`
+    /// override (`staging.x: { null_value: "\\N" }`) wins over the global
+    /// `options.null_value` (default `""` — an empty cell is NULL).
+    pub fn table_null_value(&self, table_name: &str) -> &str {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => {
+                    map.values().next().and_then(|o| o.null_value.as_deref())
+                }
+                ImportTableEntry::Name(_) => None,
+            })
+            .unwrap_or(&self.options.null_value)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ImportOptions {
@@ -246,7 +307,7 @@ pub struct ImportOptions {
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            truncate: true,
+            truncate: default_true(),
             null_value: String::new(),
             format: default_csv(),
         }
@@ -472,10 +533,10 @@ impl Default for FormatConfig {
         Self {
             keyword_case: KeywordCase::Lower,
             comma_style: CommaStyle::Leading,
-            type_alignment: 27,
-            indent: 2,
+            type_alignment: default_type_alignment(),
+            indent: default_indent(),
             query_style: QueryStyle::River,
-            gutter: 10,
+            gutter: default_gutter(),
         }
     }
 }
@@ -644,6 +705,55 @@ mod tests {
         assert_eq!(config.import.tables[0].name(), "staging.lookups");
         assert_eq!(config.import.tables[1].name(), "staging.lookup_values");
         assert_eq!(config.import.after, vec!["import/loader.sql"]);
+    }
+
+    #[test]
+    fn import_table_overrides() {
+        let yaml = r#"
+project:
+  name: test
+import:
+  options:
+    truncate: true
+  tables:
+    - staging.keep
+    - staging.no_truncate:
+        truncate: false
+    - staging.tsv:
+        format: tsv
+"#;
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        // truncate: a per-table `truncate: false` wins over the global `truncate: true`;
+        // bare-name / unlisted tables inherit the global.
+        assert!(!config.import.table_truncate("staging.no_truncate"));
+        assert!(config.import.table_truncate("staging.keep"));
+        assert!(config.import.table_truncate("staging.other"));
+        // format: a per-table override is returned; otherwise None (fall back to the
+        // file extension at load time).
+        assert_eq!(config.import.table_format("staging.tsv"), Some("tsv"));
+        assert_eq!(config.import.table_format("staging.keep"), None);
+        assert_eq!(config.import.table_format("staging.other"), None);
+    }
+
+    #[test]
+    fn import_table_null_value_overrides() {
+        let yaml = r#"
+project:
+  name: test
+import:
+  tables:
+    - staging.keep
+    - staging.sentinel:
+        null_value: "\\N"
+"#;
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        // Global default is the empty string — an empty cell is NULL.
+        assert_eq!(config.import.options.null_value, "");
+        // Unlisted / bare-name tables inherit the global default.
+        assert_eq!(config.import.table_null_value("staging.keep"), "");
+        assert_eq!(config.import.table_null_value("staging.other"), "");
+        // A per-table `null_value` override wins over the global.
+        assert_eq!(config.import.table_null_value("staging.sentinel"), "\\N");
     }
 
     #[test]
@@ -899,5 +1009,49 @@ materialized_views:
         let d = cfg.materialized_views.resolve("analytics.x");
         assert!(d.refresh.is_none());
         assert!(!d.concurrently);
+    }
+
+    // ── Schema grants ──────────────────────────────────────
+
+    #[test]
+    fn schema_grants_collects_with_grants_entries() {
+        let yaml = "\
+project:
+  name: t
+schemas:
+  - config
+  - staging:
+      grants:
+        app_user: [usage, select]
+        app_admin: [usage, select, insert]
+";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let grants = config.schema_grants();
+        // Plain `Name` entries (e.g. `config`) contribute nothing.
+        assert_eq!(grants.len(), 1);
+        let staging = grants.get("staging").unwrap();
+        assert_eq!(
+            staging.get("app_user"),
+            Some(&vec!["usage".to_string(), "select".to_string()])
+        );
+        assert_eq!(
+            staging.get("app_admin"),
+            Some(&vec!["usage".to_string(), "select".to_string(), "insert".to_string()])
+        );
+    }
+
+    #[test]
+    fn schema_grants_empty_when_no_with_grants_entries() {
+        let yaml = "project:\n  name: t\nschemas:\n  - config\n  - staging\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.schema_grants().is_empty());
+    }
+
+    #[test]
+    fn schema_grants_skips_entry_with_no_grants_key() {
+        // `{ schema: {} }` parses (grants: None) but contributes no map entry.
+        let yaml = "project:\n  name: t\nschemas:\n  - staging: {}\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.schema_grants().is_empty());
     }
 }

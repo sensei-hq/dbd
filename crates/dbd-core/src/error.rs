@@ -8,9 +8,6 @@ pub enum DbdError {
     #[error("Parse error in {file}: {message}")]
     Parse { file: PathBuf, message: String },
 
-    #[error("Entity validation failed: {name} — {errors:?}")]
-    Validation { name: String, errors: Vec<String> },
-
     #[error("Safety guard: {0}")]
     SafetyGuard(String),
 
