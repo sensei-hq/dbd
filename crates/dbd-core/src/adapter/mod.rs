@@ -75,6 +75,14 @@ pub trait DatabaseAdapter: Send + Sync {
         false
     }
 
+    /// Whether this target has a SQL grant model (`GRANT` / `ALTER DEFAULT
+    /// PRIVILEGES`). Postgres/Supabase only — SQLite and Convex have no grant
+    /// concept, so the apply path skips grant emission for them rather than
+    /// feeding them Postgres-only DDL. Default `false`.
+    fn supports_schema_grants(&self) -> bool {
+        false
+    }
+
     // ── Batch transaction (atomic apply) ───────────────
     //
     // When an adapter's backend has transactional DDL, `Design::apply` wraps the

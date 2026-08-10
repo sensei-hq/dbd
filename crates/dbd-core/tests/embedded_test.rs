@@ -136,6 +136,8 @@ async fn assert_column_absent(
 async fn fresh_deploy_creates_schema() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "embedded_test").await.unwrap();
+    // Postgres/Supabase is the one target with a SQL grant model.
+    assert!(adapter.supports_schema_grants());
     let design = load_design();
 
     let mut summary: Option<DeployComplete> = None;

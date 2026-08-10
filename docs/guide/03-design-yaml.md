@@ -141,7 +141,7 @@ Append `?deploy=true` to the URL to run `npx convex deploy` automatically after 
 
 List of schema names. dbd runs `CREATE SCHEMA IF NOT EXISTS` for each. Schemas referenced in entity file paths are auto-added.
 
-A schema entry may also be an object carrying `grants:`, applied on **any** target (unlike the Supabase-only `target.grants`, above):
+A schema entry may also be an object carrying `grants:`, applied on **any Postgres/Supabase** target (unlike `target.grants`, above, which only takes effect on a Supabase target):
 
 ```yaml
 schemas:
@@ -152,7 +152,7 @@ schemas:
         app_admin: [usage, select, insert, update, delete]
 ```
 
-This emits `GRANT USAGE ON SCHEMA`, `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, overriding perms for roles present in both).
+This emits `GRANT USAGE ON SCHEMA`, `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, overriding perms for roles present in both). Targets without a SQL grant model (SQLite, Convex) skip grant emission with a note rather than failing.
 
 ### `external`
 
