@@ -359,7 +359,7 @@ pub async fn cmd_deploy(
             report.issues.len(),
             report.warnings.len(),
         ));
-        let policy_files = dbd_core::scanner::scan_policies(&project_dir);
+        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
         if !policy_files.is_empty() {
             output::info(verbosity, &format!("{} policy file(s) would be applied.", policy_files.len()));
         }

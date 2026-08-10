@@ -75,6 +75,14 @@ pub trait DatabaseAdapter: Send + Sync {
         false
     }
 
+    /// Whether this target has a SQL grant model (`GRANT` / `ALTER DEFAULT
+    /// PRIVILEGES`). Postgres/Supabase only — SQLite and Convex have no grant
+    /// concept, so the apply path skips grant emission for them rather than
+    /// feeding them Postgres-only DDL. Default `false`.
+    fn supports_schema_grants(&self) -> bool {
+        false
+    }
+
     // ── Batch transaction (atomic apply) ───────────────
     //
     // When an adapter's backend has transactional DDL, `Design::apply` wraps the
@@ -135,7 +143,9 @@ pub trait DatabaseAdapter: Send + Sync {
 
     // ── Data operations ────────────────────────────────
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()>;
+    /// Load a data file into a table. `null_value` is the sentinel string that
+    /// maps to SQL NULL (empty string = the default, meaning an empty cell is NULL).
+    async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()>;
 
     /// Export a table's data to a file.
     ///

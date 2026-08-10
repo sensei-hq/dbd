@@ -485,20 +485,6 @@ pub(in crate::formatter) fn format_create_index(
     out
 }
 
-// ── SET statement formatter ─────────────────────────────
-
-pub(in crate::formatter) fn format_set_statement(original: &str, config: &FormatConfig) -> String {
-    let result = apply_keyword_case(original, &config.keyword_case);
-    ensure_semicolon(&result)
-}
-
-// ── COMMENT ON formatter ────────────────────────────────
-
-pub(in crate::formatter) fn format_comment_on(original: &str, config: &FormatConfig) -> String {
-    let result = apply_keyword_case(original, &config.keyword_case);
-    ensure_semicolon(&result)
-}
-
 // ── CREATE VIEW formatter ───────────────────────────────
 
 pub(in crate::formatter) fn format_create_view(

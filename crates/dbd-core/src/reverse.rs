@@ -271,7 +271,10 @@ pub fn apply_overwrite(root: &Path, plan: &WritePlan) -> Result<Report> {
             }
         }
     }
-    report.conflicts = plan.items.iter().filter(|i| i.action == FileAction::Conflict).count();
+    // Every `Conflict` item above incremented `overwritten` (and nothing else
+    // does), so the two are equal for this apply-by-overwrite path — see the
+    // `conflicts` doc comment on `Report`.
+    report.conflicts = report.overwritten;
     Ok(report)
 }
 

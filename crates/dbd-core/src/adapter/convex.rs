@@ -353,16 +353,19 @@ fn schema_path(output_dir: &Path) -> PathBuf {
     output_dir.join(SCHEMA_FILE)
 }
 
-fn load_state(output_dir: &Path) -> ConvexState {
+fn load_state(output_dir: &Path) -> Result<ConvexState> {
     let path = state_path(output_dir);
     if !path.exists() {
-        return ConvexState::default();
+        return Ok(ConvexState::default());
     }
+    // A read or parse failure on an existing state file must NOT collapse to a
+    // fresh default — callers mutate + `save_state` it back, so masking the error
+    // would silently overwrite (erase) the recorded migration history.
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| DbdError::Config(format!("read convex state {}: {e}", path.display())))?;
+    serde_json::from_str(&contents)
+        .map_err(|e| DbdError::Config(format!("parse convex state {}: {e}", path.display())))
 }
 
 fn save_state(output_dir: &Path, state: &ConvexState) -> Result<()> {
@@ -587,11 +590,9 @@ impl DatabaseAdapter for ConvexAdapter {
             }
             // Convex has no concept of these — silently ignore so that
             // cross-target projects can still apply.
-            EntityType::Schema
-            | EntityType::View
-            | EntityType::External
-            | EntityType::Import
-            | EntityType::Export => Ok(()),
+            EntityType::Schema | EntityType::View | EntityType::External | EntityType::Import => {
+                Ok(())
+            }
             EntityType::Extension
             | EntityType::Role
             | EntityType::Sequence
@@ -627,7 +628,7 @@ impl DatabaseAdapter for ConvexAdapter {
         true
     }
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, _null_value: &str, dry_run: bool) -> Result<()> {
         let file_path = entity
             .file
             .as_ref()
@@ -688,7 +689,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn get_db_version(&self) -> Result<u32> {
-        Ok(load_state(&self.output_dir).version)
+        Ok(load_state(&self.output_dir)?.version)
     }
 
     async fn apply_migration(
@@ -698,7 +699,7 @@ impl DatabaseAdapter for ConvexAdapter {
         description: &str,
         checksum: &str,
     ) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         if state.migrations.iter().any(|m| m.version == version) {
             return Ok(());
         }
@@ -712,7 +713,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn clear_project_migrations(&self) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         state.migrations.clear();
         save_state(&self.output_dir, &state)
     }
@@ -726,7 +727,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        let state = load_state(&self.output_dir);
+        let state = load_state(&self.output_dir)?;
         if state.project.is_empty() {
             return Ok(None);
         }
@@ -740,7 +741,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         state.project = self.project.clone();
         state.env = env.to_string();
         state.version = version;
@@ -854,6 +855,14 @@ mod tests {
         assert!(!out.contains("_id: v."));
         assert!(!out.contains("_creationTime"));
         assert!(out.contains("name: v.string()"));
+    }
+
+    #[tokio::test]
+    async fn cv_convex_has_no_grant_model() {
+        // Convex can't execute SQL; the apply path must skip grant emission for
+        // it rather than hand it Postgres GRANT DDL.
+        let tmp = tempdir().unwrap();
+        assert!(!ConvexAdapter::new(tmp.path(), "test").supports_schema_grants());
     }
 
     #[tokio::test]
@@ -1068,7 +1077,7 @@ mod tests {
         );
         // Import without a file path fails fast (no shell-out attempted).
         let no_file = Entity::new(EntityType::Import, "config.users");
-        assert!(adapter.import_data(&no_file, false).await.is_err());
+        assert!(adapter.import_data(&no_file, "", false).await.is_err());
     }
 
     #[test]
@@ -1098,7 +1107,7 @@ mod tests {
         std::fs::write(&data_path, "{}\n").unwrap();
         e.file = Some(data_path);
         // dry_run = true should succeed without spawning npx.
-        adapter.import_data(&e, true).await.unwrap();
+        adapter.import_data(&e, "", true).await.unwrap();
     }
 
     #[tokio::test]

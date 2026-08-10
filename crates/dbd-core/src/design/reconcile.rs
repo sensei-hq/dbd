@@ -299,13 +299,7 @@ impl Design {
         // a scoped reconcile fed only its subset would unschedule out-of-scope
         // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
         // no-op on databases (and non-Postgres targets) without the extension.
-        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
-            .collect();
-        adapter.sync_refresh_jobs(&mv_jobs).await?;
+        adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);

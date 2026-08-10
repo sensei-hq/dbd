@@ -824,8 +824,8 @@ fn parse_ref_body(body: &str) -> Result<Option<ParsedRef>> {
         for (key, value) in settings {
             let k = key.to_ascii_lowercase();
             match k.as_str() {
-                "delete" => on_delete = value.as_deref().and_then(parse_fk_action),
-                "update" => on_update = value.as_deref().and_then(parse_fk_action),
+                "delete" => on_delete = value.as_deref().and_then(FkAction::from_dbml),
+                "update" => on_update = value.as_deref().and_then(FkAction::from_dbml),
                 _ => {}
             }
         }
@@ -927,20 +927,6 @@ fn parse_schema_table(s: &str) -> Result<(String, String)> {
         [schema, table] => Ok((unquote(schema), unquote(table))),
         [table] => Ok(("public".to_string(), unquote(table))),
         _ => Err(parse_err(format!("malformed ref table prefix: {s}"))),
-    }
-}
-
-/// Map a DBML FK action keyword to an [`FkAction`]. `no action` → `Some(FkAction::NoAction)`
-/// (matches the exporter, which emits the keyword; the round-trip keeps `NoAction`
-/// distinguishable from "no FK action specified").
-fn parse_fk_action(s: &str) -> Option<FkAction> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "cascade" => Some(FkAction::Cascade),
-        "restrict" => Some(FkAction::Restrict),
-        "set null" => Some(FkAction::SetNull),
-        "set default" => Some(FkAction::SetDefault),
-        "no action" => Some(FkAction::NoAction),
-        _ => None,
     }
 }
 

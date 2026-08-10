@@ -17,7 +17,7 @@ impl Design {
             .import_tables
             .iter()
             .filter(|t| t.errors.is_empty())
-            .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
+            .filter(|t| name.is_none_or(|n| t.name == n))
             .collect();
 
         // Collect all procedures that are candidates for import (in staging schemas)
@@ -59,14 +59,6 @@ impl Design {
     /// Sort import entries so that procedures writing to tables referenced by other
     /// procedures' targets come first.
     fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
-        // Build a set of all config tables written by each entry
-        let _write_set: std::collections::HashMap<String, Vec<String>> = entries
-            .iter()
-            .filter_map(|e| {
-                e.procedure.as_ref().map(|p| (p.clone(), e.writes.clone()))
-            })
-            .collect();
-
         // Build dependency: entry depends on another if its writes target has a FK
         // to a table written by another entry.
         // For now, use the DDL entity's refers to check FK deps between write targets.
@@ -177,8 +169,9 @@ impl Design {
         Ok(())
     }
 
-    /// Import phase: truncate staging tables (when configured) then load each
-    /// entry's data file. Returns the number of tables loaded.
+    /// Import phase: truncate staging tables (per-table override wins over the
+    /// global setting) then load each entry's data file. Returns the number of
+    /// tables loaded.
     async fn import_load_staging<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -191,21 +184,37 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        if self.config.import.options.truncate && !dry_run {
+        if !dry_run {
             for entry in plan {
-                let qualified = entry.table.name.replace('.', "\".\"");
-                adapter
-                    .execute_script(&format!("TRUNCATE \"{qualified}\""))
-                    .await?;
+                if self.config.import.table_truncate(&entry.table.name) {
+                    let qualified = entry.table.name.replace('.', "\".\"");
+                    adapter
+                        .execute_script(&format!("TRUNCATE \"{qualified}\""))
+                        .await?;
+                }
             }
         }
 
         let mut count = 0;
         for entry in plan {
-            let fmt = entry.table.format.as_deref().unwrap_or("csv");
-            let desc = format!("import {} ({})", entry.table.name, fmt);
+            // A per-table `format` override forces that parser regardless of the
+            // file extension; clone the entity only when an override applies.
+            let overridden;
+            let table = match self.config.import.table_format(&entry.table.name) {
+                Some(fmt) if entry.table.format.as_deref() != Some(fmt) => {
+                    let mut t = entry.table.clone();
+                    t.format = Some(fmt.to_string());
+                    overridden = t;
+                    &overridden
+                }
+                _ => &entry.table,
+            };
+            let fmt = table.format.as_deref().unwrap_or("csv");
+            let desc = format!("import {} ({})", table.name, fmt);
             on_start(&desc);
-            let result = if dry_run { Ok(()) } else { adapter.import_data(&entry.table, false).await };
+            let null_value = self.config.import.table_null_value(&entry.table.name);
+            let result =
+                if dry_run { Ok(()) } else { adapter.import_data(table, null_value, false).await };
             report_step_result(&desc, on_done, result)?;
             count += 1;
         }

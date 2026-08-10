@@ -427,15 +427,11 @@ pub(in crate::formatter) fn emit_or_group(
     };
 
     if all_comparable {
-        let max_lhs = parts.iter()
-            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
-            .max()
-            .unwrap_or(0);
+        let max_lhs = max_lhs_width(&parts);
 
         for (j, part) in parts.iter().enumerate() {
             let (lhs, op, rhs) = part.as_ref().unwrap();
-            let pad = max_lhs.saturating_sub(lhs.len());
-            let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+            let content = aligned_comparison(lhs, op, rhs, max_lhs);
             render(j, &content, lines);
         }
     } else {

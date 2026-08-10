@@ -181,16 +181,8 @@ fn format_parsed_statements(
         }
     }
 
-    // For SET, COMMENT ON, and other statements: regex-based formatting
-    let upper = original.trim().to_uppercase();
-    if upper.starts_with("SET") {
-        return format_set_statement(original, config);
-    }
-    if upper.starts_with("COMMENT") {
-        return format_comment_on(original, config);
-    }
-
-    // Fallback: keyword case transformation
+    // Fallback: keyword case transformation (also covers SET and COMMENT ON,
+    // which need no special-case handling beyond this).
     let result = apply_keyword_case(original, &config.keyword_case);
     ensure_semicolon(&result)
 }
@@ -362,6 +354,24 @@ mod tests {
         assert!(
             result.contains("Generic lookup table."),
             "Comment text should be preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn f10b_comment_on_escaped_quote_in_literal() {
+        // The literal contains a SQL-escaped quote (`''`); the scanner must not
+        // treat it as closing the string, or `AND` below would be seen as
+        // outside the literal and the literal itself would be corrupted.
+        let input = "COMMENT ON TABLE lookups IS\n'It''s a generic AND lookup table.';";
+        let result = format_ddl(input, &FormatConfig::default());
+        assert!(
+            result.contains("comment on table"),
+            "COMMENT ON should be lowercased, got: {result}"
+        );
+        assert!(
+            result.contains("It''s a generic AND lookup table."),
+            "Literal content (including the escaped quote and the keyword-like \
+             word `AND` inside it) should be preserved verbatim, got: {result}"
         );
     }
 

@@ -35,12 +35,8 @@ pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
 ///
 /// Walks the parsed query's FROM clauses to find table references directly,
 /// avoiding the alias.column false positives from string-based regex matching.
-pub fn extract_view_info(
-    statements: &[Statement],
-    search_paths: &[String],
-) -> (Vec<Reference>, Vec<String>) {
+pub fn extract_view_info(statements: &[Statement], search_paths: &[String]) -> Vec<Reference> {
     let mut references = Vec::new();
-    let columns = Vec::new();
     let default_schema = search_paths.first().map(|s| s.as_str()).unwrap_or("public");
 
     for stmt in statements {
@@ -49,7 +45,7 @@ pub fn extract_view_info(
         }
     }
 
-    (references, columns)
+    references
 }
 
 /// Extract the SELECT body text of a `CREATE [MATERIALIZED] VIEW`.
@@ -710,7 +706,7 @@ mod tests {
     fn view_refs(sql: &str) -> Vec<String> {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
-        let (refs, _) = extract_view_info(&stmts, &["public".to_string()]);
+        let refs = extract_view_info(&stmts, &["public".to_string()]);
         refs.into_iter().map(|r| r.name).collect()
     }
 

@@ -536,4 +536,32 @@ mod tests {
         assert!(script.is_none());
     }
 
+    /// Mirrors the merge `cmd_apply` performs: universal `schemas:` grants seed
+    /// the map, then the target's `grants:` extend it — adding new roles and
+    /// overriding (not unioning) the perm list for roles present in both.
+    #[test]
+    fn grants_script_target_overrides_universal_role_perms() {
+        let mut schema_grants: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        schema_grants.insert(
+            "config".to_string(),
+            HashMap::from([("app_user".to_string(), vec!["usage".to_string()])]),
+        );
+
+        let target_grants: HashMap<String, Vec<String>> = HashMap::from([
+            ("app_user".to_string(), vec!["usage".to_string(), "select".to_string()]),
+            (
+                "app_admin".to_string(),
+                vec!["usage".to_string(), "select".to_string(), "insert".to_string()],
+            ),
+        ]);
+        schema_grants
+            .entry("config".to_string())
+            .or_default()
+            .extend(target_grants);
+
+        let script = build_grants_script(&schema_grants, &[]).unwrap();
+        assert!(script.contains("GRANT USAGE ON SCHEMA \"config\" TO \"app_user\""));
+        assert!(script.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"config\" TO \"app_user\""));
+        assert!(script.contains("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA \"config\" TO \"app_admin\""));
+    }
 }

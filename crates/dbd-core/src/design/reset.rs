@@ -91,18 +91,7 @@ impl Design {
 
         // Data-model entities to drop individually (scope-filtered), in the
         // builder's reverse dependency order.
-        let is_data_model = |e: &Entity| {
-            matches!(
-                e.entity_type,
-                EntityType::Table
-                    | EntityType::View
-                    | EntityType::MaterializedView
-                    | EntityType::Function
-                    | EntityType::Procedure
-                    | EntityType::Enum
-                    | EntityType::Sequence
-            )
-        };
+        let is_data_model = |e: &Entity| crate::entity::TYPES_WITH_SCHEMA.contains(&e.entity_type);
         let entities: Vec<&Entity> = match scope {
             Some(s) if !s.is_all => {
                 let ws = self.working_set(s)?;
