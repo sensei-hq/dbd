@@ -59,14 +59,6 @@ impl Design {
     /// Sort import entries so that procedures writing to tables referenced by other
     /// procedures' targets come first.
     fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
-        // Build a set of all config tables written by each entry
-        let _write_set: std::collections::HashMap<String, Vec<String>> = entries
-            .iter()
-            .filter_map(|e| {
-                e.procedure.as_ref().map(|p| (p.clone(), e.writes.clone()))
-            })
-            .collect();
-
         // Build dependency: entry depends on another if its writes target has a FK
         // to a table written by another entry.
         // For now, use the DDL entity's refers to check FK deps between write targets.

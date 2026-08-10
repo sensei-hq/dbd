@@ -189,7 +189,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
             entity.references = references;
         }
         EntityType::View => {
-            let (refs, _columns) = extractors::extract_view_info(&statements, &entity.search_paths);
+            let refs = extractors::extract_view_info(&statements, &entity.search_paths);
             entity.references = refs;
         }
         EntityType::MaterializedView => {
@@ -203,7 +203,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
             if let Some(body) = extractors::extract_view_body(&statements) {
                 entity.writes = vec![body];
             }
-            let (refs, _columns) = extractors::extract_view_info(&statements, &entity.search_paths);
+            let refs = extractors::extract_view_info(&statements, &entity.search_paths);
             entity.references = refs;
             // Trailing CREATE INDEX statements land in table_def.indexes, exactly
             // like a table's indexes — reuse the table/index extractor (there is

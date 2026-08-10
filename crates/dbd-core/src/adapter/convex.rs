@@ -590,11 +590,9 @@ impl DatabaseAdapter for ConvexAdapter {
             }
             // Convex has no concept of these — silently ignore so that
             // cross-target projects can still apply.
-            EntityType::Schema
-            | EntityType::View
-            | EntityType::External
-            | EntityType::Import
-            | EntityType::Export => Ok(()),
+            EntityType::Schema | EntityType::View | EntityType::External | EntityType::Import => {
+                Ok(())
+            }
             EntityType::Extension
             | EntityType::Role
             | EntityType::Sequence

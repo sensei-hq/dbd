@@ -317,7 +317,7 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     }
 
     // Indexes block
-    let idx_block = emit_indexes(&table_def.indexes, &pk_columns);
+    let idx_block = emit_indexes(&table_def.indexes);
     if !idx_block.is_empty() {
         lines.push(String::new());
         lines.push("  indexes {".to_string());
@@ -371,7 +371,7 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     format!("  \"{}\" {}{}", col.name, data_type, settings_str)
 }
 
-fn emit_indexes(indexes: &[IndexDef], _pk_columns: &std::collections::HashSet<String>) -> Vec<String> {
+fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
     let mut lines = Vec::new();
 
     for idx in indexes {
