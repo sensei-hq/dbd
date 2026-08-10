@@ -1373,6 +1373,131 @@ impl Design {
         Ok(mv_to_create)
     }
 
+    /// Execute reconcile's write passes against the live database, in order:
+    /// A prerequisites + newly-added tables/enums, B ALTERs (with a `search_path`
+    /// prelude), C code objects (CREATE OR REPLACE), C-mv matview creates, and
+    /// D prune (only when `prune`). Returns the tallied summary. Factored out of
+    /// [`Design::reconcile`] so its body reads as setup → detect → write.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_reconcile_writes<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &crate::reconcile::ReconcilePlan,
+        desired_entities: &[&Entity],
+        managed_schemas: &std::collections::HashSet<String>,
+        mv_to_create: &[(&Entity, String)],
+        prune: bool,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<crate::reconcile::ReconcileComplete>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        use crate::reconcile::{matview_create_sql, qualified_entity_name, ReconcileComplete};
+        use std::collections::{HashMap, HashSet};
+
+        let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
+        let alter_sql: HashMap<&str, &str> = plan
+            .altered
+            .iter()
+            .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
+            .collect();
+
+        let mut summary = ReconcileComplete::default();
+
+        // Pass A — prerequisites + added tables/enums, in dependency order.
+        //   schema/extension/role/sequence: always (idempotent DDL);
+        //   enum/table: only when newly added (a full create).
+        for e in desired_entities {
+            let do_apply = match e.entity_type {
+                EntityType::Schema
+                | EntityType::Extension
+                | EntityType::Role
+                | EntityType::Sequence => true,
+                EntityType::Enum | EntityType::Table => {
+                    added.contains(qualified_entity_name(e).as_str())
+                }
+                _ => false,
+            };
+            if !do_apply {
+                continue;
+            }
+            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter.apply_entity(e).await;
+            report_step_result(&desc, on_done, result)?;
+            if is_created {
+                summary.created += 1;
+            } else {
+                summary.reapplied += 1;
+            }
+        }
+
+        // Generated ALTERs carry no `set search_path`, unlike the project's DDL
+        // files. Prepend one covering every managed schema (+ public) so bare
+        // references — e.g. an enum type or a default calling a managed function —
+        // resolve the same way they do when the DDL file runs.
+        let search_path = search_path_prelude(managed_schemas);
+
+        // Pass B — ALTER existing tables/enums, in dependency order.
+        for e in desired_entities {
+            let n = qualified_entity_name(e);
+            if let Some(sql) = alter_sql.get(n.as_str()) {
+                let desc = format!("alter {}:{n}", e.entity_type.tag());
+                on_start(&desc);
+                let script = format!("{search_path}{sql}");
+                let result = adapter.execute_script(&script).await;
+                report_step_result(&desc, on_done, result)?;
+                summary.altered += 1;
+            }
+        }
+
+        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
+        for e in desired_entities {
+            if !matches!(
+                e.entity_type,
+                EntityType::View | EntityType::Function | EntityType::Procedure
+            ) {
+                continue;
+            }
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter.apply_entity(e).await;
+            report_step_result(&desc, on_done, result)?;
+            summary.reapplied += 1;
+        }
+
+        // Pass C-mv (WRITES) — CREATE the matviews detection found absent. Reuses
+        // the pre-computed `mv_to_create` (no second `matview_states()` fetch).
+        // Each CREATE carries the same `search_path` prelude the ALTERs use.
+        for (e, want) in mv_to_create {
+            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            on_start(&desc);
+            let result = adapter
+                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
+                .await;
+            report_step_result(&desc, on_done, result)?;
+            summary.reapplied += 1;
+        }
+
+        // Pass D — prune orphaned tables (in managed schemas, gone from the
+        // design), only when explicitly requested. Otherwise they are reported
+        // via the returned plan and left untouched.
+        if prune {
+            for stmt in &plan.dropped {
+                let desc = format!("prune table:{}", stmt.entity_name);
+                on_start(&desc);
+                let result = adapter.execute_script(&stmt.sql).await;
+                report_step_result(&desc, on_done, result)?;
+                summary.dropped += 1;
+            }
+        }
+
+        Ok(summary)
+    }
+
     /// Reconcile the live database to the desired schema in place (declarative).
     ///
     /// Introspects the target, diffs its tables/enums against the project, and
@@ -1409,10 +1534,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_fk_convergence, plan_reconcile, qualified_entity_name, raw_snapshot_from_entities,
-            snapshot_from_entities, ReconcileComplete,
+            plan_fk_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
         };
-        use std::collections::{HashMap, HashSet};
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
@@ -1460,7 +1583,6 @@ impl Design {
         // WARN and leave it untouched. Only the CREATE *writes* run after the
         // return; here we merely record the decisions into the plan and a local
         // `mv_to_create` list the write pass reuses (no second states fetch).
-        use crate::reconcile::matview_create_sql;
         let mv_to_create = self
             .detect_reconcile_matviews(adapter, &desired_entities, &mut plan)
             .await?;
@@ -1471,105 +1593,19 @@ impl Design {
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
-        let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
-        let alter_sql: HashMap<&str, &str> = plan
-            .altered
-            .iter()
-            .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
-            .collect();
-
-        let mut summary = ReconcileComplete::default();
-
-        // Pass A — prerequisites + added tables/enums, in dependency order.
-        //   schema/extension/role/sequence: always (idempotent DDL);
-        //   enum/table: only when newly added (a full create).
-        for e in &desired_entities {
-            let do_apply = match e.entity_type {
-                EntityType::Schema
-                | EntityType::Extension
-                | EntityType::Role
-                | EntityType::Sequence => true,
-                EntityType::Enum | EntityType::Table => {
-                    added.contains(qualified_entity_name(e).as_str())
-                }
-                _ => false,
-            };
-            if !do_apply {
-                continue;
-            }
-            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, &mut on_done, result)?;
-            if is_created {
-                summary.created += 1;
-            } else {
-                summary.reapplied += 1;
-            }
-        }
-
-        // Generated ALTERs carry no `set search_path`, unlike the project's DDL
-        // files. Prepend one covering every managed schema (+ public) so bare
-        // references — e.g. an enum type or a default calling a managed function —
-        // resolve the same way they do when the DDL file runs.
-        let search_path = search_path_prelude(&managed_schemas);
-
-        // Pass B — ALTER existing tables/enums, in dependency order.
-        for e in &desired_entities {
-            let n = qualified_entity_name(e);
-            if let Some(sql) = alter_sql.get(n.as_str()) {
-                let desc = format!("alter {}:{n}", e.entity_type.tag());
-                on_start(&desc);
-                let script = format!("{search_path}{sql}");
-                let result = adapter.execute_script(&script).await;
-                report_step_result(&desc, &mut on_done, result)?;
-                summary.altered += 1;
-            }
-        }
-
-        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
-        for e in &desired_entities {
-            if !matches!(
-                e.entity_type,
-                EntityType::View | EntityType::Function | EntityType::Procedure
-            ) {
-                continue;
-            }
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, &mut on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass C-mv (WRITES) — CREATE the matviews the detection pass (above the
-        // dry_run return) found absent. Reuses the pre-computed `mv_to_create`, so
-        // there is no second `matview_states()` fetch. Each CREATE carries the same
-        // `search_path` prelude the ALTERs use, since the emitted `CREATE` (unlike
-        // a DDL file) has no `set search_path`.
-        for (e, want) in &mv_to_create {
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
-                .await;
-            report_step_result(&desc, &mut on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass D — prune orphaned tables (in managed schemas, gone from the
-        // design), only when explicitly requested. Otherwise they are reported
-        // via the returned plan and left untouched.
-        if prune {
-            for stmt in &plan.dropped {
-                let desc = format!("prune table:{}", stmt.entity_name);
-                on_start(&desc);
-                let result = adapter.execute_script(&stmt.sql).await;
-                report_step_result(&desc, &mut on_done, result)?;
-                summary.dropped += 1;
-            }
-        }
+        // Write passes A–D (see `execute_reconcile_writes`).
+        let summary = self
+            .execute_reconcile_writes(
+                adapter,
+                &plan,
+                &desired_entities,
+                &managed_schemas,
+                &mv_to_create,
+                prune,
+                &mut on_start,
+                &mut on_done,
+            )
+            .await?;
 
         // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
         // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
