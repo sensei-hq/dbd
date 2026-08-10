@@ -232,6 +232,21 @@ pub struct ImportConfig {
     pub after: Vec<String>,
 }
 
+impl ImportConfig {
+    /// Whether a staging table should be truncated before load. A per-table
+    /// `tables:` override (`staging.x: { truncate: false }`) wins over the global
+    /// `options.truncate`.
+    pub fn table_truncate(&self, table_name: &str) -> bool {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.truncate),
+                ImportTableEntry::Name(_) => None,
+            })
+            .unwrap_or(self.options.truncate)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ImportOptions {
@@ -644,6 +659,28 @@ mod tests {
         assert_eq!(config.import.tables[0].name(), "staging.lookups");
         assert_eq!(config.import.tables[1].name(), "staging.lookup_values");
         assert_eq!(config.import.after, vec!["import/loader.sql"]);
+    }
+
+    #[test]
+    fn import_table_truncate_override() {
+        let yaml = r#"
+project:
+  name: test
+import:
+  options:
+    truncate: true
+  tables:
+    - staging.keep
+    - staging.no_truncate:
+        truncate: false
+"#;
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        // A per-table `truncate: false` override wins over the global `truncate: true`.
+        assert!(!config.import.table_truncate("staging.no_truncate"));
+        // A bare-name entry inherits the global setting.
+        assert!(config.import.table_truncate("staging.keep"));
+        // An unlisted table inherits the global setting.
+        assert!(config.import.table_truncate("staging.other"));
     }
 
     #[test]
