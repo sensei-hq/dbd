@@ -411,6 +411,8 @@ Apply order: schemas → extensions → roles → enums → tables (with interle
 
 After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any materialized view it just created and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
+**Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in `_dbd_meta.scope`. A later `apply`/`deploy`/`reconcile`/`reset` that requests a *different* scope than the pin is refused ("scope guard: this database is pinned to scope 'X', but you requested 'Y'"), preventing a mistyped or forgotten `--scope` from building a divergent schema. Pass `--allow-scope-change` on the write command to re-point the database to the new scope (`reset --force` also bypasses). Databases created before this feature are unpinned and pin on their next write.
+
 ### dbd refresh
 
 Runs `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now, honoring each matview's resolved `concurrently`. `-n <entity>` or `-n <schema>.*` targets a subset; omit for all. For the initial populate or CI, independent of the pg_cron schedule. Recurring refresh is scheduled in-database via pg_cron (configured under `materialized_views:`). PostgreSQL/Supabase only.
@@ -686,14 +688,14 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.2
+  rev: v0.10.3
   hooks:
     - id: dbd-format
 ```
 
 ### dbd reset
 
-Guarded by `_dbd_meta` environment check. **Entity-level by default**: drops the
+Guarded by the `_dbd_meta` environment check **and** the scope guard (a wrong-`--scope` reset is refused unless `--allow-scope-change` or `--force`; see [dbd apply](#dbd-apply)). **Entity-level by default**: drops the
 project's own objects individually — functions/procedures (every overload via a
 `DROP ROUTINE` DO-block), materialized views (`DROP MATERIALIZED VIEW … CASCADE`,
 before the views/tables they read), views, tables, sequences, enums — in reverse

@@ -174,6 +174,7 @@ dbd inspect --scope hub
 - `--deps <report|include>` overrides a scope's own `deps` setting for one run.
 - `external:` is the only sanctioned way to declare a dependency that lives outside the managed scope; references to `external:` entries are never counted as gaps.
 - Omit `default` (or omit `scopes:` entirely) to deploy the full set. Define `default:` only if a bare `dbd deploy` should itself deploy a subset.
+- **Scope guard.** The first `apply`/`deploy`/`reconcile` pins a database to its resolved scope (recorded in `_dbd_meta.scope`); a later `apply`/`deploy`/`reconcile`/`reset` under a *different* scope is refused unless you pass `--allow-scope-change` (which re-points the DB) — this stops a mistyped or forgotten `--scope` from building a divergent schema in the wrong database.
 
 **Gap report example** (`deps: report`):
 
@@ -248,7 +249,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.2
+  rev: v0.10.3
   hooks:
     - id: dbd-format
 ```

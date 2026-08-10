@@ -23,6 +23,8 @@ pub struct ProjectMeta {
     pub project: String,
     pub env: String,
     pub version: u32,
+    /// The resolved scope this database is pinned to (`None` = unpinned).
+    pub scope: Option<String>,
     pub applied_at: Option<String>,
 }
 
@@ -236,7 +238,7 @@ pub trait DatabaseAdapter: Send + Sync {
 
     async fn ensure_meta_table(&self) -> Result<()>;
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()>;
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
 }
 
 pub mod convex;

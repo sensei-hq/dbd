@@ -90,8 +90,29 @@ impl MockAdapter {
             project: "test".to_string(),
             env: env.to_string(),
             version,
+            scope: None,
             applied_at: Some("2026-01-01T00:00:00Z".to_string()),
         });
+        self
+    }
+
+    /// Seed (or overwrite) the pinned scope for scope-guard tests.
+    pub fn with_scope(self, scope: &str) -> Self {
+        {
+            let mut m = self.meta.lock().unwrap();
+            match m.as_mut() {
+                Some(meta) => meta.scope = Some(scope.to_string()),
+                None => {
+                    *m = Some(ProjectMeta {
+                        project: "test".to_string(),
+                        env: "dev".to_string(),
+                        version: 0,
+                        scope: Some(scope.to_string()),
+                        applied_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    });
+                }
+            }
+        }
         self
     }
 
@@ -228,11 +249,12 @@ impl DatabaseAdapter for MockAdapter {
         Ok(self.meta.lock().unwrap().clone())
     }
 
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         *self.meta.lock().unwrap() = Some(ProjectMeta {
             project: "test".to_string(),
             env: env.to_string(),
             version,
+            scope: scope.map(|s| s.to_string()),
             applied_at: Some("2026-01-01T00:00:00Z".to_string()),
         });
         Ok(())
@@ -300,7 +322,7 @@ mod tests {
         let mock = MockAdapter::new();
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        mock.set_project_meta("prod", 5).await.unwrap();
+        mock.set_project_meta("prod", 5, None).await.unwrap();
 
         assert_eq!(mock.get_db_version().await.unwrap(), 5);
         let meta = mock.get_project_meta().await.unwrap().unwrap();
@@ -327,5 +349,17 @@ mod tests {
         ];
         mock.apply_entities(&entities).await.unwrap();
         assert_eq!(mock.applied_names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_meta_round_trips_scope() {
+        let mock = MockAdapter::new();
+        mock.set_project_meta("dev", 2, Some("public")).await.unwrap();
+        let meta = mock.get_project_meta().await.unwrap().expect("meta");
+        assert_eq!(meta.scope.as_deref(), Some("public"));
+
+        // None clears the pin.
+        mock.set_project_meta("dev", 3, None).await.unwrap();
+        assert_eq!(mock.get_project_meta().await.unwrap().unwrap().scope, None);
     }
 }

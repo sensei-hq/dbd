@@ -432,43 +432,71 @@ impl DatabaseAdapter for SqliteAdapter {
                 project    TEXT NOT NULL PRIMARY KEY, \
                 env        TEXT NOT NULL DEFAULT 'dev', \
                 version    INTEGER NOT NULL DEFAULT 0, \
+                scope      TEXT, \
                 created_at TEXT NOT NULL DEFAULT (datetime('now')), \
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')) \
             )",
         )
+        .await?;
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` — add `scope` only when missing.
+        let has_scope = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'",
+        )
+        .fetch_one(&self.pool)
         .await
+        .unwrap_or(0)
+            > 0;
+        if !has_scope {
+            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT").await?;
+        }
+        Ok(())
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        let result = sqlx::query(
-            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1",
-        )
-        .bind(&self.project)
-        .fetch_optional(&self.pool)
-        .await;
-
-        match result {
-            Ok(Some(row)) => Ok(Some(ProjectMeta {
-                project: row.get("project"),
-                env: row.get("env"),
-                version: row.get::<i64, _>("version") as u32,
-                applied_at: row.try_get("applied_at").ok(),
-            })),
-            Ok(None) | Err(_) => Ok(None),
+        // Inspect the table shape via pragma (which returns zero rows for a missing
+        // table — not an error), so we pick the right SELECT and let genuine read
+        // failures surface instead of masking them as "no meta", which would
+        // silently disable the scope AND prod guards.
+        let columns: Vec<String> =
+            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
+        if columns.is_empty() {
+            return Ok(None); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
         }
+        let has_scope = columns.iter().any(|c| c == "scope");
+        let sql = if has_scope {
+            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
+        } else {
+            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
+        };
+        let row = sqlx::query(sql)
+            .bind(&self.project)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        Ok(row.map(|row| ProjectMeta {
+            project: row.get("project"),
+            env: row.get("env"),
+            version: row.get::<i64, _>("version") as u32,
+            scope: if has_scope { row.try_get("scope").ok() } else { None },
+            applied_at: row.try_get("applied_at").ok(),
+        }))
     }
 
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         self.ensure_meta_table().await?;
         sqlx::query(
-            "INSERT INTO _dbd_meta (project, env, version) \
-             VALUES (?1, ?2, ?3) \
+            "INSERT INTO _dbd_meta (project, env, version, scope) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT (project) DO UPDATE \
-             SET env = excluded.env, version = excluded.version, updated_at = datetime('now')",
+             SET env = excluded.env, version = excluded.version, scope = excluded.scope, updated_at = datetime('now')",
         )
         .bind(&self.project)
         .bind(env)
         .bind(version as i64)
+        .bind(scope)
         .execute(&self.pool)
         .await
         .map_err(|e| DbdError::Config(format!("Set project meta failed: {e}")))?;
@@ -807,11 +835,70 @@ mod tests {
         let a = mem().await;
         a.ensure_meta_table().await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 0);
-        a.set_project_meta("dev", 3).await.unwrap();
+        a.set_project_meta("dev", 3, None).await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 3);
         let m = a.get_project_meta().await.unwrap().unwrap();
         assert_eq!(m.env, "dev");
         assert_eq!(m.version, 3);
+    }
+
+    #[tokio::test]
+    async fn s8_meta_scope_backfills_on_legacy_table() {
+        let a = mem().await; // project = "test"
+        // Legacy `_dbd_meta` WITHOUT the `scope` column (pre-scope-guard schema).
+        a.execute_script(
+            "CREATE TABLE _dbd_meta ( \
+                project TEXT NOT NULL PRIMARY KEY, \
+                env TEXT NOT NULL DEFAULT 'dev', \
+                version INTEGER NOT NULL DEFAULT 0, \
+                created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')) )",
+        )
+        .await
+        .unwrap();
+        a.execute_script("INSERT INTO _dbd_meta (project, env, version) VALUES ('test', 'prod', 2)")
+            .await
+            .unwrap();
+
+        // Resilient read: prod guard still sees env/version; scope = None.
+        let m = a.get_project_meta().await.unwrap().expect("legacy meta reads");
+        assert_eq!(m.env, "prod");
+        assert_eq!(m.version, 2);
+        assert_eq!(m.scope, None);
+
+        // A write backfills the column and pins the scope.
+        a.set_project_meta("prod", 3, Some("public")).await.unwrap();
+        let m2 = a.get_project_meta().await.unwrap().unwrap();
+        assert_eq!(m2.scope.as_deref(), Some("public"));
+    }
+
+    #[tokio::test]
+    async fn s9_scope_guard_fires_against_real_pin() {
+        use crate::design::Design;
+        let a = mem().await; // project = "test"
+        a.ensure_meta_table().await.unwrap();
+        // Pin the DB to scope "public" through the real adapter round-trip.
+        a.set_project_meta("dev", 1, Some("public")).await.unwrap();
+        let meta = a.get_project_meta().await.unwrap();
+        assert_eq!(meta.as_ref().unwrap().scope.as_deref(), Some("public"));
+
+        // Same scope → allowed.
+        assert!(Design::check_scope_guard(meta.as_ref(), "public", false).is_ok());
+        // Different scope → blocked, message names both scopes.
+        let err = Design::check_scope_guard(meta.as_ref(), "internal", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
+        // Bypass → allowed.
+        assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
+    }
+
+    /// A fresh DB with no `_dbd_meta` reads as `None` (not an error) — the pragma
+    /// probe returns no columns, so the resilient read short-circuits cleanly
+    /// rather than erroring on the absent table.
+    #[tokio::test]
+    async fn s10_get_meta_on_fresh_db_is_none() {
+        let a = mem().await; // no `_dbd_meta` created
+        assert!(a.get_project_meta().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1116,7 +1203,7 @@ mod tests {
         assert_eq!(a.reverse_managed_version().await.unwrap(), None);
         // After dbd's meta table + a row for this project → managed at that version.
         a.ensure_meta_table().await.unwrap();
-        a.set_project_meta("prod", 3).await.unwrap();
+        a.set_project_meta("prod", 3, None).await.unwrap();
         assert_eq!(a.reverse_managed_version().await.unwrap(), Some(3));
     }
 }
