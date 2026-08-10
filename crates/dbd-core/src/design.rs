@@ -103,6 +103,27 @@ pub struct DeployComplete {
     pub import: ImportComplete,
 }
 
+/// Bundled progress callbacks for a long-running operation: `on_start(desc)` is
+/// called before each step, `on_done(desc, err)` after each (`err` = `None` on
+/// success), and `on_complete(summary)` once at the end. Use [`Progress::none`]
+/// for a silent run.
+pub struct Progress<S, D, C> {
+    pub on_start: S,
+    pub on_done: D,
+    pub on_complete: C,
+}
+
+fn noop_start(_: &str) {}
+fn noop_done(_: &str, _: Option<&str>) {}
+fn noop_complete<C>(_: C) {}
+
+impl<C> Progress<fn(&str), fn(&str, Option<&str>), fn(C)> {
+    /// A no-op progress sink — for tests and silent runs.
+    pub fn none() -> Self {
+        Progress { on_start: noop_start, on_done: noop_done, on_complete: noop_complete::<C> }
+    }
+}
+
 /// Summary returned by `apply()` describing what happened.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
@@ -1028,9 +1049,7 @@ impl Design {
         name: Option<&str>,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
+        mut progress: Progress<S, D, C>,
     ) -> Result<()>
     where
         S: FnMut(&str),
@@ -1058,7 +1077,7 @@ impl Design {
             adapter
                 .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
                 .await?;
-            on_complete(ApplyComplete {
+            (progress.on_complete)(ApplyComplete {
                 strategy: ApplyStrategy::Current,
                 from_version: 0,
                 to_version: 0,
@@ -1142,8 +1161,8 @@ impl Design {
                     &entity_map,
                     scope,
                     &mut counts,
-                    &mut on_start,
-                    &mut on_done,
+                    &mut progress.on_start,
+                    &mut progress.on_done,
                 )
                 .await?;
             }
@@ -1210,7 +1229,7 @@ impl Design {
             .collect();
         adapter.sync_refresh_jobs(&mv_jobs).await?;
 
-        on_complete(ApplyComplete {
+        (progress.on_complete)(ApplyComplete {
             strategy: plan.strategy,
             from_version: db_version,
             to_version: latest_version,
@@ -1524,9 +1543,7 @@ impl Design {
         allow_destructive: bool,
         prune: bool,
         scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
+        mut progress: Progress<S, D, C>,
     ) -> Result<crate::reconcile::ReconcilePlan>
     where
         S: FnMut(&str),
@@ -1602,8 +1619,8 @@ impl Design {
                 &managed_schemas,
                 &mv_to_create,
                 prune,
-                &mut on_start,
-                &mut on_done,
+                &mut progress.on_start,
+                &mut progress.on_done,
             )
             .await?;
 
@@ -1626,7 +1643,7 @@ impl Design {
         adapter.ensure_meta_table().await?;
         adapter.set_project_meta(&self.env, version, scope.map(|s| s.name.as_str())).await?;
 
-        on_complete(summary);
+        (progress.on_complete)(summary);
         Ok(plan)
     }
 
@@ -1869,9 +1886,7 @@ impl Design {
         name: Option<&str>,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
+        mut progress: Progress<S, D, C>,
     ) -> Result<()>
     where
         S: FnMut(&str),
@@ -1903,16 +1918,16 @@ impl Design {
 
         // Run the import phases in order, tallying each for the summary.
         let tables = self
-            .import_load_staging(adapter, &plan, dry_run, &mut on_start, &mut on_done)
+            .import_load_staging(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
         let procedures = self
-            .import_call_procedures(adapter, &plan, dry_run, &mut on_start, &mut on_done)
+            .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
         let after_scripts = self
-            .import_run_after_scripts(adapter, dry_run, &mut on_start, &mut on_done)
+            .import_run_after_scripts(adapter, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
 
-        on_complete(ImportComplete { tables, procedures, after_scripts });
+        (progress.on_complete)(ImportComplete { tables, procedures, after_scripts });
         Ok(())
     }
 
@@ -2031,13 +2046,21 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
-            apply_summary = Some(s);
+        self.apply(adapter, None, dry_run, scope, Progress {
+            on_start: |_: &str| {},
+            on_done: |_: &str, _: Option<&str>| {},
+            on_complete: |s| {
+                apply_summary = Some(s);
+            },
         })
         .await?;
 
-        self.import_data(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
-            import_summary = Some(s);
+        self.import_data(adapter, None, dry_run, scope, Progress {
+            on_start: |_: &str| {},
+            on_done: |_: &str, _: Option<&str>| {},
+            on_complete: |s| {
+                import_summary = Some(s);
+            },
         })
         .await?;
 
@@ -2738,7 +2761,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, true, None, Progress::none()).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -2748,7 +2771,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -2825,7 +2848,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_transactions();
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         assert_eq!(mock.txn_log(), vec!["begin", "commit"]);
     }
@@ -2845,7 +2868,7 @@ mod tests {
         let mock = MockAdapter::new().with_transactions().fail_on_entity(&target);
 
         let err = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await
             .unwrap_err();
 
@@ -2859,7 +2882,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new(); // supports_transactional_apply() == false
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         assert!(mock.txn_log().is_empty());
         assert!(!mock.applied_names().is_empty());
@@ -2876,7 +2899,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
@@ -2894,7 +2917,7 @@ mod tests {
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
-            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&resolved), Progress::none())
             .await
             .unwrap();
 
@@ -2913,7 +2936,7 @@ mod tests {
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
-            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&resolved), Progress::none())
             .await
             .unwrap();
 
@@ -3118,7 +3141,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await;
+        let _ = design.import_data(&mock, None, false, None, Progress::none()).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
@@ -3493,7 +3516,7 @@ mod tests {
         // DB is at v1 → migration v2 is pending
         let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
         let result = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await;
 
         assert!(result.is_err(), "apply should be blocked by unresolved TODO");
@@ -3537,7 +3560,7 @@ mod tests {
         // Fresh DB — v1 migration is pending but data.sql has no TODOs
         let mock = crate::adapter::mock::MockAdapter::new();
         let result = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
@@ -3564,7 +3587,7 @@ mod tests {
         };
 
         let result = design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await;
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("dependency gap"), "expected gap error, got: {msg}");
@@ -3596,7 +3619,7 @@ mod tests {
         };
 
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();
@@ -3635,7 +3658,7 @@ mod tests {
 
         let scope = config_only_scope(Some(HashSet::new()));
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();
@@ -3656,7 +3679,7 @@ mod tests {
 
         let scope = config_only_scope(Some(HashSet::from(["uuid-ossp".to_string()])));
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();

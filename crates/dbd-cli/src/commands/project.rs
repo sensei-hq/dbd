@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete};
+use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete, Progress};
 use dbd_core::Design;
 
 use super::{format_deploy_summary, get_adapter, safe_copy, safe_read, safe_write};
@@ -380,9 +380,11 @@ pub async fn cmd_deploy(
                 None,
                 false,
                 Some(&resolved),
-                |desc| spinner.start(desc),
-                |desc, err| spinner.done(desc, err),
-                |s| apply_summary = Some(s),
+                Progress {
+                    on_start: |desc: &str| spinner.start(desc),
+                    on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
+                    on_complete: |s| apply_summary = Some(s),
+                },
             )
             .await;
         spinner.finish();
@@ -405,9 +407,11 @@ pub async fn cmd_deploy(
                 None,
                 false,
                 Some(&resolved),
-                |desc| spinner.start(desc),
-                |desc, err| spinner.done(desc, err),
-                |s| import_summary = Some(s),
+                Progress {
+                    on_start: |desc: &str| spinner.start(desc),
+                    on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
+                    on_complete: |s| import_summary = Some(s),
+                },
             )
             .await;
         spinner.finish();
@@ -481,7 +485,7 @@ pub async fn cmd_reconcile(
 
     if dry_run {
         let plan = design
-            .reconcile(&*adapter, true, allow_destructive, prune, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .reconcile(&*adapter, true, allow_destructive, prune, Some(&resolved), Progress::none())
             .await
             .context("Reconcile planning failed")?;
         print_reconcile_plan(&plan, prune, verbosity);
@@ -503,9 +507,11 @@ pub async fn cmd_reconcile(
                 allow_destructive,
                 prune,
                 Some(&resolved),
-                |desc| spinner.start(desc),
-                |desc, err| spinner.done(desc, err),
-                |s| summary = Some(s),
+                Progress {
+                    on_start: |desc: &str| spinner.start(desc),
+                    on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
+                    on_complete: |s| summary = Some(s),
+                },
             )
             .await;
         spinner.finish();

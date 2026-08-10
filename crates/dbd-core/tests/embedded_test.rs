@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use dbd_core::design::{ApplyStrategy, DeployComplete};
+use dbd_core::design::{ApplyStrategy, DeployComplete, Progress};
 use dbd_core::{Design, connect};
 use postgresql_embedded::{PostgreSQL, Settings};
 
@@ -293,7 +293,7 @@ async fn migration_upgrades_schema() {
 
     let mut v1_summary = None;
     v1_design
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v1_summary = Some(s))
+        .apply(&*adapter, None, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| v1_summary = Some(s) })
         .await
         .expect("v1 apply failed");
 
@@ -307,7 +307,7 @@ async fn migration_upgrades_schema() {
     let v2_design = load_design();
     let mut v2_summary = None;
     v2_design
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |s| v2_summary = Some(s))
+        .apply(&*adapter, None, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| v2_summary = Some(s) })
         .await
         .expect("v2 apply failed");
 
@@ -1285,7 +1285,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
          );\n",
     );
     load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 1 failed");
     assert_schema_exists(&*adapter, "app").await;
@@ -1303,7 +1303,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     );
     let mut summary = None;
     load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |s| summary = Some(s))
+        .reconcile(&*adapter, false, false, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| summary = Some(s) })
         .await
         .expect("reconcile phase 2 failed");
     assert_column_exists(&*adapter, "app", "items", "qty").await;
@@ -1318,7 +1318,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
          );\n",
     );
     let refused = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await;
     assert!(
         refused.is_err(),
@@ -1328,7 +1328,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
 
     // ── Phase 4: same drop with allow_destructive → applied ──
     load()
-        .reconcile(&*adapter, false, true, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
         .await
         .expect("reconcile phase 4 failed");
     assert_column_absent(&*adapter, "app", "items", "name").await;
@@ -1342,7 +1342,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     )
     .unwrap();
     load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile creating notes failed");
     assert_table_exists(&*adapter, "app", "notes").await;
@@ -1352,7 +1352,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
 
     // Without prune: the orphan is reported in the plan but left in place.
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile without prune failed");
     assert_eq!(plan.dropped.len(), 1, "notes should be reported as an orphan");
@@ -1362,7 +1362,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     // With prune: the orphan is dropped.
     let mut prune_summary = None;
     load()
-        .reconcile(&*adapter, false, false, true, None, |_| {}, |_, _| {}, |s| prune_summary = Some(s))
+        .reconcile(&*adapter, false, false, true, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| prune_summary = Some(s) })
         .await
         .expect("reconcile with prune failed");
     assert_eq!(prune_summary.unwrap().dropped, 1, "one table pruned");
@@ -1435,7 +1435,7 @@ async fn reconcile_warns_on_matview_definition_change() {
     // ── Phase 1: create the matview + sentinel comment; no warning. ──
     write_mv("select id from app.items");
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 1 (create matview) failed");
     assert_table_exists(&*adapter, "app", "items").await;
@@ -1453,7 +1453,7 @@ async fn reconcile_warns_on_matview_definition_change() {
     // ── Phase 2: SAME design → SKIP. No warning; oid unchanged. ──
     stash_oid(&*adapter).await;
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 2 (no-change) failed");
     assert!(plan.warnings.is_empty(), "unchanged matview must not warn; got {:?}", plan.warnings);
@@ -1463,7 +1463,7 @@ async fn reconcile_warns_on_matview_definition_change() {
     stash_oid(&*adapter).await;
     write_mv("select id, name from app.items");
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 3 (drift) failed");
     assert_oid_unchanged(&*adapter, "matview app.mv was recreated on drift but dbd must only warn").await;
@@ -1513,7 +1513,7 @@ async fn reconcile_dry_run_previews_matview_create_without_writing() {
 
     // ── Dry-run: the plan PREVIEWS the matview create, but writes nothing. ──
     let plan = load()
-        .reconcile(&*adapter, /*dry_run*/ true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, /*dry_run*/ true, false, false, None, Progress::none())
         .await
         .expect("dry-run reconcile failed");
     assert!(
@@ -1537,7 +1537,7 @@ async fn reconcile_dry_run_previews_matview_create_without_writing() {
 
     // ── Real reconcile: now the matview is actually created. ──
     let plan = load()
-        .reconcile(&*adapter, /*dry_run*/ false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, /*dry_run*/ false, false, false, None, Progress::none())
         .await
         .expect("reconcile (create matview) failed");
     assert!(
@@ -1595,7 +1595,7 @@ async fn diff_live_reports_matview_drift_read_only() {
     // ── Setup: reconcile creates + stamps app.mv (and its source table). ──
     write_mv("select id from app.items");
     load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile (create matview) failed");
 
@@ -1797,7 +1797,7 @@ async fn apply_stamps_matview_so_later_reconcile_does_not_warn() {
 
     // ── apply the whole design (creates the matview + stamps the sentinel). ──
     load()
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .apply(&*adapter, None, false, None, Progress::none())
         .await
         .expect("apply failed (sync_refresh_jobs must no-op without pg_cron)");
     assert_catalog(
@@ -1820,7 +1820,7 @@ async fn apply_stamps_matview_so_later_reconcile_does_not_warn() {
 
     // ── reconcile the SAME unchanged design: matview is recognized, no warning. ──
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile after apply failed");
     assert!(
@@ -1876,7 +1876,7 @@ async fn apply_does_not_restamp_pre_existing_matview() {
     // ── First apply: create + stamp the v1 hash. ──
     write_mv("select id from app.items");
     load()
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .apply(&*adapter, None, false, None, Progress::none())
         .await
         .expect("first apply failed");
     // Capture the stamped hash for later comparison.
@@ -1893,7 +1893,7 @@ async fn apply_does_not_restamp_pre_existing_matview() {
     //    a no-op, and the pre-existing matview must NOT be re-stamped. ──
     write_mv("select id, name from app.items");
     load()
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .apply(&*adapter, None, false, None, Progress::none())
         .await
         .expect("second apply failed");
     let hash_after_second = adapter
@@ -1913,7 +1913,7 @@ async fn apply_does_not_restamp_pre_existing_matview() {
     // A reconcile of the changed design still detects the drift and warns —
     // proving the un-restamped sentinel preserved drift detection.
     let plan = load()
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile failed");
     assert!(
@@ -1948,7 +1948,7 @@ async fn reconcile_dry_run_is_read_only() {
     let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
         .expect("load design");
     let plan = design
-        .reconcile(&*adapter, true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
         .await
         .expect("dry-run reconcile failed");
 
@@ -2046,7 +2046,7 @@ async fn diff_live_sees_foreign_keys_with_real_introspection() {
 
     // Apply the design → the live DB now has the FK (named children_parent_id_fkey).
     design
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .apply(&*adapter, None, false, None, Progress::none())
         .await
         .expect("apply failed");
 
@@ -2113,14 +2113,14 @@ async fn reconcile_converges_foreign_keys() {
 
     // Apply → the live DB has the FK.
     design
-        .apply(&*adapter, None, false, None, |_| {}, |_, _| {}, |_| {})
+        .apply(&*adapter, None, false, None, Progress::none())
         .await
         .expect("apply failed");
     assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
 
     // In-sync: reconcile must not churn the FK.
     let plan = design
-        .reconcile(&*adapter, true, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
         .await
         .expect("dry-run reconcile failed");
     assert!(
@@ -2138,7 +2138,7 @@ async fn reconcile_converges_foreign_keys() {
 
     // Reconcile (non-destructive) must re-add the declared FK.
     design
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile re-adding FK failed");
     assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
@@ -2169,14 +2169,14 @@ async fn reconcile_converges_foreign_keys() {
 
     // Without --allow-destructive → refused, FK untouched.
     let refused = design2
-        .reconcile(&*adapter, false, false, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await;
     assert!(refused.is_err(), "dropping an FK without --allow-destructive must be refused");
     assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
 
     // With --allow-destructive → the FK is dropped.
     design2
-        .reconcile(&*adapter, false, true, false, None, |_| {}, |_, _| {}, |_| {})
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
         .await
         .expect("destructive reconcile failed");
     assert_catalog(&*adapter, false, fk_pred, "FK on app.children").await;
