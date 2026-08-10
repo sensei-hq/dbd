@@ -231,8 +231,10 @@ Two choices worth understanding:
 |-----------|--------|-------------|
 | `staging` | list   | Schemas allowed for import (import fails for other schemas) |
 | `options` | object | Default options: `truncate`, `null_value`, `format` |
-| `tables`  | list   | Explicit table list (string or `{name: options}`); per-table `options` may include `env` (load only under matching `-e`) |
+| `tables`  | list   | Explicit table list (string, or `{name: options}` for per-table overrides of `truncate`/`format`) |
 | `after`   | list   | SQL scripts (project-relative paths) run after data load — e.g. `import/loader.sql` |
+
+> **Environment-specific data** is by folder, not config: files under `import/<env>/<schema>/<file>` load only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment (see [Commands → import](04-commands.md#dbd-import)).
 
 ### `export`
 
