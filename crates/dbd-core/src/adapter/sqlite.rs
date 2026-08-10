@@ -151,7 +151,7 @@ impl DatabaseAdapter for SqliteAdapter {
         }
     }
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()> {
         if dry_run {
             return Ok(());
         }
@@ -166,7 +166,9 @@ impl DatabaseAdapter for SqliteAdapter {
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
-            "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv").await,
+            "csv" | "tsv" => {
+                self.import_delimited(&data, table, format == "tsv", null_value).await
+            }
             "jsonl" => self.import_jsonl(&data, table).await,
             _ => Err(DbdError::Config(format!(
                 "Unsupported sqlite import format: {format}"
@@ -514,7 +516,13 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
-    async fn import_delimited(&self, data: &str, table: &str, tab: bool) -> Result<()> {
+    async fn import_delimited(
+        &self,
+        data: &str,
+        table: &str,
+        tab: bool,
+        null_value: &str,
+    ) -> Result<()> {
         let sep = if tab { '\t' } else { ',' };
         let mut lines = data.lines();
         let header_line = match lines.next() {
@@ -555,7 +563,7 @@ impl SqliteAdapter {
                 .iter()
                 .map(|v| {
                     let t = v.trim();
-                    if t.is_empty() { None } else { Some(t.to_string()) }
+                    if t == null_value { None } else { Some(t.to_string()) }
                 })
                 .collect();
             batch.push(row);
@@ -946,7 +954,7 @@ mod tests {
         let mut entity = Entity::new(EntityType::Import, "default.rows");
         entity.file = Some(path);
         entity.format = Some("csv".to_string());
-        a.import_data(&entity, false).await.unwrap();
+        a.import_data(&entity, "", false).await.unwrap();
 
         let row = sqlx::query("SELECT count(*) AS c FROM rows")
             .fetch_one(&a.pool)
@@ -954,6 +962,68 @@ mod tests {
             .unwrap();
         let count: i64 = row.get("c");
         assert_eq!(count, 2);
+    }
+
+    /// `null_value == ""` (the default) means an empty cell loads as SQL NULL —
+    /// byte-for-byte the pre-`null_value` behavior. A non-empty sentinel (e.g.
+    /// `\N`) maps only cells matching that exact sentinel to NULL; a plain empty
+    /// cell then loads as a literal empty string, not NULL.
+    #[tokio::test]
+    async fn s18_import_csv_null_value_sentinel() {
+        use tempfile::NamedTempFile;
+
+        // Default behavior: empty cell → NULL.
+        let a = mem().await;
+        a.execute_script("CREATE TABLE defaults (id INTEGER, note TEXT)")
+            .await
+            .unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(tmp, "id,note").unwrap();
+        writeln!(tmp, "1,").unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.defaults");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("csv".to_string());
+        a.import_data(&entity, "", false).await.unwrap();
+        let row = sqlx::query("SELECT note FROM defaults WHERE id = 1")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        let note: Option<String> = row.get("note");
+        assert_eq!(note, None, "empty cell should be NULL under the default sentinel");
+
+        // Custom sentinel: a cell equal to the sentinel is NULL; a plain empty
+        // cell is now a literal empty string (NOT null).
+        let b = mem().await;
+        b.execute_script("CREATE TABLE sentinels (id INTEGER, note TEXT)")
+            .await
+            .unwrap();
+        let mut tmp2 = NamedTempFile::new().unwrap();
+        writeln!(tmp2, "id,note").unwrap();
+        writeln!(tmp2, "1,\\N").unwrap();
+        writeln!(tmp2, "2,").unwrap();
+        let mut entity2 = Entity::new(EntityType::Import, "default.sentinels");
+        entity2.file = Some(tmp2.path().to_path_buf());
+        entity2.format = Some("csv".to_string());
+        b.import_data(&entity2, "\\N", false).await.unwrap();
+
+        let row1 = sqlx::query("SELECT note FROM sentinels WHERE id = 1")
+            .fetch_one(&b.pool)
+            .await
+            .unwrap();
+        let note1: Option<String> = row1.get("note");
+        assert_eq!(note1, None, "sentinel cell should be NULL");
+
+        let row2 = sqlx::query("SELECT note FROM sentinels WHERE id = 2")
+            .fetch_one(&b.pool)
+            .await
+            .unwrap();
+        let note2: Option<String> = row2.get("note");
+        assert_eq!(
+            note2,
+            Some(String::new()),
+            "empty cell should be a literal empty string when a non-empty sentinel is configured"
+        );
     }
 
     #[tokio::test]
@@ -1050,7 +1120,7 @@ mod tests {
         let mut entity = Entity::new(EntityType::Import, "default.big");
         entity.file = Some(tmp.path().to_path_buf());
         entity.format = Some("csv".to_string());
-        a.import_data(&entity, false).await.unwrap();
+        a.import_data(&entity, "", false).await.unwrap();
 
         let row = sqlx::query("SELECT count(*) AS c FROM big")
             .fetch_one(&a.pool)
@@ -1093,7 +1163,7 @@ mod tests {
         let mut entity = Entity::new(EntityType::Import, "default.mixed");
         entity.file = Some(tmp.path().to_path_buf());
         entity.format = Some("jsonl".to_string());
-        a.import_data(&entity, false).await.unwrap();
+        a.import_data(&entity, "", false).await.unwrap();
 
         let row = sqlx::query("SELECT count(*) AS c FROM mixed")
             .fetch_one(&a.pool)

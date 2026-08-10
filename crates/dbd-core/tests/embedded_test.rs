@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use dbd_core::design::{ApplyStrategy, DeployComplete, Progress};
-use dbd_core::{Design, connect};
+use dbd_core::{Design, Entity, EntityType, connect};
 use postgresql_embedded::{PostgreSQL, Settings};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -225,6 +225,50 @@ async fn deployed_tables_accept_data() {
         )
         .await;
     assert!(fk_violation.is_err(), "FK constraint should be enforced");
+}
+
+// ── Test: COPY import honors the configured null_value sentinel ───────────────
+
+#[tokio::test]
+async fn import_data_honors_null_value_sentinel() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    adapter
+        .execute_script("CREATE TABLE null_sentinel (id INTEGER, note TEXT)")
+        .await
+        .expect("create table failed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.csv");
+    // Row 1's `note` cell is the configured sentinel (`\N`) → should load as
+    // SQL NULL. Row 2's `note` cell is an empty string, which with a non-empty
+    // sentinel configured must load as a literal empty string, NOT NULL.
+    std::fs::write(&path, "id,note\n1,\\N\n2,\n").expect("write fixture csv failed");
+
+    let mut entity = Entity::new(EntityType::Table, "null_sentinel");
+    entity.file = Some(path);
+    entity.format = Some("csv".to_string());
+
+    adapter
+        .import_data(&entity, "\\N", false)
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM null_sentinel WHERE id = 1 AND note IS NULL",
+        "row 1 (sentinel cell → NULL)",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM null_sentinel WHERE id = 2 AND note = ''",
+        "row 2 (empty cell → literal empty string)",
+    )
+    .await;
 }
 
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────

@@ -628,7 +628,7 @@ impl DatabaseAdapter for ConvexAdapter {
         true
     }
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, _null_value: &str, dry_run: bool) -> Result<()> {
         let file_path = entity
             .file
             .as_ref()
@@ -1069,7 +1069,7 @@ mod tests {
         );
         // Import without a file path fails fast (no shell-out attempted).
         let no_file = Entity::new(EntityType::Import, "config.users");
-        assert!(adapter.import_data(&no_file, false).await.is_err());
+        assert!(adapter.import_data(&no_file, "", false).await.is_err());
     }
 
     #[test]
@@ -1099,7 +1099,7 @@ mod tests {
         std::fs::write(&data_path, "{}\n").unwrap();
         e.file = Some(data_path);
         // dry_run = true should succeed without spawning npx.
-        adapter.import_data(&e, true).await.unwrap();
+        adapter.import_data(&e, "", true).await.unwrap();
     }
 
     #[tokio::test]

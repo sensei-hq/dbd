@@ -212,7 +212,9 @@ impl Design {
             let fmt = table.format.as_deref().unwrap_or("csv");
             let desc = format!("import {} ({})", table.name, fmt);
             on_start(&desc);
-            let result = if dry_run { Ok(()) } else { adapter.import_data(table, false).await };
+            let null_value = self.config.import.table_null_value(&entry.table.name);
+            let result =
+                if dry_run { Ok(()) } else { adapter.import_data(table, null_value, false).await };
             report_step_result(&desc, on_done, result)?;
             count += 1;
         }
