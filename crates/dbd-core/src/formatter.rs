@@ -461,15 +461,22 @@ fn format_create_table(
     }
 
     let indent = " ".repeat(config.indent);
-    // Re-attach comments only when the parsed body's item count lines up 1:1 with
-    // the AST's columns+constraints. On any mismatch (interleaved constraints,
-    // exotic layout), emit lines bare — the round-trip guard then keeps the
-    // original text, so a comment is never dropped.
+    emit_table_items(&mut out, &item_lines, original, &indent);
+
+    out.push_str(");");
+    out
+}
+
+/// Emit each column/constraint line into `out`, re-attaching captured inline
+/// comments only when they line up 1:1 with the items. On any mismatch
+/// (interleaved constraints, exotic layout), lines are emitted bare — the
+/// round-trip guard then keeps the original text, so a comment is never dropped.
+fn emit_table_items(out: &mut String, item_lines: &[String], original: &str, indent: &str) {
     match extract_item_comments(original).filter(|c| c.len() == item_lines.len()) {
         Some(comments) => {
             for (line, ic) in item_lines.iter().zip(comments.iter()) {
                 for lead in &ic.leading {
-                    out.push_str(&indent);
+                    out.push_str(indent);
                     out.push_str(lead);
                     out.push('\n');
                 }
@@ -480,7 +487,7 @@ fn format_create_table(
                         out.push_str(trailing);
                     } else {
                         out.push('\n');
-                        out.push_str(&indent);
+                        out.push_str(indent);
                         out.push_str(trailing);
                     }
                 }
@@ -488,15 +495,12 @@ fn format_create_table(
             }
         }
         None => {
-            for line in &item_lines {
+            for line in item_lines {
                 out.push_str(line);
                 out.push('\n');
             }
         }
     }
-
-    out.push_str(");");
-    out
 }
 
 // ── CREATE TABLE inline-comment preservation ────────────
@@ -1009,6 +1013,18 @@ fn read_word(first: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) 
     word
 }
 
+/// Re-case `word` per `case` when it is a SQL keyword; otherwise return it as-is.
+fn recase_keyword(word: &str, keywords: &HashSet<&'static str>, case: &KeywordCase) -> String {
+    if !keywords.contains(word.to_uppercase().as_str()) {
+        return word.to_string();
+    }
+    match case {
+        KeywordCase::Lower => word.to_lowercase(),
+        KeywordCase::Upper => word.to_uppercase(),
+        KeywordCase::Preserve => word.to_string(),
+    }
+}
+
 fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
     if matches!(case, KeywordCase::Preserve) {
         return sql.to_string();
@@ -1045,15 +1061,7 @@ fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
         // Collect a word and re-case it when it is a keyword.
         if c.is_ascii_alphabetic() || c == '_' {
             let word = read_word(c, &mut chars);
-            if keywords.contains(word.to_uppercase().as_str()) {
-                match case {
-                    KeywordCase::Lower => result.push_str(&word.to_lowercase()),
-                    KeywordCase::Upper => result.push_str(&word.to_uppercase()),
-                    KeywordCase::Preserve => result.push_str(&word),
-                }
-            } else {
-                result.push_str(&word);
-            }
+            result.push_str(&recase_keyword(&word, &keywords, case));
             continue;
         }
 
@@ -1474,24 +1482,16 @@ fn emit_aligned_conditions(
     let all_comparable = conditions.len() > 1 && parts.iter().all(|p| p.is_some());
 
     if all_comparable {
-        let max_lhs = parts.iter()
-            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
-            .max()
-            .unwrap_or(0);
-
+        let max_lhs = max_lhs_width(&parts);
         for (i, part) in parts.iter().enumerate() {
             let (lhs, op, rhs) = part.as_ref().unwrap();
-            let pad = max_lhs.saturating_sub(lhs.len());
-            let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+            let content = aligned_comparison(lhs, op, rhs, max_lhs);
             let keyword = if i == 0 { first_kw } else { cont_kw };
             lines.push(river_line(gutter, keyword, &content));
         }
     } else {
-        // Mixed: expand OR groups inline, align remaining comparisons
-        let max_lhs = parts.iter()
-            .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
-            .max()
-            .unwrap_or(0);
+        // Mixed: expand OR groups inline, align the remaining comparisons.
+        let max_lhs = max_lhs_width(&parts);
         let multi_cmp = parts.iter().filter(|p| p.is_some()).count() > 1;
 
         for (i, cond) in conditions.iter().enumerate() {
@@ -1501,8 +1501,7 @@ fn emit_aligned_conditions(
                 emit_or_group(&or_parts, keyword, gutter, config, lines);
             } else if multi_cmp && parts[i].is_some() {
                 let (lhs, op, rhs) = parts[i].as_ref().unwrap();
-                let pad = max_lhs.saturating_sub(lhs.len());
-                let content = format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs);
+                let content = aligned_comparison(lhs, op, rhs, max_lhs);
                 lines.push(river_line(gutter, keyword, &content));
             } else {
                 let content = apply_keyword_case(&cond.to_string(), &config.keyword_case);
@@ -1510,6 +1509,21 @@ fn emit_aligned_conditions(
             }
         }
     }
+}
+
+/// Width of the widest LHS among the parsed comparison parts, for alignment.
+fn max_lhs_width(parts: &[Option<(String, String, String)>]) -> usize {
+    parts
+        .iter()
+        .filter_map(|p| p.as_ref().map(|(l, _, _)| l.len()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Format one aligned `lhs<pad> op rhs` comparison, padding the LHS to `max_lhs`.
+fn aligned_comparison(lhs: &str, op: &str, rhs: &str, max_lhs: usize) -> String {
+    let pad = max_lhs.saturating_sub(lhs.len());
+    format!("{}{} {} {}", lhs, " ".repeat(pad), op, rhs)
 }
 
 /// If `expr` is `(a OR b OR ...)`, return the flattened OR parts.
