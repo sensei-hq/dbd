@@ -1645,8 +1645,11 @@ impl DatabaseAdapter for PostgresAdapter {
                 let version: i32 = row.get("version");
                 Ok(version as u32)
             }
+            // `bookkeeping_schema` already confirmed the table exists, so a read
+            // error here is real (transient failure, permission) — surface it
+            // rather than masking a live DB's version as 0 and misplanning apply.
             Ok(None) => Ok(0),
-            Err(_) => Ok(0), // Table doesn't exist yet
+            Err(e) => Err(DbdError::Config(format!("read _dbd_meta version failed: {e}"))),
         }
     }
 

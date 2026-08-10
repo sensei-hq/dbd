@@ -373,18 +373,25 @@ impl DatabaseAdapter for SqliteAdapter {
     }
 
     async fn get_db_version(&self) -> Result<u32> {
-        let result = sqlx::query("SELECT version FROM _dbd_meta WHERE project = ?1")
+        // `_dbd_meta` absent ⇒ fresh DB (version 0). Probe via pragma (empty for a
+        // missing table, not an error) so a genuine read failure surfaces instead
+        // of being masked as 0 and misplanning apply against a live DB.
+        let has_meta = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?
+            > 0;
+        if !has_meta {
+            return Ok(0);
+        }
+        let row = sqlx::query("SELECT version FROM _dbd_meta WHERE project = ?1")
             .bind(&self.project)
             .fetch_optional(&self.pool)
-            .await;
-
-        match result {
-            Ok(Some(row)) => {
-                let version: i64 = row.get("version");
-                Ok(version as u32)
-            }
-            Ok(None) | Err(_) => Ok(0),
-        }
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta version failed: {e}")))?;
+        Ok(row.map(|r| r.get::<i64, _>("version") as u32).unwrap_or(0))
     }
 
     async fn apply_migration(

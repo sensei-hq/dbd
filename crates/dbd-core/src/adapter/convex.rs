@@ -353,16 +353,19 @@ fn schema_path(output_dir: &Path) -> PathBuf {
     output_dir.join(SCHEMA_FILE)
 }
 
-fn load_state(output_dir: &Path) -> ConvexState {
+fn load_state(output_dir: &Path) -> Result<ConvexState> {
     let path = state_path(output_dir);
     if !path.exists() {
-        return ConvexState::default();
+        return Ok(ConvexState::default());
     }
+    // A read or parse failure on an existing state file must NOT collapse to a
+    // fresh default — callers mutate + `save_state` it back, so masking the error
+    // would silently overwrite (erase) the recorded migration history.
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| DbdError::Config(format!("read convex state {}: {e}", path.display())))?;
+    serde_json::from_str(&contents)
+        .map_err(|e| DbdError::Config(format!("parse convex state {}: {e}", path.display())))
 }
 
 fn save_state(output_dir: &Path, state: &ConvexState) -> Result<()> {
@@ -688,7 +691,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn get_db_version(&self) -> Result<u32> {
-        Ok(load_state(&self.output_dir).version)
+        Ok(load_state(&self.output_dir)?.version)
     }
 
     async fn apply_migration(
@@ -698,7 +701,7 @@ impl DatabaseAdapter for ConvexAdapter {
         description: &str,
         checksum: &str,
     ) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         if state.migrations.iter().any(|m| m.version == version) {
             return Ok(());
         }
@@ -712,7 +715,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn clear_project_migrations(&self) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         state.migrations.clear();
         save_state(&self.output_dir, &state)
     }
@@ -726,7 +729,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        let state = load_state(&self.output_dir);
+        let state = load_state(&self.output_dir)?;
         if state.project.is_empty() {
             return Ok(None);
         }
@@ -740,7 +743,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
-        let mut state = load_state(&self.output_dir);
+        let mut state = load_state(&self.output_dir)?;
         state.project = self.project.clone();
         state.env = env.to_string();
         state.version = version;
