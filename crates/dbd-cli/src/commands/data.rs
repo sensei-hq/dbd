@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use dbd_core::design::ImportComplete;
+use dbd_core::design::{ImportComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
 use super::{format_import_summary, get_adapter};
@@ -126,7 +126,7 @@ pub async fn cmd_import(
         entity.file = Some(path.to_path_buf());
         entity.format = Some(format.to_string());
         adapter
-            .import_data(&entity, false)
+            .import_data(&entity, design.config().import.table_null_value(&qualified), false)
             .await
             .context(format!("Failed to import {qualified} ← {}", path.display()))?;
 
@@ -146,9 +146,11 @@ pub async fn cmd_import(
             name,
             false,
             Some(&resolved),
-            |desc| spinner.start(desc),
-            |desc, err| spinner.done(desc, err),
-            |s| import_summary = Some(s),
+            Progress {
+                on_start: |desc: &str| spinner.start(desc),
+                on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
+                on_complete: |s| import_summary = Some(s),
+            },
         )
         .await;
     spinner.finish();

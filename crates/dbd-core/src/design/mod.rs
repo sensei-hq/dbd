@@ -9,58 +9,20 @@ use crate::parser;
 use crate::references;
 use crate::refcache::RefCache;
 use crate::scanner;
-use crate::scope::{self, ResolvedScope};
+use crate::scope::ResolvedScope;
 use crate::script;
 use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
-// ── Execution plan types ──────────────────────────────────
 
-/// Strategy for applying entities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApplyStrategy {
-    /// Fresh database — no previous version, apply everything.
-    Fresh,
-    /// Pending migrations exist — interleave migrations with applies.
-    Migrate,
-    /// Already current — just re-apply idempotent DDL.
-    Current,
-}
+mod scope;
+mod apply;
+mod reconcile;
+mod import;
+mod reset;
+mod plan;
 
-/// A single step in the execution plan.
-#[derive(Debug, Clone)]
-pub enum ExecutionStep {
-    /// Create a brand-new entity (from a migration's `added` list).
-    CreateEntity(String),
-    /// Run a migration SQL file for an altered entity.
-    MigrateEntity {
-        entity_name: String,
-        migration_sql_path: PathBuf,
-        migration_version: u32,
-    },
-    /// Apply (or re-apply) an entity's current DDL idempotently.
-    ApplyEntity(String),
-    /// Drop an entity using a migration SQL file.
-    DropEntity {
-        entity_name: String,
-        drop_sql_path: PathBuf,
-        migration_version: u32,
-    },
-    /// Record that a migration version was applied.
-    RecordMigration {
-        version: u32,
-        checksum: String,
-    },
-    /// Set the project version to the latest.
-    SetVersion(u32),
-}
-
-/// A complete execution plan with strategy and ordered steps.
-#[derive(Debug)]
-pub struct ExecutionPlan {
-    pub strategy: ApplyStrategy,
-    pub steps: Vec<ExecutionStep>,
-}
+pub use plan::{build_execution_plan, ApplyStrategy, ExecutionPlan, ExecutionStep};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone)]
@@ -103,6 +65,27 @@ pub struct DeployComplete {
     pub import: ImportComplete,
 }
 
+/// Bundled progress callbacks for a long-running operation: `on_start(desc)` is
+/// called before each step, `on_done(desc, err)` after each (`err` = `None` on
+/// success), and `on_complete(summary)` once at the end. Use [`Progress::none`]
+/// for a silent run.
+pub struct Progress<S, D, C> {
+    pub on_start: S,
+    pub on_done: D,
+    pub on_complete: C,
+}
+
+fn noop_start(_: &str) {}
+fn noop_done(_: &str, _: Option<&str>) {}
+fn noop_complete<C>(_: C) {}
+
+impl<C> Progress<fn(&str), fn(&str, Option<&str>), fn(C)> {
+    /// A no-op progress sink — for tests and silent runs.
+    pub fn none() -> Self {
+        Progress { on_start: noop_start, on_done: noop_done, on_complete: noop_complete::<C> }
+    }
+}
+
 /// Summary returned by `apply()` describing what happened.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
@@ -111,173 +94,10 @@ pub struct ApplyResult {
     pub to_version: u32,
 }
 
-/// Build an execution plan based on entity state and pending migrations.
-///
-/// Pure logic — no I/O. The caller is responsible for executing the steps.
-pub fn build_execution_plan(
-    entities: &[Entity],
-    db_version: u32,
-    latest_version: u32,
-    pending_migrations: &[PendingMigration],
-    scope_names: Option<&std::collections::HashSet<String>>,
-) -> ExecutionPlan {
-    // Filter to valid, non-external entities
-    let valid_entities: Vec<&Entity> = entities
-        .iter()
-        .filter(|e| e.errors.is_empty())
-        .filter(|e| e.entity_type != EntityType::External)
-        .collect();
-
-    // Fresh: db_version == 0 → apply everything + set version
-    if db_version == 0 {
-        return plan_fresh(&valid_entities, latest_version);
-    }
-
-    // Current: no pending migrations or already at latest
-    if db_version >= latest_version || pending_migrations.is_empty() {
-        return plan_current(&valid_entities);
-    }
-
-    // Migrate: db_version < latest and there are pending migrations
-    plan_migrate(&valid_entities, pending_migrations, latest_version, scope_names)
-}
-
-/// Fresh install: apply every entity's DDL, then stamp the latest version.
-fn plan_fresh(valid_entities: &[&Entity], latest_version: u32) -> ExecutionPlan {
-    let mut steps: Vec<ExecutionStep> = valid_entities
-        .iter()
-        .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
-        .collect();
-    steps.push(ExecutionStep::SetVersion(latest_version));
-    ExecutionPlan {
-        strategy: ApplyStrategy::Fresh,
-        steps,
-    }
-}
-
-/// Up to date: (re)apply current DDL for every entity, no version change.
-fn plan_current(valid_entities: &[&Entity]) -> ExecutionPlan {
-    let steps: Vec<ExecutionStep> = valid_entities
-        .iter()
-        .map(|e| ExecutionStep::ApplyEntity(e.name.clone()))
-        .collect();
-    ExecutionPlan {
-        strategy: ApplyStrategy::Current,
-        steps,
-    }
-}
-
-/// Migrate forward: create/alter/apply in-scope entities, run drop scripts,
-/// record each pending migration, and stamp the latest version.
-fn plan_migrate(
-    valid_entities: &[&Entity],
-    pending_migrations: &[PendingMigration],
-    latest_version: u32,
-    scope_names: Option<&std::collections::HashSet<String>>,
-) -> ExecutionPlan {
-    let in_scope = |n: &str| scope_names.is_none_or(|s| s.contains(n));
-
-    // Collect all added/altered across all pending migrations
-    let all_added: std::collections::HashSet<&str> = pending_migrations
-        .iter()
-        .flat_map(|m| m.added.iter().map(|s| s.as_str()))
-        .collect();
-    let all_altered: std::collections::HashSet<&str> = pending_migrations
-        .iter()
-        .flat_map(|m| m.altered.iter().map(|s| s.as_str()))
-        .collect();
-
-    let mut steps: Vec<ExecutionStep> = Vec::new();
-
-    for entity in valid_entities {
-        if !in_scope(entity.name.as_str()) {
-            continue;
-        }
-        if all_added.contains(entity.name.as_str()) {
-            steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
-        }
-        if all_altered.contains(entity.name.as_str()) {
-            push_migrate_steps_for(&entity.name, pending_migrations, &mut steps);
-        }
-        // Every in-scope entity (added, altered, or unchanged) re-applies its DDL.
-        steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
-    }
-
-    // Handle dropped entities
-    for migration in pending_migrations {
-        for table_name in &migration.dropped {
-            if !in_scope(table_name) {
-                continue;
-            }
-            steps.push(ExecutionStep::DropEntity {
-                entity_name: table_name.clone(),
-                drop_sql_path: migration_entity_sql_path(
-                    &migration.migration_dir,
-                    table_name,
-                    ".drop.sql",
-                ),
-                migration_version: migration.to_version,
-            });
-        }
-    }
-
-    // Record each migration
-    for migration in pending_migrations {
-        steps.push(ExecutionStep::RecordMigration {
-            version: migration.to_version,
-            checksum: migration.checksum.clone(),
-        });
-    }
-
-    // Set version to latest
-    steps.push(ExecutionStep::SetVersion(latest_version));
-
-    ExecutionPlan {
-        strategy: ApplyStrategy::Migrate,
-        steps,
-    }
-}
-
-/// Push a `MigrateEntity` step for every pending migration that alters `entity_name`.
-fn push_migrate_steps_for(
-    entity_name: &str,
-    pending_migrations: &[PendingMigration],
-    steps: &mut Vec<ExecutionStep>,
-) {
-    for migration in pending_migrations {
-        if migration.altered.iter().any(|a| a == entity_name) {
-            steps.push(ExecutionStep::MigrateEntity {
-                entity_name: entity_name.to_string(),
-                migration_sql_path: migration_entity_sql_path(
-                    &migration.migration_dir,
-                    entity_name,
-                    ".sql",
-                ),
-                migration_version: migration.to_version,
-            });
-        }
-    }
-}
-
-/// Path to a per-entity migration SQL file: `<dir>/<schema>/<table><suffix>`
-/// (or `<dir>/<table><suffix>` when the entity name is unqualified).
-fn migration_entity_sql_path(migration_dir: &Path, entity_name: &str, suffix: &str) -> PathBuf {
-    let parts: Vec<&str> = entity_name.split('.').collect();
-    let (schema, table) = if parts.len() > 1 {
-        (Some(parts[0]), parts[1])
-    } else {
-        (None, parts[0])
-    };
-    match schema {
-        Some(s) => migration_dir.join(s).join(format!("{table}{suffix}")),
-        None => migration_dir.join(format!("{table}{suffix}")),
-    }
-}
-
 /// Refuse to apply while any pending migration still has unresolved `-- TODO:`
 /// lines in its `data.sql` files.
 fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
-    let todos = snapshot::pending_data_sql_todos(pending);
+    let todos = snapshot::pending_data_sql_todos(pending)?;
     if todos.is_empty() {
         return Ok(());
     }
@@ -381,7 +201,7 @@ pub struct Report {
     pub entity: Option<Entity>,
     pub issues: Vec<Entity>,
     pub warnings: Vec<Entity>,
-    pub gaps: Vec<scope::ScopeGap>,
+    pub gaps: Vec<crate::scope::ScopeGap>,
 }
 
 /// An entry in the import plan: staging table + matched procedure + write targets.
@@ -408,7 +228,7 @@ pub async fn apply_policies(
     project_dir: &Path,
     dry_run: bool,
 ) -> Result<PolicyReport> {
-    let files = crate::scanner::scan_policies(project_dir);
+    let files = crate::scanner::scan_policies(project_dir)?;
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
@@ -534,20 +354,24 @@ impl Design {
 
         let design_config = config::read(config_path)?;
 
-        // Scan and parse DDL entities
-        let ddl_files = scanner::scan_ddl(&project_dir);
-        let mut entities: Vec<Entity> = ddl_files
-            .iter()
-            .filter_map(|file| {
-                let sql = std::fs::read_to_string(file).ok()?;
-                // Use relative path for entity type/name derivation, but
-                // store the absolute path so the file is readable regardless of CWD.
-                let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-                let mut entity = parser::parse_entity(relative, &sql).ok()?;
+        // Scan and parse DDL entities. A file that fails to read must not
+        // silently vanish from the desired set — a live table could be
+        // dropped by `reconcile --prune` — so propagate the read error.
+        // `parse_entity`'s own Err (unparseable DDL) still drops the entity,
+        // unchanged from prior behavior.
+        let ddl_files = scanner::scan_ddl(&project_dir)?;
+        let mut entities: Vec<Entity> = Vec::new();
+        for file in &ddl_files {
+            let sql = std::fs::read_to_string(file)
+                .map_err(|e| DbdError::Config(format!("read DDL {}: {e}", file.display())))?;
+            // Use relative path for entity type/name derivation, but
+            // store the absolute path so the file is readable regardless of CWD.
+            let relative = file.strip_prefix(&project_dir).unwrap_or(file);
+            if let Ok(mut entity) = parser::parse_entity(relative, &sql) {
                 entity.file = Some(file.clone());
-                Some(entity)
-            })
-            .collect();
+                entities.push(entity);
+            }
+        }
 
         // Add schema entities
         for schema_name in design_config.schema_names() {
@@ -625,7 +449,7 @@ impl Design {
 
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
-        let import_files = scanner::scan_import(&project_dir, Some(env));
+        let import_files = scanner::scan_import(&project_dir, Some(env))?;
         let import_tables: Vec<Entity> = import_files
             .iter()
             .map(|file| {
@@ -668,192 +492,12 @@ impl Design {
         &self.project_dir
     }
 
-    /// External entity names from config (for ref resolution / gap analysis).
-    fn external_names(&self) -> Vec<String> {
-        self.config.external.iter().map(|e| e.name.clone()).collect()
-    }
-
-    /// Resolve a scope by name. `None` ⇒ `default` scope if defined, else `all`.
-    /// `deps_override` (CLI `--deps`) wins over the scope's own `deps`.
-    pub fn resolve_scope(
-        &self,
-        name: Option<&str>,
-        deps_override: Option<DepsPolicy>,
-    ) -> Result<ResolvedScope> {
-        scope::resolve(
-            &self.config.scopes,
-            name,
-            deps_override,
-            &self.entities,
-            &self.external_names(),
-        )
-    }
-
-    /// The set of entity names an operation should act on under this scope.
-    /// `include` policy expands to the dependency closure.
-    pub fn working_set(&self, scope: &ResolvedScope) -> Result<std::collections::HashSet<String>> {
-        match scope.deps {
-            DepsPolicy::Include => scope::closure(scope, &self.entities, &self.external_names()),
-            DepsPolicy::Report => Ok(scope.entities.clone()),
-        }
-    }
-
-    /// Whether an entity is kept under a resolved scope's working set.
-    /// Roles/externals are always-on infrastructure. Extensions are too by
-    /// default, unless the scope sets an `extensions` allowlist — then only the
-    /// named extensions apply (an empty list drops them all), letting a scope
-    /// target a database that lacks an extension (e.g. an embedded PG without
-    /// pgvector).
-    fn entity_in_scope(
-        entity: &Entity,
-        scope: &ResolvedScope,
-        working_set: &std::collections::HashSet<String>,
-    ) -> bool {
-        if scope.is_all {
-            return true;
-        }
-        match entity.entity_type {
-            EntityType::Extension => match &scope.extensions {
-                Some(allow) => allow.contains(&entity.name),
-                None => true,
-            },
-            EntityType::Role | EntityType::External => true,
-            _ => working_set.contains(&entity.name),
-        }
-    }
-
-    /// The loaded entities filtered to a resolved scope's working set
-    /// (closure under `include`, the plain set under `report`). The all-scope
-    /// returns every entity. Read-only and gap-neutral — for entity-selecting
-    /// commands like `dbml` that document/emit a subset without the write-path
-    /// gap gate.
-    pub fn scoped_entities(&self, scope: &ResolvedScope) -> Result<Vec<Entity>> {
-        if scope.is_all {
-            return Ok(self.entities.clone());
-        }
-        let ws = self.working_set(scope)?;
-        Ok(self
-            .entities
-            .iter()
-            .filter(|e| Self::entity_in_scope(e, scope, &ws))
-            .cloned()
-            .collect())
-    }
-
-    /// Resolve a scope to its working set, running the `report`-policy gap gate
-    /// first (aborts before any write). `None`/all-scope ⇒ `Ok(None)` (no
-    /// filtering). Shared by `apply`, `reconcile`, and `diff_live`.
-    fn scope_working_set(
-        &self,
-        scope: Option<&ResolvedScope>,
-    ) -> Result<Option<std::collections::HashSet<String>>> {
-        match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Ok(Some(self.working_set(s)?))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Valid, non-external entities kept under `scope`'s working set, optionally
-    /// narrowed to a single entity `name`. Shared by `apply` (which passes a
-    /// `name`) and `reconcile`/`diff_live` (which pass `None`).
-    fn entities_in_scope(
-        &self,
-        scope: Option<&ResolvedScope>,
-        working_set: Option<&std::collections::HashSet<String>>,
-        name: Option<&str>,
-    ) -> Vec<&Entity> {
-        self.entities
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != EntityType::External)
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| match (working_set, scope) {
-                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
-                _ => true,
-            })
-            .collect()
-    }
-
-    /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
-    /// name; anything else → its `schema` (or the default schema). Shared by
-    /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
-    fn managed_schemas(desired: &[&Entity]) -> std::collections::HashSet<String> {
-        desired
-            .iter()
-            .map(|e| match e.entity_type {
-                EntityType::Schema => e.name.clone(),
-                _ => {
-                    let s = e.schema.clone().unwrap_or_default();
-                    if s.is_empty() {
-                        crate::reconcile::DEFAULT_SCHEMA.to_string()
-                    } else {
-                        s
-                    }
-                }
-            })
-            .collect()
-    }
-
-    /// Under `report` policy, error if the scope has dependency gaps (an in-scope
-    /// entity that references a managed entity outside the scope). No-op for the
-    /// all-scope, `include` policy, or a gap-free scope. Shared by `apply` and
-    /// `import_data` so both refuse the same way before any write.
-    pub fn check_scope_gaps(&self, scope: &ResolvedScope) -> Result<()> {
-        if scope.is_all || scope.deps != DepsPolicy::Report {
-            return Ok(());
-        }
-        let gaps = scope::analyze_gaps(scope, &self.entities, &self.external_names());
-        if gaps.is_empty() {
-            return Ok(());
-        }
-        let detail: String = gaps
-            .iter()
-            .map(|g| format!("  {} requires {} ({})", g.required_by, g.missing, g.chain.join(" → ")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Err(DbdError::Config(format!(
-            "scope '{}' has {} dependency gap(s) — add them or use --deps include:\n{detail}",
-            scope.name,
-            gaps.len()
-        )))
-    }
-
-    /// Scope guard: refuse to operate under a scope different from the one this
-    /// database was pinned to. `meta` is the stored project meta (`None` on a
-    /// fresh database), `requested` is the resolved scope name for this run, and
-    /// `allow_scope_change` bypasses the guard (the next successful write re-pins
-    /// the DB). A database with no recorded scope (`meta.scope == None`) is
-    /// unpinned and never blocks — the current run pins it. Mirrors the prod
-    /// guard in [`Design::reset`]; invoked from the CLI write handlers.
-    pub fn check_scope_guard(
-        meta: Option<&crate::adapter::ProjectMeta>,
-        requested: &str,
-        allow_scope_change: bool,
-    ) -> Result<()> {
-        if allow_scope_change {
-            return Ok(());
-        }
-        if let Some(pinned) = meta.and_then(|m| m.scope.as_deref())
-            && pinned != requested
-        {
-            return Err(DbdError::SafetyGuard(format!(
-                "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
-                 Applying a different scope would build a divergent schema.\n\
-                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'."
-            )));
-        }
-        Ok(())
-    }
-
     /// Scan all migration directories for unresolved `-- TODO:` comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
     /// Used by `inspect` to surface outstanding data corrections.
     /// `apply` independently blocks on PENDING migrations with TODOs.
-    pub fn data_sql_todos(&self) -> Vec<snapshot::DataSqlTodo> {
+    pub fn data_sql_todos(&self) -> Result<Vec<snapshot::DataSqlTodo>> {
         snapshot::scan_data_sql_todos(&self.project_dir)
     }
 
@@ -885,21 +529,9 @@ impl Design {
             }
         }
 
-        let mut dropped = 0usize;
-        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
-            for entity in entities {
-                entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
-                    Some(name) if resolved.contains(name) => {
-                        *dropped += 1;
-                        false
-                    }
-                    _ => true,
-                });
-            }
-        };
-        drop_in(&mut self.entities, &mut dropped);
-        drop_in(&mut self.import_tables, &mut dropped);
-        Ok(dropped)
+        Ok(Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
+            resolved.contains(name)
+        }))
     }
 
     /// Capture the full set of user-defined entities (tables, views, enums)
@@ -929,29 +561,43 @@ impl Design {
     /// (regardless of whether any warnings matched), or `Ok((0, None))`
     /// when no cache file exists.
     pub fn resolve_unknown_refs_via_cache(&mut self) -> Result<(usize, Option<usize>)> {
-        const PREFIX: &str = "Unresolved reference: ";
-
         let cache = match RefCache::load(&self.project_dir)? {
             Some(c) => c,
             None => return Ok((0, None)),
         };
         let size = cache.len();
 
+        let dropped = Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
+            cache.contains(name)
+        });
+        Ok((dropped, Some(size)))
+    }
+
+    /// Drop "Unresolved reference: NAME" warnings from `entities` and
+    /// `import_tables` whose NAME satisfies `is_resolved`. Returns the count
+    /// dropped. Shared by `resolve_unknown_refs_via_db` (live DB resolution)
+    /// and `resolve_unknown_refs_via_cache` (ref-cache snapshot).
+    fn drop_resolved_ref_warnings(
+        entities: &mut [Entity],
+        import_tables: &mut [Entity],
+        is_resolved: impl Fn(&str) -> bool,
+    ) -> usize {
+        const PREFIX: &str = "Unresolved reference: ";
         let mut dropped = 0usize;
-        let drop_in = |entities: &mut Vec<Entity>, dropped: &mut usize| {
-            for entity in entities {
+        let mut drop_in = |ents: &mut [Entity]| {
+            for entity in ents.iter_mut() {
                 entity.warnings.retain(|w| match w.strip_prefix(PREFIX) {
-                    Some(name) if cache.contains(name) => {
-                        *dropped += 1;
+                    Some(name) if is_resolved(name) => {
+                        dropped += 1;
                         false
                     }
                     _ => true,
                 });
             }
         };
-        drop_in(&mut self.entities, &mut dropped);
-        drop_in(&mut self.import_tables, &mut dropped);
-        Ok((dropped, Some(size)))
+        drop_in(entities);
+        drop_in(import_tables);
+        dropped
     }
 
     /// Validate all entities and return self for chaining.
@@ -972,6 +618,18 @@ impl Design {
         self
     }
 
+    /// Entities (main + import tables) matching `has_items`, optionally narrowed
+    /// to a single entity by `name`. Shared by `report()`'s `issues`/`warnings`
+    /// collections, which differ only in `has_items`.
+    fn filtered_entities(&self, name: Option<&str>, has_items: impl Fn(&Entity) -> bool) -> Vec<Entity> {
+        self.entities
+            .iter()
+            .chain(self.import_tables.iter())
+            .filter(|e| has_items(e) && name.is_none_or(|n| e.name == n))
+            .cloned()
+            .collect()
+    }
+
     /// Generate a validation report, optionally filtered to one entity by
     /// `name` and augmented with dependency gaps when a `scope` is supplied.
     pub fn report(&mut self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Report {
@@ -981,26 +639,11 @@ impl Design {
 
         let entity = name.and_then(|n| self.entities.iter().find(|e| e.name == n).cloned());
 
-        let issues: Vec<Entity> = self
-            .entities
-            .iter()
-            .chain(self.import_tables.iter())
-            .filter(|e| !e.errors.is_empty())
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .cloned()
-            .collect();
-
-        let warnings: Vec<Entity> = self
-            .entities
-            .iter()
-            .chain(self.import_tables.iter())
-            .filter(|e| !e.warnings.is_empty())
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .cloned()
-            .collect();
+        let issues = self.filtered_entities(name, |e| !e.errors.is_empty());
+        let warnings = self.filtered_entities(name, |e| !e.warnings.is_empty());
 
         let gaps = match scope {
-            Some(s) => scope::analyze_gaps(s, &self.entities, &self.external_names()),
+            Some(s) => crate::scope::analyze_gaps(s, &self.entities, &self.external_names()),
             None => Vec::new(),
         };
 
@@ -1010,1054 +653,6 @@ impl Design {
             warnings,
             gaps,
         }
-    }
-
-    /// Apply all entities to the database via the adapter.
-    ///
-    /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
-    /// and executes the plan steps in order.
-    ///
-    /// `on_start(desc)` is called just before each visible step.
-    /// `on_done(desc, err)` is called after — `err` is `None` on success.
-    /// `on_complete(summary)` is called once after all steps succeed.
-    /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn apply<S, D, C>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        name: Option<&str>,
-        dry_run: bool,
-        scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
-    ) -> Result<()>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-        C: FnMut(ApplyComplete),
-    {
-        // Resolve scope → working set (gap-gated under `report`), then filter to
-        // the valid, in-scope, name-matching entities. The gate runs even under
-        // `dry_run`: a gappy scope is misconfigured regardless of writes.
-        let working_set = self.scope_working_set(scope)?;
-        let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
-
-        if dry_run {
-            return Ok(());
-        }
-
-        // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
-        if adapter.prefers_batch_apply() {
-            let count = valid_entities.len() as u32;
-            let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
-            adapter.apply_entities(&owned).await?;
-            // Batch adapters skip the execution plan (and its SetVersion step), so
-            // pin the applied scope here. Preserve the recorded version.
-            let db_version = adapter.get_db_version().await?;
-            adapter
-                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
-                .await?;
-            on_complete(ApplyComplete {
-                strategy: ApplyStrategy::Current,
-                from_version: 0,
-                to_version: 0,
-                applied: count,
-                migrated: 0,
-                created: 0,
-                dropped: 0,
-            });
-            return Ok(());
-        }
-
-        // Build execution plan
-        let db_version = adapter.get_db_version().await?;
-        let latest_version = self.config.project.version.unwrap_or(0);
-        let pending = snapshot::pending_migrations(db_version, &self.project_dir);
-
-        // Block apply if any pending migration has unresolved data.sql TODOs.
-        ensure_no_pending_todos(&pending)?;
-
-        // Filter entities by name if scoped
-        let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
-
-        // Ensure migrations table exists if we have migration steps
-        let has_migrations = plan.steps.iter().any(|s| matches!(
-            s,
-            ExecutionStep::MigrateEntity { .. }
-                | ExecutionStep::DropEntity { .. }
-                | ExecutionStep::RecordMigration { .. }
-        ));
-        if has_migrations {
-            adapter.ensure_migrations_table().await?;
-        }
-
-        // Running tallies for the on_complete summary.
-        let mut counts = ApplyCounts::default();
-
-        // Build entity lookup for ApplyEntity / CreateEntity steps
-        let entity_map: std::collections::HashMap<&str, &Entity> = self
-            .entities
-            .iter()
-            .map(|e| (e.name.as_str(), e))
-            .collect();
-
-        // Materialized views this run applies (respecting the scope + name
-        // filter). Capture which of them ALREADY exist before applying, so that
-        // afterwards we stamp the `dbd:hash` sentinel only on the ones this run
-        // newly creates. Skip the state query entirely when there are none.
-        let applied_matviews: Vec<&Entity> = valid_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty()
-        {
-            std::collections::HashSet::new()
-        } else {
-            adapter.matview_states().await?.into_keys().collect()
-        };
-
-        // Wrap the whole plan in one transaction when the backend supports it,
-        // so an interrupted upgrade rolls back to the prior schema instead of
-        // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
-        // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
-        let use_txn = adapter.supports_transactional_apply()
-            && std::env::var_os("DBD_NO_TX").is_none()
-            && !plan.steps.is_empty();
-
-        if use_txn {
-            adapter.begin_batch().await?;
-        }
-
-        // Execute plan steps inside an async block so a mid-plan error routes
-        // through rollback below rather than returning early. Each step's logic
-        // lives in `execute_plan_step`, keeping this a thin driver loop.
-        let exec: Result<()> = async {
-            for step in &plan.steps {
-                self.execute_plan_step(
-                    adapter,
-                    step,
-                    &entity_map,
-                    scope,
-                    &mut counts,
-                    &mut on_start,
-                    &mut on_done,
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        .await;
-
-        match exec {
-            Ok(()) => {
-                if use_txn {
-                    adapter.commit_batch().await?;
-                }
-            }
-            Err(e) => {
-                if use_txn {
-                    // Best-effort rollback; surface the original failure.
-                    let _ = adapter.rollback_batch().await;
-                }
-                return Err(e);
-            }
-        }
-
-        // The Current strategy (DB already at latest) emits no SetVersion step, so
-        // the scope would never be pinned/re-pinned on an up-to-date apply. Stamp it
-        // here — post-commit, alongside the matview sentinels — so every successful
-        // `apply`/`deploy` pins the applied scope (needed for `--allow-scope-change`
-        // re-pinning and for pinning pre-existing/legacy databases). Preserve the
-        // recorded version (`db_version`) to avoid downgrading it. Fresh/Migrate
-        // already pinned via their SetVersion step, so skip to avoid a double write.
-        if !plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))) {
-            adapter
-                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
-                .await?;
-        }
-
-        // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
-        // created (absent from `pre_existing_matviews`), so a later `dbd
-        // reconcile` recognizes them as dbd-managed instead of warning "exists
-        // but is not stamped by dbd". An already-existing matview is left
-        // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
-        // hash onto one whose deployed definition may have drifted would mask
-        // that drift. Runs after commit, so the object exists for the COMMENT.
-        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
-            adapter
-                .execute_script(&crate::reconcile::matview_hash_comment_sql(
-                    &e.name,
-                    &crate::reconcile::matview_hash(e),
-                ))
-                .await?;
-        }
-
-        // Sync pg_cron refresh jobs across the WHOLE design (not the scoped
-        // subset): `sync_refresh_jobs` unschedules every `dbd:refresh:%` job
-        // absent from the set it is given, so a scoped run fed only its subset
-        // would unschedule out-of-scope matviews' jobs. Centralized here (rather
-        // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
-        // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
-        // databases (and non-Postgres targets) without the extension.
-        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
-            .collect();
-        adapter.sync_refresh_jobs(&mv_jobs).await?;
-
-        on_complete(ApplyComplete {
-            strategy: plan.strategy,
-            from_version: db_version,
-            to_version: latest_version,
-            applied: counts.applied,
-            migrated: counts.migrated,
-            created: counts.created,
-            dropped: counts.dropped,
-        });
-        Ok(())
-    }
-
-    /// Execute one step of an apply execution plan: run its DDL/meta write via
-    /// `adapter`, report progress through `on_start`/`on_done`, and update
-    /// `counts`. Factored out of [`Design::apply`] so its plan loop stays a thin
-    /// driver.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_plan_step<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        step: &ExecutionStep,
-        entity_map: &std::collections::HashMap<&str, &Entity>,
-        scope: Option<&ResolvedScope>,
-        counts: &mut ApplyCounts,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<()>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        match step {
-            ExecutionStep::CreateEntity(entity_name) => {
-                if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                    let desc = format!("{}:{entity_name}", entity.entity_type.tag());
-                    on_start(&desc);
-                    let result = adapter.apply_entity(entity).await;
-                    report_step_result(&desc, on_done, result)?;
-                    counts.created += 1;
-                    counts.applied += 1;
-                }
-            }
-            ExecutionStep::ApplyEntity(entity_name) => {
-                if let Some(entity) = entity_map.get(entity_name.as_str()) {
-                    let desc = format!("{}:{entity_name}", entity.entity_type.tag());
-                    on_start(&desc);
-                    let result = adapter.apply_entity(entity).await;
-                    report_step_result(&desc, on_done, result)?;
-                    counts.applied += 1;
-                }
-            }
-            ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
-                    .map(|e| e.entity_type.tag())
-                    .unwrap_or_else(|| "entity".to_string());
-                let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
-                on_start(&desc);
-                let result: Result<()> = async {
-                    if migration_sql_path.exists() {
-                        let sql = std::fs::read_to_string(migration_sql_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
-                    let data_path = migration_sql_path.with_extension("data.sql");
-                    if data_path.exists() {
-                        let sql = std::fs::read_to_string(&data_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                report_step_result(&desc, on_done, result)?;
-                counts.migrated += 1;
-            }
-            ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
-                    .map(|e| e.entity_type.tag())
-                    .unwrap_or_else(|| "entity".to_string());
-                let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
-                on_start(&desc);
-                let result: Result<()> = async {
-                    if drop_sql_path.exists() {
-                        let sql = std::fs::read_to_string(drop_sql_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                report_step_result(&desc, on_done, result)?;
-                counts.dropped += 1;
-            }
-            ExecutionStep::RecordMigration { version, checksum } => {
-                let desc = format!("migration to v{version}");
-                adapter.apply_migration(*version, "", &desc, checksum).await?;
-            }
-            ExecutionStep::SetVersion(version) => {
-                adapter
-                    .set_project_meta(&self.env, *version, scope.map(|s| s.name.as_str()))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Read-only materialized-view detection for `reconcile`: for each design
-    /// matview, decide create/skip/warn against the live `dbd:hash` sentinels,
-    /// recording creates into `plan.matview_creates` and drift/unstamped notes
-    /// into `plan.warnings`. Returns the `(entity, want-hash)` pairs the write
-    /// pass should CREATE, so no second `matview_states()` fetch is needed.
-    async fn detect_reconcile_matviews<'a>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        desired_entities: &[&'a Entity],
-        plan: &mut crate::reconcile::ReconcilePlan,
-    ) -> Result<Vec<(&'a Entity, String)>> {
-        use crate::reconcile::{decide_matview_action, matview_hash, MatviewAction};
-        let matviews: Vec<&'a Entity> = desired_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        let mut mv_to_create: Vec<(&'a Entity, String)> = Vec::new();
-        if matviews.is_empty() {
-            return Ok(mv_to_create);
-        }
-        let states = adapter.matview_states().await?;
-        for &e in &matviews {
-            let want = matview_hash(e);
-            match decide_matview_action(&want, states.get(&e.name).cloned()) {
-                MatviewAction::Skip => {}
-                MatviewAction::Create => {
-                    plan.matview_creates.push(e.name.clone());
-                    mv_to_create.push((e, want));
-                }
-                MatviewAction::Warn => {
-                    // Detected drift, but dbd never auto-recreates a matview.
-                    // Surface it through the plan's warnings (the same channel
-                    // `dbd reconcile` prints for risky-change advisories).
-                    let has_sentinel = matches!(states.get(&e.name), Some(Some(_)));
-                    plan.warnings.push(if has_sentinel {
-                        format!(
-                            "materialized view {name}: definition differs from the deployed object \
-                             (dbd does not auto-recreate materialized views because that would \
-                             DROP … CASCADE and lose data/dependents). To apply the new \
-                             definition, drop it manually (`DROP MATERIALIZED VIEW \"{schema}\".\"{bare}\" CASCADE`) \
-                             and re-run `dbd apply` to recreate it.",
-                            name = e.name,
-                            schema = e.schema.as_deref().unwrap_or("public"),
-                            bare = e.name.rsplit('.').next().unwrap_or(&e.name),
-                        )
-                    } else {
-                        format!(
-                            "materialized view {}: exists but is not stamped by dbd (cannot \
-                             verify its definition); recreate it under dbd management to enable \
-                             drift detection.",
-                            e.name
-                        )
-                    });
-                }
-            }
-        }
-        Ok(mv_to_create)
-    }
-
-    /// Execute reconcile's write passes against the live database, in order:
-    /// A prerequisites + newly-added tables/enums, B ALTERs (with a `search_path`
-    /// prelude), C code objects (CREATE OR REPLACE), C-mv matview creates, and
-    /// D prune (only when `prune`). Returns the tallied summary. Factored out of
-    /// [`Design::reconcile`] so its body reads as setup → detect → write.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_reconcile_writes<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        plan: &crate::reconcile::ReconcilePlan,
-        desired_entities: &[&Entity],
-        managed_schemas: &std::collections::HashSet<String>,
-        mv_to_create: &[(&Entity, String)],
-        prune: bool,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<crate::reconcile::ReconcileComplete>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        use crate::reconcile::{matview_create_sql, qualified_entity_name, ReconcileComplete};
-        use std::collections::{HashMap, HashSet};
-
-        let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
-        let alter_sql: HashMap<&str, &str> = plan
-            .altered
-            .iter()
-            .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
-            .collect();
-
-        let mut summary = ReconcileComplete::default();
-
-        // Pass A — prerequisites + added tables/enums, in dependency order.
-        //   schema/extension/role/sequence: always (idempotent DDL);
-        //   enum/table: only when newly added (a full create).
-        for e in desired_entities {
-            let do_apply = match e.entity_type {
-                EntityType::Schema
-                | EntityType::Extension
-                | EntityType::Role
-                | EntityType::Sequence => true,
-                EntityType::Enum | EntityType::Table => {
-                    added.contains(qualified_entity_name(e).as_str())
-                }
-                _ => false,
-            };
-            if !do_apply {
-                continue;
-            }
-            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            if is_created {
-                summary.created += 1;
-            } else {
-                summary.reapplied += 1;
-            }
-        }
-
-        // Generated ALTERs carry no `set search_path`, unlike the project's DDL
-        // files. Prepend one covering every managed schema (+ public) so bare
-        // references — e.g. an enum type or a default calling a managed function —
-        // resolve the same way they do when the DDL file runs.
-        let search_path = search_path_prelude(managed_schemas);
-
-        // Pass B — ALTER existing tables/enums, in dependency order.
-        for e in desired_entities {
-            let n = qualified_entity_name(e);
-            if let Some(sql) = alter_sql.get(n.as_str()) {
-                let desc = format!("alter {}:{n}", e.entity_type.tag());
-                on_start(&desc);
-                let script = format!("{search_path}{sql}");
-                let result = adapter.execute_script(&script).await;
-                report_step_result(&desc, on_done, result)?;
-                summary.altered += 1;
-            }
-        }
-
-        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
-        for e in desired_entities {
-            if !matches!(
-                e.entity_type,
-                EntityType::View | EntityType::Function | EntityType::Procedure
-            ) {
-                continue;
-            }
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass C-mv (WRITES) — CREATE the matviews detection found absent. Reuses
-        // the pre-computed `mv_to_create` (no second `matview_states()` fetch).
-        // Each CREATE carries the same `search_path` prelude the ALTERs use.
-        for (e, want) in mv_to_create {
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
-                .await;
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass D — prune orphaned tables (in managed schemas, gone from the
-        // design), only when explicitly requested. Otherwise they are reported
-        // via the returned plan and left untouched.
-        if prune {
-            for stmt in &plan.dropped {
-                let desc = format!("prune table:{}", stmt.entity_name);
-                on_start(&desc);
-                let result = adapter.execute_script(&stmt.sql).await;
-                report_step_result(&desc, on_done, result)?;
-                summary.dropped += 1;
-            }
-        }
-
-        Ok(summary)
-    }
-
-    /// Reconcile the live database to the desired schema in place (declarative).
-    ///
-    /// Introspects the target, diffs its tables/enums against the project, and
-    /// applies the result directly — no snapshot files, no version bump. Added
-    /// tables/enums get a full create; existing ones are `ALTER`ed to match;
-    /// other objects (schemas, extensions, sequences, functions, views, roles)
-    /// are re-applied idempotently.
-    ///
-    /// The diff is scoped to the schemas the design declares, so reconcile never
-    /// touches tables in other schemas. Within those schemas, tables the design
-    /// no longer declares (orphans) are dropped **only** when `prune` is set —
-    /// otherwise they are left untouched and reported via the returned plan.
-    ///
-    /// This is the pre-release (pre-v1) workflow; callers gate it on
-    /// `project.released`. When the plan drops a column or constraint from an
-    /// existing table and `allow_destructive` is false, it refuses before any
-    /// write. Returns the computed plan so callers can surface warnings, orphans,
-    /// and a summary.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reconcile<S, D, C>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        dry_run: bool,
-        allow_destructive: bool,
-        prune: bool,
-        scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
-    ) -> Result<crate::reconcile::ReconcilePlan>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-        C: FnMut(crate::reconcile::ReconcileComplete),
-    {
-        use crate::reconcile::{
-            plan_fk_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
-        };
-
-        // Batch adapters (e.g. Convex) have no live SQL schema to diff.
-        if adapter.prefers_batch_apply() {
-            return Err(DbdError::Config(
-                "reconcile is not supported for this target (no live SQL schema to diff)"
-                    .to_string(),
-            ));
-        }
-
-        // Desired entities: valid, non-external, in scope — in dependency order.
-        let working_set = self.scope_working_set(scope)?;
-        let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
-
-        // Desired snapshot (tables + enums, schema-normalized).
-        let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
-        let desired = snapshot_from_entities(&desired_owned);
-
-        // Schemas the design manages. Reconcile only diffs within these, so it
-        // never considers (or prunes) tables in schemas the project doesn't own.
-        let managed_schemas = Self::managed_schemas(&desired_entities);
-
-        // Live snapshot, restricted to managed schemas. Tables here but not in
-        // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
-        let live_entities = adapter.introspect().await?;
-        let live_full = snapshot_from_entities(&live_entities);
-        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
-
-        let mut plan = plan_reconcile(&live, &desired);
-
-        // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
-        // above, so converge them from the RAW snapshots — adding declared FKs
-        // the live DB lacks and dropping (destructive) ones the design removed.
-        let desired_raw = raw_snapshot_from_entities(&desired_owned);
-        let live_raw =
-            restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
-        plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
-
-        // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
-        // so `--dry-run` previews matview creates AND drift warnings. Postgres has
-        // no `CREATE OR REPLACE MATERIALIZED VIEW`, and dbd deliberately never
-        // auto-drops one (a DROP … CASCADE would repopulate it and drop its
-        // dependents — unacceptable in a dev-loop reconcile). So: CREATE an absent
-        // matview (stamping a `dbd:hash` sentinel), SKIP one whose stored hash
-        // matches the design, and for one that drifted (or carries no sentinel)
-        // WARN and leave it untouched. Only the CREATE *writes* run after the
-        // return; here we merely record the decisions into the plan and a local
-        // `mv_to_create` list the write pass reuses (no second states fetch).
-        let mv_to_create = self
-            .detect_reconcile_matviews(adapter, &desired_entities, &mut plan)
-            .await?;
-
-        if dry_run {
-            return Ok(plan);
-        }
-
-        ensure_reconcile_not_destructive(&plan, allow_destructive)?;
-
-        // Write passes A–D (see `execute_reconcile_writes`).
-        let summary = self
-            .execute_reconcile_writes(
-                adapter,
-                &plan,
-                &desired_entities,
-                &managed_schemas,
-                &mv_to_create,
-                prune,
-                &mut on_start,
-                &mut on_done,
-            )
-            .await?;
-
-        // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
-        // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
-        // unschedules every `dbd:refresh:%` job absent from the set it is given, so
-        // a scoped reconcile fed only its subset would unschedule out-of-scope
-        // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
-        // no-op on databases (and non-Postgres targets) without the extension.
-        let mv_jobs: Vec<(String, crate::config::ResolvedMatview)> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
-            .collect();
-        adapter.sync_refresh_jobs(&mv_jobs).await?;
-
-        // Stamp the project version so `migrate --status` / `apply` stay consistent.
-        let version = self.config.project.version.unwrap_or(1);
-        adapter.ensure_meta_table().await?;
-        adapter.set_project_meta(&self.env, version, scope.map(|s| s.name.as_str())).await?;
-
-        on_complete(summary);
-        Ok(plan)
-    }
-
-    /// Read-only: introspect the live database and return the complete
-    /// difference against the design. Never writes. Unlike `reconcile`, this is
-    /// available even after the project is released.
-    pub async fn diff_live(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        scope: Option<&ResolvedScope>,
-    ) -> Result<crate::SchemaDiff> {
-        use crate::reconcile::raw_snapshot_from_entities;
-
-        // Batch adapters (e.g. Convex) have no live SQL schema to diff.
-        if adapter.prefers_batch_apply() {
-            return Err(DbdError::Config(
-                "diff is not supported for this target (no live SQL schema to diff)".to_string(),
-            ));
-        }
-
-        // Desired entities: valid, non-external, in scope — in dependency order.
-        let working_set = self.scope_working_set(scope)?;
-        let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
-
-        // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)
-        // so FK/CHECK/indexes/comments survive for `SchemaDiff` to compare.
-        let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
-        let desired = raw_snapshot_from_entities(&desired_owned);
-
-        // Schemas the design manages. The diff is scoped to these, so it never
-        // reports drift for tables in schemas the project doesn't own.
-        let managed_schemas = Self::managed_schemas(&desired_entities);
-
-        // Live snapshot, restricted to managed schemas. Raw so introspected
-        // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
-        let live_entities = adapter.introspect().await?;
-        let live_full = raw_snapshot_from_entities(&live_entities);
-        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
-
-        let mut diff = crate::SchemaDiff::compute(live, desired);
-
-        // Materialized-view drift (read-only) — matviews aren't in the tables/
-        // enums snapshots above, so `compute` never reports them; categorize them
-        // separately (Missing / Drifted / Unstamped / Orphan).
-        diff.matview_drift = self
-            .matview_drift(adapter, &desired_entities, &live_entities, &managed_schemas)
-            .await?;
-
-        Ok(diff)
-    }
-
-    /// Categorize materialized-view drift for [`Design::diff_live`] (read-only).
-    /// Compares each design matview's hash to the live `dbd:hash` sentinel —
-    /// Missing (absent) / Drifted (sentinel mismatch) / Unstamped (no sentinel) —
-    /// and adds Orphan for a live matview in a managed schema that's gone from the
-    /// design. Only fetches `matview_states()` when the design has a matview
-    /// (orphans come from `live_entities`). Returned sorted by name.
-    async fn matview_drift(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        desired_entities: &[&Entity],
-        live_entities: &[Entity],
-        managed_schemas: &std::collections::HashSet<String>,
-    ) -> Result<Vec<crate::schema_diff::MatviewDrift>> {
-        use crate::reconcile::{matview_hash, DEFAULT_SCHEMA};
-        use crate::schema_diff::{MatviewDrift, MatviewDriftKind};
-        use std::collections::HashSet;
-
-        let design_matviews: Vec<&Entity> = desired_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        let design_mv_names: HashSet<&str> =
-            design_matviews.iter().map(|e| e.name.as_str()).collect();
-
-        let mut drift: Vec<MatviewDrift> = Vec::new();
-
-        if !design_matviews.is_empty() {
-            let states = adapter.matview_states().await?;
-            for e in &design_matviews {
-                let want = matview_hash(e);
-                let kind = match states.get(&e.name) {
-                    None => MatviewDriftKind::Missing,
-                    Some(Some(h)) if *h == want => continue, // in sync — emit nothing
-                    Some(Some(_)) => MatviewDriftKind::Drifted,
-                    Some(None) => MatviewDriftKind::Unstamped,
-                };
-                drift.push(MatviewDrift { name: e.name.clone(), kind });
-            }
-        }
-
-        // Orphans: live matviews in a managed schema, absent from the design. No
-        // hash needed, so this reuses the already-fetched `live_entities`.
-        for e in live_entities {
-            if e.entity_type != EntityType::MaterializedView {
-                continue;
-            }
-            let schema = {
-                let s = e.schema.clone().unwrap_or_default();
-                if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
-            };
-            if managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str()) {
-                drift.push(MatviewDrift { name: e.name.clone(), kind: MatviewDriftKind::Orphan });
-            }
-        }
-
-        drift.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(drift)
-    }
-
-    /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
-    ///
-    /// Procedure matching is based on reads/writes analysis, not naming convention:
-    /// - A procedure that *reads from* a staging table is its import procedure
-    /// - Procedures are ordered so that if proc A writes to table X, and proc B
-    ///   reads from table X (via FK), A runs before B
-    ///
-    /// Example: import_lookups reads staging.lookups, writes config.lookups
-    ///          import_lookup_values reads staging.lookup_values, writes config.lookup_values
-    ///          config.lookup_values has FK to config.lookups
-    ///          → import_lookups must run before import_lookup_values
-    pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
-        let tables: Vec<&Entity> = self
-            .import_tables
-            .iter()
-            .filter(|t| t.errors.is_empty())
-            .filter(|t| name.is_none() || t.name == name.unwrap_or(""))
-            .collect();
-
-        // Collect all procedures that are candidates for import (in staging schemas)
-        let procedures: Vec<&Entity> = self
-            .entities
-            .iter()
-            .filter(|e| {
-                e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function
-            })
-            .filter(|e| !e.reads.is_empty() || !e.writes.is_empty())
-            .collect();
-
-        // Build entries: match each staging table to the procedure that reads from it
-        let mut entries: Vec<ImportPlanEntry> = tables
-            .iter()
-            .map(|table| {
-                let matched_proc = procedures.iter().find(|proc| {
-                    proc.reads.iter().any(|r| r == &table.name)
-                });
-
-                ImportPlanEntry {
-                    table: (*table).clone(),
-                    procedure: matched_proc.map(|p| p.name.clone()),
-                    writes: matched_proc
-                        .map(|p| p.writes.clone())
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
-
-        // Sort by write dependencies:
-        // If entry A writes to a table that entry B's target table references (via FK),
-        // A must come before B.
-        self.sort_import_plan(&mut entries);
-
-        entries
-    }
-
-    /// Sort import entries so that procedures writing to tables referenced by other
-    /// procedures' targets come first.
-    fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
-        // Build a set of all config tables written by each entry
-        let _write_set: std::collections::HashMap<String, Vec<String>> = entries
-            .iter()
-            .filter_map(|e| {
-                e.procedure.as_ref().map(|p| (p.clone(), e.writes.clone()))
-            })
-            .collect();
-
-        // Build dependency: entry depends on another if its writes target has a FK
-        // to a table written by another entry.
-        // For now, use the DDL entity's refers to check FK deps between write targets.
-        let entity_refs: std::collections::HashMap<String, Vec<String>> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::Table)
-            .map(|e| (e.name.clone(), e.refers.clone()))
-            .collect();
-
-        // Simple topological sort on entries
-        let n = entries.len();
-        let mut sorted = Vec::with_capacity(n);
-        let mut placed = vec![false; n];
-
-        for _ in 0..n {
-            for i in 0..n {
-                if placed[i] {
-                    continue;
-                }
-                // Check if all dependencies are already placed
-                let deps_satisfied = entries[i].writes.iter().all(|write_target| {
-                    // Get FK deps of this write target
-                    let fk_deps = entity_refs.get(write_target).cloned().unwrap_or_default();
-                    // All FK deps that are also write targets of other entries must be placed
-                    fk_deps.iter().all(|dep| {
-                        !entries.iter().enumerate().any(|(j, other)| {
-                            !placed[j] && j != i && other.writes.contains(dep)
-                        })
-                    })
-                });
-
-                if deps_satisfied {
-                    sorted.push(entries[i].clone());
-                    placed[i] = true;
-                    break;
-                }
-            }
-        }
-
-        // Append any remaining (cycles or unresolved)
-        for i in 0..n {
-            if !placed[i] {
-                sorted.push(entries[i].clone());
-            }
-        }
-
-        *entries = sorted;
-    }
-
-    /// Import staging data via the adapter.
-    ///
-    /// `on_start(desc)` is called just before each step.
-    /// `on_done(desc, err)` is called after each step — `err` is `None` on success,
-    /// `Some(message)` on failure (called before the error is returned so the caller
-    /// can update UI state before propagation).
-    /// `on_complete(summary)` is called once after all steps succeed.
-    /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn import_data<S, D, C>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        name: Option<&str>,
-        dry_run: bool,
-        scope: Option<&ResolvedScope>,
-        mut on_start: S,
-        mut on_done: D,
-        mut on_complete: C,
-    ) -> Result<()>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-        C: FnMut(ImportComplete),
-    {
-        let plan = self.import_plan(name);
-        let plan: Vec<ImportPlanEntry> = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                let ws = self.working_set(s)?;
-                plan.into_iter()
-                    .filter(|e| import_entry_in_scope(e, &ws, false))
-                    .collect()
-            }
-            _ => plan,
-        };
-
-        // Ensure internal dbd procedures are present before any JSONL import runs.
-        // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
-        if !dry_run {
-            let has_jsonl = plan.iter().any(|e| {
-                e.table.format.as_deref().is_some_and(|f| f == "json" || f == "jsonl")
-            });
-            if has_jsonl {
-                adapter.ensure_import_procedure().await?;
-            }
-        }
-
-        // Run the import phases in order, tallying each for the summary.
-        let tables = self
-            .import_load_staging(adapter, &plan, dry_run, &mut on_start, &mut on_done)
-            .await?;
-        let procedures = self
-            .import_call_procedures(adapter, &plan, dry_run, &mut on_start, &mut on_done)
-            .await?;
-        let after_scripts = self
-            .import_run_after_scripts(adapter, dry_run, &mut on_start, &mut on_done)
-            .await?;
-
-        on_complete(ImportComplete { tables, procedures, after_scripts });
-        Ok(())
-    }
-
-    /// Import phase: truncate staging tables (when configured) then load each
-    /// entry's data file. Returns the number of tables loaded.
-    async fn import_load_staging<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        plan: &[ImportPlanEntry],
-        dry_run: bool,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<u32>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        if self.config.import.options.truncate && !dry_run {
-            for entry in plan {
-                let qualified = entry.table.name.replace('.', "\".\"");
-                adapter
-                    .execute_script(&format!("TRUNCATE \"{qualified}\""))
-                    .await?;
-            }
-        }
-
-        let mut count = 0;
-        for entry in plan {
-            let fmt = entry.table.format.as_deref().unwrap_or("csv");
-            let desc = format!("import {} ({})", entry.table.name, fmt);
-            on_start(&desc);
-            let result = if dry_run { Ok(()) } else { adapter.import_data(&entry.table, false).await };
-            report_step_result(&desc, on_done, result)?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Import phase: call each entry's import procedure. Returns the number
-    /// called.
-    async fn import_call_procedures<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        plan: &[ImportPlanEntry],
-        dry_run: bool,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<u32>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        let mut count = 0;
-        for entry in plan {
-            if let Some(ref proc_name) = entry.procedure {
-                let desc = format!("call {proc_name}()");
-                on_start(&desc);
-                let result = if dry_run { Ok(()) } else { adapter.execute_script(&format!("CALL {proc_name}();")).await };
-                report_step_result(&desc, on_done, result)?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Import phase: run the project-global `import.after` scripts. These are
-    /// intentionally NOT scope-filtered — they are post-import hooks, not tied to
-    /// individual entries; scoped callers ensure their after-scripts are safe.
-    /// Returns the number of scripts run.
-    async fn import_run_after_scripts<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        dry_run: bool,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<u32>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        let mut count = 0;
-        for after_file in &self.config.import.after {
-            let full_path = self.project_dir.join(after_file);
-            let desc = format!("run {after_file}");
-            on_start(&desc);
-            let result = if dry_run {
-                Ok(())
-            } else {
-                let sql = std::fs::read_to_string(&full_path)?;
-                adapter.execute_script(&sql).await
-            };
-            report_step_result(&desc, on_done, result)?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Deploy the full schema: apply DDL then import seed data.
-    ///
-    /// Equivalent to `apply` followed by `import_data`. dbd handles
-    /// fresh / migrate / current strategy automatically — safe to call
-    /// on every bootstrap (idempotent when schema is already current).
-    ///
-    /// `on_complete(summary)` is called once after both phases succeed with
-    /// combined version info and step counts.
-    pub async fn deploy<C>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        dry_run: bool,
-        scope: Option<&ResolvedScope>,
-        mut on_complete: C,
-    ) -> Result<()>
-    where
-        C: FnMut(DeployComplete),
-    {
-        let mut apply_summary: Option<ApplyComplete> = None;
-        let mut import_summary: Option<ImportComplete> = None;
-
-        self.apply(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
-            apply_summary = Some(s);
-        })
-        .await?;
-
-        self.import_data(adapter, None, dry_run, scope, |_| {}, |_, _| {}, |s| {
-            import_summary = Some(s);
-        })
-        .await?;
-
-        on_complete(DeployComplete {
-            apply: apply_summary.unwrap_or(ApplyComplete {
-                strategy: ApplyStrategy::Current,
-                from_version: 0,
-                to_version: 0,
-                applied: 0,
-                migrated: 0,
-                created: 0,
-                dropped: 0,
-            }),
-            import: import_summary.unwrap_or(ImportComplete {
-                tables: 0,
-                procedures: 0,
-                after_scripts: 0,
-            }),
-        });
-        Ok(())
     }
 
     /// Combine all DDL into a single SQL file.
@@ -2088,17 +683,7 @@ impl Design {
         name: Option<&str>,
         scope: Option<&ResolvedScope>,
     ) -> Result<dependency::GraphResult> {
-        let graphable = |e: &Entity| {
-            matches!(
-                e.entity_type,
-                EntityType::Table
-                    | EntityType::View
-                    | EntityType::MaterializedView
-                    | EntityType::Function
-                    | EntityType::Procedure
-                    | EntityType::Enum
-            )
-        };
+        let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
@@ -2113,142 +698,19 @@ impl Design {
         Ok(dependency::graph_from_entities(&non_meta, name))
     }
 
-    /// Schemas a `reset` would drop under an optional scope. `None`/all-scope ⇒
-    /// every managed schema; a subset scope ⇒ only the schemas its working set
-    /// occupies (reset is schema-granular — `DROP SCHEMA … CASCADE`).
-    pub fn reset_target_schemas(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
-        let all: Vec<String> = self
-            .entities
+    /// Every materialized view's qualified name paired with its resolved
+    /// refresh-job config, across the WHOLE design (not scope-filtered).
+    ///
+    /// Used to feed `adapter.sync_refresh_jobs`, which unschedules every
+    /// `dbd:refresh:%` job absent from the set it is given — so callers must
+    /// pass the full set even from a scoped operation, or out-of-scope
+    /// matviews' jobs would be unscheduled. Shared by `apply` and `reconcile`.
+    pub(crate) fn all_matview_jobs(&self) -> Vec<(String, crate::config::ResolvedMatview)> {
+        self.entities
             .iter()
-            .filter(|e| e.entity_type == EntityType::Schema)
-            .map(|e| e.name.clone())
-            .collect();
-        match scope {
-            Some(s) if !s.is_all => {
-                let ws = self.working_set(s)?;
-                Ok(all
-                    .into_iter()
-                    .filter(|schema| {
-                        let prefix = format!("{schema}.");
-                        ws.contains(schema) || ws.iter().any(|n| n.starts_with(&prefix))
-                    })
-                    .collect())
-            }
-            _ => Ok(all),
-        }
-    }
-
-    /// Reset the database (with safety guards). `scope` restricts the dropped
-    /// schemas to that scope's working set (`None`/all-scope ⇒ everything). Roles
-    /// are only dropped on a full reset — a subset scope leaves shared roles
-    /// intact since roles are not scope-selectable.
-    pub async fn reset(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        target: &str,
-        force: bool,
-        drop_schemas: bool,
-        drop_extensions: bool,
-        scope: Option<&ResolvedScope>,
-    ) -> Result<()> {
-        if !force
-            && let Some(meta) = adapter.get_project_meta().await? {
-                if meta.env == "prod" {
-                    return Err(DbdError::SafetyGuard(
-                        "reset is blocked — database is marked as prod. Use --force to override."
-                            .to_string(),
-                    ));
-                }
-                if meta.version >= 1 {
-                    return Err(DbdError::SafetyGuard(
-                        "reset is blocked — database has applied migrations. Use --force to override."
-                            .to_string(),
-                    ));
-                }
-            }
-
-        if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
-            adapter.execute_script(&sql).await?;
-        }
-        adapter.clear_project_migrations().await?;
-
-        Ok(())
-    }
-
-    /// Build the SQL a `reset` would run, without touching the database. Drops
-    /// the project's managed data-model entities individually (scope-filtered)
-    /// and, when `drop_schemas`/`drop_extensions` are set, the managed schemas /
-    /// configured extensions. Returns `None` when there is nothing to drop.
-    /// Used by `reset()` and by `--dry-run`.
-    pub fn reset_script(
-        &self,
-        target: &str,
-        drop_schemas: bool,
-        drop_extensions: bool,
-        scope: Option<&ResolvedScope>,
-    ) -> Result<Option<String>> {
-        // Roles aren't scope-selectable, so only a full reset drops them; a
-        // subset scope leaves shared roles intact.
-        let is_subset = matches!(scope, Some(s) if !s.is_all);
-        let roles: &[_] = if is_subset {
-            &[]
-        } else {
-            self.config
-                .target
-                .values()
-                .next()
-                .map(|t| &t.roles[..])
-                .unwrap_or(&[])
-        };
-
-        // Data-model entities to drop individually (scope-filtered), in the
-        // builder's reverse dependency order.
-        let is_data_model = |e: &Entity| {
-            matches!(
-                e.entity_type,
-                EntityType::Table
-                    | EntityType::View
-                    | EntityType::MaterializedView
-                    | EntityType::Function
-                    | EntityType::Procedure
-                    | EntityType::Enum
-                    | EntityType::Sequence
-            )
-        };
-        let entities: Vec<&Entity> = match scope {
-            Some(s) if !s.is_all => {
-                let ws = self.working_set(s)?;
-                self.entities
-                    .iter()
-                    .filter(|e| is_data_model(e) && Self::entity_in_scope(e, s, &ws))
-                    .collect()
-            }
-            _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
-        };
-
-        // Schemas the `--schemas` path may drop — all managed schemas, or just
-        // those the scope occupies.
-        let schemas = self.reset_target_schemas(scope)?;
-
-        // The active target's extensions (by bare name) for the `--extensions` path.
-        let extensions: Vec<String> = self
-            .config
-            .target
-            .values()
-            .next()
-            .map(|t| t.extensions.iter().map(|e| e.name().to_string()).collect())
-            .unwrap_or_default();
-
-        script::build_reset_script(
-            &entities,
-            roles,
-            &extensions,
-            target,
-            drop_schemas,
-            drop_extensions,
-            &schemas,
-        )
-        .map_err(DbdError::SafetyGuard)
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
+            .collect()
     }
 }
 
@@ -2738,7 +1200,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, true, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, true, None, Progress::none()).await.unwrap();
         assert!(mock.applied_names().is_empty());
     }
 
@@ -2748,7 +1210,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new();
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
         assert!(!mock.applied_names().is_empty());
     }
 
@@ -2825,7 +1287,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new().with_transactions();
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         assert_eq!(mock.txn_log(), vec!["begin", "commit"]);
     }
@@ -2845,7 +1307,7 @@ mod tests {
         let mock = MockAdapter::new().with_transactions().fail_on_entity(&target);
 
         let err = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await
             .unwrap_err();
 
@@ -2859,7 +1321,7 @@ mod tests {
         let design = Design::from_config(&config_path, "dev").unwrap();
         let mock = MockAdapter::new(); // supports_transactional_apply() == false
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         assert!(mock.txn_log().is_empty());
         assert!(!mock.applied_names().is_empty());
@@ -2876,7 +1338,7 @@ mod tests {
         // Before apply, version is 0
         assert_eq!(mock.get_db_version().await.unwrap(), 0);
 
-        design.apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await.unwrap();
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
 
         // After apply on a fresh env, meta should have been written
         // (version depends on design.yaml project.version — likely 0 or None for fixture)
@@ -2894,7 +1356,7 @@ mod tests {
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
-            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&resolved), Progress::none())
             .await
             .unwrap();
 
@@ -2913,7 +1375,7 @@ mod tests {
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
-            .apply(&mock, None, false, Some(&resolved), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&resolved), Progress::none())
             .await
             .unwrap();
 
@@ -3118,7 +1580,7 @@ mod tests {
 
         let mock = MockAdapter::new();
         // import_data will fail on actual COPY (no real file), but truncate should happen first
-        let _ = design.import_data(&mock, None, false, None, |_| {}, |_, _| {}, |_| {}).await;
+        let _ = design.import_data(&mock, None, false, None, Progress::none()).await;
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
@@ -3493,7 +1955,7 @@ mod tests {
         // DB is at v1 → migration v2 is pending
         let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
         let result = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await;
 
         assert!(result.is_err(), "apply should be blocked by unresolved TODO");
@@ -3537,7 +1999,7 @@ mod tests {
         // Fresh DB — v1 migration is pending but data.sql has no TODOs
         let mock = crate::adapter::mock::MockAdapter::new();
         let result = design
-            .apply(&mock, None, false, None, |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, None, Progress::none())
             .await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
@@ -3564,7 +2026,7 @@ mod tests {
         };
 
         let result = design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await;
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("dependency gap"), "expected gap error, got: {msg}");
@@ -3596,7 +2058,7 @@ mod tests {
         };
 
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();
@@ -3635,7 +2097,7 @@ mod tests {
 
         let scope = config_only_scope(Some(HashSet::new()));
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();
@@ -3656,7 +2118,7 @@ mod tests {
 
         let scope = config_only_scope(Some(HashSet::from(["uuid-ossp".to_string()])));
         design
-            .apply(&mock, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {})
+            .apply(&mock, None, false, Some(&scope), Progress::none())
             .await
             .unwrap();
         let applied = mock.applied_names();
@@ -3707,7 +2169,7 @@ mod tests {
     fn p2_empty_policies_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -3715,7 +2177,7 @@ mod tests {
     fn p3_missing_policies_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         // No policies/ dir created
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert!(files.is_empty());
     }
 
@@ -3727,7 +2189,7 @@ mod tests {
         std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
         std::fs::write(policies_dir.join("lookups.sql"), "-- policy").unwrap();
 
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert_eq!(files.len(), 2);
         // Should be sorted alphabetically
         let names: Vec<String> = files
@@ -3746,7 +2208,7 @@ mod tests {
         std::fs::write(policies_dir.join("readme.md"), "# docs").unwrap();
         std::fs::write(policies_dir.join("notes.txt"), "notes").unwrap();
 
-        let files = crate::scanner::scan_policies(tmp.path());
+        let files = crate::scanner::scan_policies(tmp.path()).unwrap();
         assert_eq!(files.len(), 1, "only .sql/.ddl files should be discovered");
     }
 

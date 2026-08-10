@@ -141,6 +141,19 @@ Append `?deploy=true` to the URL to run `npx convex deploy` automatically after 
 
 List of schema names. dbd runs `CREATE SCHEMA IF NOT EXISTS` for each. Schemas referenced in entity file paths are auto-added.
 
+A schema entry may also be an object carrying `grants:`, applied on **any Postgres/Supabase** target (unlike `target.grants`, above, which only takes effect on a Supabase target):
+
+```yaml
+schemas:
+  - config
+  - staging:
+      grants:
+        app_user: [usage, select]
+        app_admin: [usage, select, insert, update, delete]
+```
+
+This emits `GRANT USAGE ON SCHEMA`, `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, overriding perms for roles present in both). Targets without a SQL grant model (SQLite, Convex) skip grant emission with a note rather than failing.
+
 ### `external`
 
 FK stubs for tables managed outside the project (e.g., Supabase `auth.users`):
@@ -231,8 +244,21 @@ Two choices worth understanding:
 |-----------|--------|-------------|
 | `staging` | list   | Schemas allowed for import (import fails for other schemas) |
 | `options` | object | Default options: `truncate`, `null_value`, `format` |
-| `tables`  | list   | Explicit table list (string or `{name: options}`); per-table `options` may include `env` (load only under matching `-e`) |
+| `tables`  | list   | Explicit table list (string, or `{name: options}` for per-table overrides of `truncate`/`format`/`null_value`) |
 | `after`   | list   | SQL scripts (project-relative paths) run after data load — e.g. `import/loader.sql` |
+
+`null_value` is the sentinel string that means SQL NULL in a CSV/TSV data file. It defaults to `''` (empty string), so by default an empty cell loads as NULL — this is unchanged unless you configure a sentinel. Set a non-empty sentinel (e.g. `\N`, Postgres's own COPY default) when your data files need to distinguish a genuine empty string from NULL: once configured, only a cell matching the sentinel exactly becomes NULL, and a plain empty cell loads as a literal empty string. A per-table `null_value` under `tables:` overrides the global `options.null_value` for that table only:
+
+```yaml
+import:
+  options:
+    null_value: ''       # default: empty cell → NULL
+  tables:
+    - staging.legacy_export:
+        null_value: '\N' # this table's data files use \N for NULL; empty cells are literal ''
+```
+
+> **Environment-specific data** is by folder, not config: files under `import/<env>/<schema>/<file>` load only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment (see [Commands → import](04-commands.md#dbd-import)).
 
 ### `export`
 
