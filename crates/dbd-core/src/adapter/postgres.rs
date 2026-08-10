@@ -1712,11 +1712,15 @@ impl DatabaseAdapter for PostgresAdapter {
                 project     varchar NOT NULL PRIMARY KEY, \
                 env         varchar NOT NULL DEFAULT 'dev', \
                 version     integer NOT NULL DEFAULT 0, \
+                scope       varchar, \
                 created_at  timestamptz NOT NULL DEFAULT now(), \
                 updated_at  timestamptz NOT NULL DEFAULT now() \
             )",
         )
-        .await
+        .await?;
+        // Backfill `scope` on databases whose `_dbd_meta` predates the column.
+        self.exec_raw("ALTER TABLE public._dbd_meta ADD COLUMN IF NOT EXISTS scope varchar")
+            .await
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
@@ -1726,26 +1730,47 @@ impl DatabaseAdapter for PostgresAdapter {
             return Ok(None); // no `_dbd_meta` anywhere yet
         };
         let quoted = schema.replace('"', "\"\"");
-        let result = sqlx::query(&format!(
-            "SELECT project, env, version, updated_at::text as applied_at FROM \"{quoted}\"._dbd_meta WHERE project = $1"
+        // Preferred read includes `scope`. On a database whose `_dbd_meta`
+        // predates the column this SELECT errors; fall back to the legacy shape
+        // (scope = None) so env/version — and the prod guard — still work.
+        let with_scope = sqlx::query(&format!(
+            "SELECT project, env, version, scope, updated_at::text as applied_at FROM \"{quoted}\"._dbd_meta WHERE project = $1"
         ))
         .bind(&self.project)
         .fetch_optional(&self.pool)
         .await;
 
-        match result {
+        match with_scope {
             Ok(Some(row)) => Ok(Some(ProjectMeta {
                 project: row.get("project"),
                 env: row.get("env"),
                 version: row.get::<i32, _>("version") as u32,
+                scope: row.try_get("scope").ok(),
                 applied_at: row.try_get("applied_at").ok(),
             })),
             Ok(None) => Ok(None),
-            Err(_) => Ok(None), // Table doesn't exist yet
+            Err(_) => {
+                let legacy = sqlx::query(&format!(
+                    "SELECT project, env, version, updated_at::text as applied_at FROM \"{quoted}\"._dbd_meta WHERE project = $1"
+                ))
+                .bind(&self.project)
+                .fetch_optional(&self.pool)
+                .await;
+                match legacy {
+                    Ok(Some(row)) => Ok(Some(ProjectMeta {
+                        project: row.get("project"),
+                        env: row.get("env"),
+                        version: row.get::<i32, _>("version") as u32,
+                        scope: None,
+                        applied_at: row.try_get("applied_at").ok(),
+                    })),
+                    _ => Ok(None),
+                }
+            }
         }
     }
 
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()> {
+    async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         // `ensure_meta_table` pins `_dbd_meta` to `public` (relocating a stray
         // copy a scoped apply may have left in another schema). The insert is
         // schema-qualified, so it resolves deterministically regardless of the
@@ -1753,14 +1778,15 @@ impl DatabaseAdapter for PostgresAdapter {
         // dance required, which never worked across the non-batch pool anyway.
         self.ensure_meta_table().await?;
         let q = sqlx::query(
-            "INSERT INTO public._dbd_meta (project, env, version) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO public._dbd_meta (project, env, version, scope) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (project) DO UPDATE \
-             SET env = EXCLUDED.env, version = EXCLUDED.version, updated_at = now()"
+             SET env = EXCLUDED.env, version = EXCLUDED.version, scope = EXCLUDED.scope, updated_at = now()"
         )
         .bind(&self.project)
         .bind(env)
-        .bind(version as i32);
+        .bind(version as i32)
+        .bind(scope);
         let mut guard = self.batch.lock().await;
         match guard.as_mut() {
             Some(tx) => q.execute(&mut **tx).await,
