@@ -1172,7 +1172,7 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
-    async fn import_data(&self, entity: &Entity, dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()> {
         if dry_run {
             return Ok(());
         }
@@ -1190,8 +1190,16 @@ impl DatabaseAdapter for PostgresAdapter {
         match format {
             "csv" | "tsv" => {
                 let delimiter = if format == "tsv" { ", DELIMITER E'\\t'" } else { "" };
+                // Postgres CSV COPY's default NULL is the empty unquoted string,
+                // which already matches today's behavior — only add the clause
+                // when a non-empty sentinel is configured.
+                let null_clause = if null_value.is_empty() {
+                    String::new()
+                } else {
+                    format!(", NULL '{}'", null_value.replace('\'', "''"))
+                };
                 let copy_sql = format!(
-                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter})"
+                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})"
                 );
                 let mut conn = self.pool.acquire().await
                     .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;

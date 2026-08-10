@@ -184,7 +184,7 @@ impl DatabaseAdapter for MockAdapter {
         Ok(())
     }
 
-    async fn import_data(&self, entity: &Entity, _dry_run: bool) -> Result<()> {
+    async fn import_data(&self, entity: &Entity, _null_value: &str, _dry_run: bool) -> Result<()> {
         self.imported.lock().unwrap().push(entity.name.clone());
         Ok(())
     }

@@ -126,7 +126,7 @@ pub async fn cmd_import(
         entity.file = Some(path.to_path_buf());
         entity.format = Some(format.to_string());
         adapter
-            .import_data(&entity, false)
+            .import_data(&entity, design.config().import.table_null_value(&qualified), false)
             .await
             .context(format!("Failed to import {qualified} ← {}", path.display()))?;
 

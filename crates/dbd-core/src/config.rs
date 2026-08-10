@@ -276,6 +276,22 @@ impl ImportConfig {
                 ImportTableEntry::Name(_) => None,
             })
     }
+
+    /// The null sentinel for a table's data load. A per-table `null_value`
+    /// override (`staging.x: { null_value: "\\N" }`) wins over the global
+    /// `options.null_value` (default `""` — an empty cell is NULL).
+    pub fn table_null_value(&self, table_name: &str) -> &str {
+        self.tables
+            .iter()
+            .find(|t| t.name() == table_name)
+            .and_then(|t| match t {
+                ImportTableEntry::WithOptions(map) => {
+                    map.values().next().and_then(|o| o.null_value.as_deref())
+                }
+                ImportTableEntry::Name(_) => None,
+            })
+            .unwrap_or(&self.options.null_value)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -717,6 +733,27 @@ import:
         assert_eq!(config.import.table_format("staging.tsv"), Some("tsv"));
         assert_eq!(config.import.table_format("staging.keep"), None);
         assert_eq!(config.import.table_format("staging.other"), None);
+    }
+
+    #[test]
+    fn import_table_null_value_overrides() {
+        let yaml = r#"
+project:
+  name: test
+import:
+  tables:
+    - staging.keep
+    - staging.sentinel:
+        null_value: "\\N"
+"#;
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        // Global default is the empty string — an empty cell is NULL.
+        assert_eq!(config.import.options.null_value, "");
+        // Unlisted / bare-name tables inherit the global default.
+        assert_eq!(config.import.table_null_value("staging.keep"), "");
+        assert_eq!(config.import.table_null_value("staging.other"), "");
+        // A per-table `null_value` override wins over the global.
+        assert_eq!(config.import.table_null_value("staging.sentinel"), "\\N");
     }
 
     #[test]
