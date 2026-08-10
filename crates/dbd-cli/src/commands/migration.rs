@@ -6,6 +6,17 @@ use dbd_core::Design;
 use super::get_adapter;
 use crate::output::{self, Verbosity};
 
+/// The boolean flags that drive `dbd reset`, grouped so callers construct them
+/// by name. This prevents a transposition of, e.g., `allow_scope_change` (which
+/// would silently disable the scope guard) into an adjacent positional bool slot.
+pub(crate) struct ResetOptions {
+    pub dry_run: bool,
+    pub force: bool,
+    pub drop_schemas: bool,
+    pub drop_extensions: bool,
+    pub allow_scope_change: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
@@ -13,15 +24,12 @@ pub async fn cmd_reset(
     project_dir: &Path,
     database_url: Option<&str>,
     target: &str,
-    dry_run: bool,
-    force: bool,
-    drop_schemas: bool,
-    drop_extensions: bool,
-    allow_scope_change: bool,
+    opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let ResetOptions { dry_run, force, drop_schemas, drop_extensions, allow_scope_change } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
 
@@ -185,9 +193,15 @@ mod tests {
     #[tokio::test]
     async fn reset_dry_run_needs_no_database() {
         cmd_reset(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            "dev", /*dry_run*/ true, /*force*/ false, /*drop_schemas*/ false,
-            /*drop_extensions*/ false, /*allow_scope_change*/ false, None, None, Verbosity::Normal,
+            &testutil::fixture_config(), "dev", &testutil::fixtures(), None, "dev",
+            ResetOptions {
+                dry_run: true,
+                force: false,
+                drop_schemas: false,
+                drop_extensions: false,
+                allow_scope_change: false,
+            },
+            None, None, Verbosity::Normal,
         )
         .await
         .unwrap();
