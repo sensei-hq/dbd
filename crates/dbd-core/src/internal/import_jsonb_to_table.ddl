@@ -9,6 +9,13 @@
 --     schema-qualified using the element type's namespace.
 --   • Scalars — (data->>'col')::typename
 -- Skips GENERATED ALWAYS AS IDENTITY and stored generated columns automatically.
+--
+-- Only columns present in the staged jsonb are inserted: the INSERT carries an
+-- explicit column list restricted to keys that appear in the source data, so a
+-- column absent from every row falls back to its table DEFAULT instead of being
+-- forced to NULL. Without this, a seed that omits a `not null default now()`
+-- column (e.g. `modified_at`) would violate the not-null constraint even though
+-- the default would have satisfied it.
 create or replace procedure staging.import_jsonb_to_table(
     p_source_table text
   , p_target_table text
@@ -19,40 +26,55 @@ $$
 declare
   v_target_schema text := split_part(p_target_table, '.', 1);
   v_target_name   text := split_part(p_target_table, '.', 2);
+  v_present_keys  text[];
+  v_col_list      text;
   v_col_exprs     text;
   v_sql           text;
 begin
-  select string_agg(
-    case
-      when t.typtype = 'e'
-        -- Enum scalar: cast text to qualified enum type
-        then format('(data->>%L)::%s',
-               a.attname,
-               quote_ident(tn.nspname) || '.' || quote_ident(t.typname))
+  -- Keys that actually appear in the staged jsonb (union across all rows).
+  -- Columns not in this set are omitted from the INSERT so their DEFAULT fires.
+  execute format(
+    'select coalesce(array_agg(distinct k), array[]::text[]) from %s, lateral jsonb_object_keys(data) as k'
+  , p_source_table
+  ) into v_present_keys;
 
-      when t.typcategory = 'A'
-        -- Array: expand JSON array and cast to target type.
-        -- jsonb_typeof guard returns SQL NULL for missing/null keys.
-        -- Element type is schema-qualified for user-defined types (enums, composites).
-        then format(
-               $f$case when jsonb_typeof(data->%L) = 'array'
-                    then array(select jsonb_array_elements_text(data->%L))
-                    else null
-               end::%s$f$,
-               a.attname,
-               a.attname,
-               case when et.typtype in ('e', 'c')
-                    then quote_ident(etn.nspname) || '.' || quote_ident(et.typname) || '[]'
-                    else format_type(a.atttypid, a.atttypmod)
-               end)
+  -- Nothing staged (no rows / no keys) → nothing to import.
+  if array_length(v_present_keys, 1) is null then
+    return;
+  end if;
 
-      else
-        -- Scalar: cast text representation to the column type
-        format('(data->>%L)::%s', a.attname, t.typname)
-    end
-  , ', ' order by a.attnum
-  )
-  into v_col_exprs
+  select
+      string_agg(quote_ident(a.attname), ', ' order by a.attnum),
+      string_agg(
+        case
+          when t.typtype = 'e'
+            -- Enum scalar: cast text to qualified enum type
+            then format('(data->>%L)::%s',
+                   a.attname,
+                   quote_ident(tn.nspname) || '.' || quote_ident(t.typname))
+
+          when t.typcategory = 'A'
+            -- Array: expand JSON array and cast to target type.
+            -- jsonb_typeof guard returns SQL NULL for missing/null keys.
+            -- Element type is schema-qualified for user-defined types (enums, composites).
+            then format(
+                   $f$case when jsonb_typeof(data->%L) = 'array'
+                        then array(select jsonb_array_elements_text(data->%L))
+                        else null
+                   end::%s$f$,
+                   a.attname,
+                   a.attname,
+                   case when et.typtype in ('e', 'c')
+                        then quote_ident(etn.nspname) || '.' || quote_ident(et.typname) || '[]'
+                        else format_type(a.atttypid, a.atttypmod)
+                   end)
+
+          else
+            -- Scalar: cast text representation to the column type
+            format('(data->>%L)::%s', a.attname, t.typname)
+        end
+      , ', ' order by a.attnum)
+  into v_col_list, v_col_exprs
   from pg_catalog.pg_attribute  a
   join pg_catalog.pg_class       c   on c.oid   = a.attrelid
   join pg_catalog.pg_namespace   cn  on cn.oid  = c.relnamespace
@@ -65,13 +87,14 @@ begin
     and c.relname      = v_target_name
     and a.attnum       > 0
     and not a.attisdropped
-    and a.attidentity  <> 'a'   -- exclude GENERATED ALWAYS AS IDENTITY
-    and a.attgenerated = ''     -- exclude stored generated columns
+    and a.attidentity  <> 'a'          -- exclude GENERATED ALWAYS AS IDENTITY
+    and a.attgenerated = ''            -- exclude stored generated columns
+    and a.attname::text = any(v_present_keys)  -- only columns present in the source data
   ;
 
   if v_col_exprs is null then
-    raise exception 'import_jsonb_to_table: table %.% not found or has no columns',
-      v_target_schema, v_target_name;
+    raise exception 'import_jsonb_to_table: table %.% has no columns matching the staged data keys (%)',
+      v_target_schema, v_target_name, v_present_keys;
   end if;
 
   -- p_source_table is a dbd-managed, schema-qualified staging table
@@ -80,8 +103,9 @@ begin
   -- resolve against the session search_path, which pooled connections don't
   -- share. See sensei-hq/dbd#6.
   v_sql := format(
-    'insert into %s select %s from %s'
+    'insert into %s (%s) select %s from %s'
   , p_target_table
+  , v_col_list
   , v_col_exprs
   , p_source_table
   );
