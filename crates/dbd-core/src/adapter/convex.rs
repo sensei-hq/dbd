@@ -683,8 +683,8 @@ impl DatabaseAdapter for ConvexAdapter {
         Ok(pending.iter().map(|e| convex_table_name(&e.name)).collect())
     }
 
-    async fn ensure_migrations_table(&self) -> Result<()> {
-        // State file is created lazily on first record.
+    async fn heal_bookkeeping(&self) -> Result<()> {
+        // State file is created lazily on first record; nothing to heal.
         Ok(())
     }
 
@@ -719,10 +719,6 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn ensure_import_procedure(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn ensure_meta_table(&self) -> Result<()> {
         Ok(())
     }
 

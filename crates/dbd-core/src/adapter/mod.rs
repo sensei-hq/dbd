@@ -226,7 +226,11 @@ pub trait DatabaseAdapter: Send + Sync {
 
     // ── Migration tracking ─────────────────────────────
 
-    async fn ensure_migrations_table(&self) -> Result<()>;
+    /// Ensure bookkeeping storage exists and is at the current layout, healing any
+    /// legacy/mislocated bookkeeping in place. Idempotent; safe to call at the start
+    /// of every ownership operation (apply/deploy/reconcile/reset/migrate). Runs
+    /// before any version/guard read so those reads see consistent state.
+    async fn heal_bookkeeping(&self) -> Result<()>;
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(
         &self,
@@ -246,7 +250,6 @@ pub trait DatabaseAdapter: Send + Sync {
 
     // ── Meta tracking (environment, safety guards) ─────
 
-    async fn ensure_meta_table(&self) -> Result<()>;
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
 }
