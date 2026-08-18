@@ -324,8 +324,9 @@ and views, losslessly; no schemas/enums/functions/sequences/roles, **triggers sk
 flat (`ddl/table/<name>.ddl`) and `design.yaml` carries `schemas: []`. (`dbd inspect` on a SQLite
 project may emit benign schema-qualification warnings; the DDL is valid and applies.)
 
-`init --from-db` **refuses** to run against a **dbd-managed** database (a `_dbd_meta` table → use
-`dbd merge`), and refuses in a directory that already has a `design.yaml` (use `merge`). The
+`init --from-db` **refuses** to run against a **dbd-managed** database (`dbd.meta`, or a legacy
+`_dbd_meta`, in any schema → use `dbd merge`), and refuses in a directory that already has a
+`design.yaml` (use `merge`). The
 generated `design.yaml` writes the connection as the literal `$DATABASE_URL` env reference —
 **secrets never land in the repo**.
 
@@ -355,12 +356,13 @@ deleted**). `--dry-run` previews the plan + the snapshot version that would be c
 edits config, so files written for a schema not in `schemas:` produce a **warning**. Secrets never
 written (the connection is not persisted; `$DATABASE_URL`).
 
-**Version safety.** When the target is a **dbd-managed** database (`_dbd_meta` exists), `merge`
-compares the DB's applied version **D** against the project version **Y** (`0` when unset):
-**D < Y → refuse** (project is ahead of a stale DB; overwriting would discard newer work — no
-override flag; `dbd apply` to advance the DB, or revert the project via version control); **D ≥ Y,
-or any foreign DB / DBML source** → the overwrite + auto-snapshot path. (A DBML or foreign source
-has no `_dbd_meta`, so the gate never engages — it always takes the snapshot path.)
+**Version safety.** When the target is a **dbd-managed** database (`dbd.meta`, or a legacy
+`_dbd_meta`, exists), `merge` compares the DB's applied version **D** against the project version
+**Y** (`0` when unset): **D < Y → refuse** (project is ahead of a stale DB; overwriting would
+discard newer work — no override flag; `dbd apply` to advance the DB, or revert the project via
+version control); **D ≥ Y, or any foreign DB / DBML source** → the overwrite + auto-snapshot path.
+(A DBML or foreign source has no `dbd.meta`/`_dbd_meta`, so the gate never engages — it always
+takes the snapshot path.)
 
 ### Reverse-engineering — entity coverage
 
@@ -375,8 +377,9 @@ only, never passwords; superusers/`pg_*`/cloud/Supabase platform roles filtered)
 sequences (`ddl/sequence/<schema>/<name>.ddl`).
 
 **Not captured:** partial indexes (`… WHERE …`), expression indexes (`lower(name)`), triggers,
-aggregates, operators, domains, composite types. dbd's own `_dbd_meta`/`_dbd_migrations` are always
-excluded. Column order reflects the DB's physical order — run `dbd format` to normalize.
+aggregates, operators, domains, composite types. dbd's own bookkeeping — the `dbd` schema
+(`dbd.meta`/`dbd.migrations`) on Postgres/Supabase — is always excluded. Column order reflects the
+DB's physical order — run `dbd format` to normalize.
 
 A **DBML source** (`--from-dbml`) covers only **schemas + enums + tables + foreign keys** — DBML
 cannot express functions, procedures, views, standalone sequences, roles, or check constraints.
@@ -411,7 +414,7 @@ Apply order: schemas → extensions → roles → enums → tables (with interle
 
 After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any materialized view it just created and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
-**Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in `_dbd_meta.scope`. A later `apply`/`deploy`/`reconcile`/`reset` that requests a *different* scope than the pin is refused ("scope guard: this database is pinned to scope 'X', but you requested 'Y'"), preventing a mistyped or forgotten `--scope` from building a divergent schema. Pass `--allow-scope-change` on the write command to re-point the database to the new scope (`reset --force` also bypasses). Databases created before this feature are unpinned and pin on their next write.
+**Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in the bookkeeping table's `scope` column (`dbd.meta.scope` on Postgres/Supabase, `_dbd_meta.scope` on SQLite). A later `apply`/`deploy`/`reconcile`/`reset` that requests a *different* scope than the pin is refused ("scope guard: this database is pinned to scope 'X', but you requested 'Y'"), preventing a mistyped or forgotten `--scope` from building a divergent schema. Pass `--allow-scope-change` on the write command to re-point the database to the new scope (`reset --force` also bypasses). Databases created before this feature are unpinned and pin on their next write.
 
 ### dbd refresh
 
@@ -695,7 +698,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ### dbd reset
 
-Guarded by the `_dbd_meta` environment check **and** the scope guard (a wrong-`--scope` reset is refused unless `--allow-scope-change` or `--force`; see [dbd apply](#dbd-apply)). **Entity-level by default**: drops the
+Guarded by the bookkeeping environment check (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite) **and** the scope guard (a wrong-`--scope` reset is refused unless `--allow-scope-change` or `--force`; see [dbd apply](#dbd-apply)). **Entity-level by default**: drops the
 project's own objects individually — functions/procedures (every overload via a
 `DROP ROUTINE` DO-block), materialized views (`DROP MATERIALIZED VIEW … CASCADE`,
 before the views/tables they read), views, tables, sequences, enums — in reverse
@@ -818,8 +821,8 @@ let graph = design.graph(None, None)?;
 
 | Target | Adapter | URL form | Extensions | Roles | SQL exec | Import | Migrations |
 |--------|---------|----------|------------|-------|----------|--------|------------|
-| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `_dbd_migrations` |
-| Supabase | sqlx-postgres | `postgres://…` (with `target: supabase`) | filtered (managed) | yes | yes | COPY streaming | `_dbd_migrations` |
+| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `dbd.migrations` (dedicated `dbd` schema) |
+| Supabase | sqlx-postgres | `postgres://…` (with `target: supabase`) | filtered (managed) | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
 | SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
 | Convex | codegen | `convex:` (→ `./convex`), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>`; whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
 
@@ -872,7 +875,16 @@ API: `Design::write_ref_cache(adapter, source)` / `Design::resolve_unknown_refs_
 
 ## Safety model
 
-`_dbd_meta` table in the database records project name, environment, and version.
+The bookkeeping table records project name, environment, and version. On Postgres/Supabase this is
+`dbd.meta` in a dedicated `dbd` schema (paired with `dbd.migrations`); the `dbd` schema is not in
+PostgREST's default `db-schemas` (so it's unreachable via the API), and it's excluded from
+reverse-engineering/`merge`/DBML/`diagram`/introspection and protected from `dbd reset`
+(`--schemas`/`--clean` never drop it). Existing databases heal automatically — on the next
+`apply`/`deploy`/`reconcile`/`reset`, dbd relocates legacy `public._dbd_meta`/`public._dbd_migrations`
+(and any scoped-apply strays in other schemas) into `dbd.meta`/`dbd.migrations` and drops the
+originals; no user action required. On SQLite it's `_dbd_meta`/`_dbd_migrations` (SQLite has no
+schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JSON sidecar next to
+`schema.ts`.
 
 | State | `reset` | `reset --force` |
 |-------|---------|-----------------|
