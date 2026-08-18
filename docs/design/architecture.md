@@ -1985,6 +1985,15 @@ Then:
 
 #### `_dbd_meta` table
 
+> **Current implementation note:** this section documents the original design (table names,
+> guard logic). On today's Postgres/Supabase adapter these tables live in a dedicated `dbd`
+> schema as `dbd.meta`/`dbd.migrations` (not PostgREST-exposed; excluded from
+> reverse-engineering/reset), with existing `public._dbd_meta`/`public._dbd_migrations`
+> databases healed into the new location automatically on the next write — see
+> `docs/superpowers/specs/2026-08-18-dbd-bookkeeping-schema-design.md`. SQLite is unchanged
+> (`_dbd_meta`/`_dbd_migrations`, as below) since it has no schemas. The guard logic and
+> scenarios below still apply verbatim, just against the current table location.
+
 Created alongside `_dbd_migrations` on first `apply`. Records project-level metadata.
 
 ```sql

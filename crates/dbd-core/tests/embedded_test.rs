@@ -2283,43 +2283,41 @@ async fn batch_failure_mid_plan_rolls_back_prior_ddl() {
     assert_schema_absent(&*adapter, "partial_schema").await;
 }
 
-// ── Bookkeeping table lives in `public`, healing a scoped-apply stray ──────────
+// ── Bookkeeping lives in the `dbd` schema; heal folds legacy `_dbd_*` copies ───
 
-/// Assert `_dbd_meta.version` for `project` equals `expected`, reading the given
-/// schema explicitly (so the test doesn't depend on search_path resolution).
-async fn assert_meta_version(
+/// Assert `dbd.meta.version` for `project` equals `expected`.
+async fn assert_dbd_meta_version(
     adapter: &dyn dbd_core::DatabaseAdapter,
-    schema: &str,
     project: &str,
     expected: i32,
 ) {
     let sql = format!(
         "DO $$ DECLARE v integer; BEGIN \
-           SELECT version INTO v FROM \"{schema}\"._dbd_meta WHERE project = '{project}'; \
+           SELECT version INTO v FROM dbd.meta WHERE project = '{project}'; \
            IF v IS DISTINCT FROM {expected} THEN \
-             RAISE EXCEPTION '{schema}._dbd_meta[{project}].version = %, expected {expected}', v; \
-           END IF; \
-         END $$"
+             RAISE EXCEPTION 'dbd.meta[{project}].version = %, expected {expected}', v; \
+           END IF; END $$"
     );
     adapter
         .execute_script(&sql)
         .await
-        .unwrap_or_else(|e| panic!("assert_meta_version({schema}, {project}) failed: {e}"));
+        .unwrap_or_else(|e| panic!("assert_dbd_meta_version({project}) failed: {e}"));
 }
 
 /// A scoped apply can leave `_dbd_meta` in a non-`public` schema (pooled
-/// connections don't share `search_path`). Reads must still find it, and the
-/// next write must relocate it into `public` — preserving every row — so later
-/// unqualified/pooled access can't miss it (which surfaced as
-/// `relation "_dbd_meta" does not exist` during reconcile).
+/// connections don't share `search_path`). The read-only detection path must
+/// still recognise the DB as managed BEFORE heal runs (both-names awareness),
+/// and `heal_bookkeeping` must fold every row into `dbd.meta` — preserving
+/// unrelated rows — then drop the stray copy, so later access can't miss it
+/// (which surfaced as `relation "_dbd_meta" does not exist` during reconcile).
 #[tokio::test]
-async fn meta_table_heals_from_stray_schema_into_public() {
+async fn heal_relocates_stray_meta_and_preserves_rows() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "meta_heal_test").await.unwrap();
 
     // Simulate the leak: `_dbd_meta` created in `dojo`, not `public`, with a row
     // for this project (v7) and an unrelated project's row (v99) to prove the
-    // relocation moves data rather than recreating an empty table.
+    // heal moves data rather than recreating an empty table.
     adapter
         .execute_script(
             "CREATE SCHEMA dojo; \
@@ -2336,32 +2334,22 @@ async fn meta_table_heals_from_stray_schema_into_public() {
         .await
         .expect("seed stray dojo._dbd_meta");
 
-    // Precondition: no `public._dbd_meta` yet, and the version read must find the
-    // stray copy (v7) — NOT silently fall back to 0.
-    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
-    assert_eq!(
-        adapter.get_db_version().await.unwrap(),
-        7,
-        "get_db_version must read the stray dojo._dbd_meta, not miss it as 0"
-    );
+    // Before heal the new layout doesn't exist; detection still sees it as managed.
+    assert_eq!(adapter.reverse_managed_version().await.unwrap(), Some(7));
 
-    // A write heals the location: relocate into `public` and upsert this project
-    // to v8. This is exactly what reconcile/apply do at the end of a run.
-    adapter
-        .set_project_meta("prod", 8, None)
-        .await
-        .expect("set_project_meta should heal + upsert");
+    adapter.heal_bookkeeping().await.unwrap();
 
-    // `_dbd_meta` now lives in `public`; the stray `dojo` copy is gone.
-    assert_table_exists(&*adapter, "public", "_dbd_meta").await;
+    // `_dbd_meta` now lives in `dbd.meta`; the stray `dojo` copy is gone.
+    assert_table_exists(&*adapter, "dbd", "meta").await;
     assert_table_absent(&*adapter, "dojo", "_dbd_meta").await;
 
-    // This project's row was updated in place (v8), and the unrelated row rode
-    // along with the relocation (v99) — proving data was moved, not dropped.
-    assert_meta_version(&*adapter, "public", "meta_heal_test", 8).await;
-    assert_meta_version(&*adapter, "public", "other_project", 99).await;
+    // This project's row rode along (v7), and the unrelated row too (v99) —
+    // proving data was moved, not dropped.
+    assert_dbd_meta_version(&*adapter, "meta_heal_test", 7).await;
+    assert_dbd_meta_version(&*adapter, "other_project", 99).await;
 
-    // And the version reads resolve against `public` now.
+    // Post-heal writes target `dbd.meta` and reads resolve against it.
+    adapter.set_project_meta("prod", 8, None).await.unwrap();
     assert_eq!(adapter.get_db_version().await.unwrap(), 8);
     let meta = adapter.get_project_meta().await.unwrap().unwrap();
     assert_eq!(meta.version, 8);
@@ -2369,37 +2357,195 @@ async fn meta_table_heals_from_stray_schema_into_public() {
     assert_eq!(meta.project, "meta_heal_test");
 }
 
+/// The CLI scope/prod guard reads `get_project_meta()` BEFORE the core op heals.
+/// On a legacy, not-yet-healed DB whose `_dbd_meta` predates the `scope` column,
+/// that read must still return the row via `get_meta`'s SQLSTATE-42703
+/// (undefined_column) fallback — otherwise the guard silently disables. This is
+/// the pre-heal path `heal_folds_legacy_meta_without_scope_column` does NOT hit
+/// (it reads only after heal, against `dbd.meta`, which has the scope column).
 #[tokio::test]
-async fn legacy_meta_without_scope_reads_and_backfills() {
+async fn get_meta_reads_legacy_scopeless_meta_before_heal() {
     let (_pg, url) = start_pg().await;
-    let adapter = connect(&url, "legacy_scope_test").await.unwrap();
-
-    // Legacy `public._dbd_meta` WITHOUT the `scope` column, prod row.
+    let adapter = connect(&url, "preheal").await.unwrap();
+    // Legacy public._dbd_meta WITHOUT the scope column, prod row — and DO NOT heal.
     adapter
         .execute_script(
             "CREATE TABLE public._dbd_meta ( \
-                project varchar NOT NULL PRIMARY KEY, \
-                env varchar NOT NULL DEFAULT 'dev', \
+                project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
                 version integer NOT NULL DEFAULT 0, \
-                created_at timestamptz NOT NULL DEFAULT now(), \
-                updated_at timestamptz NOT NULL DEFAULT now() ); \
-             INSERT INTO public._dbd_meta (project, env, version) \
-                VALUES ('legacy_scope_test', 'prod', 4)",
+                created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+             INSERT INTO public._dbd_meta (project, env, version) VALUES ('preheal','prod',4);",
         )
         .await
-        .expect("seed legacy public._dbd_meta");
-
-    // Resilient read: prod guard still sees env/version; scope is None.
-    let m = adapter.get_project_meta().await.unwrap().expect("legacy meta reads");
+        .unwrap();
+    // The guard reads meta BEFORE core heals — must return the prod row via the 42703 fallback.
+    let m = adapter
+        .get_project_meta()
+        .await
+        .unwrap()
+        .expect("pre-heal legacy meta must be readable");
     assert_eq!(m.env, "prod");
     assert_eq!(m.version, 4);
     assert_eq!(m.scope, None);
+}
 
-    // A write backfills the `scope` column and pins the scope.
-    adapter
-        .set_project_meta("prod", 5, Some("public"))
-        .await
-        .expect("set_project_meta backfills the scope column");
-    let m2 = adapter.get_project_meta().await.unwrap().unwrap();
-    assert_eq!(m2.scope.as_deref(), Some("public"));
+// ── heal_bookkeeping: move to `dbd` schema + fold legacy `public._dbd_*` ───────
+
+#[tokio::test]
+async fn heal_fresh_db_creates_dbd_schema() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fresh").await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap();
+    assert_table_exists(&*adapter, "dbd", "meta").await;
+    assert_table_exists(&*adapter, "dbd", "migrations").await;
+    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "public", "_dbd_migrations").await;
+}
+
+#[tokio::test]
+async fn heal_folds_legacy_public_meta_into_dbd() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "legacy").await.unwrap();
+    adapter.execute_script(
+        "CREATE TABLE public._dbd_meta ( \
+            project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, scope varchar, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+         CREATE TABLE public._dbd_migrations ( \
+            project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
+            description text, checksum text, PRIMARY KEY (project, version) ); \
+         INSERT INTO public._dbd_meta (project, env, version, scope) VALUES ('legacy','prod',4,'public'); \
+         INSERT INTO public._dbd_migrations (project, version, description, checksum) VALUES ('legacy',1,'init','abc');"
+    ).await.unwrap();
+
+    adapter.heal_bookkeeping().await.unwrap();
+
+    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "public", "_dbd_migrations").await;
+    assert_dbd_meta_version(&*adapter, "legacy", 4).await;
+    let m = adapter.get_project_meta().await.unwrap().unwrap();
+    assert_eq!(m.env, "prod");
+    assert_eq!(m.scope.as_deref(), Some("public"));
+    assert_eq!(adapter.get_db_version().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn heal_folds_legacy_meta_without_scope_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nolscope").await.unwrap();
+    adapter.execute_script(
+        "CREATE TABLE public._dbd_meta ( \
+            project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('nolscope','prod',4);"
+    ).await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap();
+    let m = adapter.get_project_meta().await.unwrap().unwrap();
+    assert_eq!(m.version, 4);
+    assert_eq!(m.env, "prod");
+    assert_eq!(m.scope, None);
+    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
+}
+
+#[tokio::test]
+async fn heal_folds_multiple_stray_copies_public_wins() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "p").await.unwrap();
+    // public (canonical) v1 + stray dojo v2 for the same project.
+    adapter.execute_script(
+        "CREATE SCHEMA dojo; \
+         CREATE TABLE public._dbd_meta (project varchar PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, scope varchar, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()); \
+         CREATE TABLE dojo._dbd_meta (LIKE public._dbd_meta INCLUDING ALL); \
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('p','prod',1); \
+         INSERT INTO dojo._dbd_meta   (project, env, version) VALUES ('p','prod',2); \
+         CREATE TABLE public._dbd_migrations (project varchar, version integer, applied_at timestamptz DEFAULT now(), \
+            description text, checksum text, PRIMARY KEY (project, version)); \
+         CREATE TABLE dojo._dbd_migrations (LIKE public._dbd_migrations INCLUDING ALL); \
+         INSERT INTO public._dbd_migrations (project, version) VALUES ('p',1); \
+         INSERT INTO dojo._dbd_migrations   (project, version) VALUES ('p',2);"
+    ).await.unwrap();
+
+    adapter.heal_bookkeeping().await.unwrap();
+
+    // Canonical public row wins (v1), matching today's read-prefers-public semantics.
+    assert_dbd_meta_version(&*adapter, "p", 1).await;
+    // Migrations union both copies (composite PK).
+    assert_table_absent(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "dojo", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "dojo", "_dbd_migrations").await;
+    let n: i64 = 2; // versions 1 and 2 present
+    let sql = format!(
+        "DO $$ DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM dbd.migrations WHERE project='p'; \
+         IF c <> {n} THEN RAISE EXCEPTION 'dbd.migrations count = %, expected {n}', c; END IF; END $$"
+    );
+    adapter.execute_script(&sql).await.unwrap();
+}
+
+#[tokio::test]
+async fn heal_is_idempotent() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "idem").await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap();
+    adapter.set_project_meta("prod", 3, Some("public")).await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap(); // second heal — no-op
+    let m = adapter.get_project_meta().await.unwrap().unwrap();
+    assert_eq!(m.version, 3);
+    assert_eq!(m.scope.as_deref(), Some("public"));
+}
+
+/// `dbd migrate --status` is read-only: it must resolve the version through
+/// the both-names-aware catalog read WITHOUT ever invoking `heal_bookkeeping`,
+/// which would relocate/drop a legacy DB's bookkeeping as a side effect of a
+/// status check. Regression test for a status command that used to heal.
+#[tokio::test]
+async fn get_db_version_reads_legacy_without_healing() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "statusonly").await.unwrap();
+    // Legacy public._dbd_meta at v5 — a read (as migrate --status does) must NOT relocate/drop it.
+    adapter.execute_script(
+        "CREATE TABLE public._dbd_meta ( \
+            project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, scope varchar, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('statusonly','prod',5);"
+    ).await.unwrap();
+    // The read returns the legacy version via the both-names path...
+    assert_eq!(adapter.get_db_version().await.unwrap(), 5);
+    // ...and does NOT heal: legacy table still present, dbd.meta NOT created.
+    assert_table_exists(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "dbd", "meta").await;
+}
+
+/// The `dbd` bookkeeping schema must be invisible to reverse-engineering /
+/// introspection — it's dbd's own internal state, never a project object —
+/// while still surviving as a real schema in the database.
+#[tokio::test]
+async fn dbd_schema_excluded_from_introspect_and_survives() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "excl").await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap();
+    // introspect() must not surface dbd.meta / dbd.migrations (or the dbd schema)
+    let ents = adapter.introspect().await.unwrap();
+    assert!(
+        ents.iter().all(|e| !e.name.starts_with("dbd.") && e.name != "dbd"),
+        "dbd.* leaked into introspect: {:?}",
+        ents.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    assert!(
+        ents.iter().all(|e| e.schema.as_deref() != Some("dbd")),
+        "an entity with schema = dbd leaked into introspect: {:?}",
+        ents.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    // list_entities() (the `dbd inspect` refcache path) must also exclude dbd.*
+    let names = adapter.list_entities().await.unwrap();
+    assert!(
+        names.iter().all(|n| !n.starts_with("dbd.")),
+        "dbd.* leaked into list_entities: {names:?}"
+    );
+    // dbd bookkeeping is still present (it's dbd-internal, not a project object)
+    assert_table_exists(&*adapter, "dbd", "meta").await;
+    assert_table_exists(&*adapter, "dbd", "migrations").await;
 }

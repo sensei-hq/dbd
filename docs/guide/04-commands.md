@@ -35,7 +35,7 @@ dbd inspect -s sensei-hq/daemon/database  # GitHub repo
 
 ### Scope guard
 
-The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of `_dbd_meta`. Any later `apply`, `deploy`, `reconcile`, or `reset` that requests a *different* scope is refused:
+The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite). Any later `apply`, `deploy`, `reconcile`, or `reset` that requests a *different* scope is refused:
 
 ```
 scope guard: this database is pinned to scope 'public', but you requested 'internal'.
@@ -203,7 +203,7 @@ dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 
 ## `dbd reset`
 
-Drop the project's own managed objects so you can re-`apply` from scratch. Guarded by the `_dbd_meta` environment check **and** the [scope guard](#scope-guard) — a wrong-`--scope` reset (which would drop the wrong objects) is refused.
+Drop the project's own managed objects so you can re-`apply` from scratch. Guarded by the bookkeeping environment check (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite) **and** the [scope guard](#scope-guard) — a wrong-`--scope` reset (which would drop the wrong objects) is refused.
 
 ```sh
 dbd reset                          # Blocked if prod or version >= 1
@@ -219,7 +219,7 @@ dbd reset --scope hub --dry-run    # Only the objects the 'hub' scope occupies
 
 **Opt-in wider drops:**
 
-- `--schemas` — also `DROP SCHEMA … CASCADE` for the project's managed schemas. Always skips the true system schemas (`pg_catalog`, `information_schema`, `pg_toast`); on a `supabase` target also skips the Supabase-managed set (`auth`, `storage`, … and `public`). On a `postgres` target, `public` **is** dropped.
+- `--schemas` — also `DROP SCHEMA … CASCADE` for the project's managed schemas. Always skips the true system schemas (`pg_catalog`, `information_schema`, `pg_toast`) and dbd's own `dbd` bookkeeping schema; on a `supabase` target also skips the Supabase-managed set (`auth`, `storage`, … and `public`). On a `postgres` target, `public` **is** dropped.
 - `--extensions` — also `DROP EXTENSION … CASCADE` for each extension in the target's `extensions:` config.
 - `--clean` — shorthand for `--schemas --extensions`.
 
@@ -496,8 +496,8 @@ literal `$DATABASE_URL` env reference — never the connection string you passed
 connections only; `--target sqlite` with `--from-db` is rejected.
 
 **Managed databases & version safety.** `init --from-db` is for databases **not** managed by
-dbd. If it detects a `_dbd_meta` table (in any schema — dbd tracks the applied version there),
-it **refuses** and points you at `merge`, which knows how to reconcile a managed database into
+dbd. If it detects `dbd.meta` (or a legacy `_dbd_meta` in any schema — dbd tracks the applied
+version there), it **refuses** and points you at `merge`, which knows how to reconcile a managed database into
 its own project safely.
 
 **What's captured (and what isn't).** Reverse-engineering covers the **data model**:
@@ -533,7 +533,7 @@ Not yet captured:
 - **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
   are skipped, since they can't be represented losslessly yet.
 - **Triggers**, aggregates, operators, domains, composite types.
-- dbd's own bookkeeping tables (`_dbd_meta`, `_dbd_migrations`) are always excluded.
+- dbd's own bookkeeping — the `dbd` schema (`dbd.meta`/`dbd.migrations`) — is always excluded.
 
 Column order reflects the database's **physical** order (which can differ from a
 hand-authored file after `ALTER TABLE ADD COLUMN`). Run `dbd format` on the result to
@@ -603,8 +603,8 @@ version that *would* be created, writing nothing.
 `init --from-db`). Because it never edits config, if it writes files for a schema not
 listed in `design.yaml`'s `schemas:`, it **warns** so you can add the schema yourself.
 
-**Managed databases & version safety.** When the target is a **dbd-managed** database (a
-`_dbd_meta` table exists in any schema), `merge` compares the database's applied version
+**Managed databases & version safety.** When the target is a **dbd-managed** database (`dbd.meta`
+exists, or a legacy `_dbd_meta` in any schema), `merge` compares the database's applied version
 **D** against the project's `design.yaml` `project.version` **Y** (treated as `0` when
 unset). The only thing this changes is whether the merge proceeds at all:
 
@@ -612,7 +612,7 @@ unset). The only thing this changes is whether the merge proceeds at all:
   it would discard newer work. Bring the database up to date with `dbd apply`, or revert the
   project to v`D` via version control if you really mean to discard those changes. (There is
   no override flag.)
-- **everything else** (a **foreign** database with no `_dbd_meta`, or a managed database with
+- **everything else** (a **foreign** database with no `dbd.meta`/`_dbd_meta`, or a managed database with
   **D ≥ Y**) → the overwrite + auto-snapshot path described above.
 
 ---
@@ -664,7 +664,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.4
+  rev: v0.10.6
   hooks:
     - id: dbd-format
 ```

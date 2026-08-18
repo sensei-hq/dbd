@@ -60,8 +60,8 @@ dbd format         # normalize to your conventions (introspected column order is
 ```
 
 `init --from-db` writes a baseline snapshot, so the project is version-tracked from day one. It
-**refuses** if the database is already dbd-managed (it finds a `_dbd_meta` table) — use `dbd merge`
-for that. From here it's an ordinary project: edit DDL → snapshot → apply.
+**refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
+use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
 
 ### Add a new database to an existing project
 
@@ -119,5 +119,5 @@ the project's `project.version` **Y**:
 - **D < Y → refuse.** The project is ahead of a stale database; overwriting project DDL from it
   would discard newer work. Bring the database up to date with `dbd apply`, or revert the project
   to version `D` via version control if you really mean to discard it. There is no override flag.
-- **D ≥ Y, or any source with no `_dbd_meta` (a foreign DB, a DBML file, an unmanaged SQLite DB) →
-  proceed.** dbd overwrites the introspected DDL and auto-snapshots the diff.
+- **D ≥ Y, or any source with no `dbd.meta`/`_dbd_meta` (a foreign DB, a DBML file, an unmanaged
+  SQLite DB) → proceed.** dbd overwrites the introspected DDL and auto-snapshots the diff.
