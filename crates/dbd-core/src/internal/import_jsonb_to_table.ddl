@@ -21,6 +21,11 @@ create or replace procedure staging.import_jsonb_to_table(
   , p_target_table text
 )
 language plpgsql
+-- Pinned search_path (Supabase lint 0011 "function_search_path_mutable"): the body is fully
+-- pg_catalog-qualified and every user type it emits into dynamic SQL is schema-qualified
+-- (enums, array elements, and scalars via format_type below), so '' is safe and immune to a
+-- caller-hijacked path.
+set search_path = ''
 as
 $$
 declare
@@ -70,8 +75,11 @@ begin
                    end)
 
           else
-            -- Scalar: cast text representation to the column type
-            format('(data->>%L)::%s', a.attname, t.typname)
+            -- Scalar: cast text representation to the column type. format_type schema-
+            -- qualifies a user-defined scalar/domain type (required now search_path is pinned
+            -- to '' — an unqualified name would not resolve); built-ins render canonically
+            -- (integer, text, …). -1 typmod = no length modifier, matching the prior cast.
+            format('(data->>%L)::%s', a.attname, format_type(a.atttypid, -1))
         end
       , ', ' order by a.attnum)
   into v_col_list, v_col_exprs
