@@ -482,6 +482,16 @@ impl Design {
         &self.entities
     }
 
+    /// Number of entities loaded from a DDL file under `ddl/`, as opposed to
+    /// entities synthesized from `design.yaml` config (schemas, extensions,
+    /// config-declared roles). A zero count on `apply` usually means the
+    /// resolved project directory (`--source`) is wrong — the config loaded but
+    /// no authored DDL was scanned — so callers can warn instead of silently
+    /// reporting success.
+    pub fn authored_entity_count(&self) -> usize {
+        self.entities.iter().filter(|e| e.file.is_some()).count()
+    }
+
     /// Access import tables (data files found in import/).
     pub fn import_tables(&self) -> &[Entity] {
         &self.import_tables
@@ -2003,6 +2013,71 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
+    }
+
+    // ── authored-entity guard (wrong --source / empty ddl detection) ──────────
+
+    #[test]
+    fn authored_entity_count_zero_when_no_ddl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        // Config declares a schema but there is NO ddl/ dir — mirrors a wrong
+        // `--source`: the config loads, but no authored DDL is scanned.
+        std::fs::write(
+            project_dir.join("design.yaml"),
+            "project:\n  name: test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
+        )
+        .unwrap();
+        let design =
+            Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
+
+        assert_eq!(
+            design.authored_entity_count(),
+            0,
+            "a project with a schema but no ddl/ files has zero authored entities"
+        );
+        // The config-derived schema entity IS present, so entities().len() alone
+        // (which would be >= 1) does not catch the empty-ddl case.
+        assert!(
+            design
+                .entities()
+                .iter()
+                .any(|e| e.entity_type == crate::entity::EntityType::Schema),
+            "the public schema entity is loaded from config"
+        );
+    }
+
+    #[test]
+    fn authored_entity_count_counts_ddl_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        std::fs::write(
+            project_dir.join("design.yaml"),
+            "project:\n  name: test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
+        )
+        .unwrap();
+        let ddl_dir = project_dir.join("ddl/table/public");
+        std::fs::create_dir_all(&ddl_dir).unwrap();
+        std::fs::write(
+            ddl_dir.join("widgets.ddl"),
+            "create table if not exists public.widgets (id bigint primary key);\n",
+        )
+        .unwrap();
+        let design =
+            Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
+
+        assert_eq!(
+            design.authored_entity_count(),
+            1,
+            "the widgets table authored under ddl/ is counted"
+        );
+        assert!(
+            design
+                .entities()
+                .iter()
+                .any(|e| e.name == "public.widgets" && e.file.is_some()),
+            "widgets came from a ddl file"
+        );
     }
 
     #[tokio::test]

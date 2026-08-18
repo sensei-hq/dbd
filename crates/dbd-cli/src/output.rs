@@ -44,6 +44,11 @@ pub fn always(msg: &str) {
     println!("{msg}");
 }
 
+/// Print a warning to stderr (always shown, yellow, `⚠` prefix).
+pub fn warn(msg: &str) {
+    eprintln!("{}", style(format!("⚠ {msg}")).yellow());
+}
+
 /// Print a summary line with counts.
 pub fn summary(errors: usize, warnings: usize, entities: usize) {
     if errors == 0 && warnings == 0 {
