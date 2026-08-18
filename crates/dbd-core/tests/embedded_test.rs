@@ -2495,3 +2495,34 @@ async fn heal_is_idempotent() {
     assert_eq!(m.version, 3);
     assert_eq!(m.scope.as_deref(), Some("public"));
 }
+
+/// The `dbd` bookkeeping schema must be invisible to reverse-engineering /
+/// introspection — it's dbd's own internal state, never a project object —
+/// while still surviving as a real schema in the database.
+#[tokio::test]
+async fn dbd_schema_excluded_from_introspect_and_survives() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "excl").await.unwrap();
+    adapter.heal_bookkeeping().await.unwrap();
+    // introspect() must not surface dbd.meta / dbd.migrations (or the dbd schema)
+    let ents = adapter.introspect().await.unwrap();
+    assert!(
+        ents.iter().all(|e| !e.name.starts_with("dbd.") && e.name != "dbd"),
+        "dbd.* leaked into introspect: {:?}",
+        ents.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    assert!(
+        ents.iter().all(|e| e.schema.as_deref() != Some("dbd")),
+        "an entity with schema = dbd leaked into introspect: {:?}",
+        ents.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    // list_entities() (the `dbd inspect` refcache path) must also exclude dbd.*
+    let names = adapter.list_entities().await.unwrap();
+    assert!(
+        names.iter().all(|n| !n.starts_with("dbd.")),
+        "dbd.* leaked into list_entities: {names:?}"
+    );
+    // dbd bookkeeping is still present (it's dbd-internal, not a project object)
+    assert_table_exists(&*adapter, "dbd", "meta").await;
+    assert_table_exists(&*adapter, "dbd", "migrations").await;
+}

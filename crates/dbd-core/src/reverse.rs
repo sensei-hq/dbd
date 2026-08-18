@@ -2,8 +2,9 @@
 //! dbd project folder. Pure (no DB) except where it calls an adapter's
 //! `introspect()`. See docs/superpowers/specs/2026-06-15-reverse-engineer-design.md.
 
-/// Schemas always excluded (Postgres internals), regardless of flags.
-pub const ALWAYS_EXCLUDED: &[&str] = &["pg_catalog", "information_schema"];
+/// Schemas always excluded from reverse-engineering: Postgres internals plus
+/// dbd's own bookkeeping schema (`dbd`), regardless of flags.
+pub const ALWAYS_EXCLUDED: &[&str] = &["pg_catalog", "information_schema", "dbd"];
 
 /// Supabase platform schemas excluded by default (overridable with `all=true`).
 pub const SUPABASE_DENYLIST: &[&str] = &[
@@ -365,6 +366,11 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
 mod tests {
     use super::*;
     fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn dbd_schema_is_internal() {
+        assert!(is_internal("dbd"));
+    }
 
     #[test]
     fn excludes_internal_and_supabase_by_default() {
