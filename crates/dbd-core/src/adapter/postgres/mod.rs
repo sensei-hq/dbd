@@ -347,7 +347,7 @@ impl PostgresAdapter {
     fn schema_filter_column(col: &str) -> String {
         // Keep in sync with `reverse::ALWAYS_EXCLUDED` / `reverse::is_internal`.
         format!(
-            "{col} NOT IN ('pg_catalog', 'information_schema') \
+            "{col} NOT IN ('pg_catalog', 'information_schema', 'dbd') \
              AND {col} NOT LIKE 'pg_toast%' \
              AND {col} NOT LIKE 'pg_temp%'"
         )
@@ -1419,15 +1419,14 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut names: Vec<String> = Vec::new();
 
         // Tables + views (information_schema covers BASE TABLE, VIEW, FOREIGN, etc.)
-        let rows = sqlx::query(
-            "SELECT table_schema, table_name FROM information_schema.tables \
-             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-               AND table_schema NOT LIKE 'pg_toast%' \
-               AND table_schema NOT LIKE 'pg_temp%'"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("list_entities tables query failed: {e}")))?;
+        let table_filter = Self::schema_filter_column("table_schema");
+        let sql = format!(
+            "SELECT table_schema, table_name FROM information_schema.tables WHERE {table_filter}"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("list_entities tables query failed: {e}")))?;
 
         for row in &rows {
             let schema: String = row.get("table_schema");
@@ -1436,16 +1435,16 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         // Enum types
-        let rows = sqlx::query(
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let sql = format!(
             "SELECT n.nspname, t.typname FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
-             WHERE t.typtype = 'e' \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND n.nspname NOT LIKE 'pg_toast%'"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("list_entities enums query failed: {e}")))?;
+             WHERE t.typtype = 'e' AND {ns_filter}"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("list_entities enums query failed: {e}")))?;
 
         for row in &rows {
             let schema: String = row.get("nspname");
