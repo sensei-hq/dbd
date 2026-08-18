@@ -34,6 +34,11 @@ impl Design {
             return Ok(());
         }
 
+        // Heal-first: ensure bookkeeping storage exists (and is at the current
+        // layout, healing any legacy layout in place) before anything else reads
+        // or writes it — every ownership operation calls this up front.
+        adapter.heal_bookkeeping().await?;
+
         // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {
             let count = valid_entities.len() as u32;
@@ -68,17 +73,6 @@ impl Design {
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
         let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
-
-        // Ensure migrations table exists if we have migration steps
-        let has_migrations = plan.steps.iter().any(|s| matches!(
-            s,
-            ExecutionStep::MigrateEntity { .. }
-                | ExecutionStep::DropEntity { .. }
-                | ExecutionStep::RecordMigration { .. }
-        ));
-        if has_migrations {
-            adapter.ensure_migrations_table().await?;
-        }
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();

@@ -56,7 +56,7 @@ pub async fn cmd_migrate_status(
     verbosity: Verbosity,
 ) -> Result<()> {
     let adapter = get_adapter(config, database_url).await?;
-    adapter.ensure_migrations_table().await?;
+    adapter.heal_bookkeeping().await?;
     let db_version = adapter.get_db_version().await?;
 
     let snapshots = dbd_core::snapshot::list_snapshots(project_dir);

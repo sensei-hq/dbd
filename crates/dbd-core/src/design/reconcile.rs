@@ -277,6 +277,12 @@ impl Design {
             return Ok(plan);
         }
 
+        // Heal-first: ensure bookkeeping storage exists (and is at the current
+        // layout, healing any legacy layout in place) before any meta read/write
+        // below — every ownership operation calls this up front. Runs after the
+        // dry-run return above so `--dry-run` stays read-only.
+        adapter.heal_bookkeeping().await?;
+
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
         // Write passes A–D (see `execute_reconcile_writes`).
@@ -303,7 +309,6 @@ impl Design {
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);
-        adapter.ensure_meta_table().await?;
         adapter.set_project_meta(&self.env, version, scope.map(|s| s.name.as_str())).await?;
 
         (progress.on_complete)(summary);
