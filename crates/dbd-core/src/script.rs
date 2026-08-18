@@ -49,8 +49,9 @@ fn generate_role_script(entity: &Entity) -> String {
     script
 }
 
-/// True system schemas that are never dropped, on any target.
-const ALWAYS_PROTECTED: &[&str] = &["pg_catalog", "information_schema", "pg_toast"];
+/// Schemas never dropped by reset on any target: Postgres internals plus
+/// dbd's own bookkeeping schema (`dbd`).
+const ALWAYS_PROTECTED: &[&str] = &["pg_catalog", "information_schema", "pg_toast", "dbd"];
 
 /// Schema of an entity, defaulting to `public` when unqualified.
 fn entity_schema(entity: &Entity) -> &str {
@@ -273,6 +274,12 @@ pub fn build_grants_script(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn dbd_schema_is_protected_on_all_targets() {
+        assert!(schema_is_protected("dbd", "postgres"));
+        assert!(schema_is_protected("dbd", "supabase"));
+    }
 
     #[test]
     fn ddl_for_schema() {

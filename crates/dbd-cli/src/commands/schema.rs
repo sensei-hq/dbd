@@ -7,6 +7,21 @@ use dbd_core::{Design, Entity, EntityType};
 use super::{format_apply_summary, get_adapter, safe_read, safe_write};
 use crate::output::{self, Verbosity};
 
+/// Warn when the config loaded but no authored DDL was scanned under the
+/// resolved project dir — the tell-tale of a wrong `--source`. The config path
+/// (`-c`) and the ddl/ scan root (`--source`) are independent, so an absolute
+/// `-c` with a defaulted `--source` loads the config yet silently scans the
+/// wrong directory, which would otherwise read as a successful no-op.
+fn warn_if_no_authored_ddl(design: &Design, project_dir: &Path) {
+    if design.authored_entity_count() == 0 {
+        output::warn(&format!(
+            "no authored DDL found under '{dir}/ddl' — check that --source points at your \
+             project (currently '{dir}').",
+            dir = project_dir.display()
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_inspect(
     config: &Path,
@@ -21,6 +36,7 @@ pub async fn cmd_inspect(
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    warn_if_no_authored_ddl(&design, project_dir);
 
     resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
 
@@ -310,6 +326,7 @@ pub async fn cmd_apply(
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    warn_if_no_authored_ddl(&design, project_dir);
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {

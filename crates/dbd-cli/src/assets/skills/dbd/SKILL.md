@@ -56,7 +56,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
 | `dbd doctor [--fix]` | Audit/repair config + layout: old design.yaml, stale files, plural dirs (`--fix` migrates these). Also flags **misfiled view/matview DDL** (a `CREATE MATERIALIZED VIEW` under `ddl/view/`, or a plain view under `ddl/materialized_view/`) — reported with a move hint, **not** auto-fixed. Run it to verify layout before `reset`/`apply` |
-| `dbd reset` | Drop the project's own objects (guarded by `_dbd_meta` env check; blocked in prod / post-v1). Also scope-guarded — `--force` or `--allow-scope-change` bypasses |
+| `dbd reset` | Drop the project's own objects (guarded by the bookkeeping env check — `dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite; blocked in prod / post-v1). Also scope-guarded — `--force` or `--allow-scope-change` bypasses |
 | `dbd format [--check]` | DDL formatter (river-style SELECT bodies; `--check` for pre-commit) |
 
 **Global scope flags** (honored by `inspect`/`apply`/`import`/`deploy`/`reconcile`
@@ -64,8 +64,9 @@ and the filter-only `dbml`/`combine`/`graph`/`export`/`reset`):
 `--scope <name>` selects a `scopes:` subset; `--deps report|include` overrides
 its gap policy. One design → many DBs: `dbd deploy --scope hub --database $HUB_URL`.
 
-**Scope guard**: `_dbd_meta` records the scope a database was built with (nullable
-`scope` column; `NULL` = unpinned). `apply`/`deploy`/`reconcile`/`reset` refuse to
+**Scope guard**: the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on
+SQLite) records the scope a database was built with (nullable `scope` column; `NULL` =
+unpinned). `apply`/`deploy`/`reconcile`/`reset` refuse to
 run under a different scope than the one the database is pinned to:
 `scope guard: this database is pinned to scope 'X', but you requested 'Y'.
 Applying a different scope would build a divergent schema.` Pass `--scope X` to

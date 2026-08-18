@@ -39,6 +39,11 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<()> {
+        // Heal-first: ensure bookkeeping storage exists (and is at the current
+        // layout, healing any legacy layout in place) before the meta read below
+        // — every ownership operation calls this up front.
+        adapter.heal_bookkeeping().await?;
+
         if !force
             && let Some(meta) = adapter.get_project_meta().await? {
                 if meta.env == "prod" {

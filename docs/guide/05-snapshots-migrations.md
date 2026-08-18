@@ -21,14 +21,15 @@ This:
 ## Version tracking
 
 - `design.yaml` version field tracks the latest snapshot version
-- `_dbd_meta` table in the database tracks the applied version
+- The bookkeeping table tracks the applied version in the database — `dbd.meta` in a dedicated
+  `dbd` schema on Postgres/Supabase, `_dbd_meta` on SQLite
 - `dbd apply` compares these and runs pending migrations
 
 ## Apply scenarios
 
 | DB state | Action |
 |----------|--------|
-| Fresh (no _dbd_meta) | Apply all DDL directly, mark latest version |
+| Fresh (no bookkeeping table) | Apply all DDL directly, mark latest version |
 | Behind (version < latest) | Run pending migrations, then apply DDL |
 | Current (version == latest) | Idempotent apply (CREATE IF NOT EXISTS) |
 
