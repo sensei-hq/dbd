@@ -94,6 +94,53 @@ impl SqliteAdapter {
             None => name,
         }
     }
+
+    /// Inner body for the migrations-table half of `heal_bookkeeping`. Kept as a
+    /// private inherent method (not a trait method) so it can be composed with
+    /// `ensure_meta_table_inner` inside `heal_bookkeeping`.
+    async fn ensure_migrations_table_inner(&self) -> Result<()> {
+        self.execute_script(
+            "CREATE TABLE IF NOT EXISTS _dbd_migrations ( \
+                project     TEXT NOT NULL, \
+                version     INTEGER NOT NULL, \
+                applied_at  TEXT NOT NULL DEFAULT (datetime('now')), \
+                description TEXT, \
+                checksum    TEXT, \
+                PRIMARY KEY (project, version) \
+            )",
+        )
+        .await
+    }
+
+    /// Inner body for the meta-table half of `heal_bookkeeping`. Kept as a
+    /// private inherent method (not a trait method) so it can be composed with
+    /// `ensure_migrations_table_inner` inside `heal_bookkeeping`, and called
+    /// directly by `set_project_meta`.
+    async fn ensure_meta_table_inner(&self) -> Result<()> {
+        self.execute_script(
+            "CREATE TABLE IF NOT EXISTS _dbd_meta ( \
+                project    TEXT NOT NULL PRIMARY KEY, \
+                env        TEXT NOT NULL DEFAULT 'dev', \
+                version    INTEGER NOT NULL DEFAULT 0, \
+                scope      TEXT, \
+                created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')) \
+            )",
+        )
+        .await?;
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` — add `scope` only when missing.
+        let has_scope = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+        if !has_scope {
+            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT").await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -360,18 +407,9 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(Some(row.map(|r| r.get::<i64, _>("version") as u32).unwrap_or(0)))
     }
 
-    async fn ensure_migrations_table(&self) -> Result<()> {
-        self.execute_script(
-            "CREATE TABLE IF NOT EXISTS _dbd_migrations ( \
-                project     TEXT NOT NULL, \
-                version     INTEGER NOT NULL, \
-                applied_at  TEXT NOT NULL DEFAULT (datetime('now')), \
-                description TEXT, \
-                checksum    TEXT, \
-                PRIMARY KEY (project, version) \
-            )",
-        )
-        .await
+    async fn heal_bookkeeping(&self) -> Result<()> {
+        self.ensure_meta_table_inner().await?;
+        self.ensure_migrations_table_inner().await
     }
 
     async fn get_db_version(&self) -> Result<u32> {
@@ -435,32 +473,6 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(())
     }
 
-    async fn ensure_meta_table(&self) -> Result<()> {
-        self.execute_script(
-            "CREATE TABLE IF NOT EXISTS _dbd_meta ( \
-                project    TEXT NOT NULL PRIMARY KEY, \
-                env        TEXT NOT NULL DEFAULT 'dev', \
-                version    INTEGER NOT NULL DEFAULT 0, \
-                scope      TEXT, \
-                created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')) \
-            )",
-        )
-        .await?;
-        // SQLite has no `ADD COLUMN IF NOT EXISTS` — add `scope` only when missing.
-        let has_scope = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0)
-            > 0;
-        if !has_scope {
-            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT").await?;
-        }
-        Ok(())
-    }
-
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
         // Inspect the table shape via pragma (which returns zero rows for a missing
         // table — not an error), so we pick the right SELECT and let genuine read
@@ -495,7 +507,7 @@ impl DatabaseAdapter for SqliteAdapter {
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
-        self.ensure_meta_table().await?;
+        self.ensure_meta_table_inner().await?;
         sqlx::query(
             "INSERT INTO _dbd_meta (project, env, version, scope) \
              VALUES (?1, ?2, ?3, ?4) \
@@ -843,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn s5_migrations_table_roundtrip() {
         let a = mem().await;
-        a.ensure_migrations_table().await.unwrap();
+        a.heal_bookkeeping().await.unwrap();
         a.apply_migration(1, "CREATE TABLE m (id INTEGER)", "init", "abc")
             .await
             .unwrap();
@@ -855,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn s6_meta_set_get() {
         let a = mem().await;
-        a.ensure_meta_table().await.unwrap();
+        a.heal_bookkeeping().await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 0);
         a.set_project_meta("dev", 3, None).await.unwrap();
         assert_eq!(a.get_db_version().await.unwrap(), 3);
@@ -898,7 +910,7 @@ mod tests {
     async fn s9_scope_guard_fires_against_real_pin() {
         use crate::design::Design;
         let a = mem().await; // project = "test"
-        a.ensure_meta_table().await.unwrap();
+        a.heal_bookkeeping().await.unwrap();
         // Pin the DB to scope "public" through the real adapter round-trip.
         a.set_project_meta("dev", 1, Some("public")).await.unwrap();
         let meta = a.get_project_meta().await.unwrap();
@@ -926,8 +938,7 @@ mod tests {
     #[tokio::test]
     async fn s7_internal_tables_excluded_from_list() {
         let a = mem().await;
-        a.ensure_meta_table().await.unwrap();
-        a.ensure_migrations_table().await.unwrap();
+        a.heal_bookkeeping().await.unwrap();
         a.execute_script("CREATE TABLE keep_me (id INTEGER)")
             .await
             .unwrap();
@@ -1286,7 +1297,7 @@ mod tests {
         // Fresh DB with no _dbd_meta → foreign.
         assert_eq!(a.reverse_managed_version().await.unwrap(), None);
         // After dbd's meta table + a row for this project → managed at that version.
-        a.ensure_meta_table().await.unwrap();
+        a.heal_bookkeeping().await.unwrap();
         a.set_project_meta("prod", 3, None).await.unwrap();
         assert_eq!(a.reverse_managed_version().await.unwrap(), Some(3));
     }

@@ -280,6 +280,46 @@ impl PostgresAdapter {
         self.exec_raw(create_public_sql).await
     }
 
+    /// Inner body for the migrations-table half of `heal_bookkeeping`. Kept as a
+    /// private inherent method (not a trait method) so it can be composed with
+    /// `ensure_meta_table_inner` inside `heal_bookkeeping`.
+    async fn ensure_migrations_table_inner(&self) -> Result<()> {
+        self.ensure_public_bookkeeping(
+            "_dbd_migrations",
+            "CREATE TABLE IF NOT EXISTS public._dbd_migrations ( \
+                project     varchar NOT NULL, \
+                version     integer NOT NULL, \
+                applied_at  timestamptz NOT NULL DEFAULT now(), \
+                description text, \
+                checksum    text, \
+                PRIMARY KEY (project, version) \
+            )",
+        )
+        .await
+    }
+
+    /// Inner body for the meta-table half of `heal_bookkeeping`. Kept as a
+    /// private inherent method (not a trait method) so it can be composed with
+    /// `ensure_migrations_table_inner` inside `heal_bookkeeping`, and called
+    /// directly by `set_project_meta`.
+    async fn ensure_meta_table_inner(&self) -> Result<()> {
+        self.ensure_public_bookkeeping(
+            "_dbd_meta",
+            "CREATE TABLE IF NOT EXISTS public._dbd_meta ( \
+                project     varchar NOT NULL PRIMARY KEY, \
+                env         varchar NOT NULL DEFAULT 'dev', \
+                version     integer NOT NULL DEFAULT 0, \
+                scope       varchar, \
+                created_at  timestamptz NOT NULL DEFAULT now(), \
+                updated_at  timestamptz NOT NULL DEFAULT now() \
+            )",
+        )
+        .await?;
+        // Backfill `scope` on databases whose `_dbd_meta` predates the column.
+        self.exec_raw("ALTER TABLE public._dbd_meta ADD COLUMN IF NOT EXISTS scope varchar")
+            .await
+    }
+
     /// True if the pg_cron extension is installed (its `cron.job` relation
     /// exists). Uses `to_regclass`, which returns NULL for a missing relation
     /// instead of erroring — so this is safe to run on databases WITHOUT pg_cron.
@@ -1602,19 +1642,9 @@ impl DatabaseAdapter for PostgresAdapter {
         }
     }
 
-    async fn ensure_migrations_table(&self) -> Result<()> {
-        self.ensure_public_bookkeeping(
-            "_dbd_migrations",
-            "CREATE TABLE IF NOT EXISTS public._dbd_migrations ( \
-                project     varchar NOT NULL, \
-                version     integer NOT NULL, \
-                applied_at  timestamptz NOT NULL DEFAULT now(), \
-                description text, \
-                checksum    text, \
-                PRIMARY KEY (project, version) \
-            )",
-        )
-        .await
+    async fn heal_bookkeeping(&self) -> Result<()> {
+        self.ensure_meta_table_inner().await?;
+        self.ensure_migrations_table_inner().await
     }
 
     async fn get_db_version(&self) -> Result<u32> {
@@ -1656,7 +1686,7 @@ impl DatabaseAdapter for PostgresAdapter {
         if !sql.is_empty() {
             self.execute_script(sql).await?;
         }
-        // `_dbd_migrations` is pinned to `public` (see `ensure_migrations_table`),
+        // `_dbd_migrations` is pinned to `public` (see `ensure_migrations_table_inner`),
         // so the qualified insert lands in the right table regardless of the
         // ambient search_path or which pooled connection runs it.
         let q = sqlx::query(
@@ -1699,24 +1729,6 @@ impl DatabaseAdapter for PostgresAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("ensure staging.import_jsonb_to_table failed: {e}")))?;
         Ok(())
-    }
-
-    async fn ensure_meta_table(&self) -> Result<()> {
-        self.ensure_public_bookkeeping(
-            "_dbd_meta",
-            "CREATE TABLE IF NOT EXISTS public._dbd_meta ( \
-                project     varchar NOT NULL PRIMARY KEY, \
-                env         varchar NOT NULL DEFAULT 'dev', \
-                version     integer NOT NULL DEFAULT 0, \
-                scope       varchar, \
-                created_at  timestamptz NOT NULL DEFAULT now(), \
-                updated_at  timestamptz NOT NULL DEFAULT now() \
-            )",
-        )
-        .await?;
-        // Backfill `scope` on databases whose `_dbd_meta` predates the column.
-        self.exec_raw("ALTER TABLE public._dbd_meta ADD COLUMN IF NOT EXISTS scope varchar")
-            .await
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
@@ -1776,12 +1788,12 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
-        // `ensure_meta_table` pins `_dbd_meta` to `public` (relocating a stray
+        // `ensure_meta_table_inner` pins `_dbd_meta` to `public` (relocating a stray
         // copy a scoped apply may have left in another schema). The insert is
         // schema-qualified, so it resolves deterministically regardless of the
         // ambient search_path or which pooled connection runs it — no `RESET`
         // dance required, which never worked across the non-batch pool anyway.
-        self.ensure_meta_table().await?;
+        self.ensure_meta_table_inner().await?;
         let q = sqlx::query(
             "INSERT INTO public._dbd_meta (project, env, version, scope) \
              VALUES ($1, $2, $3, $4) \

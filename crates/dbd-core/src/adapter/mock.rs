@@ -219,7 +219,7 @@ impl DatabaseAdapter for MockAdapter {
         Ok(())
     }
 
-    async fn ensure_migrations_table(&self) -> Result<()> {
+    async fn heal_bookkeeping(&self) -> Result<()> {
         Ok(())
     }
 
@@ -238,10 +238,6 @@ impl DatabaseAdapter for MockAdapter {
     }
 
     async fn clear_project_migrations(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn ensure_meta_table(&self) -> Result<()> {
         Ok(())
     }
 
