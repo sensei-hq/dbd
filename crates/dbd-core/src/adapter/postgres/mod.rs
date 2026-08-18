@@ -182,7 +182,7 @@ pub struct PostgresAdapter {
     /// `Pool::begin` yields a `'static` transaction (it owns a pooled
     /// connection), so it can be held across the whole apply loop.
     batch: tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>,
-    /// dbd's own bookkeeping storage (`_dbd_meta` / `_dbd_migrations`).
+    /// dbd's own bookkeeping storage (`dbd.meta` / `dbd.migrations`).
     bookkeeping: Bookkeeping,
 }
 
