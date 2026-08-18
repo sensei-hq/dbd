@@ -2496,6 +2496,29 @@ async fn heal_is_idempotent() {
     assert_eq!(m.scope.as_deref(), Some("public"));
 }
 
+/// `dbd migrate --status` is read-only: it must resolve the version through
+/// the both-names-aware catalog read WITHOUT ever invoking `heal_bookkeeping`,
+/// which would relocate/drop a legacy DB's bookkeeping as a side effect of a
+/// status check. Regression test for a status command that used to heal.
+#[tokio::test]
+async fn get_db_version_reads_legacy_without_healing() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "statusonly").await.unwrap();
+    // Legacy public._dbd_meta at v5 — a read (as migrate --status does) must NOT relocate/drop it.
+    adapter.execute_script(
+        "CREATE TABLE public._dbd_meta ( \
+            project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, scope varchar, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('statusonly','prod',5);"
+    ).await.unwrap();
+    // The read returns the legacy version via the both-names path...
+    assert_eq!(adapter.get_db_version().await.unwrap(), 5);
+    // ...and does NOT heal: legacy table still present, dbd.meta NOT created.
+    assert_table_exists(&*adapter, "public", "_dbd_meta").await;
+    assert_table_absent(&*adapter, "dbd", "meta").await;
+}
+
 /// The `dbd` bookkeeping schema must be invisible to reverse-engineering /
 /// introspection — it's dbd's own internal state, never a project object —
 /// while still surviving as a real schema in the database.
