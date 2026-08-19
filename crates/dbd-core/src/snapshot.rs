@@ -1601,9 +1601,11 @@ mod tests {
                 columns: vec![crate::entity::IndexColumn {
                     name: "id".to_string(),
                     order: None,
+                    ..Default::default()
                 }],
                 unique: false,
                 index_type: None,
+                ..Default::default()
             },
         );
 

@@ -220,7 +220,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_fk_convergence, plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
+            plan_check_convergence, plan_comment_convergence, plan_fk_convergence,
+            plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
             snapshot_from_entities,
         };
 
@@ -265,6 +266,18 @@ impl Design {
         // the live DB lacks (idempotent CREATE), and drops (destructive) one the
         // design removed. PK/UNIQUE-backing indexes are excluded on both sides.
         plan_index_convergence(&mut plan, &live_raw, &desired_raw);
+
+        // CHECK constraints: canonicalize strips these too, and nothing used to
+        // put them back — so `dbd diff` reported CHECK drift that reconcile could
+        // never act on, even with --allow-destructive. Converge them from the RAW
+        // snapshots, matching by canonical expression since Postgres auto-names
+        // every CHECK.
+        plan_check_convergence(&mut plan, &live_raw, &desired_raw);
+
+        // Column comments: canonicalize clears these as well, so reconcile could
+        // never act on the comment drift `dbd diff` kept reporting. Metadata only,
+        // so never destructive.
+        plan_comment_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates AND drift warnings. Postgres has

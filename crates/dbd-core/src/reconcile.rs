@@ -305,8 +305,57 @@ fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
 /// intact — `nextval('seq'::regclass)` and other function calls are untouched —
 /// and a genuine type change is still caught by the column's `data_type` diff, so
 /// erasing the cast here can't hide a real change.
+///
+/// Case is then folded outside quoted text ([`fold_unquoted_case`]), because
+/// `pg_get_expr` re-spells keywords and function names in Postgres's own casing
+/// rather than the author's: `current_date` comes back `CURRENT_DATE`, `NOW()`
+/// comes back `now()`, `coalesce(…)` comes back `COALESCE(…)`. Comparing those
+/// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
+/// re-spelled, so the next diff reported the same change — forever.
 fn canonical_default(raw: &str) -> String {
-    strip_trailing_cast(raw.trim()).trim().to_string()
+    fold_unquoted_case(strip_trailing_cast(raw.trim()).trim())
+}
+
+/// Lowercase a default expression *outside* string literals and quoted
+/// identifiers, so two spellings of the same keyword compare equal.
+///
+/// Unquoted SQL is case-insensitive, so folding it changes no meaning. Quoted text
+/// is not: `'Active'` and `'active'` are different defaults and `"MyCol"` is a
+/// different column from `"mycol"`, so both are copied through untouched — the
+/// canonical form is emitted as DDL (`SET DEFAULT …`), and folding a literal would
+/// silently change the value written to the database.
+///
+/// A dollar-quoted expression (`$$Hello$$`) is returned unchanged rather than
+/// risking a fold inside its body. `pg_get_expr` never emits that form, so at
+/// worst such a default keeps reading as drift — the safe direction.
+fn fold_unquoted_case(s: &str) -> String {
+    if s.contains('$') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    // The delimiter of the quoted run currently being copied verbatim. Postgres
+    // escapes a quote by doubling it, which needs no special handling here: the
+    // first closes the run and the second immediately reopens it.
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        match quote {
+            Some(delim) => {
+                out.push(ch);
+                if ch == delim {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    out.push(ch);
+                } else {
+                    out.extend(ch.to_lowercase());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Remove a trailing top-level `::type` cast from a default expression. Tracks
@@ -559,6 +608,183 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
     }
 }
 
+// ── CHECK convergence ───────────────────────────────────────
+
+/// A table's CHECK constraints, keyed by canonical expression.
+///
+/// Postgres auto-names every CHECK and the design usually leaves inline ones
+/// unnamed, so the expression is the only stable identity — canonicalized via
+/// [`crate::sql_expr`] so an authored `status in ('a','b')` matches the
+/// `status = ANY (ARRAY['a'::text,'b'::text])` `pg_get_constraintdef` returns.
+///
+/// An expression that will not canonicalize keeps its raw text as the key, so it
+/// compares only against an identical spelling: it may read as drift, but it can
+/// never be mistaken for a different constraint and dropped.
+fn table_checks(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
+    t.table_constraints
+        .iter()
+        .filter_map(|con| match con {
+            TableConstraint::Check { expression, .. } => {
+                let key = crate::sql_expr::canonicalize_predicate(expression)
+                    .unwrap_or_else(|| expression.clone());
+                Some((key, con))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Converge CHECK constraints into an existing reconcile `plan`.
+///
+/// Reconcile's [`canonicalize`] strips CHECKs from the snapshots the main diff
+/// sees, and until now nothing put them back — so reconcile was blind to them and
+/// `--allow-destructive` silently left every CHECK the read-only `dbd diff`
+/// flagged in place. This closes that gap the same way [`plan_fk_convergence`]
+/// does for foreign keys, from the RAW (un-canonicalized) snapshots. For every
+/// table present in BOTH sides:
+/// - a CHECK the design declares but the live DB lacks is **added**
+///   (`ADD [CONSTRAINT name] CHECK (…)`, non-destructive), and
+/// - a CHECK the live DB has but the design dropped is **removed** by its real
+///   live name (`DROP CONSTRAINT <live-name>`, setting `plan.destructive` so it
+///   is gated behind `--allow-destructive`).
+///
+/// CHECKs match by canonical expression, never by name, so a live auto-named
+/// constraint and the design's unnamed inline one reconcile to no change. New and
+/// pruned tables are skipped: their CHECKs ride along with the `CREATE`/`DROP
+/// TABLE`.
+pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    use crate::diff::{FieldChange, FieldDetail, FieldType};
+
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+
+        let desired_checks = table_checks(dt);
+        let live_checks = table_checks(lt);
+        let desired_keys: HashSet<&str> = desired_checks.iter().map(|(k, _)| k.as_str()).collect();
+        let live_keys: HashSet<&str> = live_checks.iter().map(|(k, _)| k.as_str()).collect();
+
+        let mut changes: Vec<FieldChange> = Vec::new();
+
+        // Drops first (destructive). `DROP CONSTRAINT` needs the live constraint's
+        // real name — the reason CHECKs can't simply be name-stripped before
+        // diffing, and why the read-only diff path used to emit an unusable
+        // `DROP CONSTRAINT ck:<expression>`.
+        for (key, con) in live_checks.iter().filter(|(k, _)| !desired_keys.contains(k.as_str())) {
+            let TableConstraint::Check { name, .. } = con else {
+                continue;
+            };
+            // Without a name there is no statement to issue; warn rather than
+            // emit SQL that cannot run.
+            let Some(name) = name else {
+                plan.warnings.push(format!(
+                    "CHECK ({key}) on {qname} is not in the design but has no constraint name — drop it manually"
+                ));
+                continue;
+            };
+            changes.push(FieldChange {
+                field_name: format!("\"{name}\""),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Drop,
+            });
+            plan.destructive = true;
+        }
+
+        // Adds: a design CHECK the live DB lacks. An unnamed one is emitted
+        // without a `CONSTRAINT` clause so Postgres auto-names it.
+        for (key, con) in desired_checks.iter().filter(|(k, _)| !live_keys.contains(k.as_str())) {
+            changes.push(FieldChange {
+                field_name: format!("ck:{key}"),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*con).clone()))),
+            });
+        }
+
+        if changes.is_empty() {
+            continue;
+        }
+
+        let diff = MigrationDiff {
+            entity_name: qname.clone(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(changes),
+        };
+        let sql = diff::generate_migration_sql(std::slice::from_ref(&diff));
+        if sql.trim().is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, sql);
+    }
+}
+
+// ── Column-comment convergence ──────────────────────────────
+
+/// Converge column comments into an existing reconcile `plan`.
+///
+/// Reconcile's [`canonicalize`] clears `ColumnDef::comment`, and until now nothing
+/// put it back — so reconcile was blind to comment drift that the read-only
+/// `dbd diff` reported on every run. This closes that gap the same way
+/// [`plan_check_convergence`] does for CHECKs, from the RAW (un-canonicalized)
+/// snapshots. For every column present in BOTH sides whose comment differs, emit
+/// `COMMENT ON COLUMN … IS '…'`, or `IS NULL` when the design has no comment and
+/// the live database does.
+///
+/// Comments are metadata, so a change is never destructive. Columns only on one
+/// side are skipped: a new column's comment rides along with its `ADD COLUMN`, and
+/// a dropped column takes its comment with it.
+///
+/// Table-level comments are not converged here because `TableSnapshot` does not
+/// model them at all — they are invisible to both this pass and `dbd diff`, so
+/// they cannot drift between the two.
+pub fn plan_comment_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+        let live_comments: HashMap<&str, Option<&String>> = lt
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.comment.as_ref()))
+            .collect();
+
+        let mut lines: Vec<String> = Vec::new();
+        for dc in &dt.columns {
+            // Absent from the live table → its comment comes with the ADD COLUMN.
+            let Some(live_comment) = live_comments.get(dc.name.as_str()) else {
+                continue;
+            };
+            if *live_comment == dc.comment.as_ref() {
+                continue;
+            }
+            lines.push(crate::emit::emit_column_comment_sql(
+                &format!("\"{}\".\"{}\"", dt.schema, dt.name),
+                &dc.name,
+                dc.comment.as_deref(),
+            ));
+        }
+
+        if lines.is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, lines.join("\n"));
+    }
+}
+
 /// Append `sql` to the `altered` statement for `entity_name`, appending after any
 /// existing ALTER SQL (so an FK add runs after the `ADD COLUMN` that created its
 /// column), or pushing a new statement when the table had no other changes.
@@ -649,43 +875,89 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
 
 /// A secondary index's comparable shape — everything that defines it EXCEPT its
 /// name. Used to match a live index against the design's, so same-shape indexes
-/// under different names reconcile to no change. Columns are ordered (a
-/// composite `(a, b)` differs from `(b, a)`), lowercased, and carry their
-/// descending flag; the access method collapses btree/`None` to the default.
+/// under different names reconcile to no change.
+///
+/// Every field of [`crate::entity::IndexDef`] except the name is represented,
+/// deliberately: a shape that ignores an attribute declares two different indexes
+/// equal, and reconcile then leaves real drift in place — or, worse, matches an
+/// index it is about to recreate differently and churns a `DROP`/`CREATE` pair on
+/// every run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IndexShape {
     unique: bool,
-    method: &'static str,
-    columns: Vec<(String, bool)>,
+    method: String,
+    columns: Vec<IndexColumnShape>,
+    predicate: Option<String>,
+    include: Vec<String>,
+    nulls_not_distinct: bool,
+    with_options: Vec<(String, String)>,
+}
+
+/// One key entry's shape: the column name or expression text, plus every
+/// modifier that changes which queries the index can answer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IndexColumnShape {
+    name: String,
+    is_expression: bool,
+    descending: bool,
+    nulls_first: Option<bool>,
+    opclass: Option<String>,
 }
 
 /// The name-agnostic shape of an index for cross-representation matching.
 fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
-    use crate::entity::{IndexType, SortOrder};
-    let method = match ix.index_type {
-        Some(IndexType::Hash) => "hash",
-        Some(IndexType::Gin) => "gin",
-        Some(IndexType::Gist) => "gist",
-        Some(IndexType::Brin) => "brin",
-        Some(IndexType::SpGist) => "spgist",
-        // btree (Some(Btree) or None) is the default access method.
-        Some(IndexType::Btree) | None => "btree",
-    };
+    use crate::entity::SortOrder;
+    // Collapse the default spellings (`using btree`, `asc`) first, so the shape
+    // of an authored index matches the shape of the introspected one.
+    let mut ix = ix.clone();
+    crate::schema_diff::normalize_index(&mut ix);
+
     let columns = ix
         .columns
         .iter()
-        .map(|c| (c.name.to_lowercase(), matches!(c.order, Some(SortOrder::Desc))))
+        .map(|c| IndexColumnShape {
+            // An expression is case-significant (it can contain string literals);
+            // a column name is not.
+            name: if c.is_expression { c.name.clone() } else { c.name.to_lowercase() },
+            is_expression: c.is_expression,
+            descending: matches!(c.order, Some(SortOrder::Desc)),
+            nulls_first: c.nulls_first,
+            opclass: c.opclass.as_ref().map(|o| o.to_lowercase()),
+        })
         .collect();
-    IndexShape { unique: ix.unique, method, columns }
+    IndexShape {
+        unique: ix.unique,
+        method: ix.index_type.as_ref().map_or("btree".to_string(), |t| t.amname().to_string()),
+        columns,
+        predicate: ix.predicate.clone(),
+        include: ix.include.iter().map(|c| c.to_lowercase()).collect(),
+        nulls_not_distinct: ix.nulls_not_distinct,
+        // BTreeMap iteration is already name-ordered, so an authored and a
+        // `reloptions` ordering hash the same.
+        with_options: ix.with_options.into_iter().collect(),
+    }
 }
 
 /// The column-name sets (ordered, lowercased) that a table's PRIMARY KEY / UNIQUE
 /// constraints cover — from both inline column flags and table-level constraints.
 /// Used to drop PK/UNIQUE-backing indexes from index convergence.
+///
+/// A column's `is_pk` flag only contributes a single-column set when the table has
+/// NO table-level PRIMARY KEY, exactly as [`lift_pk_unique_keep_others`] treats it
+/// and for the same reason: the SQL parser emits a composite `primary key (a, b)`
+/// BOTH as a table constraint AND as an `is_pk` flag on each member column. Taking
+/// those flags at face value invents backing sets `[a]` and `[b]` that no index
+/// backs, which suppressed a declared single-column index on a composite-PK member
+/// (`create index on memory_links(child_id)`) from convergence — so `dbd diff` kept
+/// asking for an index reconcile refused to create.
 fn pk_unique_col_sets(t: &TableSnapshot) -> HashSet<Vec<String>> {
     let mut sets: HashSet<Vec<String>> = HashSet::new();
+    let has_table_pk = t
+        .table_constraints
+        .iter()
+        .any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
     for c in &t.columns {
-        if c.is_pk || c.is_unique {
+        if (c.is_pk && !has_table_pk) || c.is_unique {
             sets.insert(vec![c.name.to_lowercase()]);
         }
     }
@@ -703,14 +975,25 @@ fn pk_unique_col_sets(t: &TableSnapshot) -> HashSet<Vec<String>> {
 /// A table's secondary indexes: every index EXCEPT those merely backing a
 /// PRIMARY KEY / UNIQUE constraint (introspection reports those, the parsed
 /// design does not — matching by covered columns). Mirrors the suppression in
-/// `schema_diff::normalize_for_diff`.
+/// `schema_diff::normalize_for_diff`, including its rule that a partial or
+/// expression index is always a real index, never constraint backing.
 fn secondary_indexes(t: &TableSnapshot) -> Vec<&crate::entity::IndexDef> {
     let backing = pk_unique_col_sets(t);
     t.indexes
         .iter()
         .filter(|ix| {
-            let cols: Vec<String> = ix.columns.iter().map(|c| c.name.to_lowercase()).collect();
-            !backing.contains(&cols)
+            let lowered = crate::entity::IndexDef {
+                columns: ix
+                    .columns
+                    .iter()
+                    .map(|c| crate::entity::IndexColumn {
+                        name: c.name.to_lowercase(),
+                        ..c.clone()
+                    })
+                    .collect(),
+                ..(*ix).clone()
+            };
+            !crate::schema_diff::backs_a_constraint(&lowered, &backing)
         })
         .collect()
 }
@@ -1084,16 +1367,530 @@ mod tests {
         assert!(col_pos < fk_pos, "ADD COLUMN must precede ADD FOREIGN KEY; got: {sql}");
     }
 
+    // ── Column-comment convergence ───────────────────────────
+
+    fn commented(name: &str, comment: Option<&str>) -> ColumnDef {
+        ColumnDef { comment: comment.map(str::to_string), ..col(name, "text") }
+    }
+
+    fn docs_with(columns: Vec<ColumnDef>) -> Snapshot {
+        snap(vec![table("app", "docs", columns)])
+    }
+
+    /// The design sets a comment the live column lacks → `COMMENT ON COLUMN`.
+    #[test]
+    fn comment_convergence_adds_missing_comment() {
+        let live = docs_with(vec![commented("title", None)]);
+        let desired = docs_with(vec![commented("title", Some("Display name"))]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        assert_eq!(
+            plan.altered[0].sql,
+            "COMMENT ON COLUMN \"app\".\"docs\".\"title\" IS 'Display name';"
+        );
+        assert!(!plan.destructive, "a comment is metadata, never destructive");
+    }
+
+    /// A changed comment is overwritten in place.
+    #[test]
+    fn comment_convergence_updates_changed_comment() {
+        let live = docs_with(vec![commented("title", Some("old text"))]);
+        let desired = docs_with(vec![commented("title", Some("new text"))]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert!(plan.altered[0].sql.contains("IS 'new text';"), "got: {}", plan.altered[0].sql);
+    }
+
+    /// The design dropped the comment → `IS NULL`, which is how Postgres removes
+    /// one. Emitting nothing would leave the live comment in place and the next
+    /// diff would report it again.
+    #[test]
+    fn comment_convergence_clears_dropped_comment() {
+        let live = docs_with(vec![commented("title", Some("stale text"))]);
+        let desired = docs_with(vec![commented("title", None)]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(
+            plan.altered[0].sql,
+            "COMMENT ON COLUMN \"app\".\"docs\".\"title\" IS NULL;"
+        );
+    }
+
+    /// Matching comments reconcile to no change — the convergence property.
+    #[test]
+    fn comment_convergence_in_sync_is_no_change() {
+        let same = || docs_with(vec![commented("title", Some("Display name"))]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &same(), &same());
+
+        assert!(plan.is_empty() && !plan.destructive, "got {plan:?}");
+
+        // Both sides commentless is equally a no-change.
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(
+            &mut plan,
+            &docs_with(vec![commented("title", None)]),
+            &docs_with(vec![commented("title", None)]),
+        );
+        assert!(plan.is_empty(), "got {plan:?}");
+    }
+
+    /// A quote in the comment text must be escaped, or the statement won't parse.
+    #[test]
+    fn comment_convergence_escapes_quotes() {
+        let live = docs_with(vec![commented("title", None)]);
+        let desired = docs_with(vec![commented("title", Some("the project's root"))]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert!(
+            plan.altered[0].sql.contains("IS 'the project''s root';"),
+            "got: {}",
+            plan.altered[0].sql
+        );
+    }
+
+    /// A column only in the design gets its comment from the `ADD COLUMN`, and a
+    /// table only in the design from its `CREATE TABLE` — neither belongs here.
+    #[test]
+    fn comment_convergence_skips_columns_and_tables_not_in_both_sides() {
+        // New column: live table exists but lacks the column.
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(
+            &mut plan,
+            &docs_with(vec![commented("title", None)]),
+            &docs_with(vec![commented("title", None), commented("summary", Some("new col"))]),
+        );
+        assert!(plan.is_empty(), "a new column's comment rides its ADD COLUMN; got {plan:?}");
+
+        // New table entirely.
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(
+            &mut plan,
+            &snap(vec![]),
+            &docs_with(vec![commented("title", Some("Display name"))]),
+        );
+        assert!(plan.is_empty(), "a new table's comments ride its CREATE; got {plan:?}");
+    }
+
+    /// Several drifted comments on one table collapse into that table's single
+    /// altered statement rather than fighting over it.
+    #[test]
+    fn comment_convergence_merges_into_one_statement_per_table() {
+        let live = docs_with(vec![commented("title", None), commented("body", Some("old"))]);
+        let desired = docs_with(vec![
+            commented("title", Some("Display name")),
+            commented("body", Some("new")),
+        ]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "one statement per table; got {plan:?}");
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("\"title\" IS 'Display name';"), "got: {sql}");
+        assert!(sql.contains("\"body\" IS 'new';"), "got: {sql}");
+    }
+
+    /// Comment SQL appends to a table's existing ALTER statement, so the column an
+    /// `ADD COLUMN` just created is present before its comment is set.
+    #[test]
+    fn comment_convergence_appends_after_existing_alter() {
+        let live = docs_with(vec![commented("title", None)]);
+        let desired = docs_with(vec![commented("title", Some("Display name"))]);
+
+        let mut plan = ReconcilePlan::default();
+        plan.altered.push(ReconcileStatement {
+            entity_name: "app.docs".to_string(),
+            sql: "ALTER TABLE app.docs ADD COLUMN body text;".to_string(),
+        });
+        plan_comment_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "must merge, not duplicate; got {plan:?}");
+        let sql = &plan.altered[0].sql;
+        let add = sql.find("ADD COLUMN").expect("ADD COLUMN present");
+        let comment = sql.find("COMMENT ON COLUMN").expect("COMMENT present");
+        assert!(add < comment, "ADD COLUMN must precede the comment; got: {sql}");
+    }
+
+    // ── CHECK convergence ────────────────────────────────────
+
+    fn chk(name: Option<&str>, expression: &str) -> TableConstraint {
+        TableConstraint::Check {
+            name: name.map(str::to_string),
+            expression: expression.to_string(),
+        }
+    }
+
+    fn table_with_checks(checks: Vec<TableConstraint>) -> TableSnapshot {
+        TableSnapshot {
+            table_constraints: checks,
+            ..table("app", "docs", vec![col("status", "text")])
+        }
+    }
+
+    /// The design declares a CHECK the live DB lacks → non-destructive add. The
+    /// design's inline CHECK is unnamed, so no `CONSTRAINT` clause is emitted and
+    /// Postgres auto-names it.
+    #[test]
+    fn check_convergence_adds_missing_check() {
+        let live = snap(vec![table_with_checks(vec![])]);
+        let desired = snap(vec![table_with_checks(vec![chk(None, "status <> ''")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("ADD CHECK (status <> '')"), "got: {sql}");
+        assert!(!sql.contains("unnamed"), "an unnamed CHECK must not be named \"unnamed\"; got: {sql}");
+        assert!(!plan.destructive, "adding a CHECK is not destructive");
+    }
+
+    /// A live CHECK the design dropped is removed by its REAL name — the bug that
+    /// made the read-only diff emit an unusable `DROP CONSTRAINT ck:<expression>`.
+    #[test]
+    fn check_convergence_drops_extra_check_by_its_real_name() {
+        let live = snap(vec![table_with_checks(vec![chk(
+            Some("docs_status_check"),
+            "status <> ''",
+        )])]);
+        let desired = snap(vec![table_with_checks(vec![])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
+        assert!(!sql.contains("ck:"), "the expression key must never be used as a name; got: {sql}");
+        assert!(plan.destructive, "dropping a CHECK is gated as destructive");
+    }
+
+    /// The core convergence property: the design's authored spelling and the
+    /// analyzed form Postgres reports for the SAME constraint must reconcile to no
+    /// change. Without this, reconcile churns a destructive drop+add every run.
+    #[test]
+    fn check_convergence_in_sync_across_spellings_is_no_change() {
+        let live = snap(vec![table_with_checks(vec![chk(
+            Some("docs_status_check"),
+            "status = ANY (ARRAY['active'::text, 'archived'::text])",
+        )])]);
+        let desired = snap(vec![table_with_checks(vec![chk(
+            None,
+            "status in ('active', 'archived')",
+        )])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "an authored `IN` and the analyzed `= ANY (ARRAY[…])` are the same CHECK; got {plan:?}"
+        );
+    }
+
+    /// A genuinely changed CHECK is a drop of the old plus an add of the new —
+    /// Postgres cannot alter a CHECK expression in place.
+    #[test]
+    fn check_convergence_changed_expression_replaces() {
+        let live = snap(vec![table_with_checks(vec![chk(
+            Some("docs_status_check"),
+            "status in ('active')",
+        )])]);
+        let desired = snap(vec![table_with_checks(vec![chk(
+            None,
+            "status in ('active', 'archived')",
+        )])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
+        assert!(sql.contains("ADD CHECK"), "got: {sql}");
+        assert!(plan.destructive);
+    }
+
+    /// A live-only CHECK with no name cannot be dropped by any statement, so it
+    /// must surface as a warning rather than as unrunnable SQL.
+    #[test]
+    fn check_convergence_warns_on_unnamed_live_check() {
+        let live = snap(vec![table_with_checks(vec![chk(None, "status <> ''")])]);
+        let desired = snap(vec![table_with_checks(vec![])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        assert!(plan.altered.is_empty(), "no SQL for a constraint that can't be named");
+        assert_eq!(plan.warnings.len(), 1, "got {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("drop it manually"), "got {:?}", plan.warnings);
+    }
+
+    /// Tables absent from one side are skipped — their CHECKs ride along with the
+    /// CREATE/DROP TABLE.
+    #[test]
+    fn check_convergence_skips_tables_not_in_both_sides() {
+        let live = snap(vec![]);
+        let desired = snap(vec![table_with_checks(vec![chk(None, "status <> ''")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_check_convergence(&mut plan, &live, &desired);
+
+        assert!(plan.is_empty(), "a new table's CHECKs come with its CREATE; got {plan:?}");
+    }
+
     // ── Index convergence (issue #12) ────────────────────────
 
     fn idx(name: &str, cols: &[&str], unique: bool) -> crate::entity::IndexDef {
         use crate::entity::{IndexColumn, IndexDef};
         IndexDef {
             name: Some(name.to_string()),
-            columns: cols.iter().map(|c| IndexColumn { name: (*c).to_string(), order: None }).collect(),
+            columns: cols
+                .iter()
+                .map(|c| IndexColumn { name: (*c).to_string(), ..Default::default() })
+                .collect(),
             unique,
-            index_type: None,
+            ..Default::default()
         }
+    }
+
+    /// A `DESC` index that already exists must reconcile to NO change.
+    ///
+    /// Introspection used to report every column as unordered, so an authored
+    /// `(project_id, started_at desc)` never matched the live index and reconcile
+    /// emitted a `DROP`/`CREATE` pair — then reported success while the very next
+    /// `dbd diff` showed the same pair again, forever.
+    #[test]
+    fn index_convergence_desc_column_in_sync_is_no_change() {
+        use crate::entity::{IndexColumn, SortOrder};
+        let descending = || crate::entity::IndexDef {
+            name: Some("runs_project_idx".to_string()),
+            columns: vec![
+                IndexColumn { name: "project_id".to_string(), ..Default::default() },
+                IndexColumn {
+                    name: "started_at".to_string(),
+                    order: Some(SortOrder::Desc),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let table_with = |ix| {
+            snap(vec![TableSnapshot {
+                indexes: vec![ix],
+                ..table("app", "runs", vec![col("project_id", "uuid"), col("started_at", "timestamptz")])
+            }])
+        };
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &table_with(descending()), &table_with(descending()));
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "a DESC index present on both sides must not churn; got {plan:?}"
+        );
+    }
+
+    /// A partial index that already exists must reconcile to NO change.
+    ///
+    /// Introspection used to skip partial indexes entirely, so the design's copy
+    /// looked missing and reconcile issued `CREATE INDEX IF NOT EXISTS` — which
+    /// silently no-ops against the existing name. Reconcile "succeeded" without
+    /// converging anything.
+    #[test]
+    fn index_convergence_partial_index_in_sync_is_no_change() {
+        let partial = || crate::entity::IndexDef {
+            predicate: Some("file_path IS NOT NULL".to_string()),
+            ..idx("nodes_identity", &["folder_id", "file_path"], true)
+        };
+        let table_with = |ix| {
+            snap(vec![TableSnapshot {
+                indexes: vec![ix],
+                ..table("app", "nodes", vec![col("folder_id", "uuid"), col("file_path", "text")])
+            }])
+        };
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &table_with(partial()), &table_with(partial()));
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "a partial index present on both sides must not churn; got {plan:?}"
+        );
+    }
+
+    /// Two indexes on the same column that differ ONLY in their predicate are
+    /// different indexes: the shape must tell them apart, or reconcile leaves real
+    /// drift in place.
+    #[test]
+    fn index_convergence_differing_predicate_replaces() {
+        let with_predicate = |pred: &str| {
+            snap(vec![TableSnapshot {
+                indexes: vec![crate::entity::IndexDef {
+                    predicate: Some(pred.to_string()),
+                    ..idx("nodes_folder_idx", &["folder_id"], false)
+                }],
+                ..table("app", "nodes", vec![col("folder_id", "uuid")])
+            }])
+        };
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(
+            &mut plan,
+            &with_predicate("folder_id IS NOT NULL"),
+            &with_predicate("folder_id IS NULL"),
+        );
+
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP INDEX IF EXISTS"), "got: {sql}");
+        assert!(sql.contains("WHERE folder_id IS NULL"), "the new predicate must be created; got: {sql}");
+        assert!(plan.destructive);
+    }
+
+    /// An extension-method index round-trips its access method, operator class,
+    /// storage parameters and predicate — so it matches itself, and when it IS
+    /// created the statement rebuilds the real index rather than a plain btree.
+    #[test]
+    fn index_convergence_preserves_extension_method_and_options() {
+        use crate::entity::{IndexColumn, IndexType};
+        let hnsw = crate::entity::IndexDef {
+            name: Some("nodes_embedding_hnsw".to_string()),
+            columns: vec![IndexColumn {
+                name: "embedding".to_string(),
+                opclass: Some("vector_cosine_ops".to_string()),
+                ..Default::default()
+            }],
+            index_type: Some(IndexType::Other("hnsw".to_string())),
+            predicate: Some("embedding IS NOT NULL".to_string()),
+            with_options: [("m".to_string(), "16".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        let with_index = |ixs: Vec<crate::entity::IndexDef>| {
+            snap(vec![TableSnapshot {
+                indexes: ixs,
+                ..table("app", "nodes", vec![col("embedding", "vector")])
+            }])
+        };
+
+        // Present on both sides → no change.
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(
+            &mut plan,
+            &with_index(vec![hnsw.clone()]),
+            &with_index(vec![hnsw.clone()]),
+        );
+        assert!(plan.is_empty(), "an hnsw index must match itself; got {plan:?}");
+
+        // Missing from the live DB → the CREATE carries every clause.
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &with_index(vec![]), &with_index(vec![hnsw]));
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("USING hnsw"), "got: {sql}");
+        assert!(sql.contains("vector_cosine_ops"), "got: {sql}");
+        assert!(sql.contains("WITH (m = 16)"), "got: {sql}");
+        assert!(sql.contains("WHERE embedding IS NOT NULL"), "got: {sql}");
+    }
+
+    /// An index on ONE member of a composite PRIMARY KEY must still be created.
+    ///
+    /// The parser flags every member column `is_pk`, so treating those flags as
+    /// backing sets invented `[parent_id]` and `[child_id]` covers that no index
+    /// provides. Convergence then suppressed the declared single-column index while
+    /// `dbd diff` kept reporting it — a `CREATE INDEX` that reappeared on every run.
+    #[test]
+    fn index_convergence_creates_index_on_a_composite_pk_member() {
+        let base = || {
+            let mut t = table(
+                "app",
+                "memory_links",
+                vec![
+                    ColumnDef { is_pk: true, nullable: false, ..col("parent_id", "uuid") },
+                    ColumnDef { is_pk: true, nullable: false, ..col("child_id", "uuid") },
+                ],
+            );
+            t.table_constraints.push(TableConstraint::PrimaryKey {
+                name: None,
+                columns: vec!["parent_id".to_string(), "child_id".to_string()],
+            });
+            t
+        };
+        let live = snap(vec![base()]);
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![idx("memory_links_child_id_idx", &["child_id"], false)],
+            ..base()
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "composite-PK member index must converge; got {plan:?}");
+        assert!(
+            plan.altered[0].sql.contains("memory_links_child_id_idx"),
+            "got: {}",
+            plan.altered[0].sql
+        );
+    }
+
+    /// The index that genuinely backs a composite PRIMARY KEY is still suppressed —
+    /// introspection reports it, the design never declares it.
+    #[test]
+    fn index_convergence_still_ignores_composite_pk_backing_index() {
+        let mut live_t = table(
+            "app",
+            "memory_links",
+            vec![col("parent_id", "uuid"), col("child_id", "uuid")],
+        );
+        live_t.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["parent_id".to_string(), "child_id".to_string()],
+        });
+        let mut desired_t = live_t.clone();
+        live_t.indexes.push(idx("memory_links_pkey", &["parent_id", "child_id"], true));
+        desired_t.indexes.clear();
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &snap(vec![live_t]), &snap(vec![desired_t]));
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "a PK-backing index must never be dropped as an orphan; got {plan:?}"
+        );
+    }
+
+    /// A partial UNIQUE index is a real index, never PK/UNIQUE constraint backing:
+    /// `unique (a)` and `unique index (a) where b is null` enforce different things,
+    /// so the partial one must not be suppressed as "already a constraint".
+    #[test]
+    fn index_convergence_keeps_partial_unique_index_over_constrained_columns() {
+        let mut live_t = table("app", "libs", vec![col("library_id", "uuid"), col("project_id", "uuid")]);
+        live_t.table_constraints.push(TableConstraint::Unique {
+            name: None,
+            columns: vec!["library_id".to_string()],
+        });
+        let mut desired_t = live_t.clone();
+        desired_t.indexes.push(crate::entity::IndexDef {
+            predicate: Some("project_id IS NULL".to_string()),
+            ..idx("libs_global_uniq", &["library_id"], true)
+        });
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &snap(vec![live_t]), &snap(vec![desired_t]));
+
+        let sql = &plan.altered[0].sql;
+        assert!(
+            sql.contains("libs_global_uniq") && sql.contains("WHERE project_id IS NULL"),
+            "the partial unique index must still be created; got: {sql}"
+        );
     }
 
     /// The design declares a secondary index the live DB lacks → non-destructive,
@@ -1256,9 +2053,10 @@ mod tests {
         use crate::entity::{IndexColumn, IndexDef, IndexType};
         let gin = IndexDef {
             name: Some("docs_tags_gin".to_string()),
-            columns: vec![IndexColumn { name: "tags".to_string(), order: None }],
+            columns: vec![IndexColumn { name: "tags".to_string(), order: None, ..Default::default() }],
             unique: false,
             index_type: Some(IndexType::Gin),
+            ..Default::default()
         };
         let desired = snap(vec![TableSnapshot {
             indexes: vec![gin],
@@ -1551,9 +2349,10 @@ mod tests {
             columns: vec![ColumnDef { comment: Some("the total".to_string()), ..col("total", "int4") }],
             indexes: vec![IndexDef {
                 name: Some("orders_total_idx".to_string()),
-                columns: vec![IndexColumn { name: "total".to_string(), order: None }],
+                columns: vec![IndexColumn { name: "total".to_string(), order: None, ..Default::default() }],
                 unique: false,
                 index_type: None,
+                ..Default::default()
             }],
             table_constraints: vec![
                 TableConstraint::ForeignKey(ForeignKey {
@@ -1590,6 +2389,77 @@ mod tests {
         );
         // `::` embedded in a string literal must not be treated as a cast.
         assert_eq!(canonical_default("'a::b'"), "'a::b'");
+    }
+
+    /// The authored spelling of a keyword default and the spelling `pg_get_expr`
+    /// hands back must converge. Postgres re-spells in ITS casing, not the
+    /// author's — uppercase for SQL keywords and constructs, lowercase for catalog
+    /// functions — so reconcile used to emit a `SET DEFAULT` that Postgres
+    /// immediately re-spelled, and the next diff reported it again.
+    #[test]
+    fn canonical_default_converges_keyword_casing() {
+        // Keyword functions: Postgres stores these uppercase whatever was authored.
+        for (authored, introspected) in [
+            ("current_date", "CURRENT_DATE"),
+            ("current_timestamp", "CURRENT_TIMESTAMP"),
+            ("current_time", "CURRENT_TIME"),
+            ("localtimestamp", "LOCALTIMESTAMP"),
+            ("localtime", "LOCALTIME"),
+            ("current_user", "CURRENT_USER"),
+            ("session_user", "SESSION_USER"),
+            ("current_role", "CURRENT_ROLE"),
+            ("current_catalog", "CURRENT_CATALOG"),
+            ("current_schema", "CURRENT_SCHEMA"),
+            ("user", "USER"),
+            ("CURRENT_TIMESTAMP(3)", "current_timestamp(3)"),
+        ] {
+            assert_eq!(
+                canonical_default(authored),
+                canonical_default(introspected),
+                "{authored} and {introspected} are the same default"
+            );
+        }
+        // Catalog functions: Postgres stores these lowercase whatever was authored.
+        assert_eq!(canonical_default("NOW()"), canonical_default("now()"));
+        assert_eq!(canonical_default("Gen_Random_Uuid()"), "gen_random_uuid()");
+        // SQL constructs: stored uppercase, and the literal arguments keep their case.
+        assert_eq!(
+            canonical_default("coalesce('X', 'y')"),
+            canonical_default("COALESCE('X', 'y')")
+        );
+    }
+
+    /// Folding case must never reach inside quoted text: the canonical form is
+    /// emitted as `SET DEFAULT` DDL, so folding a literal would change the value
+    /// actually written to the database.
+    #[test]
+    fn canonical_default_preserves_quoted_text_case() {
+        assert_eq!(canonical_default("'Mixed Case'"), "'Mixed Case'");
+        assert_eq!(canonical_default("'Mixed Case'::text"), "'Mixed Case'");
+        assert_eq!(canonical_default("upper('aB')"), "upper('aB')");
+        assert_eq!(canonical_default("UPPER('aB')"), "upper('aB')");
+        // A quoted identifier is case-significant too.
+        assert_eq!(canonical_default("\"MyFunc\"()"), "\"MyFunc\"()");
+        // Doubled quotes escape: the run continues, so inner case survives.
+        assert_eq!(canonical_default("'It''s A Value'"), "'It''s A Value'");
+        // Two defaults differing only inside a literal must NOT converge.
+        assert_ne!(canonical_default("'Active'"), canonical_default("'active'"));
+    }
+
+    /// A dollar-quoted default is left exactly as authored rather than risking a
+    /// fold inside its body — at worst it keeps reading as drift.
+    #[test]
+    fn canonical_default_leaves_dollar_quoted_alone() {
+        assert_eq!(canonical_default("$$Hello World$$"), "$$Hello World$$");
+        assert_eq!(canonical_default("$tag$Mixed$tag$"), "$tag$Mixed$tag$");
+    }
+
+    /// Non-ASCII text survives folding intact (byte-wise lowercasing would corrupt
+    /// a multibyte sequence).
+    #[test]
+    fn canonical_default_handles_non_ascii() {
+        assert_eq!(canonical_default("'café'"), "'café'");
+        assert_eq!(canonical_default("'CAFÉ'"), "'CAFÉ'");
     }
 
     // ── Materialized-view convergence (Task 13) ──────────────
@@ -1629,9 +2499,10 @@ mod tests {
             constraints: vec![],
             indexes: vec![IndexDef {
                 name: Some("m_x_idx".into()),
-                columns: vec![IndexColumn { name: "x".into(), order: None }],
+                columns: vec![IndexColumn { name: "x".into(), order: None, ..Default::default() }],
                 unique: true,
                 index_type: None,
+                ..Default::default()
             }],
             comments: Default::default(),
         });

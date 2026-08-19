@@ -7,7 +7,7 @@
 use serde::Serialize;
 
 use crate::diff::{self, MigrationDiff};
-use crate::entity::{FkAction, ForeignKey, TableConstraint};
+use crate::entity::{FkAction, ForeignKey, IndexDef, TableConstraint};
 use crate::reconcile::{normalize_common, DEFAULT_SCHEMA};
 use crate::snapshot::Snapshot;
 
@@ -100,10 +100,13 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
                 _ => None,
             })
             .collect();
-        t.indexes.retain(|i| {
-            let cols: Vec<String> = i.columns.iter().map(|c| c.name.clone()).collect();
-            !constraint_cols.contains(&cols)
-        });
+        t.indexes.retain(|i| !backs_a_constraint(i, &constraint_cols));
+
+        // Settle each index's default spellings (explicit `using btree`, explicit
+        // `asc`) so an authored index and an introspected one compare equal.
+        for ix in &mut t.indexes {
+            normalize_index(ix);
+        }
 
         // Canonicalize CHECK expressions so equivalent spellings (extra parens,
         // casts introduced by `pg_get_constraintdef`) don't read as drift. An
@@ -127,18 +130,52 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
     }
 }
 
-/// Canonicalize a CHECK expression by parsing `SELECT 1 WHERE (<expr>)` with
-/// libpg_query and re-deparsing, so equivalent spellings (extra parens, casts)
-/// converge. Returns the bare canonical predicate (the `SELECT 1 WHERE `
-/// wrapper is stripped so the stored expression stays valid for SQL/JSON
-/// render). Returns `None` if the expression can't be parsed OR the deparse
-/// doesn't have the expected wrapper shape — caller records an advisory and
-/// leaves the raw text, so a real diff is never hidden or corrupted.
+/// Whether this index exists only to back a PRIMARY KEY / UNIQUE constraint, and
+/// so should be compared as a constraint rather than as an index.
+///
+/// A constraint's backing index is always a plain index over the constrained
+/// columns: Postgres cannot build one from a `WHERE` clause or an expression. So a
+/// partial or expression index is a real index even when it covers exactly the
+/// constrained columns — `unique (library_id)` and
+/// `unique index (library_id) where project_id is null` enforce different things.
+pub(crate) fn backs_a_constraint(
+    ix: &IndexDef,
+    constraint_cols: &std::collections::HashSet<Vec<String>>,
+) -> bool {
+    if ix.predicate.is_some() || ix.columns.iter().any(|c| c.is_expression) {
+        return false;
+    }
+    let cols: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
+    constraint_cols.contains(&cols)
+}
+
+/// Settle an index's default spellings so the authored and introspected forms of
+/// the same index compare equal. Mirrors [`normalize_fk`]'s treatment of
+/// `NO ACTION`: a default Postgres does not preserve must not read as drift.
+///
+/// - btree is the default access method, so an explicit `using btree` collapses
+///   to "no `USING` clause";
+/// - `ASC` is the default direction, so an explicit `asc` collapses to unset.
+pub(crate) fn normalize_index(ix: &mut IndexDef) {
+    use crate::entity::{IndexType, SortOrder};
+    if ix.index_type == Some(IndexType::Btree) {
+        ix.index_type = None;
+    }
+    for col in &mut ix.columns {
+        if col.order == Some(SortOrder::Asc) {
+            col.order = None;
+        }
+    }
+}
+
+/// Canonicalize a CHECK expression so an authored spelling and the analyzed form
+/// `pg_get_constraintdef` reports converge — see [`crate::sql_expr`] for what is
+/// normalized (parens, case, literal casts, `IN` vs `= ANY (ARRAY[…])`).
+///
+/// Returns `None` if the expression can't be parsed or re-deparsed; the caller
+/// records an advisory and keeps the raw text, so a real diff is never hidden.
 fn canonicalize_check_expr(expr: &str) -> Option<String> {
-    let wrapped = format!("SELECT 1 WHERE ({expr})");
-    let parsed = pg_query::parse(&wrapped).ok()?;
-    let deparsed = parsed.deparse().ok()?;
-    deparsed.strip_prefix("SELECT 1 WHERE ").map(str::to_string)
+    crate::sql_expr::canonicalize_predicate(expr)
 }
 
 /// Normalize a foreign key so a parsed (design) and an introspected (live) form
@@ -180,8 +217,8 @@ mod tests {
 
     fn idx(name: &str, cols: &[&str], unique: bool) -> IndexDef {
         IndexDef { name: Some(name.into()),
-            columns: cols.iter().map(|c| IndexColumn { name: (*c).into(), order: None }).collect(),
-            unique, index_type: None }
+            columns: cols.iter().map(|c| IndexColumn { name: (*c).into(), ..Default::default() }).collect(),
+            unique, ..Default::default() }
     }
     fn table(cols: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot { name: "users".into(), schema: "public".into(), columns: cols, indexes: vec![], table_constraints: vec![] }
