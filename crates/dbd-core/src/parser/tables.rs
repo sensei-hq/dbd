@@ -349,7 +349,25 @@ fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
         name,
         columns,
         unique: create_index.unique,
-        index_type: None, // sqlparser doesn't expose USING method easily
+        index_type: convert_index_type(create_index.using.as_ref()),
+    }
+}
+
+/// Map sqlparser's `USING <method>` to our [`crate::entity::IndexType`]. Access
+/// methods dbd's model can't represent (Bloom, user-defined `Custom`) fall back
+/// to `None` (the btree default) — the honest representation, since emitting a
+/// bogus `USING` clause would be worse than omitting it.
+fn convert_index_type(using: Option<&sqlparser::ast::IndexType>) -> Option<crate::entity::IndexType> {
+    use crate::entity::IndexType as Ours;
+    use sqlparser::ast::IndexType as Theirs;
+    match using? {
+        Theirs::BTree => Some(Ours::Btree),
+        Theirs::Hash => Some(Ours::Hash),
+        Theirs::GIN => Some(Ours::Gin),
+        Theirs::GiST => Some(Ours::Gist),
+        Theirs::SPGiST => Some(Ours::SpGist),
+        Theirs::BRIN => Some(Ours::Brin),
+        Theirs::Bloom | Theirs::Custom(_) => None,
     }
 }
 
@@ -461,6 +479,29 @@ mod tests {
         assert!(def.indexes[0].unique);
         assert_eq!(def.indexes[0].name, Some("foo_name_idx".to_string()));
         assert_eq!(def.indexes[0].columns[0].name, "name");
+        // A plain index has no explicit access method (btree default).
+        assert_eq!(def.indexes[0].index_type, None);
+    }
+
+    /// The `USING <method>` clause must be captured so a GIN/GiST index round-trips
+    /// as its real access method — otherwise reconcile would recreate a live GIN as
+    /// a plain btree (introspection reports the real method; the design must too).
+    #[test]
+    fn extracts_index_using_method() {
+        use crate::entity::IndexType;
+        let stmts = parse(
+            "CREATE TABLE foo (id int, tags text[]);
+             CREATE INDEX foo_tags_gin ON foo USING gin (tags);",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        assert_eq!(def.indexes.len(), 1);
+        assert_eq!(def.indexes[0].name, Some("foo_tags_gin".to_string()));
+        assert_eq!(
+            def.indexes[0].index_type,
+            Some(IndexType::Gin),
+            "the GIN access method must be captured from `USING gin`"
+        );
     }
 
     #[test]

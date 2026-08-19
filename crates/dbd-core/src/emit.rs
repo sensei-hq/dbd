@@ -173,7 +173,7 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
 /// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
 /// statement is idempotent on re-apply — matviews set it (their whole DDL is
 /// re-applied by `dbd apply`); tables keep their existing exact output.
-fn emit_index_sql(
+pub(crate) fn emit_index_sql(
     ix: &crate::entity::IndexDef,
     qname: &str,
     table_name: &str,

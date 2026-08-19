@@ -220,7 +220,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_fk_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
+            plan_fk_convergence, plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
+            snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -258,6 +259,12 @@ impl Design {
         let live_raw =
             restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
         plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
+
+        // Secondary indexes (issue #12): canonicalize also strips indexes, so —
+        // like FKs — converge them from the RAW snapshots. Adds a declared index
+        // the live DB lacks (idempotent CREATE), and drops (destructive) one the
+        // design removed. PK/UNIQUE-backing indexes are excluded on both sides.
+        plan_index_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates AND drift warnings. Postgres has
