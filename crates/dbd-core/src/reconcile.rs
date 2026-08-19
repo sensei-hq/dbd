@@ -49,9 +49,11 @@ pub struct ReconcilePlan {
     /// Risky-change advisories (type changes, possible renames, enum value drops,
     /// orphaned enums that are not auto-dropped).
     pub warnings: Vec<String>,
-    /// Whether the plan drops a column or constraint from an existing table
-    /// (data loss). Whole-table drops are separate — see [`Self::dropped`] — and
-    /// gated by pruning, not by this flag.
+    /// Whether the plan makes a change gated behind `--allow-destructive`:
+    /// dropping a column or constraint from an existing table (data loss), or
+    /// dropping a foreign key (see [`plan_fk_convergence`]) or a secondary index
+    /// (see [`plan_index_convergence`]). Whole-table drops are separate — see
+    /// [`Self::dropped`] — and gated by pruning, not by this flag.
     pub destructive: bool,
 }
 
@@ -166,13 +168,14 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
 /// Canonicalize a snapshot so a **parsed** (desired) table and an **introspected**
 /// (live) table of the same shape compare equal for the column/PK/unique diff.
 ///
-/// Reconcile does not diff check constraints or indexes on existing tables here —
-/// their introspected/parsed forms differ too much to compare reliably (create
-/// them via the initial `CREATE`, or use snapshots) — so after the shared
+/// Reconcile does not diff check constraints on existing tables here — their
+/// introspected/parsed forms differ too much to compare reliably (create them
+/// via the initial `CREATE`, or use snapshots) — so after the shared
 /// [`normalize_common`] pass this drops them from the diff entirely, along with
-/// column comments and inline FK. **Foreign keys are handled separately** by
-/// [`plan_fk_convergence`] from the raw (un-canonicalized) snapshots, so they are
-/// stripped here too — keeping this column/PK/unique diff free of FK noise.
+/// column comments and inline FK. **Foreign keys and indexes are handled
+/// separately** by [`plan_fk_convergence`] and [`plan_index_convergence`] from
+/// the raw (un-canonicalized) snapshots, so they are stripped here too — keeping
+/// this column/PK/unique diff free of FK and index noise.
 pub fn canonicalize(snap: &mut Snapshot) {
     normalize_common(snap);
     for t in &mut snap.tables {
@@ -571,6 +574,147 @@ fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
     }
 }
 
+// ── Index convergence (issue #12) ───────────────────────────
+
+/// Converge secondary indexes into an existing reconcile `plan`.
+///
+/// Reconcile's [`canonicalize`] strips indexes from the snapshots the main diff
+/// sees, so — like foreign keys (issue #8) — index drift is handled here from
+/// the RAW (un-canonicalized) `live` and `desired` snapshots. For every table
+/// present in BOTH sides:
+/// - an index the design declares but the live DB lacks is **added**
+///   (`CREATE [UNIQUE] INDEX IF NOT EXISTS …`, non-destructive), and
+/// - an index the live DB has but the design dropped is **removed**
+///   (`DROP INDEX IF EXISTS …`, which sets `plan.destructive` so it is gated
+///   behind `--allow-destructive`).
+///
+/// Indexes match by [`IndexShape`] (name-agnostic: unique flag, access method,
+/// and ordered columns), so a live index and a design index of the same shape
+/// under different names reconcile to no change — mirroring FK convergence. An
+/// index whose shape changed (columns, uniqueness, or method) is a drop of the
+/// old plus an add of the new; Postgres can't alter those in place.
+///
+/// Indexes that merely back a PRIMARY KEY / UNIQUE constraint are excluded on
+/// both sides (introspection reports them; the parsed design does not), matching
+/// `schema_diff::normalize_for_diff`. New and pruned tables are skipped — their
+/// indexes ride along with the `CREATE`/`DROP TABLE`.
+pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        // Only tables present in both sides — new/pruned tables carry their
+        // indexes via the full CREATE/DROP TABLE.
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+
+        let desired_ix = secondary_indexes(dt);
+        let live_ix = secondary_indexes(lt);
+        let desired_shapes: HashSet<IndexShape> = desired_ix.iter().map(|i| index_shape(i)).collect();
+        let live_shapes: HashSet<IndexShape> = live_ix.iter().map(|i| index_shape(i)).collect();
+
+        let mut lines: Vec<String> = Vec::new();
+
+        // Drops first (destructive): a live index the design no longer declares.
+        // Use the live index's real name — that's what `DROP INDEX` needs. An
+        // index lives in its table's schema, so qualify the drop with it. Drops
+        // precede adds so a shape-change on a shared name doesn't collide.
+        for ix in live_ix.iter().filter(|ix| !desired_shapes.contains(&index_shape(ix))) {
+            if let Some(name) = &ix.name {
+                lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
+                plan.destructive = true;
+            }
+        }
+
+        // Adds: a design index missing from the live DB. Rendered via the same
+        // `emit::emit_index_sql` helper the initial CREATE uses (idempotent
+        // `IF NOT EXISTS`, correct `USING <method>`), so a GIN/GiST index
+        // converges as its real access method, not a plain btree.
+        let qtable = format!("\"{}\".\"{}\"", dt.schema, dt.name);
+        for ix in desired_ix.iter().filter(|ix| !live_shapes.contains(&index_shape(ix))) {
+            lines.push(crate::emit::emit_index_sql(ix, &qtable, &dt.name, true));
+        }
+
+        if lines.is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, lines.join("\n"));
+    }
+}
+
+/// A secondary index's comparable shape — everything that defines it EXCEPT its
+/// name. Used to match a live index against the design's, so same-shape indexes
+/// under different names reconcile to no change. Columns are ordered (a
+/// composite `(a, b)` differs from `(b, a)`), lowercased, and carry their
+/// descending flag; the access method collapses btree/`None` to the default.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IndexShape {
+    unique: bool,
+    method: &'static str,
+    columns: Vec<(String, bool)>,
+}
+
+/// The name-agnostic shape of an index for cross-representation matching.
+fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
+    use crate::entity::{IndexType, SortOrder};
+    let method = match ix.index_type {
+        Some(IndexType::Hash) => "hash",
+        Some(IndexType::Gin) => "gin",
+        Some(IndexType::Gist) => "gist",
+        Some(IndexType::Brin) => "brin",
+        Some(IndexType::SpGist) => "spgist",
+        // btree (Some(Btree) or None) is the default access method.
+        Some(IndexType::Btree) | None => "btree",
+    };
+    let columns = ix
+        .columns
+        .iter()
+        .map(|c| (c.name.to_lowercase(), matches!(c.order, Some(SortOrder::Desc))))
+        .collect();
+    IndexShape { unique: ix.unique, method, columns }
+}
+
+/// The column-name sets (ordered, lowercased) that a table's PRIMARY KEY / UNIQUE
+/// constraints cover — from both inline column flags and table-level constraints.
+/// Used to drop PK/UNIQUE-backing indexes from index convergence.
+fn pk_unique_col_sets(t: &TableSnapshot) -> HashSet<Vec<String>> {
+    let mut sets: HashSet<Vec<String>> = HashSet::new();
+    for c in &t.columns {
+        if c.is_pk || c.is_unique {
+            sets.insert(vec![c.name.to_lowercase()]);
+        }
+    }
+    for con in &t.table_constraints {
+        match con {
+            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
+                sets.insert(columns.iter().map(|s| s.to_lowercase()).collect());
+            }
+            _ => {}
+        }
+    }
+    sets
+}
+
+/// A table's secondary indexes: every index EXCEPT those merely backing a
+/// PRIMARY KEY / UNIQUE constraint (introspection reports those, the parsed
+/// design does not — matching by covered columns). Mirrors the suppression in
+/// `schema_diff::normalize_for_diff`.
+fn secondary_indexes(t: &TableSnapshot) -> Vec<&crate::entity::IndexDef> {
+    let backing = pk_unique_col_sets(t);
+    t.indexes
+        .iter()
+        .filter(|ix| {
+            let cols: Vec<String> = ix.columns.iter().map(|c| c.name.to_lowercase()).collect();
+            !backing.contains(&cols)
+        })
+        .collect()
+}
+
 /// Summary of an executed reconcile, passed to the `on_complete` callback.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileComplete {
@@ -938,6 +1082,199 @@ mod tests {
         let col_pos = sql.find("ADD COLUMN parent_id").expect("ADD COLUMN present");
         let fk_pos = sql.find("ADD FOREIGN KEY").expect("ADD FOREIGN KEY present");
         assert!(col_pos < fk_pos, "ADD COLUMN must precede ADD FOREIGN KEY; got: {sql}");
+    }
+
+    // ── Index convergence (issue #12) ────────────────────────
+
+    fn idx(name: &str, cols: &[&str], unique: bool) -> crate::entity::IndexDef {
+        use crate::entity::{IndexColumn, IndexDef};
+        IndexDef {
+            name: Some(name.to_string()),
+            columns: cols.iter().map(|c| IndexColumn { name: (*c).to_string(), order: None }).collect(),
+            unique,
+            index_type: None,
+        }
+    }
+
+    /// The design declares a secondary index the live DB lacks → non-destructive,
+    /// idempotent `CREATE INDEX IF NOT EXISTS`. This is the reported bug's core
+    /// case: a `CREATE INDEX` added to an existing table's `.ddl` that reconcile
+    /// silently skipped (canonicalize strips indexes; there was no convergence).
+    #[test]
+    fn index_convergence_adds_missing_index() {
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![idx("children_parent_id_idx", &["parent_id"], false)],
+            ..table("app", "children", vec![col("parent_id", "uuid")])
+        }]);
+        let live = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "expected one altered table; got {plan:?}");
+        assert_eq!(plan.altered[0].entity_name, "app.children");
+        assert!(
+            plan.altered[0].sql.contains(
+                "CREATE INDEX IF NOT EXISTS \"children_parent_id_idx\" ON \"app\".\"children\" (\"parent_id\");"
+            ),
+            "expected idempotent CREATE INDEX; got: {}",
+            plan.altered[0].sql
+        );
+        assert!(!plan.destructive, "adding an index is not destructive");
+    }
+
+    /// The live DB has a secondary index the design dropped → schema-qualified
+    /// `DROP INDEX IF EXISTS <live-name>`, gated as destructive.
+    #[test]
+    fn index_convergence_drops_extra_index_is_destructive() {
+        let live = snap(vec![TableSnapshot {
+            indexes: vec![idx("children_parent_id_idx", &["parent_id"], false)],
+            ..table("app", "children", vec![col("parent_id", "uuid")])
+        }]);
+        let desired = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        assert!(
+            plan.altered[0].sql.contains("DROP INDEX IF EXISTS \"app\".\"children_parent_id_idx\";"),
+            "expected schema-qualified DROP INDEX with the live name; got: {}",
+            plan.altered[0].sql
+        );
+        assert!(plan.destructive, "dropping an index is gated as destructive");
+    }
+
+    /// A live index and a design index of the same shape under DIFFERENT names
+    /// reconcile to no change — no phantom drop/create churn on an in-sync DB.
+    #[test]
+    fn index_convergence_in_sync_by_shape_is_no_change() {
+        let live = snap(vec![TableSnapshot {
+            indexes: vec![idx("live_auto_name", &["email"], false)],
+            ..table("app", "users", vec![col("email", "text")])
+        }]);
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![idx("users_email_idx", &["email"], false)],
+            ..table("app", "users", vec![col("email", "text")])
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "same-shape index must reconcile to no change; got {plan:?}"
+        );
+    }
+
+    /// A PK-backing index (introspection reports it; the parsed design does not)
+    /// must be excluded on both sides — never dropped, never re-created.
+    #[test]
+    fn index_convergence_ignores_pk_backing_index() {
+        let live = snap(vec![TableSnapshot {
+            indexes: vec![idx("users_pkey", &["id"], true)],
+            table_constraints: vec![TableConstraint::PrimaryKey {
+                name: Some("users_pkey".to_string()),
+                columns: vec!["id".to_string()],
+            }],
+            ..table("app", "users", vec![not_null("id", "uuid")])
+        }]);
+        let desired = snap(vec![TableSnapshot {
+            table_constraints: vec![TableConstraint::PrimaryKey { name: None, columns: vec!["id".to_string()] }],
+            ..table("app", "users", vec![pk_col("id", "uuid")])
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "PK-backing index must not be dropped or re-created; got {plan:?}"
+        );
+    }
+
+    /// An index whose shape changed (here uniqueness) drops the old and creates
+    /// the new — Postgres can't alter it in place — with the drop before the
+    /// create so the shared name doesn't collide.
+    #[test]
+    fn index_convergence_changed_shape_replaces() {
+        let live = snap(vec![TableSnapshot {
+            indexes: vec![idx("users_email_idx", &["email"], false)],
+            ..table("app", "users", vec![col("email", "text")])
+        }]);
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![idx("users_email_idx", &["email"], true)],
+            ..table("app", "users", vec![col("email", "text")])
+        }]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP INDEX IF EXISTS \"app\".\"users_email_idx\";"), "must drop old index; got: {sql}");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"users_email_idx\" ON \"app\".\"users\" (\"email\");"),
+            "must create the new unique index; got: {sql}"
+        );
+        assert!(plan.destructive, "replacing an index drops the old one → destructive");
+        assert!(
+            sql.find("DROP INDEX").unwrap() < sql.find("CREATE UNIQUE INDEX").unwrap(),
+            "drop must precede create; got: {sql}"
+        );
+    }
+
+    /// Index add SQL is appended AFTER any existing ALTER (e.g. the `ADD COLUMN`
+    /// that created the indexed column), so the column exists before the index.
+    #[test]
+    fn index_convergence_appends_after_existing_alter() {
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![idx("users_email_idx", &["email"], false)],
+            ..table("app", "users", vec![col("email", "text")])
+        }]);
+        let live = snap(vec![table("app", "users", vec![])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan.altered.push(ReconcileStatement {
+            entity_name: "app.users".to_string(),
+            sql: "ALTER TABLE app.users ADD COLUMN email text;".to_string(),
+        });
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "index merges into the existing statement");
+        let sql = &plan.altered[0].sql;
+        let col_pos = sql.find("ADD COLUMN email").expect("ADD COLUMN present");
+        let idx_pos = sql.find("CREATE INDEX").expect("CREATE INDEX present");
+        assert!(col_pos < idx_pos, "ADD COLUMN must precede CREATE INDEX; got: {sql}");
+    }
+
+    /// A non-btree index converges with its real access method — the previous
+    /// diff-engine emitter dropped `USING <method>`, silently turning a GIN index
+    /// into a btree. Reconcile renders via `emit::emit_index_sql`, which keeps it.
+    #[test]
+    fn index_convergence_add_emits_using_method() {
+        use crate::entity::{IndexColumn, IndexDef, IndexType};
+        let gin = IndexDef {
+            name: Some("docs_tags_gin".to_string()),
+            columns: vec![IndexColumn { name: "tags".to_string(), order: None }],
+            unique: false,
+            index_type: Some(IndexType::Gin),
+        };
+        let desired = snap(vec![TableSnapshot {
+            indexes: vec![gin],
+            ..table("app", "docs", vec![col("tags", "text[]")])
+        }]);
+        let live = snap(vec![table("app", "docs", vec![col("tags", "text[]")])]);
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &live, &desired);
+
+        assert_eq!(plan.altered.len(), 1);
+        assert!(
+            plan.altered[0].sql.contains("USING gin"),
+            "a GIN index must converge with its access method, not as btree; got: {}",
+            plan.altered[0].sql
+        );
     }
 
     #[test]
