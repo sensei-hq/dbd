@@ -592,9 +592,10 @@ mod tests {
             indexes: vec![
                 IndexDef {
                     name: Some("orders_tags_idx".into()),
-                    columns: vec![IndexColumn { name: "tags".into(), order: None }],
+                    columns: vec![IndexColumn { name: "tags".into(), order: None, ..Default::default() }],
                     unique: false,
                     index_type: Some(IndexType::Gin),
+                    ..Default::default()
                 },
             ],
             comments: Default::default(),

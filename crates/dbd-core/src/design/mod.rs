@@ -2730,7 +2730,7 @@ mod tests {
                 name: Some("m_idx".to_string()),
                 columns: vec![],
                 unique: true,
-                index_type: None,
+                ..Default::default()
             }],
             comments: Default::default(),
         });

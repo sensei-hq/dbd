@@ -775,14 +775,16 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
         }
     }
 
+    // DBML's `indexes` block has no syntax for a partial `WHERE`, an operator
+    // class, or storage parameters, so those stay at their defaults.
     Ok(IndexDef {
         name,
         columns: column_names
             .into_iter()
-            .map(|name| IndexColumn { name, order: None })
+            .map(|name| IndexColumn { name, ..Default::default() })
             .collect(),
         unique,
-        index_type: None,
+        ..Default::default()
     })
 }
 
@@ -1513,9 +1515,10 @@ mod tests {
             ],
             indexes: vec![IndexDef {
                 name: Some("idx_orders_code".into()),
-                columns: vec![IndexColumn { name: "code".into(), order: None }],
+                columns: vec![IndexColumn { name: "code".into(), order: None, ..Default::default() }],
                 unique: true,
                 index_type: None,
+                ..Default::default()
             }],
             comments,
         });

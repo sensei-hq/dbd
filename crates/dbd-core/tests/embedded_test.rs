@@ -502,11 +502,20 @@ async fn introspect_returns_fixture_entities() {
         "widget_tags_idx should be captured as a GIN index"
     );
 
-    // Expression index widget_lower_name_idx — must be skipped (IndexDef cannot represent it)
-    let expr_idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_lower_name_idx"));
+    // Expression index widget_lower_name_idx — captured, with its key flagged as an
+    // expression. It used to be skipped, which made an existing expression index
+    // invisible: the design's copy read as missing and every diff asked to create it.
+    let expr_idx = td
+        .indexes
+        .iter()
+        .find(|i| i.name.as_deref() == Some("widget_lower_name_idx"))
+        .expect("expression index 'widget_lower_name_idx' should be introspected");
+    let key = &expr_idx.columns[0];
+    assert!(key.is_expression, "lower(name) is an expression, not a column: {key:?}");
     assert!(
-        expr_idx.is_none(),
-        "expression index 'widget_lower_name_idx' should NOT appear in introspect output"
+        key.name.contains("lower"),
+        "the expression text must be captured; got {:?}",
+        key.name
     );
 
     // Table comment
@@ -692,16 +701,18 @@ async fn emitted_index_ddl_applies_to_postgres() {
             // method (and its position after `ON table`) must be correct.
             IndexDef {
                 name: Some("doc_tags_gin".into()),
-                columns: vec![IndexColumn { name: "tags".into(), order: None }],
+                columns: vec![IndexColumn { name: "tags".into(), order: None, ..Default::default() }],
                 unique: false,
                 index_type: Some(IndexType::Gin),
+                ..Default::default()
             },
             // HASH index on a plain column.
             IndexDef {
                 name: Some("doc_title_hash".into()),
-                columns: vec![IndexColumn { name: "title".into(), order: None }],
+                columns: vec![IndexColumn { name: "title".into(), order: None, ..Default::default() }],
                 unique: false,
                 index_type: Some(IndexType::Hash),
+                ..Default::default()
             },
         ],
         comments: Default::default(),
@@ -718,6 +729,119 @@ async fn emitted_index_ddl_applies_to_postgres() {
         .execute_script(&sql)
         .await
         .unwrap_or_else(|e| panic!("emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{sql}"));
+}
+
+// ── Test: index round-trip convergence against real Postgres ─────────────────
+
+/// The convergence property reconcile depends on, checked end to end against a
+/// real server: introspect an index, re-emit it as DDL, apply that DDL to an
+/// identical table, introspect again — and get the SAME `IndexDef`.
+///
+/// Any attribute the model, the introspector, or the emitter drops shows up here
+/// as a mismatch. That is precisely how the reported bug behaved: `DESC` and the
+/// `WHERE` predicate were lost, so reconcile recreated an index that differed
+/// from the one it had just read, and the next `dbd diff` reported the same
+/// `DROP INDEX`/`CREATE INDEX` pair again — forever.
+#[tokio::test]
+async fn index_definitions_round_trip_through_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "index_roundtrip_test").await.unwrap();
+
+    // `origin` carries the awkward index shapes; `echo` is the identical table the
+    // re-emitted DDL is applied to.
+    let columns = "(
+           id          uuid not null,
+           folder_id   uuid,
+           file_path   text,
+           status      text,
+           created_at  timestamptz,
+           context     jsonb,
+           tags        text[]
+         )";
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA rt;
+             CREATE TABLE rt.origin {columns};
+             CREATE TABLE rt.echo {columns};
+
+             -- descending key with the implied NULLS FIRST
+             CREATE INDEX ix_desc ON rt.origin (folder_id, created_at DESC);
+             -- descending key overriding the implied NULLS ordering
+             CREATE INDEX ix_desc_nulls_last ON rt.origin (created_at DESC NULLS LAST);
+             -- partial unique index with NULLS NOT DISTINCT
+             CREATE UNIQUE INDEX ix_partial ON rt.origin (folder_id, file_path)
+                 NULLS NOT DISTINCT WHERE file_path IS NOT NULL;
+             -- partial index whose predicate Postgres stores with a cast
+             CREATE INDEX ix_pred_cast ON rt.origin (id) WHERE status = 'active';
+             -- partial index whose predicate Postgres stores as = ANY (ARRAY[…])
+             CREATE INDEX ix_pred_any ON rt.origin (id) WHERE status IN ('a', 'b');
+             -- expression key
+             CREATE INDEX ix_expr ON rt.origin ((context ->> 'module'));
+             -- non-btree access method
+             CREATE INDEX ix_gin ON rt.origin USING gin (tags);
+             -- INCLUDE payload
+             CREATE INDEX ix_include ON rt.origin (folder_id) INCLUDE (status);"
+        ))
+        .await
+        .expect("failed to seed rt schema");
+
+    /// Introspected indexes of `rt.<table>`, keyed by name.
+    async fn indexes_of(
+        adapter: &dyn dbd_core::DatabaseAdapter,
+        table: &str,
+    ) -> std::collections::BTreeMap<String, dbd_core::entity::IndexDef> {
+        adapter
+            .introspect()
+            .await
+            .expect("introspect failed")
+            .into_iter()
+            .filter(|e| e.name == format!("rt.{table}"))
+            .filter_map(|e| e.table_def)
+            .flat_map(|td| td.indexes)
+            .filter_map(|ix| ix.name.clone().map(|n| (n, ix)))
+            .collect()
+    }
+
+    let origin = indexes_of(&*adapter, "origin").await;
+    assert_eq!(
+        origin.len(),
+        8,
+        "every index must be introspected, including partial and expression ones; got {:?}",
+        origin.keys().collect::<Vec<_>>()
+    );
+
+    // Re-emit each index onto `echo`, then introspect it back.
+    let mut replay = String::new();
+    for ix in origin.values() {
+        // Rename so origin's names stay free; the shape is what must round-trip.
+        let mut echoed = ix.clone();
+        echoed.name = Some(format!("{}_echo", ix.name.as_deref().unwrap()));
+        replay.push_str(&dbd_core::emit::emit_index_sql(
+            &echoed,
+            "\"rt\".\"echo\"",
+            "echo",
+            false,
+        ));
+        replay.push('\n');
+    }
+    adapter
+        .execute_script(&replay)
+        .await
+        .unwrap_or_else(|e| panic!("re-emitted index DDL rejected by Postgres: {e}\n--- DDL ---\n{replay}"));
+
+    let echo = indexes_of(&*adapter, "echo").await;
+    for (name, before) in &origin {
+        let echoed_name = format!("{name}_echo");
+        let after = echo
+            .get(&echoed_name)
+            .unwrap_or_else(|| panic!("{echoed_name} missing after replay; got {:?}", echo.keys().collect::<Vec<_>>()));
+        // Compare everything but the (deliberately changed) name.
+        let expected = dbd_core::entity::IndexDef { name: after.name.clone(), ..before.clone() };
+        assert_eq!(
+            &expected, after,
+            "index {name} did not survive the emit/apply/introspect round trip"
+        );
+    }
 }
 
 // ── Test 8: Function & procedure introspection (with overloads + extension) ───
@@ -2226,6 +2350,143 @@ async fn reconcile_converges_foreign_keys() {
         .await
         .expect("destructive reconcile failed");
     assert_catalog(&*adapter, false, fk_pred, "FK on app.children").await;
+}
+
+// ── Reconcile convergence: comments and keyword defaults ──────────────────────
+
+/// Apply a design, then require reconcile to report NOTHING — the property both
+/// of these fixes exist for, checked against a real server.
+///
+/// Two spellings Postgres rewrites used to churn on every run:
+/// - `default current_date` comes back from `pg_get_expr` as `CURRENT_DATE`, so
+///   reconcile emitted a `SET DEFAULT` that Postgres immediately re-spelled;
+/// - column comments were cleared by `canonicalize` with no convergence pass, so
+///   `dbd diff` reported comment drift that reconcile could never act on.
+///
+/// The test then perturbs the live database three ways — changed comment, removed
+/// comment, changed default — and requires reconcile to restore each and settle.
+#[tokio::test]
+async fn reconcile_converges_comments_and_keyword_defaults() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_comment_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_comment_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    // Lowercase keyword defaults throughout — Postgres stores every one of these
+    // in its own casing, which is what used to read as drift.
+    std::fs::write(
+        dir.join("ddl/table/app/docs.ddl"),
+        "set search_path to app;\n\
+         create table if not exists docs (\n\
+           id          uuid        primary key\n\
+         , effective   date        not null default current_date\n\
+         , created_at  timestamptz not null default current_timestamp\n\
+         , author      text        not null default current_user\n\
+         , touched_at  timestamptz not null default now()\n\
+         , label       text        not null default 'Mixed Case'\n\
+         , title       text\n\
+         , body        text\n\
+         );\n\
+         comment on column docs.title is 'Display name';\n\
+         comment on column docs.body is 'The document''s body';\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load design");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    /// The reconcile plan's ALTER SQL, or an empty vec when it is in sync.
+    async fn plan_sql(
+        design: &Design,
+        adapter: &dyn dbd_core::DatabaseAdapter,
+    ) -> Vec<String> {
+        design
+            .reconcile(adapter, true, true, false, None, Progress::none())
+            .await
+            .expect("dry-run reconcile failed")
+            .altered
+            .into_iter()
+            .map(|s| s.sql)
+            .collect()
+    }
+
+    // Freshly applied → nothing to do. This is the assertion that used to fail:
+    // `SET DEFAULT current_date` and every `COMMENT ON COLUMN` reappeared forever.
+    let sql = plan_sql(&design, &*adapter).await;
+    assert!(
+        sql.is_empty(),
+        "a freshly applied design must reconcile to no change; got {sql:?}"
+    );
+
+    // Reading the live comment back must give exactly what the design declared,
+    // including the escaped apostrophe.
+    let comment_of = |col: &'static str| {
+        let adapter = &*adapter;
+        async move {
+            adapter
+                .introspect()
+                .await
+                .expect("introspect failed")
+                .into_iter()
+                .find(|e| e.name == "app.docs")
+                .and_then(|e| e.table_def)
+                .and_then(|td| td.columns.iter().find(|c| c.name == col).and_then(|c| c.comment.clone()))
+        }
+    };
+    assert_eq!(comment_of("body").await.as_deref(), Some("The document's body"));
+
+    // Perturb: change one comment, remove another, and change a default.
+    adapter
+        .execute_script(
+            "COMMENT ON COLUMN app.docs.title IS 'drifted text';
+             COMMENT ON COLUMN app.docs.body IS NULL;
+             ALTER TABLE app.docs ALTER COLUMN effective SET DEFAULT '2020-01-01';",
+        )
+        .await
+        .expect("perturb failed");
+
+    let sql = plan_sql(&design, &*adapter).await.join("\n");
+    assert!(sql.contains("app.docs"), "drift must be detected; got: {sql}");
+
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile failed");
+
+    // Restored to the design.
+    assert_eq!(comment_of("title").await.as_deref(), Some("Display name"));
+    assert_eq!(comment_of("body").await.as_deref(), Some("The document's body"));
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef ad \
+         JOIN pg_class c ON c.oid = ad.adrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ad.adnum \
+         WHERE n.nspname = 'app' AND c.relname = 'docs' AND a.attname = 'effective' \
+           AND pg_get_expr(ad.adbin, ad.adrelid) = 'CURRENT_DATE'",
+        "app.docs.effective default restored to CURRENT_DATE",
+    )
+    .await;
+
+    // And it SETTLES: a second reconcile has nothing left to do. Restoring drift
+    // but never converging is exactly the reported failure.
+    let sql = plan_sql(&design, &*adapter).await;
+    assert!(
+        sql.is_empty(),
+        "reconcile must converge, not churn on every run; got {sql:?}"
+    );
 }
 
 // ── Batch transaction (atomic apply) ──────────────────────────────────────────
