@@ -91,15 +91,23 @@ pub fn emit_table(entity: &Entity) -> String {
         out.push_str(&format!("\nCOMMENT ON TABLE {qname} IS '{}';", esc(tc)));
     }
     for c in &def.columns {
-        if let Some(cm) = &c.comment {
-            out.push_str(&format!(
-                "\nCOMMENT ON COLUMN {qname}.{} IS '{}';",
-                q(&c.name),
-                esc(cm)
-            ));
+        if c.comment.is_some() {
+            out.push('\n');
+            out.push_str(&emit_column_comment_sql(&qname, &c.name, c.comment.as_deref()));
         }
     }
     out
+}
+
+/// Render `COMMENT ON COLUMN <qname>."<column>" IS …;`.
+///
+/// `None` renders `IS NULL`, which is how Postgres *removes* a comment — needed
+/// when the design drops a comment the live database still carries.
+pub fn emit_column_comment_sql(qname: &str, column: &str, comment: Option<&str>) -> String {
+    match comment {
+        Some(text) => format!("COMMENT ON COLUMN {qname}.{} IS '{}';", q(column), esc(text)),
+        None => format!("COMMENT ON COLUMN {qname}.{} IS NULL;", q(column)),
+    }
 }
 
 /// Render one column definition line (indented, no trailing comma).
@@ -168,43 +176,85 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
     }
 }
 
-/// Render a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] … ON <qname> [USING method] (cols);` line.
+/// Render one key entry of an index: `"col" [opclass] [DESC] [NULLS FIRST|LAST]`.
+///
+/// An expression entry is emitted verbatim in parentheses and never quoted —
+/// quoting it as an identifier is what produced
+/// `column "(context ->> 'module')" does not exist`.
+pub(crate) fn emit_index_column(c: &crate::entity::IndexColumn) -> String {
+    let mut out = if c.is_expression {
+        // Postgres requires an expression key to be parenthesized; a function
+        // call like `lower(name)` already reads as one.
+        if c.name.starts_with('(') { c.name.clone() } else { format!("({})", c.name) }
+    } else {
+        q(&c.name)
+    };
+    if let Some(opclass) = &c.opclass {
+        out.push_str(&format!(" {opclass}"));
+    }
+    if matches!(c.order, Some(crate::entity::SortOrder::Desc)) {
+        out.push_str(" DESC");
+    }
+    match c.nulls_first {
+        Some(true) => out.push_str(" NULLS FIRST"),
+        Some(false) => out.push_str(" NULLS LAST"),
+        None => {}
+    }
+    out
+}
+
+/// Render a full `CREATE [UNIQUE] INDEX [IF NOT EXISTS] … ;` statement.
+///
+/// Emits every clause [`crate::entity::IndexDef`] carries — access method,
+/// operator class, sort order, `INCLUDE`, `NULLS NOT DISTINCT`, `WITH` storage
+/// parameters and the partial-index `WHERE`. A clause dropped here would make
+/// reconcile create an index that differs from the one the design asked for, so
+/// the next diff reports drift the reconcile just claimed to fix.
+///
 /// `table_name` is the bare table name used to synthesize an index name when
 /// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
 /// statement is idempotent on re-apply — matviews set it (their whole DDL is
 /// re-applied by `dbd apply`); tables keep their existing exact output.
-pub(crate) fn emit_index_sql(
+pub fn emit_index_sql(
     ix: &crate::entity::IndexDef,
     qname: &str,
     table_name: &str,
     if_not_exists: bool,
 ) -> String {
-    let cols = ix
-        .columns
-        .iter()
-        .map(|c| match c.order {
-            Some(crate::entity::SortOrder::Desc) => format!("{} DESC", q(&c.name)),
-            _ => q(&c.name),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let cols = ix.columns.iter().map(emit_index_column).collect::<Vec<_>>().join(", ");
     let unique = if ix.unique { "UNIQUE " } else { "" };
     let idx_name = ix.name.clone().unwrap_or_else(|| format!("{table_name}_idx"));
     use crate::entity::IndexType;
-    let using = match ix.index_type {
-        Some(IndexType::Hash) => " USING hash",
-        Some(IndexType::Gin) => " USING gin",
-        Some(IndexType::Gist) => " USING gist",
-        Some(IndexType::Brin) => " USING brin",
-        Some(IndexType::SpGist) => " USING spgist",
-        // btree (Some(Btree) or None) is the default — no USING clause.
-        _ => "",
+    // btree (Some(Btree) or None) is the default — no USING clause.
+    let using = match &ix.index_type {
+        None | Some(IndexType::Btree) => String::new(),
+        Some(method) => format!(" USING {}", method.amname()),
     };
     let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
     // Postgres grammar: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table
     // [USING method] (cols) — the access method goes AFTER the table, before
     // the column list.
-    format!("CREATE {unique}INDEX {ine}{} ON {qname}{using} ({cols});", q(&idx_name))
+    let mut sql = format!("CREATE {unique}INDEX {ine}{} ON {qname}{using} ({cols})", q(&idx_name));
+    if !ix.include.is_empty() {
+        sql.push_str(&format!(" INCLUDE ({})", quote_cols(&ix.include)));
+    }
+    if ix.nulls_not_distinct {
+        sql.push_str(" NULLS NOT DISTINCT");
+    }
+    if !ix.with_options.is_empty() {
+        let opts = ix
+            .with_options
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" WITH ({opts})"));
+    }
+    if let Some(predicate) = &ix.predicate {
+        sql.push_str(&format!(" WHERE {predicate}"));
+    }
+    sql.push(';');
+    sql
 }
 
 fn quote_cols(cols: &[String]) -> String {
@@ -401,9 +451,10 @@ mod tests {
             ],
             indexes: vec![IndexDef {
                 name: Some("orders_customer_id_idx".into()),
-                columns: vec![IndexColumn { name: "customer_id".into(), order: None }],
+                columns: vec![IndexColumn { name: "customer_id".into(), order: None, ..Default::default() }],
                 unique: false,
                 index_type: None,
+                ..Default::default()
             }],
             comments: Default::default(),
         });
@@ -508,9 +559,10 @@ mod tests {
             constraints: vec![],
             indexes: vec![IndexDef {
                 name: Some("daily_sales_x_idx".into()),
-                columns: vec![IndexColumn { name: "x".into(), order: None }],
+                columns: vec![IndexColumn { name: "x".into(), order: None, ..Default::default() }],
                 unique: true,
                 index_type: None,
+                ..Default::default()
             }],
             comments: Default::default(),
         });
@@ -713,9 +765,10 @@ mod tests {
         };
         let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
             name: Some(name.into()),
-            columns: vec![IndexColumn { name: col.into(), order: None }],
+            columns: vec![IndexColumn { name: col.into(), order: None, ..Default::default() }],
             unique: false,
             index_type: ty,
+            ..Default::default()
         };
         let mut e = Entity::new(EntityType::Table, "app.docs");
         e.table_def = Some(TableDef {

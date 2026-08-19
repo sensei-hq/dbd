@@ -25,6 +25,7 @@ pub mod scope;
 pub mod reverse;
 pub mod script;
 pub mod snapshot;
+pub mod sql_expr;
 
 pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};

@@ -125,9 +125,11 @@
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: false,
             index_type: None,
+            ..Default::default()
         });
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
@@ -172,9 +174,11 @@
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: false,
             index_type: None,
+            ..Default::default()
         });
         let t_new = table("public", "users", vec![col("id", "int")]);
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
@@ -235,9 +239,11 @@
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: false,
             index_type: None,
+            ..Default::default()
         });
         let mut t_new = table("public", "users", vec![col("id", "int")]);
         t_new.indexes.push(IndexDef {
@@ -245,9 +251,11 @@
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: false,
             index_type: Some(IndexType::Hash),
+            ..Default::default()
         });
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
@@ -361,9 +369,11 @@
             columns: vec![IndexColumn {
                 name: "name".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: false,
             index_type: None,
+            ..Default::default()
         });
 
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
@@ -1049,14 +1059,16 @@
                     columns: vec![IndexColumn {
                         name: "email".to_string(),
                         order: None,
+                        ..Default::default()
                     }],
                     unique: false,
                     index_type: None,
+                    ..Default::default()
                 }))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
-        assert_eq!(sql, "CREATE INDEX idx_email ON public.users (email);");
+        assert_eq!(sql, "CREATE INDEX \"idx_email\" ON public.users (\"email\");");
 
         // Unique index
         let diffs_unique = vec![MigrationDiff {
@@ -1070,16 +1082,18 @@
                     columns: vec![IndexColumn {
                         name: "email".to_string(),
                         order: None,
+                        ..Default::default()
                     }],
                     unique: true,
                     index_type: None,
+                    ..Default::default()
                 }))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs_unique);
         assert_eq!(
             sql,
-            "CREATE UNIQUE INDEX idx_email_unique ON public.users (email);"
+            "CREATE UNIQUE INDEX \"idx_email_unique\" ON public.users (\"email\");"
         );
     }
 
@@ -1367,21 +1381,25 @@
                         IndexColumn {
                             name: "email".to_string(),
                             order: Some(SortOrder::Desc),
+                            ..Default::default()
                         },
                         IndexColumn {
                             name: "name".to_string(),
                             order: Some(SortOrder::Asc),
+                            ..Default::default()
                         },
                     ],
                     unique: false,
                     index_type: None,
+                    ..Default::default()
                 }))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
+        // `ASC` is the default direction and is not re-emitted; `DESC` is.
         assert_eq!(
             sql,
-            "CREATE INDEX idx_email_name ON public.users (email DESC, name ASC);"
+            "CREATE INDEX \"idx_email_name\" ON public.users (\"email\" DESC, \"name\");"
         );
     }
 
@@ -1594,9 +1612,10 @@
                     field_type: FieldType::Index,
                     action: ChangeAction::Add(Box::new(FieldDetail::Index(IndexDef {
                         name: Some("idx_email".to_string()),
-                        columns: vec![IndexColumn { name: "email".to_string(), order: None }],
+                        columns: vec![IndexColumn { name: "email".to_string(), order: None, ..Default::default() }],
                         unique: false,
                         index_type: None,
+                        ..Default::default()
                     }))),
                 },
             ]),

@@ -744,9 +744,11 @@ mod tests {
             columns: vec![IndexColumn {
                 name: "name".to_string(),
                 order: None,
+                ..Default::default()
             }],
             unique: true,
             index_type: None,
+            ..Default::default()
         }];
 
         let table_def = entity.table_def.as_ref().unwrap();
