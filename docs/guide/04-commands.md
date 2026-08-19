@@ -303,7 +303,7 @@ the exact column-level change before applying.
 The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
 schemas. Two kinds of destruction each need an explicit opt-in:
 
-- **`--allow-destructive`** — drop a *column* or constraint from a managed table.
+- **`--allow-destructive`** — drop a *column*, constraint, foreign key, or index from a managed table.
 - **`--prune`** — drop a whole *table* still in a managed schema but no longer in the design (an
   orphan). Without `--prune`, orphans are reported and left in place.
 
@@ -312,15 +312,19 @@ Reconcile is **disabled once the project is released** (`project.released: true`
 `--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
 
 **What reconcile compares** (against the introspected live schema): columns
-(name, type, nullability, default, identity), primary-key / unique constraints, and **foreign
-keys**. Bare enum types are schema-qualified to match introspection, and common type aliases are
+(name, type, nullability, default, identity), primary-key / unique constraints, **foreign
+keys**, and secondary **indexes**. Bare enum types are schema-qualified to match introspection, and common type aliases are
 normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
 matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
 and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
 added (`ADD FOREIGN KEY …`, Postgres auto-names it), and an FK the design dropped is removed
-(`DROP CONSTRAINT …`, gated behind `--allow-destructive`). **Not** reconciled on existing tables:
-check constraints and indexes — their introspected and parsed forms differ too much to diff
-reliably, so change those via `dbd snapshot` (they're still created with the initial `CREATE`).
+(`DROP CONSTRAINT …`, gated behind `--allow-destructive`). Indexes converge the same way: matched by
+shape (unique flag, access method incl. `USING gin/gist/brin/hash`, ordered columns) so a same-shape
+index under a different name is no change; a declared index the live DB lacks is added
+(`CREATE INDEX IF NOT EXISTS …`) and one the design dropped is removed (`DROP INDEX …`, gated behind
+`--allow-destructive`). Indexes that merely back a PK/UNIQUE constraint are ignored on both sides.
+**Not** reconciled on existing tables: check constraints — their introspected and parsed forms differ
+too much to diff reliably, so change those via `dbd snapshot` (they're still created with the initial `CREATE`).
 Because introspected and hand-written DDL can spell a default or exotic type differently,
 reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
 `--dry-run` first.
@@ -330,8 +334,8 @@ reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`
 ## `dbd diff`
 
 Read-only. Show the complete difference between the live database and the design —
-**everything `reconcile --dry-run` omits**: CHECK constraints, indexes, and column
-comments, in addition to columns, PK/unique, foreign keys, and enums. Never writes, and
+**everything `reconcile --dry-run` omits**: CHECK constraints and column
+comments, in addition to columns, PK/unique, foreign keys, indexes, and enums. Never writes, and
 available even after `dbd release`.
 
 ```sh
@@ -664,7 +668,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.6
+  rev: v0.10.7
   hooks:
     - id: dbd-format
 ```

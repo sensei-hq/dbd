@@ -112,8 +112,8 @@ fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
     )))
 }
 
-/// Refuse a destructive reconcile (dropped columns/constraints) unless the
-/// caller explicitly opted in with `allow_destructive`.
+/// Refuse a destructive reconcile (dropped columns, constraints, foreign keys,
+/// or indexes) unless the caller explicitly opted in with `allow_destructive`.
 fn ensure_reconcile_not_destructive(
     plan: &crate::reconcile::ReconcilePlan,
     allow_destructive: bool,
@@ -128,7 +128,7 @@ fn ensure_reconcile_not_destructive(
         .collect::<Vec<_>>()
         .join("\n");
     Err(DbdError::Config(format!(
-        "reconcile would make destructive changes (dropped columns/constraints) on:\n{details}\n\
+        "reconcile would make destructive changes (dropped columns, constraints, or indexes) on:\n{details}\n\
          Re-run with --allow-destructive to proceed."
     )))
 }
