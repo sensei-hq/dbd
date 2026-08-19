@@ -827,9 +827,11 @@ mod tests {
                 columns: vec![IndexColumn {
                     name: "user_id".into(),
                     order: None,
+                    ..Default::default()
                 }],
                 unique: false,
                 index_type: None,
+                ..Default::default()
             }],
         );
         let out = generate_schema_ts(&[&t]);

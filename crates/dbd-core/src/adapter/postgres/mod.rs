@@ -742,39 +742,73 @@ impl PostgresAdapter {
 
     /// Introspect a table's standalone indexes.
     ///
-    /// Excludes indexes that back a PK or UNIQUE constraint (`constraint_index_oids`
-    /// / `indisprimary`). Also skips expression indexes (indexprs IS NOT NULL),
-    /// partial indexes (indpred IS NOT NULL), and any index whose indkey contains
-    /// a 0 (expression column) — IndexDef cannot represent these, and emitting an
-    /// empty column list would produce invalid DDL.
+    /// Excludes only the indexes that back a PK or UNIQUE constraint
+    /// (`constraint_index_oids` / `indisprimary`) — those are reported as
+    /// constraints instead. Everything else is read in full, including partial,
+    /// expression and extension-method (`hnsw`, `ivfflat`) indexes: an index this
+    /// function cannot see reads as missing, and reconcile then re-issues a
+    /// `CREATE INDEX IF NOT EXISTS` that silently no-ops against the existing
+    /// name — succeeding without ever converging.
+    ///
+    /// Per-column detail comes from the catalogs rather than by re-parsing
+    /// `pg_get_indexdef`: `indkey` says whether an entry is a column or an
+    /// expression, `indoption` carries the sort direction, and `indclass` the
+    /// operator class.
+    ///
+    /// Two normalizations keep an introspected index comparable to an authored
+    /// one, which never spells out a default:
+    /// - an operator class that is the type's default for this access method is
+    ///   reported as `None` (so an authored `using gin(tags)` matches);
+    /// - `NULLS FIRST`/`LAST` is reported only when it differs from the direction's
+    ///   implied default (`DESC` implies `NULLS FIRST`, so plain `DESC` — stored as
+    ///   `indoption = 3` — yields `nulls_first: None`).
+    ///
+    /// Known limitation: an authored index that spells out its type's *default*
+    /// operator class reads as drift, since the introspected side reports `None`.
     async fn introspect_indexes(
         &self,
         schema: &str,
         table: &str,
         constraint_index_oids: &std::collections::HashSet<i64>,
     ) -> crate::error::Result<Vec<crate::entity::IndexDef>> {
-        use crate::entity::{IndexColumn, IndexDef};
+        use crate::entity::{IndexColumn, IndexDef, SortOrder};
 
+        // `indnullsnotdistinct` only exists on PG 15+; reading it through
+        // `to_jsonb` yields NULL instead of erroring on older servers.
         let idx_sql =
             "SELECT i.relname AS index_name, \
                     ix.indexrelid::int8 AS index_oid, \
                     ix.indisunique, \
                     ix.indisprimary, \
                     am.amname AS index_type, \
-                    (SELECT array_agg(a.attname ORDER BY pos.ord) \
-                     FROM unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, ord) \
-                     JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = pos.attnum \
-                     WHERE pos.attnum > 0 \
-                    ) AS col_names \
+                    coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false) \
+                        AS nulls_not_distinct, \
+                    pg_get_expr(ix.indpred, ix.indrelid) AS predicate, \
+                    i.reloptions::text[] AS reloptions, \
+                    ix.indnkeyatts::int4 AS nkeyatts, \
+                    (SELECT array_agg( \
+                              CASE WHEN ix.indkey[k.ord - 1] > 0 THEN \
+                                (SELECT a.attname::text FROM pg_attribute a \
+                                  WHERE a.attrelid = ix.indrelid \
+                                    AND a.attnum = ix.indkey[k.ord - 1]) \
+                              END ORDER BY k.ord) \
+                     FROM generate_series(1, ix.indnatts::int) AS k(ord)) AS col_names, \
+                    (SELECT array_agg(pg_get_indexdef(ix.indexrelid, k.ord::int, true) \
+                                      ORDER BY k.ord) \
+                     FROM generate_series(1, ix.indnatts::int) AS k(ord)) AS col_defs, \
+                    (SELECT array_agg( \
+                              CASE WHEN op.opcdefault THEN NULL ELSE op.opcname::text END \
+                              ORDER BY k.ord) \
+                     FROM generate_series(1, ix.indnkeyatts::int) AS k(ord) \
+                     LEFT JOIN pg_opclass op ON op.oid = ix.indclass[k.ord - 1]) AS opclasses, \
+                    (SELECT array_agg(ix.indoption[k.ord - 1]::int4 ORDER BY k.ord) \
+                     FROM generate_series(1, ix.indnkeyatts::int) AS k(ord)) AS coloptions \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace ns ON ns.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
              WHERE ns.nspname = $1 AND t.relname = $2 \
-               AND ix.indexprs IS NULL \
-               AND ix.indpred IS NULL \
-               AND NOT (0 = ANY(ix.indkey::int2[])) \
              ORDER BY i.relname";
 
         let idx_rows = sqlx::query(idx_sql)
@@ -798,28 +832,75 @@ impl PostgresAdapter {
             let index_name: String = ix.get("index_name");
             let indisunique: bool = ix.get("indisunique");
             let index_type_str: String = ix.get("index_type");
-            let col_names: Vec<String> = ix
-                .try_get::<Vec<String>, _>("col_names")
-                .unwrap_or_default();
+            let nkeyatts = ix.get::<i32, _>("nkeyatts").max(0) as usize;
+            let col_names: Vec<Option<String>> =
+                ix.try_get::<Vec<Option<String>>, _>("col_names").unwrap_or_default();
+            let col_defs: Vec<String> = ix.try_get::<Vec<String>, _>("col_defs").unwrap_or_default();
+            let opclasses: Vec<Option<String>> =
+                ix.try_get::<Vec<Option<String>>, _>("opclasses").unwrap_or_default();
+            let coloptions: Vec<i32> = ix.try_get::<Vec<i32>, _>("coloptions").unwrap_or_default();
 
-            use crate::entity::IndexType;
-            let index_type = match index_type_str.as_str() {
-                "hash" => Some(IndexType::Hash),
-                "gin" => Some(IndexType::Gin),
-                "gist" => Some(IndexType::Gist),
-                "brin" => Some(IndexType::Brin),
-                "spgist" => Some(IndexType::SpGist),
-                _ => None, // btree is the default — represent as None (no USING clause)
-            };
+            // Key columns first, then any INCLUDE payload columns.
+            let mut columns: Vec<IndexColumn> = Vec::with_capacity(nkeyatts);
+            for pos in 0..nkeyatts {
+                // `indkey` holds 0 for an expression entry; its text then comes
+                // from `pg_get_indexdef`, canonicalized so an authored
+                // `(context ->> 'module')` matches the `'module'::text` Postgres
+                // stores.
+                let (name, is_expression) = match col_names.get(pos).and_then(Option::as_ref) {
+                    Some(col) => (col.clone(), false),
+                    None => {
+                        let raw = col_defs.get(pos).cloned().unwrap_or_default();
+                        let expr = crate::sql_expr::canonicalize_expression(&raw).unwrap_or(raw);
+                        (expr, true)
+                    }
+                };
+                let opt = coloptions.get(pos).copied().unwrap_or(0);
+                let descending = opt & 0x01 != 0;
+                let nulls_first = opt & 0x02 != 0;
+                columns.push(IndexColumn {
+                    name,
+                    is_expression,
+                    order: descending.then_some(SortOrder::Desc),
+                    // `DESC` implies `NULLS FIRST` and `ASC` implies `NULLS LAST`;
+                    // record the clause only when it overrides that.
+                    nulls_first: (nulls_first != descending).then_some(nulls_first),
+                    opclass: opclasses.get(pos).and_then(Clone::clone),
+                });
+            }
+            let include: Vec<String> = col_names
+                .iter()
+                .skip(nkeyatts)
+                .enumerate()
+                .map(|(offset, name)| match name {
+                    Some(col) => col.clone(),
+                    None => col_defs.get(nkeyatts + offset).cloned().unwrap_or_default(),
+                })
+                .collect();
+
+            let predicate = ix.try_get::<Option<String>, _>("predicate").unwrap_or(None).map(|raw| {
+                crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw)
+            });
+            let with_options = ix
+                .try_get::<Option<Vec<String>>, _>("reloptions")
+                .unwrap_or(None)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|opt| {
+                    let (key, value) = opt.split_once('=')?;
+                    Some((key.trim().to_lowercase(), value.trim().to_string()))
+                })
+                .collect();
 
             indexes.push(IndexDef {
                 name: Some(index_name),
-                columns: col_names
-                    .into_iter()
-                    .map(|c| IndexColumn { name: c, order: None })
-                    .collect(),
+                columns,
                 unique: indisunique,
-                index_type,
+                index_type: Some(crate::entity::IndexType::from_amname(&index_type_str)),
+                predicate,
+                include,
+                nulls_not_distinct: ix.try_get("nulls_not_distinct").unwrap_or(false),
+                with_options,
             });
         }
 

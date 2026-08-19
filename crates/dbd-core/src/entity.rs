@@ -182,21 +182,64 @@ pub struct ColumnDef {
 }
 
 /// Index definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Models everything about a Postgres index that distinguishes it from another
+/// index on the same columns, because reconcile compares an authored index
+/// against an introspected one: anything this struct cannot hold is invisible to
+/// that comparison and shows up as permanent, never-converging drift.
+///
+/// Every field past `index_type` is `#[serde(default)]` so snapshots written
+/// before it existed still deserialize.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: Option<String>,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
     pub index_type: Option<IndexType>,
+    /// `WHERE` predicate of a partial index, canonicalized via
+    /// [`crate::sql_expr::canonicalize_predicate`] so the authored spelling and
+    /// `pg_get_expr`'s analyzed one compare equal.
+    #[serde(default)]
+    pub predicate: Option<String>,
+    /// Non-key payload columns: `INCLUDE (a, b)`.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// `NULLS NOT DISTINCT` — makes NULLs collide instead of duplicate, so it
+    /// changes what a UNIQUE index actually enforces.
+    #[serde(default)]
+    pub nulls_not_distinct: bool,
+    /// Access-method storage parameters: `WITH (m = 16, ef_construction = 64)`.
+    /// Keyed and ordered by name so an authored and a `reloptions` ordering
+    /// compare equal.
+    #[serde(default)]
+    pub with_options: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One entry in an index's key list: a column, or an expression over columns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IndexColumn {
+    /// A column name, or the expression text when [`Self::is_expression`].
     pub name: String,
+    /// Whether `name` holds an expression (`(context ->> 'module')`, `lower(x)`)
+    /// rather than a column name. Emitters must not quote an expression as an
+    /// identifier — that produces `column "(context ->> 'module')" does not exist`.
+    #[serde(default)]
+    pub is_expression: bool,
     pub order: Option<SortOrder>,
+    /// `NULLS FIRST` (`Some(true)`) / `NULLS LAST` (`Some(false)`); `None` for
+    /// the access method's default.
+    #[serde(default)]
+    pub nulls_first: Option<bool>,
+    /// Operator class, e.g. `vector_cosine_ops` — picks which operators the
+    /// index can answer, so two indexes differing only here are not the same.
+    #[serde(default)]
+    pub opclass: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// An index access method. Postgres's set is open-ended (extensions add `hnsw`,
+/// `ivfflat`, `bloom`, …), so unrecognized methods round-trip through
+/// [`IndexType::Other`] rather than collapsing to the btree default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexType {
     Btree,
@@ -207,6 +250,37 @@ pub enum IndexType {
     /// SP-GiST. Serializes as `spgist` (Postgres's `pg_am.amname`).
     #[serde(rename = "spgist")]
     SpGist,
+    /// Any other access method, held as its `pg_am.amname`.
+    Other(String),
+}
+
+impl IndexType {
+    /// The `pg_am.amname` for this access method — what `USING <method>` takes.
+    pub fn amname(&self) -> &str {
+        match self {
+            IndexType::Btree => "btree",
+            IndexType::Hash => "hash",
+            IndexType::Gin => "gin",
+            IndexType::Gist => "gist",
+            IndexType::Brin => "brin",
+            IndexType::SpGist => "spgist",
+            IndexType::Other(name) => name,
+        }
+    }
+
+    /// Parse a `pg_am.amname`, mapping the methods dbd names explicitly and
+    /// keeping anything else verbatim.
+    pub fn from_amname(amname: &str) -> Self {
+        match amname.to_lowercase().as_str() {
+            "btree" => IndexType::Btree,
+            "hash" => IndexType::Hash,
+            "gin" => IndexType::Gin,
+            "gist" => IndexType::Gist,
+            "brin" => IndexType::Brin,
+            "spgist" => IndexType::SpGist,
+            other => IndexType::Other(other.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

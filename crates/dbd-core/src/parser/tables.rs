@@ -74,9 +74,14 @@ fn process_create_table(
     references: &mut Vec<Reference>,
 ) {
     for col_def in &create_table.columns {
-        let (col, col_refs) = extract_column(col_def, default_schema);
+        let (col, col_refs, col_checks) = extract_column(col_def, default_schema);
         columns.push(col);
         references.extend(col_refs);
+        // Postgres promotes a column-level CHECK to a table constraint, and
+        // introspection reports it as one, so lift it here too. Dropping it —
+        // as the parser used to — made every inline CHECK look like a live-only
+        // constraint that reconcile would offer to delete.
+        constraints.extend(col_checks);
     }
 
     for constraint in &create_table.constraints {
@@ -130,8 +135,12 @@ fn record_comment(
     }
 }
 
-/// Extract a column definition from a sqlparser ColumnDef.
-fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, Vec<Reference>) {
+/// Extract a column definition from a sqlparser ColumnDef, along with any
+/// column-level `CHECK` constraints, which belong to the table.
+fn extract_column(
+    col_def: &SqlColumnDef,
+    default_schema: &str,
+) -> (ColumnDef, Vec<Reference>, Vec<TableConstraint>) {
     let name = col_def.name.value.clone();
     let data_type = col_def.data_type.to_string();
     let mut nullable = true;
@@ -141,8 +150,9 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
     let mut default_value = None;
     let mut inline_fk = None;
     let mut references = Vec::new();
+    let mut checks = Vec::new();
 
-    for ColumnOptionDef { option, .. } in &col_def.options {
+    for ColumnOptionDef { name: option_name, option, .. } in &col_def.options {
         match option {
             ColumnOption::PrimaryKey(_) => {
                 is_pk = true;
@@ -159,6 +169,18 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
             }
             ColumnOption::Default(expr) => {
                 default_value = Some(expr.to_string());
+            }
+            ColumnOption::Check(chk) => {
+                // `col int constraint c check (…)` parks the name on the option,
+                // not on the inner constraint.
+                let name = option_name
+                    .as_ref()
+                    .or(chk.name.as_ref())
+                    .map(|n| n.value.clone());
+                checks.push(TableConstraint::Check {
+                    name,
+                    expression: chk.expr.to_string(),
+                });
             }
             ColumnOption::ForeignKey(fk_constraint) => {
                 let ref_table_parts: Vec<&str> =
@@ -244,7 +266,7 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
         inline_fk,
     };
 
-    (col, references)
+    (col, references, checks)
 }
 
 /// Extract a table-level constraint.
@@ -324,6 +346,11 @@ fn extract_table_constraint(
 }
 
 /// Extract an index definition from a CREATE INDEX statement.
+///
+/// Everything the statement says is captured, because whatever is dropped here
+/// reads as drift against the introspected index forever. The `WHERE` predicate
+/// is canonicalized so an authored `where status = 'active'` matches the
+/// `status = 'active'::sensei.memory_status` Postgres reports back.
 fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
     let name = create_index
         .name
@@ -333,15 +360,26 @@ fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
     let columns: Vec<IndexColumn> = create_index
         .columns
         .iter()
-        .map(|col| IndexColumn {
-            name: col.column.expr.to_string(),
-            order: col.column.options.asc.map(|asc| {
-                if asc {
-                    crate::entity::SortOrder::Asc
-                } else {
-                    crate::entity::SortOrder::Desc
-                }
-            }),
+        .map(|col| {
+            // An `Identifier` is a column name; anything else — `(a ->> 'b')`,
+            // `lower(x)` — is an expression and must never be quoted as one.
+            let (name, is_expression) = match &col.column.expr {
+                sqlparser::ast::Expr::Identifier(ident) => (ident.value.clone(), false),
+                expr => (expr.to_string(), true),
+            };
+            IndexColumn {
+                name,
+                is_expression,
+                order: col.column.options.asc.map(|asc| {
+                    if asc {
+                        crate::entity::SortOrder::Asc
+                    } else {
+                        crate::entity::SortOrder::Desc
+                    }
+                }),
+                nulls_first: col.column.options.nulls_first,
+                opclass: col.operator_class.as_ref().map(|c| c.to_string()),
+            }
         })
         .collect();
 
@@ -350,25 +388,49 @@ fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
         columns,
         unique: create_index.unique,
         index_type: convert_index_type(create_index.using.as_ref()),
+        predicate: create_index.predicate.as_ref().map(|p| {
+            let raw = p.to_string();
+            crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw)
+        }),
+        include: create_index.include.iter().map(|i| i.value.clone()).collect(),
+        // `NULLS DISTINCT` is the default, so only `NOT DISTINCT` is recorded.
+        nulls_not_distinct: create_index.nulls_distinct == Some(false),
+        with_options: create_index.with.iter().filter_map(with_option).collect(),
     }
 }
 
-/// Map sqlparser's `USING <method>` to our [`crate::entity::IndexType`]. Access
-/// methods dbd's model can't represent (Bloom, user-defined `Custom`) fall back
-/// to `None` (the btree default) — the honest representation, since emitting a
-/// bogus `USING` clause would be worse than omitting it.
+/// Parse one `WITH (…)` storage parameter, which sqlparser hands over as the
+/// expression `key = value`. Anything not in that shape is skipped rather than
+/// guessed at.
+fn with_option(expr: &sqlparser::ast::Expr) -> Option<(String, String)> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            Some((left.to_string().to_lowercase(), right.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Map sqlparser's `USING <method>` to our [`crate::entity::IndexType`].
+///
+/// Extension methods arrive as `Custom` (`hnsw`, `ivfflat`) and are preserved via
+/// [`crate::entity::IndexType::Other`] — collapsing them to the btree default
+/// used to make a vector index unrepresentable, and reconcile then tried to
+/// recreate it as a btree.
 fn convert_index_type(using: Option<&sqlparser::ast::IndexType>) -> Option<crate::entity::IndexType> {
     use crate::entity::IndexType as Ours;
     use sqlparser::ast::IndexType as Theirs;
-    match using? {
-        Theirs::BTree => Some(Ours::Btree),
-        Theirs::Hash => Some(Ours::Hash),
-        Theirs::GIN => Some(Ours::Gin),
-        Theirs::GiST => Some(Ours::Gist),
-        Theirs::SPGiST => Some(Ours::SpGist),
-        Theirs::BRIN => Some(Ours::Brin),
-        Theirs::Bloom | Theirs::Custom(_) => None,
-    }
+    Some(match using? {
+        Theirs::BTree => Ours::Btree,
+        Theirs::Hash => Ours::Hash,
+        Theirs::GIN => Ours::Gin,
+        Theirs::GiST => Ours::Gist,
+        Theirs::SPGiST => Ours::SpGist,
+        Theirs::BRIN => Ours::Brin,
+        Theirs::Bloom => Ours::Other("bloom".to_string()),
+        Theirs::Custom(ident) => Ours::from_amname(&ident.value),
+    })
 }
 
 /// Convert sqlparser's ReferentialAction to our FkAction.
@@ -501,6 +563,113 @@ mod tests {
             def.indexes[0].index_type,
             Some(IndexType::Gin),
             "the GIN access method must be captured from `USING gin`"
+        );
+    }
+
+    /// A column-level `CHECK` belongs to the table, exactly as Postgres stores it
+    /// and introspection reports it. Dropping it made every inline CHECK look like
+    /// a live-only constraint that reconcile would offer to delete.
+    #[test]
+    fn lifts_column_level_check_to_a_table_constraint() {
+        let stmts = parse(
+            "CREATE TABLE foo (
+               singleton boolean primary key default true check (singleton),
+               source    text not null check (source in ('mcp', 'builtin')),
+               qty       int constraint foo_qty_chk check (qty > 0)
+             );",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        let checks: Vec<_> = def
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::Check { name, expression } => Some((name.clone(), expression.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks.len(), 3, "every inline CHECK must be captured; got {checks:?}");
+        assert!(checks.iter().any(|(n, e)| n.is_none() && e == "singleton"));
+        assert!(checks.iter().any(|(n, _)| n.as_deref() == Some("foo_qty_chk")));
+    }
+
+    /// An extension access method (`hnsw`) arrives as sqlparser's `Custom` and
+    /// must survive as itself. Collapsing it to the btree default made a vector
+    /// index unrepresentable, so reconcile kept trying to rebuild it as a btree.
+    #[test]
+    fn extracts_extension_access_method() {
+        use crate::entity::IndexType;
+        let stmts = parse(
+            "CREATE TABLE foo (id int, embedding vector(3));
+             CREATE INDEX foo_hnsw ON foo USING hnsw (embedding vector_cosine_ops)
+               WITH (m = 16, ef_construction = 64)
+              WHERE embedding IS NOT NULL;",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        let ix = &def.indexes[0];
+        assert_eq!(ix.index_type, Some(IndexType::Other("hnsw".to_string())));
+        assert_eq!(ix.columns[0].opclass, Some("vector_cosine_ops".to_string()));
+        assert_eq!(ix.predicate, Some("embedding IS NOT NULL".to_string()));
+        assert_eq!(ix.with_options.get("m"), Some(&"16".to_string()));
+        assert_eq!(ix.with_options.get("ef_construction"), Some(&"64".to_string()));
+    }
+
+    /// An expression key must be flagged as one. Storing it in `name` as if it
+    /// were a column made the emitter quote it, producing
+    /// `column "(context ->> 'module')" does not exist`.
+    #[test]
+    fn extracts_expression_index_key_as_an_expression() {
+        let stmts = parse(
+            "CREATE TABLE foo (id int, context jsonb, name text);
+             CREATE INDEX foo_module ON foo ((context ->> 'module'), lower(name));",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        let cols = &def.indexes[0].columns;
+        assert!(cols[0].is_expression, "a JSON path key is an expression, not a column");
+        assert!(cols[1].is_expression, "a function call key is an expression");
+        assert_eq!(
+            crate::emit::emit_index_column(&cols[0]),
+            "(context ->> 'module')",
+            "an expression key must not be quoted as an identifier"
+        );
+    }
+
+    /// A plain column key stays a column, so it still gets quoted.
+    #[test]
+    fn extracts_plain_column_index_key_as_a_column() {
+        let stmts = parse(
+            "CREATE TABLE foo (id int, folder_id int);
+             CREATE UNIQUE INDEX foo_folder ON foo (folder_id)
+               NULLS NOT DISTINCT
+              WHERE folder_id IS NOT NULL;",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        let ix = &def.indexes[0];
+        assert!(!ix.columns[0].is_expression);
+        assert!(ix.nulls_not_distinct, "NULLS NOT DISTINCT changes what UNIQUE enforces");
+        assert_eq!(ix.predicate, Some("folder_id IS NOT NULL".to_string()));
+    }
+
+    /// The authored predicate is canonicalized on the way in, so it matches the
+    /// analyzed form Postgres reports for the same index.
+    #[test]
+    fn canonicalizes_the_partial_index_predicate() {
+        let stmts = parse(
+            "CREATE TABLE foo (id int, scope text);
+             CREATE INDEX foo_scope ON foo (id) where scope in ('user', 'project');",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        assert_eq!(
+            def.indexes[0].predicate.as_deref(),
+            crate::sql_expr::canonicalize_predicate(
+                "scope = ANY (ARRAY['user'::text, 'project'::text])"
+            )
+            .as_deref(),
+            "authored and introspected predicate spellings must canonicalize alike"
         );
     }
 

@@ -312,22 +312,17 @@ fn push_column_alter_sql(
 }
 
 /// `CREATE [UNIQUE] INDEX …` for a newly added index.
+///
+/// Delegates to [`crate::emit::emit_index_sql`] so the migration SQL carries the
+/// same clauses (access method, operator class, `WHERE`, `WITH`, …) the initial
+/// apply would. Rendering a reduced form here is what made a partial or `hnsw`
+/// index diff forever: the statement created something other than what the design
+/// declared, so the next diff reported the same change again.
 fn index_add_sql(entity_name: &str, idx: &crate::entity::IndexDef) -> String {
-    let unique_str = if idx.unique { "UNIQUE " } else { "" };
-    let idx_name = idx.name.as_deref().unwrap_or("unnamed");
-    let cols: Vec<String> = idx
-        .columns
-        .iter()
-        .map(|c| match c.order {
-            Some(crate::entity::SortOrder::Desc) => format!("{} DESC", c.name),
-            Some(crate::entity::SortOrder::Asc) => format!("{} ASC", c.name),
-            None => c.name.clone(),
-        })
-        .collect();
-    format!(
-        "CREATE {}INDEX {} ON {} ({});",
-        unique_str, idx_name, entity_name, cols.join(", ")
-    )
+    // `entity_name` is the already-qualified `schema.table`, and the fallback
+    // index name only needs the bare table part.
+    let table_name = entity_name.rsplit('.').next().unwrap_or(entity_name);
+    crate::emit::emit_index_sql(idx, entity_name, table_name, false)
 }
 
 /// Escape single quotes for a SQL string literal (doubling), matching `emit.rs`.
@@ -411,11 +406,15 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             sql
         }
         TableConstraint::Check { name, expression } => {
-            let con_name = name.as_deref().unwrap_or("unnamed");
-            format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
-                entity_name, con_name, expression
-            )
+            // An unnamed CHECK (the design's inline `check (…)`) is emitted
+            // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
+            // rather than literally naming the constraint "unnamed", which is
+            // what a shared name would then collide on. Mirrors the FK arm.
+            let con_clause = name
+                .as_deref()
+                .map(|n| format!("CONSTRAINT {n} "))
+                .unwrap_or_default();
+            format!("ALTER TABLE {entity_name} ADD {con_clause}CHECK ({expression});")
         }
     }
 }
