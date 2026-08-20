@@ -67,6 +67,12 @@ pub fn cmd_import_dry_run(
         .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
         .collect();
 
+    // Anything the scan or plan left out, before listing what remains — so a
+    // preview that shows no steps still explains itself.
+    for warning in design.import_warnings(name) {
+        output::warn(&warning);
+    }
+
     // Step 1: Data loading
     for entry in &plan {
         let file = entry.table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
@@ -156,9 +162,13 @@ pub async fn cmd_import(
     spinner.finish();
     result?;
 
-    if let Some(s) = import_summary {
-        output::info(verbosity, &format_import_summary(&s));
+    let summary = import_summary.unwrap_or_default();
+    // Always reported, whatever the verbosity: these are the reasons a data file
+    // did not load, and a silent skip is what makes an empty import look fine.
+    for warning in &summary.warnings {
+        output::warn(warning);
     }
+    output::info(verbosity, &format_import_summary(&summary));
     Ok(())
 }
 

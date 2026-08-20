@@ -230,7 +230,15 @@ pub(super) fn format_import_summary(s: &ImportComplete) -> String {
 pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> String {
     let apply_line = format_apply_summary(&s.apply);
     let import_line = format_import_summary(&s.import);
-    format!("{apply_line} {import_line}")
+    let policy_line = format!(
+        "{} policy file(s) applied{}.",
+        s.policies.applied.len(),
+        match s.policies.failed.len() {
+            0 => String::new(),
+            n => format!(", {n} failed"),
+        }
+    );
+    format!("{apply_line} {import_line} {policy_line}")
 }
 
 // ── Database adapter ──────────────────────────────────────────────────────────
@@ -436,21 +444,49 @@ mod tests {
 
     #[test]
     fn format_import_summary_reports_counts() {
-        let s = ImportComplete { tables: 3, procedures: 2, after_scripts: 1 };
+        let s = ImportComplete { tables: 3, procedures: 2, after_scripts: 1, ..Default::default() };
         let out = format_import_summary(&s);
         assert!(out.contains("3 table"), "expected table count in: {out}");
         assert!(out.contains("2 procedure"), "expected procedure count in: {out}");
         assert!(out.contains("1 after script"), "expected after-script count in: {out}");
     }
 
+    /// An import that loaded nothing still reports — a blank line here is what
+    /// made a deploy that seeded no rows look like a success.
     #[test]
-    fn format_deploy_summary_combines_apply_and_import() {
+    fn format_import_summary_reports_zero_explicitly() {
+        let out = format_import_summary(&ImportComplete::default());
+        assert!(out.contains("0 table"), "a zero import must still be stated: {out}");
+    }
+
+    #[test]
+    fn format_deploy_summary_combines_apply_import_and_policies() {
         let s = dbd_core::design::DeployComplete {
             apply: apply_complete(ApplyStrategy::Fresh),
-            import: ImportComplete { tables: 2, procedures: 1, after_scripts: 0 },
+            import: ImportComplete { tables: 2, procedures: 1, ..Default::default() },
+            policies: dbd_core::design::PolicyReport {
+                applied: vec![std::path::PathBuf::from("policies/users.sql")],
+                failed: Vec::new(),
+            },
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("Fresh") && out.contains("table"));
+        assert!(out.contains("1 policy file(s) applied"), "policy phase must be reported: {out}");
+    }
+
+    /// Failed policy files are non-fatal, so the summary must say how many
+    /// failed — otherwise a deploy reports success with RLS not applied.
+    #[test]
+    fn format_deploy_summary_reports_failed_policies() {
+        let s = dbd_core::design::DeployComplete {
+            policies: dbd_core::design::PolicyReport {
+                applied: Vec::new(),
+                failed: vec![(std::path::PathBuf::from("policies/bad.sql"), "boom".to_string())],
+            },
+            ..Default::default()
+        };
+        let out = format_deploy_summary(&s);
+        assert!(out.contains("1 failed"), "failed policy count must be reported: {out}");
     }
 
     /// `$VAR` is looked up (falling back to the literal when unset); a plain
