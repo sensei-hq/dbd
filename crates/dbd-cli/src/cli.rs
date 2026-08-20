@@ -134,7 +134,7 @@ pub enum Commands {
         #[arg(long, env = "DBD_DIAGRAM_URL")]
         site: Option<String>,
     },
-    /// Deploy from source: fetch + apply + import
+    /// Deploy from source: fetch + apply + import + policies
     Deploy {
         /// Preview what would be executed
         #[arg(long)]

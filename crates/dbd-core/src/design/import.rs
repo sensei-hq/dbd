@@ -1,6 +1,58 @@
 use super::*;
 
 impl Design {
+    /// Staging data files excluded from the import plan because their entity
+    /// failed to parse.
+    ///
+    /// Exposed so callers can report them — a data file that dbd could not read
+    /// must never vanish from a run without a word.
+    pub fn import_invalid_tables(&self) -> Vec<&Entity> {
+        self.import_tables.iter().filter(|t| !t.errors.is_empty()).collect()
+    }
+
+    /// Diagnostics for everything the `import/` scan and plan construction left
+    /// out, before any scope filtering. Empty when nothing was excluded.
+    ///
+    /// `name` is the caller's `--name` filter, if any, so an entity name that
+    /// matches no staging file is reported as the typo it is rather than as a
+    /// clean empty import.
+    pub fn import_warnings(&self, name: Option<&str>) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if let Some(n) = name
+            && !self.import_tables.iter().any(|t| t.name == n)
+        {
+            warnings.push(format!("no staging data file matches --name {n} — nothing to import"));
+        }
+
+        if self.import_scan_skips.dir_missing {
+            warnings.push(
+                "no import/ directory — nothing to import (create import/<schema>/<table>.csv to seed data)"
+                    .to_string(),
+            );
+        }
+
+        for env in self.import_scan_skips.skipped_envs() {
+            let count =
+                self.import_scan_skips.skipped_by_env.iter().filter(|(e, _)| e == env).count();
+            warnings.push(format!(
+                "{count} data file(s) under import/{env}/ skipped — this run's env is '{}'",
+                self.env
+            ));
+        }
+
+        for table in self.import_invalid_tables() {
+            let file = table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+            warnings.push(format!(
+                "staging table {} not imported — data file failed to parse ({file}): {}",
+                table.name,
+                table.errors.join("; ")
+            ));
+        }
+
+        warnings
+    }
+
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
     /// Procedure matching is based on reads/writes analysis, not naming convention:
@@ -12,6 +64,9 @@ impl Design {
     ///          import_lookup_values reads staging.lookup_values, writes config.lookup_values
     ///          config.lookup_values has FK to config.lookups
     ///          → import_lookups must run before import_lookup_values
+    ///
+    /// Staging tables that failed to parse are excluded here; they are reported
+    /// separately via [`Design::import_invalid_tables`].
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
         let tables: Vec<&Entity> = self
             .import_tables
@@ -131,14 +186,22 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ImportComplete),
     {
+        let mut warnings = self.import_warnings(name);
+
         let plan = self.import_plan(name);
         let plan: Vec<ImportPlanEntry> = match scope {
             Some(s) if !s.is_all => {
                 self.check_scope_gaps(s)?;
                 let ws = self.working_set(s)?;
-                plan.into_iter()
-                    .filter(|e| import_entry_in_scope(e, &ws, false))
-                    .collect()
+                let (kept, dropped): (Vec<_>, Vec<_>) =
+                    plan.into_iter().partition(|e| import_entry_in_scope(e, &ws, false));
+                for entry in &dropped {
+                    warnings.push(format!(
+                        "staging table {} not imported — outside scope '{}'",
+                        entry.table.name, s.name
+                    ));
+                }
+                kept
             }
             _ => plan,
         };
@@ -165,7 +228,7 @@ impl Design {
             .import_run_after_scripts(adapter, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
 
-        (progress.on_complete)(ImportComplete { tables, procedures, after_scripts });
+        (progress.on_complete)(ImportComplete { tables, procedures, after_scripts, warnings });
         Ok(())
     }
 
