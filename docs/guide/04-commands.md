@@ -133,6 +133,18 @@ Procedures are matched by reads/writes analysis (which procedure reads from whic
 
 **Environment-specific data.** Files placed under `import/<env>/<schema>/<file>` are loaded only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment. So `import/dev/staging/seed.csv` loads on `dbd import -e dev` but not under `prod`, letting you ship dev seed data without it reaching production.
 
+**Nothing is skipped silently.** The summary always states the table count — including `0` — and any file that did not load is reported with its reason:
+
+| Reason | Warning |
+| --- | --- |
+| No `import/` directory | `no import/ directory — nothing to import` |
+| File belongs to another env | `N data file(s) under import/<env>/ skipped — this run's env is '<env>'` |
+| Staging file failed to parse | `staging table X not imported — data file failed to parse` |
+| Entry cut by `--scope` | `staging table X not imported — outside scope '<name>'` |
+| `-n` matched no staging file | `no staging data file matches --name <name>` |
+
+This is what makes the wrong-`-e` trap visible: a run that seeds no rows now says so instead of reporting a clean, empty success.
+
 ---
 
 ## `dbd combine`
@@ -260,7 +272,16 @@ Use `dbd apply` to execute pending migrations. There is no separate migrate --ap
 
 ## `dbd deploy`
 
-Deploy from a local path or GitHub source. Runs apply + import in one step.
+Deploy from a local path or GitHub source. Runs apply + import + policies in one
+step — `deploy` means bringing the database fully up from source, so RLS policies
+from `policies/` are applied unconditionally (unlike `apply`, where they are
+opt-in behind `--with-policies`).
+
+Every phase reports its count, including zero. If nothing was imported, `deploy`
+says why — no `import/` directory, data files belonging to a different `--env`,
+a staging file that failed to parse, or entries cut by the active `--scope`.
+A policy file that fails is non-fatal: it is reported as a warning and counted
+in the summary, and the deploy still succeeds.
 
 ```sh
 dbd deploy --source owner/repo/path -d $DATABASE_URL    # From GitHub

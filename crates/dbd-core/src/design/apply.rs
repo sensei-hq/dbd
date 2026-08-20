@@ -288,60 +288,88 @@ impl Design {
         Ok(())
     }
 
-    /// Deploy the full schema: apply DDL then import seed data.
+    /// Deploy the full schema: apply DDL, import seed data, then apply RLS
+    /// policies.
     ///
-    /// Equivalent to `apply` followed by `import_data`. dbd handles
-    /// fresh / migrate / current strategy automatically — safe to call
-    /// on every bootstrap (idempotent when schema is already current).
+    /// This is the same three-phase pipeline `dbd deploy` runs, and the CLI
+    /// delegates to it — one implementation, so the library and the command can
+    /// not drift apart. dbd handles fresh / migrate / current strategy
+    /// automatically, so this is safe to call on every bootstrap (idempotent
+    /// when the schema is already current).
     ///
-    /// `on_complete(summary)` is called once after both phases succeed with
-    /// combined version info and step counts.
+    /// Policies come from `policies/` and are applied unconditionally, unlike
+    /// [`Design::apply`] where they are opt-in: "deploy" means bringing the
+    /// database fully up from source. A policy file that fails does NOT fail the
+    /// deploy — it lands in [`DeployComplete::policies`]`.failed` and the caller
+    /// reports it as a warning.
+    ///
+    /// `progress.on_complete(summary)` is called once after all phases with the
+    /// combined counts and every non-fatal diagnostic
+    /// ([`DeployComplete::warnings`]).
     pub async fn deploy<C>(
         &self,
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
-        mut on_complete: C,
+        on_complete: C,
     ) -> Result<()>
     where
+        C: FnMut(DeployComplete),
+    {
+        self.deploy_with_progress(adapter, dry_run, scope, Progress {
+            on_start: |_: &str| {},
+            on_done: |_: &str, _: Option<&str>| {},
+            on_complete,
+        })
+        .await
+    }
+
+    /// [`Design::deploy`] with per-step progress callbacks, for callers that
+    /// render a spinner or log each step (this is what `dbd deploy` uses).
+    ///
+    /// Identical pipeline and reporting — only the progress plumbing differs.
+    pub async fn deploy_with_progress<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        mut progress: Progress<S, D, C>,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
         C: FnMut(DeployComplete),
     {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
         self.apply(adapter, None, dry_run, scope, Progress {
-            on_start: |_: &str| {},
-            on_done: |_: &str, _: Option<&str>| {},
+            on_start: &mut progress.on_start,
+            on_done: &mut progress.on_done,
             on_complete: |s| {
                 apply_summary = Some(s);
             },
         })
         .await?;
 
+        // Always run the import phase, even when the plan is empty: it still
+        // executes the project's `import.after` scripts, and its summary is what
+        // reports "0 table(s) loaded" plus the reason why.
         self.import_data(adapter, None, dry_run, scope, Progress {
-            on_start: |_: &str| {},
-            on_done: |_: &str, _: Option<&str>| {},
+            on_start: &mut progress.on_start,
+            on_done: &mut progress.on_done,
             on_complete: |s| {
                 import_summary = Some(s);
             },
         })
         .await?;
 
-        on_complete(DeployComplete {
-            apply: apply_summary.unwrap_or(ApplyComplete {
-                strategy: ApplyStrategy::Current,
-                from_version: 0,
-                to_version: 0,
-                applied: 0,
-                migrated: 0,
-                created: 0,
-                dropped: 0,
-            }),
-            import: import_summary.unwrap_or(ImportComplete {
-                tables: 0,
-                procedures: 0,
-                after_scripts: 0,
-            }),
+        let policies = super::apply_policies(adapter, &self.project_dir, dry_run).await?;
+
+        (progress.on_complete)(DeployComplete {
+            apply: apply_summary.unwrap_or_default(),
+            import: import_summary.unwrap_or_default(),
+            policies,
         });
         Ok(())
     }

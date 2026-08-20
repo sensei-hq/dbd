@@ -25,7 +25,7 @@ mod plan;
 pub use plan::{build_execution_plan, ApplyStrategy, ExecutionPlan, ExecutionStep};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ApplyComplete {
     pub strategy: ApplyStrategy,
     pub from_version: u32,
@@ -51,18 +51,43 @@ struct ApplyCounts {
 }
 
 /// Summary passed to the `on_complete` callback of `import_data()`.
-#[derive(Debug, Clone)]
+///
+/// A zero-count import is a legitimate outcome, but it must never be a *silent*
+/// one: every reason the plan came up short — no `import/` directory, files
+/// belonging to another env, staging tables that failed to parse, entries cut by
+/// the active scope — is recorded in `warnings` so the caller can report it.
+#[derive(Debug, Clone, Default)]
 pub struct ImportComplete {
     pub tables: u32,
     pub procedures: u32,
     pub after_scripts: u32,
+    /// Non-fatal diagnostics explaining anything the import left out.
+    pub warnings: Vec<String>,
 }
 
 /// Combined summary passed to the `on_complete` callback of `deploy()`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeployComplete {
     pub apply: ApplyComplete,
     pub import: ImportComplete,
+    /// Outcome of the RLS policy phase. Failures here are non-fatal — they are
+    /// reported as warnings and the deploy still succeeds.
+    pub policies: PolicyReport,
+}
+
+impl DeployComplete {
+    /// Every non-fatal diagnostic from the deploy, ready to print as warnings:
+    /// the import's own warnings followed by one line per failed policy file.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = self.import.warnings.clone();
+        out.extend(
+            self.policies
+                .failed
+                .iter()
+                .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
+        );
+        out
+    }
 }
 
 /// Bundled progress callbacks for a long-running operation: `on_start(desc)` is
@@ -215,6 +240,10 @@ pub struct ImportPlanEntry {
 }
 
 /// Result of applying RLS policies.
+///
+/// A failed policy file is non-fatal — it is collected here and surfaced as a
+/// warning rather than aborting the run — so callers MUST report `failed`.
+#[derive(Debug, Clone, Default)]
 pub struct PolicyReport {
     pub applied: Vec<PathBuf>,
     pub failed: Vec<(PathBuf, String)>,
@@ -322,6 +351,9 @@ pub struct Design {
     config: DesignConfig,
     entities: Vec<Entity>,
     import_tables: Vec<Entity>,
+    /// What the `import/` scan left out, kept so an import that loads nothing
+    /// can explain itself instead of reporting a bare zero.
+    import_scan_skips: crate::scanner::ImportScan,
     project_dir: PathBuf,
     env: String,
     validated: bool,
@@ -449,8 +481,9 @@ impl Design {
 
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
-        let import_files = scanner::scan_import(&project_dir, Some(env))?;
-        let import_tables: Vec<Entity> = import_files
+        let mut import_scan = scanner::scan_import(&project_dir, Some(env))?;
+        let import_tables: Vec<Entity> = import_scan
+            .files
             .iter()
             .map(|file| {
                 // Use the relative path for entity type/name/schema derivation,
@@ -461,11 +494,15 @@ impl Design {
                 entity
             })
             .collect();
+        // The selected files are now represented by `import_tables`; keep only
+        // the scan's exclusion record so nothing is stored twice.
+        import_scan.files = Vec::new();
 
         Ok(Self {
             config: design_config,
             entities,
             import_tables,
+            import_scan_skips: import_scan,
             project_dir,
             env: env.to_string(),
             validated: false,
@@ -1578,6 +1615,175 @@ mod tests {
         assert_eq!(plan[0].table.name, "staging.lookups");
     }
 
+    // ── Import diagnostics: nothing is dropped silently ───
+
+    /// Build a throwaway project with the given files under `import/`.
+    fn project_with_import_files(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: warn_test\n  version: 1\nsource:\n  dialect: postgresql\n",
+        )
+        .unwrap();
+        for (rel, contents) in files {
+            let path = tmp.path().join("import").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        }
+        tmp
+    }
+
+    fn load_project(dir: &Path, env: &str) -> Design {
+        Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).unwrap()
+    }
+
+    /// Data files belonging to another env are excluded by design — but the
+    /// exclusion must be *reported*. This is the wrong-`--env` case where a
+    /// deploy loads no rows and previously said nothing at all.
+    #[test]
+    fn import_warns_about_files_skipped_for_another_env() {
+        let tmp = project_with_import_files(&[
+            ("dev/staging/lookups.csv", "id,name\n1,a\n"),
+            ("prod/staging/lookups.csv", "id,name\n2,b\n"),
+        ]);
+        let design = load_project(tmp.path(), "prod");
+
+        let warnings = design.import_warnings(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("import/dev/") && w.contains("prod")),
+            "skipping another env's files must be reported: {warnings:?}"
+        );
+    }
+
+    /// The matching env's files are used, so there is nothing to warn about.
+    #[test]
+    fn import_does_not_warn_when_every_file_matches_the_env() {
+        let tmp = project_with_import_files(&[("dev/staging/lookups.csv", "id,name\n1,a\n")]);
+        let design = load_project(tmp.path(), "dev");
+        assert!(
+            design.import_warnings(None).is_empty(),
+            "a fully-matching import set must not warn: {:?}",
+            design.import_warnings(None)
+        );
+    }
+
+    /// A project with no `import/` directory reports why it has nothing to load
+    /// instead of quietly importing zero rows.
+    #[test]
+    fn import_warns_when_import_dir_is_absent() {
+        let tmp = project_with_import_files(&[]);
+        let design = load_project(tmp.path(), "dev");
+        let warnings = design.import_warnings(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("no import/ directory")),
+            "an absent import/ dir must be explained: {warnings:?}"
+        );
+    }
+
+    /// Entries cut by the active scope are reported through the import summary
+    /// — the scope filter is the least visible of the drop paths, because the
+    /// data file exists, parses, and matches the env, yet still never loads.
+    #[tokio::test]
+    async fn import_warns_about_entries_dropped_by_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/config")).unwrap();
+        std::fs::create_dir_all(dir.join("import/staging")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: scope_warn_test\n  version: 1\n\
+             source:\n  dialect: postgresql\n\
+             schemas:\n  - config\n  - staging\n\
+             import:\n  staging:\n    - staging\n\
+             scopes:\n  config_only:\n    includes:\n      - config\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/config/things.ddl"),
+            "create table if not exists config.things (id int primary key);\n",
+        )
+        .unwrap();
+        // A staging data file with no matching import procedure, so the entry is
+        // kept or dropped on the staging table's own scope membership.
+        std::fs::write(dir.join("import/staging/lookups.csv"), "id,name\n1,a\n").unwrap();
+
+        let design = load_project(dir, "dev");
+        assert!(!design.import_tables().is_empty(), "the staging file must be discovered");
+
+        let scope = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = MockAdapter::new();
+        let mut summary: Option<ImportComplete> = None;
+        design
+            .import_data(&mock, None, /*dry_run*/ true, Some(&scope), Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            })
+            .await
+            .unwrap();
+
+        let summary = summary.expect("import must always report a summary");
+        assert_eq!(summary.tables, 0, "the out-of-scope staging table must not load");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("staging.lookups") && w.contains("outside scope")),
+            "a scope-dropped entry must be reported: {:?}",
+            summary.warnings
+        );
+    }
+
+    /// A `--name` that matches no staging file is a typo, and must not look
+    /// like an empty-but-healthy import.
+    #[tokio::test]
+    async fn import_warns_when_name_filter_matches_nothing() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "dev").unwrap();
+
+        let mock = MockAdapter::new();
+        let mut summary: Option<ImportComplete> = None;
+        design
+            .import_data(&mock, Some("staging.does_not_exist"), true, None, Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            })
+            .await
+            .unwrap();
+
+        let summary = summary.expect("import must always report a summary");
+        assert_eq!(summary.tables, 0);
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("does_not_exist")),
+            "an unmatched --name must be reported: {:?}",
+            summary.warnings
+        );
+    }
+
+    /// An import that loads nothing still delivers a summary — the caller needs
+    /// the zero to report it.
+    #[tokio::test]
+    async fn import_always_reports_a_summary_even_with_no_data() {
+        let tmp = project_with_import_files(&[]);
+        let design = load_project(tmp.path(), "dev");
+
+        let mock = MockAdapter::new();
+        let mut summary: Option<ImportComplete> = None;
+        design
+            .import_data(&mock, None, false, None, Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            })
+            .await
+            .unwrap();
+
+        let summary = summary.expect("import must report a summary even when it loads nothing");
+        assert_eq!(summary.tables, 0);
+        assert!(!summary.warnings.is_empty(), "a zero import must carry its reason");
+    }
+
     // ── Import truncate test ──────────────────────────────
 
     #[tokio::test]
@@ -2236,6 +2442,89 @@ mod tests {
 
         assert!(mock.applied_names().is_empty(), "dry_run must not apply any entities");
         assert!(mock.imported_names().is_empty(), "dry_run must not import any data");
+    }
+
+    /// The export must run the SAME three phases as `dbd deploy` — including
+    /// RLS policies, which it previously skipped entirely. An embedder calling
+    /// `Design::deploy` got a database with no policies applied and no warning.
+    #[tokio::test]
+    async fn deploy_export_applies_policies_like_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(
+            tmp.path().join("policies/users.sql"),
+            "ALTER TABLE config.users ENABLE ROW LEVEL SECURITY;",
+        )
+        .unwrap();
+
+        let design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .deploy(&mock, false, None, |s| summary = Some(s))
+            .await
+            .unwrap();
+
+        let summary: DeployComplete = summary.expect("deploy must report a summary");
+        assert_eq!(summary.policies.applied.len(), 1, "policy file must be applied by the export");
+        assert!(summary.policies.failed.is_empty());
+    }
+
+    /// A deploy with nothing to import must still report a summary — the zero
+    /// count is the signal that the registry rows did not load.
+    #[tokio::test]
+    async fn deploy_reports_zero_import_with_reason_when_no_import_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
+
+        let design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .deploy(&mock, false, None, |s| summary = Some(s))
+            .await
+            .unwrap();
+
+        let summary: DeployComplete = summary.expect("deploy must report a summary even with no data");
+        assert_eq!(summary.import.tables, 0);
+        let warnings = summary.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("no import/ directory")),
+            "a missing import/ dir must be explained, not silent: {warnings:?}"
+        );
+    }
+
+    /// A policy file that fails must not fail the deploy, but it MUST come back
+    /// as a warning — non-fatal is fine, silent is not.
+    #[tokio::test]
+    async fn deploy_reports_failed_policy_as_warning_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(tmp.path().join("policies/broken.sql"), "THIS IS NOT SQL;").unwrap();
+
+        let design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let mock = MockAdapter::new().fail_script_containing("THIS IS NOT SQL");
+        let mut summary = None;
+        let result = design
+            .deploy(&mock, false, None, |s| summary = Some(s))
+            .await;
+
+        assert!(result.is_ok(), "a failed policy file must not fail the deploy");
+        let summary: DeployComplete = summary.expect("deploy must report a summary");
+        assert_eq!(summary.policies.failed.len(), 1, "the failure must be recorded");
+        let warnings = summary.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("policy not applied") && w.contains("broken.sql")),
+            "failed policy must surface as a warning: {warnings:?}"
+        );
     }
 
     // ── Policy tests ────────────────────────────────────────

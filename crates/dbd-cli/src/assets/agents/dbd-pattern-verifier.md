@@ -8,9 +8,11 @@ description: >-
   one) — plus non-idempotent DDL, hardcoded secrets in design.yaml, wrong/plural
   type folders, misfiled view/matview DDL (a matview under ddl/view/ that makes
   reset emit DROP VIEW), string-set CHECK constraints that should be Postgres
-  enums, and materialized-view drift misuse. Reviews from the files (no DB
-  needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only if the
-  binary is present.
+  enums, materialized-view drift misuse, seed data that can never load (an
+  `import/<env>/` tree no deploy env ever matches, files outside the `import/`
+  convention, or a `--scope` that drops them), and RLS expected from `dbd apply`
+  without `--with-policies`. Reviews from the files (no DB needed); corroborates
+  with `dbd doctor`/`dbd inspect`/`dbd diff` only if the binary is present.
 
   <example>
   Context: A developer changed some DDL in a dbd project and is about to apply it.
@@ -73,6 +75,21 @@ judging the workflow, and state which one you concluded and why (the file eviden
 6. **Materialized-view drift misuse** — code/docs that expect `reconcile` to auto-recreate a
    drifted matview (it only warns; a recreate is a manual `DROP … CASCADE` + re-apply), or a
    matview created outside dbd that will read as `unstamped`.
+7. **Seed data that can never load** — the schema applies, but the rows never arrive.
+   - An `import/<env>/…` directory whose `<env>` matches no environment the project actually
+     deploys with (check `-e`/`--environment` in install scripts, CI, Makefiles, READMEs).
+     `import/dev/staging/x.csv` is invisible to a `-e prod` deploy — by design, and dbd now warns,
+     but the *layout* is still the bug when no run ever uses that env.
+   - Data files outside the convention: anything under `data/` or `seeds/` rather than
+     `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
+   - A `--scope` in the deploy command whose working set excludes the staging tables (or the
+     tables the import procedures write to) — those entries are dropped from the import plan.
+   - Evidence: the `import/` tree next to the actual deploy/install invocation.
+8. **RLS expected but never applied** — an install path that runs `dbd apply` (RLS is opt-in,
+   needs `--with-policies`) while the project has a `policies/` directory, or docs claiming
+   `apply` covers policies. `dbd deploy` applies them unconditionally; `dbd apply` does not.
+   Note that a *failed* policy file is non-fatal on deploy (warned + counted, exit 0), so
+   "the deploy succeeded" is not evidence that RLS is in place.
 
 ## How to work
 

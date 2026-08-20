@@ -81,7 +81,7 @@ Phase 1 covers the core commands that work with a local or remote source:
 | `inspect`    | P0       | Config parsing, DDL scanning, validation |
 | `apply`      | P0       | Full entity apply with migrations    |
 | `import`     | P0       | CSV/TSV/JSONL data loading           |
-| `deploy`     | P0       | Fetch + apply + import               |
+| `deploy`     | P0       | Fetch + apply + import + policies    |
 | `combine`    | P0       | Combine DDL into single file         |
 | `graph`      | P1       | Dependency graph as JSON             |
 | `dbml`       | P1       | DBML generation                      |
@@ -1423,7 +1423,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Deploy from source: fetch + apply + import
+    /// Deploy from source: fetch + apply + import + policies
     Deploy {
         #[arg(long)]
         dry_run: bool,

@@ -62,7 +62,7 @@ myproject/
 | `dbd import` | Load staging data from CSV/TSV/JSONL files |
 | `dbd export` | Export table data to csv/tsv/jsonl files |
 | `dbd refresh` | Refresh materialized views now (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`); `--name <entity>` or `<schema>.*` to target a subset. Scheduled refresh is managed via pg_cron |
-| `dbd deploy` | Fetch from GitHub or local path + apply + import |
+| `dbd deploy` | Fetch from GitHub or local path + apply + import + RLS policies |
 | `dbd combine` | Combine all DDL into a single SQL file |
 | `dbd graph` | Output dependency graph as JSON |
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |

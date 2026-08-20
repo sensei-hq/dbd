@@ -47,6 +47,35 @@ pub fn scan_ddl(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Outcome of scanning `import/`: the selected files plus everything that was
+/// deliberately left out.
+///
+/// The exclusions are carried rather than discarded so callers can report why an
+/// import loaded nothing. "No `import/` directory" and "every data file belongs
+/// to a different env" both produce zero files, and a bare empty list cannot
+/// tell those apart — which is exactly the case where a deploy looks like it
+/// succeeded while loading no rows at all.
+#[derive(Debug, Clone, Default)]
+pub struct ImportScan {
+    /// Data files selected for this env, sorted.
+    pub files: Vec<PathBuf>,
+    /// The project has no `import/` directory at all.
+    pub dir_missing: bool,
+    /// Data files excluded because the leading component under `import/` names a
+    /// different env. Each entry is `(env_name, path_relative_to_import_dir)`.
+    pub skipped_by_env: Vec<(String, PathBuf)>,
+}
+
+impl ImportScan {
+    /// Distinct env names that owned at least one excluded file, sorted.
+    pub fn skipped_envs(&self) -> Vec<&str> {
+        let mut envs: Vec<&str> = self.skipped_by_env.iter().map(|(e, _)| e.as_str()).collect();
+        envs.sort_unstable();
+        envs.dedup();
+        envs
+    }
+}
+
 /// Scan the `import/` folder for data files (.csv, .tsv, .json, .jsonl).
 ///
 /// When `env` is `None`, all files under `import/` are returned regardless of depth.
@@ -58,13 +87,16 @@ pub fn scan_ddl(root: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// This lets projects keep shared seed data in `import/staging/` and
 /// environment-specific fixtures in `import/dev/staging/` or `import/prod/staging/`.
-pub fn scan_import(root: &Path, env: Option<&str>) -> Result<Vec<PathBuf>> {
+///
+/// Files excluded by the env rule are reported in [`ImportScan::skipped_by_env`]
+/// rather than dropped silently.
+pub fn scan_import(root: &Path, env: Option<&str>) -> Result<ImportScan> {
     let import_dir = root.join("import");
     if !import_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(ImportScan { dir_missing: true, ..Default::default() });
     }
 
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut scan = ImportScan::default();
     for entry in WalkDir::new(&import_dir) {
         let entry = entry
             .map_err(|e| DbdError::Config(format!("scan {}: {e}", import_dir.display())))?;
@@ -85,27 +117,29 @@ pub fn scan_import(root: &Path, env: Option<&str>) -> Result<Vec<PathBuf>> {
         };
         // Count directories between import/ and the file.
         let parent_depth = relative.parent().map(|p| p.components().count()).unwrap_or(0);
-        let include = if parent_depth <= 1 {
-            // import/file or import/{schema}/file — always included
-            true
+        // import/file and import/{schema}/file are always included; only
+        // import/{env}/{…}/file is env-gated.
+        let owning_env = if parent_depth <= 1 {
+            None
         } else {
-            // import/{env}/{schema}/file — include only when env matches
-            match env {
-                None => true,
-                Some(target) => relative
-                    .iter()
-                    .next()
-                    .and_then(|c| c.to_str())
-                    .is_some_and(|first| first == target),
-            }
+            relative.iter().next().and_then(|c| c.to_str()).map(|s| s.to_string())
         };
-        if include {
-            files.push(entry.into_path());
+
+        match (owning_env, env) {
+            // Depth-gated file whose env does not match the target env.
+            (Some(owner), Some(target)) if owner != target => {
+                scan.skipped_by_env.push((owner, relative.to_path_buf()));
+            }
+            _ => {
+                let path = entry.path().to_path_buf();
+                scan.files.push(path);
+            }
         }
     }
 
-    files.sort();
-    Ok(files)
+    scan.files.sort();
+    scan.skipped_by_env.sort();
+    Ok(scan)
 }
 
 /// Scan the `policies/` folder for policy files (.ddl, .sql).
@@ -186,41 +220,60 @@ mod tests {
         assert!(files.is_empty());
     }
 
+    /// File names of an `ImportScan`'s selected files, for terse assertions.
+    fn selected_names(scan: &ImportScan) -> Vec<&str> {
+        scan.files.iter().filter_map(|f| f.file_name().and_then(|n| n.to_str())).collect()
+    }
+
     #[test]
     fn scan_import_finds_data_files() {
         let tmp = create_test_project();
         // No env filter: all data files returned
-        let files = scan_import(tmp.path(), None).unwrap();
+        let scan = scan_import(tmp.path(), None).unwrap();
+        let files = &scan.files;
 
         assert_eq!(files.len(), 3);
-        let names: Vec<&str> = files
-            .iter()
-            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
-            .collect();
+        let names = selected_names(&scan);
         assert!(names.contains(&"lookups.csv"));
         assert!(names.contains(&"events.jsonl"));
         assert!(names.contains(&"fixtures.csv"));
         // notes.txt should not be included
         assert!(!names.contains(&"notes.txt"));
+        // Nothing is env-gated when env is None, so nothing is reported as skipped.
+        assert!(scan.skipped_by_env.is_empty());
+        assert!(!scan.dir_missing);
     }
 
+    /// A missing `import/` directory must be distinguishable from an `import/`
+    /// directory that simply held no matching files — the caller reports the
+    /// two differently, so an empty file list alone is not enough.
     #[test]
-    fn scan_import_returns_empty_when_no_import_dir() {
+    fn scan_import_flags_missing_import_dir() {
         let tmp = TempDir::new().unwrap();
-        let files = scan_import(tmp.path(), None).unwrap();
-        assert!(files.is_empty());
+        let scan = scan_import(tmp.path(), None).unwrap();
+        assert!(scan.files.is_empty());
+        assert!(scan.dir_missing, "absent import/ must be flagged, not just empty");
+    }
+
+    /// An `import/` directory that exists but holds no data files is NOT
+    /// "missing" — the project opted in and left it empty.
+    #[test]
+    fn scan_import_present_but_empty_dir_is_not_missing() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("import")).unwrap();
+        let scan = scan_import(tmp.path(), None).unwrap();
+        assert!(scan.files.is_empty());
+        assert!(!scan.dir_missing, "an existing but empty import/ is not missing");
     }
 
     #[test]
     fn scan_import_env_includes_matching_env() {
         let tmp = create_test_project();
         // env="dev": depth-1 files + import/dev/** included; import/prod/** excluded
-        let files = scan_import(tmp.path(), Some("dev")).unwrap();
+        let scan = scan_import(tmp.path(), Some("dev")).unwrap();
+        let files = &scan.files;
 
-        let names: Vec<&str> = files
-            .iter()
-            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
-            .collect();
+        let names = selected_names(&scan);
         // Depth-1 files always included
         assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
         assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
@@ -229,16 +282,31 @@ mod tests {
         assert_eq!(files.len(), 3);
     }
 
+    /// Excluding another env's fixtures must be *reported*, not silent — this is
+    /// the case where a deploy under the wrong `--env` loads no rows and, before
+    /// this, said nothing about the files it walked past.
+    #[test]
+    fn scan_import_reports_files_skipped_for_other_envs() {
+        let tmp = create_test_project();
+        let scan = scan_import(tmp.path(), Some("prod")).unwrap();
+
+        assert_eq!(scan.skipped_envs(), vec!["dev"], "dev fixtures must be reported as skipped");
+        let skipped: Vec<&str> = scan
+            .skipped_by_env
+            .iter()
+            .filter_map(|(_, p)| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert_eq!(skipped, vec!["fixtures.csv"]);
+    }
+
     #[test]
     fn scan_import_env_excludes_other_envs() {
         let tmp = create_test_project();
         // env="prod": import/dev/** excluded, only depth-1 files returned
-        let files = scan_import(tmp.path(), Some("prod")).unwrap();
+        let scan = scan_import(tmp.path(), Some("prod")).unwrap();
+        let files = &scan.files;
 
-        let names: Vec<&str> = files
-            .iter()
-            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
-            .collect();
+        let names = selected_names(&scan);
         assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
         assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
         assert!(!names.contains(&"fixtures.csv"), "fixtures.csv excluded for prod: {names:?}");
