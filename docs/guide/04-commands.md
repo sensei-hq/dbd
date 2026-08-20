@@ -689,7 +689,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.8
+  rev: v0.10.9
   hooks:
     - id: dbd-format
 ```
