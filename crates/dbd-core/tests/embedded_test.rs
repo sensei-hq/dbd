@@ -1582,11 +1582,16 @@ async fn reconcile_warns_on_matview_definition_change() {
     // Persist the current matview oid in a table (survives across pooled
     // connections) so a later DO block can compare against it. A drop+recreate
     // changes the oid; an untouched matview keeps it.
+    //
+    // Schema-qualified deliberately: the fixture DDL runs `set search_path to
+    // app`, which sticks to whichever pooled connection ran it, so an
+    // unqualified name here resolves inconsistently depending on which
+    // connection the pool hands back.
     async fn stash_oid(adapter: &dyn dbd_core::DatabaseAdapter) {
         adapter
             .execute_script(
-                "DROP TABLE IF EXISTS _mv_oid; \
-                 CREATE TABLE _mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
+                "DROP TABLE IF EXISTS public._mv_oid; \
+                 CREATE TABLE public._mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
             )
             .await
             .expect("stash oid failed");
@@ -1595,7 +1600,7 @@ async fn reconcile_warns_on_matview_definition_change() {
         adapter
             .execute_script(&format!(
                 "DO $$ BEGIN \
-                   IF (SELECT oid FROM _mv_oid) <> 'app.mv'::regclass::oid \
+                   IF (SELECT oid FROM public._mv_oid) <> 'app.mv'::regclass::oid \
                    THEN RAISE EXCEPTION '{msg}'; END IF; END $$;"
             ))
             .await
@@ -1795,8 +1800,8 @@ async fn diff_live_reports_matview_drift_read_only() {
     // Snapshot app.mv's oid so we can prove diff_live never recreated it.
     adapter
         .execute_script(
-            "DROP TABLE IF EXISTS _mv_oid; \
-             CREATE TABLE _mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
+            "DROP TABLE IF EXISTS public._mv_oid; \
+             CREATE TABLE public._mv_oid AS SELECT 'app.mv'::regclass::oid AS oid;",
         )
         .await
         .expect("stash oid failed");
@@ -1818,7 +1823,7 @@ async fn diff_live_reports_matview_drift_read_only() {
     adapter
         .execute_script(
             "DO $$ BEGIN \
-               IF (SELECT oid FROM _mv_oid) <> 'app.mv'::regclass::oid \
+               IF (SELECT oid FROM public._mv_oid) <> 'app.mv'::regclass::oid \
                THEN RAISE EXCEPTION 'diff_live recreated app.mv but it must be read-only'; END IF; END $$;",
         )
         .await

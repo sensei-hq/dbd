@@ -4,13 +4,15 @@ use crate::entity::{Entity, EntityType};
 use crate::snapshot::PendingMigration;
 
 /// Strategy for applying entities.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ApplyStrategy {
     /// Fresh database — no previous version, apply everything.
     Fresh,
     /// Pending migrations exist — interleave migrations with applies.
     Migrate,
-    /// Already current — just re-apply idempotent DDL.
+    /// Already current — just re-apply idempotent DDL. Also the default for a
+    /// summary describing a run that applied nothing.
+    #[default]
     Current,
 }
 

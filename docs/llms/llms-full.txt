@@ -452,7 +452,11 @@ naming convention.
 
 ### dbd deploy
 
-One-shot: fetch source → apply → import → cleanup.
+One-shot: fetch source → apply → import → policies → cleanup.
+
+`deploy` means "bring the database fully up from source", so RLS policies from
+`policies/` are applied **unconditionally** — unlike `dbd apply`, where they are
+opt-in behind `--with-policies`.
 
 ```sh
 dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
@@ -468,6 +472,25 @@ GitHub sources are cached under `~/.cache/dbd` (macOS: `~/Library/Caches/dbd`).
 `--no-cache` re-downloads the current source; `--clear-cache` removes the entire
 cache directory before deploying. Both are no-ops for local path sources
 (`--clear-cache` still clears the cache).
+
+**Nothing is skipped silently.** Every phase reports its count, including zero,
+and a deploy that imports nothing says why:
+
+| Reason a data file did not load | Reported as |
+| --- | --- |
+| No `import/` directory | `no import/ directory — nothing to import` |
+| File under `import/<other-env>/` | `N data file(s) under import/<env>/ skipped — this run's env is '<env>'` |
+| Staging file failed to parse | `staging table X not imported — data file failed to parse` |
+| Entry cut by `--scope` | `staging table X not imported — outside scope '<name>'` |
+| `-n <name>` matched no staging file | `no staging data file matches --name <name>` |
+
+A policy file that fails is **non-fatal**: it is reported as a warning, counted
+in the summary (`N policy file(s) applied, M failed`), and the deploy still
+exits 0. This is the wrong-`--env` trap — a deploy that applied DDL but seeded
+no rows used to look indistinguishable from a clean success.
+
+`dbd deploy` is a thin wrapper over the library's `Design::deploy`, so the CLI
+and an embedding application run the identical pipeline and cannot drift.
 
 ### dbd reconcile
 
@@ -585,6 +608,10 @@ dbd apply --with-policies   # apply entities + policies in one step
 Row-Level Security policy files contain idempotent SQL (`enable row level
 security`, `drop policy if exists`, `create policy`). Failures are logged and
 skipped (fail-forward); exit code 1 if any failed.
+
+`dbd deploy` (and `Design::deploy`) runs this phase unconditionally as its final
+step. There, a failed policy file is a warning rather than an error: it is
+reported and counted, and the deploy still exits 0.
 
 ### dbd combine
 
@@ -797,8 +824,10 @@ let adapter = connect("postgres://localhost/mydb", &design.config().project.name
 // Resolve the scope once (None, None ⇒ full design, the scope's default deps policy).
 let scope = design.resolve_scope(None, None)?;
 
-// apply / import_data / deploy all take: (&*adapter, name, dry_run, scope,
+// apply / import_data take: (&*adapter, name, dry_run, scope,
 // on_start(&str), on_done(&str, Option<&str>), on_complete(summary)).
+// deploy drops the name and takes only on_complete: (&*adapter, dry_run,
+// scope, on_complete(DeployComplete)).
 design
     .apply(&*adapter, None, /*dry_run*/ false, Some(&scope),
         |desc| println!("→ {desc}"),
@@ -807,8 +836,15 @@ design
     .await?;
 design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
 
-// Or apply + import in one call:
-// design.deploy(&*adapter, false, Some(&scope), |s| println!("v{}", s.apply.to_version)).await?;
+// Or apply + import + policies in one call — the same pipeline `dbd deploy`
+// runs, so an embedder and the CLI cannot drift. A failed policy file does not
+// fail the deploy; it lands in s.policies.failed and in s.warnings().
+design.deploy(&*adapter, false, Some(&scope), |s| {
+    println!("v{} — {} table(s) imported", s.apply.to_version, s.import.tables);
+    for w in s.warnings() { eprintln!("warning: {w}"); }
+}).await?;
+// Use design.deploy_with_progress(&*adapter, dry_run, scope, Progress { .. })
+// for per-step callbacks (spinner / logging).
 
 // Dependency graph (for visualization) — returns Result.
 let graph = design.graph(None, None)?;

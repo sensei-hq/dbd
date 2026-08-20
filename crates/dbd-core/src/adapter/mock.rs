@@ -23,6 +23,9 @@ pub struct MockAdapter {
     pub supports_txn: bool,
     /// If set, `apply_entity` errors for this entity name (fault injection).
     pub fail_on: Arc<Mutex<Option<String>>>,
+    /// If set, `execute_script` errors for any SQL containing this substring
+    /// (fault injection — used to exercise failed policy files).
+    pub fail_script_on: Arc<Mutex<Option<String>>>,
     /// Entities `introspect()` reports as the live database state. Empty by
     /// default, i.e. an empty live DB.
     pub introspected: Arc<Mutex<Vec<Entity>>>,
@@ -46,6 +49,7 @@ impl MockAdapter {
             txn: Arc::new(Mutex::new(Vec::new())),
             supports_txn: false,
             fail_on: Arc::new(Mutex::new(None)),
+            fail_script_on: Arc::new(Mutex::new(None)),
             introspected: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -53,6 +57,13 @@ impl MockAdapter {
     /// Report transactional-apply support so `Design::apply` wraps the batch.
     pub fn with_transactions(mut self) -> Self {
         self.supports_txn = true;
+        self
+    }
+
+    /// Make `execute_script` fail for any SQL containing `needle`, to exercise
+    /// non-fatal failure paths such as a broken policy file.
+    pub fn fail_script_containing(self, needle: &str) -> Self {
+        *self.fail_script_on.lock().unwrap() = Some(needle.to_string());
         self
     }
 
@@ -147,6 +158,13 @@ impl DatabaseAdapter for MockAdapter {
 
     async fn execute_script(&self, sql: &str) -> Result<()> {
         self.scripts.lock().unwrap().push(sql.to_string());
+        if let Some(needle) = self.fail_script_on.lock().unwrap().as_deref()
+            && sql.contains(needle)
+        {
+            return Err(crate::error::DbdError::Config(
+                "mock: injected failure executing script".to_string(),
+            ));
+        }
         Ok(())
     }
 

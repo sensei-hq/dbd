@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete, Progress};
+use dbd_core::design::Progress;
 use dbd_core::Design;
 
 use super::{format_deploy_summary, get_adapter, safe_copy, safe_read, safe_write};
@@ -359,10 +359,28 @@ pub async fn cmd_deploy(
             report.issues.len(),
             report.warnings.len(),
         ));
-        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
-        if !policy_files.is_empty() {
-            output::info(verbosity, &format!("{} policy file(s) would be applied.", policy_files.len()));
+
+        // Preview the import the same way the real run reports it: always state
+        // the file count — including zero — and why anything was left out.
+        let ws = design.working_set(&resolved)?;
+        let import_plan: Vec<_> = design
+            .import_plan(None)
+            .into_iter()
+            .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
+            .collect();
+        output::info(
+            verbosity,
+            &format!("{} data file(s) would be imported.", import_plan.len()),
+        );
+        for warning in design.import_warnings(None) {
+            output::warn(&warning);
         }
+
+        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
+        output::info(
+            verbosity,
+            &format!("{} policy file(s) would be applied.", policy_files.len()),
+        );
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
@@ -370,84 +388,39 @@ pub async fn cmd_deploy(
     let adapter = get_adapter(&config_path, database_url).await?;
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+
+    // Delegate to the library's `Design::deploy` — apply + import + policies —
+    // so `dbd deploy` and an embedder calling the crate run the same pipeline.
     output::info(verbosity, "Applying schema...");
-    let mut apply_summary: Option<ApplyComplete> = None;
+    let mut summary: Option<dbd_core::design::DeployComplete> = None;
     {
         let spinner = output::StepSpinner::new(verbosity);
         let result = design
-            .apply(
+            .deploy_with_progress(
                 &*adapter,
-                None,
                 false,
                 Some(&resolved),
                 Progress {
                     on_start: |desc: &str| spinner.start(desc),
                     on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
-                    on_complete: |s| apply_summary = Some(s),
+                    on_complete: |s| summary = Some(s),
                 },
             )
             .await;
         spinner.finish();
-        result.context("Apply failed")?;
+        result.context("Deploy failed")?;
     }
 
-    let mut import_summary: Option<ImportComplete> = None;
-    let ws = design.working_set(&resolved)?;
-    let import_plan: Vec<_> = design
-        .import_plan(None)
-        .into_iter()
-        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
-        .collect();
-    if !import_plan.is_empty() {
-        output::info(verbosity, &format!("Importing {} data file(s)...", import_plan.len()));
-        let spinner = output::StepSpinner::new(verbosity);
-        let result = design
-            .import_data(
-                &*adapter,
-                None,
-                false,
-                Some(&resolved),
-                Progress {
-                    on_start: |desc: &str| spinner.start(desc),
-                    on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
-                    on_complete: |s| import_summary = Some(s),
-                },
-            )
-            .await;
-        spinner.finish();
-        result.context("Import failed")?;
+    let summary = summary.unwrap_or_default();
+    if !summary.policies.applied.is_empty() {
+        output::info(verbosity, &format!("Applied {} policy file(s).", summary.policies.applied.len()));
     }
-
-    // RLS policies from policies/ are part of a full deploy — applied
-    // unconditionally (unlike `apply`, which gates them behind --with-policies)
-    // because `deploy` means "bring the DB fully up from source". No-op when the
-    // project has no policies/ dir.
-    let policy_report = dbd_core::design::apply_policies(&*adapter, &project_dir, false)
-        .await
-        .context("Policy apply failed")?;
-    if !policy_report.applied.is_empty() {
-        output::info(verbosity, &format!("Applied {} policy file(s).", policy_report.applied.len()));
+    // Non-fatal diagnostics — skipped imports and failed policy files — are
+    // always surfaced, regardless of verbosity. A deploy that quietly loaded
+    // nothing is the failure mode this reporting exists to prevent.
+    for warning in summary.warnings() {
+        output::warn(&warning);
     }
-    for (file, err) in &policy_report.failed {
-        output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
-    }
-
-    let summary = dbd_core::design::DeployComplete {
-        apply: apply_summary.unwrap_or(dbd_core::design::ApplyComplete {
-            strategy: ApplyStrategy::Current,
-            from_version: 0,
-            to_version: 0,
-            applied: 0,
-            migrated: 0,
-            created: 0,
-            dropped: 0,
-        }),
-        import: import_summary.unwrap_or(ImportComplete {
-            tables: 0,
-            procedures: 0,
-            after_scripts: 0,
-        }),
-    };
     output::info(verbosity, &format_deploy_summary(&summary));
     Ok(())
 }

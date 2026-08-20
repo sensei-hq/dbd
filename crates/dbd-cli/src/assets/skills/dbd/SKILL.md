@@ -51,7 +51,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd release` (`baseline`) | Cut v1: baseline snapshot + `project.released: true` (locks in snapshot/migration flow) |
 | `dbd snapshot` | Diff vs latest snapshot → migration SQL (smart multi-stage for renames/type changes) |
 | `dbd migrate --status` | Show migration status (read-only; `apply` runs them) |
-| `dbd import` / `export` | Load / dump table data (CSV/TSV/JSONL) via the `import/` & `export/` conventions |
+| `dbd import` / `export` | Load / dump table data (CSV/TSV/JSONL) via the `import/` & `export/` conventions. Env-scoped: `import/<env>/<schema>/<file>` loads only when `-e <env>` matches; `import/<schema>/<file>` loads always. Never skips silently — see the seed-data gotcha below |
 | `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
@@ -89,6 +89,30 @@ referenced by an index or constraint passes `inspect` cleanly and only fails at
 `apply`, as a database error. Column-level correctness is the database's job, not
 `inspect`'s.
 
+## Critical gotcha — schema applied, rows missing
+
+DDL applying is not evidence that seed data loaded. `dbd deploy` runs
+**apply → import → policies**; the import phase can legitimately load nothing,
+and the usual cause is layout, not failure:
+
+- **Wrong env.** `import/<env>/<schema>/<file>` loads only when `-e <env>` matches.
+  A `-e prod` deploy walks straight past `import/dev/…`.
+- **Outside the convention.** Only `import/**` with a `.csv`/`.tsv`/`.json`/`.jsonl`
+  extension is scanned — `data/` and `seeds/` are invisible.
+- **Cut by `--scope`.** An entry is dropped when its procedure's write targets
+  (or, with no procedure, the staging table itself) fall outside the scope.
+- **Unparseable staging file**, or a `-n <name>` matching no staging file.
+
+dbd reports every one of these: the summary always states the table count —
+including `0` — followed by the reason. **Do not treat a silent-looking success
+as proof**; read the count. Verify against the database (`select count(*)`),
+not the exit code.
+
+Policies are the same shape: `deploy` applies them unconditionally, but a failed
+policy file is **non-fatal** — warned and counted, exit still 0. "The deploy
+succeeded" does not mean RLS is in place. `dbd apply` skips policies entirely
+unless given `--with-policies`.
+
 ## Workflow — pre-release vs upgrades (read this before changing a schema)
 
 dbd has **two** schema-change workflows and using the wrong one corrupts the
@@ -121,6 +145,7 @@ Otherwise it is **pre-release**.
 - **Secrets via `$ENV_VAR`** in `design.yaml` target URLs — never a literal connection string.
 - **String-set `CHECK` → consider an enum**: `check (status in ('a','b'))` is better modeled as a Postgres `enum` (`ddl/enum/…`) for type safety + introspection. `dbd inspect` suggests these.
 - **`inspect` doesn't check column-level refs** (index/CHECK/FK column lists) — those fail at `apply` as DB errors, not at `inspect`.
+- **Seed data lands where the env says it does**: `import/<env>/…` only loads under `-e <env>`. If a deploy must seed rows, check the reported import count (never assume) and confirm `policies/` is applied by `deploy`, not by a bare `apply`.
 - **Run `dbd doctor` to verify layout** before `reset`/`apply`. Beyond old-format config, stale files, and plural folders (all `--fix`-able), it flags **misfiled view/matview DDL**: dbd types an entity by its folder, so a `CREATE MATERIALIZED VIEW` sitting under `ddl/view/` is treated as a plain view and `dbd reset` emits `DROP VIEW` on it → `"… is not a view"`. doctor prints the file and a move hint (`→ ddl/materialized_view/<schema>/…`); move the file to fix (not auto-fixed — folder = type is the source of truth).
 
 ## Materialized views
@@ -172,11 +197,21 @@ design
         |summary| println!("applied {} entities", summary.applied))
     .await?;
 
-// Or apply + import in one call:
-design.deploy(&*adapter, false, Some(&scope), |s| println!("deployed to v{}", s.apply.to_version)).await?;
+// Or apply + import + policies in one call — the same pipeline `dbd deploy` runs:
+design.deploy(&*adapter, false, Some(&scope), |s| {
+    println!("deployed to v{}", s.apply.to_version);
+    println!("{} table(s) imported", s.import.tables);
+    // Non-fatal diagnostics: skipped imports and failed policy files.
+    for w in s.warnings() { eprintln!("warning: {w}"); }
+}).await?;
 ```
+
+`deploy` applies RLS policies from `policies/` unconditionally, so an embedder
+gets the same end state as the CLI. A failing policy file does not fail the
+deploy — it lands in `summary.policies.failed` and is surfaced by
+`summary.warnings()`. Use `deploy_with_progress` for per-step callbacks.
 
 Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 `Entity` / `EntityType`, `SchemaModel`, `ResolvedScope`, `ApplyComplete` /
-`DeployComplete` / `ImportComplete`, `DbdError` / `Result`. RLS policies are
-orchestrated at the CLI layer via the free fn `dbd_core::design::apply_policies`.
+`DeployComplete` / `ImportComplete`, `DbdError` / `Result`. The free fn
+`dbd_core::design::apply_policies` remains available to apply policies alone.
