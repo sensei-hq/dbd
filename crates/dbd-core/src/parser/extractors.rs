@@ -162,9 +162,12 @@ fn qualify_relation(name: &sqlparser::ast::ObjectName, default_schema: &str) -> 
 /// Deliberately separate from [`collect_table_refs`]: that walker also feeds
 /// `Entity::reads`/`writes` for functions and procedures, which downstream
 /// consumers (import planning, scope analysis) read as *table* sets. Keeping
-/// function calls out of it means only views and materialized views gain these
-/// edges.
-fn collect_function_refs<N: sqlparser::ast::Visit>(
+/// function calls out of it means a caller opts in.
+///
+/// Works on any `Visit` node, so callers can pass a whole query or a single
+/// expression — a column `DEFAULT`, a `CHECK`, a generated-column expression or
+/// an index key (see `tables::extract_table`).
+pub(super) fn collect_function_refs<N: sqlparser::ast::Visit>(
     node: &N,
     default_schema: &str,
 ) -> Vec<Reference> {

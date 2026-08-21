@@ -514,6 +514,280 @@ fn all_tables_precede_every_view_and_routine() {
     );
 }
 
+// ── Table → function (issue #10) ─────────────────────────────────────────────
+
+const MAKE_SLUG: (&str, &str) = (
+    "ddl/function/app/make_slug.ddl",
+    "set search_path to app;\n\
+     create or replace function make_slug(n integer) returns text\n\
+     language sql immutable as $$ select 'x' || n $$;\n",
+);
+
+/// A column `DEFAULT` calling a project-managed function.
+#[test]
+fn table_with_default_calling_function_is_applied_after_it() {
+    let design = design_for(
+        "tbl_default",
+        &[
+            MAKE_SLUG,
+            (
+                "ddl/table/app/things.ddl",
+                "set search_path to app;\n\
+                 create table if not exists things (\n\
+                   id int primary key,\n\
+                   slug text default app.make_slug(1)\n\
+                 );\n",
+            ),
+        ],
+    );
+    assert_no_errors(&design);
+
+    let table = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.things")
+        .unwrap();
+    assert!(
+        table.refers.contains(&"app.make_slug".to_string()),
+        "DEFAULT function call should be a dependency: {:?}",
+        table.refers
+    );
+    assert!(
+        position(&design, "app.make_slug") < position(&design, "app.things"),
+        "function must be applied before the table whose DEFAULT calls it"
+    );
+}
+
+/// A `CHECK` constraint calling a project-managed function, both inline on the
+/// column and as a table-level constraint.
+#[test]
+fn table_with_check_calling_function_is_applied_after_it() {
+    let design = design_for(
+        "tbl_check",
+        &[
+            (
+                "ddl/function/app/is_valid.ddl",
+                "set search_path to app;\n\
+                 create or replace function is_valid(t text) returns boolean\n\
+                 language sql immutable as $$ select length(t) > 0 $$;\n",
+            ),
+            (
+                "ddl/table/app/inline_check.ddl",
+                "set search_path to app;\n\
+                 create table if not exists inline_check (\n\
+                   id int primary key,\n\
+                   name text check (app.is_valid(name))\n\
+                 );\n",
+            ),
+            (
+                "ddl/table/app/table_check.ddl",
+                "set search_path to app;\n\
+                 create table if not exists table_check (\n\
+                   id int primary key,\n\
+                   name text,\n\
+                   constraint name_ok check (app.is_valid(name))\n\
+                 );\n",
+            ),
+        ],
+    );
+    assert_no_errors(&design);
+
+    let fn_pos = position(&design, "app.is_valid");
+    assert!(
+        fn_pos < position(&design, "app.inline_check"),
+        "function must precede the table with an inline CHECK calling it"
+    );
+    assert!(
+        fn_pos < position(&design, "app.table_check"),
+        "function must precede the table with a table-level CHECK calling it"
+    );
+}
+
+/// A generated (computed) column calling a project-managed function.
+#[test]
+fn table_with_generated_column_calling_function_is_applied_after_it() {
+    let design = design_for(
+        "tbl_generated",
+        &[
+            MAKE_SLUG,
+            (
+                "ddl/table/app/gen.ddl",
+                "set search_path to app;\n\
+                 create table if not exists gen (\n\
+                   id int primary key,\n\
+                   slug text generated always as (app.make_slug(id)) stored\n\
+                 );\n",
+            ),
+        ],
+    );
+    assert_no_errors(&design);
+    assert!(
+        position(&design, "app.make_slug") < position(&design, "app.gen"),
+        "function must precede the table with a generated column calling it"
+    );
+}
+
+/// An index expression calling a project-managed function. The `CREATE INDEX`
+/// ships in the table's own DDL file, so it runs in the table's step.
+#[test]
+fn table_with_index_expression_calling_function_is_applied_after_it() {
+    let design = design_for(
+        "tbl_index_expr",
+        &[
+            MAKE_SLUG,
+            (
+                "ddl/table/app/indexed.ddl",
+                "set search_path to app;\n\
+                 create table if not exists indexed (id int primary key);\n\
+                 create index indexed_slug_idx on indexed (app.make_slug(id));\n",
+            ),
+        ],
+    );
+    assert_no_errors(&design);
+    assert!(
+        position(&design, "app.make_slug") < position(&design, "app.indexed"),
+        "function must precede the table with an index expression calling it"
+    );
+}
+
+/// Built-ins in a `DEFAULT` must not become dependencies, and must not warn.
+#[test]
+fn builtin_calls_in_table_defaults_do_not_warn() {
+    let design = design_for(
+        "tbl_builtin_default",
+        &[(
+            "ddl/table/app/events.ddl",
+            "set search_path to app;\n\
+             create table if not exists events (\n\
+               id uuid primary key default gen_random_uuid(),\n\
+               created_at timestamptz not null default now(),\n\
+               label text not null default coalesce(nullif('', ''), 'none')\n\
+             );\n",
+        )],
+    );
+    assert_no_errors(&design);
+
+    let table = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.events")
+        .unwrap();
+    assert!(
+        table.warnings.is_empty(),
+        "built-in DEFAULT calls must not warn: {:?}",
+        table.warnings
+    );
+    assert!(
+        table.refers.is_empty(),
+        "built-in DEFAULT calls must not be dependencies: {:?}",
+        table.refers
+    );
+}
+
+/// Both table↔function directions in one project, which no fixed order between
+/// the two types can satisfy: `helper` is called by a table DEFAULT, and
+/// `reads_table` reads that same table.
+#[test]
+fn both_table_function_directions_in_one_project() {
+    let design = design_for(
+        "tbl_both_ways",
+        &[
+            (
+                "ddl/function/app/helper.ddl",
+                "set search_path to app;\n\
+                 create or replace function helper(n integer) returns text\n\
+                 language sql immutable as $$ select 'h' || n $$;\n",
+            ),
+            (
+                "ddl/table/app/rows.ddl",
+                "set search_path to app;\n\
+                 create table if not exists rows (\n\
+                   id int primary key,\n\
+                   tag text default app.helper(1)\n\
+                 );\n",
+            ),
+            (
+                "ddl/function/app/reads_table.ddl",
+                "set search_path to app;\n\
+                 create or replace function reads_table() returns bigint\n\
+                 language sql stable as $$ select count(*) from app.rows $$;\n",
+            ),
+        ],
+    );
+    assert_no_errors(&design);
+
+    let helper = position(&design, "app.helper");
+    let rows = position(&design, "app.rows");
+    let reads = position(&design, "app.reads_table");
+    assert!(
+        helper < rows && rows < reads,
+        "expected helper < rows < reads_table, got {helper} / {rows} / {reads}"
+    );
+}
+
+/// A long FK chain must not push tables past the view/function bands.
+///
+/// This is the property the level `SPREAD` exists for: levels accumulate one
+/// step per dependency hop, so without a spread wider than the longest chain, a
+/// deep enough table would out-level a dependency-free routine and be applied
+/// after it.
+#[test]
+fn deep_fk_chain_does_not_push_tables_past_routines() {
+    let mut files: Vec<(String, String)> = vec![(
+        "ddl/table/app/t0.ddl".to_string(),
+        "set search_path to app;\ncreate table if not exists t0 (id int primary key);\n".to_string(),
+    )];
+    // t1 → t0 → … a 9-deep chain, deeper than the type-rank gap.
+    for i in 1..10 {
+        files.push((
+            format!("ddl/table/app/t{i}.ddl"),
+            format!(
+                "set search_path to app;\n\
+                 create table if not exists t{i} (\n\
+                   id int primary key,\n\
+                   prev int references app.t{prev}(id)\n\
+                 );\n",
+                prev = i - 1
+            ),
+        ));
+    }
+    files.push((
+        "ddl/view/app/v_free.ddl".to_string(),
+        "set search_path to app;\ncreate or replace view v_free as select 1 as x;\n".to_string(),
+    ));
+    files.push((
+        "ddl/function/app/f_free.ddl".to_string(),
+        "set search_path to app;\n\
+         create or replace function f_free() returns int language sql immutable as $$ select 1 $$;\n"
+            .to_string(),
+    ));
+
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let design = design_for("deep_chain", &borrowed);
+    assert_no_errors(&design);
+
+    // The deepest table still precedes both dependency-free routines.
+    let deepest = position(&design, "app.t9");
+    assert!(
+        deepest < position(&design, "app.v_free"),
+        "deep table t9 was pushed past a dependency-free view"
+    );
+    assert!(
+        deepest < position(&design, "app.f_free"),
+        "deep table t9 was pushed past a dependency-free function"
+    );
+    // And the chain itself is still ordered.
+    for i in 1..10 {
+        assert!(
+            position(&design, &format!("app.t{}", i - 1)) < position(&design, &format!("app.t{i}")),
+            "FK chain out of order at t{i}"
+        );
+    }
+}
+
 /// Sanity: the fixture project still loads and orders without errors, so the
 /// grouped sort has not introduced a cycle in real-world DDL.
 #[test]
