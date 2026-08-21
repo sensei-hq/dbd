@@ -118,16 +118,39 @@ pub async fn cmd_import(
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
+    // `--file` without `--name` is rejected before a connection is attempted, so
+    // the error is about the flags rather than the database.
+    if file.is_some() && name.is_none() {
+        bail!("--file requires --name <entity>");
+    }
+
+    let adapter = get_adapter(config, database_url).await?;
+    import_with_adapter(&*adapter, &design, name, file, scope, deps, verbosity).await
+}
+
+/// The body of `dbd import`, with the adapter supplied rather than connected.
+///
+/// Split out so the ad-hoc path's decisions — resolving a bare table name to its
+/// schema-qualified form, and inferring the format from the file extension — are
+/// testable against a recording adapter without a live database.
+pub(crate) async fn import_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    name: Option<&str>,
+    file: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     // Ad-hoc single-file import: `dbd import -n <entity> -f <path>`.
     if let Some(path) = file {
         let name = match name {
             Some(n) => n,
             None => bail!("--file requires --name <entity>"),
         };
-        let qualified = resolve_table_name(&design, name);
+        let qualified = resolve_table_name(design, name);
         let format = format_from_ext(path);
 
-        let adapter = get_adapter(config, database_url).await?;
         let mut entity = Entity::new(EntityType::Table, &qualified);
         entity.file = Some(path.to_path_buf());
         entity.format = Some(format.to_string());
@@ -142,13 +165,11 @@ pub async fn cmd_import(
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
-    let adapter = get_adapter(config, database_url).await?;
-
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
     let result = design
         .import_data(
-            &*adapter,
+            adapter,
             name,
             false,
             Some(&resolved),
@@ -185,6 +206,28 @@ pub async fn cmd_export(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let adapter = get_adapter(config, database_url).await?;
+    export_with_adapter(&*adapter, config, env, project_dir, name, format, output, scope, deps, verbosity).await
+}
+
+/// The body of `dbd export`, with the adapter supplied rather than connected.
+///
+/// Split out so the decisions here — which tables are in scope, and which format
+/// each one exports as — are testable against a recording adapter without a
+/// live database.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn export_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    name: Option<&str>,
+    format: &str,
+    output: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir))
         .context("Failed to load design")?;
 
@@ -195,8 +238,6 @@ pub async fn cmd_export(
         .into_iter()
         .map(|e| e.name)
         .collect();
-
-    let adapter = get_adapter(config, database_url).await?;
 
     // Build a name→format map from config export entries (per-table overrides).
     let config_format_map: std::collections::HashMap<String, String> = design
@@ -325,5 +366,187 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("--file requires --name"), "got: {err}");
+    }
+
+    // ── Adapter-backed paths, via the recording mock ──────────────────────────
+    //
+    // These assert what the command decided to send the adapter — the table set,
+    // the per-table format, the resolved entity name — not merely that it
+    // returned `Ok`. A test that only checked Ok-ness would pass with the
+    // selection logic entirely broken.
+
+    use dbd_core::adapter::mock::MockAdapter;
+
+    fn fixture_design() -> Design {
+        Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures()))
+            .unwrap()
+    }
+
+    /// An ad-hoc `--file` import resolves the bare name to its schema-qualified
+    /// form before handing it to the adapter.
+    #[tokio::test]
+    async fn import_adhoc_sends_qualified_name_to_adapter() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        import_with_adapter(
+            &mock, &design, Some("lookups"), Some(Path::new("data/lookups.csv")),
+            None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let imported = mock.imported.lock().unwrap().clone();
+        assert_eq!(imported.len(), 1, "expected exactly one import: {imported:?}");
+        assert!(
+            imported[0].contains('.') && imported[0].ends_with("lookups"),
+            "expected a schema-qualified name, got {:?}",
+            imported[0]
+        );
+    }
+
+    /// An unknown name is passed through verbatim rather than silently dropped,
+    /// so an ad-hoc COPY target can still be addressed by a bare name.
+    #[tokio::test]
+    async fn import_adhoc_unknown_name_passes_through() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        import_with_adapter(
+            &mock, &design, Some("not_a_fixture_table"), Some(Path::new("data/x.jsonl")),
+            None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*mock.imported.lock().unwrap(), vec!["not_a_fixture_table".to_string()]);
+    }
+
+    /// Format precedence: a per-table `format:` in `design.yaml`'s `export:`
+    /// block beats the CLI `--format` flag; a table without one uses the flag.
+    ///
+    /// The fixture declares `config.lookups` (no override) and
+    /// `config.lookup_values` (`format: jsonl`), so one run pins both halves of
+    /// the rule — and would catch the precedence being inverted.
+    #[tokio::test]
+    async fn export_format_precedence_config_override_beats_cli_flag() {
+        let mock = MockAdapter::new();
+        export_with_adapter(
+            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            None, "tsv", None, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let exported = mock.exported.lock().unwrap().clone();
+        assert!(
+            exported.contains(&"config.lookups (tsv)".to_string()),
+            "a table with no override must use the CLI --format: {exported:?}"
+        );
+        assert!(
+            exported.contains(&"config.lookup_values (jsonl)".to_string()),
+            "a per-table config format must beat the CLI --format: {exported:?}"
+        );
+    }
+
+    /// The `export:` block also restricts *which* tables are exported. Needs a
+    /// table that exists but is NOT listed, so it runs against a copy of the
+    /// fixture with one added — the fixture itself lists every table it has, so
+    /// asserting this against it would prove nothing.
+    #[tokio::test]
+    async fn export_config_block_restricts_the_table_set() {
+        let proj = testutil::copy_fixture_project();
+        let extra = proj.path().join("ddl/table/config/unlisted.ddl");
+        std::fs::write(
+            &extra,
+            "set search_path to config;\n\
+             create table if not exists unlisted (id int primary key);\n",
+        )
+        .unwrap();
+        let cfg = proj.path().join("design.yaml");
+
+        // Precondition: the new table really is part of the design.
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        assert!(
+            design.entities().iter().any(|e| e.name == "config.unlisted"),
+            "added table should be discovered"
+        );
+
+        let mock = MockAdapter::new();
+        export_with_adapter(
+            &mock, &cfg, "dev", proj.path(),
+            None, "csv", None, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let exported = mock.exported.lock().unwrap().clone();
+        assert!(
+            !exported.iter().any(|e| e.starts_with("config.unlisted")),
+            "a table absent from `export:` must not be exported: {exported:?}"
+        );
+        assert!(
+            exported.iter().any(|e| e.starts_with("config.lookups")),
+            "listed tables must still export: {exported:?}"
+        );
+    }
+
+    /// `--name` narrows the export to that one table.
+    #[tokio::test]
+    async fn export_name_filter_selects_one_table() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        let target = design
+            .entities()
+            .iter()
+            .find(|e| e.entity_type == EntityType::Table)
+            .map(|e| e.name.clone())
+            .expect("fixture has at least one table");
+
+        export_with_adapter(
+            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            Some(&target), "csv", None, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let exported = mock.exported.lock().unwrap().clone();
+        assert_eq!(
+            exported,
+            vec![format!("{target} (csv)")],
+            "only the named table should be exported"
+        );
+    }
+
+    /// A name matching no table exports nothing and takes the early return —
+    /// it must not silently export everything.
+    #[tokio::test]
+    async fn export_unknown_name_exports_nothing() {
+        let mock = MockAdapter::new();
+        export_with_adapter(
+            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
+            Some("no_such_table"), "csv", None, None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            mock.exported.lock().unwrap().is_empty(),
+            "an unmatched --name must export nothing, not everything"
+        );
+    }
+
+    /// A full (non-ad-hoc) import runs the design's import plan through the
+    /// adapter and loads the fixture's data files.
+    #[tokio::test]
+    async fn import_full_plan_loads_fixture_tables() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .unwrap();
+
+        assert!(
+            !mock.imported.lock().unwrap().is_empty(),
+            "the fixture project has import data, so the plan must load something"
+        );
     }
 }

@@ -511,4 +511,363 @@ mod tests {
         .await
         .unwrap();
     }
+
+    // ── `run` dispatch ────────────────────────────────────────────────────────
+    //
+    // The dispatcher is pure delegation, so these assert the *routing*: each
+    // command reaches a handler that produces its own observable effect (a file
+    // written, a specific error). Read-only commands run against the in-repo
+    // fixture; anything that writes runs against a throwaway copy.
+
+    /// Dispatch `cmd` against a throwaway copy of the fixture project, returning
+    /// the result and keeping the temp dir alive for the caller's assertions.
+    async fn run_in_copy(
+        cmd: &crate::cli::Commands,
+        tmp: &tempfile::TempDir,
+    ) -> Result<()> {
+        let dir = tmp.path();
+        run(
+            cmd, &dir.join("design.yaml"), "dev", None, dir,
+            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+        )
+        .await
+    }
+
+    /// `dbd combine` writes the concatenated schema to the requested file.
+    #[tokio::test]
+    async fn run_dispatches_combine_and_writes_the_file() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        let out = tmp.path().join("combined.sql");
+        run_in_copy(&Commands::Combine { file: out.clone() }, &tmp).await.unwrap();
+        let written = std::fs::read_to_string(&out).expect("combine should write the file");
+        assert!(
+            written.to_lowercase().contains("create table"),
+            "combined output should contain the project's DDL"
+        );
+    }
+
+    /// `dbd dbml` writes a DBML document.
+    #[tokio::test]
+    async fn run_dispatches_dbml_and_writes_the_file() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        let out = tmp.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: out.clone() }, &tmp).await.unwrap();
+        let written = std::fs::read_to_string(&out).expect("dbml should write the file");
+        assert!(written.contains("table"), "expected DBML table blocks: {written:.120}");
+    }
+
+    /// `dbd diagram --json` writes the diagram model.
+    #[tokio::test]
+    async fn run_dispatches_diagram_json_and_writes_the_file() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        let out = tmp.path().join("diagram.json");
+        run_in_copy(
+            &Commands::Diagram { json: true, file: out.clone(), print_url: false, site: None },
+            &tmp,
+        )
+        .await
+        .unwrap();
+        let written = std::fs::read_to_string(&out).expect("diagram should write the file");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&written).is_ok(),
+            "diagram --json must write valid JSON"
+        );
+    }
+
+    /// `dbd snapshot` creates a snapshot; `dbd snapshot --list` takes the
+    /// early-return listing branch.
+    #[tokio::test]
+    async fn run_dispatches_snapshot_create_then_list() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Snapshot { list: false, name: Some("via run".into()) }, &tmp)
+            .await
+            .unwrap();
+        assert!(
+            !dbd_core::snapshot::list_snapshots(tmp.path()).is_empty(),
+            "snapshot dispatch should have created one"
+        );
+        run_in_copy(&Commands::Snapshot { list: true, name: None }, &tmp).await.unwrap();
+    }
+
+    /// `dbd import --dry-run` routes to the dry-run handler, not the DB one —
+    /// proven by it succeeding with no database configured.
+    #[tokio::test]
+    async fn run_dispatches_import_dry_run_without_a_database() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Import { name: None, file: None, dry_run: true }, &tmp)
+            .await
+            .unwrap();
+    }
+
+    /// `dbd reset --dry-run` likewise returns before any adapter is built.
+    #[tokio::test]
+    async fn run_dispatches_reset_dry_run_without_a_database() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(
+            &Commands::Reset {
+                target: "dev".to_string(),
+                dry_run: true,
+                force: false,
+                schemas: false,
+                extensions: false,
+                clean: false,
+                allow_scope_change: false,
+            },
+            &tmp,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `dbd migrate` without `--status` is the informational branch: it prints
+    /// guidance and succeeds without touching a database.
+    #[tokio::test]
+    async fn run_dispatches_migrate_without_status_needs_no_database() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Migrate { status: false }, &tmp).await.unwrap();
+    }
+
+    /// `dbd format` routes to the formatter and rewrites the project's DDL.
+    ///
+    /// Deliberately not `--check`: that path calls `std::process::exit(1)` when
+    /// files would change (`schema::cmd_format`), which would terminate the test
+    /// harness rather than fail a test.
+    #[tokio::test]
+    async fn run_dispatches_format_and_rewrites_ddl() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        let target = tmp.path().join("ddl/table/config/lookups.ddl");
+        let before = std::fs::read_to_string(&target).unwrap();
+
+        run_in_copy(&Commands::Format { check: false }, &tmp).await.unwrap();
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_ne!(
+            before, after,
+            "the fixture DDL is unformatted, so `format` should have rewritten it"
+        );
+    }
+
+    /// `dbd graph` routes to the graph handler and succeeds offline.
+    #[tokio::test]
+    async fn run_dispatches_graph() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Graph { name: None }, &tmp).await.unwrap();
+    }
+
+    /// `dbd install --dry-run` reports what it would write without writing.
+    #[tokio::test]
+    async fn run_dispatches_install_dry_run() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Install { project: true, dry_run: true }, &tmp).await.unwrap();
+    }
+
+    /// `dbd init --from-dbml` with a non-Postgres target is rejected in the
+    /// dispatcher itself, before any reverse-engineering runs.
+    #[tokio::test]
+    async fn run_rejects_init_from_dbml_for_non_postgres_target() {
+        use crate::cli::Commands;
+        let tmp = testutil::copy_fixture_project();
+        let err = run_in_copy(
+            &Commands::Init {
+                name: Some("x".to_string()),
+                target: "sqlite".to_string(),
+                from_db: None,
+                from_dbml: Some(tmp.path().join("schema.dbml")),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: true,
+            },
+            &tmp,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--from-dbml"),
+            "the guard must name the offending flag: {err}"
+        );
+    }
+
+    /// Plain `dbd init` (no `--from-db`/`--from-dbml`) scaffolds a project in an
+    /// empty directory.
+    #[tokio::test]
+    async fn run_dispatches_plain_init_and_scaffolds_a_project() {
+        use crate::cli::Commands;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(
+            &Commands::Init {
+                name: Some("scaffolded".to_string()),
+                target: "postgres".to_string(),
+                from_db: None,
+                from_dbml: None,
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: false,
+            },
+            &dir.join("design.yaml"), "dev", None, dir,
+            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let cfg = dir.join("design.yaml");
+        assert!(cfg.exists(), "init should have written design.yaml");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            written.contains("scaffolded"),
+            "the project name should reach design.yaml: {written}"
+        );
+    }
+
+    /// `dbd init --from-dbml --dry-run` routes through the reverse-engineering
+    /// handler. The DBML input is produced by `dbd dbml` on the fixture, so the
+    /// two commands are exercised against each other rather than a stale file.
+    #[tokio::test]
+    async fn run_dispatches_init_from_dbml_dry_run() {
+        use crate::cli::Commands;
+        let src = testutil::copy_fixture_project();
+        let dbml = src.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &src).await.unwrap();
+        assert!(dbml.exists(), "precondition: DBML input must exist");
+
+        let dest = tempfile::tempdir().unwrap();
+        let dir = dest.path();
+        run(
+            &Commands::Init {
+                name: Some("from_dbml".to_string()),
+                target: "postgres".to_string(),
+                from_db: None,
+                from_dbml: Some(dbml),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: true,
+            },
+            &dir.join("design.yaml"), "dev", None, dir,
+            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !dir.join("design.yaml").exists(),
+            "--dry-run must not write design.yaml"
+        );
+    }
+
+    /// `dbd merge --from-dbml --dry-run` takes the no-connection merge branch.
+    #[tokio::test]
+    async fn run_dispatches_merge_from_dbml_dry_run() {
+        use crate::cli::Commands;
+        let proj = testutil::copy_fixture_project();
+        let dbml = proj.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &proj).await.unwrap();
+
+        run_in_copy(
+            &Commands::Merge {
+                conn: None,
+                from_dbml: Some(dbml),
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: true,
+            },
+            &proj,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `dbd release` routes to the release handler.
+    #[tokio::test]
+    async fn run_dispatches_release() {
+        use crate::cli::Commands;
+        let proj = testutil::copy_fixture_project();
+        run_in_copy(&Commands::Release { name: Some("v1".to_string()) }, &proj)
+            .await
+            .unwrap();
+    }
+
+    // ── get_adapter ───────────────────────────────────────────────────────────
+
+    /// A config with no reachable URL fails before any connection is attempted,
+    /// with a message pointing at how to supply one.
+    #[tokio::test]
+    async fn get_adapter_without_a_url_explains_how_to_set_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("design.yaml");
+        std::fs::write(
+            &cfg,
+            "project:\n  name: nourl\nsource:\n  dialect: postgresql\n\
+             target:\n  postgres: {}\nschemas:\n  - app\n",
+        )
+        .unwrap();
+
+        let err = get_adapter(&cfg, None).await.err().expect("expected an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DATABASE_URL") || msg.contains("target.url") || msg.contains("No target"),
+            "expected an actionable message about the missing URL, got: {msg}"
+        );
+    }
+
+    /// An unreadable config is reported as a config error, not a connection one.
+    #[tokio::test]
+    async fn get_adapter_reports_unreadable_config() {
+        let err = get_adapter(Path::new("/nonexistent/design.yaml"), None)
+            .await
+            .err()
+            .expect("expected an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("config"), "expected a config-read error, got: {msg}");
+    }
+
+    /// `$VAR` in `target.url` is resolved from the environment by `get_adapter`.
+    /// Uses a bogus host so it fails at connect time — proving the variable was
+    /// expanded rather than passed through literally.
+    #[tokio::test]
+    async fn get_adapter_expands_env_var_in_target_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("design.yaml");
+        std::fs::write(
+            &cfg,
+            "project:\n  name: envurl\nsource:\n  dialect: postgresql\n\
+             target:\n  postgres:\n    url: $DBD_TEST_URL_VAR\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded test setup; the var is unique to this test.
+        unsafe {
+            std::env::set_var("DBD_TEST_URL_VAR", "postgres://user@127.0.0.1:1/nope");
+        }
+
+        let err = get_adapter(&cfg, None).await.err().expect("expected an error");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("$DBD_TEST_URL_VAR"),
+            "the env var should have been expanded, not passed through: {msg}"
+        );
+
+        unsafe {
+            std::env::remove_var("DBD_TEST_URL_VAR");
+        }
+    }
 }
