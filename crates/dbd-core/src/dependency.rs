@@ -36,7 +36,19 @@ pub fn build_dependency_graph(entities: &[Entity]) -> HashMap<String, HashSet<St
 
 /// Topological sort using iterative layer extraction.
 ///
-/// Entities with no in-group dependencies are extracted first.
+/// Entities with no remaining in-group dependencies are extracted as a batch,
+/// and each batch is ordered by `EntityType::apply_rank()` then name. So the
+/// dependency graph decides the levels, and the type sequence only breaks ties
+/// *within* a level — where no edge expresses the ordering Postgres needs (a
+/// table does not refer to its schema, nor to a sequence backing a column
+/// default, nor to its owning role).
+///
+/// Run this across ALL entity types at once. Sorting per type bucket instead
+/// silently discards every cross-type edge, because `build_dependency_map`
+/// keeps only the dependencies naming an entity in the set it is given — that
+/// was issue #9, where a view calling a project-managed function was applied
+/// before the function existed.
+///
 /// Cyclic entities get an error added and are appended at the end.
 pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     if entities.is_empty() {
@@ -49,7 +61,7 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     let mut sorted = Vec::with_capacity(entities.len());
 
     // Kahn's algorithm: iteratively extract entities with no remaining in-group
-    // dependencies, in deterministic (sorted) batches.
+    // dependencies, in deterministic (rank, name) batches.
     loop {
         let mut ready: Vec<String> = remaining
             .iter()
@@ -60,7 +72,7 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         if ready.is_empty() {
             break;
         }
-        ready.sort();
+        sort_batch(&mut ready, &entity_map);
 
         for name in &ready {
             remaining.remove(name);
@@ -83,6 +95,18 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     }
 
     sorted
+}
+
+/// Order one ready batch by apply rank, then name. Names missing from
+/// `entity_map` cannot occur (the batch is drawn from it) but sort last rather
+/// than panicking.
+fn sort_batch(batch: &mut [String], entity_map: &HashMap<String, Entity>) {
+    batch.sort_by_key(|name| {
+        let rank = entity_map
+            .get(name)
+            .map_or(u8::MAX, |e| e.entity_type.apply_rank());
+        (rank, name.clone())
+    });
 }
 
 /// Build the in-group dependency map: entity name → the subset of its `refers`
@@ -125,7 +149,13 @@ fn append_cyclic(
 }
 
 /// Group entities by dependency level (layer 0 = no deps, layer 1 = depends on layer 0, etc.)
+///
+/// Layers are ordered internally the same way `sort_by_dependencies` orders a
+/// batch — apply rank, then name — so a rendered graph reads in the order
+/// `apply` executes.
 pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
+    let entity_map: HashMap<String, Entity> =
+        entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
     let mut remaining = build_dependency_map(entities);
 
     let mut layers = Vec::new();
@@ -142,7 +172,7 @@ pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
         }
 
         let mut layer = ready;
-        layer.sort();
+        sort_batch(&mut layer, &entity_map);
 
         for name in &layer {
             remaining.remove(name);

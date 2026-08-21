@@ -1,6 +1,6 @@
 use sqlparser::ast::{Expr, Set, Statement, Value};
 
-use crate::entity::{EnumValue, Reference};
+use crate::entity::{EnumValue, REF_TYPE_FUNCTION, Reference};
 
 /// Extract search_path values from SET statements.
 pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
@@ -31,10 +31,21 @@ pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
     vec!["public".to_string()]
 }
 
-/// Extract table references from a VIEW's SELECT query using the AST.
+/// Extract the objects a VIEW's SELECT query depends on, using the AST.
 ///
-/// Walks the parsed query's FROM clauses to find table references directly,
-/// avoiding the alias.column false positives from string-based regex matching.
+/// Two kinds of reference come out of a view body:
+///
+/// - **Relations** (tables, views, matviews, and FROM-clause table functions),
+///   walked from the query's range tables. Using the AST rather than string
+///   matching avoids the `alias.column` false positives a regex produces.
+/// - **Function calls** anywhere in the body — target list, WHERE, GROUP BY,
+///   a CASE arm. Postgres requires the function to exist before the view is
+///   created, so these are genuine apply-order dependencies (issue #9).
+///
+/// Function references are tagged [`REF_TYPE_FUNCTION`] and resolved softly:
+/// a body's built-in and aggregate calls are indistinguishable here from calls
+/// to a project-managed function, so `references::resolve_references` keeps the
+/// ones that name a known entity and drops the rest without warning.
 pub fn extract_view_info(statements: &[Statement], search_paths: &[String]) -> Vec<Reference> {
     let mut references = Vec::new();
     let default_schema = search_paths.first().map(|s| s.as_str()).unwrap_or("public");
@@ -42,6 +53,11 @@ pub fn extract_view_info(statements: &[Statement], search_paths: &[String]) -> V
     for stmt in statements {
         if let Statement::CreateView(create_view) = stmt {
             extract_table_refs_from_query(&create_view.query, default_schema, &mut references);
+            for reference in collect_function_refs(&create_view.query, default_schema) {
+                if !references.iter().any(|r| r.name == reference.name) {
+                    references.push(reference);
+                }
+            }
         }
     }
 
@@ -87,10 +103,16 @@ fn extract_table_refs_from_query(
 /// Walk any AST node, collecting every table reference with query-local CTE
 /// references filtered out. Works on a `Query`, a `Statement`, or any other
 /// node that implements `Visit`.
+///
+/// A FROM-clause entry carrying arguments (`FROM app.srf_fn()`) is a call to a
+/// set-returning function, not a table, and is tagged [`REF_TYPE_FUNCTION`] so
+/// it resolves softly — otherwise every `FROM generate_series(1, 3)` in a view
+/// body reports an unresolved reference to a built-in.
 fn collect_table_refs<N: sqlparser::ast::Visit>(node: &N, default_schema: &str) -> Vec<Reference> {
     let mut visitor = TableRefVisitor {
         default_schema,
         cte_names: Vec::new(),
+        table_functions: Vec::new(),
         refs: Vec::new(),
     };
     let _ = node.visit(&mut visitor);
@@ -105,6 +127,12 @@ fn collect_table_refs<N: sqlparser::ast::Visit>(node: &N, default_schema: &str) 
                 .cte_names
                 .iter()
                 .any(|name| r.name == format!("{default_schema}.{name}"))
+        })
+        .map(|mut r| {
+            if visitor.table_functions.contains(&r.name) {
+                r.ref_type = Some(REF_TYPE_FUNCTION.to_string());
+            }
+            r
         })
         .collect()
 }
@@ -129,10 +157,55 @@ fn qualify_relation(name: &sqlparser::ast::ObjectName, default_schema: &str) -> 
     }
 }
 
-/// AST visitor that collects table references and CTE names in a single pass.
+/// Collect every function/procedure call in an AST node as a soft reference.
+///
+/// Deliberately separate from [`collect_table_refs`]: that walker also feeds
+/// `Entity::reads`/`writes` for functions and procedures, which downstream
+/// consumers (import planning, scope analysis) read as *table* sets. Keeping
+/// function calls out of it means only views and materialized views gain these
+/// edges.
+fn collect_function_refs<N: sqlparser::ast::Visit>(
+    node: &N,
+    default_schema: &str,
+) -> Vec<Reference> {
+    let mut visitor = FunctionRefVisitor {
+        default_schema,
+        refs: Vec::new(),
+    };
+    let _ = node.visit(&mut visitor);
+    visitor.refs
+}
+
+/// AST visitor that collects called function names from every expression
+/// position (target list, WHERE, GROUP BY, CASE arms, subqueries).
+struct FunctionRefVisitor<'a> {
+    default_schema: &'a str,
+    refs: Vec<Reference>,
+}
+
+impl sqlparser::ast::Visitor for FunctionRefVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> core::ops::ControlFlow<Self::Break> {
+        if let Expr::Function(func) = expr
+            && let Some(qualified) = qualify_relation(&func.name, self.default_schema)
+            && !self.refs.iter().any(|r| r.name == qualified)
+        {
+            self.refs.push(Reference {
+                name: qualified,
+                ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            });
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
+/// AST visitor that collects table references, CTE names and FROM-clause
+/// function calls in a single pass.
 struct TableRefVisitor<'a> {
     default_schema: &'a str,
     cte_names: Vec<String>,
+    table_functions: Vec<String>,
     refs: Vec<Reference>,
 }
 
@@ -148,6 +221,25 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
             for cte in &with.cte_tables {
                 self.cte_names.push(cte.alias.name.value.clone());
             }
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+
+    /// Note FROM-clause entries that carry arguments: those are set-returning
+    /// function calls, which `pre_visit_relation` cannot tell apart from a plain
+    /// table (it only receives the name). `args` is `None` for a real table.
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &sqlparser::ast::TableFactor,
+    ) -> core::ops::ControlFlow<Self::Break> {
+        if let sqlparser::ast::TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        } = table_factor
+            && let Some(qualified) = qualify_relation(name, self.default_schema)
+        {
+            self.table_functions.push(qualified);
         }
         core::ops::ControlFlow::Continue(())
     }
@@ -186,7 +278,20 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     Vec::new()
 }
 
-/// Extract read/write table dependencies from a function/procedure.
+/// What a function or procedure body depends on.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ProcRefs {
+    /// Tables and views the body reads.
+    pub reads: Vec<String>,
+    /// Tables and views the body writes.
+    pub writes: Vec<String>,
+    /// Functions the body calls. Soft references (see [`REF_TYPE_FUNCTION`]):
+    /// a body's built-in calls are indistinguishable from calls to a
+    /// project-managed function until the resolver runs.
+    pub functions: Vec<String>,
+}
+
+/// Extract the dependencies of a function/procedure body.
 ///
 /// Three tiers, tried in order:
 /// 1. `LANGUAGE sql` bodies → re-parsed with sqlparser and walked by the view
@@ -196,6 +301,12 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
 ///    `RETURN QUERY`, and `IF` conditions.
 /// 3. Anything neither parser accepts → regex scan of the raw text.
 ///
+/// Called functions are collected from tier 1 only, and that is deliberate:
+/// Postgres validates a `LANGUAGE sql` body when the routine is created (with
+/// the default `check_function_bodies = on`), so a function it calls must exist
+/// first. A PL/pgSQL body resolves names at run time instead, so its calls are
+/// not creation-order dependencies.
+///
 /// Dynamic SQL (`EXECUTE 'text'`) is intentionally NOT tracked: it is a runtime
 /// dependency, not a compile-time one, so it never affects whether the object
 /// can be created. Tiers 1 and 2 ignore it for free (it is a string literal);
@@ -204,17 +315,18 @@ pub fn extract_proc_refs(
     statements: &[Statement],
     raw_sql: &str,
     default_schema: &str,
-) -> (Vec<String>, Vec<String>) {
+) -> ProcRefs {
     // 1. `LANGUAGE sql` bodies: re-parse with sqlparser + the view visitor.
-    if let Some((reads, writes)) = extract_proc_refs_via_ast(statements, default_schema) {
-        return (reads, writes);
+    if let Some(refs) = extract_proc_refs_via_ast(statements, default_schema) {
+        return refs;
     }
     // 2. PL/pgSQL: parse with libpg_query (the real Postgres parser).
     if let Some((reads, writes)) = extract_proc_refs_via_pg_query(raw_sql, default_schema) {
-        return (reads, writes);
+        return ProcRefs { reads, writes, functions: Vec::new() };
     }
     // 3. Last resort: regex scan (bodies neither parser can handle).
-    extract_proc_reads_writes(raw_sql)
+    let (reads, writes) = extract_proc_reads_writes(raw_sql);
+    ProcRefs { reads, writes, functions: Vec::new() }
 }
 
 /// Extract reads/writes from a PL/pgSQL body using libpg_query (Postgres's own
@@ -300,19 +412,18 @@ fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
     }
 }
 
-/// Try to extract reads/writes from a `LANGUAGE sql` function body via the AST.
+/// Try to extract a `LANGUAGE sql` function body's dependencies via the AST.
 ///
 /// Returns `Some` once at least one statically-parseable SQL body is found
-/// (even if it references no tables), so the caller knows the AST path applied
+/// (even if it references nothing), so the caller knows the AST path applied
 /// and the regex fallback should be skipped. Returns `None` when no body could
 /// be parsed as SQL (e.g. PL/pgSQL), leaving the caller to fall back.
 fn extract_proc_refs_via_ast(
     statements: &[Statement],
     default_schema: &str,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<ProcRefs> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
-    let mut reads: Vec<String> = Vec::new();
-    let mut writes: Vec<String> = Vec::new();
+    let mut refs = ProcRefs::default();
     let mut parsed_any = false;
 
     for stmt in statements {
@@ -336,32 +447,37 @@ fn extract_proc_refs_via_ast(
 
         parsed_any = true;
         for body_stmt in &body_stmts {
-            classify_body_refs(body_stmt, default_schema, &mut reads, &mut writes);
+            classify_body_refs(body_stmt, default_schema, &mut refs);
+            // Calls in expression position (target list, WHERE, CASE arms).
+            for reference in collect_function_refs(body_stmt, default_schema) {
+                push_unique(&mut refs.functions, reference.name);
+            }
         }
     }
 
-    parsed_any.then_some((reads, writes))
+    parsed_any.then_some(refs)
 }
 
-/// Sort one body statement's table references into `reads`/`writes` (a reference
-/// that is also a write target counts as a write), and record write targets that
-/// never surface as a visited relation (e.g. an INSERT target).
-fn classify_body_refs(
-    body_stmt: &Statement,
-    default_schema: &str,
-    reads: &mut Vec<String>,
-    writes: &mut Vec<String>,
-) {
+/// Sort one body statement's references into reads / writes / called functions
+/// (a reference that is also a write target counts as a write), and record write
+/// targets that never surface as a visited relation (e.g. an INSERT target).
+///
+/// A FROM-clause entry that is really a function call (`FROM generate_series(…)`)
+/// arrives tagged [`REF_TYPE_FUNCTION`] and must not be filed as a table read —
+/// otherwise it is reported as an unresolved reference to a missing table.
+fn classify_body_refs(body_stmt: &Statement, default_schema: &str, refs: &mut ProcRefs) {
     let targets = proc_write_targets(body_stmt, default_schema);
     for reference in collect_table_refs(body_stmt, default_schema) {
-        if targets.contains(&reference.name) {
-            push_unique(writes, reference.name);
+        if reference.ref_type.as_deref() == Some(REF_TYPE_FUNCTION) {
+            push_unique(&mut refs.functions, reference.name);
+        } else if targets.contains(&reference.name) {
+            push_unique(&mut refs.writes, reference.name);
         } else {
-            push_unique(reads, reference.name);
+            push_unique(&mut refs.reads, reference.name);
         }
     }
     for target in targets {
-        push_unique(writes, target);
+        push_unique(&mut refs.writes, target);
     }
 }
 
@@ -525,6 +641,12 @@ mod tests {
     /// (e.g. `RETURNS SETOF`), `statements` is empty and extraction relies on
     /// the libpg_query / regex paths driven by the raw text.
     fn proc_refs(sql: &str) -> (Vec<String>, Vec<String>) {
+        let refs = proc_all_refs(sql);
+        (refs.reads, refs.writes)
+    }
+
+    /// Like `proc_refs`, but keeps the called-function set too.
+    fn proc_all_refs(sql: &str) -> ProcRefs {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap_or_default();
         extract_proc_refs(&stmts, sql, "public")
@@ -585,6 +707,56 @@ mod tests {
         assert!(
             !reads.iter().any(|r| r.ends_with(".created")),
             "EXTRACT false positive: {reads:?}"
+        );
+    }
+
+    #[test]
+    fn proc_sql_body_collects_called_functions_not_reads() {
+        // A `LANGUAGE sql` body is validated at CREATE time, so a function it
+        // calls is a creation-order dependency.
+        let refs = proc_all_refs(
+            "CREATE FUNCTION f(n int) RETURNS int LANGUAGE sql AS $$ \
+             SELECT app.helper(n) + 1 FROM real.t $$;",
+        );
+        assert!(refs.functions.contains(&"app.helper".to_string()), "{refs:?}");
+        assert!(refs.reads.contains(&"real.t".to_string()), "{refs:?}");
+        assert!(
+            !refs.reads.contains(&"app.helper".to_string()),
+            "a called function must not be filed as a table read: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn proc_sql_body_from_clause_function_is_not_a_read() {
+        // `FROM websearch_to_tsquery(...)` is a set-returning function call, not
+        // a missing table — filing it under reads reports it as unresolved.
+        let refs = proc_all_refs(
+            "CREATE FUNCTION f(q text) RETURNS int LANGUAGE sql AS $$ \
+             SELECT count(*) FROM real.docs d, websearch_to_tsquery('english', q) tsq \
+              WHERE d.tsv @@ tsq $$;",
+        );
+        assert!(refs.reads.contains(&"real.docs".to_string()), "{refs:?}");
+        assert!(
+            !refs.reads.iter().any(|r| r.ends_with("websearch_to_tsquery")),
+            "FROM-clause function leaked into reads: {refs:?}"
+        );
+        assert!(
+            refs.functions.iter().any(|f| f.ends_with("websearch_to_tsquery")),
+            "FROM-clause function should be a soft function ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn proc_plpgsql_body_collects_no_called_functions() {
+        // PL/pgSQL resolves names at run time, so its calls are not
+        // creation-order dependencies and must not constrain the apply order.
+        let refs = proc_all_refs(
+            "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM app.helper(1); END; $$;",
+        );
+        assert!(
+            refs.functions.is_empty(),
+            "plpgsql calls must not become dependencies: {refs:?}"
         );
     }
 

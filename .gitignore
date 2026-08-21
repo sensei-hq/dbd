@@ -5,3 +5,6 @@ Cargo.lock
 
 # git worktrees (superpowers)
 .worktrees/
+
+# throwaway projects written by integration tests
+/tests/.tmp/
