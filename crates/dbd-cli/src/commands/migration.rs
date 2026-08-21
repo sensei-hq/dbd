@@ -43,9 +43,28 @@ pub async fn cmd_reset(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+    reset_with_adapter(&*adapter, &design, target, force, drop_schemas, drop_extensions, &resolved, allow_scope_change).await
+}
+
+/// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
+/// connected.
+///
+/// Split out so the scope guard — which is what stops a reset pinned to one
+/// scope from wiping another — is testable without a live database.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reset_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    target: &str,
+    force: bool,
+    drop_schemas: bool,
+    drop_extensions: bool,
+    resolved: &dbd_core::ResolvedScope,
+    allow_scope_change: bool,
+) -> Result<()> {
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
-    design.reset(&*adapter, target, force, drop_schemas, drop_extensions, Some(&resolved)).await?;
+    design.reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved)).await?;
     Ok(())
 }
 
@@ -56,6 +75,17 @@ pub async fn cmd_migrate_status(
     verbosity: Verbosity,
 ) -> Result<()> {
     let adapter = get_adapter(config, database_url).await?;
+    migrate_status_with_adapter(&*adapter, project_dir, verbosity).await
+}
+
+/// The body of `dbd migrate --status`, with the adapter supplied rather than
+/// connected. Split out so the pending-migration reporting is testable without a
+/// live database.
+pub(crate) async fn migrate_status_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    project_dir: &Path,
+    verbosity: Verbosity,
+) -> Result<()> {
     let db_version = adapter.get_db_version().await?;
 
     let snapshots = dbd_core::snapshot::list_snapshots(project_dir);
@@ -213,5 +243,200 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
         cmd_snapshot_create(&cfg, "dev", proj.path(), Some("test snapshot"), Verbosity::Normal).unwrap();
+    }
+
+    /// A second snapshot with nothing changed takes the no-changes branch and
+    /// must not write another migration directory.
+    #[test]
+    fn snapshot_create_twice_reports_no_changes() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("first"), Verbosity::Normal).unwrap();
+        let after_first = dbd_core::snapshot::list_snapshots(proj.path()).len();
+
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("second"), Verbosity::Normal).unwrap();
+        let after_second = dbd_core::snapshot::list_snapshots(proj.path()).len();
+
+        assert_eq!(
+            after_first, after_second,
+            "an unchanged schema must not produce another snapshot"
+        );
+    }
+
+    /// A real schema change after a baseline produces a further snapshot, which
+    /// is the branch that reports added/altered/dropped counts.
+    #[test]
+    fn snapshot_create_after_a_change_adds_a_snapshot() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        let before = dbd_core::snapshot::list_snapshots(proj.path()).len();
+
+        std::fs::write(
+            proj.path().join("ddl/table/config/added_later.ddl"),
+            "set search_path to config;\n\
+             create table if not exists added_later (id int primary key);\n",
+        )
+        .unwrap();
+
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("after change"), Verbosity::Verbose).unwrap();
+        let after = dbd_core::snapshot::list_snapshots(proj.path()).len();
+
+        assert!(
+            after > before,
+            "a new table must produce a snapshot ({before} → {after})"
+        );
+    }
+
+    /// Listing a project that HAS snapshots exercises the print-each-entry path,
+    /// which an empty fixture never reaches.
+    #[test]
+    fn snapshot_list_prints_existing_snapshots() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("listed"), Verbosity::Normal).unwrap();
+        assert!(
+            !dbd_core::snapshot::list_snapshots(proj.path()).is_empty(),
+            "precondition: the project must have a snapshot to list"
+        );
+        cmd_snapshot_list(proj.path(), Verbosity::Verbose);
+    }
+
+    // ── Adapter-backed paths, via the mock ────────────────────────────────────
+
+    use dbd_core::adapter::mock::MockAdapter;
+
+    /// `migrate --status` on a database behind the latest snapshot reports the
+    /// gap as pending.
+    ///
+    /// Note a *baseline* snapshot is not a pending migration — it records the
+    /// starting state — so this needs a real schema change on top of one to
+    /// produce something pending at all.
+    #[tokio::test]
+    async fn migrate_status_reports_pending_when_db_behind() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        std::fs::write(
+            proj.path().join("ddl/table/config/pending_probe.ddl"),
+            "set search_path to config;\n\
+             create table if not exists pending_probe (id int primary key);\n",
+        )
+        .unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("change"), Verbosity::Normal).unwrap();
+
+        // Precondition: a database at v1 has the v1→v2 migration outstanding.
+        let pending = dbd_core::snapshot::pending_migrations(1, proj.path());
+        assert!(
+            !pending.is_empty(),
+            "a change snapshot on top of a baseline must be pending from v1"
+        );
+
+        // Mock reports v1, so the status path takes the "pending" branch.
+        let mock = MockAdapter::new().with_version(1);
+        migrate_status_with_adapter(&mock, proj.path(), Verbosity::Verbose)
+            .await
+            .unwrap();
+    }
+
+    /// An up-to-date database takes the "up to date" branch instead.
+    #[tokio::test]
+    async fn migrate_status_reports_up_to_date_on_empty_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockAdapter::new();
+        assert!(
+            dbd_core::snapshot::pending_migrations(0, tmp.path()).is_empty(),
+            "precondition: no snapshots means nothing pending"
+        );
+        migrate_status_with_adapter(&mock, tmp.path(), Verbosity::Verbose)
+            .await
+            .unwrap();
+    }
+
+    /// The scope guard blocks a reset when the database is pinned to a different
+    /// scope — the check that stops a scoped reset wiping another scope.
+    #[tokio::test]
+    async fn reset_is_blocked_when_pinned_to_another_scope() {
+        let design = Design::from_config_with_dir(
+            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
+        )
+        .unwrap();
+        let resolved = design.resolve_scope(None, None).unwrap();
+
+        let mock = MockAdapter::new().with_version(0).with_scope("a_different_scope");
+
+        let err = reset_with_adapter(
+            &mock, &design, "dev", false, false, false, &resolved, false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("a_different_scope"),
+            "the guard must name the pinned scope: {err}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "a blocked reset must not execute any SQL"
+        );
+    }
+
+    /// `--allow-scope-change` is the documented override for the scope guard, so
+    /// the same mismatch then proceeds and the reset runs.
+    ///
+    /// The pinned version stays 0 on purpose: a database with applied migrations
+    /// trips a *separate* safety guard that only `--force` clears, which would
+    /// mask whether the scope override worked.
+    #[tokio::test]
+    async fn reset_proceeds_when_scope_change_allowed() {
+        let design = Design::from_config_with_dir(
+            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
+        )
+        .unwrap();
+        let resolved = design.resolve_scope(None, None).unwrap();
+
+        let mock = MockAdapter::new().with_version(0).with_scope("a_different_scope");
+
+        reset_with_adapter(&mock, &design, "dev", false, false, false, &resolved, true)
+            .await
+            .unwrap();
+        assert!(
+            !mock.scripts.lock().unwrap().is_empty(),
+            "an allowed reset must actually execute the drop script"
+        );
+    }
+
+    /// The applied-migrations guard is independent of the scope guard: a
+    /// database at v1 is blocked even when the scope matches, and only `--force`
+    /// clears it.
+    #[tokio::test]
+    async fn reset_is_blocked_when_db_has_applied_migrations() {
+        let design = Design::from_config_with_dir(
+            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
+        )
+        .unwrap();
+        let resolved = design.resolve_scope(None, None).unwrap();
+
+        // Scope matches, so only the applied-migrations guard can fire.
+        let blocked = MockAdapter::new().with_version(1).with_scope(&resolved.name);
+        let err = reset_with_adapter(&blocked, &design, "dev", false, false, false, &resolved, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--force"),
+            "the guard must point at the override: {err}"
+        );
+        assert!(
+            blocked.scripts.lock().unwrap().is_empty(),
+            "a blocked reset must not execute any SQL"
+        );
+
+        let forced = MockAdapter::new().with_version(1).with_scope(&resolved.name);
+        reset_with_adapter(&forced, &design, "dev", true, false, false, &resolved, false)
+            .await
+            .unwrap();
+        assert!(
+            !forced.scripts.lock().unwrap().is_empty(),
+            "--force must let the reset through"
+        );
     }
 }
