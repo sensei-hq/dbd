@@ -14,7 +14,6 @@ use crate::script;
 use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
-
 mod scope;
 mod apply;
 mod reconcile;
@@ -196,7 +195,6 @@ fn restrict_snapshot_to_schemas(
             .collect(),
     }
 }
-
 
 /// Whether an import plan entry runs under a scope's working set.
 /// An entry with write-targets is kept only if ALL targets are in scope;
@@ -460,22 +458,39 @@ impl Design {
         // Resolve references
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
-        // Sort by type priority then dependencies
-        // Apply order: schemas → extensions → roles → sequences → enums → tables → views → materialized views → functions/procedures → externals
-        // Sequences are placed before tables so a column `DEFAULT nextval('seq')`
-        // referencing a standalone sequence finds the sequence already created.
-        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
+        // Apply order: schemas → extensions → roles → sequences → enums →
+        // tables → {views, materialized views, functions, procedures} →
+        // externals. Sequences are placed before tables so a column
+        // `DEFAULT nextval('seq')` referencing a standalone sequence finds the
+        // sequence already created.
+        //
+        // Views, matviews, functions and procedures are sorted as ONE group
+        // rather than four, because that is the only place where a real
+        // dependency runs against the type sequence: a view can call a function
+        // (issue #9) and a `LANGUAGE sql` function body can read a view, so no
+        // fixed order between them is correct. Sorting them together lets the
+        // graph decide, with `EntityType::apply_rank` breaking ties inside a
+        // dependency level so an unrelated view still precedes an unrelated
+        // function, as before.
+        //
+        // The other groups stay separate on purpose. Their dependencies never
+        // contradict the type sequence, and keeping them apart preserves the
+        // guarantee that every table exists before any view or function body is
+        // compiled — which matters because body extraction is best-effort (see
+        // `extractors::extract_proc_reads_writes`), and Postgres validates a
+        // `LANGUAGE sql` body at creation time.
+        let (schemas, extensions, roles, sequences, enums, tables, routines, externals) =
             partition_entities(entities);
-        let sorted_roles = dependency::sort_by_dependencies(&roles);
-        let sorted_enums = dependency::sort_by_dependencies(&enums);
-        let sorted_tables = dependency::sort_by_dependencies(&tables);
-        let sorted_views = dependency::sort_by_dependencies(&views);
-        let sorted_matviews = dependency::sort_by_dependencies(&matviews);
-        let sorted_functions = dependency::sort_by_dependencies(&functions);
 
         let entities = [
-            schemas, extensions, sorted_roles, sequences, sorted_enums,
-            sorted_tables, sorted_views, sorted_matviews, sorted_functions, externals,
+            schemas,
+            extensions,
+            dependency::sort_by_dependencies(&roles),
+            sequences,
+            dependency::sort_by_dependencies(&enums),
+            dependency::sort_by_dependencies(&tables),
+            dependency::sort_by_dependencies(&routines),
+            externals,
         ]
         .concat();
 
@@ -761,17 +776,16 @@ impl Design {
     }
 }
 
-/// Partition entities by type for ordered apply.
-/// Returns: (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions/procedures, externals)
+/// Partition entities into the groups `Design::from_config` applies in order.
 ///
-/// Sequences are emitted before tables so a column `DEFAULT nextval('seq')`
-/// referencing a standalone sequence finds the sequence already created.
+/// Returns `(schemas, extensions, roles, sequences, enums, tables, routines,
+/// externals)`, where `routines` holds views, materialized views, functions and
+/// procedures together — the one group whose members depend on each other in
+/// both directions, so only a topological sort can order them (issue #9).
 #[allow(clippy::type_complexity)]
 fn partition_entities(
     entities: Vec<Entity>,
 ) -> (
-    Vec<Entity>,
-    Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
     Vec<Entity>,
@@ -787,9 +801,7 @@ fn partition_entities(
     let mut sequences = Vec::new();
     let mut enums = Vec::new();
     let mut tables = Vec::new();
-    let mut views = Vec::new();
-    let mut matviews = Vec::new();
-    let mut functions = Vec::new(); // functions + procedures
+    let mut routines = Vec::new(); // views + matviews + functions + procedures
     let mut externals = Vec::new();
 
     for entity in entities {
@@ -800,15 +812,16 @@ fn partition_entities(
             EntityType::Sequence => sequences.push(entity),
             EntityType::Enum => enums.push(entity),
             EntityType::Table => tables.push(entity),
-            EntityType::View => views.push(entity),
-            EntityType::MaterializedView => matviews.push(entity),
-            EntityType::Function | EntityType::Procedure => functions.push(entity),
+            EntityType::View
+            | EntityType::MaterializedView
+            | EntityType::Function
+            | EntityType::Procedure => routines.push(entity),
             EntityType::External => externals.push(entity),
             _ => tables.push(entity), // Default to tables group
         }
     }
 
-    (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals)
+    (schemas, extensions, roles, sequences, enums, tables, routines, externals)
 }
 
 /// Validate materialized-view refresh configuration against the resolved
@@ -2982,13 +2995,10 @@ mod tests {
 
     // ── Apply-order tests ───────────────────────
 
-    /// Mirrors the real partition + concat apply order from `Design::from_config`,
-    /// minus the `sort_by_dependencies` calls, so type-bucket ordering can be
-    /// exercised without a DB / full `Design::from_config`.
+    /// The apply order `Design::from_config` produces, without needing a DB or
+    /// an on-disk project.
     fn order_entities_for_test(entities: Vec<Entity>) -> Vec<Entity> {
-        let (schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals) =
-            partition_entities(entities);
-        [schemas, extensions, roles, sequences, enums, tables, views, matviews, functions, externals].concat()
+        dependency::sort_by_dependencies(&entities)
     }
 
     #[test]
@@ -3005,6 +3015,52 @@ mod tests {
         assert!(pos("app.t") < pos("app.v"));
         assert!(pos("app.v") < pos("app.mv"));
         assert!(pos("app.mv") < pos("app.f"));
+    }
+
+    /// A real dependency overrides the type sequence: the function is applied
+    /// before the view that calls it, even though View outranks Function.
+    #[test]
+    fn dependency_overrides_type_order_for_view_on_function() {
+        use crate::entity::EntityType;
+        let mut view = Entity::new(EntityType::View, "app.v");
+        view.refers = vec!["app.f".to_string()];
+        let ents = vec![view, Entity::new(EntityType::Function, "app.f")];
+
+        let ordered = order_entities_for_test(ents);
+        let pos = |name: &str| ordered.iter().position(|e| e.name == name).unwrap();
+        assert!(pos("app.f") < pos("app.v"), "got {:?}", ordered.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert!(ordered.iter().all(|e| e.errors.is_empty()));
+    }
+
+    /// The reverse edge is honored by the same mechanism, which is why the type
+    /// sequence cannot simply be reordered to put functions first.
+    #[test]
+    fn dependency_overrides_type_order_for_function_on_view() {
+        use crate::entity::EntityType;
+        let mut func = Entity::new(EntityType::Function, "app.f");
+        func.refers = vec!["app.v".to_string()];
+        let ents = vec![func, Entity::new(EntityType::View, "app.v")];
+
+        let ordered = order_entities_for_test(ents);
+        let pos = |name: &str| ordered.iter().position(|e| e.name == name).unwrap();
+        assert!(pos("app.v") < pos("app.f"));
+    }
+
+    /// Schemas still lead, and a table still precedes a view, when nothing in
+    /// the graph says otherwise.
+    #[test]
+    fn type_rank_orders_entities_within_a_dependency_level() {
+        use crate::entity::EntityType;
+        let ents = vec![
+            Entity::new(EntityType::Function, "app.f"),
+            Entity::new(EntityType::Table, "app.t"),
+            Entity::schema("app"),
+            Entity::new(EntityType::Enum, "app.e"),
+            Entity::new(EntityType::Sequence, "app.s"),
+        ];
+        let sorted = order_entities_for_test(ents);
+        let ordered: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(ordered, vec!["app", "app.s", "app.e", "app.t", "app.f"]);
     }
 
     // ── Materialized-view validation ────────────────────────

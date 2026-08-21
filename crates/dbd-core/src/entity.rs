@@ -75,7 +75,43 @@ impl EntityType {
             other => other.tag(),
         }
     }
+
+    /// Apply-order rank, used only to break ties between entities the
+    /// dependency graph leaves unordered (see `dependency::sort_by_dependencies`).
+    ///
+    /// Dependencies always win: a view that calls a function is applied after
+    /// it even though View outranks Function, and a function whose body reads a
+    /// view is applied after that view. The rank supplies the order for the
+    /// relationships Postgres needs but that no `refers` edge records — a table
+    /// does not "refer to" its schema, a `DEFAULT nextval('s')` column does not
+    /// refer to `s`, and a table owned by a role does not refer to the role.
+    pub fn apply_rank(&self) -> u8 {
+        match self {
+            EntityType::Schema => 0,
+            EntityType::Extension => 1,
+            EntityType::Role => 2,
+            EntityType::Sequence => 3,
+            EntityType::Enum => 4,
+            EntityType::Table => 5,
+            EntityType::View => 6,
+            EntityType::MaterializedView => 7,
+            EntityType::Function | EntityType::Procedure => 8,
+            EntityType::External => 9,
+            // Anything else sorts with tables, matching the historical
+            // catch-all bucket.
+            EntityType::Import => 5,
+        }
+    }
 }
+
+/// `Reference::ref_type` for a call to a function or procedure.
+///
+/// Function references are *soft*: a view body is full of built-in and
+/// aggregate calls (`now()`, `sum()`, `coalesce()`) that look exactly like a
+/// call to a project-managed function, and only the resolver knows which is
+/// which. Unlike a table reference, one that does not resolve to a known entity
+/// is dropped silently instead of warned about.
+pub const REF_TYPE_FUNCTION: &str = "function";
 
 /// A parsed reference to another entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]

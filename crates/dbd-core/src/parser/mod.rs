@@ -3,7 +3,7 @@ mod tables;
 
 use std::path::Path;
 
-use crate::entity::{Entity, EntityType, Reference};
+use crate::entity::{Entity, EntityType, REF_TYPE_FUNCTION, Reference};
 use crate::error::Result;
 
 pub use extractors::extract_search_paths;
@@ -135,6 +135,31 @@ fn extract_role_memberships(sql: &str, entity: &mut Entity) {
         .collect();
 }
 
+/// Store a routine's extracted dependencies on the entity.
+///
+/// `reads`/`writes` stay table sets — import planning and scope analysis read
+/// them that way — and become hard references. Called functions are added as
+/// soft references ([`REF_TYPE_FUNCTION`]): a body's built-in calls look exactly
+/// like calls to a project-managed function here, so the resolver keeps the ones
+/// that name a known entity and drops the rest without warning.
+fn apply_proc_refs(entity: &mut Entity, refs: extractors::ProcRefs) {
+    entity.references = refs
+        .reads
+        .iter()
+        .chain(refs.writes.iter())
+        .map(|name| Reference {
+            name: name.clone(),
+            ref_type: None,
+        })
+        .chain(refs.functions.iter().map(|name| Reference {
+            name: name.clone(),
+            ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+        }))
+        .collect();
+    entity.reads = refs.reads;
+    entity.writes = refs.writes;
+}
+
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
 
@@ -156,18 +181,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
             // libpg_query parses the body, with the regex scanner as last resort.
             // No parsed statements here, so the LANGUAGE sql AST path is skipped.
             if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
-                let (reads, writes) = extractors::extract_proc_refs(&[], &cleaned, "public");
-                entity.reads = reads;
-                entity.writes = writes;
-                entity.references = entity
-                    .reads
-                    .iter()
-                    .chain(entity.writes.iter())
-                    .map(|name| Reference {
-                        name: name.clone(),
-                        ref_type: None,
-                    })
-                    .collect();
+                apply_proc_refs(&mut entity, extractors::extract_proc_refs(&[], &cleaned, "public"));
                 entity.refers = entity
                     .references
                     .iter()
@@ -220,19 +234,8 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
                 .first()
                 .map(|s| s.as_str())
                 .unwrap_or("public");
-            let (reads, writes) = extractors::extract_proc_refs(&statements, &cleaned, default_schema);
-            entity.reads = reads;
-            entity.writes = writes;
-            // References from reads/writes
-            entity.references = entity
-                .reads
-                .iter()
-                .chain(entity.writes.iter())
-                .map(|name| Reference {
-                    name: name.clone(),
-                    ref_type: None,
-                })
-                .collect();
+            let refs = extractors::extract_proc_refs(&statements, &cleaned, default_schema);
+            apply_proc_refs(&mut entity, refs);
         }
         _ => {}
     }

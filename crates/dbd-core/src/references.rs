@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::entity::{Entity, ForeignKey, TableConstraint};
+use crate::entity::{Entity, ForeignKey, REF_TYPE_FUNCTION, TableConstraint};
 
 /// Match parsed references against known entities and external entities.
 ///
@@ -56,6 +56,12 @@ fn resolve_entity_references(entity: &mut Entity, known: &HashSet<String>, ignor
 
 /// (1) String references → `refers` (FK targets, view/proc deps). Recovers
 /// bare-qualified schemas along the search_path; warns on the unresolvable.
+///
+/// Function references (tagged [`REF_TYPE_FUNCTION`]) are the exception: they
+/// resolve or vanish, silently. A view body's `now()` / `sum()` / `coalesce()`
+/// calls are collected the same way a call to a project-managed function is,
+/// and only this resolution step can tell them apart — so an unresolved one is
+/// a built-in, not a mistake worth reporting.
 fn resolve_entity_refers(
     entity: &mut Entity,
     default_schema: &str,
@@ -63,7 +69,15 @@ fn resolve_entity_refers(
     known: &HashSet<String>,
     ignore: &[String],
 ) {
+    let soft: HashSet<&str> = entity
+        .references
+        .iter()
+        .filter(|r| r.ref_type.as_deref() == Some(REF_TYPE_FUNCTION))
+        .map(|r| r.name.as_str())
+        .collect();
+
     let mut resolved_refers = Vec::new();
+    let mut unresolved = Vec::new();
     for ref_name in &entity.refers {
         if is_ignored(ref_name, ignore) {
             continue;
@@ -78,11 +92,16 @@ fn resolve_entity_refers(
             resolved_refers.push(format!("{sch}.{table}"));
             continue;
         }
+        if !soft.contains(ref_name.as_str()) {
+            unresolved.push(ref_name.clone());
+        }
+    }
+    entity.refers = resolved_refers;
+    for ref_name in unresolved {
         entity
             .warnings
             .push(format!("Unresolved reference: {ref_name}"));
     }
-    entity.refers = resolved_refers;
 }
 
 /// (2) FK structs → `ref_schema` (consumed by emit/dbml/reconcile). Kept in
