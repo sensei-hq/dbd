@@ -13,6 +13,11 @@ pub struct MockAdapter {
     pub applied: Arc<Mutex<Vec<String>>>,
     pub scripts: Arc<Mutex<Vec<String>>>,
     pub imported: Arc<Mutex<Vec<String>>>,
+    /// Ordered log of `export_data` calls as `"<name> (<format>)"`. Recorded
+    /// because choosing *which* tables to export and in *which* format is the
+    /// caller's decision (per-table config override beats the CLI `--format`
+    /// flag), so a test has to be able to assert it.
+    pub exported: Arc<Mutex<Vec<String>>>,
     pub meta: Arc<Mutex<Option<ProjectMeta>>>,
     pub connected: bool,
     /// Entity names that `resolve_entity` should report as existing.
@@ -43,6 +48,7 @@ impl MockAdapter {
             applied: Arc::new(Mutex::new(Vec::new())),
             scripts: Arc::new(Mutex::new(Vec::new())),
             imported: Arc::new(Mutex::new(Vec::new())),
+            exported: Arc::new(Mutex::new(Vec::new())),
             meta: Arc::new(Mutex::new(None)),
             connected: false,
             known_entities: Arc::new(Mutex::new(HashSet::new())),
@@ -207,7 +213,12 @@ impl DatabaseAdapter for MockAdapter {
         Ok(())
     }
 
-    async fn export_data(&self, _entity: &Entity, _out_dir: Option<&std::path::Path>) -> Result<()> {
+    async fn export_data(&self, entity: &Entity, _out_dir: Option<&std::path::Path>) -> Result<()> {
+        self.exported.lock().unwrap().push(format!(
+            "{} ({})",
+            entity.name,
+            entity.format.as_deref().unwrap_or("csv")
+        ));
         Ok(())
     }
 
