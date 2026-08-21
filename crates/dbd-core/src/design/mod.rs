@@ -458,41 +458,29 @@ impl Design {
         // Resolve references
         references::resolve_references(&mut entities, &external_names, &design_config.ignore);
 
-        // Apply order: schemas → extensions → roles → sequences → enums →
-        // tables → {views, materialized views, functions, procedures} →
-        // externals. Sequences are placed before tables so a column
-        // `DEFAULT nextval('seq')` referencing a standalone sequence finds the
-        // sequence already created.
+        // Order for apply in one pass over the whole graph. Dependencies decide,
+        // with the type sequence (schemas → extensions → roles → sequences →
+        // enums → tables → views → matviews → functions/procedures, via
+        // `EntityType::apply_rank`) acting as a floor rather than a partition —
+        // see `dependency::sort_by_dependencies` for why that distinction is the
+        // whole design.
         //
-        // Views, matviews, functions and procedures are sorted as ONE group
-        // rather than four, because that is the only place where a real
-        // dependency runs against the type sequence: a view can call a function
-        // (issue #9) and a `LANGUAGE sql` function body can read a view, so no
-        // fixed order between them is correct. Sorting them together lets the
-        // graph decide, with `EntityType::apply_rank` breaking ties inside a
-        // dependency level so an unrelated view still precedes an unrelated
-        // function, as before.
+        // A single sort is required because two type pairs depend on each other
+        // in BOTH directions, so no fixed sequence can order them: a view can
+        // call a function and a function body can read a view (issue #9); a
+        // table's `DEFAULT`/`CHECK` can call a function and a function body can
+        // read that table (issue #10).
         //
-        // The other groups stay separate on purpose. Their dependencies never
-        // contradict the type sequence, and keeping them apart preserves the
-        // guarantee that every table exists before any view or function body is
-        // compiled — which matters because body extraction is best-effort (see
-        // `extractors::extract_proc_reads_writes`), and Postgres validates a
-        // `LANGUAGE sql` body at creation time.
-        let (schemas, extensions, roles, sequences, enums, tables, routines, externals) =
-            partition_entities(entities);
+        // External entities are held out of the graph and appended. They are
+        // never applied (`entities_in_scope` drops them), they exist only so
+        // `resolve_references` can resolve references to objects dbd does not
+        // manage — and being the highest rank, leaving them in would drag every
+        // entity that references one to the very end of the order.
+        let (externals, managed): (Vec<Entity>, Vec<Entity>) = entities
+            .into_iter()
+            .partition(|e| e.entity_type == EntityType::External);
 
-        let entities = [
-            schemas,
-            extensions,
-            dependency::sort_by_dependencies(&roles),
-            sequences,
-            dependency::sort_by_dependencies(&enums),
-            dependency::sort_by_dependencies(&tables),
-            dependency::sort_by_dependencies(&routines),
-            externals,
-        ]
-        .concat();
+        let entities = [dependency::sort_by_dependencies(&managed), externals].concat();
 
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
@@ -774,54 +762,6 @@ impl Design {
             .map(|e| (e.name.clone(), self.config.materialized_views.resolve(&e.name)))
             .collect()
     }
-}
-
-/// Partition entities into the groups `Design::from_config` applies in order.
-///
-/// Returns `(schemas, extensions, roles, sequences, enums, tables, routines,
-/// externals)`, where `routines` holds views, materialized views, functions and
-/// procedures together — the one group whose members depend on each other in
-/// both directions, so only a topological sort can order them (issue #9).
-#[allow(clippy::type_complexity)]
-fn partition_entities(
-    entities: Vec<Entity>,
-) -> (
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-    Vec<Entity>,
-) {
-    let mut schemas = Vec::new();
-    let mut extensions = Vec::new();
-    let mut roles = Vec::new();
-    let mut sequences = Vec::new();
-    let mut enums = Vec::new();
-    let mut tables = Vec::new();
-    let mut routines = Vec::new(); // views + matviews + functions + procedures
-    let mut externals = Vec::new();
-
-    for entity in entities {
-        match entity.entity_type {
-            EntityType::Schema => schemas.push(entity),
-            EntityType::Extension => extensions.push(entity),
-            EntityType::Role => roles.push(entity),
-            EntityType::Sequence => sequences.push(entity),
-            EntityType::Enum => enums.push(entity),
-            EntityType::Table => tables.push(entity),
-            EntityType::View
-            | EntityType::MaterializedView
-            | EntityType::Function
-            | EntityType::Procedure => routines.push(entity),
-            EntityType::External => externals.push(entity),
-            _ => tables.push(entity), // Default to tables group
-        }
-    }
-
-    (schemas, extensions, roles, sequences, enums, tables, routines, externals)
 }
 
 /// Validate materialized-view refresh configuration against the resolved
