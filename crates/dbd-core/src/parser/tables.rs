@@ -33,6 +33,13 @@ pub fn extract_table(
                 );
             }
             Statement::CreateIndex(create_index) => {
+                // An index key can be an expression calling a function
+                // (`create index … on t (app.slug(id))`), and the CREATE INDEX
+                // ships in the table's own DDL file — so it runs in the table's
+                // apply step and the function must already exist.
+                for col in &create_index.columns {
+                    push_function_refs(&col.column.expr, default_schema, &mut references);
+                }
                 indexes.push(extract_index(create_index));
             }
             Statement::Comment {
@@ -168,6 +175,7 @@ fn extract_column(
                 nullable = true;
             }
             ColumnOption::Default(expr) => {
+                push_function_refs(expr, default_schema, &mut references);
                 default_value = Some(expr.to_string());
             }
             ColumnOption::Check(chk) => {
@@ -177,6 +185,7 @@ fn extract_column(
                     .as_ref()
                     .or(chk.name.as_ref())
                     .map(|n| n.value.clone());
+                push_function_refs(&chk.expr, default_schema, &mut references);
                 checks.push(TableConstraint::Check {
                     name,
                     expression: chk.expr.to_string(),
@@ -241,6 +250,15 @@ fn extract_column(
                     _ => Some(IdentityKind::Always),
                 };
                 nullable = false;
+            }
+            // `GENERATED ALWAYS AS (expr) STORED` — a computed column. The
+            // expression is not stored on `ColumnDef`, but a function it calls
+            // must exist before the table is created.
+            ColumnOption::Generated {
+                generation_expr: Some(expr),
+                ..
+            } => {
+                push_function_refs(expr, default_schema, &mut references);
             }
             _ => {}
         }
@@ -334,14 +352,40 @@ fn extract_table_constraint(
 
             Some((TableConstraint::ForeignKey(fk), references))
         }
-        SqlTableConstraint::Check(chk) => Some((
-            TableConstraint::Check {
-                name: chk.name.as_ref().map(|n| n.value.clone()),
-                expression: chk.expr.to_string(),
-            },
-            Vec::new(),
-        )),
+        SqlTableConstraint::Check(chk) => {
+            let mut references = Vec::new();
+            push_function_refs(&chk.expr, default_schema, &mut references);
+            Some((
+                TableConstraint::Check {
+                    name: chk.name.as_ref().map(|n| n.value.clone()),
+                    expression: chk.expr.to_string(),
+                },
+                references,
+            ))
+        }
         _ => None,
+    }
+}
+
+/// Append the functions an expression calls to `references`, de-duplicated.
+///
+/// Used for every place a table's DDL can call a function — a column `DEFAULT`,
+/// a `CHECK`, a generated-column expression, an index key. Postgres needs the
+/// function to exist before the table is created (issue #10).
+///
+/// These are soft references (see `entity::REF_TYPE_FUNCTION`): `default now()`
+/// and `default gen_random_uuid()` are indistinguishable here from a call to a
+/// project-managed function, so the resolver keeps the ones naming a known
+/// entity and drops the rest without warning.
+fn push_function_refs(
+    expr: &sqlparser::ast::Expr,
+    default_schema: &str,
+    references: &mut Vec<Reference>,
+) {
+    for reference in super::extractors::collect_function_refs(expr, default_schema) {
+        if !references.iter().any(|r| r.name == reference.name) {
+            references.push(reference);
+        }
     }
 }
 

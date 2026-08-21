@@ -34,20 +34,37 @@ pub fn build_dependency_graph(entities: &[Entity]) -> HashMap<String, HashSet<St
         .collect()
 }
 
-/// Topological sort using iterative layer extraction.
+/// Order entities for apply: dependencies first, with the type sequence as a
+/// floor rather than a partition.
 ///
-/// Entities with no remaining in-group dependencies are extracted as a batch,
-/// and each batch is ordered by `EntityType::apply_rank()` then name. So the
-/// dependency graph decides the levels, and the type sequence only breaks ties
-/// *within* a level — where no edge expresses the ordering Postgres needs (a
-/// table does not refer to its schema, nor to a sequence backing a column
-/// default, nor to its owning role).
+/// Each entity gets a level:
+///
+/// ```text
+/// level(e) = max( rank(e) * SPREAD,  1 + max(level(d) for d in deps(e)) )
+/// ```
+///
+/// and the result is sorted by `(level, rank, name)`.
+///
+/// The `rank(e) * SPREAD` term is the floor: with `SPREAD` larger than the
+/// longest possible dependency chain, an entity can never drift below its own
+/// type band by accumulating depth. That preserves the orderings Postgres needs
+/// but that no `refers` edge records — a table does not refer to its schema, to
+/// a sequence backing a `DEFAULT nextval('s')` column, or to its owning role —
+/// and it keeps every routine after every table *unless a real edge says
+/// otherwise*. That last part matters: body extraction is best-effort, and
+/// Postgres compiles a `LANGUAGE sql` body at `CREATE`, so a routine whose table
+/// reference was missed must still land after the tables.
+///
+/// The `1 + max(level(deps))` term is what lets a real edge win. It is the only
+/// way to order the type pairs that genuinely depend on each other in both
+/// directions: a view can call a function and a function body can read a view
+/// (issue #9); a table's `DEFAULT`/`CHECK` can call a function and a function
+/// body can read that table (issue #10). No fixed type sequence satisfies
+/// either pair, so the graph has to decide.
 ///
 /// Run this across ALL entity types at once. Sorting per type bucket instead
-/// silently discards every cross-type edge, because `build_dependency_map`
-/// keeps only the dependencies naming an entity in the set it is given — that
-/// was issue #9, where a view calling a project-managed function was applied
-/// before the function existed.
+/// silently discards every cross-type edge, because [`build_dependency_map`]
+/// keeps only the dependencies naming an entity in the set it is given.
 ///
 /// Cyclic entities get an error added and are appended at the end.
 pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
@@ -57,11 +74,48 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
 
     let entity_map: HashMap<String, Entity> =
         entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
-    let mut remaining = build_dependency_map(entities);
-    let mut sorted = Vec::with_capacity(entities.len());
+    let (topo_order, cyclic) = topological_order(entities, &entity_map);
+    let levels = compute_levels(&topo_order, entities, &entity_map);
 
-    // Kahn's algorithm: iteratively extract entities with no remaining in-group
-    // dependencies, in deterministic (rank, name) batches.
+    let mut sorted: Vec<Entity> = topo_order
+        .iter()
+        .filter_map(|name| entity_map.get(name).cloned())
+        .collect();
+    sorted.sort_by_key(|e| {
+        (
+            levels.get(&e.name).copied().unwrap_or(0),
+            e.entity_type.apply_rank(),
+            e.name.clone(),
+        )
+    });
+
+    // Anything left is cyclic — mark with error and append.
+    if !cyclic.is_empty() {
+        append_cyclic(&cyclic, &entity_map, &mut sorted);
+    }
+
+    sorted
+}
+
+/// Multiplier that separates one type band from the next. Larger than any
+/// possible dependency chain (which cannot exceed the entity count), so
+/// accumulated depth never pushes an entity out of its own band unless a real
+/// edge to a higher-ranked entity does it.
+fn level_spread(entity_count: usize) -> u64 {
+    entity_count as u64 + 1
+}
+
+/// Kahn's algorithm. Returns `(topological order, entities left in a cycle)`.
+///
+/// Ready entities are drained in `(rank, name)` order so the topological order
+/// itself is deterministic; the final ordering is decided by the level sort.
+fn topological_order(
+    entities: &[Entity],
+    entity_map: &HashMap<String, Entity>,
+) -> (Vec<String>, HashMap<String, HashSet<String>>) {
+    let mut remaining = build_dependency_map(entities);
+    let mut order = Vec::with_capacity(entities.len());
+
     loop {
         let mut ready: Vec<String> = remaining
             .iter()
@@ -72,16 +126,12 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         if ready.is_empty() {
             break;
         }
-        sort_batch(&mut ready, &entity_map);
+        sort_batch(&mut ready, entity_map);
 
         for name in &ready {
             remaining.remove(name);
-            if let Some(entity) = entity_map.get(name) {
-                sorted.push(entity.clone());
-            }
+            order.push(name.clone());
         }
-
-        // Remove resolved names from remaining deps
         for deps in remaining.values_mut() {
             for name in &ready {
                 deps.remove(name);
@@ -89,12 +139,40 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         }
     }
 
-    // Anything left is cyclic — mark with error and append.
-    if !remaining.is_empty() {
-        append_cyclic(&remaining, &entity_map, &mut sorted);
+    (order, remaining)
+}
+
+/// Assign each entity its level, walking the topological order so every
+/// dependency is already resolved when its dependent is reached.
+///
+/// A dependency outside `topo_order` (an external entity, or one caught in a
+/// cycle) contributes nothing — it is not applied in this pass, so it cannot
+/// constrain the order.
+fn compute_levels(
+    topo_order: &[String],
+    entities: &[Entity],
+    entity_map: &HashMap<String, Entity>,
+) -> HashMap<String, u64> {
+    let spread = level_spread(entities.len());
+    let deps = build_dependency_map(entities);
+    let mut levels: HashMap<String, u64> = HashMap::with_capacity(topo_order.len());
+
+    for name in topo_order {
+        let floor = entity_map
+            .get(name)
+            .map_or(0, |e| e.entity_type.apply_rank() as u64 * spread);
+        let from_deps = deps
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|dep| levels.get(dep))
+            .map(|level| level + 1)
+            .max()
+            .unwrap_or(0);
+        levels.insert(name.clone(), floor.max(from_deps));
     }
 
-    sorted
+    levels
 }
 
 /// Order one ready batch by apply rank, then name. Names missing from
