@@ -330,6 +330,87 @@ pub fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
     Vec::new()
 }
 
+/// Whether libpg_query — Postgres's own grammar — accepts this file.
+///
+/// The authority on "is this valid SQL". sqlparser is a convenience parser that
+/// reimplements the grammar and lags the server, so its rejection alone says
+/// nothing about the file; this says whether Postgres itself would take it.
+pub fn is_valid_postgres(raw_sql: &str) -> bool {
+    pg_query::parse(raw_sql).is_ok()
+}
+
+/// `search_path` schemas from libpg_query's AST, for the fallback path where
+/// sqlparser produced no statements for [`extract_search_paths`] to read.
+///
+/// Mirrors that function's contract, including its `["public"]` default when the
+/// file sets no search path. Recovering this is not optional: reads and view
+/// references are qualified against it, so an empty list silently re-qualifies
+/// `t` to `public.t` — a plausibly-wrong edge pointing at a different table,
+/// which is worse than no edge at all.
+pub fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
+    let Ok(parsed) = pg_query::parse(raw_sql) else {
+        return vec![DEFAULT_SEARCH_PATH.to_string()];
+    };
+    for stmt in &parsed.protobuf.stmts {
+        let Some(pg_query::NodeEnum::VariableSetStmt(set)) =
+            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
+        else {
+            continue;
+        };
+        if !set.name.eq_ignore_ascii_case("search_path") {
+            continue;
+        }
+        let paths: Vec<String> = set.args.iter().filter_map(const_str).collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    vec![DEFAULT_SEARCH_PATH.to_string()]
+}
+
+/// The default schema when a file sets no `search_path` — matches
+/// [`extract_search_paths`].
+const DEFAULT_SEARCH_PATH: &str = "public";
+
+/// The string behind a `SET` argument node: a bare identifier arrives as a
+/// `ColumnRef` (`to app`), a quoted one as an `A_Const` string (`to 'app'`).
+fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
+    match node.node.as_ref()? {
+        pg_query::NodeEnum::String(s) => Some(s.sval.clone()),
+        pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        pg_query::NodeEnum::ColumnRef(r) => r.fields.first().and_then(const_str),
+        _ => None,
+    }
+}
+
+/// The tables a view's body reads, from libpg_query's AST — the fallback for a
+/// view [`extract_view_info`] could not read because sqlparser rejected the file.
+///
+/// Without this a recovered view carries no dependency edge at all, so it could
+/// be applied before the table it selects from: a loud skip traded for a silent
+/// misordering.
+pub fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Reference> {
+    let Ok(parsed) = pg_query::parse(raw_sql) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for table in parsed.select_tables() {
+        if let Some(name) = qualify_name_str(&table, default_schema) {
+            push_unique(&mut names, name);
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| Reference {
+            name,
+            ref_type: Some("table".to_string()),
+        })
+        .collect()
+}
+
 /// What a function or procedure body depends on.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ProcRefs {
@@ -1193,3 +1274,4 @@ mod tests {
         assert_eq!(paths, vec!["public"]);
     }
 }
+
