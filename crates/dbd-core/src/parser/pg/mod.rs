@@ -11,15 +11,7 @@ use crate::error::Result;
 use crate::parser::{DdlParser, SqlparserDdl};
 
 /// libpg_query — PostgreSQL's own grammar.
-///
-/// `pub`, not `pub(crate)`: until dispatch (a later step) constructs this from
-/// production code, it is reachable only from this module's own tests, and
-/// `cargo clippy -D warnings` correctly reports a `pub(crate)`-but-unreached
-/// type as dead code. Making it part of the crate's public surface is the
-/// only way to keep every commit in this migration both behaviour-neutral
-/// and clippy-clean without `#[allow(dead_code)]`; tighten back to
-/// `pub(crate)` once dispatch gives it a real, in-crate caller.
-pub struct PgQueryDdl;
+pub(crate) struct PgQueryDdl;
 
 impl PgQueryDdl {
     /// Entity types this parser handles itself.
@@ -27,11 +19,7 @@ impl PgQueryDdl {
     /// Single source of truth: dispatch below and `tests/parser_parity.rs` both
     /// read it, so a type cannot be switched over without also coming under the
     /// parity gate.
-    pub const COVERED: &'static [EntityType] = &[];
-
-    pub fn covers(entity_type: EntityType) -> bool {
-        Self::COVERED.contains(&entity_type)
-    }
+    pub(crate) const COVERED: &'static [EntityType] = &[];
 }
 
 impl DdlParser for PgQueryDdl {
@@ -68,6 +56,5 @@ mod tests {
     #[test]
     fn nothing_is_covered_yet() {
         assert!(PgQueryDdl::COVERED.is_empty());
-        assert!(!PgQueryDdl::covers(EntityType::Table));
     }
 }

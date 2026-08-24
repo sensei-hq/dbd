@@ -384,6 +384,13 @@ impl Design {
 
         let design_config = config::read(config_path)?;
 
+        // Validate and resolve the parser before reading any file, so a bad
+        // `source.parser` fails at load rather than partway through the scan.
+        let parser_choice = crate::parser::ParserChoice::resolve(
+            &design_config.source.dialect,
+            design_config.source.parser.as_deref(),
+        )?;
+
         // Scan and parse DDL entities. A file that fails to read must not
         // silently vanish from the desired set — a live table could be
         // dropped by `reconcile --prune` — so propagate the read error.
@@ -397,7 +404,7 @@ impl Design {
             // Use relative path for entity type/name derivation, but
             // store the absolute path so the file is readable regardless of CWD.
             let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-            if let Ok(mut entity) = parser::parse_entity(relative, &sql) {
+            if let Ok(mut entity) = parser::parse_entity_with(parser_choice, relative, &sql) {
                 entity.file = Some(file.clone());
                 entities.push(entity);
             }

@@ -1,5 +1,5 @@
 mod extractors;
-pub mod pg;
+pub(crate) mod pg;
 mod tables;
 
 use std::path::Path;
@@ -208,13 +208,31 @@ impl DdlParser for SqlparserDdl {
     }
 }
 
-/// Parse a DDL file with sqlparser, regardless of `source.parser`.
+/// Parse a DDL file with an explicit parser choice.
 ///
-/// Still the entry point for the project scan (`design::from_config_with_dir`)
-/// until dispatch lands; the round-trip callers that reconstruct DDL and read it
-/// straight back (`emit`, `dbml_parse` tests) keep using it afterwards.
+/// The project scan (`design::from_config_with_dir`) resolves `source.parser`
+/// once, before reading any file, and calls this directly so a bad config
+/// value fails at load rather than partway through the scan.
+pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result<Entity> {
+    match choice {
+        ParserChoice::Sqlparser => SqlparserDdl.parse(file, sql),
+        ParserChoice::PgQuery => pg::PgQueryDdl.parse(file, sql),
+    }
+}
+
+/// Parse a DDL file with the Postgres default parser.
+///
+/// Kept for the round-trip callers that reconstruct DDL and read it straight
+/// back (`emit`, `dbml_parse` tests) rather than scanning a project directory.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
-    SqlparserDdl.parse(file, sql)
+    parse_entity_with(ParserChoice::PgQuery, file, sql)
+}
+
+/// Entity types the Postgres-native parser handles itself.
+///
+/// Public so the parity gate reads the same list dispatch does.
+pub fn pg_native_types() -> &'static [EntityType] {
+    pg::PgQueryDdl::COVERED
 }
 
 fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
