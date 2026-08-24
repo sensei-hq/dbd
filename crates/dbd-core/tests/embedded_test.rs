@@ -383,6 +383,8 @@ async fn introspect_returns_fixture_entities() {
 
         CREATE TYPE revtest.color AS ENUM ('red', 'green');
 
+        CREATE TYPE revtest.empty_color AS ENUM ();
+
         CREATE TABLE revtest.owner (
             id uuid PRIMARY KEY DEFAULT gen_random_uuid()
         );
@@ -424,6 +426,23 @@ async fn introspect_returns_fixture_entities() {
     let color_enum = color_enum.expect("enum 'revtest.color' not found in introspect output");
     let enum_value_names: Vec<&str> = color_enum.enum_values.iter().map(|v| v.name.as_str()).collect();
     assert_eq!(enum_value_names, vec!["red", "green"], "enum values should be [red, green]");
+
+    // ── Assert: label-less enum revtest.empty_color still introspects ─────────
+    // `CREATE TYPE e AS ENUM ()` is valid Postgres and creates a real type with
+    // zero pg_enum rows. introspect_enums used to INNER JOIN pg_enum, which made
+    // such a type invisible here — reconcile then saw it as permanently missing
+    // and recreated it on every run, never converging. It must be found, with
+    // an empty (not absent) values list.
+    let empty_enum = entities.iter().find(|e| {
+        e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.empty_color"
+    });
+    let empty_enum =
+        empty_enum.expect("label-less enum 'revtest.empty_color' not found in introspect output");
+    assert!(
+        empty_enum.enum_values.is_empty(),
+        "empty_color should introspect with zero values, got: {:?}",
+        empty_enum.enum_values
+    );
 
     // ── Assert: table revtest.widget present ──────────────────────────────────
     let widget = entities.iter().find(|e| {
