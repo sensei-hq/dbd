@@ -205,8 +205,19 @@ file — that is the definition of invalid Postgres. This preserves the invarian
 the file is genuinely unreadable, so apply/reconcile refuse only on real
 breakage.
 
-Postgres's parse errors carry a cursor position; surface it in the message so
-`dbd inspect` points at the offending token.
+**Error messages lose line and column.** libpg_query's C API reports a
+`cursorpos`, but the Rust binding keeps only `error.message` and discards it
+(`pg_query::query::parse` builds `Error::Parse(message)` from
+`(*result.error).message` alone). Measured on the same invalid input:
+
+| parser | message |
+| --- | --- |
+| sqlparser | `Expected: identifier, found: ; at Line: 1, Column: 29` |
+| libpg_query | `syntax error at or near ";"` |
+
+The offending token is still named, which is the bulk of the diagnostic value,
+but `dbd inspect` output gets less precise. This is an accepted regression for
+this rollout and tracked as F5.
 
 ## Risks
 
@@ -261,6 +272,14 @@ sqlparser *fails*. Running it unconditionally would also catch the opposite
 gap — files sqlparser accepts that Postgres rejects (`SELECT FROM FROM`,
 `where where`). Once `PgQueryDdl` is primary this is moot for Postgres, but it
 remains open for whatever still routes to `SqlparserDdl`.
+
+### F5 — Recover line and column in libpg_query parse errors
+
+See Error handling: the binding drops `cursorpos`, so native parse errors name
+the token but not where it is. `pg_query::bindings` exposes the raw
+`PgQueryError` struct, so a small wrapper could read `cursorpos` and convert the
+byte offset into line/column against the source text. Worth doing once several
+entity types are native and `dbd inspect` output is mostly libpg_query's.
 
 ### F4 — Separately-tracked, not caused by this work
 
