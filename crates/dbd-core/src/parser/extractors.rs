@@ -281,6 +281,55 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     Vec::new()
 }
 
+/// Enum labels from a `DO $$ … $$` guarded `CREATE TYPE … AS ENUM`, read off
+/// libpg_query's AST (Postgres's own parser).
+///
+/// Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a DO
+/// block that swallows `duplicate_object` is the only idiom available for a
+/// conditional enum — and sqlparser rejects `DO` outright. This is the same
+/// second tier [`extract_proc_refs`] already uses for PL/pgSQL bodies: parse the
+/// block, take the SQL it embeds, and re-parse that into a real statement tree.
+///
+/// Returns an empty vec when the input is not a PL/pgSQL block libpg_query
+/// accepts, or when it declares no enum — the caller keeps its parse error, so a
+/// genuinely broken file is never quietly waved through.
+pub fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
+    let Ok(tree) = pg_query::parse_plpgsql(raw_sql) else {
+        return Vec::new();
+    };
+
+    let mut queries = Vec::new();
+    collect_plpgsql_queries(&tree, &mut queries);
+
+    for query in &queries {
+        let Ok(parsed) = pg_query::parse(query) else {
+            continue;
+        };
+        for stmt in &parsed.protobuf.stmts {
+            let Some(pg_query::NodeEnum::CreateEnumStmt(create)) =
+                stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
+            else {
+                continue;
+            };
+            let values: Vec<EnumValue> = create
+                .vals
+                .iter()
+                .filter_map(|v| match v.node.as_ref() {
+                    Some(pg_query::NodeEnum::String(s)) => Some(EnumValue {
+                        name: s.sval.clone(),
+                        note: None,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// What a function or procedure body depends on.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ProcRefs {
@@ -653,6 +702,22 @@ mod tests {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap_or_default();
         extract_proc_refs(&stmts, sql, "public")
+    }
+
+    #[test]
+    fn guarded_enum_values_read_off_the_pg_query_ast() {
+        let values = extract_enum_values_via_pg_query(
+            "do $$ begin\n  create type status_t as enum ('active', 'archived');\n\
+             exception when duplicate_object then null;\nend $$;",
+        );
+        let names: Vec<&str> = values.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["active", "archived"]);
+    }
+
+    #[test]
+    fn pg_query_enum_fallback_is_empty_when_no_enum_is_declared() {
+        assert!(extract_enum_values_via_pg_query("do $$ begin perform 1; end $$;").is_empty());
+        assert!(extract_enum_values_via_pg_query("NOT SQL AT ALL ;;;").is_empty());
     }
 
     #[test]
