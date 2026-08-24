@@ -235,6 +235,10 @@ impl Design {
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
+        // A file dbd could not read means the desired schema has a hole in it.
+        // Refuse before planning, `dry_run` included: a plan computed from a
+        // partial design reports drift that isn't there and misses drift that is.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized).
@@ -354,6 +358,9 @@ impl Design {
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
+        // Read-only, but the same refusal applies: "in sync with the design" is a
+        // false statement when part of the design was never read.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)

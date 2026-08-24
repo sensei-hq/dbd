@@ -28,6 +28,12 @@ impl Design {
         // the valid, in-scope, name-matching entities. The gate runs even under
         // `dry_run`: a gappy scope is misconfigured regardless of writes.
         let working_set = self.scope_working_set(scope)?;
+        // Refuse a design with a file dbd could not read, before any write.
+        // `entities_in_scope` drops those entities silently, which is how apply
+        // used to report success while never creating the object. Like the scope
+        // gate above, this runs under `dry_run` too: an incomplete design is
+        // incomplete whether or not we are about to write.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
         let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
 
         if dry_run {
