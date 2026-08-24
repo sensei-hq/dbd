@@ -110,6 +110,69 @@ impl Design {
             .collect()
     }
 
+    /// Entities that would be in scope but were dropped by
+    /// [`Self::entities_in_scope`]'s error filter — its exact inverse, and it
+    /// must stay in step with it.
+    pub(in crate::design) fn unparseable_in_scope(
+        &self,
+        scope: Option<&ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+        name: Option<&str>,
+    ) -> Vec<&Entity> {
+        self.entities
+            .iter()
+            .filter(|e| !e.errors.is_empty())
+            .filter(|e| e.entity_type != EntityType::External)
+            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
+            .filter(|e| match (working_set, scope) {
+                (Some(ws), Some(s)) => Self::entity_in_scope(e, s, ws),
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// Refuse to act on a design dbd could not fully read.
+    ///
+    /// [`Self::entities_in_scope`] silently drops an entity that carries a parse
+    /// error, and without this guard that filter is invisible: `dbd apply`
+    /// reported "N entities applied" and exited 0 while never creating the
+    /// object, and `dbd reconcile` reported no drift for it. A design is only a
+    /// source of truth if every file in it was understood, so callers check this
+    /// *before* any write — a partial apply is what makes the failure expensive.
+    ///
+    /// This fires only on SQL Postgres itself rejects. Valid SQL that merely
+    /// outruns sqlparser is recovered in `parser::parse_entity` via libpg_query
+    /// and never reaches here.
+    pub(in crate::design) fn ensure_fully_parsed(
+        &self,
+        scope: Option<&ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let bad = self.unparseable_in_scope(scope, working_set, name);
+        if bad.is_empty() {
+            return Ok(());
+        }
+
+        let mut msg = format!(
+            "{} file(s) could not be parsed, so the design is incomplete and cannot be applied:\n",
+            bad.len()
+        );
+        for e in &bad {
+            let where_ = e
+                .file
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_else(|| e.name.clone());
+            msg.push_str(&format!("\n  {where_}\n"));
+            for err in &e.errors {
+                msg.push_str(&format!("    {err}\n"));
+            }
+        }
+        msg.push_str("\nFix the file(s), or run `dbd inspect` for the full report.");
+        Err(DbdError::Config(msg))
+    }
+
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
