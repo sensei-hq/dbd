@@ -19,7 +19,7 @@ pub use extractors::extract_search_paths;
 // - Enum values
 // ── sqlparser workarounds ────────────────────────────────────────────
 //
-// WORKAROUND_REGISTRY: sqlparser-rs 0.61 (Apache DataFusion)
+// WORKAROUND_REGISTRY: sqlparser-rs 0.62 (Apache DataFusion)
 //
 // The workarounds below patch SQL text before feeding it to sqlparser.
 // Each is annotated with the limitation it addresses and what to check
