@@ -10,6 +10,11 @@ use crate::parser::extractors;
 /// in the `DO $$ … EXCEPTION WHEN duplicate_object $$` guard that is Postgres's
 /// only idiom for a conditional CREATE TYPE.
 pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
+    // Set before the parse-error early return: an errored entity must still
+    // carry the sqlparser path's `["public"]` default, since View qualifies
+    // its refs against `search_paths`.
+    entity.search_paths = extractors::extract_search_paths_via_pg_query(sql);
+
     // libpg_query is Postgres's own grammar, so its rejection is the definition
     // of invalid SQL. Recording an error only here keeps the invariant
     // `Design::ensure_fully_parsed` relies on: apply refuses only on real
@@ -19,36 +24,44 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
         return Ok(entity);
     }
 
-    entity.search_paths = extractors::extract_search_paths_via_pg_query(sql);
-    entity.enum_values = enum_values(sql);
-
-    if entity.enum_values.is_empty() {
-        entity
+    match enum_values(sql) {
+        // `CREATE TYPE e AS ENUM ()` is valid Postgres with zero labels — not
+        // an absence of the statement, so it must not error.
+        Some(values) => entity.enum_values = values,
+        None => entity
             .errors
-            .push("no `CREATE TYPE … AS ENUM (…)` found in this enum file".to_string());
+            .push("this enum file declares no `CREATE TYPE … AS ENUM`".to_string()),
     }
 
     Ok(entity)
 }
 
 /// Enum labels, whichever spelling the file uses.
-fn enum_values(sql: &str) -> Vec<EnumValue> {
-    if let Ok(parsed) = pg_query::parse(sql) {
-        let values = labels_from_parse_result(&parsed);
-        if !values.is_empty() {
-            return values;
-        }
+///
+/// `None` means no `CreateEnumStmt` was found anywhere (bare or DO-guarded);
+/// `Some(vec![])` means one was found and it declares zero labels — those are
+/// different outcomes and callers must not conflate them.
+fn enum_values(sql: &str) -> Option<Vec<EnumValue>> {
+    if let Ok(parsed) = pg_query::parse(sql)
+        && let Some(values) = labels_from_parse_result(&parsed)
+    {
+        return Some(values);
     }
     // Guarded form: the CREATE lives inside a PL/pgSQL block, which the
-    // top-level statement walk above cannot see into.
-    extractors::extract_enum_values_via_pg_query(sql)
+    // top-level statement walk above cannot see into. This fallback returns a
+    // plain `Vec`, so it can't distinguish "no CreateEnumStmt in the block"
+    // from "found with zero labels" the way `labels_from_parse_result` does
+    // above — an empty result here is treated as not found.
+    let values = extractors::extract_enum_values_via_pg_query(sql);
+    (!values.is_empty()).then_some(values)
 }
 
-/// Labels from the first `CreateEnumStmt` in a parsed statement list.
+/// Labels from the first `CreateEnumStmt` in a parsed statement list, or
+/// `None` if the statement list contains no `CreateEnumStmt` at all.
 ///
 /// Shared with [`extractors::extract_enum_values_via_pg_query`], which runs this
 /// over the statements it recovers from inside a `DO` block.
-pub(crate) fn labels_from_parse_result(parsed: &pg_query::ParseResult) -> Vec<EnumValue> {
+pub(crate) fn labels_from_parse_result(parsed: &pg_query::ParseResult) -> Option<Vec<EnumValue>> {
     for stmt in &parsed.protobuf.stmts {
         let Some(pg_query::NodeEnum::CreateEnumStmt(create)) =
             stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
@@ -66,11 +79,9 @@ pub(crate) fn labels_from_parse_result(parsed: &pg_query::ParseResult) -> Vec<En
                 _ => None,
             })
             .collect();
-        if !values.is_empty() {
-            return values;
-        }
+        return Some(values);
     }
-    Vec::new()
+    None
 }
 
 #[cfg(test)]
@@ -137,5 +148,25 @@ mod tests {
     fn valid_sql_declaring_no_enum_records_an_error() {
         let e = parse("select 1;");
         assert!(!e.errors.is_empty(), "an enum file with no CREATE TYPE must error");
+    }
+
+    /// `CREATE TYPE e AS ENUM ()` is valid Postgres (confirmed against a live
+    /// server) and is exactly what dbd's own emitter produces for a label-less
+    /// enum — it must parse clean, not be mistaken for "no CREATE TYPE found".
+    #[test]
+    fn empty_enum_parses_with_zero_labels_and_no_error() {
+        let e = parse("set search_path to app;\ncreate type status as enum ();");
+        assert!(e.enum_values.is_empty(), "got: {:?}", e.enum_values);
+        assert!(e.errors.is_empty(), "got: {:?}", e.errors);
+    }
+
+    /// The sqlparser path always defaults `search_paths` to `["public"]`, even
+    /// on error; View qualifies its refs against this field, so the two parsers
+    /// must not diverge on it just because one hit a parse error.
+    #[test]
+    fn errored_entity_still_defaults_search_paths_to_public() {
+        let e = parse("create type status as enum (;;;");
+        assert!(!e.errors.is_empty(), "sanity: this SQL must still error");
+        assert_eq!(e.search_paths, vec!["public".to_string()]);
     }
 }

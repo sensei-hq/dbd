@@ -305,8 +305,9 @@ pub fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
         let Ok(parsed) = pg_query::parse(query) else {
             continue;
         };
-        let values = crate::parser::pg::enums::labels_from_parse_result(&parsed);
-        if !values.is_empty() {
+        if let Some(values) = crate::parser::pg::enums::labels_from_parse_result(&parsed)
+            && !values.is_empty()
+        {
             return values;
         }
     }
