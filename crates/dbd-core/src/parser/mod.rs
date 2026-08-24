@@ -190,19 +190,60 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
                     return Ok(entity);
                 }
             }
-            entity.errors.push(format!("Parse error: {e}"));
-            // For procedures/functions we can still extract reads/writes even
-            // when sqlparser can't parse the statement (e.g. RETURNS SETOF/TABLE):
-            // libpg_query parses the body, with the regex scanner as last resort.
-            // No parsed statements here, so the LANGUAGE sql AST path is skipped.
-            if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
-                apply_proc_refs(&mut entity, extractors::extract_proc_refs(&[], &cleaned, "public"));
-                entity.refers = entity
-                    .references
-                    .iter()
-                    .map(|r| r.name.clone())
-                    .collect();
+            // sqlparser reimplements the SQL grammar and lags Postgres, so its
+            // rejection alone says nothing about the file. When libpg_query —
+            // Postgres's own parser — accepts it, the file is valid and the
+            // limitation is ours: record no error, and recover what the entity
+            // actually needs from the raw text.
+            //
+            // Only for the types dbd applies as raw SQL and needs no structural
+            // AST for. A TABLE must keep its error: without `table_def` it is
+            // filtered out of the desired snapshot (`reconcile::
+            // raw_snapshot_from_entities`), which makes the live table read as
+            // an orphan that `--prune` would DROP. A MATERIALIZED VIEW must too:
+            // its emitter rebuilds the CREATE from `writes[0]`, which only the
+            // sqlparser path populates.
+            let ast_optional = matches!(
+                entity.entity_type,
+                EntityType::Function | EntityType::Procedure | EntityType::View
+            );
+            let recovered = ast_optional && extractors::is_valid_postgres(&cleaned);
+            if !recovered {
+                entity.errors.push(format!("Parse error: {e}"));
             }
+
+            // Reads and view references are qualified against the search path,
+            // so recover it first — defaulting to `public` (as the sqlparser
+            // path does) would re-point `t` at `public.t`, a plausibly-wrong
+            // edge to a different table rather than an absent one.
+            entity.search_paths = extractors::extract_search_paths_via_pg_query(&cleaned);
+            let default_schema = entity
+                .search_paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "public".to_string());
+
+            match entity.entity_type {
+                // libpg_query parses the body; the regex scanner is the last
+                // resort. No parsed statements here, so the LANGUAGE sql AST
+                // path is skipped.
+                EntityType::Function | EntityType::Procedure => {
+                    apply_proc_refs(
+                        &mut entity,
+                        extractors::extract_proc_refs(&[], &cleaned, &default_schema),
+                    );
+                }
+                EntityType::View => {
+                    entity.references =
+                        extractors::extract_view_refs_via_pg_query(&cleaned, &default_schema);
+                }
+                _ => {}
+            }
+            entity.refers = entity
+                .references
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
             return Ok(entity);
         }
     };
@@ -391,6 +432,96 @@ mod tests {
         )
         .unwrap();
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+    }
+
+    // ── libpg_query validation fallback ──────────────────────────────────────
+    //
+    // sqlparser is a convenience parser, not Postgres's. When it rejects a file
+    // that libpg_query — Postgres's own grammar — accepts, the limitation is
+    // ours and the file is valid SQL. Recording a parse error there is not
+    // cosmetic: it drops the entity from apply/reconcile's desired set, so the
+    // object is never created and the command still exits 0.
+    //
+    // The fallback is deliberately NOT applied to tables: a table with no
+    // `table_def` is filtered out of the desired snapshot (`reconcile.rs:91`),
+    // which makes the live table read as an orphan that `--prune` would DROP.
+    // Erroring keeps it visible; silently accepting it risks data loss.
+
+    #[test]
+    fn window_function_valid_in_postgres_is_not_an_error() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/wf.ddl"),
+            "set search_path to app;\n\
+             create function wf() returns int language plpgsql as $$ begin perform 1 from t; end $$ window;",
+        )
+        .unwrap();
+        assert!(
+            entity.errors.is_empty(),
+            "valid Postgres must not be reported as a user error: {:?}",
+            entity.errors
+        );
+    }
+
+    #[test]
+    fn view_with_check_option_is_not_an_error_and_keeps_its_refs() {
+        let entity = parse_entity(
+            Path::new("ddl/view/app/v.ddl"),
+            "set search_path to app;\n\
+             create view v as select * from t where a > 1 with cascaded check option;",
+        )
+        .unwrap();
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+        assert!(
+            entity.refers.contains(&"app.t".to_string()),
+            "a recovered view must keep its dependency edge, got {:?}",
+            entity.refers
+        );
+    }
+
+    // The wrong-schema trap: without search_path recovery the fallback would
+    // qualify reads to `public`, turning a missing edge into a plausibly-wrong
+    // one that points at a different table.
+
+    #[test]
+    fn fallback_recovers_search_paths_so_refs_resolve_to_the_right_schema() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/wf2.ddl"),
+            "set search_path to app;\n\
+             create function wf2() returns int language plpgsql as $$ begin perform 1 from t; end $$ window;",
+        )
+        .unwrap();
+        assert_eq!(entity.search_paths, vec!["app".to_string()]);
+        assert!(
+            entity.reads.contains(&"app.t".to_string()),
+            "read must qualify against the file's search_path, not `public`: {:?}",
+            entity.reads
+        );
+    }
+
+    #[test]
+    fn table_sqlparser_cannot_read_still_errors() {
+        let entity = parse_entity(
+            Path::new("ddl/table/app/excl.ddl"),
+            "set search_path to app;\n\
+             create table excl (id int primary key, r int4range, exclude using gist (r with &&));",
+        )
+        .unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a table with no table_def reads as an orphan that --prune would drop; \
+             it must stay visible as an error"
+        );
+        assert!(entity.table_def.is_none());
+    }
+
+    #[test]
+    fn sql_neither_parser_accepts_still_errors() {
+        let entity = parse_entity(
+            Path::new("ddl/view/app/broken.ddl"),
+            "create view v as SELECT * FROM ;",
+        )
+        .unwrap();
+        assert!(!entity.errors.is_empty(), "genuinely broken SQL must still error");
     }
 
     // ── Guarded enum: `DO $$ … $$` around CREATE TYPE ────────────────────────
