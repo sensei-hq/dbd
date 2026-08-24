@@ -406,12 +406,16 @@ impl PostgresAdapter {
         use crate::entity::EnumValue;
 
         let ns_filter = Self::schema_filter_column("n.nspname");
-        // Fetch enums and their ordered values in one query
+        // Fetch enums and their ordered values in one query. LEFT JOIN pg_enum:
+        // `CREATE TYPE e AS ENUM ()` is valid Postgres and creates a real type
+        // with zero pg_enum rows, so an inner join made it invisible to
+        // introspection — reconcile then saw it as missing and recreated it
+        // every run, forever, without ever converging.
         let sql = format!(
             "SELECT n.nspname, t.typname, e.enumlabel \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
-             JOIN pg_enum e ON e.enumtypid = t.oid \
+             LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
              WHERE t.typtype = 'e' AND {ns_filter} \
              ORDER BY n.nspname, t.typname, e.enumsortorder"
         );
@@ -420,16 +424,20 @@ impl PostgresAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("introspect_enums failed: {e}")))?;
 
-        // Group by (schema, typname)
+        // Group by (schema, typname). A label-less enum still gets exactly one
+        // map entry (via `.or_default()`) even though nothing is pushed to it,
+        // because its single row carries a NULL `enumlabel` rather than
+        // contributing no rows at all.
         let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> =
             indexmap::IndexMap::new();
         for row in &rows {
             let schema: String = row.get("nspname");
             let typname: String = row.get("typname");
-            let label: String = row.get("enumlabel");
-            map.entry((schema, typname))
-                .or_default()
-                .push(EnumValue { name: label, note: None });
+            let label: Option<String> = row.get("enumlabel");
+            let values = map.entry((schema, typname)).or_default();
+            if let Some(label) = label {
+                values.push(EnumValue { name: label, note: None });
+            }
         }
 
         let entities = map
