@@ -1,4 +1,5 @@
 mod extractors;
+pub mod pg;
 mod tables;
 
 use std::path::Path;
