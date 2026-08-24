@@ -175,6 +175,21 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     let statements = match sqlparser::parser::Parser::parse_sql(&dialect, &cleaned) {
         Ok(stmts) => stmts,
         Err(e) => {
+            // An enum guarded by `DO $$ … $$` — the only idiom Postgres offers
+            // for a conditional CREATE TYPE — is valid SQL that sqlparser can't
+            // read. Recovering it here matters more than the missing AST: an
+            // entity carrying a parse error is filtered out of apply/reconcile's
+            // desired set entirely (`design::scope::entities_in_scope`), so the
+            // type was never created and the first table using it failed with a
+            // bare `type "…" does not exist` that named neither the file nor the
+            // real cause. libpg_query reads the block, so no error is recorded.
+            if entity.entity_type == EntityType::Enum {
+                let values = extractors::extract_enum_values_via_pg_query(&cleaned);
+                if !values.is_empty() {
+                    entity.enum_values = values;
+                    return Ok(entity);
+                }
+            }
             entity.errors.push(format!("Parse error: {e}"));
             // For procedures/functions we can still extract reads/writes even
             // when sqlparser can't parse the statement (e.g. RETURNS SETOF/TABLE):
@@ -341,6 +356,63 @@ mod tests {
         )
         .unwrap();
         assert!(!entity.errors.is_empty());
+    }
+
+    // ── Guarded enum: `DO $$ … $$` around CREATE TYPE ────────────────────────
+    //
+    // Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a
+    // DO block that swallows `duplicate_object` is the only idiom for a
+    // conditional enum. sqlparser rejects `DO` outright, and a parse error drops
+    // the entity from apply/reconcile's desired set — so the type was never
+    // created and the first table using it died with `type "…" does not exist`,
+    // never mentioning the real cause. libpg_query reads the block.
+
+    #[test]
+    fn guarded_do_block_enum_is_parsed() {
+        let sql = "set search_path to app;\n\
+                   \n\
+                   do $$ begin\n\
+                     create type status_t as enum ('active', 'archived');\n\
+                   exception when duplicate_object then null;\n\
+                   end $$;\n";
+        let entity = parse_entity(Path::new("ddl/enum/app/status_t.ddl"), sql).unwrap();
+
+        assert_eq!(entity.entity_type, EntityType::Enum);
+        assert_eq!(entity.name, "app.status_t");
+        assert!(
+            entity.errors.is_empty(),
+            "a guarded enum is valid Postgres and must not report a parse error: {:?}",
+            entity.errors
+        );
+        let values: Vec<&str> = entity.enum_values.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(values, vec!["active", "archived"]);
+    }
+
+    // The fallback must not turn every unparseable enum file into a silent pass.
+
+    #[test]
+    fn unparseable_enum_still_reports_an_error() {
+        let entity = parse_entity(
+            Path::new("ddl/enum/app/broken.ddl"),
+            "THIS IS NOT SQL AT ALL ;;;",
+        )
+        .unwrap();
+        assert!(!entity.errors.is_empty(), "a broken enum file must still surface a parse error");
+        assert!(entity.enum_values.is_empty());
+    }
+
+    #[test]
+    fn do_block_declaring_no_enum_keeps_its_parse_error() {
+        let entity = parse_entity(
+            Path::new("ddl/enum/app/empty.ddl"),
+            "do $$ begin perform 1; end $$;",
+        )
+        .unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a DO block with no CREATE TYPE declares no enum — the error must stand"
+        );
+        assert!(entity.enum_values.is_empty());
     }
 
     // ── Role round-trip: emit → parse → refers ───────────────────────────────
