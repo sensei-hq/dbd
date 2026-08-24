@@ -1082,6 +1082,41 @@ Every other type still delegates to sqlparser."
 
 ---
 
+## Execution record (what actually happened)
+
+The plan's task boundaries did not survive contact with this repo's CI, which
+runs `cargo clippy --all-targets -- -D warnings`. Two boundaries created code
+that could not compile clean:
+
+- **Tasks 3 and 4 merged.** `PgQueryDdl` with no dispatch is dead code. Only a
+  *non-test* caller clears `dead_code` — `#[cfg(test)]` code is invisible to
+  that analysis — so the skeleton and its dispatch had to land together. A
+  `covers()` helper written in task 3 was deleted and reintroduced in task 7,
+  the step that first branches on it.
+- **Tasks 5, 6 and 7 merged.** Same cause: an unwired `parse_enum` is dead code,
+  and the parity harness could not rescue it (an integration test is a separate
+  crate and cannot see `pub(crate)` items, and the warning comes from the lib
+  target anyway). Parser, gate and switchover landed in one commit.
+
+The merge did not weaken the gate. The pre-commit hook runs `cargo test` before
+a commit lands, so a parity disagreement blocks the commit regardless of whether
+the harness arrived one commit earlier.
+
+**Generalisable lesson:** in a crate built with `-D warnings --all-targets`,
+"write it now, wire it later" is not a valid task boundary.
+
+Two defects were also found that the plan did not anticipate:
+
+- `ParserChoice::resolve` missed the `postgres` dialect spelling, which
+  `dbd doctor --fix` itself writes when migrating a legacy `project.database`.
+  Fixed, and the spec's dispatch table corrected.
+- A `DO`-guarded enum recorded `search_paths=[]` where a plain `create type`
+  recorded `["app"]`. Fixed before the gate existed; otherwise it would have
+  surfaced as a parity failure with no obvious connection to the parser work.
+
+The parity gate was verified non-vacuous by mutation: dropping one label from
+`parse_enum` makes it fail and name the offending file.
+
 ## Verification checklist
 
 - [ ] `cargo test --workspace` exits 0 (the exit code is the assertion; test-binary counts drift)
