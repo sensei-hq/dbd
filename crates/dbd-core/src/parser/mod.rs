@@ -32,7 +32,7 @@ impl ParserChoice {
                 "unknown source.parser {other:?} — expected \"pg_query\" or \"sqlparser\""
             ))),
             None => Ok(match dialect {
-                "postgresql" | "supabase" => Self::PgQuery,
+                "postgresql" | "postgres" | "supabase" => Self::PgQuery,
                 _ => Self::Sqlparser,
             }),
         }
@@ -731,6 +731,9 @@ mod tests {
     fn postgres_dialects_default_to_pg_query() {
         assert_eq!(ParserChoice::resolve("postgresql", None).unwrap(), ParserChoice::PgQuery);
         assert_eq!(ParserChoice::resolve("supabase", None).unwrap(), ParserChoice::PgQuery);
+        // `dbd doctor --fix` migrates a legacy `project.database: Postgres`
+        // to this spelling (doctor.rs:120-127), so it must not miss.
+        assert_eq!(ParserChoice::resolve("postgres", None).unwrap(), ParserChoice::PgQuery);
     }
 
     #[test]
@@ -759,5 +762,8 @@ mod tests {
             .to_string();
         assert!(err.contains("pg_query"), "got: {err}");
         assert!(err.contains("sqlparser"), "got: {err}");
+
+        assert!(ParserChoice::resolve("postgresql", Some("")).is_err());
+        assert!(ParserChoice::resolve("postgresql", Some("PG_QUERY")).is_err());
     }
 }

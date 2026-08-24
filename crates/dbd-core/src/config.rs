@@ -653,6 +653,18 @@ mod tests {
     }
 
     #[test]
+    fn source_parser_is_optional_and_parses() {
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
+        assert_eq!(cfg.source.parser, None);
+        let cfg: DesignConfig =
+            serde_yaml::from_str("project:\n  name: t\nsource:\n  parser: pg_query\n").unwrap();
+        assert_eq!(cfg.source.parser.as_deref(), Some("pg_query"));
+        // SourceConfig carries both a manual Default impl and per-field serde
+        // defaults; pin that they cannot drift apart for the new field.
+        assert_eq!(cfg.source.dialect, "postgresql");
+    }
+
+    #[test]
     fn parses_target_config() {
         let config = read(&fixture("design.yaml")).unwrap();
         assert_eq!(config.default_target(), Some("postgres"));
