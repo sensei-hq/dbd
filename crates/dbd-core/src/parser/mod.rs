@@ -193,9 +193,8 @@ fn apply_proc_refs(entity: &mut Entity, refs: extractors::ProcRefs) {
 
 /// Reads a DDL file into an [`Entity`].
 ///
-/// Two implementations exist so the Postgres-native parser can be built and
-/// verified beside the incumbent rather than replacing it in one step.
-pub(crate) trait DdlParser: Sync {
+/// A second implementation is built beside it rather than replacing it in one step.
+pub(crate) trait DdlParser {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity>;
 }
 
@@ -208,10 +207,11 @@ impl DdlParser for SqlparserDdl {
     }
 }
 
-/// Parse a DDL file with the Postgres default parser.
+/// Parse a DDL file with sqlparser, regardless of `source.parser`.
 ///
-/// Kept for callers that reconstruct DDL and read it straight back
-/// (`emit`, `dbml_parse`) rather than scanning a project directory.
+/// Still the entry point for the project scan (`design::from_config_with_dir`)
+/// until dispatch lands; the round-trip callers that reconstruct DDL and read it
+/// straight back (`emit`, `dbml_parse` tests) keep using it afterwards.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     SqlparserDdl.parse(file, sql)
 }
