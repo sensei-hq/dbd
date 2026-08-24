@@ -16,9 +16,10 @@ pub(crate) struct PgQueryDdl;
 impl PgQueryDdl {
     /// Entity types this parser handles itself.
     ///
-    /// Single source of truth: dispatch below and `tests/parser_parity.rs` both
-    /// read it, so a type cannot be switched over without also coming under the
-    /// parity gate.
+    /// Single source of truth for the switchover. `PgQueryDdl::parse` will
+    /// branch on it as types go native, and the parity harness
+    /// (`tests/parser_parity.rs`, task 6) will read the same list — so a type
+    /// cannot switch over without also coming under the gate.
     pub(crate) const COVERED: &'static [EntityType] = &[];
 }
 
@@ -33,8 +34,6 @@ impl DdlParser for PgQueryDdl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::SqlparserDdl;
-    use std::path::Path;
 
     fn json(entity: &Entity) -> serde_json::Value {
         serde_json::to_value(entity).expect("Entity serializes")

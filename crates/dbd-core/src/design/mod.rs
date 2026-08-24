@@ -394,8 +394,8 @@ impl Design {
         // Scan and parse DDL entities. A file that fails to read must not
         // silently vanish from the desired set — a live table could be
         // dropped by `reconcile --prune` — so propagate the read error.
-        // `parse_entity`'s own Err (unparseable DDL) still drops the entity,
-        // unchanged from prior behavior.
+        // `parse_entity_with`'s own Err (unparseable DDL) still drops the
+        // entity, unchanged from prior behavior.
         let ddl_files = scanner::scan_ddl(&project_dir)?;
         let mut entities: Vec<Entity> = Vec::new();
         for file in &ddl_files {

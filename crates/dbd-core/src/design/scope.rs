@@ -141,8 +141,9 @@ impl Design {
     /// *before* any write — a partial apply is what makes the failure expensive.
     ///
     /// This fires only on SQL Postgres itself rejects. Valid SQL that merely
-    /// outruns sqlparser is recovered in `parser::parse_entity` via libpg_query
-    /// and never reaches here.
+    /// outruns sqlparser is recovered via libpg_query inside
+    /// `parser::parse_with_sqlparser`, reached from the scan path through
+    /// `parser::parse_entity_with` → `SqlparserDdl`, and never reaches here.
     pub(in crate::design) fn ensure_fully_parsed(
         &self,
         scope: Option<&ResolvedScope>,
