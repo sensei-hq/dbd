@@ -4,6 +4,8 @@
 //! [`SqlparserDdl`], so the tree is releasable at every step of the migration
 //! rather than only at the end.
 
+pub(crate) mod enums;
+
 use std::path::Path;
 
 use crate::entity::{Entity, EntityType};
@@ -16,18 +18,30 @@ pub(crate) struct PgQueryDdl;
 impl PgQueryDdl {
     /// Entity types this parser handles itself.
     ///
-    /// Single source of truth for the switchover. `PgQueryDdl::parse` will
-    /// branch on it as types go native, and the parity harness
-    /// (`tests/parser_parity.rs`, task 6) will read the same list — so a type
-    /// cannot switch over without also coming under the gate.
-    pub(crate) const COVERED: &'static [EntityType] = &[];
+    /// Single source of truth for the switchover. `PgQueryDdl::parse` branches
+    /// on it as types go native, and the parity harness (`tests/parser_parity.rs`)
+    /// reads the same list — so a type cannot switch over without also coming
+    /// under the gate.
+    pub(crate) const COVERED: &'static [EntityType] = &[EntityType::Enum];
+
+    /// Whether this parser handles `entity_type` itself.
+    pub(crate) fn covers(entity_type: EntityType) -> bool {
+        Self::COVERED.contains(&entity_type)
+    }
 }
 
 impl DdlParser for PgQueryDdl {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
-        // Nothing is native yet, so every type delegates. Types move into
-        // COVERED one at a time, each behind the parity gate.
-        SqlparserDdl.parse(file, sql)
+        let entity = Entity::from_file(file);
+        if !Self::covers(entity.entity_type) {
+            return SqlparserDdl.parse(file, sql);
+        }
+        match entity.entity_type {
+            EntityType::Enum => enums::parse_enum(entity, sql),
+            // Unreachable while COVERED and this match agree; delegating rather
+            // than panicking keeps a mismatch a non-event.
+            _ => SqlparserDdl.parse(file, sql),
+        }
     }
 }
 
@@ -53,7 +67,8 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_covered_yet() {
-        assert!(PgQueryDdl::COVERED.is_empty());
+    fn enum_is_covered() {
+        assert!(PgQueryDdl::covers(EntityType::Enum));
+        assert!(!PgQueryDdl::covers(EntityType::Table));
     }
 }

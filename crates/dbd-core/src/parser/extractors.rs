@@ -305,26 +305,9 @@ pub fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
         let Ok(parsed) = pg_query::parse(query) else {
             continue;
         };
-        for stmt in &parsed.protobuf.stmts {
-            let Some(pg_query::NodeEnum::CreateEnumStmt(create)) =
-                stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-            else {
-                continue;
-            };
-            let values: Vec<EnumValue> = create
-                .vals
-                .iter()
-                .filter_map(|v| match v.node.as_ref() {
-                    Some(pg_query::NodeEnum::String(s)) => Some(EnumValue {
-                        name: s.sval.clone(),
-                        note: None,
-                    }),
-                    _ => None,
-                })
-                .collect();
-            if !values.is_empty() {
-                return values;
-            }
+        let values = crate::parser::pg::enums::labels_from_parse_result(&parsed);
+        if !values.is_empty() {
+            return values;
         }
     }
     Vec::new()
