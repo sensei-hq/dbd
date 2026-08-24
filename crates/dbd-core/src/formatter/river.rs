@@ -144,6 +144,12 @@ pub(in crate::formatter) fn river_emit_select_list(
                 // case keeps identifier case like the expression arms above.
                 (apply_keyword_case(&kind.to_string(), &config.keyword_case), None)
             }
+            // `expr AS (a, b)` — a multi-alias projection (DuckDB/BigQuery
+            // struct expansion). No alias column to align on, so render the
+            // whole item and treat it as unaliased.
+            SelectItem::ExprWithAliases { .. } => {
+                (apply_keyword_case(&item.to_string(), &config.keyword_case), None)
+            }
         })
         .collect();
 

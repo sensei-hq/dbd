@@ -358,6 +358,41 @@ mod tests {
         assert!(!entity.errors.is_empty());
     }
 
+    // ── sqlparser 0.62 grammar gaps ──────────────────────────────────────────
+    //
+    // 0.61 rejected these three, and a parse error is not cosmetic: it drops the
+    // entity from apply/reconcile's desired set, so `dbd apply` reported success
+    // while never creating the object. Pin them so a future downgrade or a
+    // regression in the dependency is caught here rather than in a user's
+    // database. `returns setof` is the case that surfaced the whole class.
+
+    #[test]
+    fn setof_returning_function_parses_and_keeps_its_refs() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/srf.ddl"),
+            "set search_path to app;\n\
+             create function srf() returns setof t language sql as $$ select * from t $$;",
+        )
+        .unwrap();
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+        assert!(
+            entity.reads.contains(&"app.t".to_string()),
+            "a parsed function must resolve its read against the file's search_path, got {:?}",
+            entity.reads
+        );
+    }
+
+    #[test]
+    fn variadic_function_parses() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/vf.ddl"),
+            "set search_path to app;\n\
+             create function vf(variadic a int[]) returns int language sql as $$ select 1 $$;",
+        )
+        .unwrap();
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+    }
+
     // ── Guarded enum: `DO $$ … $$` around CREATE TYPE ────────────────────────
     //
     // Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a
