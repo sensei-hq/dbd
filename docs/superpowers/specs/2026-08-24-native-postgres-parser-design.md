@@ -81,7 +81,7 @@ Dispatch:
 | --- | --- | --- |
 | `pg_query` | any | `PgQueryDdl` |
 | `sqlparser` | any | `SqlparserDdl` |
-| unset | `postgresql`, `supabase` | `PgQueryDdl` |
+| unset | `postgresql`, `postgres`, `supabase` | `PgQueryDdl` |
 | unset | anything else | `SqlparserDdl` |
 | unrecognised value | — | config error |
 

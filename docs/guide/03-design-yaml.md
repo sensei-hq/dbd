@@ -74,6 +74,7 @@ ignore:
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
 | `dialect` | string | `postgresql` | SQL dialect of the DDL files |
+| `parser`  | string | (from `dialect`) | Override the DDL parser: `pg_query` or `sqlparser` |
 
 ### `target`
 
