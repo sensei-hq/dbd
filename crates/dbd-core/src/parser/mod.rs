@@ -191,7 +191,32 @@ fn apply_proc_refs(entity: &mut Entity, refs: extractors::ProcRefs) {
     entity.writes = refs.writes;
 }
 
+/// Reads a DDL file into an [`Entity`].
+///
+/// Two implementations exist so the Postgres-native parser can be built and
+/// verified beside the incumbent rather than replacing it in one step.
+pub(crate) trait DdlParser: Sync {
+    fn parse(&self, file: &Path, sql: &str) -> Result<Entity>;
+}
+
+/// sqlparser-rs. Historical behaviour, unchanged.
+pub(crate) struct SqlparserDdl;
+
+impl DdlParser for SqlparserDdl {
+    fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
+        parse_with_sqlparser(file, sql)
+    }
+}
+
+/// Parse a DDL file with the Postgres default parser.
+///
+/// Kept for callers that reconstruct DDL and read it straight back
+/// (`emit`, `dbml_parse`) rather than scanning a project directory.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
+    SqlparserDdl.parse(file, sql)
+}
+
+fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
 
     // Role DDL contains DO $$ … $$ blocks that sqlparser cannot parse.
@@ -765,5 +790,22 @@ mod tests {
 
         assert!(ParserChoice::resolve("postgresql", Some("")).is_err());
         assert!(ParserChoice::resolve("postgresql", Some("PG_QUERY")).is_err());
+    }
+
+    // ── DdlParser ───────────────────────────────────────────────────────────
+
+    /// Object safety is a real requirement: dispatch selects an implementation
+    /// at runtime, so the trait must be usable behind a reference.
+    #[test]
+    fn sqlparser_ddl_is_usable_as_a_trait_object() {
+        let parser: &dyn DdlParser = &SqlparserDdl;
+        let entity = parser
+            .parse(
+                Path::new("ddl/enum/app/s.ddl"),
+                "create type s as enum ('a', 'b');",
+            )
+            .unwrap();
+        assert_eq!(entity.enum_values.len(), 2);
+        assert!(entity.errors.is_empty(), "got: {:?}", entity.errors);
     }
 }
