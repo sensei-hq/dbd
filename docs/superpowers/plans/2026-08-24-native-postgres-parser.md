@@ -166,8 +166,10 @@ Expected: PASS, all parser tests green
 
 - [ ] **Step 6: Run the full suite (the config change touches deserialization)**
 
-Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"; grep -cE "^test result: ok" /tmp/t.log`
-Expected: `exit: 0` and `7`
+Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"`
+Expected: `exit: 0`. `cargo test` exits non-zero if any test fails, so the exit
+code is the whole assertion — do not count test-result lines, that number drifts
+every time a task adds a test binary.
 
 - [ ] **Step 7: Commit**
 
@@ -265,8 +267,10 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
 
 - [ ] **Step 4: Run the full suite — this must be behaviour-neutral**
 
-Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"; grep -cE "^test result: ok" /tmp/t.log`
-Expected: `exit: 0` and `7`
+Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"`
+Expected: `exit: 0`. `cargo test` exits non-zero if any test fails, so the exit
+code is the whole assertion — do not count test-result lines, that number drifts
+every time a task adds a test binary.
 
 - [ ] **Step 5: Run clippy**
 
@@ -546,8 +550,8 @@ Expected: PASS — 3 tests
 
 - [ ] **Step 6: Run the full suite — still behaviour-neutral (PgQueryDdl delegates)**
 
-Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"; grep -cE "^test result: ok" /tmp/t.log`
-Expected: `exit: 0` and `8` (the new test binary adds one)
+Run: `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"`
+Expected: `exit: 0`
 
 - [ ] **Step 7: Run clippy**
 
@@ -1073,7 +1077,7 @@ Every other type still delegates to sqlparser."
 
 ## Verification checklist
 
-- [ ] `cargo test --workspace` exits 0
+- [ ] `cargo test --workspace` exits 0 (the exit code is the assertion; test-binary counts drift)
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [ ] `cargo test -p dbd-core --test parser_parity` compares at least one file (not vacuous)
 - [ ] A project with `source.parser: pgquery` fails to load, naming the valid values
