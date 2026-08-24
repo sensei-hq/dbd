@@ -28,6 +28,12 @@
 | `crates/dbd-core/tests/parser_parity.rs` | **Create** — differential gate |
 | `tests/fixtures/parser_corpus/ddl/enum/app/*.ddl` | **Create** — corpus files |
 
+**Prerequisite landed during Task 2 (commit `c415f3c`):** a `DO`-guarded enum
+used to return from the recovery arm before search-path extraction, recording
+`search_paths=[]` where an identical plain `create type` recorded `["app"]`.
+Both spellings now agree. Without that fix the Task 7 parity gate would have
+compared `[]` against `["app"]` and failed on `guarded.ddl`.
+
 **Note on `pg` module placement:** the four libpg_query helpers currently in `extractors.rs` (`is_valid_postgres`, `extract_search_paths_via_pg_query`, `extract_view_refs_via_pg_query`, `extract_enum_values_via_pg_query`) stay there for now — they are still called by the fallback in the sqlparser path. Per the spec they move into `parser/pg/` when that fallback retires at the end of rollout. Moving them now would make the sqlparser implementation depend on the pg module for no gain.
 
 ---
@@ -243,7 +249,7 @@ Leave the entire body unchanged. Then add immediately above it:
 ///
 /// Two implementations exist so the Postgres-native parser can be built and
 /// verified beside the incumbent rather than replacing it in one step.
-pub(crate) trait DdlParser: Sync {
+pub(crate) trait DdlParser {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity>;
 }
 
@@ -256,10 +262,11 @@ impl DdlParser for SqlparserDdl {
     }
 }
 
-/// Parse a DDL file with the Postgres default parser.
+/// Parse a DDL file with sqlparser, regardless of `source.parser`.
 ///
-/// Kept for callers that reconstruct DDL and read it straight back
-/// (`emit`, `dbml_parse`) rather than scanning a project directory.
+/// Still the entry point for the project scan (`design::from_config_with_dir`)
+/// until dispatch lands; the round-trip callers that reconstruct DDL and read it
+/// straight back (`emit`, `dbml_parse` tests) keep using it afterwards.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     SqlparserDdl.parse(file, sql)
 }
