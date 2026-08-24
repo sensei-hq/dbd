@@ -4,9 +4,40 @@ mod tables;
 use std::path::Path;
 
 use crate::entity::{Entity, EntityType, REF_TYPE_FUNCTION, Reference};
-use crate::error::Result;
+use crate::error::{DbdError, Result};
 
 pub use extractors::extract_search_paths;
+
+/// Which parser reads a project's DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserChoice {
+    /// sqlparser-rs — multi-dialect, the historical default.
+    Sqlparser,
+    /// libpg_query — PostgreSQL's own grammar, vendored from the server.
+    PgQuery,
+}
+
+impl ParserChoice {
+    /// `explicit` (`source.parser`) wins when set; otherwise the dialect decides.
+    ///
+    /// An unrecognised value is an error rather than a silent fallback: quietly
+    /// ignoring a typo would leave the project on a parser its author did not
+    /// choose, which is exactly the class of invisible behaviour this migration
+    /// exists to remove.
+    pub fn resolve(dialect: &str, explicit: Option<&str>) -> Result<Self> {
+        match explicit {
+            Some("pg_query") => Ok(Self::PgQuery),
+            Some("sqlparser") => Ok(Self::Sqlparser),
+            Some(other) => Err(DbdError::Config(format!(
+                "unknown source.parser {other:?} — expected \"pg_query\" or \"sqlparser\""
+            ))),
+            None => Ok(match dialect {
+                "postgresql" | "supabase" => Self::PgQuery,
+                _ => Self::Sqlparser,
+            }),
+        }
+    }
+}
 
 // Parse a DDL file and produce an Entity with extracted metadata.
 //
@@ -692,5 +723,41 @@ mod tests {
         let cleaned = super::preprocess_sql(sql);
         assert!(!cleaned.to_lowercase().contains("comment on materialized view"),
             "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}");
+    }
+
+    // ── ParserChoice ────────────────────────────────────────────────────────
+
+    #[test]
+    fn postgres_dialects_default_to_pg_query() {
+        assert_eq!(ParserChoice::resolve("postgresql", None).unwrap(), ParserChoice::PgQuery);
+        assert_eq!(ParserChoice::resolve("supabase", None).unwrap(), ParserChoice::PgQuery);
+    }
+
+    #[test]
+    fn other_dialects_keep_sqlparser() {
+        assert_eq!(ParserChoice::resolve("sqlite", None).unwrap(), ParserChoice::Sqlparser);
+    }
+
+    #[test]
+    fn explicit_parser_overrides_the_dialect() {
+        assert_eq!(
+            ParserChoice::resolve("postgresql", Some("sqlparser")).unwrap(),
+            ParserChoice::Sqlparser
+        );
+        assert_eq!(
+            ParserChoice::resolve("sqlite", Some("pg_query")).unwrap(),
+            ParserChoice::PgQuery
+        );
+    }
+
+    /// `source.parser` is public API, so a typo must not silently leave the
+    /// project on a parser the author did not ask for.
+    #[test]
+    fn an_unknown_parser_errors_and_names_the_valid_values() {
+        let err = ParserChoice::resolve("postgresql", Some("pgquery"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pg_query"), "got: {err}");
+        assert!(err.contains("sqlparser"), "got: {err}");
     }
 }
