@@ -242,6 +242,10 @@ fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
             if entity.entity_type == EntityType::Enum {
                 let values = extractors::extract_enum_values_via_pg_query(&cleaned);
                 if !values.is_empty() {
+                    // Set before returning: this arm skips the search-path extraction
+                    // below, so a guarded enum used to lose the `set search_path` its
+                    // plain-CREATE sibling records.
+                    entity.search_paths = extractors::extract_search_paths_via_pg_query(&cleaned);
                     entity.enum_values = values;
                     return Ok(entity);
                 }
@@ -608,6 +612,11 @@ mod tests {
         );
         let values: Vec<&str> = entity.enum_values.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(values, vec!["active", "archived"]);
+
+        // The guarded form must record its search path like the plain
+        // `create type` form does — this arm returns before the extraction
+        // further down, so it has to set it itself.
+        assert_eq!(entity.search_paths, vec!["app".to_string()]);
     }
 
     // The fallback must not turn every unparseable enum file into a silent pass.
