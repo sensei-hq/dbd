@@ -726,7 +726,95 @@
         let sql = generate_migration_sql(&diffs);
         assert_eq!(
             sql,
-            "ALTER TABLE public.users ALTER COLUMN id TYPE bigint;"
+            "ALTER TABLE public.users ALTER COLUMN id TYPE bigint USING id::bigint;"
+        );
+    }
+
+    // ── S7a: type change always carries USING ───────────────
+    //
+    // Postgres accepts the bare `ALTER COLUMN … TYPE t` only where an assignment
+    // cast exists. `text → integer`, `text → <enum>`, `text → uuid/jsonb` and
+    // `integer → boolean` all fail with "cannot be cast automatically", which
+    // aborted reconcile mid-plan. The explicit cast is a superset of the bare
+    // form, so it is emitted unconditionally.
+
+    #[test]
+    fn s7a_type_change_emits_using_cast() {
+        let sql = generate_migration_sql(&[alter_col(
+            "public.users",
+            "status",
+            col("status", "text"),
+            col("status", "app.status_t"),
+        )]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status TYPE app.status_t \
+             USING status::app.status_t;"
+        );
+    }
+
+    // ── S7b: an unchanged default is stashed across the alter ─
+    //
+    // A default the new type can't absorb blocks the alter itself ("default for
+    // column … cannot be cast automatically"), even with USING. Since the default
+    // is equal on both sides no default DDL used to be emitted at all, so the
+    // type change could never succeed.
+
+    #[test]
+    fn s7b_type_change_restashes_unchanged_default() {
+        let old = col_with_default("status", "text", "'active'");
+        let new = col_with_default("status", "app.status_t", "'active'");
+        let sql = generate_migration_sql(&[alter_col("public.users", "status", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT;\n\
+             ALTER TABLE public.users ALTER COLUMN status TYPE app.status_t \
+             USING status::app.status_t;\n\
+             ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 'active';"
+        );
+    }
+
+    // ── S7c: a changed default settles after the new type ────
+
+    #[test]
+    fn s7c_type_change_with_changed_default_sets_new_one_last() {
+        let old = col_with_default("status", "text", "'old'");
+        let new = col_with_default("status", "app.status_t", "'new'");
+        let sql = generate_migration_sql(&[alter_col("public.users", "status", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT;\n\
+             ALTER TABLE public.users ALTER COLUMN status TYPE app.status_t \
+             USING status::app.status_t;\n\
+             ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 'new';"
+        );
+    }
+
+    // ── S7d: a default dropped alongside a type change is dropped once ─
+
+    #[test]
+    fn s7d_type_change_dropping_default_emits_single_drop() {
+        let old = col_with_default("status", "text", "'active'");
+        let new = col("status", "app.status_t");
+        let sql = generate_migration_sql(&[alter_col("public.users", "status", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT;\n\
+             ALTER TABLE public.users ALTER COLUMN status TYPE app.status_t \
+             USING status::app.status_t;"
+        );
+    }
+
+    // ── S7e: a default change on its own is untouched by the stash ─
+
+    #[test]
+    fn s7e_default_change_without_type_change_is_unaffected() {
+        let old = col_with_default("status", "text", "'old'");
+        let new = col_with_default("status", "text", "'new'");
+        let sql = generate_migration_sql(&[alter_col("public.users", "status", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ALTER COLUMN status SET DEFAULT 'new';"
         );
     }
 
@@ -895,7 +983,7 @@
             ..col("id", "int")
         };
         let sql = generate_migration_sql(&[alter_col("public.users", "id", old, new)]);
-        let expected = "ALTER TABLE public.users ALTER COLUMN id TYPE bigint;\n\
+        let expected = "ALTER TABLE public.users ALTER COLUMN id TYPE bigint USING id::bigint;\n\
                         COMMENT ON COLUMN public.users.id IS 'the id';\n\
                         -- public.users.id: unique flag changed (false -> true); manage as a table UNIQUE constraint";
         assert_eq!(sql, expected);
@@ -1321,10 +1409,13 @@
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
-        assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status TYPE TEXT;"));
+        assert!(sql.contains(
+            "ALTER TABLE public.users ALTER COLUMN status TYPE TEXT USING status::TEXT;"
+        ));
         assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status DROP NOT NULL;"));
         assert!(sql.contains("ALTER TABLE public.users ALTER COLUMN status DROP DEFAULT;"));
-        // Should have exactly 3 ALTER statements
+        // Should have exactly 3 ALTER statements — the dropped default is the
+        // same statement that clears the way for the type change, not a second one.
         let line_count = sql.lines().count();
         assert_eq!(line_count, 3, "expected 3 ALTER statements, got {}", line_count);
     }

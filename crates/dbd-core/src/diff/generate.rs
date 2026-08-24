@@ -222,10 +222,35 @@ fn push_column_alter_sql(
     new_col: &crate::entity::ColumnDef,
     lines: &mut Vec<String>,
 ) {
-    if old_col.data_type != new_col.data_type {
+    let type_changed = old_col.data_type != new_col.data_type;
+
+    // A default the new type can't absorb blocks the type change itself —
+    // `default for column "c" cannot be cast automatically to type status_t` —
+    // and that fires even with a `USING` clause, because Postgres re-casts the
+    // default separately. Stash the default before the alter and restore it
+    // after. Nothing used to be emitted at all when the default was equal on
+    // both sides, so `text default 'active'` → enum could never converge.
+    let stash_default = type_changed && old_col.default_value.is_some();
+    if stash_default {
         lines.push(format!(
-            "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
-            entity_name, new_col.name, new_col.data_type
+            "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+            entity_name, new_col.name
+        ));
+    }
+
+    if type_changed {
+        // Always spell the cast out. Postgres accepts the bare
+        // `ALTER COLUMN … TYPE t` only where an assignment cast exists, so
+        // `text → integer`, `text → <enum>`, `text → uuid`, `text → jsonb` and
+        // `integer → boolean` all failed with "cannot be cast automatically" —
+        // aborting reconcile after earlier passes had already committed, which
+        // left the database half-converged and every re-run failing the same
+        // way. `USING col::t` is a superset of the bare form (it still covers
+        // int → bigint), so it is unconditional rather than gated on a
+        // cast-safety guess that can drift from Postgres's own cast catalog.
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+            entity_name, new_col.name, new_col.data_type, new_col.name, new_col.data_type
         ));
     }
     if old_col.nullable != new_col.nullable {
@@ -241,17 +266,23 @@ fn push_column_alter_sql(
             ));
         }
     }
-    if old_col.default_value != new_col.default_value {
-        match &new_col.default_value {
-            Some(val) => lines.push(format!(
+    // Settle the default last, once the column is already the new type. A
+    // stashed default is restored even when it did not change; a default that
+    // was stashed and is now gone needs no second `DROP DEFAULT`.
+    match &new_col.default_value {
+        Some(val) if stash_default || old_col.default_value != new_col.default_value => {
+            lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                 entity_name, new_col.name, val
-            )),
-            None => lines.push(format!(
+            ));
+        }
+        None if !stash_default && old_col.default_value.is_some() => {
+            lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
                 entity_name, new_col.name
-            )),
+            ));
         }
+        _ => {}
     }
     if old_col.comment != new_col.comment {
         match &new_col.comment {
