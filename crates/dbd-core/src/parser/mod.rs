@@ -222,15 +222,19 @@ pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result
 
 /// Parse a DDL file with the Postgres default parser.
 ///
-/// Kept for the round-trip callers that reconstruct DDL and read it straight
-/// back (`emit`, `dbml_parse` tests) rather than scanning a project directory.
+/// Used by this crate's tests and by external embedders (see
+/// `docs/design/architecture.md`); the project scan goes through
+/// [`parse_entity_with`] with the choice resolved from `source.parser`.
+/// Defaults to `PgQuery`, which today delegates to sqlparser for every type.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     parse_entity_with(ParserChoice::PgQuery, file, sql)
 }
 
 /// Entity types the Postgres-native parser handles itself.
 ///
-/// Public so the parity gate reads the same list dispatch does.
+/// Exposed for the parity harness (task 6), an integration test in a separate
+/// crate that cannot see `pg::PgQueryDdl::COVERED` directly, so it gates on the
+/// same list the switchover uses.
 pub fn pg_native_types() -> &'static [EntityType] {
     pg::PgQueryDdl::COVERED
 }

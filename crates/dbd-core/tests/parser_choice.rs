@@ -47,11 +47,26 @@ fn an_explicit_valid_parser_loads() {
         "parser_choice_ok",
         "  dialect: postgresql\n  parser: sqlparser\n",
     );
-    Design::from_config(&config, "dev").expect("an explicit valid parser must load");
+    let design = Design::from_config(&config, "dev").expect("an explicit valid parser must load");
+    // Loading `Ok` is not enough: the scan loop drops a failed parse silently
+    // (`if let Ok(entity) = …`), so a Design loads empty when the parser is
+    // broken. Assert the chosen parser actually produced the entity.
+    assert!(
+        design.entities().iter().any(|e| e.name == "app.t"),
+        "chosen parser must produce the table, got: {:?}",
+        design.entities().iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn omitting_source_parser_loads() {
     let config = project_with_source_block("parser_choice_absent", "  dialect: postgresql\n");
-    Design::from_config(&config, "dev").expect("source.parser is optional");
+    let design = Design::from_config(&config, "dev").expect("source.parser is optional");
+    // Same reasoning as above: assert the entity was actually produced, not
+    // just that loading returned `Ok`.
+    assert!(
+        design.entities().iter().any(|e| e.name == "app.t"),
+        "default parser must produce the table, got: {:?}",
+        design.entities().iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
 }
