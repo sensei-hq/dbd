@@ -18,29 +18,33 @@ pub(crate) struct PgQueryDdl;
 impl PgQueryDdl {
     /// Entity types this parser handles itself.
     ///
-    /// Single source of truth for the switchover. `PgQueryDdl::parse` branches
-    /// on it as types go native, and the parity harness (`tests/parser_parity.rs`)
-    /// reads the same list — so a type cannot switch over without also coming
-    /// under the gate.
+    /// Read by the parity harness (`tests/parser_parity.rs`) through
+    /// [`crate::parser::pg_native_types`]. [`Self::native`] is the actual
+    /// source of truth for dispatch; `covered_and_dispatch_cannot_drift` below
+    /// pins the two together so this list can't claim a type `native` doesn't
+    /// implement.
     pub(crate) const COVERED: &'static [EntityType] = &[EntityType::Enum];
 
-    /// Whether this parser handles `entity_type` itself.
-    pub(crate) fn covers(entity_type: EntityType) -> bool {
-        Self::COVERED.contains(&entity_type)
+    /// The native parser for a type, or `None` when it still delegates.
+    ///
+    /// Single source of truth. `COVERED` is asserted against this, so a type
+    /// cannot be listed as covered without an implementation — a mismatch used
+    /// to fall through a wildcard match arm to sqlparser, leaving the parity
+    /// gate comparing the incumbent against itself and passing for free.
+    fn native(entity_type: EntityType) -> Option<fn(Entity, &str) -> Result<Entity>> {
+        match entity_type {
+            EntityType::Enum => Some(enums::parse_enum),
+            _ => None,
+        }
     }
 }
 
 impl DdlParser for PgQueryDdl {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
         let entity = Entity::from_file(file);
-        if !Self::covers(entity.entity_type) {
-            return SqlparserDdl.parse(file, sql);
-        }
-        match entity.entity_type {
-            EntityType::Enum => enums::parse_enum(entity, sql),
-            // Unreachable while COVERED and this match agree; delegating rather
-            // than panicking keeps a mismatch a non-event.
-            _ => SqlparserDdl.parse(file, sql),
+        match Self::native(entity.entity_type) {
+            Some(parse) => parse(entity, sql),
+            None => SqlparserDdl.parse(file, sql),
         }
     }
 }
@@ -68,7 +72,22 @@ mod tests {
 
     #[test]
     fn enum_is_covered() {
-        assert!(PgQueryDdl::covers(EntityType::Enum));
-        assert!(!PgQueryDdl::covers(EntityType::Table));
+        assert!(PgQueryDdl::native(EntityType::Enum).is_some());
+        assert!(PgQueryDdl::native(EntityType::Table).is_none());
+    }
+
+    /// COVERED and the dispatch match must agree for every entity type: a type
+    /// listed but unimplemented would delegate silently and the parity gate
+    /// would compare sqlparser against itself.
+    #[test]
+    fn covered_and_dispatch_cannot_drift() {
+        use crate::entity::{TYPES_WITH_SCHEMA, TYPES_WITHOUT_SCHEMA};
+        for t in TYPES_WITH_SCHEMA.iter().chain(TYPES_WITHOUT_SCHEMA) {
+            assert_eq!(
+                PgQueryDdl::COVERED.contains(t),
+                PgQueryDdl::native(*t).is_some(),
+                "COVERED and dispatch disagree on {t:?}"
+            );
+        }
     }
 }
