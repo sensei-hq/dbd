@@ -135,12 +135,17 @@ pub struct ProjectConfig {
 pub struct SourceConfig {
     #[serde(default = "default_dialect")]
     pub dialect: String,
+    /// Which DDL parser reads this project's files. `None` lets `dialect`
+    /// decide; set it only to override that choice.
+    #[serde(default)]
+    pub parser: Option<String>,
 }
 
 impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             dialect: default_dialect(),
+            parser: None,
         }
     }
 }
