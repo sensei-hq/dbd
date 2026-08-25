@@ -7,6 +7,7 @@
 pub(crate) mod common;
 pub(crate) mod enums;
 pub(crate) mod procs;
+pub(crate) mod roles;
 pub(crate) mod views;
 
 use std::path::Path;
@@ -31,6 +32,7 @@ impl PgQueryDdl {
         EntityType::View,
         EntityType::Function,
         EntityType::Procedure,
+        EntityType::Role,
     ];
 
     /// The native parser for a type, or `None` when it still delegates.
@@ -44,6 +46,7 @@ impl PgQueryDdl {
             EntityType::Enum => Some(enums::parse_enum),
             EntityType::View => Some(views::parse_view),
             EntityType::Function | EntityType::Procedure => Some(procs::parse_proc),
+            EntityType::Role => Some(roles::parse_role),
             _ => None,
         }
     }
