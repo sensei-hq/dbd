@@ -229,6 +229,27 @@ against, so parity cannot cover these.
 
 A type joins `COVERED` only when both layers are green for it.
 
+### The gate cannot outlive the second implementation
+
+Differential parity only proves something while two independent
+implementations exist to disagree. Role was the first type to lose that:
+sqlparser cannot parse `DO $$ … $$` at all, so its "incumbent" was never
+sqlparser but a regex scanner, and that regex was deleted rather than kept
+alongside the native parser — keeping it would have left `source.parser:
+sqlparser` selecting the *worse* implementation on purpose. `SqlparserDdl`
+now delegates `EntityType::Role` to the same `pg::roles::parse_role` the
+native path calls, so a Role file in the corpus would compare that function
+against itself. That was verified directly: mutating `parse_role` to drop a
+membership left `parser_parity.rs` green. `tests/parser_parity.rs` now lists
+Role in `NO_SECOND_IMPLEMENTATION` and skips it explicitly rather than
+counting it as covered; Role's correctness rests on its unit tests
+(`parser::pg::roles`) and on live verification instead.
+
+Table and `MaterializedView` will hit the same thing when sqlparser is
+finally removed at the end of this migration — at that point every type
+delegates to itself and the gate retires entirely, rather than silently
+self-comparing every type it lists.
+
 ## Error handling
 
 `PgQueryDdl` records a parse error only when libpg_query itself rejects the

@@ -5,9 +5,26 @@
 //! still delegates would compare `SqlparserDdl` against itself and pass for
 //! free — a green test proving nothing.
 
-use dbd_core::Entity;
+use dbd_core::{Entity, EntityType};
 use dbd_core::parser::{ParserChoice, parse_entity_with, pg_native_types};
 use std::path::{Path, PathBuf};
+
+/// Entity types with no independent second implementation to compare against.
+///
+/// The gate's whole value is "the native parser agrees with the incumbent". For
+/// Role there is no incumbent: sqlparser cannot parse `DO $$ … $$` at all, so
+/// the historical implementation was a regex scanner, and that was deleted
+/// rather than kept — a user falling back to it would have got the *worse*
+/// implementation, whose object-grant exclusion was a text lookahead.
+///
+/// `SqlparserDdl` therefore delegates Role to the same `pg::roles::parse_role`
+/// the native path uses, which means a Role file here would compare that
+/// function against itself and pass for free. Skipping it is honest; counting
+/// it would be a green check proving nothing.
+///
+/// Role's correctness rests on its unit tests in `parser::pg::roles` and on
+/// live verification (apply ordering, `pg_auth_members`), not on this gate.
+const NO_SECOND_IMPLEMENTATION: &[EntityType] = &[EntityType::Role];
 
 /// Every `.ddl`/`.sql` file under `root`, recursively.
 fn ddl_files(root: &Path) -> Vec<PathBuf> {
@@ -89,7 +106,13 @@ fn native_types_match_sqlparser_on_every_corpus_file() {
     for file in corpus() {
         let sql = std::fs::read_to_string(&file).expect("corpus file is readable");
         // The path decides the entity type, exactly as the scan loop does.
-        if !covered.contains(&Entity::from_file(&file).entity_type) {
+        let entity_type = Entity::from_file(&file).entity_type;
+        if !covered.contains(&entity_type) {
+            continue;
+        }
+        // See NO_SECOND_IMPLEMENTATION: this type would compare its own native
+        // parser against itself, which can never disagree and proves nothing.
+        if NO_SECOND_IMPLEMENTATION.contains(&entity_type) {
             continue;
         }
         checked += 1;
