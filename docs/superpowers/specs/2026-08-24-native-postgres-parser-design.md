@@ -148,7 +148,7 @@ impl PgQueryDdl {
 | --- | --- | --- | --- |
 | 1 | Enum | seed already written; smallest surface | the enum arm of the libpg_query fallback |
 | 2 | View | `select_tables()` + `call_functions()` | — |
-| 2b | MaterializedView | **split out — needs its own spec**, see below | matview `WITH DATA` regex workaround |
+| 2b | MaterializedView | [own spec](2026-08-25-native-postgres-parser-matviews-design.md) — `writes[0]` becomes verbatim source, sentinel versioned to v2 | matview `WITH DATA` regex workaround |
 | 3 | Function / Procedure | see the measured note below | `PROCEDURE`→`FUNCTION` regex workaround |
 | 4 | Role | libpg_query parses `GRANT role TO role` natively | `extract_role_memberships` regex |
 | 5 | Table | 752 lines, highest risk, most surface | `COMMENT ON` regex workaround |
