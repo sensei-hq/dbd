@@ -8,7 +8,7 @@ use crate::entity::{EnumValue, REF_TYPE_FUNCTION, Reference};
 // `push_unique`, `collect_plpgsql_queries`), but nothing in `pg` reaches back
 // into the sqlparser-specific logic here, so the module dependency stays one
 // way — see `pg::common`'s module doc comment.
-pub(crate) use super::pg::common::{
+pub(in crate::parser) use super::pg::common::{
     extract_enum_values_via_pg_query, extract_search_paths_via_pg_query,
     extract_view_refs_via_pg_query, is_valid_postgres,
 };

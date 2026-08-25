@@ -25,7 +25,7 @@ use super::enums;
 /// genuinely broken file is never quietly waved through.
 ///
 /// [`extractors::extract_proc_refs`]: crate::parser::extractors::extract_proc_refs
-pub(crate) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
+pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
     let Ok(tree) = pg_query::parse_plpgsql(raw_sql) else {
         return Vec::new();
     };
@@ -55,7 +55,7 @@ pub(crate) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> 
 /// The authority on "is this valid SQL". sqlparser is a convenience parser that
 /// reimplements the grammar and lags the server, so its rejection alone says
 /// nothing about the file; this says whether Postgres itself would take it.
-pub(crate) fn is_valid_postgres(raw_sql: &str) -> bool {
+pub(in crate::parser) fn is_valid_postgres(raw_sql: &str) -> bool {
     pg_query::parse(raw_sql).is_ok()
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn is_valid_postgres(raw_sql: &str) -> bool {
 /// which is worse than no edge at all.
 ///
 /// [`extractors::extract_search_paths`]: crate::parser::extractors::extract_search_paths
-pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
+pub(in crate::parser) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return vec![DEFAULT_SEARCH_PATH.to_string()];
     };
@@ -120,7 +120,7 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
 /// misordering.
 ///
 /// [`extractors::extract_view_info`]: crate::parser::extractors::extract_view_info
-pub(crate) fn extract_view_refs_via_pg_query(
+pub(in crate::parser) fn extract_view_refs_via_pg_query(
     raw_sql: &str,
     default_schema: &str,
 ) -> Vec<Reference> {
