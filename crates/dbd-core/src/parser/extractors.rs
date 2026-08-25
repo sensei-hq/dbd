@@ -3,15 +3,18 @@ use sqlparser::ast::{Expr, Set, Statement, Value};
 use crate::entity::{EnumValue, REF_TYPE_FUNCTION, Reference};
 
 // Re-exported so existing call sites (`extractors::extract_enum_values_via_pg_query`
-// etc.) keep working unchanged. The definitions live in `pg::common` now: `pg`
-// depends on a few small helpers still defined below (`qualify_name_str`,
-// `push_unique`, `collect_plpgsql_queries`), but nothing in `pg` reaches back
-// into the sqlparser-specific logic here, so the module dependency stays one
-// way — see `pg::common`'s module doc comment.
+// etc.) keep working unchanged. The definitions live in `pg::common` now — the
+// whole libpg_query island lives there, so this module depends on `pg` and
+// nothing under `pg` depends back on this module. See `pg::common`'s module
+// doc comment.
 pub(in crate::parser) use super::pg::common::{
     extract_enum_values_via_pg_query, extract_search_paths_via_pg_query,
     extract_view_refs_via_pg_query, is_valid_postgres,
 };
+// `push_unique` and `SYSTEM_SCHEMAS` are generic, not libpg_query-specific, but
+// live in `pg::common` too so these two call sites depend on `pg` rather than
+// the reverse (see that module's doc comment for the full rationale).
+use super::pg::common::{self, SYSTEM_SCHEMAS, push_unique};
 
 /// Extract search_path values from SET statements.
 pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
@@ -335,104 +338,12 @@ pub fn extract_proc_refs(
         return refs;
     }
     // 2. PL/pgSQL: parse with libpg_query (the real Postgres parser).
-    if let Some((reads, writes)) = extract_proc_refs_via_pg_query(raw_sql, default_schema) {
+    if let Some((reads, writes)) = common::extract_proc_refs_via_pg_query(raw_sql, default_schema) {
         return ProcRefs { reads, writes, functions: Vec::new() };
     }
     // 3. Last resort: regex scan (bodies neither parser can handle).
     let (reads, writes) = extract_proc_reads_writes(raw_sql);
     ProcRefs { reads, writes, functions: Vec::new() }
-}
-
-/// Extract reads/writes from a PL/pgSQL body using libpg_query (Postgres's own
-/// parser), which cleanly separates embedded SQL from PL/pgSQL control flow
-/// (`SELECT ... INTO`, `PERFORM`, `FOR ... IN ... LOOP`, `RETURN QUERY`, `IF`).
-///
-/// Returns `None` when the input isn't a PL/pgSQL routine libpg_query can parse
-/// (e.g. a `LANGUAGE sql` body, or invalid PL/pgSQL), so the caller falls back.
-///
-/// Dynamic SQL (`EXECUTE '...'`) is ignored: the embedded text is a string
-/// literal, so re-parsing it yields a constant with no table references.
-fn extract_proc_refs_via_pg_query(
-    raw_sql: &str,
-    default_schema: &str,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let tree = pg_query::parse_plpgsql(raw_sql).ok()?;
-
-    let mut queries = Vec::new();
-    collect_plpgsql_queries(&tree, &mut queries);
-
-    let mut reads = Vec::new();
-    let mut writes = Vec::new();
-    for query in &queries {
-        // A `query` may be a full statement, or a bare expression (e.g. an `IF`
-        // condition). Parse it directly, else `SELECT`-wrap it so any subqueries
-        // are still seen. A dynamic-SQL string literal yields no tables either way.
-        let Ok(parsed) =
-            pg_query::parse(query).or_else(|_| pg_query::parse(&format!("SELECT {query}")))
-        else {
-            continue;
-        };
-        for table in parsed.select_tables() {
-            if let Some(name) = qualify_name_str(&table, default_schema) {
-                push_unique(&mut reads, name);
-            }
-        }
-        for table in parsed.dml_tables() {
-            if let Some(name) = qualify_name_str(&table, default_schema) {
-                push_unique(&mut writes, name);
-            }
-        }
-    }
-    Some((reads, writes))
-}
-
-/// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
-/// JSON tree (libpg_query stores each statement's SQL under a `"query"` key).
-///
-/// `pub(super)`: also used by `pg::common::extract_enum_values_via_pg_query`,
-/// referenced there by fully-qualified path rather than a `use` import so
-/// `pg`'s dependency on this module stays a narrow, explicit exception rather
-/// than a module-level cycle (see `pg::common`'s doc comment).
-pub(super) fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                if key == "query"
-                    && let Some(s) = val.as_str()
-                    && !s.is_empty()
-                {
-                    out.push(s.to_string());
-                }
-                collect_plpgsql_queries(val, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_plpgsql_queries(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Qualify a `schema.table` / `table` string (as returned by libpg_query):
-/// apply the default schema to unqualified names, drop system-schema refs.
-///
-/// `pub(super)`: also used by `pg::common::extract_view_refs_via_pg_query`,
-/// referenced there by fully-qualified path rather than a `use` import — see
-/// [`collect_plpgsql_queries`] for why.
-pub(super) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
-    let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
-    match parts.as_slice() {
-        [.., schema, table] => {
-            if SYSTEM_SCHEMAS.contains(schema) {
-                return None;
-            }
-            Some(format!("{schema}.{table}"))
-        }
-        [table] => Some(format!("{default_schema}.{table}")),
-        _ => None,
-    }
 }
 
 /// Try to extract a `LANGUAGE sql` function body's dependencies via the AST.
@@ -565,17 +476,6 @@ fn proc_write_targets(stmt: &Statement, default_schema: &str) -> Vec<String> {
     targets
 }
 
-/// Push a value only if not already present (preserves insertion order).
-///
-/// `pub(super)`: also used by `pg::common::extract_view_refs_via_pg_query`,
-/// referenced there by fully-qualified path rather than a `use` import — see
-/// [`collect_plpgsql_queries`] for why.
-pub(super) fn push_unique(v: &mut Vec<String>, item: String) {
-    if !v.contains(&item) {
-        v.push(item);
-    }
-}
-
 /// Last-resort reads/writes scanner for bodies neither parser accepts.
 ///
 /// `extract_proc_refs` handles `LANGUAGE sql` bodies via sqlparser and PL/pgSQL
@@ -637,9 +537,6 @@ pub fn extract_proc_reads_writes(sql: &str) -> (Vec<String>, Vec<String>) {
 
     (reads, writes)
 }
-
-/// System schemas to exclude from references.
-const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
 
 /// Find qualified table names (schema.table) after a SQL keyword pattern.
 /// Excludes system schema references.
