@@ -230,7 +230,12 @@ fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Qualify a `schema.table` / `table` string (as returned by libpg_query):
 /// apply the default schema to unqualified names, drop system-schema refs.
-fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
+///
+/// `pub(in crate::parser)`, matching this file's other libpg_query helpers,
+/// because `pg::views` (a real caller, not a lint workaround) qualifies
+/// `call_functions()` names with it the same way this module already
+/// qualifies `select_tables()` names.
+pub(in crate::parser) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
     let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [.., schema, table] => {

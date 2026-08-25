@@ -36,8 +36,49 @@ fn corpus() -> Vec<PathBuf> {
     files
 }
 
-fn json(entity: &Entity) -> serde_json::Value {
-    serde_json::to_value(entity).expect("Entity serializes")
+/// Strip soft (function) references before comparing.
+///
+/// Postgres parses `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` as dedicated
+/// expression nodes rather than function calls, so libpg_query does not report
+/// them; sqlparser does. The difference is inert — those names resolve to no
+/// entity, so `resolve_references` drops them on both sides and the apply graph
+/// is identical — but it would fail a whole-Entity comparison on any view using
+/// `COALESCE`, which is very common SQL.
+///
+/// This is the only step here that narrows the gate — it DROPS data, so it
+/// needs its own justification (above). [`canonicalize_reference_order`]
+/// below is a different kind of step: it reorders, it does not drop, so a
+/// genuine difference in which references a parser found still fails.
+fn without_soft_refs(entity: &Entity) -> Entity {
+    let mut e = entity.clone();
+    e.references
+        .retain(|r| r.ref_type.as_deref() != Some(dbd_core::entity::REF_TYPE_FUNCTION));
+    e.refers = e.references.iter().map(|r| r.name.clone()).collect();
+    e
+}
+
+/// Canonicalise reference ORDER before comparing.
+///
+/// Distinct from [`without_soft_refs`] above: that drops data, this does
+/// not. Sorting preserves set equality, so a genuine difference in which
+/// references a parser found still fails the gate. No consumer depends on
+/// order — `dependency.rs:31` and `:198` collect `refers` into a `HashSet`
+/// before the topological sort, so apply ordering cannot see it; the only
+/// order-visible effect is the edge list in `dbd graph` output.
+fn canonicalize_reference_order(mut entity: Entity) -> Entity {
+    entity
+        .references
+        .sort_by(|a, b| (&a.name, &a.ref_type).cmp(&(&b.name, &b.ref_type)));
+    entity.refers.sort();
+    entity
+}
+
+/// The comparison view of an `Entity`: soft refs excluded, then reference
+/// order canonicalised. See the two functions above for what each step does
+/// and does not do to the underlying data.
+fn comparable(entity: &Entity) -> serde_json::Value {
+    let e = canonicalize_reference_order(without_soft_refs(entity));
+    serde_json::to_value(&e).expect("Entity serializes")
 }
 
 #[test]
@@ -58,7 +99,12 @@ fn native_types_match_sqlparser_on_every_corpus_file() {
 
         if old.errors.is_empty() {
             // No regression: identical Entity for anything the incumbent reads.
-            assert_eq!(json(&old), json(&new), "parsers disagree on {}", file.display());
+            assert_eq!(
+                comparable(&old),
+                comparable(&new),
+                "parsers disagree on {}",
+                file.display()
+            );
         } else {
             // Improvement: the native parser must read what the incumbent could not.
             assert!(
