@@ -129,6 +129,14 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
 /// be applied before the table it selects from: a loud skip traded for a silent
 /// misordering.
 ///
+/// Sorted before returning: `ParseResult::select_tables()` is built from a
+/// `HashSet` internally, so its iteration order is not source order — it's
+/// Rust's randomized per-process hash order, confirmed by parsing the same SQL
+/// in the same binary across separate runs and observing different orderings.
+/// Left unsorted, `entity.refers`/`entity.references` for any multi-relation
+/// view would vary from run to run, which is a nondeterminism bug regardless of
+/// how the result is later compared.
+///
 /// [`extractors::extract_view_info`]: crate::parser::extractors::extract_view_info
 pub(in crate::parser) fn extract_view_refs_via_pg_query(
     raw_sql: &str,
@@ -143,6 +151,7 @@ pub(in crate::parser) fn extract_view_refs_via_pg_query(
             push_unique(&mut names, name);
         }
     }
+    names.sort();
     names
         .into_iter()
         .map(|name| Reference {
