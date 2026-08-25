@@ -508,8 +508,8 @@ pub async fn cmd_reconcile(
         output::info(
             verbosity,
             &format!(
-                "Reconciled — {} created, {} altered, {} re-applied, {} pruned.",
-                s.created, s.altered, s.reapplied, s.dropped
+                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned.",
+                s.created, s.altered, s.reapplied, s.restamped, s.dropped
             ),
         );
     }
@@ -529,9 +529,10 @@ fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
 /// its summary line; normal mode shows only the one-line-per-entity summary,
 /// matching the CLI convention that SQL is a `-v` detail.
 fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) -> Vec<String> {
-    // `is_empty()` already covers added/altered/dropped/matview_creates, but
-    // warnings live in their own channel — a plan whose ONLY content is a matview
-    // drift warning must still print it rather than falsely claiming "in sync".
+    // `is_empty()` already covers added/altered/dropped/matview_creates/
+    // matview_restamps, but warnings live in their own channel — a plan whose
+    // ONLY content is a matview drift warning must still print it rather than
+    // falsely claiming "in sync".
     if plan.is_empty() && plan.dropped.is_empty() && plan.warnings.is_empty() {
         return vec!["Already in sync — no changes.".to_string()];
     }
@@ -541,6 +542,14 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
     }
     for name in &plan.matview_creates {
         lines.push(format!("  + create materialized view {name}"));
+    }
+    for name in &plan.matview_restamps {
+        // Not a `~ alter` (no structural change) and not a `⚠` (not drift): a
+        // v1 sentinel's hash isn't comparable to a current one, so upgrading it
+        // is a metadata-only write — but still a live write worth previewing.
+        lines.push(format!(
+            "  ↻ restamp materialized view {name} (v1 hash sentinel upgraded to v2, no drift)"
+        ));
     }
     for s in &plan.altered {
         lines.push(format!("  ~ alter  {}", s.entity_name));
@@ -922,6 +931,7 @@ mod tests {
         let plan = dbd_core::ReconcilePlan {
             added: vec!["public.new_table".to_string()],
             matview_creates: vec!["analytics.daily_sales".to_string()],
+            matview_restamps: vec!["analytics.legacy_report".to_string()],
             altered: vec![ReconcileStatement {
                 entity_name: "public.users".to_string(),
                 sql: "ALTER TABLE public.users ADD COLUMN email text;".to_string(),
@@ -939,6 +949,10 @@ mod tests {
         assert!(
             pruned.contains("+ create materialized view analytics.daily_sales"),
             "got: {pruned}"
+        );
+        assert!(
+            pruned.contains("restamp materialized view analytics.legacy_report"),
+            "the plan must preview a pending v1→v2 restamp; got: {pruned}"
         );
         assert!(pruned.contains("~ alter  public.users"), "got: {pruned}");
         assert!(pruned.contains("- prune  public.orphan"), "got: {pruned}");

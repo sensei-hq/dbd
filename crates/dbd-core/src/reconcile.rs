@@ -46,6 +46,11 @@ pub struct ReconcilePlan {
     /// (`matview_create_sql` + hash sentinel) and are detected during `--dry-run`
     /// so the preview can list them.
     pub matview_creates: Vec<String>,
+    /// Materialized views live with a `v1` (unversioned) hash sentinel — written
+    /// by a dbd that hashed a different body contract, so its value is not
+    /// comparable to a current hash. Reconcile re-stamps these to `v2` silently
+    /// (never a drift warning); carried here so `--dry-run` previews the write.
+    pub matview_restamps: Vec<String>,
     /// Risky-change advisories (type changes, possible renames, enum value drops,
     /// orphaned enums that are not auto-dropped).
     pub warnings: Vec<String>,
@@ -64,6 +69,7 @@ impl ReconcilePlan {
             && self.altered.is_empty()
             && self.dropped.is_empty()
             && self.matview_creates.is_empty()
+            && self.matview_restamps.is_empty()
     }
 }
 
@@ -1010,6 +1016,11 @@ pub struct ReconcileComplete {
     /// Idempotent objects re-applied (schemas, extensions, sequences,
     /// functions, views, roles).
     pub reapplied: u32,
+    /// Materialized views whose live `v1` hash sentinel was silently re-stamped
+    /// to `v2`. Counted separately from `reapplied` so this one-time upgrade
+    /// write — to a live object, during what looks like a routine reconcile —
+    /// is visible in the summary rather than folded into an unrelated count.
+    pub restamped: u32,
 }
 
 // ── Materialized-view convergence (Task 13) ──────────────────
@@ -1036,6 +1047,11 @@ pub(crate) enum MatviewAction {
     Create,
     /// Live hash matches the design → nothing to do.
     Skip,
+    /// Live sentinel is `v1` (written under a superseded body contract, so its
+    /// hash isn't comparable to a current one) → re-stamp to `v2` silently.
+    /// Never a `Warn`: a v1/v2 mismatch says nothing about whether the design
+    /// actually drifted.
+    Restamp,
     /// Exists but the design differs (or it carries no dbd sentinel) → warn and
     /// leave it untouched. dbd never auto-drops a materialized view.
     Warn,
@@ -1044,17 +1060,20 @@ pub(crate) enum MatviewAction {
 /// Decide the action for a design matview from its wanted hash and the live
 /// sentinel state:
 /// - `None` — the matview does not exist live → **Create**.
-/// - `Some(Some(h))` — it exists with stored hash `h`; **Skip** iff `h == want`,
-///   else **Warn** (definition drifted).
+/// - `Some(Some(Sentinel::V2(h)))` — it exists with stored hash `h`; **Skip**
+///   iff `h == want`, else **Warn** (definition drifted).
+/// - `Some(Some(Sentinel::V1(_)))` — stamped under the superseded body
+///   contract → **Restamp** to `v2` (not comparable, so never a drift signal).
 /// - `Some(None)` — it exists but carries no `dbd:hash` sentinel (created outside
 ///   dbd, or before this feature) → **Warn** (cannot verify its definition).
 pub(crate) fn decide_matview_action(
     want_hash: &str,
-    live: Option<Option<String>>,
+    live: Option<Option<Sentinel>>,
 ) -> MatviewAction {
     match live {
         None => MatviewAction::Create,
-        Some(Some(h)) if h == want_hash => MatviewAction::Skip,
+        Some(Some(Sentinel::V2(h))) if h == want_hash => MatviewAction::Skip,
+        Some(Some(Sentinel::V1(_))) => MatviewAction::Restamp,
         Some(_) => MatviewAction::Warn,
     }
 }
@@ -1082,22 +1101,61 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=<hash>';` for the sentinel.
-/// `qualified` is `schema.name` (unqualified → `public`); single quotes in the
-/// payload are doubled so the literal stays well-formed.
+/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=v2:<hash>';` for the
+/// sentinel. `qualified` is `schema.name` (unqualified → `public`); single
+/// quotes in the payload are doubled so the literal stays well-formed.
+///
+/// Versioned (`v2:`) because the hash input is the matview's `writes[0]`, so
+/// any change to what that field holds changes every stamp already written.
+/// Without a version, such a change makes every existing matview report drift
+/// once on upgrade — indistinguishable from real drift, with a warning that
+/// tells users to `DROP … CASCADE`. See [`Sentinel`] and
+/// [`decide_matview_action`] for how an unversioned (`v1`) stamp is handled:
+/// re-stamped silently, never read as a drift signal.
 pub(crate) fn matview_hash_comment_sql(qualified: &str, hash: &str) -> String {
     let (schema, name) = qualified.split_once('.').unwrap_or((DEFAULT_SCHEMA, qualified));
-    let payload = format!("dbd:hash={hash}").replace('\'', "''");
+    let payload = format!("dbd:hash=v2:{hash}").replace('\'', "''");
     format!("COMMENT ON MATERIALIZED VIEW \"{schema}\".\"{name}\" IS '{payload}';")
 }
 
-/// Extract the hash from a `dbd:hash=<hex>` comment, or `None` when the comment
-/// is absent or carries no such sentinel. Inverse of [`matview_hash_comment_sql`]'s
-/// payload; tolerant of trailing text after the hash token.
-pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<String> {
+/// A parsed `dbd:hash` stamp.
+///
+/// Versioned because the hash input is the matview's `writes[0]`, so any
+/// change to what that field holds changes every stamp already written. A
+/// bare hash predates versioning and is recognised as `V1`: its value hashes a
+/// different body contract than the current code computes, so it must never
+/// be compared against a current hash — see [`decide_matview_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Sentinel {
+    /// Written by a dbd that hashed the pre-versioning body contract. Its hash
+    /// is not comparable with a current one, so it is re-stamped rather than
+    /// read.
+    V1(String),
+    /// Current format (`dbd:hash=v2:<hash>`).
+    V2(String),
+}
+
+/// Extract the sentinel from a `dbd:hash=…` comment, or `None` when the
+/// comment is absent or carries no such sentinel. Inverse of
+/// [`matview_hash_comment_sql`]'s payload; tolerant of trailing text after the
+/// token.
+pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
     let rest = comment?.split("dbd:hash=").nth(1)?;
-    let hash: String = rest.chars().take_while(char::is_ascii_alphanumeric).collect();
-    (!hash.is_empty()).then_some(hash)
+    // Alphanumeric-or-`:` so a versioned `v2:<hash>` token is captured whole.
+    // Plain `is_ascii_alphanumeric` stops at the `:` and would silently yield
+    // the literal "v2" as the hash — wrong, and it would never match a real
+    // hash, turning every matview into a *permanent* false-drift warning.
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
+        .collect();
+    match token.strip_prefix("v2:") {
+        Some(hash) if !hash.is_empty() => Some(Sentinel::V2(hash.to_string())),
+        // An unversioned token is a v1 stamp. Reject anything else carrying a
+        // colon — an unrecognised future version must not be misread as v1.
+        _ if !token.is_empty() && !token.contains(':') => Some(Sentinel::V1(token)),
+        _ => None,
+    }
 }
 
 /// `CREATE MATERIALIZED VIEW … WITH DATA;` (+ any index statements, via
@@ -2530,57 +2588,89 @@ mod tests {
         );
     }
 
-    /// The sentinel comment SQL and `parse_dbd_hash` round-trip: the payload
-    /// stored (`dbd:hash=<hex>`) parses back to the same hash.
+    // ── Sentinel versioning ─────────────────────────────────────────────────
+
+    /// The stamp SQL and `parse_dbd_hash` round-trip through the current (`v2`)
+    /// format: the payload stored (`dbd:hash=v2:<hex>`) parses back to the same
+    /// hash.
     #[test]
-    fn matview_hash_comment_sql_roundtrips() {
+    fn v2_stamp_round_trips() {
         let sql = matview_hash_comment_sql("a.m", "deadbeefcafe0001");
-        assert!(
-            sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=deadbeefcafe0001';"),
-            "got: {sql}"
-        );
-        // obj_description returns the payload (without the surrounding quotes).
+        assert!(sql.contains("dbd:hash=v2:deadbeefcafe0001"), "got: {sql}");
+        let payload = sql.split_once("IS '").unwrap().1.trim_end_matches("';");
         assert_eq!(
-            parse_dbd_hash(Some("dbd:hash=deadbeefcafe0001")),
-            Some("deadbeefcafe0001".to_string())
+            parse_dbd_hash(Some(payload)),
+            Some(Sentinel::V2("deadbeefcafe0001".to_string()))
         );
     }
 
-    /// `parse_dbd_hash` returns `None` for a missing comment or a non-sentinel one.
+    /// A stamp written by an older dbd has no version prefix. It must be
+    /// recognised as v1, not misparsed — `take_while(is_ascii_alphanumeric)`
+    /// would stop at the `:` of a v2 stamp and yield "v2".
     #[test]
-    fn parse_dbd_hash_none_cases() {
+    fn unversioned_stamp_parses_as_v1() {
+        assert_eq!(
+            parse_dbd_hash(Some("dbd:hash=deadbeefcafe0001")),
+            Some(Sentinel::V1("deadbeefcafe0001".to_string()))
+        );
+    }
+
+    #[test]
+    fn absent_or_foreign_comment_has_no_sentinel() {
         assert_eq!(parse_dbd_hash(None), None);
-        assert_eq!(parse_dbd_hash(Some("just a user comment")), None);
+        assert_eq!(parse_dbd_hash(Some("just a comment")), None);
+    }
+
+    /// An empty hash token (`dbd:hash=` with nothing after it) is also `None`,
+    /// distinct from no sentinel at all — both must not crash the parser.
+    #[test]
+    fn parse_dbd_hash_empty_hash_is_none() {
         assert_eq!(parse_dbd_hash(Some("dbd:hash=")), None, "empty hash → None");
     }
 
     /// A create carries both the `CREATE MATERIALIZED VIEW … WITH DATA` and the
-    /// hash sentinel comment.
+    /// v2 hash sentinel comment.
     #[test]
     fn matview_create_sql_has_create_and_comment() {
         let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
         assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
-        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=abc123';"));
+        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=v2:abc123';"));
     }
 
-    /// The decision core, hash-based, over all four states: dbd never auto-drops,
-    /// so a drifted or unstamped matview is **Warn**, not recreate.
+    /// A v1 stamp means "written by a dbd that hashed the old body contract",
+    /// so its hash is not comparable — re-stamp silently rather than warn.
     #[test]
-    fn decide_matview_action_covers_all_branches() {
-        // Absent → Create.
-        assert_eq!(decide_matview_action("h", None), MatviewAction::Create);
-        // Present, matching hash → Skip.
-        assert_eq!(
-            decide_matview_action("h", Some(Some("h".into()))),
+    fn a_v1_stamp_is_restamped_not_warned() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V1("anything".into())))),
+            MatviewAction::Restamp
+        ));
+    }
+
+    #[test]
+    fn a_matching_v2_stamp_is_skipped() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V2("want".into())))),
             MatviewAction::Skip
-        );
-        // Present, different hash → Warn (definition drifted).
-        assert_eq!(
-            decide_matview_action("h", Some(Some("other".into()))),
+        ));
+    }
+
+    #[test]
+    fn a_differing_v2_stamp_is_real_drift() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V2("other".into())))),
             MatviewAction::Warn
-        );
-        // Present, no dbd sentinel → Warn (cannot verify).
-        assert_eq!(decide_matview_action("h", Some(None)), MatviewAction::Warn);
+        ));
+    }
+
+    #[test]
+    fn an_unstamped_matview_still_warns() {
+        assert!(matches!(decide_matview_action("want", Some(None)), MatviewAction::Warn));
+    }
+
+    #[test]
+    fn an_absent_matview_is_created() {
+        assert!(matches!(decide_matview_action("want", None), MatviewAction::Create));
     }
 
     /// A plan carrying only a matview create is NOT empty — otherwise the CLI's
@@ -2589,6 +2679,18 @@ mod tests {
     fn is_empty_false_when_only_matview_creates() {
         let plan = ReconcilePlan {
             matview_creates: vec!["analytics.daily_sales".to_string()],
+            ..Default::default()
+        };
+        assert!(!plan.is_empty());
+    }
+
+    /// A plan carrying only a matview restamp is NOT empty either — it is a
+    /// real write to a live object, so `--dry-run` must preview it rather than
+    /// claiming "Already in sync".
+    #[test]
+    fn is_empty_false_when_only_matview_restamps() {
+        let plan = ReconcilePlan {
+            matview_restamps: vec!["analytics.daily_sales".to_string()],
             ..Default::default()
         };
         assert!(!plan.is_empty());
