@@ -2,6 +2,17 @@ use sqlparser::ast::{Expr, Set, Statement, Value};
 
 use crate::entity::{EnumValue, REF_TYPE_FUNCTION, Reference};
 
+// Re-exported so existing call sites (`extractors::extract_enum_values_via_pg_query`
+// etc.) keep working unchanged. The definitions live in `pg::common` now: `pg`
+// depends on a few small helpers still defined below (`qualify_name_str`,
+// `push_unique`, `collect_plpgsql_queries`), but nothing in `pg` reaches back
+// into the sqlparser-specific logic here, so the module dependency stays one
+// way — see `pg::common`'s module doc comment.
+pub(crate) use super::pg::common::{
+    extract_enum_values_via_pg_query, extract_search_paths_via_pg_query,
+    extract_view_refs_via_pg_query, is_valid_postgres,
+};
+
 /// Extract search_path values from SET statements.
 pub fn extract_search_paths(statements: &[Statement]) -> Vec<String> {
     for stmt in statements {
@@ -281,120 +292,6 @@ pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     Vec::new()
 }
 
-/// Enum labels from a `DO $$ … $$` guarded `CREATE TYPE … AS ENUM`, read off
-/// libpg_query's AST (Postgres's own parser).
-///
-/// Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a DO
-/// block that swallows `duplicate_object` is the only idiom available for a
-/// conditional enum — and sqlparser rejects `DO` outright. This is the same
-/// second tier [`extract_proc_refs`] already uses for PL/pgSQL bodies: parse the
-/// block, take the SQL it embeds, and re-parse that into a real statement tree.
-///
-/// Returns an empty vec when the input is not a PL/pgSQL block libpg_query
-/// accepts, or when it declares no enum — the caller keeps its parse error, so a
-/// genuinely broken file is never quietly waved through.
-pub fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
-    let Ok(tree) = pg_query::parse_plpgsql(raw_sql) else {
-        return Vec::new();
-    };
-
-    let mut queries = Vec::new();
-    collect_plpgsql_queries(&tree, &mut queries);
-
-    for query in &queries {
-        let Ok(parsed) = pg_query::parse(query) else {
-            continue;
-        };
-        if let Some(values) = crate::parser::pg::enums::labels_from_parse_result(&parsed)
-            && !values.is_empty()
-        {
-            return values;
-        }
-    }
-    Vec::new()
-}
-
-/// Whether libpg_query — Postgres's own grammar — accepts this file.
-///
-/// The authority on "is this valid SQL". sqlparser is a convenience parser that
-/// reimplements the grammar and lags the server, so its rejection alone says
-/// nothing about the file; this says whether Postgres itself would take it.
-pub fn is_valid_postgres(raw_sql: &str) -> bool {
-    pg_query::parse(raw_sql).is_ok()
-}
-
-/// `search_path` schemas from libpg_query's AST, for the fallback path where
-/// sqlparser produced no statements for [`extract_search_paths`] to read.
-///
-/// Mirrors that function's contract, including its `["public"]` default when the
-/// file sets no search path. Recovering this is not optional: reads and view
-/// references are qualified against it, so an empty list silently re-qualifies
-/// `t` to `public.t` — a plausibly-wrong edge pointing at a different table,
-/// which is worse than no edge at all.
-pub fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
-    let Ok(parsed) = pg_query::parse(raw_sql) else {
-        return vec![DEFAULT_SEARCH_PATH.to_string()];
-    };
-    for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::VariableSetStmt(set)) =
-            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-        else {
-            continue;
-        };
-        if !set.name.eq_ignore_ascii_case("search_path") {
-            continue;
-        }
-        let paths: Vec<String> = set.args.iter().filter_map(const_str).collect();
-        if !paths.is_empty() {
-            return paths;
-        }
-    }
-    vec![DEFAULT_SEARCH_PATH.to_string()]
-}
-
-/// The default schema when a file sets no `search_path` — matches
-/// [`extract_search_paths`].
-const DEFAULT_SEARCH_PATH: &str = "public";
-
-/// The string behind a `SET` argument node: a bare identifier arrives as a
-/// `ColumnRef` (`to app`), a quoted one as an `A_Const` string (`to 'app'`).
-fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
-    match node.node.as_ref()? {
-        pg_query::NodeEnum::String(s) => Some(s.sval.clone()),
-        pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
-            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
-            _ => None,
-        },
-        pg_query::NodeEnum::ColumnRef(r) => r.fields.first().and_then(const_str),
-        _ => None,
-    }
-}
-
-/// The tables a view's body reads, from libpg_query's AST — the fallback for a
-/// view [`extract_view_info`] could not read because sqlparser rejected the file.
-///
-/// Without this a recovered view carries no dependency edge at all, so it could
-/// be applied before the table it selects from: a loud skip traded for a silent
-/// misordering.
-pub fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Reference> {
-    let Ok(parsed) = pg_query::parse(raw_sql) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = Vec::new();
-    for table in parsed.select_tables() {
-        if let Some(name) = qualify_name_str(&table, default_schema) {
-            push_unique(&mut names, name);
-        }
-    }
-    names
-        .into_iter()
-        .map(|name| Reference {
-            name,
-            ref_type: Some("table".to_string()),
-        })
-        .collect()
-}
-
 /// What a function or procedure body depends on.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ProcRefs {
@@ -491,7 +388,12 @@ fn extract_proc_refs_via_pg_query(
 
 /// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
 /// JSON tree (libpg_query stores each statement's SQL under a `"query"` key).
-fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
+///
+/// `pub(super)`: also used by `pg::common::extract_enum_values_via_pg_query`,
+/// referenced there by fully-qualified path rather than a `use` import so
+/// `pg`'s dependency on this module stays a narrow, explicit exception rather
+/// than a module-level cycle (see `pg::common`'s doc comment).
+pub(super) fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {
@@ -515,7 +417,11 @@ fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Qualify a `schema.table` / `table` string (as returned by libpg_query):
 /// apply the default schema to unqualified names, drop system-schema refs.
-fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
+///
+/// `pub(super)`: also used by `pg::common::extract_view_refs_via_pg_query`,
+/// referenced there by fully-qualified path rather than a `use` import — see
+/// [`collect_plpgsql_queries`] for why.
+pub(super) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
     let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [.., schema, table] => {
@@ -660,7 +566,11 @@ fn proc_write_targets(stmt: &Statement, default_schema: &str) -> Vec<String> {
 }
 
 /// Push a value only if not already present (preserves insertion order).
-fn push_unique(v: &mut Vec<String>, item: String) {
+///
+/// `pub(super)`: also used by `pg::common::extract_view_refs_via_pg_query`,
+/// referenced there by fully-qualified path rather than a `use` import — see
+/// [`collect_plpgsql_queries`] for why.
+pub(super) fn push_unique(v: &mut Vec<String>, item: String) {
     if !v.contains(&item) {
         v.push(item);
     }
@@ -767,22 +677,6 @@ mod tests {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap_or_default();
         extract_proc_refs(&stmts, sql, "public")
-    }
-
-    #[test]
-    fn guarded_enum_values_read_off_the_pg_query_ast() {
-        let values = extract_enum_values_via_pg_query(
-            "do $$ begin\n  create type status_t as enum ('active', 'archived');\n\
-             exception when duplicate_object then null;\nend $$;",
-        );
-        let names: Vec<&str> = values.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, vec!["active", "archived"]);
-    }
-
-    #[test]
-    fn pg_query_enum_fallback_is_empty_when_no_enum_is_declared() {
-        assert!(extract_enum_values_via_pg_query("do $$ begin perform 1; end $$;").is_empty());
-        assert!(extract_enum_values_via_pg_query("NOT SQL AT ALL ;;;").is_empty());
     }
 
     #[test]

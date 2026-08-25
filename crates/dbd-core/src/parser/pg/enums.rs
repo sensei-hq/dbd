@@ -2,7 +2,8 @@
 
 use crate::entity::{Entity, EnumValue};
 use crate::error::Result;
-use crate::parser::extractors;
+
+use super::common;
 
 /// Parse an enum DDL file.
 ///
@@ -13,7 +14,7 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before the parse-error early return: an errored entity must still
     // carry the sqlparser path's `["public"]` default, since View qualifies
     // its refs against `search_paths`.
-    entity.search_paths = extractors::extract_search_paths_via_pg_query(sql);
+    entity.search_paths = common::extract_search_paths_via_pg_query(sql);
 
     // libpg_query is Postgres's own grammar, so its rejection is the definition
     // of invalid SQL. Recording an error only here keeps the invariant
@@ -52,14 +53,14 @@ fn enum_values(sql: &str) -> Option<Vec<EnumValue>> {
     // plain `Vec`, so it can't distinguish "no CreateEnumStmt in the block"
     // from "found with zero labels" the way `labels_from_parse_result` does
     // above — an empty result here is treated as not found.
-    let values = extractors::extract_enum_values_via_pg_query(sql);
+    let values = common::extract_enum_values_via_pg_query(sql);
     (!values.is_empty()).then_some(values)
 }
 
 /// Labels from the first `CreateEnumStmt` in a parsed statement list, or
 /// `None` if the statement list contains no `CreateEnumStmt` at all.
 ///
-/// Shared with [`extractors::extract_enum_values_via_pg_query`], which runs this
+/// Shared with [`common::extract_enum_values_via_pg_query`], which runs this
 /// over the statements it recovers from inside a `DO` block.
 pub(crate) fn labels_from_parse_result(parsed: &pg_query::ParseResult) -> Option<Vec<EnumValue>> {
     for stmt in &parsed.protobuf.stmts {

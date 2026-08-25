@@ -4,6 +4,7 @@
 //! [`SqlparserDdl`], so the tree is releasable at every step of the migration
 //! rather than only at the end.
 
+pub(crate) mod common;
 pub(crate) mod enums;
 
 use std::path::Path;
