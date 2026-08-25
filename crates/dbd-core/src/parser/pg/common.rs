@@ -170,6 +170,15 @@ pub(in crate::parser) fn extract_view_refs_via_pg_query(
 ///
 /// Dynamic SQL (`EXECUTE '...'`) is ignored: the embedded text is a string
 /// literal, so re-parsing it yields a constant with no table references.
+///
+/// Sorted before returning: `select_tables`/`dml_tables` are `HashSet`-derived
+/// (see `extract_view_refs_via_pg_query`), and each embedded query here gets
+/// its own `pg_query::parse` call — an independently-seeded `HashSet` — so two
+/// calls on identical input can and do disagree on order within the same
+/// process. Caught by the parser-parity gate once `Function`/`Procedure` were
+/// covered: the sqlparser incumbent's PL/pgSQL tier calls this same function,
+/// so an unsorted result compared two independent hash orderings of the same
+/// set and failed nondeterministically.
 pub(in crate::parser) fn extract_proc_refs_via_pg_query(
     raw_sql: &str,
     default_schema: &str,
@@ -201,6 +210,8 @@ pub(in crate::parser) fn extract_proc_refs_via_pg_query(
             }
         }
     }
+    reads.sort();
+    writes.sort();
     Some((reads, writes))
 }
 
