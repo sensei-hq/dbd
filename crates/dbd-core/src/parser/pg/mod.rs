@@ -6,6 +6,7 @@
 
 pub(crate) mod common;
 pub(crate) mod enums;
+pub(crate) mod matviews;
 pub(crate) mod procs;
 pub(crate) mod roles;
 pub(crate) mod views;
@@ -30,6 +31,7 @@ impl PgQueryDdl {
     pub(crate) const COVERED: &'static [EntityType] = &[
         EntityType::Enum,
         EntityType::View,
+        EntityType::MaterializedView,
         EntityType::Function,
         EntityType::Procedure,
         EntityType::Role,
@@ -45,6 +47,7 @@ impl PgQueryDdl {
         match entity_type {
             EntityType::Enum => Some(enums::parse_enum),
             EntityType::View => Some(views::parse_view),
+            EntityType::MaterializedView => Some(matviews::parse_matview),
             EntityType::Function | EntityType::Procedure => Some(procs::parse_proc),
             EntityType::Role => Some(roles::parse_role),
             _ => None,
