@@ -131,42 +131,6 @@ fn preprocess_sql(sql: &str) -> String {
     result.into_owned()
 }
 
-/// Scan role DDL for `GRANT <parent> TO <member>` membership lines.
-///
-/// sqlparser cannot handle `DO $$ … $$` blocks or `GRANT role TO role`, so we
-/// use a simple, non-backtracking regex on the raw SQL instead.
-///
-/// The pattern matches role-membership grants (identifiers only, no privilege
-/// keywords like `SELECT`). The `… ON …` form (object grants such as
-/// `GRANT SELECT ON TABLE … TO …`) will not match because an `ON` clause
-/// appears between the privilege list and the target — the regex requires the
-/// `TO` to follow immediately after the identifier, so object grants are
-/// correctly excluded.
-///
-/// Captured group 1 (the granted/parent role) is recorded as a `Reference`.
-/// Duplicates are deduplicated while preserving first-seen order.
-fn extract_role_memberships(sql: &str, entity: &mut Entity) {
-    let re = regex::Regex::new(
-        r#"(?i)\bGRANT\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?\s+TO\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?"#,
-    )
-    .expect("role membership regex is valid");
-    let mut seen = std::collections::HashSet::new();
-    for cap in re.captures_iter(sql) {
-        let granted = cap[1].to_string();
-        if seen.insert(granted.clone()) {
-            entity.references.push(Reference {
-                name: granted,
-                ref_type: None,
-            });
-        }
-    }
-    entity.refers = entity
-        .references
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
-}
-
 /// Store a routine's extracted dependencies on the entity.
 ///
 /// `reads`/`writes` stay table sets — import planning and scope analysis read
@@ -242,11 +206,14 @@ pub fn pg_native_types() -> &'static [EntityType] {
 fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
 
-    // Role DDL contains DO $$ … $$ blocks that sqlparser cannot parse.
-    // Scan the raw SQL directly with a regex and return early — no sqlparser needed.
+    // Role DDL is idempotent-wrapped in `DO $$ … $$`, which sqlparser cannot
+    // parse, so there has never been a sqlparser implementation to fall back
+    // to — the previous special case here called a regex scanner. Delegate to
+    // the libpg_query parser instead: `source.parser: sqlparser` therefore
+    // does not change how roles are read, because the alternative it would
+    // select is the fragile text scan this replaced, not a different parser.
     if entity.entity_type == EntityType::Role {
-        extract_role_memberships(sql, &mut entity);
-        return Ok(entity);
+        return pg::roles::parse_role(entity, sql);
     }
 
     let cleaned = preprocess_sql(sql);
