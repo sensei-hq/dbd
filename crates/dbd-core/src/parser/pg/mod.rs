@@ -6,6 +6,7 @@
 
 pub(crate) mod common;
 pub(crate) mod enums;
+pub(crate) mod views;
 
 use std::path::Path;
 
@@ -24,7 +25,7 @@ impl PgQueryDdl {
     /// source of truth for dispatch; `covered_and_dispatch_cannot_drift` below
     /// pins the two together so this list can't claim a type `native` doesn't
     /// implement.
-    pub(crate) const COVERED: &'static [EntityType] = &[EntityType::Enum];
+    pub(crate) const COVERED: &'static [EntityType] = &[EntityType::Enum, EntityType::View];
 
     /// The native parser for a type, or `None` when it still delegates.
     ///
@@ -35,6 +36,7 @@ impl PgQueryDdl {
     fn native(entity_type: EntityType) -> Option<fn(Entity, &str) -> Result<Entity>> {
         match entity_type {
             EntityType::Enum => Some(enums::parse_enum),
+            EntityType::View => Some(views::parse_view),
             _ => None,
         }
     }
