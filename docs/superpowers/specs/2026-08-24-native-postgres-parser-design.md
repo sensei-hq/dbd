@@ -149,9 +149,29 @@ impl PgQueryDdl {
 | 1 | Enum | seed already written; smallest surface | the enum arm of the libpg_query fallback |
 | 2 | View | `select_tables()` + `call_functions()` | — |
 | 2b | MaterializedView | **split out — needs its own spec**, see below | matview `WITH DATA` regex workaround |
-| 3 | Function / Procedure | `parse_plpgsql` tier already exists | `PROCEDURE`→`FUNCTION` regex workaround |
+| 3 | Function / Procedure | see the measured note below | `PROCEDURE`→`FUNCTION` regex workaround |
 | 4 | Role | libpg_query parses `GRANT role TO role` natively | `extract_role_memberships` regex |
 | 5 | Table | 752 lines, highest risk, most surface | `COMMENT ON` regex workaround |
+
+**Step 3 is larger than "the `parse_plpgsql` tier already exists" implies.**
+Measured across 7 routine bodies: the libpg_query tier agrees with the incumbent
+on all 3 PL/pgSQL cases and none of the 4 `LANGUAGE sql` cases, because
+`extract_proc_refs_via_pg_query` only reads PL/pgSQL blocks. A native parser
+needs a second path that parses a `LANGUAGE sql` body with `pg_query::parse` and
+reads `select_tables`/`dml_tables`/`call_functions` from it.
+
+It must also reproduce a deliberate semantic rule in the incumbent: called
+functions are collected for `LANGUAGE sql` bodies only. Postgres validates those
+at creation (`check_function_bodies = on`), so a function they call must exist
+first; a PL/pgSQL body resolves names at run time, so its calls are not
+creation-order dependencies. That means detecting the language from
+`CreateFunctionStmt`'s options rather than treating all bodies alike.
+
+Noted while measuring: `extract_proc_refs_via_pg_query` returns `Some(([], []))`
+rather than `None` for a non-PL/pgSQL body, which makes the regex tier below it
+unreachable. Latent today — tier 1 catches those bodies first, and in the case
+tested the regex tier would also have found nothing — but the tier chain does
+not fall through as its own doc comment describes.
 
 **Step 2 was split during planning.** A matview stores its body in `writes[0]`,
 which `emit_matview` and `reconcile` use to rebuild the `CREATE`. The sqlparser
