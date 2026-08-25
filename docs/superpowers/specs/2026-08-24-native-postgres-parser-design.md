@@ -19,6 +19,7 @@ rejects 4 that Postgres accepts:
 | `exclude using gist (r with &&)` | `Expected: ',' or ')' after column definition, found: gist` |
 | `create unlogged table t (…)` | `Expected: an object type after CREATE, found: unlogged` |
 | `… with cascaded check option` | `Expected: end of statement, found: with` |
+| `trim(both from a)` | `Expected: ), found: a` |
 
 libpg_query rejects **0 of 24**: it is Postgres's own C parser, vendored from
 the server, so its grammar is identical by construction to the version it is
@@ -146,10 +147,21 @@ impl PgQueryDdl {
 | # | type | rationale | retires |
 | --- | --- | --- | --- |
 | 1 | Enum | seed already written; smallest surface | the enum arm of the libpg_query fallback |
-| 2 | View / MaterializedView | `select_tables()` + function refs; matview needs body text for `writes[0]` | matview `WITH DATA` regex workaround |
+| 2 | View | `select_tables()` + `call_functions()` | — |
+| 2b | MaterializedView | **split out — needs its own spec**, see below | matview `WITH DATA` regex workaround |
 | 3 | Function / Procedure | `parse_plpgsql` tier already exists | `PROCEDURE`→`FUNCTION` regex workaround |
 | 4 | Role | libpg_query parses `GRANT role TO role` natively | `extract_role_memberships` regex |
 | 5 | Table | 752 lines, highest risk, most surface | `COMMENT ON` regex workaround |
+
+**Step 2 was split during planning.** A matview stores its body in `writes[0]`,
+which `emit_matview` and `reconcile` use to rebuild the `CREATE`. The sqlparser
+path fills it with `query.to_string()` — sqlparser's own re-rendering — and
+libpg_query's deparse agrees on only 10 of 14 realistic bodies (`a::TEXT` vs
+`a::text`, `coalesce` vs `COALESCE`, paren preservation, `TABLESAMPLE BERNOULLI
+(10)` vs `bernoulli(10)`). Byte parity is unreachable without first deciding
+whether `writes[0]` should hold verbatim source sliced by
+`RawStmt.stmt_location`/`stmt_len` instead — a change that alters `emit` output.
+A plain view carries only references, so it is parity-clean and ships alone.
 
 Step 5 covers columns, types, defaults, identity, PK/unique/FK, CHECK, indexes
 (access method, opclass, predicate, include, storage params) and comments. It is
