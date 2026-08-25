@@ -24,7 +24,13 @@ use std::path::{Path, PathBuf};
 ///
 /// Role's correctness rests on its unit tests in `parser::pg::roles` and on
 /// live verification (apply ordering, `pg_auth_members`), not on this gate.
-const NO_SECOND_IMPLEMENTATION: &[EntityType] = &[EntityType::Role];
+///
+/// `MaterializedView` is excluded for a different reason than `Role`: here the
+/// two implementations are *intended* to disagree. The incumbent stores
+/// sqlparser's re-rendering of the body in `writes[0]`; the native parser stores
+/// the verbatim source. A gate asserting they match would assert the change did
+/// not happen.
+const NO_SECOND_IMPLEMENTATION: &[EntityType] = &[EntityType::Role, EntityType::MaterializedView];
 
 /// Every `.ddl`/`.sql` file under `root`, recursively.
 fn ddl_files(root: &Path) -> Vec<PathBuf> {
