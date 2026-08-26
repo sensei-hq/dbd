@@ -58,7 +58,7 @@ patch minor major:
 
 ## Install the dbd binary into ~/.cargo/bin from the current working tree.
 install:
-	@cargo install --path crates/dbd-cli --locked --force
+	@cargo install --path . --locked --force
 
 ## Remove the target/ build directory to reclaim disk space.
 clean:

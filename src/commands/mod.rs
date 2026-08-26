@@ -592,7 +592,7 @@ pub(crate) mod testutil {
 
     /// The shared `tests/fixtures` project (`design.yaml` + `ddl/` + `import/`).
     pub(crate) fn fixtures() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
     }
 
     /// The fixture project's `design.yaml`.
