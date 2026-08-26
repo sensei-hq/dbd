@@ -9,6 +9,7 @@ pub(crate) mod enums;
 pub(crate) mod matviews;
 pub(crate) mod procs;
 pub(crate) mod roles;
+pub(crate) mod sequences;
 pub(crate) mod tables;
 pub(crate) mod views;
 
@@ -37,6 +38,7 @@ impl PgQueryDdl {
         EntityType::Procedure,
         EntityType::Role,
         EntityType::Table,
+        EntityType::Sequence,
     ];
 
     /// The native parser for a type, or `None` when it still delegates.
@@ -52,6 +54,7 @@ impl PgQueryDdl {
             EntityType::MaterializedView => Some(matviews::parse_matview),
             EntityType::Function | EntityType::Procedure => Some(procs::parse_proc),
             EntityType::Role => Some(roles::parse_role),
+            EntityType::Sequence => Some(sequences::parse_sequence),
             EntityType::Table => Some(tables::parse_table),
             _ => None,
         }
@@ -89,10 +92,24 @@ mod tests {
         assert_eq!(json(&old), json(&new));
     }
 
+    /// Every file-backed entity type is now native. `Schema` and `Extension`
+    /// are synthesized from `design.yaml` rather than parsed from files — their
+    /// folders are not even recognised DDL folders — so they are correctly
+    /// absent, not overlooked.
     #[test]
-    fn enum_is_covered() {
-        assert!(PgQueryDdl::native(EntityType::Enum).is_some());
-        assert!(PgQueryDdl::native(EntityType::Sequence).is_none());
+    fn every_parsed_entity_type_is_native() {
+        for t in [
+            EntityType::Enum,
+            EntityType::Table,
+            EntityType::View,
+            EntityType::MaterializedView,
+            EntityType::Function,
+            EntityType::Procedure,
+            EntityType::Role,
+            EntityType::Sequence,
+        ] {
+            assert!(PgQueryDdl::native(t).is_some(), "{t:?} is not native");
+        }
     }
 
     /// COVERED and the dispatch match must agree for every entity type: a type
