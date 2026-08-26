@@ -365,6 +365,7 @@ pub fn cmd_combine(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    output::scope_filtered(&resolved, design.scoped_entities(&resolved)?.len(), design.entities().len());
     design.combine(file, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
