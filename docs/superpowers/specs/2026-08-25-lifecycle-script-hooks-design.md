@@ -96,6 +96,34 @@ parse — the script is treated as **unscoped and always runs**, with a warning
 naming it. Silently skipping a hook because analysis failed would be the worse
 failure: a user would see their realtime setup quietly not happen.
 
+### Derivation fails on the flagship case, measured
+
+The real `sensei` project's only after-script,
+`import/after/realtime_publication.sql`, is a `do $$ … $$` block that attaches
+relay tables to `supabase_realtime`. Run against it, every accessor returns
+empty:
+
+```
+select_tables: []   dml_tables: []   tables: []   call_functions: []
+```
+
+Its table names never appear as SQL identifiers. They live as *data* — inside
+`array['relay_sessions', 'relay_segments', 'relay_inbox']` and
+`format('alter publication … dojo.%I', t)`. The PL/pgSQL tier does recover the
+embedded statements, but they contain the format string, not the tables.
+
+**No parser can derive this, and none ever will.** So `writes:` is not an escape
+hatch for an exotic edge — it is the **primary** mechanism for exactly the kind
+of hook this feature exists to serve. Derivation earns its place on the simpler
+shape (`insert into target select … from staging_a join staging_b`), which is
+the case that silently produced wrong data.
+
+Note also that the real script already hand-guards itself three ways — absent
+publication, absent table, already-a-member — precisely because it runs for every
+scope. The feature's value there is replacing defensive PL/pgSQL with one
+declarative line, not enabling something impossible today. The larger value is
+the loader shape, where nothing guards anything.
+
 ## Behaviour under scope
 
 Skip and warn, matching how excluded staging tables already behave:
