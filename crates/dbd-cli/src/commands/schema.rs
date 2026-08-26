@@ -382,6 +382,11 @@ pub async fn cmd_apply(
     result?;
 
     if let Some(s) = apply_summary {
+        // Always reported, whatever the verbosity: a hook a scope filtered out
+        // is the reason something the user expected to happen did not.
+        for warning in &s.warnings {
+            output::warn(warning);
+        }
         output::info(verbosity, &format_apply_summary(&s));
     }
 

@@ -36,7 +36,43 @@ impl Design {
         self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
         let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
 
+        // A hook is filtered against the same working set the entities were.
+        // `None` — unscoped or the all-scope — runs every hook, and skips the
+        // derivation cost entirely on that common path.
+        let hook_scope = match (scope, working_set.as_ref()) {
+            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), ws)),
+            _ => None,
+        };
+
+        // `apply.before` runs here: after the scope and parse gates, so a bad
+        // design still refuses before any hook fires, and before the first
+        // entity, so a hook can prepare the ground the DDL lands on.
+        let before = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+            dry_run,
+            &mut progress,
+        )
+        .await?;
+
         if dry_run {
+            // A dry run executes nothing but must still name every script the
+            // real run would — including the after-hooks, which the early
+            // return below would otherwise hide, and including a missing file,
+            // which is a misconfiguration whether or not we are about to write.
+            hooks::run_hooks(
+                adapter,
+                &self.project_dir,
+                &self.config.apply.after,
+                hooks::HookKind::After,
+                hook_scope,
+                dry_run,
+                &mut progress,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -56,6 +92,19 @@ impl Design {
             adapter
                 .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
                 .await?;
+            // Batch adapters take this shortcut past the execution plan, but a
+            // hook is a hook: leaving `apply.after` out here would recreate, for
+            // one backend, exactly the silent no-op this feature removes.
+            let after = hooks::run_hooks(
+                adapter,
+                &self.project_dir,
+                &self.config.apply.after,
+                hooks::HookKind::After,
+                hook_scope,
+                dry_run,
+                &mut progress,
+            )
+            .await?;
             (progress.on_complete)(ApplyComplete {
                 strategy: ApplyStrategy::Current,
                 from_version: 0,
@@ -64,6 +113,9 @@ impl Design {
                 migrated: 0,
                 created: 0,
                 dropped: 0,
+                before_scripts: before.ran,
+                after_scripts: after.ran,
+                warnings: [before.warnings, after.warnings].concat(),
             });
             return Ok(());
         }
@@ -191,6 +243,21 @@ impl Design {
         // databases (and non-Postgres targets) without the extension.
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
+        // `apply.after` closes with the phase: every entity is applied, every
+        // matview stamped, and — critically — `policies/` has not run yet.
+        // Publications and grants attach to objects that must already exist;
+        // RLS is independent of them, so it stays last (see `deploy_with_progress`).
+        let after = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.after,
+            hooks::HookKind::After,
+            hook_scope,
+            dry_run,
+            &mut progress,
+        )
+        .await?;
+
         (progress.on_complete)(ApplyComplete {
             strategy: plan.strategy,
             from_version: db_version,
@@ -199,6 +266,9 @@ impl Design {
             migrated: counts.migrated,
             created: counts.created,
             dropped: counts.dropped,
+            before_scripts: before.ran,
+            after_scripts: after.ran,
+            warnings: [before.warnings, after.warnings].concat(),
         });
         Ok(())
     }

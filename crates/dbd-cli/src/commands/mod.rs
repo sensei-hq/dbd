@@ -204,7 +204,7 @@ pub async fn run(
 // ── Summary formatting helpers ────────────────────────────────────────────────
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
-    match s.strategy {
+    let entities = match s.strategy {
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
@@ -217,6 +217,13 @@ pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
                 s.from_version, s.to_version, s.applied, s.migrated, s.created, s.dropped
             )
         }
+    };
+    // Only mentioned when a project actually has hooks — a line reading
+    // "0 hook script(s)" on every apply would be noise for the projects
+    // (currently most of them) that declare none.
+    match s.before_scripts + s.after_scripts {
+        0 => entities,
+        n => format!("{entities} {n} hook script(s) run."),
     }
 }
 
@@ -416,7 +423,16 @@ mod tests {
     }
 
     fn apply_complete(strategy: ApplyStrategy) -> ApplyComplete {
-        ApplyComplete { strategy, from_version: 1, to_version: 2, applied: 3, migrated: 1, created: 2, dropped: 0 }
+        ApplyComplete {
+            strategy,
+            from_version: 1,
+            to_version: 2,
+            applied: 3,
+            migrated: 1,
+            created: 2,
+            dropped: 0,
+            ..Default::default()
+        }
     }
 
     /// Each apply strategy renders its own distinct summary line, and every
