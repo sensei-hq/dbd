@@ -46,6 +46,11 @@ pub struct ReconcilePlan {
     /// (`matview_create_sql` + hash sentinel) and are detected during `--dry-run`
     /// so the preview can list them.
     pub matview_creates: Vec<String>,
+    /// Materialized views live with a `v1` (unversioned) hash sentinel — written
+    /// by a dbd that hashed a different body contract, so its value is not
+    /// comparable to a current hash. Reconcile re-stamps these to `v2` silently
+    /// (never a drift warning); carried here so `--dry-run` previews the write.
+    pub matview_restamps: Vec<String>,
     /// Risky-change advisories (type changes, possible renames, enum value drops,
     /// orphaned enums that are not auto-dropped).
     pub warnings: Vec<String>,
@@ -64,6 +69,7 @@ impl ReconcilePlan {
             && self.altered.is_empty()
             && self.dropped.is_empty()
             && self.matview_creates.is_empty()
+            && self.matview_restamps.is_empty()
     }
 }
 
@@ -212,7 +218,11 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
         match con {
             TableConstraint::PrimaryKey { columns, .. } => {
                 has_table_pk = true;
-                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
+                push(
+                    &mut kept,
+                    &mut seen,
+                    TableConstraint::PrimaryKey { name: None, columns },
+                )
             }
             TableConstraint::Unique { columns, .. } => {
                 push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
@@ -231,10 +241,24 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
         // table has exactly one PK, so only synthesize one from a column flag
         // when no table-level PK exists (the inline single-column PK case).
         if c.is_pk && !has_table_pk {
-            push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
+            push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec![c.name.clone()],
+                },
+            );
         }
         if c.is_unique {
-            push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
+            push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec![c.name.clone()],
+                },
+            );
         }
     }
     kept.extend(others);
@@ -256,10 +280,23 @@ fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<
 /// Normalize a column type for cross-representation comparison: lowercase, drop a
 /// redundant `public.` prefix, map common Postgres aliases to the `format_type`
 /// spelling, and schema-qualify a bare enum name using `enum_types`.
-fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
+///
+/// Public for the same reason as [`crate::parser::pg_native_types`]: the parser
+/// parity harness is an integration test in a separate crate, and comparing two
+/// parsers' *type spellings* is exactly what this function is for. A local copy
+/// there would be a second alias table free to drift from this one.
+pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
     let mut s = raw.trim().to_lowercase();
-    if let Some(rest) = s.strip_prefix("public.") {
-        s = rest.to_string();
+    // `public.` and `pg_catalog.` are the implicit search path — a type named
+    // through either is the same type as the bare form. Postgres rewrites
+    // SQL-standard names into pg_catalog-qualified internals at parse time
+    // (`int` → `pg_catalog.int4`), so without this the alias table below never
+    // sees them and every such column reads as drifted.
+    for prefix in ["public.", "pg_catalog."] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+            break;
+        }
     }
     // Split "base(args)" so parameterized aliases (varchar(255)) normalize too.
     let (base, args) = match s.split_once('(') {
@@ -279,9 +316,7 @@ fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
         "char" | "bpchar" => "character".to_string(),
         "decimal" => "numeric".to_string(),
         // Qualify a bare enum reference to match introspection.
-        other if !other.contains('.') => {
-            enum_types.get(other).cloned().unwrap_or_else(|| other.to_string())
-        }
+        other if !other.contains('.') => enum_types.get(other).cloned().unwrap_or_else(|| other.to_string()),
         other => other.to_string(),
     };
     match args {
@@ -585,9 +620,9 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
             changes.push(FieldChange {
                 field_name: format!("fk:{}", fk.columns.join(",")),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
-                    TableConstraint::ForeignKey(fk.clone()),
-                ))),
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(
+                    fk.clone(),
+                )))),
             });
         }
 
@@ -625,8 +660,7 @@ fn table_checks(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
         .iter()
         .filter_map(|con| match con {
             TableConstraint::Check { expression, .. } => {
-                let key = crate::sql_expr::canonicalize_predicate(expression)
-                    .unwrap_or_else(|| expression.clone());
+                let key = crate::sql_expr::canonicalize_predicate(expression).unwrap_or_else(|| expression.clone());
                 Some((key, con))
             }
             _ => None,
@@ -918,7 +952,11 @@ fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
         .map(|c| IndexColumnShape {
             // An expression is case-significant (it can contain string literals);
             // a column name is not.
-            name: if c.is_expression { c.name.clone() } else { c.name.to_lowercase() },
+            name: if c.is_expression {
+                c.name.clone()
+            } else {
+                c.name.to_lowercase()
+            },
             is_expression: c.is_expression,
             descending: matches!(c.order, Some(SortOrder::Desc)),
             nulls_first: c.nulls_first,
@@ -927,7 +965,10 @@ fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
         .collect();
     IndexShape {
         unique: ix.unique,
-        method: ix.index_type.as_ref().map_or("btree".to_string(), |t| t.amname().to_string()),
+        method: ix
+            .index_type
+            .as_ref()
+            .map_or("btree".to_string(), |t| t.amname().to_string()),
         columns,
         predicate: ix.predicate.clone(),
         include: ix.include.iter().map(|c| c.to_lowercase()).collect(),
@@ -1010,6 +1051,11 @@ pub struct ReconcileComplete {
     /// Idempotent objects re-applied (schemas, extensions, sequences,
     /// functions, views, roles).
     pub reapplied: u32,
+    /// Materialized views whose live `v1` hash sentinel was silently re-stamped
+    /// to `v2`. Counted separately from `reapplied` so this one-time upgrade
+    /// write — to a live object, during what looks like a routine reconcile —
+    /// is visible in the summary rather than folded into an unrelated count.
+    pub restamped: u32,
 }
 
 // ── Materialized-view convergence (Task 13) ──────────────────
@@ -1036,6 +1082,11 @@ pub(crate) enum MatviewAction {
     Create,
     /// Live hash matches the design → nothing to do.
     Skip,
+    /// Live sentinel is `v1` (written under a superseded body contract, so its
+    /// hash isn't comparable to a current one) → re-stamp to `v2` silently.
+    /// Never a `Warn`: a v1/v2 mismatch says nothing about whether the design
+    /// actually drifted.
+    Restamp,
     /// Exists but the design differs (or it carries no dbd sentinel) → warn and
     /// leave it untouched. dbd never auto-drops a materialized view.
     Warn,
@@ -1044,17 +1095,17 @@ pub(crate) enum MatviewAction {
 /// Decide the action for a design matview from its wanted hash and the live
 /// sentinel state:
 /// - `None` — the matview does not exist live → **Create**.
-/// - `Some(Some(h))` — it exists with stored hash `h`; **Skip** iff `h == want`,
-///   else **Warn** (definition drifted).
+/// - `Some(Some(Sentinel::V2(h)))` — it exists with stored hash `h`; **Skip**
+///   iff `h == want`, else **Warn** (definition drifted).
+/// - `Some(Some(Sentinel::V1(_)))` — stamped under the superseded body
+///   contract → **Restamp** to `v2` (not comparable, so never a drift signal).
 /// - `Some(None)` — it exists but carries no `dbd:hash` sentinel (created outside
 ///   dbd, or before this feature) → **Warn** (cannot verify its definition).
-pub(crate) fn decide_matview_action(
-    want_hash: &str,
-    live: Option<Option<String>>,
-) -> MatviewAction {
+pub(crate) fn decide_matview_action(want_hash: &str, live: Option<Option<Sentinel>>) -> MatviewAction {
     match live {
         None => MatviewAction::Create,
-        Some(Some(h)) if h == want_hash => MatviewAction::Skip,
+        Some(Some(Sentinel::V2(h))) if h == want_hash => MatviewAction::Skip,
+        Some(Some(Sentinel::V1(_))) => MatviewAction::Restamp,
         Some(_) => MatviewAction::Warn,
     }
 }
@@ -1082,22 +1133,61 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=<hash>';` for the sentinel.
-/// `qualified` is `schema.name` (unqualified → `public`); single quotes in the
-/// payload are doubled so the literal stays well-formed.
+/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=v2:<hash>';` for the
+/// sentinel. `qualified` is `schema.name` (unqualified → `public`); single
+/// quotes in the payload are doubled so the literal stays well-formed.
+///
+/// Versioned (`v2:`) because the hash input is the matview's `writes[0]`, so
+/// any change to what that field holds changes every stamp already written.
+/// Without a version, such a change makes every existing matview report drift
+/// once on upgrade — indistinguishable from real drift, with a warning that
+/// tells users to `DROP … CASCADE`. See [`Sentinel`] and
+/// [`decide_matview_action`] for how an unversioned (`v1`) stamp is handled:
+/// re-stamped silently, never read as a drift signal.
 pub(crate) fn matview_hash_comment_sql(qualified: &str, hash: &str) -> String {
     let (schema, name) = qualified.split_once('.').unwrap_or((DEFAULT_SCHEMA, qualified));
-    let payload = format!("dbd:hash={hash}").replace('\'', "''");
+    let payload = format!("dbd:hash=v2:{hash}").replace('\'', "''");
     format!("COMMENT ON MATERIALIZED VIEW \"{schema}\".\"{name}\" IS '{payload}';")
 }
 
-/// Extract the hash from a `dbd:hash=<hex>` comment, or `None` when the comment
-/// is absent or carries no such sentinel. Inverse of [`matview_hash_comment_sql`]'s
-/// payload; tolerant of trailing text after the hash token.
-pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<String> {
+/// A parsed `dbd:hash` stamp.
+///
+/// Versioned because the hash input is the matview's `writes[0]`, so any
+/// change to what that field holds changes every stamp already written. A
+/// bare hash predates versioning and is recognised as `V1`: its value hashes a
+/// different body contract than the current code computes, so it must never
+/// be compared against a current hash — see [`decide_matview_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Sentinel {
+    /// Written by a dbd that hashed the pre-versioning body contract. Its hash
+    /// is not comparable with a current one, so it is re-stamped rather than
+    /// read.
+    V1(String),
+    /// Current format (`dbd:hash=v2:<hash>`).
+    V2(String),
+}
+
+/// Extract the sentinel from a `dbd:hash=…` comment, or `None` when the
+/// comment is absent or carries no such sentinel. Inverse of
+/// [`matview_hash_comment_sql`]'s payload; tolerant of trailing text after the
+/// token.
+pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
     let rest = comment?.split("dbd:hash=").nth(1)?;
-    let hash: String = rest.chars().take_while(char::is_ascii_alphanumeric).collect();
-    (!hash.is_empty()).then_some(hash)
+    // Alphanumeric-or-`:` so a versioned `v2:<hash>` token is captured whole.
+    // Plain `is_ascii_alphanumeric` stops at the `:` and would silently yield
+    // the literal "v2" as the hash — wrong, and it would never match a real
+    // hash, turning every matview into a *permanent* false-drift warning.
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
+        .collect();
+    match token.strip_prefix("v2:") {
+        Some(hash) if !hash.is_empty() => Some(Sentinel::V2(hash.to_string())),
+        // An unversioned token is a v1 stamp. Reject anything else carrying a
+        // colon — an unrecognised future version must not be misread as v1.
+        _ if !token.is_empty() && !token.contains(':') => Some(Sentinel::V1(token)),
+        _ => None,
+    }
 }
 
 /// `CREATE MATERIALIZED VIEW … WITH DATA;` (+ any index statements, via
@@ -1138,12 +1228,7 @@ fn matview_index_keys(e: &Entity) -> std::collections::BTreeSet<(bool, Vec<Strin
         .map(|d| d.indexes.as_slice())
         .unwrap_or(&[])
         .iter()
-        .map(|ix| {
-            (
-                ix.unique,
-                ix.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-            )
-        })
+        .map(|ix| (ix.unique, ix.columns.iter().map(|c| c.name.to_lowercase()).collect()))
         .collect()
 }
 
@@ -1196,6 +1281,42 @@ mod tests {
         assert!(!plan.destructive);
     }
 
+    // ── pg_catalog-qualified type names ─────────────────────────────────────
+
+    /// Postgres rewrites SQL-standard type names at parse time, so libpg_query
+    /// reports `pg_catalog.int4` where sqlparser reports `INT`. Both name the
+    /// same type; the alias table below already knows `int4`, it just never saw
+    /// it because the qualified form does not reach the match.
+    #[test]
+    fn pg_catalog_qualified_types_normalize_like_their_bare_form() {
+        let e = std::collections::HashMap::new();
+        for (qualified, bare) in [
+            ("pg_catalog.int4", "int"),
+            ("pg_catalog.int8", "bigint"),
+            ("pg_catalog.int2", "smallint"),
+            ("pg_catalog.bool", "boolean"),
+            ("pg_catalog.varchar(30)", "varchar(30)"),
+            ("pg_catalog.bpchar(2)", "char(2)"),
+            ("pg_catalog.numeric(10,2)", "numeric(10,2)"),
+            ("pg_catalog.timestamptz", "timestamp with time zone"),
+        ] {
+            assert_eq!(
+                canonical_type(qualified, &e),
+                canonical_type(bare, &e),
+                "{qualified} and {bare} must canonicalize alike"
+            );
+        }
+    }
+
+    /// Only the two system schemas are stripped. A user type keeps its schema —
+    /// `app.status_t` and `other.status_t` are different types.
+    #[test]
+    fn a_user_schema_qualification_is_preserved() {
+        let e = std::collections::HashMap::new();
+        assert_eq!(canonical_type("app.status_t", &e), "app.status_t");
+        assert_ne!(canonical_type("app.status_t", &e), canonical_type("other.status_t", &e));
+    }
+
     /// Issue #8: the read-only diff builder retains foreign keys; the reconcile
     /// (canonicalize) builder strips them. This split is why `dbd diff` can now
     /// see FK drift while reconcile's apply-path diff still ignores it.
@@ -1211,7 +1332,10 @@ mod tests {
         };
         let mut entity = Entity::new(EntityType::Table, "public.users");
         entity.table_def = Some(TableDef {
-            columns: vec![ColumnDef { inline_fk: Some(fk), ..col("org_id", "uuid") }],
+            columns: vec![ColumnDef {
+                inline_fk: Some(fk),
+                ..col("org_id", "uuid")
+            }],
             constraints: vec![],
             indexes: vec![],
             comments: TableComments::default(),
@@ -1219,15 +1343,27 @@ mod tests {
         let entities = vec![entity];
 
         let raw = raw_snapshot_from_entities(&entities);
-        assert!(raw.tables[0].columns[0].inline_fk.is_some(), "raw builder must retain the inline FK");
+        assert!(
+            raw.tables[0].columns[0].inline_fk.is_some(),
+            "raw builder must retain the inline FK"
+        );
 
         let canon = snapshot_from_entities(&entities);
-        assert!(canon.tables[0].columns[0].inline_fk.is_none(), "canonicalize builder must strip the inline FK");
+        assert!(
+            canon.tables[0].columns[0].inline_fk.is_none(),
+            "canonicalize builder must strip the inline FK"
+        );
     }
 
     // ── Foreign-key convergence (issue #8) ──────────────────
 
-    fn ref_fk(name: Option<&str>, col: &str, ref_schema: Option<&str>, ref_table: &str, on_delete: Option<FkAction>) -> ForeignKey {
+    fn ref_fk(
+        name: Option<&str>,
+        col: &str,
+        ref_schema: Option<&str>,
+        ref_table: &str,
+        on_delete: Option<FkAction>,
+    ) -> ForeignKey {
         ForeignKey {
             name: name.map(str::to_string),
             columns: vec![col.to_string()],
@@ -1259,7 +1395,9 @@ mod tests {
         assert_eq!(plan.altered.len(), 1, "expected one altered table; got {plan:?}");
         assert_eq!(plan.altered[0].entity_name, "app.children");
         assert!(
-            plan.altered[0].sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id)"),
+            plan.altered[0]
+                .sql
+                .contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id)"),
             "expected unnamed ADD FOREIGN KEY; got: {}",
             plan.altered[0].sql
         );
@@ -1272,7 +1410,11 @@ mod tests {
     fn fk_convergence_drops_extra_fk_is_destructive() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            None,
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
@@ -1295,7 +1437,11 @@ mod tests {
     fn fk_convergence_in_sync_is_no_change() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", Some(FkAction::NoAction),
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            Some(FkAction::NoAction),
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![TableSnapshot {
@@ -1309,7 +1455,10 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_fk_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.is_empty() && !plan.destructive, "in-sync FK must reconcile to no change; got {plan:?}");
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "in-sync FK must reconcile to no change; got {plan:?}"
+        );
     }
 
     /// A changed FK action (design adds `ON DELETE CASCADE`) drops the old and
@@ -1318,12 +1467,22 @@ mod tests {
     fn fk_convergence_changed_action_replaces() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            None,
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![TableSnapshot {
             columns: vec![ColumnDef {
-                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", Some(FkAction::Cascade))),
+                inline_fk: Some(ref_fk(
+                    None,
+                    "parent_id",
+                    Some("app"),
+                    "parents",
+                    Some(FkAction::Cascade),
+                )),
                 ..col("parent_id", "uuid")
             }],
             ..table("app", "children", vec![])
@@ -1334,9 +1493,14 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP CONSTRAINT children_parent_id_fkey"), "must drop old FK; got: {sql}");
-        assert!(sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id) ON DELETE CASCADE"),
-            "must add the new FK with the action; got: {sql}");
+        assert!(
+            sql.contains("DROP CONSTRAINT children_parent_id_fkey"),
+            "must drop old FK; got: {sql}"
+        );
+        assert!(
+            sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id) ON DELETE CASCADE"),
+            "must add the new FK with the action; got: {sql}"
+        );
         assert!(plan.destructive, "replacing an FK drops the old one → destructive");
     }
 
@@ -1370,7 +1534,10 @@ mod tests {
     // ── Column-comment convergence ───────────────────────────
 
     fn commented(name: &str, comment: Option<&str>) -> ColumnDef {
-        ColumnDef { comment: comment.map(str::to_string), ..col(name, "text") }
+        ColumnDef {
+            comment: comment.map(str::to_string),
+            ..col(name, "text")
+        }
     }
 
     fn docs_with(columns: Vec<ColumnDef>) -> Snapshot {
@@ -1403,7 +1570,11 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_comment_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.altered[0].sql.contains("IS 'new text';"), "got: {}", plan.altered[0].sql);
+        assert!(
+            plan.altered[0].sql.contains("IS 'new text';"),
+            "got: {}",
+            plan.altered[0].sql
+        );
     }
 
     /// The design dropped the comment → `IS NULL`, which is how Postgres removes
@@ -1470,7 +1641,10 @@ mod tests {
             &docs_with(vec![commented("title", None)]),
             &docs_with(vec![commented("title", None), commented("summary", Some("new col"))]),
         );
-        assert!(plan.is_empty(), "a new column's comment rides its ADD COLUMN; got {plan:?}");
+        assert!(
+            plan.is_empty(),
+            "a new column's comment rides its ADD COLUMN; got {plan:?}"
+        );
 
         // New table entirely.
         let mut plan = ReconcilePlan::default();
@@ -1552,7 +1726,10 @@ mod tests {
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("ADD CHECK (status <> '')"), "got: {sql}");
-        assert!(!sql.contains("unnamed"), "an unnamed CHECK must not be named \"unnamed\"; got: {sql}");
+        assert!(
+            !sql.contains("unnamed"),
+            "an unnamed CHECK must not be named \"unnamed\"; got: {sql}"
+        );
         assert!(!plan.destructive, "adding a CHECK is not destructive");
     }
 
@@ -1572,7 +1749,10 @@ mod tests {
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
-        assert!(!sql.contains("ck:"), "the expression key must never be used as a name; got: {sql}");
+        assert!(
+            !sql.contains("ck:"),
+            "the expression key must never be used as a name; got: {sql}"
+        );
         assert!(plan.destructive, "dropping a CHECK is gated as destructive");
     }
 
@@ -1646,7 +1826,10 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_check_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.is_empty(), "a new table's CHECKs come with its CREATE; got {plan:?}");
+        assert!(
+            plan.is_empty(),
+            "a new table's CHECKs come with its CREATE; got {plan:?}"
+        );
     }
 
     // ── Index convergence (issue #12) ────────────────────────
@@ -1657,7 +1840,10 @@ mod tests {
             name: Some(name.to_string()),
             columns: cols
                 .iter()
-                .map(|c| IndexColumn { name: (*c).to_string(), ..Default::default() })
+                .map(|c| IndexColumn {
+                    name: (*c).to_string(),
+                    ..Default::default()
+                })
                 .collect(),
             unique,
             ..Default::default()
@@ -1676,7 +1862,10 @@ mod tests {
         let descending = || crate::entity::IndexDef {
             name: Some("runs_project_idx".to_string()),
             columns: vec![
-                IndexColumn { name: "project_id".to_string(), ..Default::default() },
+                IndexColumn {
+                    name: "project_id".to_string(),
+                    ..Default::default()
+                },
                 IndexColumn {
                     name: "started_at".to_string(),
                     order: Some(SortOrder::Desc),
@@ -1688,7 +1877,11 @@ mod tests {
         let table_with = |ix| {
             snap(vec![TableSnapshot {
                 indexes: vec![ix],
-                ..table("app", "runs", vec![col("project_id", "uuid"), col("started_at", "timestamptz")])
+                ..table(
+                    "app",
+                    "runs",
+                    vec![col("project_id", "uuid"), col("started_at", "timestamptz")],
+                )
             }])
         };
 
@@ -1753,7 +1946,10 @@ mod tests {
 
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("DROP INDEX IF EXISTS"), "got: {sql}");
-        assert!(sql.contains("WHERE folder_id IS NULL"), "the new predicate must be created; got: {sql}");
+        assert!(
+            sql.contains("WHERE folder_id IS NULL"),
+            "the new predicate must be created; got: {sql}"
+        );
         assert!(plan.destructive);
     }
 
@@ -1814,8 +2010,16 @@ mod tests {
                 "app",
                 "memory_links",
                 vec![
-                    ColumnDef { is_pk: true, nullable: false, ..col("parent_id", "uuid") },
-                    ColumnDef { is_pk: true, nullable: false, ..col("child_id", "uuid") },
+                    ColumnDef {
+                        is_pk: true,
+                        nullable: false,
+                        ..col("parent_id", "uuid")
+                    },
+                    ColumnDef {
+                        is_pk: true,
+                        nullable: false,
+                        ..col("child_id", "uuid")
+                    },
                 ],
             );
             t.table_constraints.push(TableConstraint::PrimaryKey {
@@ -1833,7 +2037,11 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_index_convergence(&mut plan, &live, &desired);
 
-        assert_eq!(plan.altered.len(), 1, "composite-PK member index must converge; got {plan:?}");
+        assert_eq!(
+            plan.altered.len(),
+            1,
+            "composite-PK member index must converge; got {plan:?}"
+        );
         assert!(
             plan.altered[0].sql.contains("memory_links_child_id_idx"),
             "got: {}",
@@ -1855,7 +2063,9 @@ mod tests {
             columns: vec!["parent_id".to_string(), "child_id".to_string()],
         });
         let mut desired_t = live_t.clone();
-        live_t.indexes.push(idx("memory_links_pkey", &["parent_id", "child_id"], true));
+        live_t
+            .indexes
+            .push(idx("memory_links_pkey", &["parent_id", "child_id"], true));
         desired_t.indexes.clear();
 
         let mut plan = ReconcilePlan::default();
@@ -1872,7 +2082,11 @@ mod tests {
     /// so the partial one must not be suppressed as "already a constraint".
     #[test]
     fn index_convergence_keeps_partial_unique_index_over_constrained_columns() {
-        let mut live_t = table("app", "libs", vec![col("library_id", "uuid"), col("project_id", "uuid")]);
+        let mut live_t = table(
+            "app",
+            "libs",
+            vec![col("library_id", "uuid"), col("project_id", "uuid")],
+        );
         live_t.table_constraints.push(TableConstraint::Unique {
             name: None,
             columns: vec!["library_id".to_string()],
@@ -1935,7 +2149,9 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         assert!(
-            plan.altered[0].sql.contains("DROP INDEX IF EXISTS \"app\".\"children_parent_id_idx\";"),
+            plan.altered[0]
+                .sql
+                .contains("DROP INDEX IF EXISTS \"app\".\"children_parent_id_idx\";"),
             "expected schema-qualified DROP INDEX with the live name; got: {}",
             plan.altered[0].sql
         );
@@ -1977,7 +2193,10 @@ mod tests {
             ..table("app", "users", vec![not_null("id", "uuid")])
         }]);
         let desired = snap(vec![TableSnapshot {
-            table_constraints: vec![TableConstraint::PrimaryKey { name: None, columns: vec!["id".to_string()] }],
+            table_constraints: vec![TableConstraint::PrimaryKey {
+                name: None,
+                columns: vec!["id".to_string()],
+            }],
             ..table("app", "users", vec![pk_col("id", "uuid")])
         }]);
 
@@ -2009,7 +2228,10 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP INDEX IF EXISTS \"app\".\"users_email_idx\";"), "must drop old index; got: {sql}");
+        assert!(
+            sql.contains("DROP INDEX IF EXISTS \"app\".\"users_email_idx\";"),
+            "must drop old index; got: {sql}"
+        );
         assert!(
             sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"users_email_idx\" ON \"app\".\"users\" (\"email\");"),
             "must create the new unique index; got: {sql}"
@@ -2053,7 +2275,11 @@ mod tests {
         use crate::entity::{IndexColumn, IndexDef, IndexType};
         let gin = IndexDef {
             name: Some("docs_tags_gin".to_string()),
-            columns: vec![IndexColumn { name: "tags".to_string(), order: None, ..Default::default() }],
+            columns: vec![IndexColumn {
+                name: "tags".to_string(),
+                order: None,
+                ..Default::default()
+            }],
             unique: false,
             index_type: Some(IndexType::Gin),
             ..Default::default()
@@ -2135,10 +2361,17 @@ mod tests {
     }
 
     fn pk_col(name: &str, ty: &str) -> ColumnDef {
-        ColumnDef { is_pk: true, nullable: false, ..col(name, ty) }
+        ColumnDef {
+            is_pk: true,
+            nullable: false,
+            ..col(name, ty)
+        }
     }
     fn not_null(name: &str, ty: &str) -> ColumnDef {
-        ColumnDef { nullable: false, ..col(name, ty) }
+        ColumnDef {
+            nullable: false,
+            ..col(name, ty)
+        }
     }
 
     /// The core cross-representation guarantee: a table as the parser sees it
@@ -2306,16 +2539,8 @@ mod tests {
     /// strips only the redundant cast, never a real change.
     #[test]
     fn canonicalize_still_detects_real_default_change() {
-        let mut desired = snap(vec![table(
-            "public",
-            "counter",
-            vec![col_default("n", "integer", "1")],
-        )]);
-        let mut live = snap(vec![table(
-            "public",
-            "counter",
-            vec![col_default("n", "integer", "0")],
-        )]);
+        let mut desired = snap(vec![table("public", "counter", vec![col_default("n", "integer", "1")])]);
+        let mut live = snap(vec![table("public", "counter", vec![col_default("n", "integer", "0")])]);
 
         canonicalize(&mut desired);
         canonicalize(&mut live);
@@ -2346,10 +2571,17 @@ mod tests {
         let mut snap = snap(vec![TableSnapshot {
             name: "orders".to_string(),
             schema: "public".to_string(),
-            columns: vec![ColumnDef { comment: Some("the total".to_string()), ..col("total", "int4") }],
+            columns: vec![ColumnDef {
+                comment: Some("the total".to_string()),
+                ..col("total", "int4")
+            }],
             indexes: vec![IndexDef {
                 name: Some("orders_total_idx".to_string()),
-                columns: vec![IndexColumn { name: "total".to_string(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "total".to_string(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: false,
                 index_type: None,
                 ..Default::default()
@@ -2364,7 +2596,10 @@ mod tests {
                     on_delete: None,
                     on_update: None,
                 }),
-                TableConstraint::Check { name: Some("ck".to_string()), expression: "total > 0".to_string() },
+                TableConstraint::Check {
+                    name: Some("ck".to_string()),
+                    expression: "total > 0".to_string(),
+                },
             ],
         }]);
         normalize_common(&mut snap);
@@ -2372,8 +2607,18 @@ mod tests {
         assert_eq!(t.columns[0].data_type, "integer", "types must still be normalized");
         assert_eq!(t.columns[0].comment.as_deref(), Some("the total"), "comment preserved");
         assert_eq!(t.indexes.len(), 1, "indexes preserved");
-        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::ForeignKey(_))), "FK preserved");
-        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::Check { .. })), "CHECK preserved");
+        assert!(
+            t.table_constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::ForeignKey(_))),
+            "FK preserved"
+        );
+        assert!(
+            t.table_constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Check { .. })),
+            "CHECK preserved"
+        );
     }
 
     #[test]
@@ -2499,7 +2744,11 @@ mod tests {
             constraints: vec![],
             indexes: vec![IndexDef {
                 name: Some("m_x_idx".into()),
-                columns: vec![IndexColumn { name: "x".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "x".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: true,
                 index_type: None,
                 ..Default::default()
@@ -2530,57 +2779,89 @@ mod tests {
         );
     }
 
-    /// The sentinel comment SQL and `parse_dbd_hash` round-trip: the payload
-    /// stored (`dbd:hash=<hex>`) parses back to the same hash.
+    // ── Sentinel versioning ─────────────────────────────────────────────────
+
+    /// The stamp SQL and `parse_dbd_hash` round-trip through the current (`v2`)
+    /// format: the payload stored (`dbd:hash=v2:<hex>`) parses back to the same
+    /// hash.
     #[test]
-    fn matview_hash_comment_sql_roundtrips() {
+    fn v2_stamp_round_trips() {
         let sql = matview_hash_comment_sql("a.m", "deadbeefcafe0001");
-        assert!(
-            sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=deadbeefcafe0001';"),
-            "got: {sql}"
-        );
-        // obj_description returns the payload (without the surrounding quotes).
+        assert!(sql.contains("dbd:hash=v2:deadbeefcafe0001"), "got: {sql}");
+        let payload = sql.split_once("IS '").unwrap().1.trim_end_matches("';");
         assert_eq!(
-            parse_dbd_hash(Some("dbd:hash=deadbeefcafe0001")),
-            Some("deadbeefcafe0001".to_string())
+            parse_dbd_hash(Some(payload)),
+            Some(Sentinel::V2("deadbeefcafe0001".to_string()))
         );
     }
 
-    /// `parse_dbd_hash` returns `None` for a missing comment or a non-sentinel one.
+    /// A stamp written by an older dbd has no version prefix. It must be
+    /// recognised as v1, not misparsed — `take_while(is_ascii_alphanumeric)`
+    /// would stop at the `:` of a v2 stamp and yield "v2".
     #[test]
-    fn parse_dbd_hash_none_cases() {
+    fn unversioned_stamp_parses_as_v1() {
+        assert_eq!(
+            parse_dbd_hash(Some("dbd:hash=deadbeefcafe0001")),
+            Some(Sentinel::V1("deadbeefcafe0001".to_string()))
+        );
+    }
+
+    #[test]
+    fn absent_or_foreign_comment_has_no_sentinel() {
         assert_eq!(parse_dbd_hash(None), None);
-        assert_eq!(parse_dbd_hash(Some("just a user comment")), None);
+        assert_eq!(parse_dbd_hash(Some("just a comment")), None);
+    }
+
+    /// An empty hash token (`dbd:hash=` with nothing after it) is also `None`,
+    /// distinct from no sentinel at all — both must not crash the parser.
+    #[test]
+    fn parse_dbd_hash_empty_hash_is_none() {
         assert_eq!(parse_dbd_hash(Some("dbd:hash=")), None, "empty hash → None");
     }
 
     /// A create carries both the `CREATE MATERIALIZED VIEW … WITH DATA` and the
-    /// hash sentinel comment.
+    /// v2 hash sentinel comment.
     #[test]
     fn matview_create_sql_has_create_and_comment() {
         let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
         assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
-        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=abc123';"));
+        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=v2:abc123';"));
     }
 
-    /// The decision core, hash-based, over all four states: dbd never auto-drops,
-    /// so a drifted or unstamped matview is **Warn**, not recreate.
+    /// A v1 stamp means "written by a dbd that hashed the old body contract",
+    /// so its hash is not comparable — re-stamp silently rather than warn.
     #[test]
-    fn decide_matview_action_covers_all_branches() {
-        // Absent → Create.
-        assert_eq!(decide_matview_action("h", None), MatviewAction::Create);
-        // Present, matching hash → Skip.
-        assert_eq!(
-            decide_matview_action("h", Some(Some("h".into()))),
+    fn a_v1_stamp_is_restamped_not_warned() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V1("anything".into())))),
+            MatviewAction::Restamp
+        ));
+    }
+
+    #[test]
+    fn a_matching_v2_stamp_is_skipped() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V2("want".into())))),
             MatviewAction::Skip
-        );
-        // Present, different hash → Warn (definition drifted).
-        assert_eq!(
-            decide_matview_action("h", Some(Some("other".into()))),
+        ));
+    }
+
+    #[test]
+    fn a_differing_v2_stamp_is_real_drift() {
+        assert!(matches!(
+            decide_matview_action("want", Some(Some(Sentinel::V2("other".into())))),
             MatviewAction::Warn
-        );
-        // Present, no dbd sentinel → Warn (cannot verify).
-        assert_eq!(decide_matview_action("h", Some(None)), MatviewAction::Warn);
+        ));
+    }
+
+    #[test]
+    fn an_unstamped_matview_still_warns() {
+        assert!(matches!(decide_matview_action("want", Some(None)), MatviewAction::Warn));
+    }
+
+    #[test]
+    fn an_absent_matview_is_created() {
+        assert!(matches!(decide_matview_action("want", None), MatviewAction::Create));
     }
 
     /// A plan carrying only a matview create is NOT empty — otherwise the CLI's
@@ -2589,6 +2870,18 @@ mod tests {
     fn is_empty_false_when_only_matview_creates() {
         let plan = ReconcilePlan {
             matview_creates: vec!["analytics.daily_sales".to_string()],
+            ..Default::default()
+        };
+        assert!(!plan.is_empty());
+    }
+
+    /// A plan carrying only a matview restamp is NOT empty either — it is a
+    /// real write to a live object, so `--dry-run` must preview it rather than
+    /// claiming "Already in sync".
+    #[test]
+    fn is_empty_false_when_only_matview_restamps() {
+        let plan = ReconcilePlan {
+            matview_restamps: vec!["analytics.daily_sales".to_string()],
             ..Default::default()
         };
         assert!(!plan.is_empty());

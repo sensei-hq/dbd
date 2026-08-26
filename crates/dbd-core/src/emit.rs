@@ -185,7 +185,11 @@ pub(crate) fn emit_index_column(c: &crate::entity::IndexColumn) -> String {
     let mut out = if c.is_expression {
         // Postgres requires an expression key to be parenthesized; a function
         // call like `lower(name)` already reads as one.
-        if c.name.starts_with('(') { c.name.clone() } else { format!("({})", c.name) }
+        if c.name.starts_with('(') {
+            c.name.clone()
+        } else {
+            format!("({})", c.name)
+        }
     } else {
         q(&c.name)
     };
@@ -215,12 +219,7 @@ pub(crate) fn emit_index_column(c: &crate::entity::IndexColumn) -> String {
 /// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
 /// statement is idempotent on re-apply — matviews set it (their whole DDL is
 /// re-applied by `dbd apply`); tables keep their existing exact output.
-pub fn emit_index_sql(
-    ix: &crate::entity::IndexDef,
-    qname: &str,
-    table_name: &str,
-    if_not_exists: bool,
-) -> String {
+pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &str, if_not_exists: bool) -> String {
     let cols = ix.columns.iter().map(emit_index_column).collect::<Vec<_>>().join(", ");
     let unique = if ix.unique { "UNIQUE " } else { "" };
     let idx_name = ix.name.clone().unwrap_or_else(|| format!("{table_name}_idx"));
@@ -365,9 +364,7 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
         return Some(format!("{body};"));
     }
     match entity.entity_type {
-        EntityType::Schema | EntityType::Extension | EntityType::Role => {
-            crate::script::ddl_from_entity(entity)
-        }
+        EntityType::Schema | EntityType::Extension | EntityType::Role => crate::script::ddl_from_entity(entity),
         EntityType::Sequence => Some(emit_sequence(entity)),
         EntityType::Enum => Some(emit_enum(entity)),
         EntityType::Table => Some(emit_table(entity)),
@@ -387,8 +384,14 @@ mod tests {
     fn emits_enum() {
         let mut e = Entity::new(EntityType::Enum, "shop.order_status");
         e.enum_values = vec![
-            EnumValue { name: "pending".into(), note: None },
-            EnumValue { name: "paid".into(), note: None },
+            EnumValue {
+                name: "pending".into(),
+                note: None,
+            },
+            EnumValue {
+                name: "paid".into(),
+                note: None,
+            },
         ];
         assert_eq!(
             emit_enum(&e),
@@ -438,7 +441,10 @@ mod tests {
                 },
             ],
             constraints: vec![
-                TableConstraint::PrimaryKey { name: None, columns: vec!["id".into()] },
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                },
                 TableConstraint::ForeignKey(ForeignKey {
                     name: None,
                     columns: vec!["customer_id".into()],
@@ -451,7 +457,11 @@ mod tests {
             ],
             indexes: vec![IndexDef {
                 name: Some("orders_customer_id_idx".into()),
-                columns: vec![IndexColumn { name: "customer_id".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "customer_id".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: false,
                 index_type: None,
                 ..Default::default()
@@ -473,8 +483,7 @@ mod tests {
         // Round-trip: emitted DDL re-parses to a TableDef with the same structure.
         // Use the public parse_entity entry point with a fake table file path.
         let fake_path = std::path::Path::new("ddl/table/shop/orders.sql");
-        let parsed_entity = crate::parser::parse_entity(fake_path, &sql)
-            .expect("emitted table DDL should parse");
+        let parsed_entity = crate::parser::parse_entity(fake_path, &sql).expect("emitted table DDL should parse");
         let parsed = parsed_entity.table_def.expect("parsed entity should have a table_def");
 
         // Columns survive the round trip.
@@ -507,9 +516,10 @@ mod tests {
         assert_eq!(fk.ref_schema.as_deref(), Some("shop"));
 
         // Index name survives the round trip.
-        let idx = parsed.indexes.iter().find(|i| {
-            i.name.as_deref() == Some("orders_customer_id_idx")
-        });
+        let idx = parsed
+            .indexes
+            .iter()
+            .find(|i| i.name.as_deref() == Some("orders_customer_id_idx"));
         assert!(
             idx.is_some(),
             "index 'orders_customer_id_idx' must survive the round trip"
@@ -559,7 +569,11 @@ mod tests {
             constraints: vec![],
             indexes: vec![IndexDef {
                 name: Some("daily_sales_x_idx".into()),
-                columns: vec![IndexColumn { name: "x".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "x".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: true,
                 index_type: None,
                 ..Default::default()
@@ -590,10 +604,8 @@ mod tests {
         let mut e = Entity::new(EntityType::Function, "app.f");
         e.schema = Some("app".into());
         e.writes = vec![
-            "CREATE OR REPLACE FUNCTION app.f(a int) RETURNS int LANGUAGE sql AS $$ select 1 $$"
-                .into(),
-            "CREATE OR REPLACE FUNCTION app.f(a text) RETURNS int LANGUAGE sql AS $$ select 2 $$"
-                .into(),
+            "CREATE OR REPLACE FUNCTION app.f(a int) RETURNS int LANGUAGE sql AS $$ select 1 $$".into(),
+            "CREATE OR REPLACE FUNCTION app.f(a text) RETURNS int LANGUAGE sql AS $$ select 2 $$".into(),
         ];
         let sql = emit_routine(&e);
 
@@ -605,7 +617,10 @@ mod tests {
         assert!(sql.contains("$$ select 2 $$;"), "second body not ;-terminated:\n{sql}");
         assert!(!sql.contains(";;"), "no statement should be double-terminated:\n{sql}");
         // Separated by a blank line.
-        assert!(sql.contains(";\n\n"), "overloads should be separated by a blank line:\n{sql}");
+        assert!(
+            sql.contains(";\n\n"),
+            "overloads should be separated by a blank line:\n{sql}"
+        );
 
         // Dispatch wiring: emit_entity routes Function/Procedure to emit_routine.
         assert_eq!(emit_entity(&e).as_deref(), Some(sql.as_str()));
@@ -659,10 +674,7 @@ mod tests {
     fn emits_sequence_fallback_without_body() {
         let mut e = Entity::new(EntityType::Sequence, "app.counter");
         e.schema = Some("app".into());
-        assert_eq!(
-            emit_sequence(&e),
-            "CREATE SEQUENCE \"app\".\"counter\";"
-        );
+        assert_eq!(emit_sequence(&e), "CREATE SEQUENCE \"app\".\"counter\";");
     }
 
     #[test]
@@ -721,12 +733,24 @@ mod tests {
         let sql = emit_table(&e);
         // serial: bigserial with no NOT NULL / no DEFAULT nextval.
         assert!(sql.contains("\"id\" bigserial"), "got:\n{sql}");
-        assert!(!sql.contains("\"id\" bigserial NOT NULL"), "serial must not re-emit NOT NULL:\n{sql}");
-        assert!(!sql.contains("nextval('app.thing_id_seq"), "serial must drop its owned-seq default:\n{sql}");
+        assert!(
+            !sql.contains("\"id\" bigserial NOT NULL"),
+            "serial must not re-emit NOT NULL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("nextval('app.thing_id_seq"),
+            "serial must drop its owned-seq default:\n{sql}"
+        );
         // identity: GENERATED ALWAYS AS IDENTITY, no default.
-        assert!(sql.contains("\"n\" integer GENERATED ALWAYS AS IDENTITY"), "got:\n{sql}");
+        assert!(
+            sql.contains("\"n\" integer GENERATED ALWAYS AS IDENTITY"),
+            "got:\n{sql}"
+        );
         // standalone-referencing column keeps its default.
-        assert!(sql.contains("\"c\" integer DEFAULT nextval('app.counter'::regclass)"), "got:\n{sql}");
+        assert!(
+            sql.contains("\"c\" integer DEFAULT nextval('app.counter'::regclass)"),
+            "got:\n{sql}"
+        );
     }
 
     #[test]
@@ -752,7 +776,10 @@ mod tests {
             comments: Default::default(),
         });
         let sql = emit_table(&e);
-        assert!(sql.contains("\"n\" integer GENERATED BY DEFAULT AS IDENTITY"), "got:\n{sql}");
+        assert!(
+            sql.contains("\"n\" integer GENERATED BY DEFAULT AS IDENTITY"),
+            "got:\n{sql}"
+        );
     }
 
     #[test]
@@ -760,12 +787,23 @@ mod tests {
         use crate::entity::{ColumnDef, IndexColumn, IndexDef, IndexType, TableDef};
 
         let col = |n: &str, ty: &str| ColumnDef {
-            name: n.into(), data_type: ty.into(), nullable: true, default_value: None,
-            is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None,
+            name: n.into(),
+            data_type: ty.into(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            comment: None,
+            inline_fk: None,
         };
         let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
             name: Some(name.into()),
-            columns: vec![IndexColumn { name: col.into(), order: None, ..Default::default() }],
+            columns: vec![IndexColumn {
+                name: col.into(),
+                order: None,
+                ..Default::default()
+            }],
             unique: false,
             index_type: ty,
             ..Default::default()
@@ -788,11 +826,26 @@ mod tests {
         // Non-btree methods are emitted faithfully — a GIN/GiST index on an array /
         // tsvector column would be invalid as a plain btree, so the access method
         // must survive reverse-engineering.
-        assert!(sql.contains("CREATE INDEX \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"), "got:\n{sql}");
-        assert!(sql.contains("CREATE INDEX \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"), "got:\n{sql}");
+        assert!(
+            sql.contains("CREATE INDEX \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"),
+            "got:\n{sql}"
+        );
         // btree (None) emits no USING clause.
-        assert!(sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"), "got:\n{sql}");
+        assert!(
+            sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"),
+            "got:\n{sql}"
+        );
     }
 }

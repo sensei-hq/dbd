@@ -143,8 +143,7 @@ fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
 ///   the scheduled jobs (so a matview whose schedule was removed gets its stale
 ///   dbd-owned job dropped).
 fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
-    let mut scheduled: Vec<&(String, ResolvedMatview)> =
-        jobs.iter().filter(|(_, mv)| mv.refresh.is_some()).collect();
+    let mut scheduled: Vec<&(String, ResolvedMatview)> = jobs.iter().filter(|(_, mv)| mv.refresh.is_some()).collect();
 
     if scheduled.is_empty() && !pg_cron_present {
         return Ok(vec![]);
@@ -253,9 +252,20 @@ impl PostgresAdapter {
     fn matches_static_pattern(name: &str) -> bool {
         let lower = name.to_lowercase();
         let patterns = [
-            "pg_", "information_schema.", "array_", "json_", "jsonb_",
-            "regexp_", "current_", "gen_random_", "to_", "date_", "time_",
-            "string_to_", "lo_", "xml_",
+            "pg_",
+            "information_schema.",
+            "array_",
+            "json_",
+            "jsonb_",
+            "regexp_",
+            "current_",
+            "gen_random_",
+            "to_",
+            "date_",
+            "time_",
+            "string_to_",
+            "lo_",
+            "xml_",
         ];
         patterns.iter().any(|p| lower.starts_with(p))
     }
@@ -270,7 +280,7 @@ impl PostgresAdapter {
         // Check if the type already exists
         let exists = sqlx::query(
             "SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid \
-             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'"
+             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'",
         )
         .bind(schema)
         .bind(type_name)
@@ -289,9 +299,7 @@ impl PostgresAdapter {
 
     fn cache_path(&self) -> std::path::PathBuf {
         let base = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from(".cache"));
-        base.join("dbd")
-            .join("catalog")
-            .join(format!("{}.json", self.url_hash))
+        base.join("dbd").join("catalog").join(format!("{}.json", self.url_hash))
     }
 
     fn load_catalog_cache(&self) -> Option<CatalogData> {
@@ -334,11 +342,7 @@ impl PostgresAdapter {
             "data": &self.catalog,
         });
 
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&cache).unwrap_or_default(),
-        )
-        .ok();
+        std::fs::write(&path, serde_json::to_string_pretty(&cache).unwrap_or_default()).ok();
     }
 
     // ── Schema filter shared by all introspect_* helpers ──────────────────────
@@ -357,9 +361,7 @@ impl PostgresAdapter {
 
     async fn introspect_schemas(&self) -> crate::error::Result<Vec<Entity>> {
         let filter = Self::schema_filter_column("nspname");
-        let sql = format!(
-            "SELECT nspname FROM pg_namespace WHERE {filter} ORDER BY nspname"
-        );
+        let sql = format!("SELECT nspname FROM pg_namespace WHERE {filter} ORDER BY nspname");
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -406,12 +408,16 @@ impl PostgresAdapter {
         use crate::entity::EnumValue;
 
         let ns_filter = Self::schema_filter_column("n.nspname");
-        // Fetch enums and their ordered values in one query
+        // Fetch enums and their ordered values in one query. LEFT JOIN pg_enum:
+        // `CREATE TYPE e AS ENUM ()` is valid Postgres and creates a real type
+        // with zero pg_enum rows, so an inner join made it invisible to
+        // introspection — reconcile then saw it as missing and recreated it
+        // every run, forever, without ever converging.
         let sql = format!(
             "SELECT n.nspname, t.typname, e.enumlabel \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
-             JOIN pg_enum e ON e.enumtypid = t.oid \
+             LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
              WHERE t.typtype = 'e' AND {ns_filter} \
              ORDER BY n.nspname, t.typname, e.enumsortorder"
         );
@@ -420,16 +426,22 @@ impl PostgresAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("introspect_enums failed: {e}")))?;
 
-        // Group by (schema, typname)
-        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> =
-            indexmap::IndexMap::new();
+        // Group by (schema, typname). A label-less enum still gets exactly one
+        // map entry (via `.or_default()`) even though nothing is pushed to it,
+        // because its single row carries a NULL `enumlabel` rather than
+        // contributing no rows at all.
+        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> = indexmap::IndexMap::new();
         for row in &rows {
             let schema: String = row.get("nspname");
             let typname: String = row.get("typname");
-            let label: String = row.get("enumlabel");
-            map.entry((schema, typname))
-                .or_default()
-                .push(EnumValue { name: label, note: None });
+            let label: Option<String> = row.get("enumlabel");
+            let values = map.entry((schema, typname)).or_default();
+            if let Some(label) = label {
+                values.push(EnumValue {
+                    name: label,
+                    note: None,
+                });
+            }
         }
 
         let entities = map
@@ -471,11 +483,8 @@ impl PostgresAdapter {
             let table: String = trow.get("table_name");
 
             let columns = self.introspect_columns(&schema, &table).await?;
-            let (constraints, constraint_index_oids) =
-                self.introspect_constraints(&schema, &table).await?;
-            let indexes = self
-                .introspect_indexes(&schema, &table, &constraint_index_oids)
-                .await?;
+            let (constraints, constraint_index_oids) = self.introspect_constraints(&schema, &table).await?;
+            let indexes = self.introspect_indexes(&schema, &table, &constraint_index_oids).await?;
 
             let table_comment = self.introspect_table_comment(&schema, &table).await?;
 
@@ -522,8 +531,7 @@ impl PostgresAdapter {
     ) -> crate::error::Result<Vec<crate::entity::ColumnDef>> {
         use crate::entity::ColumnDef;
 
-        let cols_sql =
-            "SELECT a.attname AS column_name, \
+        let cols_sql = "SELECT a.attname AS column_name, \
                     a.attnotnull, \
                     a.attidentity::text AS attidentity, \
                     pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
@@ -552,9 +560,7 @@ impl PostgresAdapter {
             .bind(table)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                DbdError::Config(format!("introspect_tables columns {schema}.{table}: {e}"))
-            })?;
+            .map_err(|e| DbdError::Config(format!("introspect_tables columns {schema}.{table}: {e}")))?;
 
         let columns: Vec<ColumnDef> = col_rows
             .iter()
@@ -584,9 +590,7 @@ impl PostgresAdapter {
                 // that sequence is emitted separately as EntityType::Sequence.
                 let is_serial = identity.is_none()
                     && owns_default_seq
-                    && default_value
-                        .as_deref()
-                        .is_some_and(|d| d.contains("nextval("));
+                    && default_value.as_deref().is_some_and(|d| d.contains("nextval("));
 
                 let (data_type, default_value) = if is_serial {
                     let serial = match underlying_type.as_str() {
@@ -627,14 +631,10 @@ impl PostgresAdapter {
         &self,
         schema: &str,
         table: &str,
-    ) -> crate::error::Result<(
-        Vec<crate::entity::TableConstraint>,
-        std::collections::HashSet<i64>,
-    )> {
+    ) -> crate::error::Result<(Vec<crate::entity::TableConstraint>, std::collections::HashSet<i64>)> {
         use crate::entity::{ForeignKey, TableConstraint};
 
-        let cons_sql =
-            "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
+        let cons_sql = "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
                     c.conindid::int8 AS conindid, \
                     pg_get_constraintdef(c.oid, true) AS condef, \
                     (SELECT array_agg(a.attname ORDER BY pos.ord) \
@@ -661,28 +661,24 @@ impl PostgresAdapter {
             .bind(table)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                DbdError::Config(format!("introspect_tables constraints {schema}.{table}: {e}"))
-            })?;
+            .map_err(|e| DbdError::Config(format!("introspect_tables constraints {schema}.{table}: {e}")))?;
 
         let mut constraints: Vec<TableConstraint> = Vec::new();
-        let mut constraint_index_oids: std::collections::HashSet<i64> =
-            std::collections::HashSet::new();
+        let mut constraint_index_oids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         for con in &con_rows {
             let conname: String = con.get("conname");
             let contype: String = con.get("contype");
-            let col_names: Vec<String> = con
-                .try_get::<Vec<String>, _>("col_names")
-                .unwrap_or_default();
+            let col_names: Vec<String> = con.try_get::<Vec<String>, _>("col_names").unwrap_or_default();
             let conindid: Option<i64> = con.try_get("conindid").ok();
 
             match contype.as_str() {
                 "p" => {
                     if let Some(oid) = conindid
-                        && oid != 0 {
-                            constraint_index_oids.insert(oid);
-                        }
+                        && oid != 0
+                    {
+                        constraint_index_oids.insert(oid);
+                    }
                     constraints.push(TableConstraint::PrimaryKey {
                         name: Some(conname),
                         columns: col_names,
@@ -690,18 +686,17 @@ impl PostgresAdapter {
                 }
                 "u" => {
                     if let Some(oid) = conindid
-                        && oid != 0 {
-                            constraint_index_oids.insert(oid);
-                        }
+                        && oid != 0
+                    {
+                        constraint_index_oids.insert(oid);
+                    }
                     constraints.push(TableConstraint::Unique {
                         name: Some(conname),
                         columns: col_names,
                     });
                 }
                 "f" => {
-                    let ref_col_names: Vec<String> = con
-                        .try_get::<Vec<String>, _>("ref_col_names")
-                        .unwrap_or_default();
+                    let ref_col_names: Vec<String> = con.try_get::<Vec<String>, _>("ref_col_names").unwrap_or_default();
                     let ref_schema: Option<String> = con.try_get("ref_schema").ok();
                     let ref_table: String = con.try_get("ref_table").unwrap_or_default();
                     let confdeltype: Option<String> = con.try_get("confdeltype").ok();
@@ -775,8 +770,7 @@ impl PostgresAdapter {
 
         // `indnullsnotdistinct` only exists on PG 15+; reading it through
         // `to_jsonb` yields NULL instead of erroring on older servers.
-        let idx_sql =
-            "SELECT i.relname AS index_name, \
+        let idx_sql = "SELECT i.relname AS index_name, \
                     ix.indexrelid::int8 AS index_oid, \
                     ix.indisunique, \
                     ix.indisprimary, \
@@ -816,9 +810,7 @@ impl PostgresAdapter {
             .bind(table)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| {
-                DbdError::Config(format!("introspect_tables indexes {schema}.{table}: {e}"))
-            })?;
+            .map_err(|e| DbdError::Config(format!("introspect_tables indexes {schema}.{table}: {e}")))?;
 
         let mut indexes: Vec<IndexDef> = Vec::new();
         for ix in &idx_rows {
@@ -833,11 +825,9 @@ impl PostgresAdapter {
             let indisunique: bool = ix.get("indisunique");
             let index_type_str: String = ix.get("index_type");
             let nkeyatts = ix.get::<i32, _>("nkeyatts").max(0) as usize;
-            let col_names: Vec<Option<String>> =
-                ix.try_get::<Vec<Option<String>>, _>("col_names").unwrap_or_default();
+            let col_names: Vec<Option<String>> = ix.try_get::<Vec<Option<String>>, _>("col_names").unwrap_or_default();
             let col_defs: Vec<String> = ix.try_get::<Vec<String>, _>("col_defs").unwrap_or_default();
-            let opclasses: Vec<Option<String>> =
-                ix.try_get::<Vec<Option<String>>, _>("opclasses").unwrap_or_default();
+            let opclasses: Vec<Option<String>> = ix.try_get::<Vec<Option<String>>, _>("opclasses").unwrap_or_default();
             let coloptions: Vec<i32> = ix.try_get::<Vec<i32>, _>("coloptions").unwrap_or_default();
 
             // Key columns first, then any INCLUDE payload columns.
@@ -878,9 +868,10 @@ impl PostgresAdapter {
                 })
                 .collect();
 
-            let predicate = ix.try_get::<Option<String>, _>("predicate").unwrap_or(None).map(|raw| {
-                crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw)
-            });
+            let predicate = ix
+                .try_get::<Option<String>, _>("predicate")
+                .unwrap_or(None)
+                .map(|raw| crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw));
             let with_options = ix
                 .try_get::<Option<Vec<String>>, _>("reloptions")
                 .unwrap_or(None)
@@ -908,11 +899,7 @@ impl PostgresAdapter {
     }
 
     /// Introspect a table's `COMMENT ON TABLE` text, if any.
-    async fn introspect_table_comment(
-        &self,
-        schema: &str,
-        table: &str,
-    ) -> crate::error::Result<Option<String>> {
+    async fn introspect_table_comment(&self, schema: &str, table: &str) -> crate::error::Result<Option<String>> {
         let tc_sql = "SELECT obj_description((SELECT oid FROM pg_class \
                        WHERE relname = $2 \
                        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)) \
@@ -922,9 +909,7 @@ impl PostgresAdapter {
             .bind(table)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| {
-                DbdError::Config(format!("introspect_tables table_comment {schema}.{table}: {e}"))
-            })?;
+            .map_err(|e| DbdError::Config(format!("introspect_tables table_comment {schema}.{table}: {e}")))?;
         Ok(tc_row.try_get("tbl_comment").ok().flatten())
     }
 
@@ -990,8 +975,7 @@ impl PostgresAdapter {
                 .introspect_indexes(&schema, &matviewname, &std::collections::HashSet::new())
                 .await?;
 
-            let mut e =
-                Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
+            let mut e = Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
             e.writes = vec![definition];
             if !indexes.is_empty() {
                 e.table_def = Some(TableDef {
@@ -1148,18 +1132,80 @@ impl PostgresAdapter {
     fn is_sql_noise(name: &str) -> bool {
         let lower = name.to_lowercase();
         let noise = [
-            "varchar", "int", "integer", "bigint", "smallint", "numeric", "decimal",
-            "boolean", "text", "date", "timestamp", "timestamptz", "uuid", "jsonb",
-            "json", "bytea", "float", "double", "real", "serial", "bigserial",
-            "btree", "hash", "gin", "gist", "brin",
-            "now", "coalesce", "nullif", "greatest", "least", "extract",
-            "count", "sum", "avg", "min", "max", "string_agg",
-            "row_number", "rank", "dense_rank", "lead", "lag",
-            "upper", "lower", "trim", "length", "replace", "substring",
-            "cast", "exists", "between", "like", "in", "not", "and", "or",
-            "true", "false", "null", "default", "current_user", "localtime",
-            "localtimestamp", "random", "floor", "ceil", "abs", "round",
-            "enum", "record", "void", "trigger", "event_trigger",
+            "varchar",
+            "int",
+            "integer",
+            "bigint",
+            "smallint",
+            "numeric",
+            "decimal",
+            "boolean",
+            "text",
+            "date",
+            "timestamp",
+            "timestamptz",
+            "uuid",
+            "jsonb",
+            "json",
+            "bytea",
+            "float",
+            "double",
+            "real",
+            "serial",
+            "bigserial",
+            "btree",
+            "hash",
+            "gin",
+            "gist",
+            "brin",
+            "now",
+            "coalesce",
+            "nullif",
+            "greatest",
+            "least",
+            "extract",
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "string_agg",
+            "row_number",
+            "rank",
+            "dense_rank",
+            "lead",
+            "lag",
+            "upper",
+            "lower",
+            "trim",
+            "length",
+            "replace",
+            "substring",
+            "cast",
+            "exists",
+            "between",
+            "like",
+            "in",
+            "not",
+            "and",
+            "or",
+            "true",
+            "false",
+            "null",
+            "default",
+            "current_user",
+            "localtime",
+            "localtimestamp",
+            "random",
+            "floor",
+            "ceil",
+            "abs",
+            "round",
+            "enum",
+            "record",
+            "void",
+            "trigger",
+            "event_trigger",
         ];
         noise.contains(&lower.as_str())
     }
@@ -1237,16 +1283,22 @@ impl DatabaseAdapter for PostgresAdapter {
                 } else {
                     format!(", NULL '{}'", null_value.replace('\'', "''"))
                 };
-                let copy_sql = format!(
-                    "COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})"
-                );
-                let mut conn = self.pool.acquire().await
+                let copy_sql =
+                    format!("COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})");
+                let mut conn = self
+                    .pool
+                    .acquire()
+                    .await
                     .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
-                let mut copy = conn.copy_in_raw(&copy_sql).await
+                let mut copy = conn
+                    .copy_in_raw(&copy_sql)
+                    .await
                     .map_err(|e| DbdError::Config(format!("COPY failed: {e}")))?;
-                copy.send(data.as_bytes()).await
+                copy.send(data.as_bytes())
+                    .await
                     .map_err(|e| DbdError::Config(format!("COPY send failed: {e}")))?;
-                copy.finish().await
+                copy.finish()
+                    .await
                     .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
             }
             "json" | "jsonl" => {
@@ -1256,7 +1308,8 @@ impl DatabaseAdapter for PostgresAdapter {
                 // connections don't share `search_path`, so unqualified names (a bare
                 // `_temp`, or a CALL qualified with the target's own schema) resolve
                 // nondeterministically and fail. See sensei-hq/dbd#6.
-                self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)")).await?;
+                self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
+                    .await?;
                 self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
 
                 // Insert each line as a JSONB row
@@ -1275,12 +1328,11 @@ impl DatabaseAdapter for PostgresAdapter {
                 // Move data from the temp table to the target. `entity.name` is the
                 // schema-qualified destination; the procedure always lives in `staging`.
                 self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
-                self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}")).await?;
+                self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}"))
+                    .await?;
             }
             _ => {
-                return Err(DbdError::Config(format!(
-                    "Unsupported import format: {format}"
-                )));
+                return Err(DbdError::Config(format!("Unsupported import format: {format}")));
             }
         }
 
@@ -1295,15 +1347,14 @@ impl DatabaseAdapter for PostgresAdapter {
             "tsv" => format!(
                 "COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
             ),
-            "jsonl" => format!(
-                "COPY (SELECT row_to_json(t) FROM \"{qualified}\" t) TO STDOUT"
-            ),
-            _ => format!(
-                "COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true)"
-            ),
+            "jsonl" => format!("COPY (SELECT row_to_json(t) FROM \"{qualified}\" t) TO STDOUT"),
+            _ => format!("COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true)"),
         };
 
-        let mut conn = self.pool.acquire().await
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
             .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
 
         let mut data = Vec::new();
@@ -1421,9 +1472,7 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         // Qualified name check
-        if lower.contains('.')
-            && (self.catalog.functions.contains(&lower) || self.catalog.types.contains(&lower))
-        {
+        if lower.contains('.') && (self.catalog.functions.contains(&lower) || self.catalog.types.contains(&lower)) {
             // Check if it's in an extension schema
             let schema = lower.split('.').next().unwrap_or("");
             if self.catalog.extension_schemas.contains(schema) {
@@ -1434,22 +1483,14 @@ impl DatabaseAdapter for PostgresAdapter {
 
         // Bare name: check pg_catalog namespace
         let pg_qualified = format!("pg_catalog.{lower}");
-        if self.catalog.functions.contains(&pg_qualified)
-            || self.catalog.types.contains(&pg_qualified)
-        {
+        if self.catalog.functions.contains(&pg_qualified) || self.catalog.types.contains(&pg_qualified) {
             return ReferenceClass::Internal;
         }
 
         // Check if name is in any extension schema
         for ext_schema in &self.catalog.extension_schemas {
-            if self
-                .catalog
-                .functions
-                .contains(&format!("{ext_schema}.{lower}"))
-                || self
-                    .catalog
-                    .types
-                    .contains(&format!("{ext_schema}.{lower}"))
+            if self.catalog.functions.contains(&format!("{ext_schema}.{lower}"))
+                || self.catalog.types.contains(&format!("{ext_schema}.{lower}"))
             {
                 return ReferenceClass::Extension("unknown".to_string());
             }
@@ -1469,7 +1510,7 @@ impl DatabaseAdapter for PostgresAdapter {
         // Check tables/views
         let result = sqlx::query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = $1 AND table_name = $2"
+             WHERE table_schema = $1 AND table_name = $2",
         )
         .bind(schema)
         .bind(entity_name)
@@ -1485,7 +1526,7 @@ impl DatabaseAdapter for PostgresAdapter {
         let result = sqlx::query(
             "SELECT typname FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
-             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'"
+             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'",
         )
         .bind(schema)
         .bind(entity_name)
@@ -1501,9 +1542,7 @@ impl DatabaseAdapter for PostgresAdapter {
 
         // Tables + views (information_schema covers BASE TABLE, VIEW, FOREIGN, etc.)
         let table_filter = Self::schema_filter_column("table_schema");
-        let sql = format!(
-            "SELECT table_schema, table_name FROM information_schema.tables WHERE {table_filter}"
-        );
+        let sql = format!("SELECT table_schema, table_name FROM information_schema.tables WHERE {table_filter}");
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -1619,13 +1658,7 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.version().await
     }
 
-    async fn apply_migration(
-        &self,
-        version: u32,
-        sql: &str,
-        description: &str,
-        checksum: &str,
-    ) -> Result<()> {
+    async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {
         if !sql.is_empty() {
             self.execute_script(sql).await?;
         }
@@ -1659,9 +1692,7 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         let mut guard = self.batch.lock().await;
-        self.bookkeeping
-            .set_meta(guard.as_mut(), env, version, scope)
-            .await
+        self.bookkeeping.set_meta(guard.as_mut(), env, version, scope).await
     }
 
     fn supports_schema_grants(&self) -> bool {
@@ -1704,10 +1735,11 @@ impl DatabaseAdapter for PostgresAdapter {
     // ── Materialized-view refresh scheduling ────────────
 
     /// Live matview drift state: every materialized view (`pg_class.relkind =
-    /// 'm'`) in a managed schema mapped to the `dbd:hash` sentinel parsed from its
-    /// object comment. Distinct from [`Self::introspect_matviews`] (which
-    /// reconstructs the full entity for merge/init) — this reads only what
-    /// reconcile's create/skip/recreate decision needs.
+    /// 'm'`) in a managed schema mapped to its raw object comment. Distinct from
+    /// [`Self::introspect_matviews`] (which reconstructs the full entity for
+    /// merge/init) — this reads only what reconcile's create/skip/restamp/
+    /// recreate decision needs. Returns the comment unparsed (see the trait
+    /// doc); [`crate::reconcile::parse_dbd_hash`] extracts the sentinel.
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
         let sql = format!(
@@ -1727,10 +1759,7 @@ impl DatabaseAdapter for PostgresAdapter {
             let schema: String = row.get("schema");
             let name: String = row.get("name");
             let comment: Option<String> = row.get("comment");
-            states.insert(
-                format!("{schema}.{name}"),
-                crate::reconcile::parse_dbd_hash(comment.as_deref()),
-            );
+            states.insert(format!("{schema}.{name}"), comment);
         }
         Ok(states)
     }
@@ -1850,15 +1879,24 @@ mod tests {
     fn refresh_job_sql_escapes_single_quotes() {
         // Contrived name/schedule carrying single quotes — all literals escaped.
         let sql = refresh_job_sql("analytics.o'brien", "0 2 * * *'; DROP", true);
-        assert!(sql.contains("dbd:refresh:analytics.o''brien"), "job name escaped: {sql}");
-        assert!(sql.contains("\"analytics\".\"o''brien\""), "identifier escaped in command: {sql}");
+        assert!(
+            sql.contains("dbd:refresh:analytics.o''brien"),
+            "job name escaped: {sql}"
+        );
+        assert!(
+            sql.contains("\"analytics\".\"o''brien\""),
+            "identifier escaped in command: {sql}"
+        );
         assert!(sql.contains("0 2 * * *''; DROP"), "schedule literal escaped: {sql}");
     }
 
     #[test]
     fn refresh_job_sql_unqualified_falls_back_to_public() {
         let sql = refresh_job_sql("solo", "0 0 * * *", false);
-        assert!(sql.contains("\"public\".\"solo\""), "unqualified name uses public: {sql}");
+        assert!(
+            sql.contains("\"public\".\"solo\""),
+            "unqualified name uses public: {sql}"
+        );
     }
 
     #[test]
@@ -1912,16 +1950,34 @@ mod tests {
         assert_eq!(plan.len(), 3, "expected 2 schedules + 1 unschedule: {plan:?}");
 
         // Sorted by name: "analytics.abc" before "analytics.daily_sales".
-        assert!(plan[0].contains("dbd:refresh:analytics.abc"), "first (sorted): {}", plan[0]);
+        assert!(
+            plan[0].contains("dbd:refresh:analytics.abc"),
+            "first (sorted): {}",
+            plan[0]
+        );
         assert!(!plan[0].contains("CONCURRENTLY"), "abc is non-concurrent: {}", plan[0]);
-        assert!(plan[1].contains("dbd:refresh:analytics.daily_sales"), "second (sorted): {}", plan[1]);
-        assert!(plan[1].contains("CONCURRENTLY"), "daily_sales is concurrent: {}", plan[1]);
+        assert!(
+            plan[1].contains("dbd:refresh:analytics.daily_sales"),
+            "second (sorted): {}",
+            plan[1]
+        );
+        assert!(
+            plan[1].contains("CONCURRENTLY"),
+            "daily_sales is concurrent: {}",
+            plan[1]
+        );
 
         // Last statement is the single unschedule; its keep list has both scheduled
         // jobs and NOT the unscheduled one.
         let unschedule = &plan[2];
-        assert!(unschedule.contains("cron.unschedule"), "last is unschedule: {unschedule}");
-        assert!(unschedule.contains("'dbd:refresh:analytics.abc'"), "keeps abc: {unschedule}");
+        assert!(
+            unschedule.contains("cron.unschedule"),
+            "last is unschedule: {unschedule}"
+        );
+        assert!(
+            unschedule.contains("'dbd:refresh:analytics.abc'"),
+            "keeps abc: {unschedule}"
+        );
         assert!(
             unschedule.contains("'dbd:refresh:analytics.daily_sales'"),
             "keeps daily_sales: {unschedule}"
@@ -1939,7 +1995,11 @@ mod tests {
         let jobs = vec![("analytics.x".to_string(), mv(None, false))];
         let plan = plan_cron_sync(&jobs, true).unwrap();
         assert_eq!(plan.len(), 1, "expected only the unschedule statement: {plan:?}");
-        assert!(plan[0].contains("cron.unschedule"), "the one statement is unschedule: {}", plan[0]);
+        assert!(
+            plan[0].contains("cron.unschedule"),
+            "the one statement is unschedule: {}",
+            plan[0]
+        );
         assert!(plan[0].contains("ARRAY[]::text[]"), "empty keep list: {}", plan[0]);
     }
 }

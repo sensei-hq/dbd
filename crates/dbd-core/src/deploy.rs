@@ -35,9 +35,7 @@ pub async fn resolve_source(source: &str, no_cache: bool) -> Result<PathBuf> {
         // Local path
         let path = PathBuf::from(source);
         if !path.exists() {
-            return Err(DbdError::Config(format!(
-                "Source directory not found: {source}"
-            )));
+            return Err(DbdError::Config(format!("Source directory not found: {source}")));
         }
         return Ok(path);
     }
@@ -129,11 +127,7 @@ impl SourceFetcher for HttpFetcher {
 }
 
 #[cfg(feature = "deploy")]
-async fn download_and_extract(
-    gh: &github::GitHubSource,
-    cache_dir: &Path,
-    fetcher: &dyn SourceFetcher,
-) -> Result<()> {
+async fn download_and_extract(gh: &github::GitHubSource, cache_dir: &Path, fetcher: &dyn SourceFetcher) -> Result<()> {
     let url = format!(
         "https://api.github.com/repos/{}/{}/tarball/{}",
         gh.owner, gh.repo, gh.git_ref
@@ -162,8 +156,7 @@ fn extract_tarball(bytes: &[u8], cache_dir: &Path) -> Result<()> {
         .entries()
         .map_err(|e| DbdError::GitHubSource(format!("Failed to read tarball: {e}")))?
     {
-        let mut entry =
-            entry.map_err(|e| DbdError::GitHubSource(format!("Tarball entry error: {e}")))?;
+        let mut entry = entry.map_err(|e| DbdError::GitHubSource(format!("Tarball entry error: {e}")))?;
 
         let path = entry
             .path()
@@ -379,11 +372,7 @@ mod tests {
     /// appended the ordinary way — so a test can confirm the malicious
     /// entry is skipped while its neighbors still extract.
     #[cfg(feature = "deploy")]
-    fn build_malicious_tarball(
-        raw_entry_path: &str,
-        contents: &[u8],
-        benign_files: &[(&str, &[u8])],
-    ) -> Vec<u8> {
+    fn build_malicious_tarball(raw_entry_path: &str, contents: &[u8], benign_files: &[(&str, &[u8])]) -> Vec<u8> {
         let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
 
@@ -400,7 +389,9 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, format!("repo-main/{rel_path}"), *data).unwrap();
+            builder
+                .append_data(&mut header, format!("repo-main/{rel_path}"), *data)
+                .unwrap();
         }
 
         let enc = builder.into_inner().expect("write tarball to Vec");
@@ -415,10 +406,7 @@ mod tests {
         fn extract_tarball_strips_top_level_dir() {
             let tmp = TempDir::new().unwrap();
             let dest = tmp.path().join("dest");
-            let bytes = build_tarball(
-                "owner-repo-abc123",
-                &[("design.yaml", b"project:\n  name: test\n")],
-            );
+            let bytes = build_tarball("owner-repo-abc123", &[("design.yaml", b"project:\n  name: test\n")]);
 
             extract_tarball(&bytes, &dest).unwrap();
 

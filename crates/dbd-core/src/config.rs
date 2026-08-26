@@ -24,6 +24,8 @@ pub struct DesignConfig {
     #[serde(default)]
     pub import: ImportConfig,
     #[serde(default)]
+    pub apply: ApplyConfig,
+    #[serde(default)]
     pub export: Vec<ExportEntry>,
     #[serde(default)]
     pub materialized_views: MaterializedViewsConfig,
@@ -135,12 +137,17 @@ pub struct ProjectConfig {
 pub struct SourceConfig {
     #[serde(default = "default_dialect")]
     pub dialect: String,
+    /// Which DDL parser reads this project's files. `None` lets `dialect`
+    /// decide; set it only to override that choice.
+    #[serde(default)]
+    pub parser: Option<String>,
 }
 
 impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             dialect: default_dialect(),
+            parser: None,
         }
     }
 }
@@ -235,8 +242,7 @@ pub struct ExternalEntry {
 
 // ── Import ──────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ImportConfig {
     #[serde(default)]
     pub staging: Vec<String>,
@@ -245,7 +251,7 @@ pub struct ImportConfig {
     #[serde(default)]
     pub tables: Vec<ImportTableEntry>,
     #[serde(default)]
-    pub after: Vec<String>,
+    pub after: Vec<ScriptEntry>,
 }
 
 impl ImportConfig {
@@ -270,9 +276,7 @@ impl ImportConfig {
             .iter()
             .find(|t| t.name() == table_name)
             .and_then(|t| match t {
-                ImportTableEntry::WithOptions(map) => {
-                    map.values().next().and_then(|o| o.format.as_deref())
-                }
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.format.as_deref()),
                 ImportTableEntry::Name(_) => None,
             })
     }
@@ -285,9 +289,7 @@ impl ImportConfig {
             .iter()
             .find(|t| t.name() == table_name)
             .and_then(|t| match t {
-                ImportTableEntry::WithOptions(map) => {
-                    map.values().next().and_then(|o| o.null_value.as_deref())
-                }
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.null_value.as_deref()),
                 ImportTableEntry::Name(_) => None,
             })
             .unwrap_or(&self.options.null_value)
@@ -350,6 +352,50 @@ pub struct ImportTableOptions {
 pub enum EnvValue {
     Single(String),
     Multiple(Vec<String>),
+}
+
+// ── Lifecycle script hooks ──────────────────────────────
+
+/// A lifecycle hook script: a project-relative path, optionally with the tables
+/// it touches declared explicitly.
+///
+/// Mirrors [`ImportTableEntry`]'s bare-or-object shape. The object form is not
+/// an escape hatch for an exotic edge: measured against a real project's
+/// realtime-publication hook, a script naming its tables inside a `format()`
+/// string or an `array[…]` literal — never as a SQL identifier — is opaque to
+/// every accessor libpg_query offers. Scope filtering has nothing to derive
+/// unless the writes are told to it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptEntry {
+    Path(String),
+    WithWrites { script: String, writes: Vec<String> },
+}
+
+impl ScriptEntry {
+    pub fn script(&self) -> &str {
+        match self {
+            Self::Path(p) => p,
+            Self::WithWrites { script, .. } => script,
+        }
+    }
+
+    /// Explicitly declared tables, or `None` to derive them from the SQL.
+    pub fn declared_writes(&self) -> Option<&[String]> {
+        match self {
+            Self::Path(_) => None,
+            Self::WithWrites { writes, .. } => Some(writes),
+        }
+    }
+}
+
+/// Hooks around the DDL apply phase.
+#[derive(Debug, Default, Deserialize)]
+pub struct ApplyConfig {
+    #[serde(default)]
+    pub before: Vec<ScriptEntry>,
+    #[serde(default)]
+    pub after: Vec<ScriptEntry>,
 }
 
 // ── Export ───────────────────────────────────────────────
@@ -427,9 +473,7 @@ impl MaterializedViewsConfig {
             refresh: ov
                 .and_then(|o| o.refresh.clone())
                 .or_else(|| self.options.refresh.clone()),
-            concurrently: ov
-                .and_then(|o| o.concurrently)
-                .unwrap_or(self.options.concurrently),
+            concurrently: ov.and_then(|o| o.concurrently).unwrap_or(self.options.concurrently),
         }
     }
 }
@@ -571,9 +615,8 @@ pub fn normalize_env(value: Option<&str>) -> Result<String> {
 /// Read and parse a design.yaml file.
 pub fn read(path: &Path) -> Result<DesignConfig> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", path.display(), e)))?;
     let config: DesignConfig = serde_yaml::from_str(&content)?;
     Ok(config)
 }
@@ -581,9 +624,8 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
 /// Update the `project.version` field in a design.yaml file.
 pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
     value["project"]["version"] = serde_yaml::Value::Number(serde_yaml::Number::from(version));
     let output = serde_yaml::to_string(&value)?;
@@ -595,9 +637,8 @@ pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
 /// Set the `project.released` flag in a design.yaml file.
 pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
     value["project"]["released"] = serde_yaml::Value::Bool(released);
     let output = serde_yaml::to_string(&value)?;
@@ -645,6 +686,17 @@ mod tests {
     fn source_defaults_to_postgresql() {
         let config = read(&fixture("design.yaml")).unwrap();
         assert_eq!(config.source.dialect, "postgresql");
+    }
+
+    #[test]
+    fn source_parser_is_optional_and_parses() {
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
+        assert_eq!(cfg.source.parser, None);
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\nsource:\n  parser: pg_query\n").unwrap();
+        assert_eq!(cfg.source.parser.as_deref(), Some("pg_query"));
+        // SourceConfig carries both a manual Default impl and per-field serde
+        // defaults; pin that they cannot drift apart for the new field.
+        assert_eq!(cfg.source.dialect, "postgresql");
     }
 
     #[test]
@@ -704,7 +756,8 @@ mod tests {
         assert_eq!(config.import.tables.len(), 2);
         assert_eq!(config.import.tables[0].name(), "staging.lookups");
         assert_eq!(config.import.tables[1].name(), "staging.lookup_values");
-        assert_eq!(config.import.after, vec!["import/loader.sql"]);
+        assert_eq!(config.import.after.len(), 1);
+        assert_eq!(config.import.after[0].script(), "import/loader.sql");
     }
 
     #[test]
@@ -809,8 +862,7 @@ import:
     fn released_defaults_to_false_and_parses_true() {
         let config: DesignConfig = serde_yaml::from_str("project:\n  name: test\n").unwrap();
         assert!(!config.project.released, "released should default to false");
-        let config: DesignConfig =
-            serde_yaml::from_str("project:\n  name: test\n  released: true\n").unwrap();
+        let config: DesignConfig = serde_yaml::from_str("project:\n  name: test\n  released: true\n").unwrap();
         assert!(config.project.released);
     }
 
@@ -1053,5 +1105,56 @@ schemas:
         let yaml = "project:\n  name: t\nschemas:\n  - staging: {}\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.schema_grants().is_empty());
+    }
+
+    #[test]
+    fn a_bare_path_script_entry_parses() {
+        let cfg: DesignConfig =
+            serde_yaml::from_str("project:\n  name: t\nimport:\n  after:\n    - import/loader.sql\n").unwrap();
+        assert_eq!(cfg.import.after.len(), 1);
+        assert_eq!(cfg.import.after[0].script(), "import/loader.sql");
+        assert!(cfg.import.after[0].declared_writes().is_none());
+    }
+
+    #[test]
+    fn a_script_entry_with_explicit_writes_parses() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\nimport:\n  after:\n    - script: import/dyn.sql\n      writes: [app.target]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.import.after[0].script(), "import/dyn.sql");
+        assert_eq!(
+            cfg.import.after[0].declared_writes(),
+            Some(&vec!["app.target".to_string()][..])
+        );
+    }
+
+    /// The two forms must mix in one list — a project migrating to explicit
+    /// writes should not have to convert every entry at once.
+    #[test]
+    fn both_forms_mix_in_one_list() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\nimport:\n  after:\n    - a.sql\n    - script: b.sql\n      writes: [x.y]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.import.after.len(), 2);
+        assert!(cfg.import.after[0].declared_writes().is_none());
+        assert!(cfg.import.after[1].declared_writes().is_some());
+    }
+
+    #[test]
+    fn the_apply_block_parses_before_and_after() {
+        let cfg: DesignConfig =
+            serde_yaml::from_str("project:\n  name: t\napply:\n  before: [pre.sql]\n  after: [post.sql]\n").unwrap();
+        assert_eq!(cfg.apply.before.len(), 1);
+        assert_eq!(cfg.apply.after.len(), 1);
+    }
+
+    /// Every existing project omits `apply:` entirely.
+    #[test]
+    fn an_absent_apply_block_defaults_to_empty() {
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
+        assert!(cfg.apply.before.is_empty());
+        assert!(cfg.apply.after.is_empty());
     }
 }

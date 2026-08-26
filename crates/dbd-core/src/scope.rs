@@ -76,9 +76,7 @@ fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
             .iter()
             .filter(|e| is_scopable(e))
             .filter(|e| {
-                e.name.starts_with(prefix)
-                    && e.name.len() > prefix.len()
-                    && e.name.as_bytes()[prefix.len()] == b'.'
+                e.name.starts_with(prefix) && e.name.len() > prefix.len() && e.name.as_bytes()[prefix.len()] == b'.'
             })
             .map(|e| e.name.clone())
             .collect();
@@ -87,9 +85,7 @@ fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
             .iter()
             .any(|e| e.entity_type == EntityType::Schema && e.name == prefix);
         if names.is_empty() && !schema_exists {
-            return Err(DbdError::Config(format!(
-                "scope item '{item}' matches no known entity"
-            )));
+            return Err(DbdError::Config(format!("scope item '{item}' matches no known entity")));
         }
         return Ok(names);
     }
@@ -97,9 +93,7 @@ fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
     if item.contains('.') {
         let exists = all_entities.iter().any(|e| is_scopable(e) && e.name == item);
         if !exists {
-            return Err(DbdError::Config(format!(
-                "scope item '{item}' matches no known entity"
-            )));
+            return Err(DbdError::Config(format!("scope item '{item}' matches no known entity")));
         }
         Ok(HashSet::from([item.to_string()]))
     } else {
@@ -160,10 +154,7 @@ fn traverse(
         .filter(|e| is_scopable(e))
         .map(|e| e.name.as_str())
         .collect();
-    let refers: HashMap<&str, &Vec<String>> = all_entities
-        .iter()
-        .map(|e| (e.name.as_str(), &e.refers))
-        .collect();
+    let refers: HashMap<&str, &Vec<String>> = all_entities.iter().map(|e| (e.name.as_str(), &e.refers)).collect();
 
     let mut visited: HashSet<String> = resolved.entities.clone();
     let mut parent: HashMap<String, String> = HashMap::new();
@@ -278,11 +269,7 @@ pub fn resolve(
 
 /// Inspect engine: the full set of managed entities reachable from the scope
 /// but not in it. Each missing entity gets one path back to an in-scope root.
-pub fn analyze_gaps(
-    resolved: &ResolvedScope,
-    all_entities: &[Entity],
-    externals: &[String],
-) -> Vec<ScopeGap> {
+pub fn analyze_gaps(resolved: &ResolvedScope, all_entities: &[Entity], externals: &[String]) -> Vec<ScopeGap> {
     if resolved.is_all {
         return Vec::new();
     }
@@ -303,10 +290,7 @@ pub fn analyze_gaps(
             ScopeGap {
                 // Every missing node was reached via `parent` from an in-scope
                 // root, so the reversed chain always starts in-scope.
-                required_by: chain
-                    .first()
-                    .cloned()
-                    .expect("gap node always has an in-scope parent"),
+                required_by: chain.first().cloned().expect("gap node always has an in-scope parent"),
                 missing: missing.clone(),
                 chain,
             }
@@ -319,11 +303,7 @@ pub fn analyze_gaps(
 /// `deps: include` expansion: in-scope ∪ all transitively-referenced managed,
 /// non-external entities. Errors if the closure pulls in an explicitly-excluded
 /// entity.
-pub fn closure(
-    resolved: &ResolvedScope,
-    all_entities: &[Entity],
-    externals: &[String],
-) -> Result<HashSet<String>> {
+pub fn closure(resolved: &ResolvedScope, all_entities: &[Entity], externals: &[String]) -> Result<HashSet<String>> {
     if resolved.is_all {
         return Ok(resolved.entities.clone());
     }
@@ -604,10 +584,7 @@ mod tests {
 
     #[test]
     fn gaps_self_reference_is_not_a_gap() {
-        let world = vec![
-            Entity::schema("s"),
-            ent(EntityType::Table, "s.tree", &["s.tree"]),
-        ];
+        let world = vec![Entity::schema("s"), ent(EntityType::Table, "s.tree", &["s.tree"])];
         let scopes = scopes_yaml("hub:\n  includes: [s.tree]\n");
         let s = resolve(&scopes, Some("hub"), None, &world, &[]).unwrap();
         assert!(analyze_gaps(&s, &world, &[]).is_empty());
@@ -639,9 +616,7 @@ mod tests {
     #[test]
     fn closure_exclude_conflict_errors() {
         // include the child but explicitly exclude the parent it needs.
-        let scopes = scopes_yaml(
-            "hub:\n  includes: [config.lookup_values]\n  excludes: [config.lookups]\n",
-        );
+        let scopes = scopes_yaml("hub:\n  includes: [config.lookup_values]\n  excludes: [config.lookups]\n");
         let s = resolve(&scopes, Some("hub"), None, &world(), &[]).unwrap();
         let err = closure(&s, &world(), &[]).unwrap_err();
         assert!(err.to_string().contains("excludes 'config.lookups'"));

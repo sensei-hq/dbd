@@ -17,7 +17,7 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 
 # SQL Parsing
-sqlparser = { version = "0.61", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 pg_query = "6"
 
 # File system & parallelism

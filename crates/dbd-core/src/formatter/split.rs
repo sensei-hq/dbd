@@ -105,7 +105,12 @@ pub(in crate::formatter) enum Token<'a> {
 /// Consume the next token starting at byte offset `i`. `in_dollar_quote` makes
 /// everything except a closing `$$` opaque (a char at a time), matching
 /// PostgreSQL dollar-quoting. Slices preserve multi-byte UTF-8.
-pub(in crate::formatter) fn next_token<'a>(input: &'a str, bytes: &[u8], i: usize, in_dollar_quote: bool) -> (Token<'a>, usize) {
+pub(in crate::formatter) fn next_token<'a>(
+    input: &'a str,
+    bytes: &[u8],
+    i: usize,
+    in_dollar_quote: bool,
+) -> (Token<'a>, usize) {
     let c = bytes[i] as char;
     // `$$` always toggles the dollar-quoted region (even inside one).
     if c == '$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {

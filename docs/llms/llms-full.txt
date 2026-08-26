@@ -134,6 +134,14 @@ external:
     columns:
       - id: uuid
 
+apply:                          # lifecycle hooks around the DDL phase
+  before:
+    - sql/pre_ddl.sql           # after design+scope checks, before the first entity
+  after:
+    - sql/realtime.sql          # after every entity + matview stamp, BEFORE policies/
+    - script: sql/grants.sql    # declare tables dbd cannot derive by parsing
+      writes: [app.messages]
+
 import:
   staging: [staging]
   options:
@@ -145,7 +153,7 @@ import:
     - staging.lookup_values:
         truncate: false
   after:
-    - import/loader.sql
+    - import/loader.sql         # runs on `deploy` only — NOT on `dbd apply`
 
 export:
   - config.lookups
@@ -251,6 +259,14 @@ dbd deploy --scope hub --database $HUB_URL
 - Per-scope migrations fall out automatically: pending-migration steps for
   out-of-scope entities are skipped while the per-database version still advances.
 
+`snapshot`, `release` and `migrate` deliberately ignore `--scope` and warn when
+given it. A snapshot records the *design*, not one database: a scoped baseline
+would omit entities, and every later `dbd snapshot` would diff against an
+incomplete record and emit a spurious `CREATE` for them on every plane. Scope
+decides which migration steps *run*, not which ones exist — `dbd deploy --scope
+daemon` on a released project applies only the in-scope migrations while the
+database's version still advances.
+
 Scopes are honored by every entity-selecting command. The write commands
 (`inspect`, `apply`, `import`, `deploy`) gate on dependency gaps. The
 documentation/read/destructive commands (`dbml`, `combine`, `graph`, `export`,
@@ -262,6 +278,55 @@ restricts the dropped schemas to those the scope occupies, roles dropped only on
 full reset). The shared primitive is
 `Design::scoped_entities(&ResolvedScope) -> Result<Vec<Entity>>` (closure under `include`,
 plain set under `report`, everything for the all-scope).
+
+Policies are scope-filtered too: a file's target is read from its path
+(`policies/<schema>/<table>.sql`), and a policy whose table is outside the
+working set is skipped and reported rather than run. A file off that layout has
+no derivable target and always applies.
+
+### Lifecycle hooks (`apply.before` / `apply.after` / `import.after`)
+
+SQL dbd does not model — attaching a table to a publication (Supabase realtime),
+`grant`s, other post-DDL setup.
+
+| Hook | Runs on | Position |
+|---|---|---|
+| `apply.before` | `apply` **and** `deploy` | after design+scope checks, before the first entity |
+| `apply.after` | `apply` **and** `deploy` | after every entity applied + matview stamped, **before** `policies/` |
+| `import.after` | `deploy` **only** | after the data load |
+
+**`import.after` never runs on `dbd apply`.** Only the deploy path reaches the
+import phase. Post-DDL SQL parked there — often because it was once the only
+hook available — silently does nothing on `dbd apply`. If the hook's job is
+"run once every entity exists", it belongs in `apply.after`.
+
+`apply.after` runs before `policies/` because publications and grants attach to
+objects that must already exist, while RLS policies are independent of them. A
+hook that needs a policy to exist will not find one.
+
+**Entry format.** A project-relative path, or `{script: <path>, writes: [tables]}`.
+Scripts run in list order. A path dbd cannot find is an **error, not a skip**.
+`..` and absolute paths are refused.
+
+**Scope filtering.** A hook runs only when every table it depends on is in the
+working set — the same rule as staging entries. Otherwise it is skipped and
+reported, and the run continues:
+
+```
+⚠ after-script import/loader.sql skipped — needs staging.values, which is outside scope 'partial'
+```
+
+**When `writes:` is required.** dbd derives a script's tables by parsing it,
+which works only when they appear as SQL identifiers. A realtime-publication
+hook names its tables as *data* — inside `array['a','b']` and
+`format('alter publication … %I', t)` — where `select_tables()`/`dml_tables()`
+return empty. No parser can recover those; declare them with `writes:`.
+
+A script with no derivable dependencies and no `writes:` **always runs**. That
+is the safe direction (silently skipping a hook because analysis came up short
+would hide, say, a realtime hook quietly not firing), but it means scope
+filtering is a correctness aid, **not a security boundary** — never use a scope
+to prevent a hook from running.
 
 ---
 
@@ -399,6 +464,32 @@ On a Postgres/Supabase project, `inspect` also prints an advisory **`Suggestions
 `CHECK` constraints that pin a column to a fixed set of string literals (`col IN ('a','b')`,
 `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — better modeled as a Postgres `enum`. Advisory
 only: never an error, never affects the exit code.
+
+**Exit code (changed in v0.12.0).** `inspect` exits **1** when the design carries
+a blocking error, 0 otherwise. It previously always exited 0, so a CI step
+running `dbd inspect` passed green on a file `dbd apply` refuses — while apply's
+own error said "run `dbd inspect` for the full report". Warnings and suggestions
+never affect the exit code.
+
+**Parse errors name their consequence.** A file dbd cannot parse is dropped from
+the desired set, so a run would build a database missing that object;
+`apply`/`reconcile`/`deploy` refuse instead. The report says so:
+
+```
+Errors:
+
+./ddl/table/app/broken.ddl =>
+  Parse error: Invalid statement: syntax error at or near ","
+
+  → dbd apply / reconcile / deploy will refuse to run until these are fixed.
+```
+
+**Errors under `--scope`.** Only errors in the scope's working set block it, and
+`inspect --scope` splits its report by the same rule the run uses — so `inspect`
+and `apply` never disagree about what is broken. Out-of-scope errors are listed
+under `Out of scope — not blocking '<scope>'` and do not affect the exit code,
+but they are never suppressed: a file no scope builds is how a broken file
+survives unnoticed. The summary's entity count is scope-aware.
 
 ### dbd apply
 
@@ -602,6 +693,7 @@ executed by `dbd apply` (it runs DDL + pending migrations together).
 ```sh
 dbd policies                # apply policies/<schema>/<table>.sql (RLS)
 dbd policies --dry-run
+dbd policies --scope hub    # only policies whose table is in the scope
 dbd apply --with-policies   # apply entities + policies in one step
 ```
 
@@ -612,6 +704,25 @@ skipped (fail-forward); exit code 1 if any failed.
 `dbd deploy` (and `Design::deploy`) runs this phase unconditionally as its final
 step. There, a failed policy file is a warning rather than an error: it is
 reported and counted, and the deploy still exits 0.
+
+**Scope.** A policy protects one table, and its target is read from the path —
+`policies/<schema>/<table>.sql` names `<schema>.<table>`. Under `--scope`, a
+policy whose table is outside the working set is skipped, with the file, target
+and scope named, and counted in the deploy summary:
+
+```
+Skipped ./policies/dojo/repository_metrics.sql — dojo.repository_metrics is outside scope 'daemon'
+```
+
+This matters when one design serves several planes: without it, a policy for a
+schema a plane lacks runs anyway and reports `FAILED … schema dojo does not
+exist` on every deploy — an expected condition dressed as an error, which is how
+real failures stop being read. Runs without `--scope` apply every file, and
+`--dry-run` filters before previewing so the preview matches the run.
+
+A file off the `policies/<schema>/<table>.sql` layout has no derivable target and
+always applies — scope filtering here is a correctness aid, not a security
+boundary.
 
 ### dbd combine
 
@@ -630,6 +741,12 @@ dbd graph
 dbd graph -n config.lookups             # subgraph from one entity
 dbd graph --scope hub                    # filter to the 'hub' scope (composes with -n)
 ```
+
+Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`.
+`scope` (v0.12.0+) names the scope the graph was narrowed to, `null` when
+unscoped — in the JSON rather than beside it, since stdout is a contract here.
+The other scope-filtering commands (`dbml`, `combine`, `export`) print
+`scope '<name>': <kept> of <total> entities`; unscoped runs print nothing.
 
 ### dbd diagram
 
@@ -718,7 +835,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.12
+  rev: v0.12.0
   hooks:
     - id: dbd-format
 ```
@@ -814,9 +931,10 @@ let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // Inspection — offline, no database. (`report` takes &mut self: it caches validation.)
 let report = design.report(None, None);
-// report.issues:   entities with errors
-// report.warnings: entities with warnings
-// report.gaps:     out-of-scope dependency gaps (when a scope is passed)
+// report.issues:              errors blocking the active scope (what apply refuses on)
+// report.out_of_scope_issues: errored entities the scope excludes (non-blocking)
+// report.warnings:            entities with warnings
+// report.gaps:                out-of-scope dependency gaps (when a scope is passed)
 
 // Connect an adapter — Postgres/SQLite/Convex is chosen from the URL scheme.
 let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;

@@ -96,9 +96,10 @@ pub fn detect_old_format(content: &str) -> Vec<String> {
     // Check for camelCase keys
     if let Some(import) = doc.get("import")
         && let Some(options) = import.get("options")
-            && options.get("nullValue").is_some() {
-                issues.push("import.options.nullValue → rename to null_value".to_string());
-            }
+        && options.get("nullValue").is_some()
+    {
+        issues.push("import.options.nullValue → rename to null_value".to_string());
+    }
 
     issues
 }
@@ -107,8 +108,8 @@ pub fn detect_old_format(content: &str) -> Vec<String> {
 ///
 /// Returns the migrated YAML content as a string.
 pub fn migrate_config(content: &str) -> Result<String> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(content)
-        .map_err(|e| DbdError::Config(format!("Failed to parse YAML: {e}")))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| DbdError::Config(format!("Failed to parse YAML: {e}")))?;
 
     let mut new_doc = serde_yaml::Mapping::new();
 
@@ -396,8 +397,7 @@ pub struct DdlTypeMismatch {
 pub fn detect_ddl_type_mismatches(project_dir: &Path) -> Vec<DdlTypeMismatch> {
     let ddl = project_dir.join("ddl");
     // Materialized-view syntax contains "VIEW", so test it first.
-    let matview_re =
-        regex::Regex::new(r"(?is)\bcreate\s+(?:or\s+replace\s+)?materialized\s+view\b").unwrap();
+    let matview_re = regex::Regex::new(r"(?is)\bcreate\s+(?:or\s+replace\s+)?materialized\s+view\b").unwrap();
     let view_re = regex::Regex::new(r"(?is)\bcreate\s+(?:or\s+replace\s+)?view\b").unwrap();
 
     let mut out = Vec::new();
@@ -852,7 +852,9 @@ schemas:
         assert_eq!(found[0].folder, "view");
         assert_eq!(found[0].declared, "materialized_view");
         assert!(
-            found[0].suggested_path.ends_with("ddl/materialized_view/analytics/model_mix_daily.ddl"),
+            found[0]
+                .suggested_path
+                .ends_with("ddl/materialized_view/analytics/model_mix_daily.ddl"),
             "got: {}",
             found[0].suggested_path.display()
         );

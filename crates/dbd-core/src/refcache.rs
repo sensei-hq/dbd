@@ -56,10 +56,10 @@ impl RefCache {
             return Ok(None);
         }
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| DbdError::Config(format!("Read refcache failed: {e}")))?;
-        let cache: Self = serde_json::from_str(&content)
-            .map_err(|e| DbdError::Config(format!("Parse refcache failed: {e}")))?;
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| DbdError::Config(format!("Read refcache failed: {e}")))?;
+        let cache: Self =
+            serde_json::from_str(&content).map_err(|e| DbdError::Config(format!("Parse refcache failed: {e}")))?;
         Ok(Some(cache))
     }
 
@@ -75,8 +75,7 @@ impl RefCache {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| DbdError::Config(format!("Serialize refcache failed: {e}")))?;
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        std::fs::write(&path, json)
-            .map_err(|e| DbdError::Config(format!("Write refcache failed: {e}")))?;
+        std::fs::write(&path, json).map_err(|e| DbdError::Config(format!("Write refcache failed: {e}")))?;
         Ok(())
     }
 

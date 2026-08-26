@@ -110,8 +110,7 @@ fn todos_in_migration_dir(version: u32, dir: &Path) -> Result<Vec<DataSqlTodo>> 
 
     let mut result = Vec::new();
     for entry in walkdir::WalkDir::new(dir) {
-        let entry =
-            entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", dir.display())))?;
+        let entry = entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", dir.display())))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -162,10 +161,7 @@ pub fn scan_data_sql_todos(project_dir: &Path) -> Result<Vec<DataSqlTodo>> {
 
     for entry in entries {
         let dir_name = entry.file_name();
-        let version: u32 = dir_name
-            .to_string_lossy()
-            .parse()
-            .unwrap_or(0);
+        let version: u32 = dir_name.to_string_lossy().parse().unwrap_or(0);
         let mut found = todos_in_migration_dir(version, &entry.path())?;
         found.sort_by(|a, b| a.file.cmp(&b.file));
         result.extend(found);
@@ -251,9 +247,7 @@ pub struct SnapshotInfo {
 
 /// Read a specific snapshot from disk.
 pub fn read_snapshot(version: u32, dir: &Path) -> Result<Option<Snapshot>> {
-    let file = dir
-        .join(SNAPSHOTS_DIR)
-        .join(format!("{}.json", pad_version(version)));
+    let file = dir.join(SNAPSHOTS_DIR).join(format!("{}.json", pad_version(version)));
     if !file.exists() {
         return Ok(None);
     }
@@ -820,7 +814,9 @@ impl StageBuilder {
                             table_name, new_name, col_def.data_type
                         )
                     }
-                    ComplexChange::ColumnTypeChange { new_col, column_name, .. } => {
+                    ComplexChange::ColumnTypeChange {
+                        new_col, column_name, ..
+                    } => {
                         format!(
                             "ALTER TABLE {} ADD COLUMN {}_new {};",
                             table_name, column_name, new_col.data_type
@@ -830,11 +826,7 @@ impl StageBuilder {
                 };
 
                 // Append or create migration file for this table
-                push_or_append_sql(
-                    &mut self.files,
-                    entity_migration_path(table_name),
-                    add_col_sql,
-                );
+                push_or_append_sql(&mut self.files, entity_migration_path(table_name), add_col_sql);
 
                 // Generate data.sql
                 let data_sql = diff::generate_data_sql(change);
@@ -871,10 +863,7 @@ impl StageBuilder {
 
                 todos.push(TodoItem {
                     file: data_path,
-                    message: format!(
-                        "Review data migration SQL for enum value removal in {}",
-                        enum_name
-                    ),
+                    message: format!("Review data migration SQL for enum value removal in {}", enum_name),
                 });
             }
         }
@@ -884,9 +873,7 @@ impl StageBuilder {
     fn apply_complex_stage2(&mut self, change: &ComplexChange) {
         match change {
             ComplexChange::ColumnRename {
-                table_name,
-                old_name,
-                ..
+                table_name, old_name, ..
             } => {
                 // Drop old column from snapshot
                 if let Some(snap_t) = self
@@ -950,8 +937,7 @@ impl StageBuilder {
                         col.data_type = "TEXT".to_string();
                     }
 
-                    let sql =
-                        format!("ALTER TABLE {} ALTER COLUMN {} TYPE TEXT;", table_name, col_name);
+                    let sql = format!("ALTER TABLE {} ALTER COLUMN {} TYPE TEXT;", table_name, col_name);
                     push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
 
                     self.mark_altered(table_name);
@@ -1165,10 +1151,7 @@ fn write_migration_files(project_dir: &Path, snap_result: &SnapshotResult, versi
     };
     let migration_dir = project_dir.join(MIGRATIONS_DIR).join(pad_version(version));
     std::fs::create_dir_all(&migration_dir)?;
-    std::fs::write(
-        migration_dir.join("graph.json"),
-        serde_json::to_string_pretty(graph)?,
-    )?;
+    std::fs::write(migration_dir.join("graph.json"), serde_json::to_string_pretty(graph)?)?;
     for file in &snap_result.migration_files {
         let full_path = migration_dir.join(&file.relative_path);
         if let Some(parent) = full_path.parent() {
@@ -1240,11 +1223,7 @@ mod tests {
             tables: vec![],
             enums: vec![],
         };
-        fs::write(
-            dir.join("001.json"),
-            serde_json::to_string_pretty(&snap1).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("001.json"), serde_json::to_string_pretty(&snap1).unwrap()).unwrap();
 
         let snap2 = Snapshot {
             version: 2,
@@ -1253,11 +1232,7 @@ mod tests {
             tables: vec![],
             enums: vec![],
         };
-        fs::write(
-            dir.join("002.json"),
-            serde_json::to_string_pretty(&snap2).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("002.json"), serde_json::to_string_pretty(&snap2).unwrap()).unwrap();
     }
 
     fn create_migration_dir(tmp: &TempDir) {
@@ -1271,11 +1246,7 @@ mod tests {
             altered: vec!["config.lookup_values".to_string()],
             dropped: vec![],
         };
-        fs::write(
-            dir.join("graph.json"),
-            serde_json::to_string_pretty(&graph).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("graph.json"), serde_json::to_string_pretty(&graph).unwrap()).unwrap();
     }
 
     #[test]
@@ -1382,7 +1353,7 @@ mod tests {
 
     // ── Helpers for entity-based tests ─────────────────────
 
-    use crate::entity::{Entity, EntityType, EnumValue, TableDef, TableComments};
+    use crate::entity::{Entity, EntityType, EnumValue, TableComments, TableDef};
 
     fn col(name: &str, data_type: &str) -> ColumnDef {
         ColumnDef {
@@ -1462,9 +1433,10 @@ mod tests {
         };
 
         // New entities: same table with an added column
-        let entities = vec![
-            make_table_entity("config.users", vec![col("id", "int"), col("email", "text")]),
-        ];
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "int"), col("email", "text")],
+        )];
 
         let result = prepare_snapshot(&entities, Some(&prev), 2, "add email");
         assert!(!result.is_baseline);
@@ -1495,9 +1467,7 @@ mod tests {
             enums: vec![],
         };
 
-        let entities = vec![
-            make_table_entity("config.users", vec![col("id", "int")]),
-        ];
+        let entities = vec![make_table_entity("config.users", vec![col("id", "int")])];
 
         let result = prepare_snapshot(&entities, Some(&prev), 2, "no changes");
         assert!(result.no_changes);
@@ -1534,9 +1504,10 @@ mod tests {
         assert!(graph.added.contains(&"config.orders".to_string()));
         // Added tables don't generate migration SQL files
         assert!(
-            result.migration_files.iter().all(|f| {
-                !f.relative_path.to_string_lossy().contains("orders")
-            }),
+            result
+                .migration_files
+                .iter()
+                .all(|f| { !f.relative_path.to_string_lossy().contains("orders") }),
             "added tables should not produce migration SQL files"
         );
     }
@@ -1569,17 +1540,16 @@ mod tests {
         };
 
         // Only users remains
-        let entities = vec![
-            make_table_entity("config.users", vec![col("id", "int")]),
-        ];
+        let entities = vec![make_table_entity("config.users", vec![col("id", "int")])];
 
         let result = prepare_snapshot(&entities, Some(&prev), 2, "drop legacy");
         let graph = result.graph.as_ref().unwrap();
         assert!(graph.dropped.contains(&"config.legacy".to_string()));
         // Should have a migration file with DROP TABLE
-        let drop_file = result.migration_files.iter().find(|f| {
-            f.relative_path.to_string_lossy().contains("legacy")
-        });
+        let drop_file = result
+            .migration_files
+            .iter()
+            .find(|f| f.relative_path.to_string_lossy().contains("legacy"));
         assert!(drop_file.is_some(), "dropped table should have migration SQL");
         assert!(drop_file.unwrap().content.contains("DROP TABLE"));
     }
@@ -1589,14 +1559,21 @@ mod tests {
     #[test]
     fn sc7_entity_to_table_snapshot_includes_all_fields() {
         let mut entity = make_table_entity("config.users", vec![col("id", "int")]);
-        entity.table_def.as_mut().unwrap().constraints.push(
-            crate::entity::TableConstraint::PrimaryKey {
+        entity
+            .table_def
+            .as_mut()
+            .unwrap()
+            .constraints
+            .push(crate::entity::TableConstraint::PrimaryKey {
                 name: Some("pk_users".to_string()),
                 columns: vec!["id".to_string()],
-            },
-        );
-        entity.table_def.as_mut().unwrap().indexes.push(
-            crate::entity::IndexDef {
+            });
+        entity
+            .table_def
+            .as_mut()
+            .unwrap()
+            .indexes
+            .push(crate::entity::IndexDef {
                 name: Some("idx_id".to_string()),
                 columns: vec![crate::entity::IndexColumn {
                     name: "id".to_string(),
@@ -1606,8 +1583,7 @@ mod tests {
                 unique: false,
                 index_type: None,
                 ..Default::default()
-            },
-        );
+            });
 
         let snap = entity_to_table_snapshot(&entity).unwrap();
         assert_eq!(snap.name, "users");
@@ -1689,8 +1665,7 @@ mod tests {
             }],
             "enums": []
         }"#;
-        let snap: Snapshot = serde_json::from_str(json)
-            .expect("legacy snapshot with is_identity should deserialize");
+        let snap: Snapshot = serde_json::from_str(json).expect("legacy snapshot with is_identity should deserialize");
         assert_eq!(snap.tables[0].columns[0].identity, None);
     }
 
@@ -1702,9 +1677,7 @@ mod tests {
         let config_path = tmp.path().join("design.yaml");
         fs::write(&config_path, "project:\n  name: test\ntarget: {}\n").unwrap();
 
-        let entities = vec![
-            make_table_entity("config.users", vec![col("id", "BIGINT")]),
-        ];
+        let entities = vec![make_table_entity("config.users", vec![col("id", "BIGINT")])];
 
         // First snapshot — baseline
         let result = create_snapshot(&entities, tmp.path(), &config_path, "initial").unwrap();
@@ -1716,9 +1689,10 @@ mod tests {
         assert!(config_content.contains("1"));
 
         // Second snapshot with changes
-        let entities_v2 = vec![
-            make_table_entity("config.users", vec![col("id", "BIGINT"), col("email", "TEXT")]),
-        ];
+        let entities_v2 = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "BIGINT"), col("email", "TEXT")],
+        )];
         let result2 = create_snapshot(&entities_v2, tmp.path(), &config_path, "add email").unwrap();
         assert!(!result2.snapshots[0].no_changes);
         assert!(tmp.path().join("snapshots/002.json").exists());
@@ -1733,8 +1707,7 @@ mod tests {
 
         let entities = vec![make_table_entity("config.users", vec![col("id", "BIGINT")])];
 
-        let result =
-            create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 1).unwrap();
+        let result = create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 1).unwrap();
 
         assert_eq!(result.snapshots.len(), 1);
         assert!(result.snapshots[0].is_baseline);
@@ -1757,8 +1730,7 @@ mod tests {
 
         let entities = vec![make_table_entity("config.users", vec![col("id", "BIGINT")])];
 
-        let result =
-            create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 3).unwrap();
+        let result = create_baseline_snapshot(&entities, tmp.path(), &config_path, "init from db", 3).unwrap();
 
         assert_eq!(result.snapshots.len(), 1);
         assert!(result.snapshots[0].is_baseline);
@@ -1933,11 +1905,22 @@ mod tests {
     #[test]
     fn b1_simple_only_one_snapshot() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
-            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT")], indexes: vec![], table_constraints: vec![] }],
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
             enums: vec![],
         };
-        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("email", "TEXT")])];
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "INT"), col("email", "TEXT")],
+        )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "add email");
         assert_eq!(result.snapshots.len(), 1, "simple change should produce 1 snapshot");
         assert!(result.todos.is_empty());
@@ -1946,33 +1929,71 @@ mod tests {
     #[test]
     fn b2_column_rename_two_snapshots() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
-            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT"), col("name", "TEXT")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
             enums: vec![],
         };
-        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "INT"), col("display_name", "TEXT")],
+        )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
         assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
         // Stage 1 should have data.sql file
-        assert!(result.snapshots[0].migration_files.iter().any(|f|
-            f.relative_path.to_string_lossy().contains("data.sql")
-        ), "stage 1 should have data.sql for copy");
+        assert!(
+            result.snapshots[0]
+                .migration_files
+                .iter()
+                .any(|f| f.relative_path.to_string_lossy().contains("data.sql")),
+            "stage 1 should have data.sql for copy"
+        );
     }
 
     #[test]
     fn b3_enum_removal_three_snapshots() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
-                name: "events".to_string(), schema: "config".to_string(),
-                columns: vec![col("id", "INT"), ColumnDef { data_type: "public.status_type".to_string(), ..col("status", "public.status_type") }],
-                indexes: vec![], table_constraints: vec![],
+                name: "events".to_string(),
+                schema: "config".to_string(),
+                columns: vec![
+                    col("id", "INT"),
+                    ColumnDef {
+                        data_type: "public.status_type".to_string(),
+                        ..col("status", "public.status_type")
+                    },
+                ],
+                indexes: vec![],
+                table_constraints: vec![],
             }],
             // Use short name to match entity_to_enum_snapshot output
-            enums: vec![EnumSnapshot { name: "status_type".to_string(), schema: "public".to_string(), values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()] }],
+            enums: vec![EnumSnapshot {
+                name: "status_type".to_string(),
+                schema: "public".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string(), "deleted".to_string()],
+            }],
         };
         let entities = vec![
-            make_table_entity("config.events", vec![col("id", "INT"), ColumnDef { data_type: "public.status_type".to_string(), ..col("status", "public.status_type") }]),
+            make_table_entity(
+                "config.events",
+                vec![
+                    col("id", "INT"),
+                    ColumnDef {
+                        data_type: "public.status_type".to_string(),
+                        ..col("status", "public.status_type")
+                    },
+                ],
+            ),
             make_enum_entity("public.status_type", vec!["active", "inactive"]),
         ];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "remove deleted");
@@ -1983,16 +2004,31 @@ mod tests {
     #[test]
     fn s1_stage1_adds_new_column_for_rename() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
-            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT"), col("name", "TEXT")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
             enums: vec![],
         };
-        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "INT"), col("display_name", "TEXT")],
+        )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
         assert!(result.snapshots.len() >= 2);
         // Stage 1 should have 3 columns: id, name, display_name
-        let stage1_table = result.snapshots[0].snapshot.tables.iter()
-            .find(|t| t.name == "users").expect("should have users table");
+        let stage1_table = result.snapshots[0]
+            .snapshot
+            .tables
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("should have users table");
         let col_names: Vec<&str> = stage1_table.columns.iter().map(|c| c.name.as_str()).collect();
         assert!(col_names.contains(&"id"), "should have id");
         assert!(col_names.contains(&"name"), "should still have old name");
@@ -2002,16 +2038,31 @@ mod tests {
     #[test]
     fn s2_stage2_drops_old_column_for_rename() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
-            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT"), col("name", "TEXT")], indexes: vec![], table_constraints: vec![] }],
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT"), col("name", "TEXT")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
             enums: vec![],
         };
-        let entities = vec![make_table_entity("config.users", vec![col("id", "INT"), col("display_name", "TEXT")])];
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "INT"), col("display_name", "TEXT")],
+        )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
         assert!(result.snapshots.len() >= 2);
         // Stage 2 should have 2 columns: id, display_name (no "name")
-        let stage2_table = result.snapshots[1].snapshot.tables.iter()
-            .find(|t| t.name == "users").expect("should have users table");
+        let stage2_table = result.snapshots[1]
+            .snapshot
+            .tables
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("should have users table");
         let col_names: Vec<&str> = stage2_table.columns.iter().map(|c| c.name.as_str()).collect();
         assert!(col_names.contains(&"id"));
         assert!(col_names.contains(&"display_name"));
@@ -2029,8 +2080,16 @@ mod tests {
     #[test]
     fn b_no_changes_returns_one_snapshot() {
         let prev = Snapshot {
-            version: 1, description: "v1".to_string(), timestamp: "t".to_string(),
-            tables: vec![TableSnapshot { name: "users".to_string(), schema: "config".to_string(), columns: vec![col("id", "INT")], indexes: vec![], table_constraints: vec![] }],
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
             enums: vec![],
         };
         let entities = vec![make_table_entity("config.users", vec![col("id", "INT")])];
@@ -2105,17 +2164,15 @@ mod tests {
         // v3 dir — pending, has TODO
         make_data_sql(&tmp, 3, "-- TODO: must fix before v3\n");
 
-        let pending = vec![
-            PendingMigration {
-                from_version: 2,
-                to_version: 3,
-                migration_dir: tmp.path().join("migrations/003"),
-                added: vec![],
-                altered: vec!["config.users".to_string()],
-                dropped: vec![],
-                checksum: "abc".to_string(),
-            },
-        ];
+        let pending = vec![PendingMigration {
+            from_version: 2,
+            to_version: 3,
+            migration_dir: tmp.path().join("migrations/003"),
+            added: vec![],
+            altered: vec!["config.users".to_string()],
+            dropped: vec![],
+            checksum: "abc".to_string(),
+        }];
 
         let todos = pending_data_sql_todos(&pending).unwrap();
         assert_eq!(todos.len(), 1, "only v3 is pending");

@@ -1,12 +1,44 @@
 mod extractors;
+pub(crate) mod pg;
 mod tables;
 
 use std::path::Path;
 
 use crate::entity::{Entity, EntityType, REF_TYPE_FUNCTION, Reference};
-use crate::error::Result;
+use crate::error::{DbdError, Result};
 
 pub use extractors::extract_search_paths;
+
+/// Which parser reads a project's DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserChoice {
+    /// sqlparser-rs — multi-dialect, the historical default.
+    Sqlparser,
+    /// libpg_query — PostgreSQL's own grammar, vendored from the server.
+    PgQuery,
+}
+
+impl ParserChoice {
+    /// `explicit` (`source.parser`) wins when set; otherwise the dialect decides.
+    ///
+    /// An unrecognised value is an error rather than a silent fallback: quietly
+    /// ignoring a typo would leave the project on a parser its author did not
+    /// choose, which is exactly the class of invisible behaviour this migration
+    /// exists to remove.
+    pub fn resolve(dialect: &str, explicit: Option<&str>) -> Result<Self> {
+        match explicit {
+            Some("pg_query") => Ok(Self::PgQuery),
+            Some("sqlparser") => Ok(Self::Sqlparser),
+            Some(other) => Err(DbdError::Config(format!(
+                "unknown source.parser {other:?} — expected \"pg_query\" or \"sqlparser\""
+            ))),
+            None => Ok(match dialect {
+                "postgresql" | "postgres" | "supabase" => Self::PgQuery,
+                _ => Self::Sqlparser,
+            }),
+        }
+    }
+}
 
 // Parse a DDL file and produce an Entity with extracted metadata.
 //
@@ -19,7 +51,7 @@ pub use extractors::extract_search_paths;
 // - Enum values
 // ── sqlparser workarounds ────────────────────────────────────────────
 //
-// WORKAROUND_REGISTRY: sqlparser-rs 0.61 (Apache DataFusion)
+// WORKAROUND_REGISTRY: sqlparser-rs 0.62 (Apache DataFusion)
 //
 // The workarounds below patch SQL text before feeding it to sqlparser.
 // Each is annotated with the limitation it addresses and what to check
@@ -68,9 +100,7 @@ fn preprocess_sql(sql: &str) -> String {
     // Check:      Parser::parse_sql("CREATE PROCEDURE foo() LANGUAGE plpgsql AS $$ BEGIN END; $$")
     // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
     {
-        let re = regex::Regex::new(
-            r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b"
-        ).unwrap();
+        let re = regex::Regex::new(r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b").unwrap();
         if re.is_match(&result) {
             result = std::borrow::Cow::Owned(re.replace_all(&result, "${1}FUNCTION").to_string());
         }
@@ -99,42 +129,6 @@ fn preprocess_sql(sql: &str) -> String {
     result.into_owned()
 }
 
-/// Scan role DDL for `GRANT <parent> TO <member>` membership lines.
-///
-/// sqlparser cannot handle `DO $$ … $$` blocks or `GRANT role TO role`, so we
-/// use a simple, non-backtracking regex on the raw SQL instead.
-///
-/// The pattern matches role-membership grants (identifiers only, no privilege
-/// keywords like `SELECT`). The `… ON …` form (object grants such as
-/// `GRANT SELECT ON TABLE … TO …`) will not match because an `ON` clause
-/// appears between the privilege list and the target — the regex requires the
-/// `TO` to follow immediately after the identifier, so object grants are
-/// correctly excluded.
-///
-/// Captured group 1 (the granted/parent role) is recorded as a `Reference`.
-/// Duplicates are deduplicated while preserving first-seen order.
-fn extract_role_memberships(sql: &str, entity: &mut Entity) {
-    let re = regex::Regex::new(
-        r#"(?i)\bGRANT\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?\s+TO\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?"#,
-    )
-    .expect("role membership regex is valid");
-    let mut seen = std::collections::HashSet::new();
-    for cap in re.captures_iter(sql) {
-        let granted = cap[1].to_string();
-        if seen.insert(granted.clone()) {
-            entity.references.push(Reference {
-                name: granted,
-                ref_type: None,
-            });
-        }
-    }
-    entity.refers = entity
-        .references
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
-}
-
 /// Store a routine's extracted dependencies on the entity.
 ///
 /// `reads`/`writes` stay table sets — import planning and scope analysis read
@@ -160,14 +154,64 @@ fn apply_proc_refs(entity: &mut Entity, refs: extractors::ProcRefs) {
     entity.writes = refs.writes;
 }
 
+/// Reads a DDL file into an [`Entity`].
+///
+/// A second implementation is built beside it rather than replacing it in one step.
+pub(crate) trait DdlParser {
+    fn parse(&self, file: &Path, sql: &str) -> Result<Entity>;
+}
+
+/// sqlparser-rs. Historical behaviour, unchanged.
+pub(crate) struct SqlparserDdl;
+
+impl DdlParser for SqlparserDdl {
+    fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
+        parse_with_sqlparser(file, sql)
+    }
+}
+
+/// Parse a DDL file with an explicit parser choice.
+///
+/// The project scan (`design::from_config_with_dir`) resolves `source.parser`
+/// once, before reading any file, and calls this directly so a bad config
+/// value fails at load rather than partway through the scan.
+pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result<Entity> {
+    match choice {
+        ParserChoice::Sqlparser => SqlparserDdl.parse(file, sql),
+        ParserChoice::PgQuery => pg::PgQueryDdl.parse(file, sql),
+    }
+}
+
+/// Parse a DDL file with the Postgres default parser.
+///
+/// Used by this crate's tests and by external embedders (see
+/// `docs/design/architecture.md`); the project scan goes through
+/// [`parse_entity_with`] with the choice resolved from `source.parser`.
+/// Defaults to `PgQuery`, which today delegates to sqlparser for every type.
 pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
+    parse_entity_with(ParserChoice::PgQuery, file, sql)
+}
+
+/// Entity types the Postgres-native parser handles itself.
+///
+/// Exposed for the parity harness (task 6), an integration test in a separate
+/// crate that cannot see `pg::PgQueryDdl::COVERED` directly, so it gates on the
+/// same list the switchover uses.
+pub fn pg_native_types() -> &'static [EntityType] {
+    pg::PgQueryDdl::COVERED
+}
+
+fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
 
-    // Role DDL contains DO $$ … $$ blocks that sqlparser cannot parse.
-    // Scan the raw SQL directly with a regex and return early — no sqlparser needed.
+    // Role DDL is idempotent-wrapped in `DO $$ … $$`, which sqlparser cannot
+    // parse, so there has never been a sqlparser implementation to fall back
+    // to — the previous special case here called a regex scanner. Delegate to
+    // the libpg_query parser instead: `source.parser: sqlparser` therefore
+    // does not change how roles are read, because the alternative it would
+    // select is the fragile text scan this replaced, not a different parser.
     if entity.entity_type == EntityType::Role {
-        extract_role_memberships(sql, &mut entity);
-        return Ok(entity);
+        return pg::roles::parse_role(entity, sql);
     }
 
     let cleaned = preprocess_sql(sql);
@@ -175,19 +219,74 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     let statements = match sqlparser::parser::Parser::parse_sql(&dialect, &cleaned) {
         Ok(stmts) => stmts,
         Err(e) => {
-            entity.errors.push(format!("Parse error: {e}"));
-            // For procedures/functions we can still extract reads/writes even
-            // when sqlparser can't parse the statement (e.g. RETURNS SETOF/TABLE):
-            // libpg_query parses the body, with the regex scanner as last resort.
-            // No parsed statements here, so the LANGUAGE sql AST path is skipped.
-            if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
-                apply_proc_refs(&mut entity, extractors::extract_proc_refs(&[], &cleaned, "public"));
-                entity.refers = entity
-                    .references
-                    .iter()
-                    .map(|r| r.name.clone())
-                    .collect();
+            // An enum guarded by `DO $$ … $$` — the only idiom Postgres offers
+            // for a conditional CREATE TYPE — is valid SQL that sqlparser can't
+            // read. Recovering it here matters more than the missing AST: an
+            // entity carrying a parse error is filtered out of apply/reconcile's
+            // desired set entirely (`design::scope::entities_in_scope`), so the
+            // type was never created and the first table using it failed with a
+            // bare `type "…" does not exist` that named neither the file nor the
+            // real cause. libpg_query reads the block, so no error is recorded.
+            if entity.entity_type == EntityType::Enum {
+                let values = extractors::extract_enum_values_via_pg_query(&cleaned);
+                if !values.is_empty() {
+                    // Set before returning: this arm skips the search-path extraction
+                    // below, so a guarded enum used to lose the `set search_path` its
+                    // plain-CREATE sibling records.
+                    entity.search_paths = extractors::extract_search_paths_via_pg_query(&cleaned);
+                    entity.enum_values = values;
+                    return Ok(entity);
+                }
             }
+            // sqlparser reimplements the SQL grammar and lags Postgres, so its
+            // rejection alone says nothing about the file. When libpg_query —
+            // Postgres's own parser — accepts it, the file is valid and the
+            // limitation is ours: record no error, and recover what the entity
+            // actually needs from the raw text.
+            //
+            // Only for the types dbd applies as raw SQL and needs no structural
+            // AST for. A TABLE must keep its error: without `table_def` it is
+            // filtered out of the desired snapshot (`reconcile::
+            // raw_snapshot_from_entities`), which makes the live table read as
+            // an orphan that `--prune` would DROP. A MATERIALIZED VIEW must too:
+            // its emitter rebuilds the CREATE from `writes[0]`, which only the
+            // sqlparser path populates.
+            let ast_optional = matches!(
+                entity.entity_type,
+                EntityType::Function | EntityType::Procedure | EntityType::View
+            );
+            let recovered = ast_optional && extractors::is_valid_postgres(&cleaned);
+            if !recovered {
+                entity.errors.push(format!("Parse error: {e}"));
+            }
+
+            // Reads and view references are qualified against the search path,
+            // so recover it first — defaulting to `public` (as the sqlparser
+            // path does) would re-point `t` at `public.t`, a plausibly-wrong
+            // edge to a different table rather than an absent one.
+            entity.search_paths = extractors::extract_search_paths_via_pg_query(&cleaned);
+            let default_schema = entity
+                .search_paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "public".to_string());
+
+            match entity.entity_type {
+                // libpg_query parses the body; the regex scanner is the last
+                // resort. No parsed statements here, so the LANGUAGE sql AST
+                // path is skipped.
+                EntityType::Function | EntityType::Procedure => {
+                    apply_proc_refs(
+                        &mut entity,
+                        extractors::extract_proc_refs(&[], &cleaned, &default_schema),
+                    );
+                }
+                EntityType::View => {
+                    entity.references = extractors::extract_view_refs_via_pg_query(&cleaned, &default_schema);
+                }
+                _ => {}
+            }
+            entity.refers = entity.references.iter().map(|r| r.name.clone()).collect();
             return Ok(entity);
         }
     };
@@ -229,11 +328,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
             entity.enum_values = extractors::extract_enum_values(&statements);
         }
         EntityType::Function | EntityType::Procedure => {
-            let default_schema = entity
-                .search_paths
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("public");
+            let default_schema = entity.search_paths.first().map(|s| s.as_str()).unwrap_or("public");
             let refs = extractors::extract_proc_refs(&statements, &cleaned, default_schema);
             apply_proc_refs(&mut entity, refs);
         }
@@ -241,11 +336,7 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     }
 
     // Build refers list from references (entity names only)
-    entity.refers = entity
-        .references
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
+    entity.refers = entity.references.iter().map(|r| r.name.clone()).collect();
 
     Ok(entity)
 }
@@ -292,8 +383,12 @@ mod tests {
         assert!(!id_col.nullable);
         assert!(id_col.default_value.is_some());
 
+        // Postgres's own spelling of the type it resolved, not the uppercased
+        // echo of the author's keyword sqlparser used to report. Every
+        // comparison dbd makes runs both sides through `canonical_type`, so the
+        // two agree; this is the spelling that now reaches emitted DDL and DBML.
         let name_col = table_def.columns.iter().find(|c| c.name == "name").unwrap();
-        assert_eq!(name_col.data_type, "VARCHAR(30)");
+        assert_eq!(name_col.data_type, "varchar(30)");
     }
 
     #[test]
@@ -335,12 +430,186 @@ mod tests {
 
     #[test]
     fn handles_parse_error_gracefully() {
+        let entity = parse_entity(Path::new("ddl/table/config/broken.ddl"), "THIS IS NOT SQL AT ALL ;;;").unwrap();
+        assert!(!entity.errors.is_empty());
+    }
+
+    // ── sqlparser 0.62 grammar gaps ──────────────────────────────────────────
+    //
+    // 0.61 rejected these three, and a parse error is not cosmetic: it drops the
+    // entity from apply/reconcile's desired set, so `dbd apply` reported success
+    // while never creating the object. Pin them so a future downgrade or a
+    // regression in the dependency is caught here rather than in a user's
+    // database. `returns setof` is the case that surfaced the whole class.
+
+    #[test]
+    fn setof_returning_function_parses_and_keeps_its_refs() {
         let entity = parse_entity(
-            Path::new("ddl/table/config/broken.ddl"),
-            "THIS IS NOT SQL AT ALL ;;;",
+            Path::new("ddl/function/app/srf.ddl"),
+            "set search_path to app;\n\
+             create function srf() returns setof t language sql as $$ select * from t $$;",
         )
         .unwrap();
-        assert!(!entity.errors.is_empty());
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+        assert!(
+            entity.reads.contains(&"app.t".to_string()),
+            "a parsed function must resolve its read against the file's search_path, got {:?}",
+            entity.reads
+        );
+    }
+
+    #[test]
+    fn variadic_function_parses() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/vf.ddl"),
+            "set search_path to app;\n\
+             create function vf(variadic a int[]) returns int language sql as $$ select 1 $$;",
+        )
+        .unwrap();
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+    }
+
+    // ── libpg_query validation fallback ──────────────────────────────────────
+    //
+    // sqlparser is a convenience parser, not Postgres's. When it rejects a file
+    // that libpg_query — Postgres's own grammar — accepts, the limitation is
+    // ours and the file is valid SQL. Recording a parse error there is not
+    // cosmetic: it drops the entity from apply/reconcile's desired set, so the
+    // object is never created and the command still exits 0.
+    //
+    // The fallback is deliberately NOT applied to tables: a table with no
+    // `table_def` is filtered out of the desired snapshot (`reconcile.rs:91`),
+    // which makes the live table read as an orphan that `--prune` would DROP.
+    // Erroring keeps it visible; silently accepting it risks data loss.
+
+    #[test]
+    fn window_function_valid_in_postgres_is_not_an_error() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/wf.ddl"),
+            "set search_path to app;\n\
+             create function wf() returns int language plpgsql as $$ begin perform 1 from t; end $$ window;",
+        )
+        .unwrap();
+        assert!(
+            entity.errors.is_empty(),
+            "valid Postgres must not be reported as a user error: {:?}",
+            entity.errors
+        );
+    }
+
+    #[test]
+    fn view_with_check_option_is_not_an_error_and_keeps_its_refs() {
+        let entity = parse_entity(
+            Path::new("ddl/view/app/v.ddl"),
+            "set search_path to app;\n\
+             create view v as select * from t where a > 1 with cascaded check option;",
+        )
+        .unwrap();
+        assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
+        assert!(
+            entity.refers.contains(&"app.t".to_string()),
+            "a recovered view must keep its dependency edge, got {:?}",
+            entity.refers
+        );
+    }
+
+    // The wrong-schema trap: without search_path recovery the fallback would
+    // qualify reads to `public`, turning a missing edge into a plausibly-wrong
+    // one that points at a different table.
+
+    #[test]
+    fn fallback_recovers_search_paths_so_refs_resolve_to_the_right_schema() {
+        let entity = parse_entity(
+            Path::new("ddl/function/app/wf2.ddl"),
+            "set search_path to app;\n\
+             create function wf2() returns int language plpgsql as $$ begin perform 1 from t; end $$ window;",
+        )
+        .unwrap();
+        assert_eq!(entity.search_paths, vec!["app".to_string()]);
+        assert!(
+            entity.reads.contains(&"app.t".to_string()),
+            "read must qualify against the file's search_path, not `public`: {:?}",
+            entity.reads
+        );
+    }
+
+    #[test]
+    fn table_sqlparser_cannot_read_still_errors() {
+        let entity = parse_entity(
+            Path::new("ddl/table/app/excl.ddl"),
+            "set search_path to app;\n\
+             create table excl (id int primary key, r int4range, exclude using gist (r with &&));",
+        )
+        .unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a table with no table_def reads as an orphan that --prune would drop; \
+             it must stay visible as an error"
+        );
+        assert!(entity.table_def.is_none());
+    }
+
+    #[test]
+    fn sql_neither_parser_accepts_still_errors() {
+        let entity = parse_entity(Path::new("ddl/view/app/broken.ddl"), "create view v as SELECT * FROM ;").unwrap();
+        assert!(!entity.errors.is_empty(), "genuinely broken SQL must still error");
+    }
+
+    // ── Guarded enum: `DO $$ … $$` around CREATE TYPE ────────────────────────
+    //
+    // Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a
+    // DO block that swallows `duplicate_object` is the only idiom for a
+    // conditional enum. sqlparser rejects `DO` outright, and a parse error drops
+    // the entity from apply/reconcile's desired set — so the type was never
+    // created and the first table using it died with `type "…" does not exist`,
+    // never mentioning the real cause. libpg_query reads the block.
+
+    #[test]
+    fn guarded_do_block_enum_is_parsed() {
+        let sql = "set search_path to app;\n\
+                   \n\
+                   do $$ begin\n\
+                     create type status_t as enum ('active', 'archived');\n\
+                   exception when duplicate_object then null;\n\
+                   end $$;\n";
+        let entity = parse_entity(Path::new("ddl/enum/app/status_t.ddl"), sql).unwrap();
+
+        assert_eq!(entity.entity_type, EntityType::Enum);
+        assert_eq!(entity.name, "app.status_t");
+        assert!(
+            entity.errors.is_empty(),
+            "a guarded enum is valid Postgres and must not report a parse error: {:?}",
+            entity.errors
+        );
+        let values: Vec<&str> = entity.enum_values.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(values, vec!["active", "archived"]);
+
+        // The guarded form must record its search path like the plain
+        // `create type` form does — this arm returns before the extraction
+        // further down, so it has to set it itself.
+        assert_eq!(entity.search_paths, vec!["app".to_string()]);
+    }
+
+    // The fallback must not turn every unparseable enum file into a silent pass.
+
+    #[test]
+    fn unparseable_enum_still_reports_an_error() {
+        let entity = parse_entity(Path::new("ddl/enum/app/broken.ddl"), "THIS IS NOT SQL AT ALL ;;;").unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a broken enum file must still surface a parse error"
+        );
+        assert!(entity.enum_values.is_empty());
+    }
+
+    #[test]
+    fn do_block_declaring_no_enum_keeps_its_parse_error() {
+        let entity = parse_entity(Path::new("ddl/enum/app/empty.ddl"), "do $$ begin perform 1; end $$;").unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a DO block with no CREATE TYPE declares no enum — the error must stand"
+        );
+        assert!(entity.enum_values.is_empty());
     }
 
     // ── Role round-trip: emit → parse → refers ───────────────────────────────
@@ -371,8 +640,8 @@ mod tests {
 
         // Now parse the emitted DDL back — this is the path `dbd apply` takes
         // when it re-reads a file written by `dbd merge --roles`.
-        let parsed = parse_entity(Path::new("ddl/role/app_ro.ddl"), &emitted)
-            .expect("parse_entity must not error on role DDL");
+        let parsed =
+            parse_entity(Path::new("ddl/role/app_ro.ddl"), &emitted).expect("parse_entity must not error on role DDL");
 
         assert_eq!(parsed.entity_type, EntityType::Role);
         assert_eq!(parsed.name, "app_ro");
@@ -425,8 +694,7 @@ mod tests {
                    SELECT date_trunc('day', created_at) AS day, sum(total) AS revenue\n\
                    FROM shop.orders GROUP BY 1 WITH DATA;\n\
                    CREATE UNIQUE INDEX daily_sales_day_uidx ON analytics.daily_sales(day);";
-        let entity =
-            parse_entity(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"), sql).unwrap();
+        let entity = parse_entity(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"), sql).unwrap();
 
         assert_eq!(entity.entity_type, EntityType::MaterializedView);
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
@@ -452,7 +720,68 @@ mod tests {
     fn comment_on_materialized_view_is_stripped() {
         let sql = "COMMENT ON MATERIALIZED VIEW analytics.daily_sales IS 'daily rollup';";
         let cleaned = super::preprocess_sql(sql);
-        assert!(!cleaned.to_lowercase().contains("comment on materialized view"),
-            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}");
+        assert!(
+            !cleaned.to_lowercase().contains("comment on materialized view"),
+            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}"
+        );
+    }
+
+    // ── ParserChoice ────────────────────────────────────────────────────────
+
+    #[test]
+    fn postgres_dialects_default_to_pg_query() {
+        assert_eq!(
+            ParserChoice::resolve("postgresql", None).unwrap(),
+            ParserChoice::PgQuery
+        );
+        assert_eq!(ParserChoice::resolve("supabase", None).unwrap(), ParserChoice::PgQuery);
+        // `dbd doctor --fix` migrates a legacy `project.database: Postgres`
+        // to this spelling (doctor.rs:120-127), so it must not miss.
+        assert_eq!(ParserChoice::resolve("postgres", None).unwrap(), ParserChoice::PgQuery);
+    }
+
+    #[test]
+    fn other_dialects_keep_sqlparser() {
+        assert_eq!(ParserChoice::resolve("sqlite", None).unwrap(), ParserChoice::Sqlparser);
+    }
+
+    #[test]
+    fn explicit_parser_overrides_the_dialect() {
+        assert_eq!(
+            ParserChoice::resolve("postgresql", Some("sqlparser")).unwrap(),
+            ParserChoice::Sqlparser
+        );
+        assert_eq!(
+            ParserChoice::resolve("sqlite", Some("pg_query")).unwrap(),
+            ParserChoice::PgQuery
+        );
+    }
+
+    /// `source.parser` is public API, so a typo must not silently leave the
+    /// project on a parser the author did not ask for.
+    #[test]
+    fn an_unknown_parser_errors_and_names_the_valid_values() {
+        let err = ParserChoice::resolve("postgresql", Some("pgquery"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pg_query"), "got: {err}");
+        assert!(err.contains("sqlparser"), "got: {err}");
+
+        assert!(ParserChoice::resolve("postgresql", Some("")).is_err());
+        assert!(ParserChoice::resolve("postgresql", Some("PG_QUERY")).is_err());
+    }
+
+    // ── DdlParser ───────────────────────────────────────────────────────────
+
+    /// Object safety is a real requirement: dispatch selects an implementation
+    /// at runtime, so the trait must be usable behind a reference.
+    #[test]
+    fn sqlparser_ddl_is_usable_as_a_trait_object() {
+        let parser: &dyn DdlParser = &SqlparserDdl;
+        let entity = parser
+            .parse(Path::new("ddl/enum/app/s.ddl"), "create type s as enum ('a', 'b');")
+            .unwrap();
+        assert_eq!(entity.enum_values.len(), 2);
+        assert!(entity.errors.is_empty(), "got: {:?}", entity.errors);
     }
 }

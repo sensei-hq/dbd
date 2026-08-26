@@ -72,8 +72,7 @@ pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
         return Vec::new();
     }
 
-    let entity_map: HashMap<String, Entity> =
-        entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
+    let entity_map: HashMap<String, Entity> = entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
     let (topo_order, cyclic) = topological_order(entities, &entity_map);
     let levels = compute_levels(&topo_order, entities, &entity_map);
 
@@ -180,9 +179,7 @@ fn compute_levels(
 /// than panicking.
 fn sort_batch(batch: &mut [String], entity_map: &HashMap<String, Entity>) {
     batch.sort_by_key(|name| {
-        let rank = entity_map
-            .get(name)
-            .map_or(u8::MAX, |e| e.entity_type.apply_rank());
+        let rank = entity_map.get(name).map_or(u8::MAX, |e| e.entity_type.apply_rank());
         (rank, name.clone())
     });
 }
@@ -218,9 +215,7 @@ fn append_cyclic(
 
     for name in cyclic_names {
         if let Some(mut entity) = entity_map.get(&name).cloned() {
-            entity
-                .errors
-                .push("Cyclic dependency detected".to_string());
+            entity.errors.push("Cyclic dependency detected".to_string());
             sorted.push(entity);
         }
     }
@@ -232,8 +227,7 @@ fn append_cyclic(
 /// batch — apply rank, then name — so a rendered graph reads in the order
 /// `apply` executes.
 pub fn group_by_dependency_level(entities: &[Entity]) -> Vec<Vec<String>> {
-    let entity_map: HashMap<String, Entity> =
-        entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
+    let entity_map: HashMap<String, Entity> = entities.iter().map(|e| (e.name.clone(), e.clone())).collect();
     let mut remaining = build_dependency_map(entities);
 
     let mut layers = Vec::new();
@@ -306,17 +300,12 @@ pub fn graph_from_entities(entities: &[Entity], scope: Option<&str>) -> GraphRes
 
     let layers = group_by_dependency_level(&filtered);
 
-    GraphResult {
-        nodes,
-        edges,
-        layers,
-    }
+    GraphResult { nodes, edges, layers }
 }
 
 /// Collect the transitive closure of dependencies reachable from a named entity.
 fn reachable_subgraph(entities: &[Entity], start: &str) -> Vec<Entity> {
-    let entity_map: HashMap<&str, &Entity> =
-        entities.iter().map(|e| (e.name.as_str(), e)).collect();
+    let entity_map: HashMap<&str, &Entity> = entities.iter().map(|e| (e.name.as_str(), e)).collect();
 
     let mut visited = HashSet::new();
     let mut stack = vec![start.to_string()];
@@ -334,11 +323,7 @@ fn reachable_subgraph(entities: &[Entity], start: &str) -> Vec<Entity> {
         }
     }
 
-    entities
-        .iter()
-        .filter(|e| visited.contains(&e.name))
-        .cloned()
-        .collect()
+    entities.iter().filter(|e| visited.contains(&e.name)).cloned().collect()
 }
 
 #[cfg(test)]
@@ -354,11 +339,7 @@ mod tests {
 
     #[test]
     fn sorts_simple_chain() {
-        let entities = vec![
-            entity("c", &["b"]),
-            entity("a", &[]),
-            entity("b", &["a"]),
-        ];
+        let entities = vec![entity("c", &["b"]), entity("a", &[]), entity("b", &["a"])];
         let sorted = sort_by_dependencies(&entities);
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
@@ -366,11 +347,7 @@ mod tests {
 
     #[test]
     fn sorts_independent_entities_alphabetically() {
-        let entities = vec![
-            entity("c", &[]),
-            entity("a", &[]),
-            entity("b", &[]),
-        ];
+        let entities = vec![entity("c", &[]), entity("a", &[]), entity("b", &[])];
         let sorted = sort_by_dependencies(&entities);
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
@@ -396,19 +373,12 @@ mod tests {
         let entities = vec![entity("a", &["b"]), entity("b", &["a"])];
         let sorted = sort_by_dependencies(&entities);
         assert!(sorted.iter().all(|e| e.has_errors()));
-        assert!(sorted[0]
-            .errors
-            .iter()
-            .any(|e| e.contains("Cyclic")));
+        assert!(sorted[0].errors.iter().any(|e| e.contains("Cyclic")));
     }
 
     #[test]
     fn partial_cycle_preserves_non_cyclic() {
-        let entities = vec![
-            entity("a", &[]),
-            entity("b", &["a", "c"]),
-            entity("c", &["b"]),
-        ];
+        let entities = vec![entity("a", &[]), entity("b", &["a", "c"]), entity("c", &["b"])];
         let sorted = sort_by_dependencies(&entities);
         assert_eq!(sorted[0].name, "a");
         assert!(!sorted[0].has_errors());
@@ -419,10 +389,7 @@ mod tests {
 
     #[test]
     fn ignores_external_dependencies() {
-        let entities = vec![
-            entity("b", &["a", "external.thing"]),
-            entity("a", &[]),
-        ];
+        let entities = vec![entity("b", &["a", "external.thing"]), entity("a", &[])];
         let sorted = sort_by_dependencies(&entities);
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
@@ -433,7 +400,7 @@ mod tests {
     fn self_reference_is_not_a_cycle() {
         let entities = vec![
             entity("a", &[]),
-            entity("b", &["a", "b"]),  // b references itself (self-FK)
+            entity("b", &["a", "b"]), // b references itself (self-FK)
         ];
         let sorted = sort_by_dependencies(&entities);
         let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
@@ -449,11 +416,7 @@ mod tests {
 
     #[test]
     fn group_by_level() {
-        let entities = vec![
-            entity("c", &["a", "b"]),
-            entity("a", &[]),
-            entity("b", &["a"]),
-        ];
+        let entities = vec![entity("c", &["a", "b"]), entity("a", &[]), entity("b", &["a"])];
         let layers = group_by_dependency_level(&entities);
         assert_eq!(layers.len(), 3);
         assert_eq!(layers[0], vec!["a"]);
@@ -463,10 +426,7 @@ mod tests {
 
     #[test]
     fn graph_from_entities_full() {
-        let entities = vec![
-            entity("b", &["a"]),
-            entity("a", &[]),
-        ];
+        let entities = vec![entity("b", &["a"]), entity("a", &[])];
         let graph = graph_from_entities(&entities, None);
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
@@ -480,7 +440,7 @@ mod tests {
         let entities = vec![
             entity("a", &[]),
             entity("b", &["a"]),
-            entity("c", &[]),  // unrelated
+            entity("c", &[]), // unrelated
         ];
         let graph = graph_from_entities(&entities, Some("b"));
         let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -493,11 +453,7 @@ mod tests {
 
     #[test]
     fn dg1_build_graph_from_entities_with_deps() {
-        let entities = vec![
-            entity("A", &["B"]),
-            entity("B", &["C"]),
-            entity("C", &[]),
-        ];
+        let entities = vec![entity("A", &["B"]), entity("B", &["C"]), entity("C", &[])];
         let graph = build_dependency_graph(&entities);
 
         assert_eq!(graph.len(), 3);

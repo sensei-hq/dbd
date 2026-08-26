@@ -8,9 +8,23 @@ pub const ALWAYS_EXCLUDED: &[&str] = &["pg_catalog", "information_schema", "dbd"
 
 /// Supabase platform schemas excluded by default (overridable with `all=true`).
 pub const SUPABASE_DENYLIST: &[&str] = &[
-    "auth", "storage", "realtime", "_realtime", "extensions", "graphql",
-    "graphql_public", "vault", "pgsodium", "pgsodium_masks", "supabase_functions",
-    "supabase_migrations", "cron", "net", "pgbouncer", "_analytics", "_supavisor",
+    "auth",
+    "storage",
+    "realtime",
+    "_realtime",
+    "extensions",
+    "graphql",
+    "graphql_public",
+    "vault",
+    "pgsodium",
+    "pgsodium_masks",
+    "supabase_functions",
+    "supabase_migrations",
+    "cron",
+    "net",
+    "pgbouncer",
+    "_analytics",
+    "_supavisor",
     "pgtle",
 ];
 
@@ -19,14 +33,18 @@ pub const SUPABASE_DENYLIST: &[&str] = &[
 /// (`pg_*`, `rds_*`, `azure_*`, `cloudsql*`, `supabase_*`, `pgsodium*`) are
 /// excluded separately in [`role_is_managed`].
 pub const ROLE_DENYLIST: &[&str] = &[
-    "postgres", "anon", "authenticated", "service_role", "authenticator",
-    "dashboard_user", "pgbouncer",
+    "postgres",
+    "anon",
+    "authenticated",
+    "service_role",
+    "authenticator",
+    "dashboard_user",
+    "pgbouncer",
 ];
 
 /// Prefixes that mark a role as platform/managed (Postgres internals, cloud
 /// providers, Supabase). A role whose name starts with any of these is excluded.
-const ROLE_DENY_PREFIXES: &[&str] =
-    &["pg_", "rds_", "azure_", "cloudsql", "supabase_", "pgsodium"];
+const ROLE_DENY_PREFIXES: &[&str] = &["pg_", "rds_", "azure_", "cloudsql", "supabase_", "pgsodium"];
 
 /// Returns `true` if a role is platform/managed and must be EXCLUDED from
 /// reverse-engineering (even with `--roles`). A role is managed when it is a
@@ -35,9 +53,7 @@ const ROLE_DENY_PREFIXES: &[&str] =
 ///
 /// Pure (no DB) so it can be unit-tested directly.
 pub fn role_is_managed(name: &str, is_super: bool) -> bool {
-    is_super
-        || ROLE_DENY_PREFIXES.iter().any(|p| name.starts_with(p))
-        || ROLE_DENYLIST.contains(&name)
+    is_super || ROLE_DENY_PREFIXES.iter().any(|p| name.starts_with(p)) || ROLE_DENYLIST.contains(&name)
 }
 
 /// Filter `(member, granted)` membership pairs down to a per-member,
@@ -51,8 +67,7 @@ pub fn keep_memberships(
     member_to_granted: &[(String, String)],
     kept: &std::collections::HashSet<String>,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for (member, granted) in member_to_granted {
         if kept.contains(member) && kept.contains(granted) {
             map.entry(member.clone()).or_default().push(granted.clone());
@@ -66,9 +81,7 @@ pub fn keep_memberships(
 }
 
 fn is_internal(schema: &str) -> bool {
-    ALWAYS_EXCLUDED.contains(&schema)
-        || schema.starts_with("pg_toast")
-        || schema.starts_with("pg_temp")
+    ALWAYS_EXCLUDED.contains(&schema) || schema.starts_with("pg_toast") || schema.starts_with("pg_temp")
 }
 
 /// Options controlling which schemas are reverse-engineered.
@@ -106,12 +119,7 @@ pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String>
 /// (`ddl/<kind>/<schema>/<name>.ddl`).  Without this check a pathological but
 /// technically-legal SQL identifier could escape the project root.
 fn is_safe_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && !s.contains('/')
-        && !s.contains('\\')
-        && !s.contains('\0')
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\') && !s.contains('\0')
 }
 
 use crate::entity::{Entity, EntityType};
@@ -129,7 +137,9 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
     let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
     let mut p = PathBuf::from("ddl");
     p.push(&kind);
-    if entity.entity_type.has_schema() && let Some(schema) = &entity.schema {
+    if entity.entity_type.has_schema()
+        && let Some(schema) = &entity.schema
+    {
         p.push(schema);
     }
     p.push(format!("{name}.ddl"));
@@ -138,15 +148,26 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
 
 /// The entity kinds this command generates (used to scope orphan detection).
 pub const MANAGED_KINDS: &[EntityType] = &[
-    EntityType::Schema, EntityType::Extension, EntityType::Role, EntityType::Sequence,
-    EntityType::Enum, EntityType::Table, EntityType::View, EntityType::MaterializedView,
-    EntityType::Function, EntityType::Procedure,
+    EntityType::Schema,
+    EntityType::Extension,
+    EntityType::Role,
+    EntityType::Sequence,
+    EntityType::Enum,
+    EntityType::Table,
+    EntityType::View,
+    EntityType::MaterializedView,
+    EntityType::Function,
+    EntityType::Procedure,
 ];
 
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileAction { Create, Skip, Conflict }
+pub enum FileAction {
+    Create,
+    Skip,
+    Conflict,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlanItem {
@@ -169,14 +190,9 @@ pub struct WritePlan {
 
 /// Classify each generated file vs disk, and detect orphans within `selected_schemas`
 /// for the managed kinds only.
-pub fn build_plan(
-    root: &Path,
-    generated: Vec<(PathBuf, String)>,
-    selected_schemas: &[String],
-) -> WritePlan {
+pub fn build_plan(root: &Path, generated: Vec<(PathBuf, String)>, selected_schemas: &[String]) -> WritePlan {
     let mut items = Vec::new();
-    let generated_paths: std::collections::HashSet<PathBuf> =
-        generated.iter().map(|(p, _)| p.clone()).collect();
+    let generated_paths: std::collections::HashSet<PathBuf> = generated.iter().map(|(p, _)| p.clone()).collect();
 
     for (rel, content) in generated {
         let abs = root.join(&rel);
@@ -185,7 +201,11 @@ pub fn build_plan(
             Ok(_) => FileAction::Conflict,
             Err(_) => FileAction::Create,
         };
-        items.push(PlanItem { path: rel, content, action });
+        items.push(PlanItem {
+            path: rel,
+            content,
+            action,
+        });
     }
 
     // Orphans: walk ddl/<managed-kind>/<selected-schema>/*.{ddl,sql} not in generated.
@@ -216,7 +236,11 @@ pub fn build_plan(
         }
     }
     orphans.sort();
-    WritePlan { items, orphans, skipped_unsafe: vec![] }
+    WritePlan {
+        items,
+        orphans,
+        skipped_unsafe: vec![],
+    }
 }
 
 use crate::error::{DbdError, Result};
@@ -352,7 +376,11 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
     let schemas_block = if schemas.is_empty() {
         "schemas: []\n".to_string()
     } else {
-        let lines = schemas.iter().map(|s| format!("  - {s}")).collect::<Vec<_>>().join("\n");
+        let lines = schemas
+            .iter()
+            .map(|s| format!("  - {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!("schemas:\n{lines}\n")
     };
     format!(
@@ -365,7 +393,9 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn dbd_schema_is_internal() {
@@ -382,21 +412,39 @@ mod tests {
     #[test]
     fn all_schemas_keeps_supabase_but_not_pg_internal() {
         let db = v(&["public", "auth", "pg_catalog"]);
-        let got = select_schemas(&db, &SchemaSelect { all: true, ..Default::default() });
+        let got = select_schemas(
+            &db,
+            &SchemaSelect {
+                all: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(got, v(&["public", "auth"]));
     }
 
     #[test]
     fn only_allowlist_wins() {
         let db = v(&["public", "app", "reporting"]);
-        let got = select_schemas(&db, &SchemaSelect { only: v(&["app"]), ..Default::default() });
+        let got = select_schemas(
+            &db,
+            &SchemaSelect {
+                only: v(&["app"]),
+                ..Default::default()
+            },
+        );
         assert_eq!(got, v(&["app"]));
     }
 
     #[test]
     fn exclude_adds_to_denies() {
         let db = v(&["public", "app"]);
-        let got = select_schemas(&db, &SchemaSelect { exclude: v(&["app"]), ..Default::default() });
+        let got = select_schemas(
+            &db,
+            &SchemaSelect {
+                exclude: v(&["app"]),
+                ..Default::default()
+            },
+        );
         assert_eq!(got, v(&["public"]));
     }
 
@@ -418,7 +466,10 @@ mod tests {
     fn matview_reverse_path_uses_underscored_folder() {
         let e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
         let p = entity_path(&e);
-        assert_eq!(p, std::path::PathBuf::from("ddl/materialized_view/analytics/daily_sales.ddl"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("ddl/materialized_view/analytics/daily_sales.ddl")
+        );
     }
 
     #[test]
@@ -440,21 +491,35 @@ mod tests {
         fs::write(root.join("ddl/trigger/shop/t.ddl"), "TRG").unwrap();
 
         let generated = vec![
-            (PathBuf::from("ddl/table/shop/orders.ddl"), "SAME".to_string()),     // skip
-            (PathBuf::from("ddl/table/shop/customers.ddl"), "NEW".to_string()),   // conflict
-            (PathBuf::from("ddl/table/shop/products.ddl"), "NEW".to_string()),    // create
+            (PathBuf::from("ddl/table/shop/orders.ddl"), "SAME".to_string()), // skip
+            (PathBuf::from("ddl/table/shop/customers.ddl"), "NEW".to_string()), // conflict
+            (PathBuf::from("ddl/table/shop/products.ddl"), "NEW".to_string()), // create
         ];
         let plan = build_plan(root, generated, &["shop".to_string()]);
 
-        let by = |a: FileAction| plan.items.iter().filter(|i| i.action == a)
-            .map(|i| i.path.clone()).collect::<Vec<_>>();
+        let by = |a: FileAction| {
+            plan.items
+                .iter()
+                .filter(|i| i.action == a)
+                .map(|i| i.path.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(by(FileAction::Skip), vec![PathBuf::from("ddl/table/shop/orders.ddl")]);
-        assert_eq!(by(FileAction::Conflict), vec![PathBuf::from("ddl/table/shop/customers.ddl")]);
-        assert_eq!(by(FileAction::Create), vec![PathBuf::from("ddl/table/shop/products.ddl")]);
-        assert_eq!(plan.orphans, vec![
-            PathBuf::from("ddl/table/shop/legacy.ddl"),
-            PathBuf::from("ddl/table/shop/old.sql"),
-        ]);
+        assert_eq!(
+            by(FileAction::Conflict),
+            vec![PathBuf::from("ddl/table/shop/customers.ddl")]
+        );
+        assert_eq!(
+            by(FileAction::Create),
+            vec![PathBuf::from("ddl/table/shop/products.ddl")]
+        );
+        assert_eq!(
+            plan.orphans,
+            vec![
+                PathBuf::from("ddl/table/shop/legacy.ddl"),
+                PathBuf::from("ddl/table/shop/old.sql"),
+            ]
+        );
         // trigger file is unmanaged → never an orphan
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
     }
@@ -478,7 +543,11 @@ mod tests {
     }
 
     fn item(p: &str, c: &str, a: FileAction) -> PlanItem {
-        PlanItem { path: PathBuf::from(p), content: c.into(), action: a }
+        PlanItem {
+            path: PathBuf::from(p),
+            content: c.into(),
+            action: a,
+        }
     }
 
     #[test]
@@ -506,7 +575,10 @@ mod tests {
 
         // Conflict overwritten in place — NO `.bak`.
         assert_eq!(fs::read_to_string(root.join("ddl/table/s/a.ddl")).unwrap(), "NEW");
-        assert!(!root.join("ddl/table/s/a.ddl.bak").exists(), "apply_overwrite must not create .bak files");
+        assert!(
+            !root.join("ddl/table/s/a.ddl.bak").exists(),
+            "apply_overwrite must not create .bak files"
+        );
         // Create written.
         assert_eq!(fs::read_to_string(root.join("ddl/table/s/b.ddl")).unwrap(), "B");
         // Skip left untouched.
@@ -522,10 +594,13 @@ mod tests {
 
     #[test]
     fn plan_from_entities_emits_and_classifies() {
-        use crate::entity::{EnumValue};
+        use crate::entity::EnumValue;
         let dir = tempfile::tempdir().unwrap();
         let mut en = Entity::new(EntityType::Enum, "shop.status");
-        en.enum_values = vec![EnumValue { name: "a".into(), note: None }];
+        en.enum_values = vec![EnumValue {
+            name: "a".into(),
+            note: None,
+        }];
         let entities = vec![Entity::new(EntityType::Schema, "shop"), en];
 
         let plan = plan_from_entities(
@@ -549,9 +624,7 @@ mod tests {
     /// emits formatter-equivalent bytes, so the round trip is stable.
     #[test]
     fn generated_files_are_format_stable_and_skip_on_rerun() {
-        use crate::entity::{
-            ColumnDef, IndexColumn, IndexDef, IndexType, TableConstraint, TableDef,
-        };
+        use crate::entity::{ColumnDef, IndexColumn, IndexDef, IndexType, TableConstraint, TableDef};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let fmt = crate::config::FormatConfig::default();
@@ -589,15 +662,17 @@ mod tests {
                 name: None,
                 columns: vec!["id".into()],
             }],
-            indexes: vec![
-                IndexDef {
-                    name: Some("orders_tags_idx".into()),
-                    columns: vec![IndexColumn { name: "tags".into(), order: None, ..Default::default() }],
-                    unique: false,
-                    index_type: Some(IndexType::Gin),
+            indexes: vec![IndexDef {
+                name: Some("orders_tags_idx".into()),
+                columns: vec![IndexColumn {
+                    name: "tags".into(),
+                    order: None,
                     ..Default::default()
-                },
-            ],
+                }],
+                unique: false,
+                index_type: Some(IndexType::Gin),
+                ..Default::default()
+            }],
             comments: Default::default(),
         });
         let entities = vec![Entity::new(EntityType::Schema, "shop"), t];
@@ -607,7 +682,11 @@ mod tests {
         assert!(
             plan1.items.iter().all(|i| i.action == FileAction::Create),
             "first pass should be all Create: {:?}",
-            plan1.items.iter().map(|i| (i.path.clone(), i.action)).collect::<Vec<_>>()
+            plan1
+                .items
+                .iter()
+                .map(|i| (i.path.clone(), i.action))
+                .collect::<Vec<_>>()
         );
         apply_overwrite(root, &plan1).unwrap();
 
@@ -618,7 +697,8 @@ mod tests {
             let content = std::fs::read_to_string(&abs).unwrap();
             let formatted = crate::formatter::format_ddl(&content, &fmt);
             assert_eq!(
-                content, formatted,
+                content,
+                formatted,
                 "`dbd format` changed a reverse-generated file ({}): not idempotent",
                 it.path.display()
             );
@@ -697,8 +777,7 @@ mod tests {
     #[test]
     fn keep_memberships_is_self_contained() {
         // kept = {app, app_ro}; memberships: app_ro→app (kept) and app→authenticated (denied).
-        let kept: std::collections::HashSet<String> =
-            ["app".to_string(), "app_ro".to_string()].into_iter().collect();
+        let kept: std::collections::HashSet<String> = ["app".to_string(), "app_ro".to_string()].into_iter().collect();
         let members = vec![
             ("app_ro".to_string(), "app".to_string()),
             ("app".to_string(), "authenticated".to_string()),
@@ -711,10 +790,9 @@ mod tests {
 
     #[test]
     fn keep_memberships_sorts_and_dedups() {
-        let kept: std::collections::HashSet<String> =
-            ["a".to_string(), "b".to_string(), "c".to_string()]
-                .into_iter()
-                .collect();
+        let kept: std::collections::HashSet<String> = ["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect();
         let members = vec![
             ("a".to_string(), "c".to_string()),
             ("a".to_string(), "b".to_string()),
@@ -732,7 +810,10 @@ mod tests {
         // Entity with a path-traversal schema
         let mut evil_schema = Entity::new(EntityType::Enum, "status");
         evil_schema.schema = Some("../etc".to_string());
-        evil_schema.enum_values = vec![EnumValue { name: "x".into(), note: None }];
+        evil_schema.enum_values = vec![EnumValue {
+            name: "x".into(),
+            note: None,
+        }];
 
         // Entity with a slash in the name
         let mut evil_name = Entity::new(EntityType::Table, "public/evil");
@@ -741,7 +822,10 @@ mod tests {
         // A normal entity that must still be emitted
         let mut good = Entity::new(EntityType::Enum, "shop.status");
         good.schema = Some("shop".to_string());
-        good.enum_values = vec![EnumValue { name: "a".into(), note: None }];
+        good.enum_values = vec![EnumValue {
+            name: "a".into(),
+            note: None,
+        }];
 
         let entities = vec![evil_schema, evil_name, good];
         let plan = plan_from_entities(
@@ -759,12 +843,19 @@ mod tests {
         }
 
         // They must be reported in skipped_unsafe
-        assert_eq!(plan.skipped_unsafe.len(), 2,
-            "expected 2 skipped, got {:?}", plan.skipped_unsafe);
+        assert_eq!(
+            plan.skipped_unsafe.len(),
+            2,
+            "expected 2 skipped, got {:?}",
+            plan.skipped_unsafe
+        );
 
         // The good entity must be present
         let paths: Vec<String> = plan.items.iter().map(|i| i.path.display().to_string()).collect();
-        assert!(paths.iter().any(|p| p.contains("status")),
-            "good entity missing from plan: {:?}", paths);
+        assert!(
+            paths.iter().any(|p| p.contains("status")),
+            "good entity missing from plan: {:?}",
+            paths
+        );
     }
 }

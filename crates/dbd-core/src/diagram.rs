@@ -2,7 +2,7 @@
 //! The CLI builds `{site}/diagram#1.<payload>` where `<payload>` is the model
 //! JSON gzip-compressed and base64url-encoded; the site decodes it client-side.
 use base64::Engine;
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use std::io::Write;
 
 use crate::schema_model::SchemaModel;
@@ -23,7 +23,12 @@ pub fn encode_payload(model: &SchemaModel) -> Result<String, serde_json::Error> 
 /// Build the full hosted-viewer URL: `{base}/diagram#1.<payload>`.
 pub fn fragment_url(base: &str, model: &SchemaModel) -> Result<String, serde_json::Error> {
     let payload = encode_payload(model)?;
-    Ok(format!("{}/diagram#{}.{}", base.trim_end_matches('/'), FRAGMENT_VERSION, payload))
+    Ok(format!(
+        "{}/diagram#{}.{}",
+        base.trim_end_matches('/'),
+        FRAGMENT_VERSION,
+        payload
+    ))
 }
 
 #[cfg(test)]
@@ -35,8 +40,16 @@ mod tests {
 
     fn sample_model() -> SchemaModel {
         SchemaModel {
-            project: ProjectInfo { name: "Acme".to_string(), db: "postgres".to_string(), note: None },
-            schemas: vec![SchemaInfo { name: "public".to_string(), tables: 1, enums: 0 }],
+            project: ProjectInfo {
+                name: "Acme".to_string(),
+                db: "postgres".to_string(),
+                note: None,
+            },
+            schemas: vec![SchemaInfo {
+                name: "public".to_string(),
+                tables: 1,
+                enums: 0,
+            }],
             tables: vec![TableNode {
                 schema: "public".to_string(),
                 name: "users".to_string(),
@@ -44,8 +57,13 @@ mod tests {
                 note: None,
                 note_md: None,
                 columns: vec![Column {
-                    name: "id".to_string(), ty: "uuid".to_string(),
-                    pk: true, nn: true, en: false, def: None, note: None,
+                    name: "id".to_string(),
+                    ty: "uuid".to_string(),
+                    pk: true,
+                    nn: true,
+                    en: false,
+                    def: None,
+                    note: None,
                 }],
                 indexes: vec![],
             }],
@@ -54,7 +72,9 @@ mod tests {
     }
 
     fn decode_payload(payload: &str) -> SchemaModel {
-        let gz = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let gz = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap();
         let mut s = String::new();
         GzDecoder::new(&gz[..]).read_to_string(&mut s).unwrap();
         serde_json::from_str(&s).unwrap()

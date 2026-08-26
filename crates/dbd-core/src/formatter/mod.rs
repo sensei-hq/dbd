@@ -72,7 +72,9 @@ fn block_is_faithful(original: &str, formatted: &str) -> bool {
 
 /// Every comment in `original` (— line and /* */ block) must appear in `formatted`.
 fn comments_preserved(original: &str, formatted: &str) -> bool {
-    extract_comments(original).iter().all(|c| formatted.contains(c.as_str()))
+    extract_comments(original)
+        .iter()
+        .all(|c| formatted.contains(c.as_str()))
 }
 
 /// Extract trimmed comment text (line `-- …` and block `/* … */`) from SQL,
@@ -142,9 +144,7 @@ fn format_statement_block(block: &str, config: &FormatConfig) -> String {
     let dialect = PostgreSqlDialect {};
     let sql_to_parse = ensure_semicolon(trimmed);
     match Parser::parse_sql(&dialect, &sql_to_parse) {
-        Ok(statements) if !statements.is_empty() => {
-            format_parsed_statements(&statements, trimmed, config)
-        }
+        Ok(statements) if !statements.is_empty() => format_parsed_statements(&statements, trimmed, config),
         _ => {
             // Unparseable: apply keyword case only
             let result = apply_keyword_case(trimmed, &config.keyword_case);
@@ -154,11 +154,7 @@ fn format_statement_block(block: &str, config: &FormatConfig) -> String {
 }
 
 /// Format parsed statements, dispatching to specific formatters.
-fn format_parsed_statements(
-    statements: &[Statement],
-    original: &str,
-    config: &FormatConfig,
-) -> String {
+fn format_parsed_statements(statements: &[Statement], original: &str, config: &FormatConfig) -> String {
     // We typically get one statement per block after splitting
     if statements.len() == 1 {
         match &statements[0] {
@@ -171,7 +167,10 @@ fn format_parsed_statements(
             Statement::CreateView(cv) => {
                 return format_create_view(&cv.name, cv.or_replace, &cv.query, config);
             }
-            Statement::CreateType { name, representation: Some(repr) } => {
+            Statement::CreateType {
+                name,
+                representation: Some(repr),
+            } => {
                 return format_create_type(name, repr, config);
             }
             Statement::Query(q) if config.query_style == QueryStyle::River => {
@@ -251,7 +250,10 @@ mod tests {
             result.contains("create table if not exists"),
             "Expected lowercase keywords, got: {result}"
         );
-        assert!(!result.contains("CREATE"), "Should not contain uppercase CREATE, got: {result}");
+        assert!(
+            !result.contains("CREATE"),
+            "Should not contain uppercase CREATE, got: {result}"
+        );
     }
 
     #[test]
@@ -323,8 +325,7 @@ mod tests {
         let input = "CREATE OR REPLACE FUNCTION my_func() RETURNS void AS $$\nBEGIN\n  RAISE NOTICE 'hello';\nEND;\n$$ LANGUAGE plpgsql;";
         let result = format_ddl(input, &FormatConfig::default());
         assert!(
-            result.contains("create or replace function")
-                || result.contains("CREATE OR REPLACE FUNCTION"),
+            result.contains("create or replace function") || result.contains("CREATE OR REPLACE FUNCTION"),
             "Header should be formatted, got: {result}"
         );
         assert!(
@@ -412,7 +413,10 @@ mod tests {
         let input = "SELECT id, name FROM users WHERE id = 1;";
         let result = format_ddl(input, &river_config());
         // "select" right-aligned at gutter 10: 4 spaces + "select"
-        assert!(result.contains("    select"), "select should be right-aligned: {result}");
+        assert!(
+            result.contains("    select"),
+            "select should be right-aligned: {result}"
+        );
         // "from" right-aligned: 6 spaces + "from"
         assert!(result.contains("      from"), "from should be right-aligned: {result}");
         // "where" right-aligned: 5 spaces + "where"
@@ -438,7 +442,10 @@ mod tests {
         assert!(result.contains("as user_id"), "alias user_id: {result}");
         assert!(result.contains("as ts"), "alias ts: {result}");
         // Aliases should be padded to align: "id" padded to "created_at" length
-        assert!(result.contains("id         as"), "id should be padded for alignment: {result}");
+        assert!(
+            result.contains("id         as"),
+            "id should be padded for alignment: {result}"
+        );
     }
 
     #[test]
@@ -464,8 +471,14 @@ mod tests {
 
         assert!(result.contains("left join"), "LEFT qualifier preserved: {result}");
         // Both ON conditions must survive.
-        assert!(result.contains("on f.id = n.folder_id"), "first join's ON kept: {result}");
-        assert!(result.contains("on p.id = f.project_id"), "left join's ON kept: {result}");
+        assert!(
+            result.contains("on f.id = n.folder_id"),
+            "first join's ON kept: {result}"
+        );
+        assert!(
+            result.contains("on p.id = f.project_id"),
+            "left join's ON kept: {result}"
+        );
         // The plain join keyword is present (and the ON is not dropped).
         assert!(result.contains("join folders"), "plain join present: {result}");
     }
@@ -477,7 +490,10 @@ mod tests {
         let input = "CREATE VIEW v AS WITH t AS (SELECT a, b FROM x JOIN y ON y.id = x.id) \
                      SELECT t.a FROM t;";
         let result = format_ddl(input, &river_config());
-        assert!(result.to_lowercase().contains("with t as"), "CTE must survive: {result}");
+        assert!(
+            result.to_lowercase().contains("with t as"),
+            "CTE must survive: {result}"
+        );
         assert!(result.contains("y.id = x.id"), "CTE inner join must survive: {result}");
     }
 
@@ -487,7 +503,10 @@ mod tests {
         // wildcard is emitted faithfully.
         let input = "CREATE VIEW v AS SELECT l.*, p.name FROM libs l JOIN projs p ON p.id = l.pid;";
         let result = format_ddl(input, &river_config());
-        assert!(!result.contains(".*.*"), "qualified wildcard must not be doubled: {result}");
+        assert!(
+            !result.contains(".*.*"),
+            "qualified wildcard must not be doubled: {result}"
+        );
         assert!(result.contains("l.*"), "l.* preserved: {result}");
     }
 
@@ -537,7 +556,10 @@ mod tests {
         let result = format_ddl(input, &FormatConfig::default());
         // Reformatted: each column on its own indented line (verbatim fallback,
         // which keeps `(a int`, would not produce this).
-        assert!(result.contains("\n  a"), "column a reformatted onto its own line: {result}");
+        assert!(
+            result.contains("\n  a"),
+            "column a reformatted onto its own line: {result}"
+        );
         assert!(result.contains("\n, b"), "leading-comma style applied: {result}");
         // Comments preserved and re-attached.
         assert!(result.contains("-- c1"), "trailing comment 1 kept: {result}");
@@ -602,7 +624,10 @@ mod tests {
         assert!(result.contains("-- real"), "the real trailing comment kept: {result}");
         // The string's inner `-- y` must not have leaked out as a second comment
         // onto its own line.
-        assert!(!result.contains("\n  -- y"), "string content must not become a comment: {result}");
+        assert!(
+            !result.contains("\n  -- y"),
+            "string content must not become a comment: {result}"
+        );
         let a = Parser::parse_sql(&PostgreSqlDialect {}, input).unwrap();
         let b = Parser::parse_sql(&PostgreSqlDialect {}, &result).unwrap();
         assert_eq!(a, b, "must preserve semantics: {result}");
@@ -615,7 +640,10 @@ mod tests {
         assert_eq!(FormatConfig::default().query_style, QueryStyle::River);
         // A view formatted with the default config gets river styling.
         let result = format_ddl("CREATE VIEW v AS SELECT a, b FROM x;", &FormatConfig::default());
-        assert!(result.contains("    select"), "default config should river-style: {result}");
+        assert!(
+            result.contains("    select"),
+            "default config should river-style: {result}"
+        );
     }
 
     #[test]
@@ -645,12 +673,14 @@ mod tests {
         // should be padded to align with ">" on login_count line.
         let lines: Vec<&str> = result.lines().collect();
         let where_line = lines.iter().find(|l| l.trim_start().starts_with("where")).unwrap();
-        let and_line   = lines.iter().find(|l| l.trim_start().starts_with("and")).unwrap();
+        let and_line = lines.iter().find(|l| l.trim_start().starts_with("and")).unwrap();
         // The operator column should be the same in both lines
         let op_col_where = where_line.find('=').expect("= in where line");
-        let op_col_and   = and_line.find('>').expect("> in and line");
-        assert_eq!(op_col_where, op_col_and,
-            "operators must align:\n  where: {where_line}\n  and:   {and_line}");
+        let op_col_and = and_line.find('>').expect("> in and line");
+        assert_eq!(
+            op_col_where, op_col_and,
+            "operators must align:\n  where: {where_line}\n  and:   {and_line}"
+        );
     }
 
     #[test]
@@ -659,8 +689,10 @@ mod tests {
         let result = format_ddl(input, &river_config());
         // "users" is 5 chars, "orders" is 6 chars → "users" padded by 1
         // Both aliases should appear after padding
-        assert!(result.contains("users  u") || result.contains("users u"),
-            "users alias present: {result}");
+        assert!(
+            result.contains("users  u") || result.contains("users u"),
+            "users alias present: {result}"
+        );
         assert!(result.contains("orders o"), "orders alias present: {result}");
         // Check alias positions match
         let lines: Vec<&str> = result.lines().collect();
@@ -668,8 +700,10 @@ mod tests {
         let join_line = lines.iter().find(|l| l.trim_start().starts_with("inner")).unwrap();
         let alias_u = from_line.find(" u").expect("alias u");
         let alias_o = join_line.find(" o").expect("alias o");
-        assert_eq!(alias_u, alias_o,
-            "table aliases must align:\n  from: {from_line}\n  join: {join_line}");
+        assert_eq!(
+            alias_u, alias_o,
+            "table aliases must align:\n  from: {from_line}\n  join: {join_line}"
+        );
     }
 
     #[test]
@@ -703,7 +737,8 @@ mod tests {
     #[test]
     fn r15_river_or_within_and_alignment() {
         // Multiple AND conditions with an embedded OR group — operators align per group
-        let input = "SELECT id FROM users WHERE active = true AND (status = 'approved' OR role = 'admin') AND count > 10;";
+        let input =
+            "SELECT id FROM users WHERE active = true AND (status = 'approved' OR role = 'admin') AND count > 10;";
         let result = format_ddl(input, &river_config());
         // Non-OR conditions should be present
         assert!(result.contains("active"), "active condition: {result}");
@@ -714,8 +749,10 @@ mod tests {
         // Inner OR operators should align (status=6 chars, role=4 → role padded)
         let lines: Vec<&str> = result.lines().collect();
         let or_line = lines.iter().find(|l| l.trim_start().starts_with("or")).unwrap();
-        assert!(or_line.contains("role   =") || or_line.contains("role ="),
-            "role should be padded for alignment: {result}");
+        assert!(
+            or_line.contains("role   =") || or_line.contains("role ="),
+            "role should be padded for alignment: {result}"
+        );
     }
 
     #[test]
@@ -767,7 +804,10 @@ mod tests {
         let config = river_config();
         let first = format_ddl(input, &config);
         let second = format_ddl(&first, &config);
-        assert_eq!(first, second, "river formatting should be idempotent:\nfirst:\n{first}\nsecond:\n{second}");
+        assert_eq!(
+            first, second,
+            "river formatting should be idempotent:\nfirst:\n{first}\nsecond:\n{second}"
+        );
     }
 
     // ── SQLite trigger splitter (R16–R19) ──────────────────────────────────

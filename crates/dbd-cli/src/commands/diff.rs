@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::design::Design;
 use dbd_core::SchemaDiff;
+use dbd_core::design::Design;
 
 use crate::output::{self, Verbosity};
 
@@ -41,8 +41,14 @@ pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
     for m in &d.matview_drift {
         match m.kind {
             MatviewDriftKind::Missing => lines.push(format!("  + create materialized view {}", m.name)),
-            MatviewDriftKind::Drifted => lines.push(format!("  ~ matview  {} (definition differs — drop + re-apply to update)", m.name)),
-            MatviewDriftKind::Unstamped => lines.push(format!("  ⚠ materialized view {}: not stamped by dbd (definition unverifiable)", m.name)),
+            MatviewDriftKind::Drifted => lines.push(format!(
+                "  ~ matview  {} (definition differs — drop + re-apply to update)",
+                m.name
+            )),
+            MatviewDriftKind::Unstamped => lines.push(format!(
+                "  ⚠ materialized view {}: not stamped by dbd (definition unverifiable)",
+                m.name
+            )),
             MatviewDriftKind::Orphan => lines.push(format!("  - materialized view {} (only in database)", m.name)),
         }
     }
@@ -62,12 +68,14 @@ pub async fn cmd_diff(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let adapter = get_adapter(config, database_url).await?;
 
-    let diff = design.diff_live(&*adapter, Some(&resolved)).await.context("Diff failed")?;
+    let diff = design
+        .diff_live(&*adapter, Some(&resolved))
+        .await
+        .context("Diff failed")?;
 
     if json {
         let doc = serde_json::to_string_pretty(&diff).context("Failed to serialize diff")?;
@@ -103,11 +111,18 @@ mod tests {
     use dbd_core::schema_diff::{MatviewDrift, MatviewDriftKind};
 
     fn add(name: &str) -> MigrationDiff {
-        MigrationDiff { entity_name: name.into(), entity_type: EntityType::Table, action: DiffAction::Add }
+        MigrationDiff {
+            entity_name: name.into(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Add,
+        }
     }
 
     fn mv(name: &str, kind: MatviewDriftKind) -> MatviewDrift {
-        MatviewDrift { name: name.into(), kind }
+        MatviewDrift {
+            name: name.into(),
+            kind,
+        }
     }
 
     /// In-sync diff renders the friendly "no differences" line.
@@ -121,9 +136,12 @@ mod tests {
     /// A create shows a `+ create` line and advisories are surfaced.
     #[test]
     fn renders_changes_and_advisories() {
-        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![],
+        let d = SchemaDiff {
+            changes: vec![add("public.audit_log")],
+            warnings: vec![],
             advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()],
-            matview_drift: vec![] };
+            matview_drift: vec![],
+        };
         let out = diff_report_lines(&d).join("\n");
         assert!(out.contains("+ create public.audit_log"), "got: {out}");
         assert!(out.contains("advisory"), "advisory must render; got: {out}");
@@ -135,7 +153,12 @@ mod tests {
     /// trips this test instead of silently breaking downstream tooling.
     #[test]
     fn json_shape_is_stable() {
-        let d = SchemaDiff { changes: vec![add("public.audit_log")], warnings: vec![], advisories: vec![], matview_drift: vec![] };
+        let d = SchemaDiff {
+            changes: vec![add("public.audit_log")],
+            warnings: vec![],
+            advisories: vec![],
+            matview_drift: vec![],
+        };
         let json = serde_json::to_string(&d).unwrap();
         // Top-level keys tooling depends on.
         assert!(json.contains("\"changes\""), "got: {json}");
@@ -184,15 +207,21 @@ mod tests {
             ],
         };
         let out = diff_report_lines(&d).join("\n");
-        assert!(out.contains("materialized view analytics.legacy: not stamped by dbd"), "got: {out}");
-        assert!(out.contains("- materialized view analytics.stale (only in database)"), "got: {out}");
+        assert!(
+            out.contains("materialized view analytics.legacy: not stamped by dbd"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("- materialized view analytics.stale (only in database)"),
+            "got: {out}"
+        );
     }
 
     #[test]
     fn exit_code_semantics() {
-        assert_eq!(diff_exit_code(true, false), None);   // flag off → no forced exit
-        assert_eq!(diff_exit_code(false, false), None);  // flag off → no forced exit
-        assert_eq!(diff_exit_code(true, true), Some(0));  // --exit-code, in sync
+        assert_eq!(diff_exit_code(true, false), None); // flag off → no forced exit
+        assert_eq!(diff_exit_code(false, false), None); // flag off → no forced exit
+        assert_eq!(diff_exit_code(true, true), Some(0)); // --exit-code, in sync
         assert_eq!(diff_exit_code(false, true), Some(2)); // --exit-code, drift
     }
 }

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use dbd_core::design::{ImportComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
@@ -40,8 +40,7 @@ pub fn cmd_import_dry_run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     // Ad-hoc single-file import plan: print the one line and write nothing.
     if let Some(path) = file {
@@ -75,9 +74,17 @@ pub fn cmd_import_dry_run(
 
     // Step 1: Data loading
     for entry in &plan {
-        let file = entry.table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+        let file = entry
+            .table
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_default();
         let fmt = entry.table.format.as_deref().unwrap_or("csv");
-        output::info(verbosity, &format!("  import {} ({}) ← {}", entry.table.name, fmt, file));
+        output::info(
+            verbosity,
+            &format!("  import {} ({}) ← {}", entry.table.name, fmt, file),
+        );
     }
 
     // Step 2: Import procedures
@@ -91,12 +98,17 @@ pub fn cmd_import_dry_run(
         }
     }
 
-    // Step 3: After scripts
-    if !design.config().import.after.is_empty() {
+    // Step 3: After scripts — resolved through the same scope filter the real
+    // run applies, so the preview never lists a hook that would be skipped.
+    let (after_scripts, after_warnings) = design.import_after_preview(Some(&resolved))?;
+    if !after_scripts.is_empty() {
         output::info(verbosity, "");
-        for after_file in &design.config().import.after {
-            output::info(verbosity, &format!("  run {after_file}"));
+        for script in &after_scripts {
+            output::info(verbosity, &format!("  run {script}"));
         }
+    }
+    for warning in &after_warnings {
+        output::warn(warning);
     }
 
     output::summary(0, 0, plan.len());
@@ -115,8 +127,7 @@ pub async fn cmd_import(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     // `--file` without `--name` is rejected before a connection is attempted, so
     // the error is about the flags rather than the database.
@@ -207,7 +218,19 @@ pub async fn cmd_export(
     verbosity: Verbosity,
 ) -> Result<()> {
     let adapter = get_adapter(config, database_url).await?;
-    export_with_adapter(&*adapter, config, env, project_dir, name, format, output, scope, deps, verbosity).await
+    export_with_adapter(
+        &*adapter,
+        config,
+        env,
+        project_dir,
+        name,
+        format,
+        output,
+        scope,
+        deps,
+        verbosity,
+    )
+    .await
 }
 
 /// The body of `dbd export`, with the adapter supplied rather than connected.
@@ -228,16 +251,12 @@ pub(crate) async fn export_with_adapter(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     // Restrict to the scope's working set (all entities for the all-scope).
     let resolved = design.resolve_scope(scope, deps)?;
-    let in_scope: std::collections::HashSet<String> = design
-        .scoped_entities(&resolved)?
-        .into_iter()
-        .map(|e| e.name)
-        .collect();
+    let in_scope: std::collections::HashSet<String> =
+        design.scoped_entities(&resolved)?.into_iter().map(|e| e.name).collect();
 
     // Build a name→format map from config export entries (per-table overrides).
     let config_format_map: std::collections::HashMap<String, String> = design
@@ -251,19 +270,27 @@ pub(crate) async fn export_with_adapter(
     // The scope's working set filters either branch.
     let tables: Vec<&dbd_core::Entity> = if !design.config().export.is_empty() {
         let export_names: Vec<String> = design.config().export.iter().map(|e| e.name()).collect();
-        design.entities().iter()
+        design
+            .entities()
+            .iter()
             .filter(|e| e.entity_type == dbd_core::EntityType::Table)
             .filter(|e| export_names.contains(&e.name))
             .filter(|e| in_scope.contains(&e.name))
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
             .collect()
     } else {
-        design.entities().iter()
+        design
+            .entities()
+            .iter()
             .filter(|e| e.entity_type == dbd_core::EntityType::Table)
             .filter(|e| in_scope.contains(&e.name))
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
             .collect()
     };
+
+    // Say the export was narrowed before reporting what it found: "No tables to
+    // export" on a scoped run otherwise reads as an empty database.
+    output::scope_filtered(&resolved, in_scope.len(), design.entities().len());
 
     if tables.is_empty() {
         output::info(verbosity, "No tables to export.");
@@ -274,19 +301,20 @@ pub(crate) async fn export_with_adapter(
 
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
-        let effective_format = config_format_map
-            .get(&table.name)
-            .map(|s| s.as_str())
-            .unwrap_or(format);
+        let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
 
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
-        adapter.export_data(&export_entity, output).await
+        adapter
+            .export_data(&export_entity, output)
+            .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
     }
 
-    let dest = output.map(|p| p.display().to_string()).unwrap_or_else(|| "export/".to_string());
+    let dest = output
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "export/".to_string());
     output::info(verbosity, &format!("Export complete. Files written to {dest}"));
     Ok(())
 }
@@ -324,7 +352,8 @@ mod tests {
     /// falls back verbatim.
     #[test]
     fn resolve_table_name_matches_and_falls_back() {
-        let design = Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
         assert!(resolve_table_name(&design, "lookups").ends_with("lookups"));
         assert_eq!(resolve_table_name(&design, "nope_not_here"), "nope_not_here");
     }
@@ -333,15 +362,31 @@ mod tests {
     /// plan, prints it, writes nothing.
     #[test]
     fn import_dry_run_full_plan_on_fixture() {
-        cmd_import_dry_run(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, None, None, None, Verbosity::Verbose).unwrap();
+        cmd_import_dry_run(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            None,
+            None,
+            Verbosity::Verbose,
+        )
+        .unwrap();
     }
 
     /// Ad-hoc single-file dry-run prints one line for the resolved target.
     #[test]
     fn import_dry_run_adhoc_file() {
         cmd_import_dry_run(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            Some("lookups"), Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            Some("lookups"),
+            Some(Path::new("data/x.csv")),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .unwrap();
     }
@@ -350,8 +395,14 @@ mod tests {
     #[test]
     fn import_dry_run_file_without_name_bails() {
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            None, Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            Some(Path::new("data/x.csv")),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .unwrap_err();
         assert!(err.to_string().contains("--file requires --name"), "got: {err}");
@@ -360,8 +411,15 @@ mod tests {
     #[tokio::test]
     async fn import_file_without_name_bails_before_db() {
         let err = cmd_import(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, Some(Path::new("data/x.csv")), None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            Some(Path::new("data/x.csv")),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -378,8 +436,7 @@ mod tests {
     use dbd_core::adapter::mock::MockAdapter;
 
     fn fixture_design() -> Design {
-        Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures()))
-            .unwrap()
+        Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap()
     }
 
     /// An ad-hoc `--file` import resolves the bare name to its schema-qualified
@@ -389,8 +446,13 @@ mod tests {
         let mock = MockAdapter::new();
         let design = fixture_design();
         import_with_adapter(
-            &mock, &design, Some("lookups"), Some(Path::new("data/lookups.csv")),
-            None, None, Verbosity::Normal,
+            &mock,
+            &design,
+            Some("lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -411,8 +473,13 @@ mod tests {
         let mock = MockAdapter::new();
         let design = fixture_design();
         import_with_adapter(
-            &mock, &design, Some("not_a_fixture_table"), Some(Path::new("data/x.jsonl")),
-            None, None, Verbosity::Normal,
+            &mock,
+            &design,
+            Some("not_a_fixture_table"),
+            Some(Path::new("data/x.jsonl")),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -430,8 +497,16 @@ mod tests {
     async fn export_format_precedence_config_override_beats_cli_flag() {
         let mock = MockAdapter::new();
         export_with_adapter(
-            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            None, "tsv", None, None, None, Verbosity::Normal,
+            &mock,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            "tsv",
+            None,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -472,8 +547,16 @@ mod tests {
 
         let mock = MockAdapter::new();
         export_with_adapter(
-            &mock, &cfg, "dev", proj.path(),
-            None, "csv", None, None, None, Verbosity::Normal,
+            &mock,
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            "csv",
+            None,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -502,8 +585,16 @@ mod tests {
             .expect("fixture has at least one table");
 
         export_with_adapter(
-            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            Some(&target), "csv", None, None, None, Verbosity::Normal,
+            &mock,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            Some(&target),
+            "csv",
+            None,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -522,8 +613,16 @@ mod tests {
     async fn export_unknown_name_exports_nothing() {
         let mock = MockAdapter::new();
         export_with_adapter(
-            &mock, &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            Some("no_such_table"), "csv", None, None, None, Verbosity::Normal,
+            &mock,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            Some("no_such_table"),
+            "csv",
+            None,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();

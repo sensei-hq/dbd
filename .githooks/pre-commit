@@ -14,4 +14,11 @@ cargo clippy --all-targets --quiet -- -D warnings 2>&1 || {
     exit 1
 }
 
+echo "Running cargo fmt --check..."
+cargo fmt --all --check || {
+    echo ""
+    echo "Formatting differs from rustfmt.toml. Run 'cargo fmt --all' and re-commit."
+    exit 1
+}
+
 echo "All checks passed."
