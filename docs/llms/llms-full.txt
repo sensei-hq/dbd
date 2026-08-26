@@ -734,6 +734,12 @@ dbd graph -n config.lookups             # subgraph from one entity
 dbd graph --scope hub                    # filter to the 'hub' scope (composes with -n)
 ```
 
+Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`.
+`scope` (v0.12.0+) names the scope the graph was narrowed to, `null` when
+unscoped — in the JSON rather than beside it, since stdout is a contract here.
+The other scope-filtering commands (`dbml`, `combine`, `export`) print
+`scope '<name>': <kept> of <total> entities`; unscoped runs print nothing.
+
 ### dbd diagram
 
 ```sh

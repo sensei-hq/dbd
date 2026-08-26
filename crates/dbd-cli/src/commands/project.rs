@@ -29,6 +29,11 @@ pub fn cmd_graph(
             "from": e.from, "to": e.to,
         })).collect::<Vec<_>>(),
         "layers": graph.layers,
+        // Named in the document rather than printed beside it: stdout here is a
+        // JSON contract (`dbd graph | jq`), and a graph that silently omits a
+        // schema is indistinguishable from a complete one. Null for the
+        // all-scope, which filters nothing.
+        "scope": (!resolved.is_all).then(|| resolved.name.clone()),
     });
 
     output::always(&serde_json::to_string_pretty(&json)?);
@@ -55,6 +60,7 @@ pub fn cmd_dbml(
     // entities that deploy under this scope. The all-scope keeps everything.
     let resolved = design.resolve_scope(scope, deps)?;
     let entities = design.scoped_entities(&resolved)?;
+    output::scope_filtered(&resolved, entities.len(), design.entities().len());
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,

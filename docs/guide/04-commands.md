@@ -249,9 +249,11 @@ dbd graph -n config.lookups        # Subgraph reachable from one entity
 dbd graph --scope hub              # Only the 'hub' scope's working set
 ```
 
-Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
+Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`
 
 `--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose.
+
+**`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. The other scope-filtering commands (`dbml`, `combine`, `export`) print `scope '<name>': <kept> of <total> entities` instead; unscoped runs print nothing.
 
 ---
 
