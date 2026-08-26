@@ -20,6 +20,7 @@ mod reconcile;
 mod import;
 mod reset;
 mod plan;
+mod hooks;
 
 pub use plan::{build_execution_plan, ApplyStrategy, ExecutionPlan, ExecutionStep};
 

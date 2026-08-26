@@ -95,7 +95,7 @@ pub fn cmd_import_dry_run(
     if !design.config().import.after.is_empty() {
         output::info(verbosity, "");
         for after_file in &design.config().import.after {
-            output::info(verbosity, &format!("  run {after_file}"));
+            output::info(verbosity, &format!("  run {}", after_file.script()));
         }
     }
 

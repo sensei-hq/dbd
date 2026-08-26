@@ -24,6 +24,8 @@ pub struct DesignConfig {
     #[serde(default)]
     pub import: ImportConfig,
     #[serde(default)]
+    pub apply: ApplyConfig,
+    #[serde(default)]
     pub export: Vec<ExportEntry>,
     #[serde(default)]
     pub materialized_views: MaterializedViewsConfig,
@@ -250,7 +252,7 @@ pub struct ImportConfig {
     #[serde(default)]
     pub tables: Vec<ImportTableEntry>,
     #[serde(default)]
-    pub after: Vec<String>,
+    pub after: Vec<ScriptEntry>,
 }
 
 impl ImportConfig {
@@ -355,6 +357,50 @@ pub struct ImportTableOptions {
 pub enum EnvValue {
     Single(String),
     Multiple(Vec<String>),
+}
+
+// ── Lifecycle script hooks ──────────────────────────────
+
+/// A lifecycle hook script: a project-relative path, optionally with the tables
+/// it touches declared explicitly.
+///
+/// Mirrors [`ImportTableEntry`]'s bare-or-object shape. The object form is not
+/// an escape hatch for an exotic edge: measured against a real project's
+/// realtime-publication hook, a script naming its tables inside a `format()`
+/// string or an `array[…]` literal — never as a SQL identifier — is opaque to
+/// every accessor libpg_query offers. Scope filtering has nothing to derive
+/// unless the writes are told to it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptEntry {
+    Path(String),
+    WithWrites { script: String, writes: Vec<String> },
+}
+
+impl ScriptEntry {
+    pub fn script(&self) -> &str {
+        match self {
+            Self::Path(p) => p,
+            Self::WithWrites { script, .. } => script,
+        }
+    }
+
+    /// Explicitly declared tables, or `None` to derive them from the SQL.
+    pub fn declared_writes(&self) -> Option<&[String]> {
+        match self {
+            Self::Path(_) => None,
+            Self::WithWrites { writes, .. } => Some(writes),
+        }
+    }
+}
+
+/// Hooks around the DDL apply phase.
+#[derive(Debug, Default, Deserialize)]
+pub struct ApplyConfig {
+    #[serde(default)]
+    pub before: Vec<ScriptEntry>,
+    #[serde(default)]
+    pub after: Vec<ScriptEntry>,
 }
 
 // ── Export ───────────────────────────────────────────────
@@ -721,7 +767,8 @@ mod tests {
         assert_eq!(config.import.tables.len(), 2);
         assert_eq!(config.import.tables[0].name(), "staging.lookups");
         assert_eq!(config.import.tables[1].name(), "staging.lookup_values");
-        assert_eq!(config.import.after, vec!["import/loader.sql"]);
+        assert_eq!(config.import.after.len(), 1);
+        assert_eq!(config.import.after[0].script(), "import/loader.sql");
     }
 
     #[test]
@@ -1070,5 +1117,60 @@ schemas:
         let yaml = "project:\n  name: t\nschemas:\n  - staging: {}\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.schema_grants().is_empty());
+    }
+
+    #[test]
+    fn a_bare_path_script_entry_parses() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\nimport:\n  after:\n    - import/loader.sql\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.import.after.len(), 1);
+        assert_eq!(cfg.import.after[0].script(), "import/loader.sql");
+        assert!(cfg.import.after[0].declared_writes().is_none());
+    }
+
+    #[test]
+    fn a_script_entry_with_explicit_writes_parses() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\nimport:\n  after:\n    - script: import/dyn.sql\n      writes: [app.target]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.import.after[0].script(), "import/dyn.sql");
+        assert_eq!(
+            cfg.import.after[0].declared_writes(),
+            Some(&vec!["app.target".to_string()][..])
+        );
+    }
+
+    /// The two forms must mix in one list — a project migrating to explicit
+    /// writes should not have to convert every entry at once.
+    #[test]
+    fn both_forms_mix_in_one_list() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\nimport:\n  after:\n    - a.sql\n    - script: b.sql\n      writes: [x.y]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.import.after.len(), 2);
+        assert!(cfg.import.after[0].declared_writes().is_none());
+        assert!(cfg.import.after[1].declared_writes().is_some());
+    }
+
+    #[test]
+    fn the_apply_block_parses_before_and_after() {
+        let cfg: DesignConfig = serde_yaml::from_str(
+            "project:\n  name: t\napply:\n  before: [pre.sql]\n  after: [post.sql]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.apply.before.len(), 1);
+        assert_eq!(cfg.apply.after.len(), 1);
+    }
+
+    /// Every existing project omits `apply:` entirely.
+    #[test]
+    fn an_absent_apply_block_defaults_to_empty() {
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
+        assert!(cfg.apply.before.is_empty());
+        assert!(cfg.apply.after.is_empty());
     }
 }
