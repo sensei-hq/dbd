@@ -1,0 +1,10 @@
+# Revisions that only reformat. `git blame` skips these so it keeps pointing at
+# the commit that actually wrote a line.
+#
+# Enable locally (once per clone):
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically.
+
+# style: adopt rustfmt across the tree (max_width = 120)
+28d1d7681da66501f74559606e709ae78d4e1f19
