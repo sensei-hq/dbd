@@ -45,7 +45,13 @@ pub async fn cmd_inspect(
 
     report_scope_gaps(&resolved, &report, verbosity)?;
 
-    let total_entities = design.entities().len();
+    // Count what this run is actually about. Under a scope the whole-project
+    // total contradicts the "scope 'X': N entities" line printed just above.
+    let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
+    let total_entities = match scope_name {
+        Some(_) => resolved.entities.len(),
+        None => design.entities().len(),
+    };
 
     if verbosity.is_verbose()
         && let Some(entity) = &report.entity
@@ -53,7 +59,7 @@ pub async fn cmd_inspect(
         output::always(&serde_json::to_string_pretty(entity)?);
     }
 
-    print_report_findings(&report, verbosity);
+    print_report_findings(&report, scope_name, verbosity);
 
     // Auto-format DDL files when --fix is passed
     if fix {
@@ -79,11 +85,15 @@ pub async fn cmd_inspect(
     );
     print_matview_errors(&matview_errors);
 
-    output::summary(
-        report.issues.len() + todos.len() + matview_errors.len(),
-        report.warnings.len(),
-        total_entities,
-    );
+    let blocking = report.issues.len() + todos.len() + matview_errors.len();
+    output::summary(blocking, report.warnings.len(), total_entities);
+    if !report.out_of_scope_issues.is_empty() {
+        output::always(&format!(
+            "({} error(s) outside scope '{}')",
+            report.out_of_scope_issues.len(),
+            scope_name.unwrap_or("all"),
+        ));
+    }
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
@@ -92,6 +102,13 @@ pub async fn cmd_inspect(
         &design.config().source.dialect,
     );
     print_enum_hints(&enum_hints);
+
+    // Report first, then fail. The findings above are the useful output; an
+    // early return would print an "Error:" line instead of them.
+    let code = inspect_exit_code(blocking);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -174,20 +191,46 @@ fn report_scope_gaps(
 }
 
 /// Print entity errors and warnings, or an all-clear message when there's neither.
-fn print_report_findings(report: &dbd_core::design::Report, verbosity: Verbosity) {
-    if !report.issues.is_empty() {
-        output::always("Errors:");
-        for entity in &report.issues {
-            let label = entity
-                .file
-                .as_ref()
-                .map(|f| f.display().to_string())
-                .unwrap_or_else(|| entity.name.clone());
-            output::always(&format!("\n{label} =>"));
-            for err in &entity.errors {
-                output::always(&format!("  {err}"));
-            }
+/// One `file =>` block per errored entity, then its messages.
+fn print_entity_problems(entities: &[dbd_core::Entity]) {
+    for entity in entities {
+        let label = entity
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| entity.name.clone());
+        output::always(&format!("\n{label} =>"));
+        for err in &entity.errors {
+            output::always(&format!("  {err}"));
         }
+    }
+}
+
+fn print_report_findings(report: &dbd_core::design::Report, scope_name: Option<&str>, verbosity: Verbosity) {
+    if !report.issues.is_empty() {
+        match scope_name {
+            Some(name) => output::always(&format!("Errors (blocking scope '{name}'):")),
+            None => output::always("Errors:"),
+        }
+        print_entity_problems(&report.issues);
+        // An entity that failed to parse is dropped from the desired set, so a
+        // run would build a database missing it. `ensure_fully_parsed` refuses
+        // rather than do that — say so here, or the report reads as advisory
+        // and the refusal later looks like a new problem.
+        output::always(
+            "\n  → dbd apply / reconcile / deploy will refuse to run until these are fixed.",
+        );
+    }
+
+    // Errored files the scope excludes. Not blocking this run, but never
+    // silent: a file no scope builds is exactly how a broken file survives.
+    if !report.out_of_scope_issues.is_empty() {
+        let name = scope_name.unwrap_or("the active scope");
+        output::always(&format!("\nOut of scope — not blocking '{name}':"));
+        print_entity_problems(&report.out_of_scope_issues);
+        output::always(&format!(
+            "\n  → these files are not built by '{name}', so it can run. They will block a run whose scope includes them."
+        ));
     }
 
     if !report.warnings.is_empty() {
@@ -205,9 +248,25 @@ fn print_report_findings(report: &dbd_core::design::Report, verbosity: Verbosity
         }
     }
 
-    if report.issues.is_empty() && report.warnings.is_empty() {
+    if report.issues.is_empty() && report.out_of_scope_issues.is_empty() && report.warnings.is_empty()
+    {
         output::info(verbosity, "Everything looks ok");
     }
+}
+
+/// The process exit code for an inspect run.
+///
+/// Non-zero when the design carries anything that would stop a run, so a CI
+/// gate running `dbd inspect` fails on exactly what `dbd apply` would refuse
+/// on. It exited 0 here for every release up to v0.12.0, which made
+/// `apply`'s own "run `dbd inspect` for the full report" advice point at a
+/// command that passed green on the very file apply was rejecting.
+///
+/// Out-of-scope errors are deliberately excluded: the scoped run they do not
+/// belong to still succeeds, and failing it would punish the scope that is
+/// correct.
+pub(crate) fn inspect_exit_code(blocking_errors: usize) -> i32 {
+    if blocking_errors > 0 { 1 } else { 0 }
 }
 
 /// Auto-format every DDL file under `project_dir` in place (the `--fix` path).
@@ -862,11 +921,38 @@ mod tests {
         let report = dbd_core::design::Report {
             entity: None,
             issues: vec![broken],
+            out_of_scope_issues: vec![],
             warnings: vec![],
             gaps: vec![],
         };
         // Exercises the issues-loop formatting (label fallback + per-error line).
-        print_report_findings(&report, Verbosity::Normal);
+        print_report_findings(&report, None, Verbosity::Normal);
+    }
+
+    /// The out-of-scope branch renders its own heading and does not touch the
+    /// blocking one — a scoped run with only excluded errors must not read as
+    /// if it were broken.
+    #[test]
+    fn print_report_findings_renders_out_of_scope_branch() {
+        let mut broken = dbd_core::Entity::new(dbd_core::EntityType::Table, "svc.broken");
+        broken.errors.push("parse error: unexpected token".to_string());
+        let report = dbd_core::design::Report {
+            entity: None,
+            issues: vec![],
+            out_of_scope_issues: vec![broken],
+            warnings: vec![],
+            gaps: vec![],
+        };
+        print_report_findings(&report, Some("daemon"), Verbosity::Normal);
+    }
+
+    /// The exit code is the contract a CI gate depends on: non-zero on exactly
+    /// what `apply` would refuse on, zero otherwise.
+    #[test]
+    fn inspect_exit_code_semantics() {
+        assert_eq!(inspect_exit_code(0), 0, "a clean design must exit 0");
+        assert_eq!(inspect_exit_code(1), 1, "a blocking error must exit non-zero");
+        assert_eq!(inspect_exit_code(9), 1);
     }
 
     /// A wildcard scope with every dependency present hits the "no gaps"

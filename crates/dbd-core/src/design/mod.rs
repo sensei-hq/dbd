@@ -243,7 +243,15 @@ pub fn import_entry_in_scope(
 #[derive(Debug, Clone)]
 pub struct Report {
     pub entity: Option<Entity>,
+    /// Errored entities the active scope actually builds. These are exactly
+    /// what [`Design::ensure_fully_parsed`] refuses on, so `inspect` and
+    /// `apply` agree about what is broken.
     pub issues: Vec<Entity>,
+    /// Errored entities the active scope excludes. A scoped run never touches
+    /// them, so they must not be reported as blocking it — but they are still
+    /// reported, because a file that no scope builds is how a broken file goes
+    /// unnoticed. Always empty without a scope, or under `all`.
+    pub out_of_scope_issues: Vec<Entity>,
     pub warnings: Vec<Entity>,
     pub gaps: Vec<crate::scope::ScopeGap>,
 }
@@ -758,8 +766,25 @@ impl Design {
 
         let entity = name.and_then(|n| self.entities.iter().find(|e| e.name == n).cloned());
 
-        let issues = self.filtered_entities(name, |e| !e.errors.is_empty());
+        let all_issues = self.filtered_entities(name, |e| !e.errors.is_empty());
         let warnings = self.filtered_entities(name, |e| !e.warnings.is_empty());
+
+        // Split the errors the same way `ensure_fully_parsed` does, so the
+        // report agrees with what a run would actually refuse on. Reporting an
+        // out-of-scope parse error as blocking sends people to fix a file the
+        // scoped run never reads.
+        let (issues, out_of_scope_issues) = match scope {
+            Some(s) if !s.is_all => match self.working_set(s) {
+                Ok(ws) => all_issues
+                    .into_iter()
+                    .partition(|e| Self::entity_in_scope(e, s, &ws)),
+                // Working set unavailable: treat every error as blocking. The
+                // conservative direction — a spurious error is a nuisance, a
+                // hidden one is the failure this reporting exists to prevent.
+                Err(_) => (all_issues, Vec::new()),
+            },
+            _ => (all_issues, Vec::new()),
+        };
 
         let gaps = match scope {
             Some(s) => crate::scope::analyze_gaps(s, &self.entities, &self.external_names()),
@@ -769,6 +794,7 @@ impl Design {
         Report {
             entity,
             issues,
+            out_of_scope_issues,
             warnings,
             gaps,
         }
@@ -2814,6 +2840,91 @@ import:
         assert!(
             warnings.iter().any(|w| w.contains("policy skipped") && w.contains("metrics.sql")),
             "skipped policy must surface as a warning: {warnings:?}"
+        );
+    }
+
+    /// The report's error split must be the same judgement `ensure_fully_parsed`
+    /// makes, or `inspect` and `apply` disagree about what is broken. Before
+    /// this, `inspect --scope daemon` reported a parse error in an excluded
+    /// schema while `apply --scope daemon` applied cleanly and exited 0.
+    #[test]
+    fn scoped_report_blocks_on_exactly_what_apply_refuses_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/svc")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id int primary key);",
+        )
+        .unwrap();
+        // Broken, and in the schema the scope excludes.
+        std::fs::write(
+            tmp.path().join("ddl/table/svc/broken.ddl"),
+            "set search_path to svc;\ncreate table if not exists broken (id int,,,);",
+        )
+        .unwrap();
+
+        let mut design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+
+        let report = design.report(None, Some(&scope));
+        assert!(
+            report.issues.is_empty(),
+            "the excluded file must not block scope 'daemon': {:?}",
+            report.issues.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(report.out_of_scope_issues.len(), 1, "but it must still be reported");
+        assert_eq!(report.out_of_scope_issues[0].name, "svc.broken");
+
+        // The property under test: the scoped run agrees.
+        assert!(
+            design.ensure_fully_parsed(Some(&scope), Some(&ws), None).is_ok(),
+            "apply --scope daemon must not refuse when nothing in scope is broken"
+        );
+        // And unscoped, the same file does block.
+        assert!(
+            design.ensure_fully_parsed(None, None, None).is_err(),
+            "an unscoped run must still refuse"
+        );
+    }
+
+    /// The inverse: a broken file the scope *does* build must block it, and
+    /// must not be filed as out-of-scope.
+    #[test]
+    fn scoped_report_blocks_on_an_in_scope_parse_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/broken.ddl"),
+            "set search_path to app;\ncreate table if not exists broken (id int,,,);",
+        )
+        .unwrap();
+
+        let mut design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+
+        let report = design.report(None, Some(&scope));
+        assert_eq!(report.issues.len(), 1, "an in-scope parse error must block");
+        assert!(report.out_of_scope_issues.is_empty(), "and must not be filed as out-of-scope");
+        assert!(
+            design.ensure_fully_parsed(Some(&scope), Some(&ws), None).is_err(),
+            "apply --scope daemon must refuse"
         );
     }
 
