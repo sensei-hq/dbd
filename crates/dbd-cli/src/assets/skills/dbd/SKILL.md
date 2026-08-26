@@ -35,8 +35,9 @@ Each file is parsed once into `Entity` + `TableDef`; that structure drives every
 feature (dependency graph, apply, migrations, DBML, diagram, import).
 
 `design.yaml` holds `project`, `source.dialect`, `target.<name>.url` (use
-`$ENV_VAR` — never hardcode secrets), `schemas`, `import`/`export`, `dbml`,
-`scopes`, and `ignore`. See the full reference for the annotated schema.
+`$ENV_VAR` — never hardcode secrets), `schemas`, `apply` (lifecycle hooks),
+`import`/`export`, `dbml`, `scopes`, and `ignore`. See the full reference for
+the annotated schema.
 
 ## CLI command map
 
@@ -44,7 +45,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 |---|---|
 | `dbd init` | Scaffold a project; or reverse-engineer one with `--from-db <conn>` / `--from-dbml <file>` (refuses over a dbd-managed DB — use `merge`) |
 | `dbd merge` | Sync a live DB / DBML back into the project (reverse + reconcile; never edits `design.yaml`) |
-| `dbd inspect` | **Validate**: report entity errors/warnings + scope gaps. `--from-db` resolves refs against the live catalog and caches to `.dbd/refcache.json`. **Offline & no SQL execution** |
+| `dbd inspect` | **Validate**: report entity errors/warnings + scope gaps. **Exits 1 on blocking errors** (since v0.12.0 — was always 0). Under `--scope`, splits errors into blocking vs out-of-scope. `--from-db` resolves refs against the live catalog and caches to `.dbd/refcache.json`. **Offline & no SQL execution** |
 | `dbd apply` | Apply schemas + entities + pending migrations (blocks on migration TODOs). `--with-policies` also applies RLS. Scope-guarded — `--allow-scope-change` to re-pin |
 | `dbd deploy --source owner/repo/path` | Fetch (GitHub) → apply → import → **apply RLS policies**. `--no-cache` / `--clear-cache`. Scope-guarded — `--allow-scope-change` to re-pin |
 | `dbd reconcile` | Pre-release declarative diff+`CREATE`/`ALTER` in place (no snapshots). `--allow-destructive`, `--prune`, `--allow-scope-change`. Disabled after `release` |
@@ -54,7 +55,7 @@ feature (dependency graph, apply, migrations, DBML, diagram, import).
 | `dbd import` / `export` | Load / dump table data (CSV/TSV/JSONL) via the `import/` & `export/` conventions. Env-scoped: `import/<env>/<schema>/<file>` loads only when `-e <env>` matches; `import/<schema>/<file>` loads always. Never skips silently — see the seed-data gotcha below |
 | `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
-| `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward) |
+| `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward). Honors `--scope`: a policy whose table the scope excludes is skipped and reported |
 | `dbd doctor [--fix]` | Audit/repair config + layout: old design.yaml, stale files, plural dirs (`--fix` migrates these). Also flags **misfiled view/matview DDL** (a `CREATE MATERIALIZED VIEW` under `ddl/view/`, or a plain view under `ddl/materialized_view/`) — reported with a move hint, **not** auto-fixed. Run it to verify layout before `reset`/`apply` |
 | `dbd reset` | Drop the project's own objects (guarded by the bookkeeping env check — `dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite; blocked in prod / post-v1). Also scope-guarded — `--force` or `--allow-scope-change` bypasses |
 | `dbd format [--check]` | DDL formatter (river-style SELECT bodies; `--check` for pre-commit) |
@@ -113,6 +114,72 @@ policy file is **non-fatal** — warned and counted, exit still 0. "The deploy
 succeeded" does not mean RLS is in place. `dbd apply` skips policies entirely
 unless given `--with-policies`.
 
+Under `--scope`, a policy whose table is outside the working set is **skipped,
+not run** — its target is read from the path (`policies/<schema>/<table>.sql`).
+Before this, a policy for a schema a given plane lacks ran anyway and reported
+`FAILED … schema X does not exist` on every deploy: an expected condition
+dressed as an error, which is how real failures stop being read. Skips are
+reported per file and counted in the deploy summary.
+
+## Lifecycle script hooks — `apply.before` / `apply.after` / `import.after`
+
+For SQL dbd does not model: attaching a table to a publication (Supabase
+realtime), `grant`s, and other post-DDL setup.
+
+```yaml
+apply:
+  before:
+    - sql/pre_ddl.sql
+  after:
+    - sql/realtime.sql               # deps derived by parsing the SQL
+    - script: sql/grants.sql         # deps declared explicitly
+      writes: [app.messages]
+import:
+  after:
+    - import/loader.sql
+```
+
+| Hook | Runs | Position |
+|---|---|---|
+| `apply.before` | `apply` **and** `deploy` | after design + scope checks pass, before the first entity |
+| `apply.after` | `apply` **and** `deploy` | after every entity applied and matview stamped, **before** `policies/` |
+| `import.after` | `deploy` **only** | after data load |
+
+**The trap: `import.after` never runs on `dbd apply`.** Only the deploy path
+reaches the import phase. Post-DDL SQL parked in `import.after` — because it
+was the only hook that existed — silently does nothing on `dbd apply`. If a
+hook's job is "run once every entity exists", it belongs in `apply.after`.
+
+**Migrating a realtime/publication hook** (the common case):
+
+```yaml
+# before — runs on deploy, silently skipped on apply
+import:
+  after: [import/after/realtime_publication.sql]
+
+# after — runs on both, and scope-aware
+apply:
+  after:
+    - script: import/after/realtime_publication.sql
+      writes: [app.relay_sessions, app.relay_segments, app.relay_inbox]
+```
+
+`writes:` is **required** for this shape, not optional. dbd derives a script's
+tables by parsing it, which only works when they appear as SQL identifiers. A
+realtime hook names its tables as *data* — inside `array['a','b']` and
+`format('alter publication … %I', t)` — where `select_tables()`/`dml_tables()`
+return empty. No parser can recover those. Declare them.
+
+**Scope filtering.** A hook runs only when every table it depends on is in the
+working set (the same rule as staging entries); otherwise it is skipped and
+reported, and the run continues. A script whose deps cannot be derived and that
+declares no `writes:` **always runs** — the safe direction. Scope filtering is a
+correctness aid, **not a security boundary**; never use a scope to prevent a
+hook running.
+
+Scripts run in list order. A path dbd cannot find is an **error, not a skip**.
+Paths must stay in the project — `..` and absolute paths are refused.
+
 ## Workflow — pre-release vs upgrades (read this before changing a schema)
 
 dbd has **two** schema-change workflows and using the wrong one corrupts the
@@ -146,6 +213,8 @@ Otherwise it is **pre-release**.
 - **String-set `CHECK` → consider an enum**: `check (status in ('a','b'))` is better modeled as a Postgres `enum` (`ddl/enum/…`) for type safety + introspection. `dbd inspect` suggests these.
 - **`inspect` doesn't check column-level refs** (index/CHECK/FK column lists) — those fail at `apply` as DB errors, not at `inspect`.
 - **Seed data lands where the env says it does**: `import/<env>/…` only loads under `-e <env>`. If a deploy must seed rows, check the reported import count (never assume) and confirm `policies/` is applied by `deploy`, not by a bare `apply`.
+- **Post-DDL SQL belongs in `apply.after`, not `import.after`** — `import.after` runs only on `deploy`, so on `dbd apply` it silently does nothing. Move any "run once every entity exists" hook (realtime publications, grants) to `apply.after`, and declare `writes:` when the tables are `format()`/`array[…]` data rather than SQL identifiers.
+- **`dbd inspect` exits 1 on blocking errors** (v0.12.0+). Safe to use as a CI gate; a pipeline that relied on it always exiting 0 will now fail on a broken design.
 - **Run `dbd doctor` to verify layout** before `reset`/`apply`. Beyond old-format config, stale files, and plural folders (all `--fix`-able), it flags **misfiled view/matview DDL**: dbd types an entity by its folder, so a `CREATE MATERIALIZED VIEW` sitting under `ddl/view/` is treated as a plain view and `dbd reset` emits `DROP VIEW` on it → `"… is not a view"`. doctor prints the file and a move hint (`→ ddl/materialized_view/<schema>/…`); move the file to fix (not auto-fixed — folder = type is the source of truth).
 
 ## Materialized views
@@ -182,8 +251,9 @@ let design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // 2. Validate offline — no DB needed.
 let report = design.report(None, None);
-//    report.issues   → entities with errors
-//    report.warnings → entities with warnings (e.g. unresolved entity refs)
+//    report.issues              → errors blocking the active scope (what apply refuses on)
+//    report.out_of_scope_issues → errored entities the scope excludes (non-blocking)
+//    report.warnings            → entities with warnings (e.g. unresolved entity refs)
 
 // 3. Connect an adapter — Postgres/SQLite/Convex chosen from the URL scheme.
 let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;
@@ -209,7 +279,9 @@ design.deploy(&*adapter, false, Some(&scope), |s| {
 `deploy` applies RLS policies from `policies/` unconditionally, so an embedder
 gets the same end state as the CLI. A failing policy file does not fail the
 deploy — it lands in `summary.policies.failed` and is surfaced by
-`summary.warnings()`. Use `deploy_with_progress` for per-step callbacks.
+`summary.warnings()`. A policy the scope excludes lands in
+`summary.policies.skipped` and is surfaced the same way. Use
+`deploy_with_progress` for per-step callbacks.
 
 Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 `Entity` / `EntityType`, `SchemaModel`, `ResolvedScope`, `ApplyComplete` /
