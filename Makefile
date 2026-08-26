@@ -115,10 +115,12 @@ _check-clean:
 	   exit 1; \
 	 fi
 
-# Pre-flight: tests and clippy must pass before a release.
+# Pre-flight: tests, clippy and formatting must pass before a release.
 _check-ci:
 	@echo "Running cargo test..."
 	@cargo test --workspace --quiet
 	@echo "Running cargo clippy..."
 	@cargo clippy --workspace --all-targets --quiet -- -D warnings
+	@echo "Running cargo fmt --check..."
+	@cargo fmt --all --check
 	@echo "All checks passed."
