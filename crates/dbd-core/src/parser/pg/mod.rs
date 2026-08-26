@@ -9,6 +9,7 @@ pub(crate) mod enums;
 pub(crate) mod matviews;
 pub(crate) mod procs;
 pub(crate) mod roles;
+pub(crate) mod tables;
 pub(crate) mod views;
 
 use std::path::Path;
@@ -35,6 +36,7 @@ impl PgQueryDdl {
         EntityType::Function,
         EntityType::Procedure,
         EntityType::Role,
+        EntityType::Table,
     ];
 
     /// The native parser for a type, or `None` when it still delegates.
@@ -50,6 +52,7 @@ impl PgQueryDdl {
             EntityType::MaterializedView => Some(matviews::parse_matview),
             EntityType::Function | EntityType::Procedure => Some(procs::parse_proc),
             EntityType::Role => Some(roles::parse_role),
+            EntityType::Table => Some(tables::parse_table),
             _ => None,
         }
     }
@@ -77,8 +80,8 @@ mod tests {
     /// incumbent — that is what makes every step of the migration releasable.
     #[test]
     fn uncovered_types_delegate_identically() {
-        let path = Path::new("ddl/table/app/t.ddl");
-        let sql = "set search_path to app;\ncreate table t (id int primary key);";
+        let path = Path::new("ddl/sequence/app/s.ddl");
+        let sql = "set search_path to app;\ncreate sequence s start with 5;";
 
         let old = SqlparserDdl.parse(path, sql).unwrap();
         let new = PgQueryDdl.parse(path, sql).unwrap();
@@ -89,7 +92,7 @@ mod tests {
     #[test]
     fn enum_is_covered() {
         assert!(PgQueryDdl::native(EntityType::Enum).is_some());
-        assert!(PgQueryDdl::native(EntityType::Table).is_none());
+        assert!(PgQueryDdl::native(EntityType::Sequence).is_none());
     }
 
     /// COVERED and the dispatch match must agree for every entity type: a type

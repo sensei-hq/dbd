@@ -398,8 +398,12 @@ mod tests {
         assert!(!id_col.nullable);
         assert!(id_col.default_value.is_some());
 
+        // Postgres's own spelling of the type it resolved, not the uppercased
+        // echo of the author's keyword sqlparser used to report. Every
+        // comparison dbd makes runs both sides through `canonical_type`, so the
+        // two agree; this is the spelling that now reaches emitted DDL and DBML.
         let name_col = table_def.columns.iter().find(|c| c.name == "name").unwrap();
-        assert_eq!(name_col.data_type, "VARCHAR(30)");
+        assert_eq!(name_col.data_type, "varchar(30)");
     }
 
     #[test]

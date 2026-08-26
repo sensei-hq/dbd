@@ -16,12 +16,11 @@
 //! or dollar-quoted body is never mistaken for the boundary.
 
 use crate::entity::{
-    Entity, IndexColumn, IndexDef, IndexType, REF_TYPE_FUNCTION, Reference, SortOrder, TableComments,
-    TableDef,
+    Entity, IndexDef, REF_TYPE_FUNCTION, Reference, TableComments, TableDef,
 };
 use crate::error::Result;
 
-use super::common;
+use super::{common, tables};
 
 /// Parse a materialized view DDL file.
 pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
@@ -55,6 +54,18 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         .cloned()
         .unwrap_or_else(|| "public".to_string());
 
+    // Trailing CREATE INDEX statements land in table_def.indexes, exactly like
+    // a table's indexes — through the same extractor, so a matview's index
+    // keeps its opclass, predicate, INCLUDE list and storage parameters.
+    let mut index_functions = Vec::new();
+    let indexes = match extract_indexes(&parsed, &default_schema, &mut index_functions) {
+        Ok(indexes) => indexes,
+        Err(why) => {
+            entity.errors.push(why);
+            return Ok(entity);
+        }
+    };
+
     // Relations + function calls, exactly like `pg::views::parse_view` — a
     // matview's body is read the same way a view's is, only the write side
     // (the body text kept in `writes[0]`) differs.
@@ -63,6 +74,7 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         .call_functions()
         .into_iter()
         .filter_map(|name| common::qualify_name_str(&name, &default_schema))
+        .chain(index_functions)
         .collect();
     function_names.sort();
     function_names.dedup();
@@ -78,13 +90,12 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
     entity.refers = references.iter().map(|r| r.name.clone()).collect();
     entity.references = references;
 
-    // Trailing CREATE INDEX statements land in table_def.indexes, exactly like
-    // a table's indexes — there is no CREATE TABLE here, so only indexes are
-    // populated (columns/constraints/comments stay empty).
+    // There is no CREATE TABLE here, so only indexes are populated
+    // (columns/constraints/comments stay empty).
     entity.table_def = Some(TableDef {
         columns: Vec::new(),
         constraints: Vec::new(),
-        indexes: extract_indexes(&parsed, &mut entity.warnings),
+        indexes,
         comments: TableComments::default(),
     });
 
@@ -142,119 +153,26 @@ fn extract_body(sql: &str, raw_stmt: &pg_query::protobuf::RawStmt) -> Option<Str
     Some(sql[body_start..body_end].trim().trim_end_matches(';').trim().to_string())
 }
 
-/// Trailing `CREATE INDEX` statements' `IndexStmt` nodes, converted the way
-/// `tables::extract_table` converts sqlparser's `CreateIndex` for a table.
+/// Trailing `CREATE INDEX` statements, read by the table parser's extractor.
 ///
-/// Deliberately partial: an index whose key is an expression, or that carries
-/// a `WHERE` predicate, an `INCLUDE` list, or storage parameters, cannot be
-/// rendered back to SQL through this crate's `pg_query` bindings —
-/// `Node::deparse` only reconstructs whole statements, not a bare expression
-/// (confirmed empirically: it errors "unsupported top-level node type" on an
-/// `IndexElem`'s expr or a `WHERE` clause node). Rather than silently emit a
-/// wrong or truncated index, such an index is skipped with a warning. `Table`
-/// going native will need the fuller version — this one only carries what
-/// `emit_index_sql` needs for the common case.
-fn extract_indexes(parsed: &pg_query::ParseResult, warnings: &mut Vec<String>) -> Vec<IndexDef> {
+/// A matview's index is a table index in every respect the emitter and reconcile
+/// care about, so it goes through the same code — including the opclass,
+/// predicate, `INCLUDE` list and storage parameters an earlier reduced copy here
+/// used to skip with a warning.
+fn extract_indexes(
+    parsed: &pg_query::ParseResult,
+    default_schema: &str,
+    functions: &mut Vec<String>,
+) -> std::result::Result<Vec<IndexDef>, String> {
     let mut indexes = Vec::new();
     for stmt in &parsed.protobuf.stmts {
         let Some(pg_query::NodeEnum::IndexStmt(ix)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
         else {
             continue;
         };
-        match extract_one_index(ix) {
-            Some(def) => indexes.push(def),
-            None => {
-                let name = if ix.idxname.is_empty() { "<unnamed>" } else { &ix.idxname };
-                warnings.push(format!(
-                    "index {name:?} uses an expression key, predicate, INCLUDE list, or storage \
-                     parameters, which the native matview parser does not yet extract; skipped"
-                ));
-            }
-        }
+        indexes.push(tables::extract_index(ix, default_schema, functions)?);
     }
-    indexes
-}
-
-/// One index, or `None` if it uses a feature this minimal extractor skips —
-/// see [`extract_indexes`].
-fn extract_one_index(ix: &pg_query::protobuf::IndexStmt) -> Option<IndexDef> {
-    if ix.where_clause.is_some() || !ix.options.is_empty() {
-        return None;
-    }
-
-    let mut columns = Vec::with_capacity(ix.index_params.len());
-    for param in &ix.index_params {
-        let Some(pg_query::NodeEnum::IndexElem(elem)) = param.node.as_ref() else {
-            return None;
-        };
-        // An empty `name` means the key is an expression (`expr` is set
-        // instead), and a non-empty `opclass` names an operator class — both
-        // out of scope here (see the module doc comment). Bailing rather than
-        // dropping either silently: an opclass changes which operators the
-        // index can answer, so losing it would emit a wrong index, not just
-        // an incomplete one.
-        if elem.name.is_empty() || !elem.opclass.is_empty() {
-            return None;
-        }
-        columns.push(IndexColumn {
-            name: elem.name.clone(),
-            is_expression: false,
-            order: sort_order(elem.ordering),
-            nulls_first: nulls_first(elem.nulls_ordering),
-            opclass: None,
-        });
-    }
-
-    let mut include = Vec::with_capacity(ix.index_including_params.len());
-    for param in &ix.index_including_params {
-        match param.node.as_ref() {
-            Some(pg_query::NodeEnum::IndexElem(elem)) if !elem.name.is_empty() => {
-                include.push(elem.name.clone());
-            }
-            // An INCLUDE column can only ever be a plain name in Postgres
-            // grammar, so this arm is unreached in practice; kept as a safe
-            // bailout rather than assumed away.
-            _ => return None,
-        }
-    }
-
-    let access_method = ix.access_method.to_lowercase();
-    let index_type = (access_method != "btree" && !access_method.is_empty())
-        .then(|| IndexType::from_amname(&ix.access_method));
-
-    Some(IndexDef {
-        name: (!ix.idxname.is_empty()).then(|| ix.idxname.clone()),
-        columns,
-        unique: ix.unique,
-        index_type,
-        predicate: None,
-        include,
-        nulls_not_distinct: ix.nulls_not_distinct,
-        with_options: std::collections::BTreeMap::new(),
-    })
-}
-
-/// `SortByDir` → our `SortOrder`; `SortbyDefault` (no explicit `ASC`/`DESC`)
-/// is `None`, matching `tables::extract_index`'s treatment of sqlparser's
-/// `asc: None`.
-fn sort_order(ordering: i32) -> Option<SortOrder> {
-    use pg_query::protobuf::SortByDir;
-    match ordering {
-        x if x == SortByDir::SortbyAsc as i32 => Some(SortOrder::Asc),
-        x if x == SortByDir::SortbyDesc as i32 => Some(SortOrder::Desc),
-        _ => None,
-    }
-}
-
-/// `SortByNulls` → the tri-state `nulls_first`; the access method's default
-/// (no explicit `NULLS FIRST`/`NULLS LAST`) is `None`.
-fn nulls_first(nulls_ordering: i32) -> Option<bool> {
-    use pg_query::protobuf::SortByNulls;
-    match nulls_ordering {
-        x if x == SortByNulls::SortbyNullsFirst as i32 => Some(true),
-        x if x == SortByNulls::SortbyNullsLast as i32 => Some(false),
-        _ => None,
-    }
+    Ok(indexes)
 }
 
 #[cfg(test)]
@@ -316,21 +234,20 @@ mod tests {
     }
 
     /// An opclass changes which operators the index can answer, so losing it
-    /// silently would emit a *wrong* index rather than an incomplete one —
-    /// this extractor must skip it (with a warning) instead of dropping it.
+    /// would emit a *wrong* index rather than an incomplete one. An earlier
+    /// reduced extractor here skipped such an index with a warning; sharing the
+    /// table parser's extractor means it is simply read.
     #[test]
-    fn an_index_with_an_explicit_opclass_is_skipped_not_silently_mangled() {
+    fn an_index_keeps_the_details_the_reduced_extractor_used_to_skip() {
         let e = parse(
             "create materialized view m as select a from t with data;\n\
-             create index i on m (a text_pattern_ops);",
+             create index i on m (a text_pattern_ops) where a is not null;",
         );
         let ix = e.table_def.as_ref().expect("table_def").indexes.clone();
-        assert!(ix.is_empty(), "got {ix:?}");
-        assert!(
-            e.warnings.iter().any(|w| w.contains("\"i\"")),
-            "expected a warning naming the skipped index, got {:?}",
-            e.warnings
-        );
+        assert_eq!(ix.len(), 1, "got {ix:?}");
+        assert_eq!(ix[0].columns[0].opclass.as_deref(), Some("text_pattern_ops"));
+        assert_eq!(ix[0].predicate.as_deref(), Some("a IS NOT NULL"));
+        assert!(e.warnings.is_empty(), "nothing was skipped, so nothing to warn about: {:?}", e.warnings);
     }
 
     #[test]

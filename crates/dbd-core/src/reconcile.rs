@@ -262,7 +262,12 @@ fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<
 /// Normalize a column type for cross-representation comparison: lowercase, drop a
 /// redundant `public.` prefix, map common Postgres aliases to the `format_type`
 /// spelling, and schema-qualify a bare enum name using `enum_types`.
-fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
+///
+/// Public for the same reason as [`crate::parser::pg_native_types`]: the parser
+/// parity harness is an integration test in a separate crate, and comparing two
+/// parsers' *type spellings* is exactly what this function is for. A local copy
+/// there would be a second alias table free to drift from this one.
+pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
     let mut s = raw.trim().to_lowercase();
     // `public.` and `pg_catalog.` are the implicit search path — a type named
     // through either is the same type as the bare form. Postgres rewrites

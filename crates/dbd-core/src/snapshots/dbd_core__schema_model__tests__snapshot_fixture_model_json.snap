@@ -26,7 +26,7 @@ expression: json
       "columns": [
         {
           "name": "id",
-          "type": "UUID",
+          "type": "uuid",
           "pk": true,
           "nn": true,
           "def": "uuid_generate_v4()",
@@ -34,60 +34,60 @@ expression: json
         },
         {
           "name": "lookup_id",
-          "type": "UUID",
+          "type": "uuid",
           "note": "Identifier for the lookup category. References the lookups table to specify the category."
         },
         {
           "name": "value",
-          "type": "VARCHAR(255)",
+          "type": "varchar(255)",
           "note": "The actual value associated with the lookup."
         },
         {
           "name": "sequence",
-          "type": "INTEGER",
+          "type": "int",
           "note": "Order of the value within the lookup category. Used for sorting purposes."
         },
         {
           "name": "is_active",
-          "type": "BOOLEAN",
+          "type": "boolean",
           "def": "true",
           "note": "Flag indicating if the lookup value is active. Used to determine if the value is currently in use."
         },
         {
           "name": "is_hidden",
-          "type": "BOOLEAN",
+          "type": "boolean",
           "def": "false",
           "note": "Flag indicating if the lookup value should be hidden. Used to exclude the value from display."
         },
         {
           "name": "details",
-          "type": "JSONB",
+          "type": "jsonb",
           "note": "Additional details associated with the lookup value. Stored as a JSONB field to accommodate various attributes."
         },
         {
           "name": "description",
-          "type": "TEXT",
+          "type": "text",
           "note": "Description of the lookup value. Provides additional context about the value."
         },
         {
           "name": "modified_at",
-          "type": "TIMESTAMP WITH TIME ZONE",
+          "type": "timestamp with time zone",
           "nn": true,
           "def": "now()",
           "note": "The date the lookup value was last modified. Provides a history of when changes were made."
         },
         {
           "name": "modified_by",
-          "type": "VARCHAR",
+          "type": "varchar",
           "note": "The user who last modified the lookup value. Tracks who made the changes for auditing purposes."
         },
         {
           "name": "category_id",
-          "type": "UUID"
+          "type": "uuid"
         },
         {
           "name": "notes",
-          "type": "TEXT"
+          "type": "text"
         }
       ],
       "indexes": [
@@ -107,7 +107,7 @@ expression: json
       "columns": [
         {
           "name": "id",
-          "type": "UUID",
+          "type": "uuid",
           "pk": true,
           "nn": true,
           "def": "uuid_generate_v4()",
@@ -115,44 +115,44 @@ expression: json
         },
         {
           "name": "name",
-          "type": "VARCHAR(30)",
+          "type": "varchar(30)",
           "note": "Name of the lookup. Used to identify the lookup."
         },
         {
           "name": "is_editable",
-          "type": "BOOLEAN",
+          "type": "boolean",
           "def": "true",
           "note": "Flag indicating whether this lookup is editable."
         },
         {
           "name": "icon",
-          "type": "VARCHAR",
+          "type": "varchar",
           "note": "Icon to be used for the lookup."
         },
         {
           "name": "description",
-          "type": "TEXT",
+          "type": "text",
           "note": "Description of the lookup. Provides additional details about the lookup."
         },
         {
           "name": "modified_at",
-          "type": "TIMESTAMP WITH TIME ZONE",
+          "type": "timestamp with time zone",
           "nn": true,
           "def": "now()",
           "note": "Date and time the lookup entry was last modified. Provides a history of when changes were made."
         },
         {
           "name": "modified_by",
-          "type": "VARCHAR",
+          "type": "varchar",
           "note": "User that last modified the lookup entry. Tracks who made the changes for auditing purposes."
         },
         {
           "name": "tags",
-          "type": "TEXT[]"
+          "type": "text[]"
         },
         {
           "name": "display_order",
-          "type": "INTEGER",
+          "type": "int",
           "def": "0"
         }
       ],
