@@ -422,9 +422,10 @@ fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     }
 
     let mut out = vec![
-        "  A CHECK that pins a column to a fixed set of strings can be a Postgres enum instead —".to_string(),
-        "  the type is enforced by the database and introspects as a real type. Advisory only:".to_string(),
-        "  never counted as an error, never affects the exit code.".to_string(),
+        // The "[Advisory]" tag carries the not-an-error meaning; it used to take
+        // two extra lines of disclaimer to say the same thing.
+        "  [Advisory]: A CHECK that pins a column to a fixed set of strings can be a Postgres".to_string(),
+        "  enum instead — the type is enforced by the database and introspects as a real type.".to_string(),
         String::new(),
     ];
 
@@ -846,8 +847,10 @@ mod tests {
             hint("app.c", "mode", &["m", "n"]),
         ]);
         let body = out.join("\n");
+        // Anchored on the tag rather than a prose phrase: the rationale wraps
+        // across lines, so matching words inside it breaks on any reflow.
         assert_eq!(
-            body.matches("Postgres enum").count(),
+            body.matches("[Advisory]").count(),
             1,
             "rationale must appear once: {body}"
         );

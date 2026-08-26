@@ -45,8 +45,9 @@ help:
 	@echo "  make sweep         Prune stale/old-version artifacts (needs cargo-sweep)"
 	@echo ""
 	@echo "All bump targets refuse to run if the working tree has uncommitted"
-	@echo "changes or local HEAD differs from origin/main, and require tests"
-	@echo "and clippy to pass first. After a successful push, bump runs"
+	@echo "changes or local HEAD differs from origin/main, and require tests,"
+	@echo "clippy and rustfmt to pass first. After a successful push, bump"
+	@echo "installs the released binary into ~/.cargo/bin, then runs"
 	@echo "'cargo clean' to reclaim disk (next dev build recompiles fresh)."
 	@echo ""
 	@echo "Current version: $(VERSION)"
@@ -76,11 +77,20 @@ sweep:
 	@cargo sweep --time 14
 
 ## Bump version (commits, tags, pushes). Refuses if tree is dirty or CI fails.
+##
+## Notes on the recipe below, kept out of it because make echoes un-@'d comment
+## lines in a recipe and they would print on every release:
+##
+##  - The `sed` over README/guide/llms keeps the pre-commit `rev:` examples in
+##    sync with the tag being cut.
+##  - `install` runs *after* the push (so only what actually shipped lands on
+##    PATH) but *before* `cargo clean`. `cargo install --path` reuses the
+##    workspace target/, so the artifacts it builds are wiped by the clean that
+##    follows; installing after the clean instead strands a fresh target/release.
 bump: _check-clean _check-ci
 	@echo "Bumping $(VERSION) → $(NEW) ($(KIND))"
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
-	# Keep the pre-commit `rev:` examples in sync with the released tag.
 	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
 	@cargo build -q 2>&1 | grep -v "^warning" || true
 	@git add Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt
@@ -90,9 +100,12 @@ bump: _check-clean _check-ci
 	@git push origin $(BRANCH)
 	@git push origin "v$(NEW)"
 	@echo "Released v$(NEW) on $(BRANCH). Now merge $(BRANCH) → main."
+	@echo "Installing v$(NEW) into ~/.cargo/bin..."
+	@$(MAKE) install
 	@echo "Reclaiming disk: removing debug + stale build artifacts..."
 	@cargo clean
 	@echo "target/ cleaned; next build recompiles against the current lockfile."
+	@echo "dbd v$(NEW) is on your PATH."
 
 # Refuse to bump if the working tree has uncommitted changes or untracked
 # files. Also require local HEAD to be in sync with origin/<current branch>
