@@ -437,7 +437,21 @@ pub async fn cmd_apply(
 
     // Apply RLS policies if requested
     if with_policies {
-        let report = dbd_core::design::apply_policies(&*adapter, project_dir, false).await?;
+        let policy_ws = if resolved.is_all {
+            None
+        } else {
+            design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
+        };
+        let report = dbd_core::design::apply_policies(
+            &*adapter,
+            project_dir,
+            false,
+            policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+        )
+        .await?;
+        for (file, why) in &report.skipped {
+            output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+        }
         if !report.applied.is_empty() {
             output::info(verbosity, &format!("Applied {} policy file(s).", report.applied.len()));
         }
@@ -502,11 +516,15 @@ pub async fn cmd_refresh(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_policies(
     config: &Path,
+    env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     dry_run: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     if dry_run {
@@ -523,9 +541,29 @@ pub async fn cmd_policies(
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    let report = dbd_core::design::apply_policies(&*adapter, project_dir, false).await?;
+    // `dbd policies` takes the global --scope like every other command; before
+    // this it silently applied every file, so a policy for a schema this plane
+    // does not have reported `schema "…" does not exist` on every run.
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
+    let resolved = design.resolve_scope(scope, deps)?;
+    let policy_ws = if resolved.is_all {
+        None
+    } else {
+        design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
+    };
+    let report = dbd_core::design::apply_policies(
+        &*adapter,
+        project_dir,
+        false,
+        policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+    )
+    .await?;
 
-    if report.applied.is_empty() && report.failed.is_empty() {
+    for (file, why) in &report.skipped {
+        output::info(verbosity, &format!("Skipped {} — {why}", file.display()));
+    }
+
+    if report.applied.is_empty() && report.failed.is_empty() && report.skipped.is_empty() {
         output::info(verbosity, "No policy files found in policies/");
         return Ok(());
     }
@@ -651,7 +689,7 @@ mod tests {
     /// "no policy files" path without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_without_policy_dir() {
-        cmd_policies(&testutil::fixture_config(), &testutil::fixtures(), None, /*dry_run*/ true, Verbosity::Normal)
+        cmd_policies(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, /*dry_run*/ true, None, None, Verbosity::Normal)
             .await
             .unwrap();
     }
@@ -742,7 +780,7 @@ mod tests {
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");
-        cmd_policies(&cfg, proj.path(), None, /*dry_run*/ true, Verbosity::Normal)
+        cmd_policies(&cfg, "dev", proj.path(), None, /*dry_run*/ true, None, None, Verbosity::Normal)
             .await
             .unwrap();
     }

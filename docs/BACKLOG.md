@@ -8,35 +8,32 @@ the [architecture notes](design/architecture.md). They are not tracked here.
 
 ## Now
 
-### RLS policy files are applied alphabetically, ignoring their dependencies
+### Failed policy files are skipped, not fatal
 
-Reported from a live project: a policy on `repository_metrics` whose body
-references `team_projects` was applied first and failed.
+`apply_policies` logs a failing file to `PolicyReport.failed` and continues, so
+a deploy can report success with RLS only partially applied. Worth deciding
+whether it should refuse like `ensure_fully_parsed` does for DDL. The scope
+filter below removed the *expected* failures that made this backstop noisy, so
+a remaining `failed` entry is now much more likely to be a real one.
 
-`apply_policies` (`design/mod.rs:252`) executes `policies/**` in **alphabetical
-order**. Policy files are never parsed into entities — they have no
-`EntityType`, no `refers`, and never enter the dependency graph — so nothing can
-see that one policy body depends on another object. `repository_metrics` sorts
-before `team_projects`, which is the entire mechanism.
+### Ordering within `policies/` is alphabetical
 
-Open question before designing a fix: policies run *after* all DDL, so a
-referenced **table** should already exist. Establish what the failing body
-actually referenced — a helper function or view created by another policy file,
-a table outside the design, or something else — because that determines whether
-the fix is ordering within `policies/`, or a missing dependency edge from a
-policy to a DDL entity. Do not assume; get the failing file.
+Not currently a problem, and deliberately left alone: policies run after all
+DDL, so every object a policy body can reference already exists, and no policy
+file creates an object another one needs.
 
-Candidate directions once that is known:
+Recorded because it was once filed as the cause of a live failure and was not.
+That report — a policy on `repository_metrics` referencing `team_projects` —
+turned out to be a scope bug: `policies/` ignored `--scope`, so the file ran
+against a plane with no `dojo` schema. The error named a **schema**, not a
+missing table, and the DDL order was correct all along
+(`dojo.can_read_repository_metric` carries 6 edges including
+`dojo.team_projects` and lands a layer after it). Fixed by scope-filtering
+`policies/`; see [the commands reference](guide/04-commands.md#policies-under---scope).
 
-- Parse policy bodies for references (`pg_query` already extracts these — see
-  `parser::pg::common`) and order `policies/` topologically like DDL entities.
-- Or keep alphabetical execution but fail with a message naming the missing
-  object and the file, instead of the raw Postgres error.
-
-Note the current behaviour also *skips* failed policy files and logs them
-(`PolicyReport.failed`) rather than aborting — worth checking whether that
-produced a partial policy state in the reporting project, and whether it should
-refuse like `ensure_fully_parsed` does for DDL.
+If a policy body ever does need another policy's object, `pg_query` already
+extracts body references (`parser::pg::common`) and the files could be ordered
+topologically like DDL entities.
 
 ## Future
 

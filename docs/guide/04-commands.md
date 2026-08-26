@@ -705,6 +705,7 @@ Apply RLS (Row-Level Security) policies from the `policies/` directory.
 ```sh
 dbd policies                       # Apply all policy files
 dbd policies --dry-run             # Show what would be applied
+dbd policies --scope hub           # Only policies whose table is in the scope
 dbd apply --with-policies          # Apply entities + policies in one step
 ```
 
@@ -717,6 +718,33 @@ create policy "users_select_own" on config.users for select using (auth.uid() = 
 ```
 
 Failed policies are logged and skipped (fail-forward). Exit code 1 if any failures.
+
+### Policies under `--scope`
+
+A scoped run applies only the policies whose table is in the working set. The
+target comes from the file's own path — `policies/<schema>/<table>.sql` names
+`<schema>.<table>` — so no parsing is involved and the rule is the layout you
+already follow.
+
+A policy for a table the scope excludes is skipped with a warning naming the
+file, its target, and the scope:
+
+```
+Skipped ./policies/dojo/repository_metrics.sql — dojo.repository_metrics is
+outside scope 'daemon'
+```
+
+This matters when one design serves several planes. Without it, a policy for a
+schema that a given plane does not have runs anyway and reports
+`FAILED … schema dojo does not exist` on every deploy — an expected condition
+dressed as an error, which is how real failures stop being read.
+
+Runs without `--scope` are unaffected: every policy file applies. `--dry-run`
+filters before previewing, so the preview matches what a real run would do.
+
+A file that is not in `policies/<schema>/<table>.sql` form has no derivable
+target and always applies — scope filtering is a correctness aid, not a
+security boundary. Do not rely on a scope to *prevent* a policy running.
 
 ---
 

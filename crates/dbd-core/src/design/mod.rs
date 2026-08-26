@@ -86,7 +86,11 @@ pub struct DeployComplete {
 impl DeployComplete {
     /// Every non-fatal diagnostic from the deploy, ready to print as warnings:
     /// each phase's own warnings in pipeline order, then one line per failed
-    /// policy file.
+    /// policy file, then one per policy a scope excluded.
+    ///
+    /// Scope skips belong here for the same reason import's do: the deploy
+    /// left something out on purpose, and a summary that only counts what ran
+    /// never says which files those were.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.apply.warnings.clone();
         out.extend(self.import.warnings.iter().cloned());
@@ -95,6 +99,12 @@ impl DeployComplete {
                 .failed
                 .iter()
                 .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
+        );
+        out.extend(
+            self.policies
+                .skipped
+                .iter()
+                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
         );
         out
     }
@@ -256,20 +266,50 @@ pub struct ImportPlanEntry {
 pub struct PolicyReport {
     pub applied: Vec<PathBuf>,
     pub failed: Vec<(PathBuf, String)>,
+    /// Files a scope excluded, with the reason. Not failures — the table the
+    /// policy protects is not part of this plane, so the file has nothing to
+    /// act on. Reported so a skip is visible rather than silent.
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+/// The entity a policy file protects, from its path.
+///
+/// The layout is `policies/<schema>/<table>.sql`, so the target is
+/// `<schema>.<table>` — the same convention `Entity::from_file` uses for
+/// `ddl/<type>/<schema>/<name>.ddl`. Returns `None` for a file that does not
+/// follow it (a loose `policies/foo.sql`, a README), which is then treated as
+/// unscopable and always applied.
+pub(crate) fn policy_target(file: &Path, project_dir: &Path) -> Option<String> {
+    let rel = file.strip_prefix(project_dir).ok()?.strip_prefix("policies").ok()?;
+    let parts: Vec<&str> = rel.components().filter_map(|c| c.as_os_str().to_str()).collect();
+    let [schema, table] = parts.as_slice() else {
+        return None;
+    };
+    let table = table.strip_suffix(".sql").or_else(|| table.strip_suffix(".ddl"))?;
+    Some(format!("{schema}.{table}"))
 }
 
 /// Apply RLS policy files from the policies/ directory.
 ///
 /// Files are executed in alphabetical order. Failed files are logged and skipped.
+///
+/// `scope` filters them the way it filters everything else: a policy protects
+/// one table, and a plane that does not have that table has nothing for the file
+/// to do. Applying it anyway reported `schema "dojo" does not exist` on every
+/// deploy of the other plane — an expected condition dressed as an error, which
+/// is how real failures stop being read. A file whose path does not follow
+/// `policies/<schema>/<table>.sql` is unscopable and always applied.
 pub async fn apply_policies(
     adapter: &dyn DatabaseAdapter,
     project_dir: &Path,
     dry_run: bool,
+    scope: Option<(&str, &std::collections::HashSet<String>)>,
 ) -> Result<PolicyReport> {
     let files = crate::scanner::scan_policies(project_dir)?;
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
+        skipped: Vec::new(),
     };
 
     // Canonicalize the project root once so path-traversal checks are reliable.
@@ -278,6 +318,17 @@ pub async fn apply_policies(
         .unwrap_or_else(|_| project_dir.to_path_buf());
 
     for file in &files {
+        if let Some((scope_name, working_set)) = scope
+            && let Some(target) = policy_target(file, project_dir)
+            && !working_set.contains(&target)
+        {
+            report.skipped.push((
+                file.clone(),
+                format!("{target} is outside scope '{scope_name}'"),
+            ));
+            continue;
+        }
+
         if dry_run {
             report.applied.push(file.clone());
             continue;
@@ -2721,6 +2772,51 @@ import:
         );
     }
 
+    /// End-to-end on the deploy path: a scope that excludes a schema must skip
+    /// that schema's policy files and *say so*. Counting only what ran would
+    /// let `deploy --scope` report "1 applied" with nothing accounting for the
+    /// rest — the silent-omission failure this reporting exists to prevent.
+    #[tokio::test]
+    async fn a_scoped_deploy_surfaces_skipped_policies_as_warnings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id int primary key);",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/app")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/svc")).unwrap();
+        std::fs::write(tmp.path().join("policies/app/t.sql"), "select 1;").unwrap();
+        std::fs::write(tmp.path().join("policies/svc/metrics.sql"), "select 1;").unwrap();
+
+        let design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+                .unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).expect("scope must resolve");
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .deploy(&mock, false, Some(&scope), |s| summary = Some(s))
+            .await
+            .expect("deploy must succeed");
+
+        let summary: DeployComplete = summary.expect("deploy must report a summary");
+        assert_eq!(summary.policies.skipped.len(), 1, "svc policy must be skipped: {summary:?}");
+        assert_eq!(summary.policies.applied.len(), 1, "app policy must still apply");
+        assert!(summary.policies.failed.is_empty(), "a skip is not a failure");
+        let warnings = summary.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("policy skipped") && w.contains("metrics.sql")),
+            "skipped policy must surface as a warning: {warnings:?}"
+        );
+    }
+
     // ── Policy tests ────────────────────────────────────────
 
     #[test]
@@ -2782,7 +2878,7 @@ import:
         .unwrap();
 
         let mock = MockAdapter::new();
-        let report = apply_policies(&mock, tmp.path(), false).await.unwrap();
+        let report = apply_policies(&mock, tmp.path(), false, None).await.unwrap();
         assert_eq!(report.applied.len(), 1);
         assert!(report.failed.is_empty());
         assert_eq!(mock.script_count(), 1);
@@ -2796,9 +2892,87 @@ import:
         std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
 
         let mock = MockAdapter::new();
-        let report = apply_policies(&mock, tmp.path(), true).await.unwrap();
+        let report = apply_policies(&mock, tmp.path(), true, None).await.unwrap();
         assert_eq!(report.applied.len(), 1);
         assert_eq!(mock.script_count(), 0, "dry run should not execute");
+    }
+
+    /// A policy protects one table. A plane whose scope excludes that table has
+    /// nothing for the file to do, and applying it anyway reported
+    /// `schema "…" does not exist` on every deploy — an expected condition
+    /// dressed as an error.
+    #[tokio::test]
+    async fn a_policy_for_an_out_of_scope_table_is_skipped_not_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/dojo")).unwrap();
+        std::fs::write(
+            tmp.path().join("policies/dojo/repository_metrics.sql"),
+            "select 1;",
+        )
+        .unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> = ["app.other".to_string()].into_iter().collect();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("daemon", &ws)))
+            .await
+            .unwrap();
+
+        assert!(report.applied.is_empty(), "must not apply: {:?}", report.applied);
+        assert!(report.failed.is_empty(), "a skip is not a failure: {:?}", report.failed);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].1.contains("dojo.repository_metrics"), "got {:?}", report.skipped);
+        assert!(report.skipped[0].1.contains("daemon"), "must name the scope: {:?}", report.skipped);
+    }
+
+    #[tokio::test]
+    async fn a_policy_for_an_in_scope_table_is_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/dojo")).unwrap();
+        std::fs::write(tmp.path().join("policies/dojo/relay_inbox.sql"), "select 1;").unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> =
+            ["dojo.relay_inbox".to_string()].into_iter().collect();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("dojo", &ws)))
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.skipped.is_empty());
+    }
+
+    /// A file off the `policies/<schema>/<table>.sql` convention has no derivable
+    /// target, so it is unscopable and must still run — silently dropping it
+    /// would be the worse failure.
+    #[tokio::test]
+    async fn a_policy_file_off_convention_is_always_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(tmp.path().join("policies/loose.sql"), "select 1;").unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("anything", &ws)))
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 1, "off-convention file must still apply");
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn policy_target_reads_schema_and_table_from_the_path() {
+        let root = std::path::Path::new("/p");
+        assert_eq!(
+            policy_target(std::path::Path::new("/p/policies/dojo/repository_metrics.sql"), root),
+            Some("dojo.repository_metrics".to_string())
+        );
+        // off-convention shapes have no target
+        assert_eq!(policy_target(std::path::Path::new("/p/policies/loose.sql"), root), None);
+        assert_eq!(
+            policy_target(std::path::Path::new("/p/policies/a/b/c.sql"), root),
+            None
+        );
     }
 
     #[tokio::test]

@@ -440,7 +440,19 @@ impl Design {
         })
         .await?;
 
-        let policies = super::apply_policies(adapter, &self.project_dir, dry_run).await?;
+        // A policy protects one table; a plane without that table has nothing
+        // for the file to do. Filter it the way every other phase is filtered.
+        let policy_ws = match scope {
+            Some(sc) if !sc.is_all => self.working_set(sc).ok().map(|ws| (sc.name.clone(), ws)),
+            _ => None,
+        };
+        let policies = super::apply_policies(
+            adapter,
+            &self.project_dir,
+            dry_run,
+            policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+        )
+        .await?;
 
         (progress.on_complete)(DeployComplete {
             apply: apply_summary.unwrap_or_default(),
