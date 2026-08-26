@@ -63,6 +63,64 @@ dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live 
 
 **Suggestions (advisory).** On a Postgres/Supabase project, `inspect` prints a `Suggestions:` section when it finds a `CHECK` constraint that pins a column to a fixed set of string literals (`status IN ('active','inactive')`, `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — a Postgres `enum` (`ddl/enum/<schema>/<name>.ddl`) models that with type safety and cleaner introspection. Suggestions are **advisory only**: they never count as errors and never affect the exit code.
 
+### Exit code
+
+**Changed in v0.12.0.** `inspect` exits **1** when the design carries a blocking
+error, and 0 otherwise. It previously always exited 0, which meant a CI step
+running `dbd inspect` passed green on a file that `dbd apply` would refuse —
+and apply's own error says *"run `dbd inspect` for the full report"*, pointing
+at the command that had just passed.
+
+If you have a pipeline that runs `dbd inspect` for its output only, it will now
+fail on a broken design. That is the intent; it is a breaking change, hence the
+minor bump.
+
+Warnings and suggestions never affect the exit code.
+
+### Parse errors say what they cost
+
+A file dbd cannot parse is dropped from the desired set, so a run would build a
+database missing that object. `apply`, `reconcile` and `deploy` refuse rather
+than do that, and `inspect` now names the consequence with the error:
+
+```
+Errors:
+
+./ddl/table/app/broken.ddl =>
+  Parse error: Invalid statement: syntax error at or near ","
+
+  → dbd apply / reconcile / deploy will refuse to run until these are fixed.
+```
+
+### Errors under `--scope`
+
+A scoped run only builds the entities in its working set, so only those errors
+block it. `inspect --scope` splits its report the same way, using the same rule
+the run itself uses — so `inspect` and `apply` never disagree about what is
+broken:
+
+```
+$ dbd inspect --scope daemon
+scope 'daemon': 2 entities
+
+Out of scope — not blocking 'daemon':
+
+./ddl/table/svc/broken.ddl =>
+  Parse error: Invalid statement: syntax error at or near ","
+
+  → these files are not built by 'daemon', so it can run. They will block a run whose scope includes them.
+2 entities — no issues
+(1 error(s) outside scope 'daemon')
+```
+
+Exit code is **0** here, matching `apply --scope daemon`, which applies cleanly.
+Move the same broken file into a schema the scope *does* build and it becomes
+`Errors (blocking scope 'daemon')` with exit 1.
+
+Out-of-scope errors are reported, never suppressed: a file that no scope builds
+is exactly how a broken file survives unnoticed. The entity count in the summary
+is also scope-aware, so it agrees with the `scope '…': N entities` line.
+
 ---
 
 ## `dbd apply`
