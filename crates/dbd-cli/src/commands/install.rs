@@ -23,8 +23,16 @@ struct Asset {
 }
 
 const ASSETS: &[Asset] = &[
-    Asset { kind: "skill", rel: "skills/dbd/SKILL.md", contents: SKILL_MD },
-    Asset { kind: "agent", rel: "agents/dbd-pattern-verifier.md", contents: AGENT_MD },
+    Asset {
+        kind: "skill",
+        rel: "skills/dbd/SKILL.md",
+        contents: SKILL_MD,
+    },
+    Asset {
+        kind: "agent",
+        rel: "agents/dbd-pattern-verifier.md",
+        contents: AGENT_MD,
+    },
 ];
 
 /// What installing one asset would do to the target path.
@@ -63,7 +71,8 @@ fn claude_base(project: bool, project_dir: &Path) -> Result<PathBuf> {
 /// `$CLAUDE_CONFIG_DIR`/`$HOME`/`--project`). No untrusted input reaches this
 /// path, so the traversal warning below is a false positive for a local CLI.
 fn classify(dest: &Path, contents: &str) -> Result<Action> {
-    match fs::read(dest) { // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    match fs::read(dest) {
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         Ok(existing) if existing == contents.as_bytes() => Ok(Action::Unchanged),
         Ok(_) => Ok(Action::Update),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Action::Create),
@@ -86,12 +95,7 @@ fn write_asset(dest: &Path, contents: &str) -> Result<()> {
 /// The assets are dbd-owned and namespaced (`skills/dbd/`, `agents/dbd-pattern-verifier.md`),
 /// so re-running after a dbd upgrade refreshes them in place; each action
 /// (created/updated/unchanged) is reported so an overwrite is never silent.
-pub fn cmd_install(
-    project: bool,
-    dry_run: bool,
-    project_dir: &Path,
-    verbosity: Verbosity,
-) -> Result<()> {
+pub fn cmd_install(project: bool, dry_run: bool, project_dir: &Path, verbosity: Verbosity) -> Result<()> {
     let base = claude_base(project, project_dir)?;
     output::info(
         verbosity,
@@ -154,8 +158,8 @@ mod tests {
     #[test]
     fn embedded_assets_match_docs() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let skill = fs::read_to_string(repo.join("docs/skills/dbd/SKILL.md"))
-            .expect("read canonical docs/skills/dbd/SKILL.md");
+        let skill =
+            fs::read_to_string(repo.join("docs/skills/dbd/SKILL.md")).expect("read canonical docs/skills/dbd/SKILL.md");
         let agent = fs::read_to_string(repo.join("docs/agents/dbd-pattern-verifier.md"))
             .expect("read canonical docs/agents/dbd-pattern-verifier.md");
         assert_eq!(

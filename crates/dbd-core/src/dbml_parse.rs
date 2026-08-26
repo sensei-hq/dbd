@@ -21,8 +21,7 @@
 //! leniently (dbdiagram.io grows constructs over time).
 
 use crate::entity::{
-    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexColumn, IndexDef, TableConstraint,
-    TableDef,
+    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef,
 };
 use crate::error::{DbdError, Result};
 
@@ -154,10 +153,7 @@ impl<'a> Parser<'a> {
             }
         }
         if saw_open {
-            return Err(parse_err(format!(
-                "unterminated block starting at line {}",
-                start + 1
-            )));
+            return Err(parse_err(format!("unterminated block starting at line {}", start + 1)));
         }
         // No brace at all — a single keyword line; we already advanced past it.
         Ok(())
@@ -167,10 +163,7 @@ impl<'a> Parser<'a> {
 
     fn parse_enum(&mut self) -> Result<()> {
         let header = strip_comment(self.lines[self.pos]).trim().to_string();
-        let after_kw = header
-            .get(first_word(&header).len()..)
-            .unwrap_or("")
-            .trim();
+        let after_kw = header.get(first_word(&header).len()..).unwrap_or("").trim();
         // Everything up to the `{` is the name.
         let name_part = after_kw.split('{').next().unwrap_or("").trim();
         let (schema, base) = parse_qualified_name(name_part)?;
@@ -200,10 +193,7 @@ impl<'a> Parser<'a> {
             // `"value" [note: '…']` or bare `value`.
             let (token, rest) = take_identifier(&line)?;
             let note = parse_value_note(rest.trim());
-            entity.enum_values.push(crate::entity::EnumValue {
-                name: token,
-                note,
-            });
+            entity.enum_values.push(crate::entity::EnumValue { name: token, note });
         }
         self.enums.push(entity);
         Ok(())
@@ -286,10 +276,7 @@ impl<'a> Parser<'a> {
     /// Parse a table header line into `(schema, base)`, stripping the leading
     /// keyword, an inline `{`, and any trailing `[settings]`; notes the schema.
     fn parse_table_header(&mut self, header: &str) -> Result<(String, String)> {
-        let after_kw = header
-            .get(first_word(header).len()..)
-            .unwrap_or("")
-            .trim();
+        let after_kw = header.get(first_word(header).len()..).unwrap_or("").trim();
         let name_part = after_kw.split('{').next().unwrap_or("").trim();
         // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
         // strip a trailing settings group from the name part.
@@ -301,10 +288,7 @@ impl<'a> Parser<'a> {
 
     /// Assemble a table's `TableComments` from its `note` plus per-column notes
     /// (mirrors what introspection surfaces).
-    fn table_comments_from(
-        table_note: Option<String>,
-        columns: &[ColumnDef],
-    ) -> crate::entity::TableComments {
+    fn table_comments_from(table_note: Option<String>, columns: &[ColumnDef]) -> crate::entity::TableComments {
         let mut comments = crate::entity::TableComments {
             table: table_note,
             ..Default::default()
@@ -319,19 +303,12 @@ impl<'a> Parser<'a> {
 
     /// Parse an `indexes { … }` block. `header` is the line beginning with
     /// `indexes`; the `{` may be on that line or a following one.
-    fn parse_indexes_block(
-        &mut self,
-        header: &str,
-        table: &str,
-        out: &mut Vec<IndexDef>,
-    ) -> Result<()> {
+    fn parse_indexes_block(&mut self, header: &str, table: &str, out: &mut Vec<IndexDef>) -> Result<()> {
         self.advance_to_indexes_brace(header, table)?;
 
         loop {
             if self.pos >= self.lines.len() {
-                return Err(parse_err(format!(
-                    "unterminated indexes block in `{table}`"
-                )));
+                return Err(parse_err(format!("unterminated indexes block in `{table}`")));
             }
             let line = strip_comment(self.lines[self.pos]).trim().to_string();
             self.pos += 1;
@@ -364,9 +341,7 @@ impl<'a> Parser<'a> {
             if l.contains('{') {
                 return Ok(());
             }
-            return Err(parse_err(format!(
-                "indexes block in `{table}` is missing `{{`"
-            )));
+            return Err(parse_err(format!("indexes block in `{table}` is missing `{{`")));
         }
         Ok(())
     }
@@ -422,10 +397,7 @@ impl<'a> Parser<'a> {
                 on_delete: r.on_delete,
                 on_update: r.on_update,
             };
-            if let Some(entity) = self
-                .tables
-                .iter_mut()
-                .find(|e| e.name == src_qualified)
+            if let Some(entity) = self.tables.iter_mut().find(|e| e.name == src_qualified)
                 && let Some(td) = entity.table_def.as_mut()
             {
                 td.constraints.push(TableConstraint::ForeignKey(fk));
@@ -517,11 +489,7 @@ fn strip_comment(line: &str) -> &str {
             }
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            '/' if !in_single
-                && !in_double
-                && i + 1 < bytes.len()
-                && bytes[i + 1] == b'/' =>
-            {
+            '/' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
                 return &line[..i];
             }
             _ => {}
@@ -539,9 +507,7 @@ fn first_word(line: &str) -> &str {
 /// The lowercased leading keyword of a line, with a trailing `:` stripped so
 /// `Ref:` → `ref` and `Note:` → `note`.
 fn keyword(line: &str) -> String {
-    first_word(line)
-        .trim_end_matches(':')
-        .to_ascii_lowercase()
+    first_word(line).trim_end_matches(':').to_ascii_lowercase()
 }
 
 /// Parse a (possibly schema-qualified) name into `(schema, base)`.
@@ -604,9 +570,7 @@ fn take_identifier(s: &str) -> Result<(String, &str)> {
         }
     } else {
         // Bare identifier: up to whitespace or `[`.
-        let end = s
-            .find(|c: char| c.is_whitespace() || c == '[')
-            .unwrap_or(s.len());
+        let end = s.find(|c: char| c.is_whitespace() || c == '[').unwrap_or(s.len());
         if end == 0 {
             return Err(parse_err(format!("expected identifier: {s}")));
         }
@@ -632,8 +596,7 @@ fn parse_value_note(rest: &str) -> Option<String> {
 
 /// Parse a column definition line: `"name" <type> [settings]`.
 fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
-    let (name, rest) = take_identifier(line)
-        .map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
+    let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
 
     // Split type from settings: the settings group is the trailing `[ … ]`.
@@ -739,10 +702,7 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     let (cols_part, settings_part) = split_trailing_settings(line);
     let cols_part = cols_part.trim();
 
-    let column_names: Vec<String> = if let Some(inner) = cols_part
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    let column_names: Vec<String> = if let Some(inner) = cols_part.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         inner
             .split(',')
             .map(|c| unquote(c.trim()))
@@ -781,7 +741,10 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
         name,
         columns: column_names
             .into_iter()
-            .map(|name| IndexColumn { name, ..Default::default() })
+            .map(|name| IndexColumn {
+                name,
+                ..Default::default()
+            })
             .collect(),
         unique,
         ..Default::default()
@@ -800,8 +763,8 @@ fn parse_ref_body(body: &str) -> Result<Option<ParsedRef>> {
     let refs_part = refs_part.trim();
 
     // Find the relationship operator. dbd emits `>`; accept `<`, `-`, `<>`.
-    let (left, op, right) = split_ref_operator(refs_part)
-        .ok_or_else(|| parse_err(format!("Ref missing relationship operator: {body}")))?;
+    let (left, op, right) =
+        split_ref_operator(refs_part).ok_or_else(|| parse_err(format!("Ref missing relationship operator: {body}")))?;
 
     let (mut l_schema, mut l_table, mut l_cols) = parse_ref_endpoint(left)?;
     let (mut r_schema, mut r_table, mut r_cols) = parse_ref_endpoint(right)?;
@@ -1115,7 +1078,8 @@ mod tests {
 
     #[test]
     fn parse_enum_values_in_order() {
-        let dbml = "Enum \"config\".\"status\" {\n  \"active\" [note: 'is active']\n  \"inactive\"\n  \"archived\"\n}\n";
+        let dbml =
+            "Enum \"config\".\"status\" {\n  \"active\" [note: 'is active']\n  \"inactive\"\n  \"archived\"\n}\n";
         let entities = parse_dbml(dbml).unwrap();
         let e = find_enum(&entities, "config.status");
         assert_eq!(e.schema.as_deref(), Some("config"));
@@ -1384,7 +1348,7 @@ mod tests {
 
     #[test]
     fn round_trips_with_apostrophes() {
-        use crate::dbml::{generate_dbml, DbmlParams};
+        use crate::dbml::{DbmlParams, generate_dbml};
         use crate::entity::TableComments;
 
         // Table with a column whose comment (note) contains an apostrophe.
@@ -1440,7 +1404,10 @@ mod tests {
 
         let bio = td.columns.iter().find(|c| c.name == "bio").unwrap();
         // data_type must be clean — no `[note: ...]` glued on.
-        assert_eq!(bio.data_type, "text", "bio data_type must be clean, not glued with settings");
+        assert_eq!(
+            bio.data_type, "text",
+            "bio data_type must be clean, not glued with settings"
+        );
         assert_eq!(
             bio.comment.as_deref(),
             Some("The user's primary biography"),
@@ -1461,22 +1428,48 @@ mod tests {
 
     #[test]
     fn round_trips_through_generate_dbml() {
-        use crate::dbml::{generate_dbml, DbmlParams};
+        use crate::dbml::{DbmlParams, generate_dbml};
         use crate::entity::{EnumValue, IndexColumn, TableComments};
 
         // Enum.
         let mut status = Entity::new(EntityType::Enum, "config.status");
         status.enum_values = vec![
-            EnumValue { name: "active".into(), note: None },
-            EnumValue { name: "inactive".into(), note: Some("not active".into()) },
+            EnumValue {
+                name: "active".into(),
+                note: None,
+            },
+            EnumValue {
+                name: "inactive".into(),
+                note: Some("not active".into()),
+            },
         ];
 
         // Parent table (auth.memberships) with composite PK.
         let mut memberships = Entity::new(EntityType::Table, "auth.memberships");
         memberships.table_def = Some(TableDef {
             columns: vec![
-                ColumnDef { name: "user_id".into(), data_type: "uuid".into(), nullable: false, default_value: None, is_pk: true, is_unique: false, identity: None, comment: None, inline_fk: None },
-                ColumnDef { name: "tenant_id".into(), data_type: "uuid".into(), nullable: false, default_value: None, is_pk: true, is_unique: false, identity: None, comment: None, inline_fk: None },
+                ColumnDef {
+                    name: "user_id".into(),
+                    data_type: "uuid".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: true,
+                    is_unique: false,
+                    identity: None,
+                    comment: None,
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "tenant_id".into(),
+                    data_type: "uuid".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: true,
+                    is_unique: false,
+                    identity: None,
+                    comment: None,
+                    inline_fk: None,
+                },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
                 name: None,
@@ -1495,14 +1488,67 @@ mod tests {
         };
         orders.table_def = Some(TableDef {
             columns: vec![
-                ColumnDef { name: "id".into(), data_type: "bigserial".into(), nullable: false, default_value: None, is_pk: true, is_unique: false, identity: Some(crate::entity::IdentityKind::ByDefault), comment: None, inline_fk: None },
-                ColumnDef { name: "code".into(), data_type: "varchar(20)".into(), nullable: false, default_value: None, is_pk: false, is_unique: true, identity: None, comment: Some("Order code".into()), inline_fk: None },
-                ColumnDef { name: "user_id".into(), data_type: "uuid".into(), nullable: false, default_value: None, is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None },
-                ColumnDef { name: "tenant_id".into(), data_type: "uuid".into(), nullable: false, default_value: None, is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None },
-                ColumnDef { name: "qty".into(), data_type: "int".into(), nullable: true, default_value: Some("1".into()), is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None },
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: "bigserial".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: true,
+                    is_unique: false,
+                    identity: Some(crate::entity::IdentityKind::ByDefault),
+                    comment: None,
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "code".into(),
+                    data_type: "varchar(20)".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: true,
+                    identity: None,
+                    comment: Some("Order code".into()),
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "user_id".into(),
+                    data_type: "uuid".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    comment: None,
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "tenant_id".into(),
+                    data_type: "uuid".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    comment: None,
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "qty".into(),
+                    data_type: "int".into(),
+                    nullable: true,
+                    default_value: Some("1".into()),
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    comment: None,
+                    inline_fk: None,
+                },
             ],
             constraints: vec![
-                TableConstraint::PrimaryKey { name: None, columns: vec!["id".into()] },
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                },
                 TableConstraint::ForeignKey(ForeignKey {
                     name: None,
                     columns: vec!["user_id".into(), "tenant_id".into()],
@@ -1515,7 +1561,11 @@ mod tests {
             ],
             indexes: vec![IndexDef {
                 name: Some("idx_orders_code".into()),
-                columns: vec![IndexColumn { name: "code".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "code".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: true,
                 index_type: None,
                 ..Default::default()
@@ -1557,10 +1607,7 @@ mod tests {
             .iter()
             .map(|c| (c.name.as_str(), c.data_type.as_str(), c.nullable))
             .collect();
-        assert_eq!(
-            mem_cols,
-            vec![("user_id", "uuid", false), ("tenant_id", "uuid", false)]
-        );
+        assert_eq!(mem_cols, vec![("user_id", "uuid", false), ("tenant_id", "uuid", false)]);
         // Composite PK survives.
         assert!(mem_td.constraints.iter().any(|c| matches!(
             c,
@@ -1702,22 +1749,10 @@ mod tests {
 
         // Emit DDL and check the SQL text is correct.
         let sql = emit_table(t);
-        assert!(
-            sql.contains("DEFAULT 'claude'"),
-            "expected DEFAULT 'claude' in:\n{sql}"
-        );
-        assert!(
-            sql.contains("DEFAULT ''"),
-            "expected DEFAULT '' in:\n{sql}"
-        );
-        assert!(
-            sql.contains("DEFAULT now()"),
-            "expected DEFAULT now() in:\n{sql}"
-        );
-        assert!(
-            sql.contains("DEFAULT 0"),
-            "expected DEFAULT 0 in:\n{sql}"
-        );
+        assert!(sql.contains("DEFAULT 'claude'"), "expected DEFAULT 'claude' in:\n{sql}");
+        assert!(sql.contains("DEFAULT ''"), "expected DEFAULT '' in:\n{sql}");
+        assert!(sql.contains("DEFAULT now()"), "expected DEFAULT now() in:\n{sql}");
+        assert!(sql.contains("DEFAULT 0"), "expected DEFAULT 0 in:\n{sql}");
 
         // Re-parse the emitted DDL to confirm it is valid SQL.
         let fake_path = std::path::Path::new("ddl/table/public/t.sql");

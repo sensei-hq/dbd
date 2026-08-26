@@ -14,11 +14,7 @@ pub enum Verbosity {
 
 impl Verbosity {
     pub fn from_flag(verbose: bool) -> Self {
-        if verbose {
-            Self::Verbose
-        } else {
-            Self::Normal
-        }
+        if verbose { Self::Verbose } else { Self::Normal }
     }
 
     pub fn is_verbose(self) -> bool {
@@ -97,17 +93,17 @@ fn colorize(desc: &str) -> String {
         .unwrap_or_else(|| desc.split_whitespace().next().unwrap_or(desc));
 
     match key {
-        "schema"    => style(desc).cyan().to_string(),
-        "table"     => style(desc).green().to_string(),
-        "view"      => style(desc).green().dim().to_string(),
-        "enum"      => style(desc).yellow().to_string(),
-        "function"  => style(desc).magenta().to_string(),
+        "schema" => style(desc).cyan().to_string(),
+        "table" => style(desc).green().to_string(),
+        "view" => style(desc).green().dim().to_string(),
+        "enum" => style(desc).yellow().to_string(),
+        "function" => style(desc).magenta().to_string(),
         "procedure" => style(desc).magenta().to_string(),
         "extension" => style(desc).blue().to_string(),
-        "role"      => style(desc).magenta().dim().to_string(),
-        "migrate"   => style(desc).yellow().to_string(),
-        "drop"      => style(desc).red().to_string(),
-        _           => desc.to_string(),
+        "role" => style(desc).magenta().dim().to_string(),
+        "migrate" => style(desc).yellow().to_string(),
+        "drop" => style(desc).red().to_string(),
+        _ => desc.to_string(),
     }
 }
 
@@ -171,7 +167,10 @@ mod tests {
     /// ordinary run. A named scope always announces.
     #[test]
     fn scope_filtered_is_silent_for_the_all_scope() {
-        let all = dbd_core::ResolvedScope { is_all: true, ..scope_named("all") };
+        let all = dbd_core::ResolvedScope {
+            is_all: true,
+            ..scope_named("all")
+        };
         scope_filtered(&all, 5, 5); // no panic, prints nothing
         let named = scope_named("daemon");
         scope_filtered(&named, 3, 5); // prints

@@ -56,8 +56,7 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
                 // dollar-quoted string, so the outer CREATE FUNCTION is still
                 // valid; fall back to the PL/pgSQL walker rather than erroring,
                 // since we just cannot read this body's refs.
-                let (r, w) = common::extract_proc_refs_via_pg_query(sql, &default_schema)
-                    .unwrap_or_default();
+                let (r, w) = common::extract_proc_refs_via_pg_query(sql, &default_schema).unwrap_or_default();
                 return Ok(finish(entity, r, w, Vec::new()));
             };
             (
@@ -69,8 +68,7 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
         // A PL/pgSQL body resolves names at run time, so its calls are NOT
         // creation-order dependencies — `functions` stays empty deliberately.
         _ => {
-            let (r, w) = common::extract_proc_refs_via_pg_query(sql, &default_schema)
-                .unwrap_or_default();
+            let (r, w) = common::extract_proc_refs_via_pg_query(sql, &default_schema).unwrap_or_default();
             (r, w, Vec::new())
         }
     };
@@ -131,8 +129,7 @@ struct Routine {
 
 fn routine_body(parsed: &pg_query::ParseResult) -> Option<Routine> {
     for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::CreateFunctionStmt(create)) =
-            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
+        let Some(pg_query::NodeEnum::CreateFunctionStmt(create)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
         else {
             continue;
         };
@@ -143,17 +140,13 @@ fn routine_body(parsed: &pg_query::ParseResult) -> Option<Routine> {
             };
             match def.defname.as_str() {
                 "language" => {
-                    if let Some(pg_query::NodeEnum::String(s)) =
-                        def.arg.as_ref().and_then(|a| a.node.as_ref())
-                    {
+                    if let Some(pg_query::NodeEnum::String(s)) = def.arg.as_ref().and_then(|a| a.node.as_ref()) {
                         language = Some(s.sval.to_lowercase());
                     }
                 }
                 "as" => {
-                    if let Some(pg_query::NodeEnum::List(list)) =
-                        def.arg.as_ref().and_then(|a| a.node.as_ref())
-                        && let Some(pg_query::NodeEnum::String(s)) =
-                            list.items.first().and_then(|i| i.node.as_ref())
+                    if let Some(pg_query::NodeEnum::List(list)) = def.arg.as_ref().and_then(|a| a.node.as_ref())
+                        && let Some(pg_query::NodeEnum::String(s)) = list.items.first().and_then(|i| i.node.as_ref())
                     {
                         body = Some(s.sval.clone());
                     }
@@ -287,7 +280,10 @@ mod tests {
     #[test]
     fn a_file_declaring_no_routine_records_an_error() {
         let e = parse("select 1;");
-        assert!(!e.errors.is_empty(), "a routine file with no CREATE FUNCTION must error");
+        assert!(
+            !e.errors.is_empty(),
+            "a routine file with no CREATE FUNCTION must error"
+        );
     }
 
     /// A `LANGUAGE sql` body whose text is not itself valid SQL (a file mid-edit,

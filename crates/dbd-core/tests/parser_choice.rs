@@ -27,10 +27,7 @@ fn project_with_source_block(name: &str, source_block: &str) -> PathBuf {
 
 #[test]
 fn an_unknown_source_parser_fails_to_load() {
-    let config = project_with_source_block(
-        "parser_choice_bad",
-        "  dialect: postgresql\n  parser: pgquery\n",
-    );
+    let config = project_with_source_block("parser_choice_bad", "  dialect: postgresql\n  parser: pgquery\n");
     // `Design` does not derive `Debug`, so `expect_err` (which needs `T: Debug`
     // to format the Ok case) does not compile here; match instead.
     let err = match Design::from_config(&config, "dev") {
@@ -43,10 +40,7 @@ fn an_unknown_source_parser_fails_to_load() {
 
 #[test]
 fn an_explicit_valid_parser_loads() {
-    let config = project_with_source_block(
-        "parser_choice_ok",
-        "  dialect: postgresql\n  parser: sqlparser\n",
-    );
+    let config = project_with_source_block("parser_choice_ok", "  dialect: postgresql\n  parser: sqlparser\n");
     let design = Design::from_config(&config, "dev").expect("an explicit valid parser must load");
     // Loading `Ok` is not enough: the scan loop drops a failed parse silently
     // (`if let Ok(entity) = …`), so a Design loads empty when the parser is

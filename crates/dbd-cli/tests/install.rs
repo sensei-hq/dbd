@@ -13,7 +13,11 @@ fn canonical_skill() -> String {
     fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assets/skills/dbd/SKILL.md")).unwrap()
 }
 fn canonical_agent() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assets/agents/dbd-pattern-verifier.md")).unwrap()
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/assets/agents/dbd-pattern-verifier.md"
+    ))
+    .unwrap()
 }
 
 /// Global install writes both assets under `$CLAUDE_CONFIG_DIR`, byte-for-byte.
@@ -50,8 +54,14 @@ fn dry_run_writes_nothing() {
         .success()
         .stdout(contains("Would install"));
 
-    assert!(!base.join("skills/dbd/SKILL.md").exists(), "dry-run must not write the skill");
-    assert!(!base.join("agents/dbd-pattern-verifier.md").exists(), "dry-run must not write the agent");
+    assert!(
+        !base.join("skills/dbd/SKILL.md").exists(),
+        "dry-run must not write the skill"
+    );
+    assert!(
+        !base.join("agents/dbd-pattern-verifier.md").exists(),
+        "dry-run must not write the agent"
+    );
 }
 
 /// `--project` installs into `<cwd>/.claude`, ignoring the global config dir.
@@ -69,9 +79,18 @@ fn project_install_writes_under_local_dot_claude() {
         .assert()
         .success();
 
-    assert!(proj.path().join(".claude/skills/dbd/SKILL.md").exists(), "project skill should exist");
-    assert!(proj.path().join(".claude/agents/dbd-pattern-verifier.md").exists(), "project agent should exist");
-    assert!(!global.path().join("skills").exists(), "--project must not touch the global base");
+    assert!(
+        proj.path().join(".claude/skills/dbd/SKILL.md").exists(),
+        "project skill should exist"
+    );
+    assert!(
+        proj.path().join(".claude/agents/dbd-pattern-verifier.md").exists(),
+        "project agent should exist"
+    );
+    assert!(
+        !global.path().join("skills").exists(),
+        "--project must not touch the global base"
+    );
 }
 
 /// Re-running is idempotent: the second run reports every asset unchanged.

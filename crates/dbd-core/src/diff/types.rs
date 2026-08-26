@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::entity::{ColumnDef, EntityType, TableConstraint, IndexDef};
+use crate::entity::{ColumnDef, EntityType, IndexDef, TableConstraint};
 
 /// A single entity-level diff between two snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]

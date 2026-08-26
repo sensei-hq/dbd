@@ -356,13 +356,30 @@ mod tests {
     #[test]
     fn every_subcommand_parses() {
         let cmds = [
-            "inspect", "apply", "combine", "import", "refresh", "graph", "dbml", "diagram", "deploy",
-            "snapshot", "migrate", "reset", "doctor", "export", "init", "format",
-            "policies", "diff", "reconcile", "release", "install",
+            "inspect",
+            "apply",
+            "combine",
+            "import",
+            "refresh",
+            "graph",
+            "dbml",
+            "diagram",
+            "deploy",
+            "snapshot",
+            "migrate",
+            "reset",
+            "doctor",
+            "export",
+            "init",
+            "format",
+            "policies",
+            "diff",
+            "reconcile",
+            "release",
+            "install",
         ];
         for c in cmds {
-            Cli::try_parse_from(["dbd", c])
-                .unwrap_or_else(|e| panic!("`dbd {c}` failed to parse: {e}"));
+            Cli::try_parse_from(["dbd", c]).unwrap_or_else(|e| panic!("`dbd {c}` failed to parse: {e}"));
         }
         // merge requires a positional conn argument
         Cli::try_parse_from(["dbd", "merge", "postgres://x"])
@@ -389,22 +406,20 @@ mod tests {
             "expected init roles == true"
         );
         // init: absent → false
-        let cli = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x"])
-            .expect("init --from-db should parse");
+        let cli =
+            Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x"]).expect("init --from-db should parse");
         assert!(
             matches!(&cli.command, Commands::Init { roles: false, .. }),
             "expected init roles == false when absent"
         );
         // merge: present → true
-        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--roles"])
-            .expect("merge --roles should parse");
+        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--roles"]).expect("merge --roles should parse");
         assert!(
             matches!(&cli.command, Commands::Merge { roles: true, .. }),
             "expected merge roles == true"
         );
         // merge: absent → false
-        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x"])
-            .expect("merge should parse");
+        let cli = Cli::try_parse_from(["dbd", "merge", "postgres://x"]).expect("merge should parse");
         assert!(
             matches!(&cli.command, Commands::Merge { roles: false, .. }),
             "expected merge roles == false when absent"
@@ -417,14 +432,28 @@ mod tests {
         // absent → both false
         let cli = Cli::try_parse_from(["dbd", "deploy"]).expect("deploy should parse");
         assert!(
-            matches!(&cli.command, Commands::Deploy { no_cache: false, clear_cache: false, .. }),
+            matches!(
+                &cli.command,
+                Commands::Deploy {
+                    no_cache: false,
+                    clear_cache: false,
+                    ..
+                }
+            ),
             "expected deploy cache flags == false when absent"
         );
         // present → both true
         let cli = Cli::try_parse_from(["dbd", "deploy", "--no-cache", "--clear-cache"])
             .expect("deploy --no-cache --clear-cache should parse");
         assert!(
-            matches!(&cli.command, Commands::Deploy { no_cache: true, clear_cache: true, .. }),
+            matches!(
+                &cli.command,
+                Commands::Deploy {
+                    no_cache: true,
+                    clear_cache: true,
+                    ..
+                }
+            ),
             "expected deploy cache flags == true when present"
         );
     }
@@ -433,9 +462,21 @@ mod tests {
     #[test]
     fn diff_flags_parse() {
         let cli = Cli::try_parse_from(["dbd", "diff"]).expect("diff parses");
-        assert!(matches!(&cli.command, Commands::Diff { json: false, exit_code: false }));
+        assert!(matches!(
+            &cli.command,
+            Commands::Diff {
+                json: false,
+                exit_code: false
+            }
+        ));
         let cli = Cli::try_parse_from(["dbd", "diff", "--json", "--exit-code"]).expect("diff flags parse");
-        assert!(matches!(&cli.command, Commands::Diff { json: true, exit_code: true }));
+        assert!(matches!(
+            &cli.command,
+            Commands::Diff {
+                json: true,
+                exit_code: true
+            }
+        ));
     }
 
     /// `dbd reconcile` flags default to false and flip to true when present.
@@ -445,18 +486,26 @@ mod tests {
         assert!(
             matches!(
                 &cli.command,
-                Commands::Reconcile { dry_run: false, allow_destructive: false, prune: false, .. }
+                Commands::Reconcile {
+                    dry_run: false,
+                    allow_destructive: false,
+                    prune: false,
+                    ..
+                }
             ),
             "expected reconcile flags == false when absent"
         );
-        let cli = Cli::try_parse_from([
-            "dbd", "reconcile", "--dry-run", "--allow-destructive", "--prune",
-        ])
-        .expect("reconcile flags should parse");
+        let cli = Cli::try_parse_from(["dbd", "reconcile", "--dry-run", "--allow-destructive", "--prune"])
+            .expect("reconcile flags should parse");
         assert!(
             matches!(
                 &cli.command,
-                Commands::Reconcile { dry_run: true, allow_destructive: true, prune: true, .. }
+                Commands::Reconcile {
+                    dry_run: true,
+                    allow_destructive: true,
+                    prune: true,
+                    ..
+                }
             ),
             "expected reconcile flags == true when present"
         );
@@ -494,8 +543,7 @@ mod tests {
     fn release_and_baseline_alias_parse() {
         let cli = Cli::try_parse_from(["dbd", "release"]).expect("release should parse");
         assert!(matches!(&cli.command, Commands::Release { name: None }));
-        let cli = Cli::try_parse_from(["dbd", "release", "--name", "v1 GA"])
-            .expect("release --name should parse");
+        let cli = Cli::try_parse_from(["dbd", "release", "--name", "v1 GA"]).expect("release --name should parse");
         assert!(matches!(&cli.command, Commands::Release { name: Some(_) }));
         let cli = Cli::try_parse_from(["dbd", "baseline"]).expect("baseline alias should parse");
         assert!(
@@ -527,7 +575,14 @@ mod tests {
         assert!(
             matches!(
                 &cli.command,
-                Commands::Reset { schemas: false, extensions: false, clean: false, force: false, dry_run: false, .. }
+                Commands::Reset {
+                    schemas: false,
+                    extensions: false,
+                    clean: false,
+                    force: false,
+                    dry_run: false,
+                    ..
+                }
             ),
             "expected all reset flags false by default"
         );
@@ -536,22 +591,31 @@ mod tests {
             .expect("reset --schemas --extensions should parse");
         assert!(matches!(
             &cli.command,
-            Commands::Reset { schemas: true, extensions: true, clean: false, .. }
+            Commands::Reset {
+                schemas: true,
+                extensions: true,
+                clean: false,
+                ..
+            }
         ));
         // --clean --force --dry-run
         let cli = Cli::try_parse_from(["dbd", "reset", "--clean", "--force", "--dry-run"])
             .expect("reset --clean --force --dry-run should parse");
         assert!(matches!(
             &cli.command,
-            Commands::Reset { clean: true, force: true, dry_run: true, .. }
+            Commands::Reset {
+                clean: true,
+                force: true,
+                dry_run: true,
+                ..
+            }
         ));
     }
 
     /// `dbd init --from-db` (no value) must parse to `from_db == Some("")` (env-fallback sentinel).
     #[test]
     fn init_from_db_no_value_uses_env_fallback_sentinel() {
-        let cli = Cli::try_parse_from(["dbd", "init", "--from-db"])
-            .expect("init --from-db (no value) should parse");
+        let cli = Cli::try_parse_from(["dbd", "init", "--from-db"]).expect("init --from-db (no value) should parse");
         assert!(
             matches!(&cli.command, Commands::Init { from_db: Some(s), .. } if s.is_empty()),
             "expected from_db == Some(\"\")"
@@ -572,8 +636,7 @@ mod tests {
     /// `dbd init` (no --from-db flag at all) must parse to `from_db == None`.
     #[test]
     fn init_without_from_db_parses_to_none() {
-        let cli = Cli::try_parse_from(["dbd", "init"])
-            .expect("init with no flags should parse");
+        let cli = Cli::try_parse_from(["dbd", "init"]).expect("init with no flags should parse");
         assert!(
             matches!(&cli.command, Commands::Init { from_db: None, .. }),
             "expected from_db == None"
@@ -601,18 +664,14 @@ mod tests {
     /// `--from-db` and `--from-dbml` are mutually exclusive on `init`.
     #[test]
     fn init_from_db_and_from_dbml_together_is_rejected() {
-        let res = Cli::try_parse_from([
-            "dbd", "init", "--from-db", "postgres://x", "--from-dbml", "schema.dbml",
-        ]);
+        let res = Cli::try_parse_from(["dbd", "init", "--from-db", "postgres://x", "--from-dbml", "schema.dbml"]);
         assert!(res.is_err(), "init --from-db + --from-dbml together should be rejected");
     }
 
     /// On `merge`, the positional `conn` and `--from-dbml` are mutually exclusive.
     #[test]
     fn merge_conn_and_from_dbml_together_is_rejected() {
-        let res = Cli::try_parse_from([
-            "dbd", "merge", "postgres://x", "--from-dbml", "schema.dbml",
-        ]);
+        let res = Cli::try_parse_from(["dbd", "merge", "postgres://x", "--from-dbml", "schema.dbml"]);
         assert!(res.is_err(), "merge conn + --from-dbml together should be rejected");
     }
 
@@ -630,7 +689,14 @@ mod tests {
         );
         // back-compat: no flags
         let cli = Cli::try_parse_from(["dbd", "import"]).expect("import should parse");
-        assert!(matches!(&cli.command, Commands::Import { name: None, file: None, dry_run: false }));
+        assert!(matches!(
+            &cli.command,
+            Commands::Import {
+                name: None,
+                file: None,
+                dry_run: false
+            }
+        ));
         // back-compat: just -n
         let cli = Cli::try_parse_from(["dbd", "import", "-n", "t"]).expect("import -n t should parse");
         assert!(matches!(&cli.command, Commands::Import { name: Some(n), file: None, .. } if n == "t"));
@@ -693,14 +759,26 @@ mod tests {
         // bare install → global, not a dry run
         let cli = Cli::try_parse_from(["dbd", "install"]).expect("install should parse");
         assert!(
-            matches!(&cli.command, Commands::Install { project: false, dry_run: false }),
+            matches!(
+                &cli.command,
+                Commands::Install {
+                    project: false,
+                    dry_run: false
+                }
+            ),
             "expected install project == false, dry_run == false by default"
         );
         // --project --dry-run
         let cli = Cli::try_parse_from(["dbd", "install", "--project", "--dry-run"])
             .expect("install --project --dry-run should parse");
         assert!(
-            matches!(&cli.command, Commands::Install { project: true, dry_run: true }),
+            matches!(
+                &cli.command,
+                Commands::Install {
+                    project: true,
+                    dry_run: true
+                }
+            ),
             "expected install project == true, dry_run == true when present"
         );
     }

@@ -30,8 +30,8 @@ use pg_query::NodeEnum;
 use pg_query::protobuf;
 
 use crate::entity::{
-    ColumnDef, Entity, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType,
-    REF_TYPE_FUNCTION, Reference, SortOrder, TableComments, TableConstraint, TableDef,
+    ColumnDef, Entity, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, REF_TYPE_FUNCTION,
+    Reference, SortOrder, TableComments, TableConstraint, TableDef,
 };
 use crate::error::Result;
 
@@ -81,10 +81,7 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
 /// The whole file: its `CREATE TABLE`s, plus the `CREATE INDEX` and `COMMENT ON`
 /// statements that ship alongside them (Postgres has no way to nest either one
 /// inside `CREATE TABLE`, so they arrive as siblings).
-fn extract(
-    parsed: &pg_query::ParseResult,
-    default_schema: &str,
-) -> Extract<(TableDef, Vec<Reference>)> {
+fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>)> {
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
@@ -132,7 +129,12 @@ fn extract(
     }));
 
     Ok((
-        TableDef { columns, constraints, indexes, comments },
+        TableDef {
+            columns,
+            constraints,
+            indexes,
+            comments,
+        },
         references,
     ))
 }
@@ -157,18 +159,15 @@ fn process_create_table(
     // desired snapshot, and reconcile would read every live column as one to
     // DROP — a worse outcome than the orphaning the module note describes.
     if !create.inh_relations.is_empty() || create.of_typename.is_some() {
-        return Err(
-            "this table takes its columns from another table or a composite type \
+        return Err("this table takes its columns from another table or a composite type \
              (PARTITION OF / INHERITS / OF), which dbd cannot see"
-                .to_string(),
-        );
+            .to_string());
     }
 
     for elt in &create.table_elts {
         match elt.node.as_ref() {
             Some(NodeEnum::ColumnDef(col_def)) => {
-                let (col, checks) =
-                    extract_column(col_def, default_schema, references, functions)?;
+                let (col, checks) = extract_column(col_def, default_schema, references, functions)?;
                 columns.push(col);
                 // Postgres promotes a column-level CHECK to a table constraint,
                 // and introspection reports it as one. Dropping it would make
@@ -182,9 +181,7 @@ fn process_create_table(
             // so the columns it would contribute are simply missing, exactly
             // the silent partial this parser must not produce.
             _ => {
-                return Err(
-                    "this table uses a LIKE clause, whose columns dbd cannot see".to_string()
-                );
+                return Err("this table uses a LIKE clause, whose columns dbd cannot see".to_string());
             }
         }
     }
@@ -229,8 +226,8 @@ fn extract_column(
         .type_name
         .as_ref()
         .ok_or_else(|| format!("column {name:?} has no type"))?;
-    let data_type = type_text(type_name)
-        .ok_or_else(|| format!("column {name:?}: dbd could not render its type back to SQL"))?;
+    let data_type =
+        type_text(type_name).ok_or_else(|| format!("column {name:?}: dbd could not render its type back to SQL"))?;
 
     let mut nullable = true;
     let mut is_pk = false;
@@ -302,8 +299,7 @@ fn extract_column(
                 collect_function_refs(&rendered, default_schema, functions);
             }
             // Deferrability modifiers carry no payload of their own.
-            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred
-            | ConstrAttrImmediate => {}
+            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {}
             other => {
                 return Err(format!(
                     "column {name:?} has a {other:?} constraint dbd cannot represent"
@@ -366,9 +362,7 @@ fn extract_table_constraint(
                 ..fk
             }))
         }
-        other => Err(format!(
-            "this table has a {other:?} constraint dbd cannot represent"
-        )),
+        other => Err(format!("this table has a {other:?} constraint dbd cannot represent")),
     }
 }
 
@@ -435,8 +429,7 @@ fn constraint_expr(c: &protobuf::Constraint, owner: &str, clause: &str) -> Extra
         .raw_expr
         .as_ref()
         .ok_or_else(|| format!("{owner}: its {clause} clause carries no expression"))?;
-    expr_text(raw)
-        .ok_or_else(|| format!("{owner}: dbd could not render its {clause} expression back to SQL"))
+    expr_text(raw).ok_or_else(|| format!("{owner}: dbd could not render its {clause} expression back to SQL"))
 }
 
 /// Record a `COMMENT ON TABLE`/`COLUMN`. Comments on anything else in a table
@@ -459,9 +452,7 @@ fn record_comment(stmt: &protobuf::CommentStmt, comments: &mut TableComments) {
         protobuf::ObjectType::ObjectColumn => {
             // `[schema, table, column]` or `[table, column]` — the column is last.
             if let Some(column) = parts.last() {
-                comments
-                    .columns
-                    .insert(column.clone(), stmt.comment.clone());
+                comments.columns.insert(column.clone(), stmt.comment.clone());
             }
         }
         _ => {}
@@ -481,7 +472,11 @@ pub(super) fn extract_index(
     default_schema: &str,
     functions: &mut Vec<String>,
 ) -> Extract<IndexDef> {
-    let label = if ix.idxname.is_empty() { "<unnamed>" } else { &ix.idxname };
+    let label = if ix.idxname.is_empty() {
+        "<unnamed>"
+    } else {
+        &ix.idxname
+    };
 
     let mut columns = Vec::with_capacity(ix.index_params.len());
     for param in &ix.index_params {
@@ -494,9 +489,8 @@ pub(super) fn extract_index(
                 .expr
                 .as_ref()
                 .ok_or_else(|| format!("index {label:?} has a key that is neither column nor expression"))?;
-            let rendered = expr_text(expr).ok_or_else(|| {
-                format!("index {label:?}: dbd could not render an expression key back to SQL")
-            })?;
+            let rendered = expr_text(expr)
+                .ok_or_else(|| format!("index {label:?}: dbd could not render an expression key back to SQL"))?;
             collect_function_refs(&rendered, default_schema, functions);
             (parenthesize_key(expr, rendered), true)
         } else {
@@ -527,21 +521,19 @@ pub(super) fn extract_index(
         let Some(NodeEnum::DefElem(def)) = option.node.as_ref() else {
             return Err(format!("index {label:?} has an unreadable storage parameter"));
         };
-        let value = def
-            .arg
-            .as_ref()
-            .and_then(|a| scalar_text(a))
-            .ok_or_else(|| {
-                format!("index {label:?}: storage parameter {:?} has an unreadable value", def.defname)
-            })?;
+        let value = def.arg.as_ref().and_then(|a| scalar_text(a)).ok_or_else(|| {
+            format!(
+                "index {label:?}: storage parameter {:?} has an unreadable value",
+                def.defname
+            )
+        })?;
         with_options.insert(def.defname.to_lowercase(), value);
     }
 
     let predicate = match ix.where_clause.as_ref() {
         Some(w) => {
-            let raw = expr_text(w).ok_or_else(|| {
-                format!("index {label:?}: dbd could not render its WHERE predicate back to SQL")
-            })?;
+            let raw = expr_text(w)
+                .ok_or_else(|| format!("index {label:?}: dbd could not render its WHERE predicate back to SQL"))?;
             // Canonicalized so an authored `where status = 'active'` matches the
             // `status = 'active'::app.status_t` Postgres reports back.
             Some(crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw))
@@ -553,8 +545,8 @@ pub(super) fn extract_index(
     // explicit `USING btree` is indistinguishable from the default — and the
     // default is what `None` means to the emitter, which omits the clause.
     let access_method = ix.access_method.to_lowercase();
-    let index_type = (!access_method.is_empty() && access_method != "btree")
-        .then(|| IndexType::from_amname(&access_method));
+    let index_type =
+        (!access_method.is_empty() && access_method != "btree").then(|| IndexType::from_amname(&access_method));
 
     Ok(IndexDef {
         name: (!ix.idxname.is_empty()).then(|| ix.idxname.clone()),
@@ -670,8 +662,7 @@ const FRAME: &str = "dbd_deparse_frame";
 /// field the fragment does not own must hold a value a real parse produced.
 fn type_text(type_name: &protobuf::TypeName) -> Option<String> {
     let mut parsed = pg_query::parse(&format!("CREATE TABLE {FRAME} ({FRAME} int)")).ok()?;
-    let Some(NodeEnum::CreateStmt(create)) = parsed.protobuf.stmts.first_mut()?.stmt.as_mut()?.node.as_mut()
-    else {
+    let Some(NodeEnum::CreateStmt(create)) = parsed.protobuf.stmts.first_mut()?.stmt.as_mut()?.node.as_mut() else {
         return None;
     };
     let Some(NodeEnum::ColumnDef(col)) = create.table_elts.first_mut()?.node.as_mut() else {
@@ -704,8 +695,7 @@ fn without_typmod_spaces(rendered: &str) -> String {
 /// `SELECT ` prefix. See [`type_text`] on why the template is parsed.
 fn expr_text(expr: &protobuf::Node) -> Option<String> {
     let mut parsed = pg_query::parse("SELECT NULL").ok()?;
-    let Some(NodeEnum::SelectStmt(select)) = parsed.protobuf.stmts.first_mut()?.stmt.as_mut()?.node.as_mut()
-    else {
+    let Some(NodeEnum::SelectStmt(select)) = parsed.protobuf.stmts.first_mut()?.stmt.as_mut()?.node.as_mut() else {
         return None;
     };
     let Some(NodeEnum::ResTarget(target)) = select.target_list.first_mut()?.node.as_mut() else {
@@ -804,10 +794,8 @@ mod tests {
 
     #[test]
     fn identity_columns_record_which_form_and_are_not_nullable() {
-        let d = def(
-            "create table t (a int generated always as identity,\
-             b bigint generated by default as identity, c int);",
-        );
+        let d = def("create table t (a int generated always as identity,\
+             b bigint generated by default as identity, c int);");
         assert_eq!(d.columns[0].identity, Some(IdentityKind::Always));
         assert!(!d.columns[0].nullable);
         assert_eq!(d.columns[1].identity, Some(IdentityKind::ByDefault));
@@ -878,9 +866,7 @@ mod tests {
     /// An explicit schema on the target wins over the file's search path.
     #[test]
     fn an_inline_fk_keeps_an_explicit_target_schema() {
-        let e = parse(
-            "set search_path to app;\ncreate table t (pid uuid references other.parent (id));",
-        );
+        let e = parse("set search_path to app;\ncreate table t (pid uuid references other.parent (id));");
         let fk = e.table_def.as_ref().unwrap().columns[0].inline_fk.as_ref().unwrap();
         assert_eq!(fk.ref_schema.as_deref(), Some("other"));
         assert!(e.refers.contains(&"other.parent".to_string()), "got {:?}", e.refers);
@@ -900,19 +886,15 @@ mod tests {
     /// inline CHECK read as a live-only constraint reconcile offers to delete.
     #[test]
     fn a_column_level_check_becomes_a_table_constraint() {
-        let d = def(
-            "create table t (\
+        let d = def("create table t (\
                singleton boolean primary key default true check (singleton),\
                source text not null check (source in ('mcp', 'builtin')),\
-               qty int constraint t_qty_ck check (qty > 0));",
-        );
+               qty int constraint t_qty_ck check (qty > 0));");
         let checks: Vec<(Option<String>, String)> = d
             .constraints
             .iter()
             .filter_map(|c| match c {
-                TableConstraint::Check { name, expression } => {
-                    Some((name.clone(), expression.clone()))
-                }
+                TableConstraint::Check { name, expression } => Some((name.clone(), expression.clone())),
                 _ => None,
             })
             .collect();
@@ -924,9 +906,7 @@ mod tests {
 
     #[test]
     fn a_default_calling_a_function_records_a_soft_reference() {
-        let e = parse(
-            "set search_path to app;\ncreate table t (id uuid default app.new_id());",
-        );
+        let e = parse("set search_path to app;\ncreate table t (id uuid default app.new_id());");
         let r = e
             .references
             .iter()
@@ -942,9 +922,7 @@ mod tests {
     /// `pk_unique_col_sets` in `reconcile` read exactly that shape.
     #[test]
     fn a_composite_primary_key_is_both_a_constraint_and_a_per_column_flag() {
-        let d = def(
-            "create table t (a uuid not null, b uuid not null, c int, primary key (a, b));",
-        );
+        let d = def("create table t (a uuid not null, b uuid not null, c int, primary key (a, b));");
         assert!(d.constraints.iter().any(|c| matches!(
             c,
             TableConstraint::PrimaryKey { name, columns }
@@ -957,14 +935,12 @@ mod tests {
 
     #[test]
     fn named_table_constraints_keep_their_names() {
-        let d = def(
-            "set search_path to app;\n\
+        let d = def("set search_path to app;\n\
              create table t (id uuid, code text, qty int, pid uuid,\
                constraint t_pk primary key (id),\
                constraint t_code_uk unique (code),\
                constraint t_qty_ck check (qty > 0),\
-               constraint t_pid_fk foreign key (pid) references parent (id) on delete cascade);",
-        );
+               constraint t_pid_fk foreign key (pid) references parent (id) on delete cascade);");
         assert!(d.constraints.iter().any(|c| matches!(
             c, TableConstraint::PrimaryKey { name: Some(n), .. } if n == "t_pk"
         )));
@@ -1023,9 +999,7 @@ mod tests {
     /// snapshot therefore records.
     #[test]
     fn inline_checks_precede_table_level_constraints() {
-        let d = def(
-            "create table t (a int check (a > 0), b int, constraint t_b_ck check (b > 0));",
-        );
+        let d = def("create table t (a int check (a > 0), b int, constraint t_b_ck check (b > 0));");
         let names: Vec<Option<&str>> = d
             .constraints
             .iter()
@@ -1041,12 +1015,10 @@ mod tests {
 
     #[test]
     fn table_and_column_comments_are_captured() {
-        let d = def(
-            "create table t (id int, name text);\n\
+        let d = def("create table t (id int, name text);\n\
              comment on table t is 'the table';\n\
              comment on column t.id is 'the id';\n\
-             comment on column app.t.name is 'the name';",
-        );
+             comment on column app.t.name is 'the name';");
         assert_eq!(d.comments.table.as_deref(), Some("the table"));
         assert_eq!(d.comments.columns.get("id").map(String::as_str), Some("the id"));
         assert_eq!(d.columns[0].comment.as_deref(), Some("the id"));
@@ -1070,11 +1042,9 @@ mod tests {
 
     #[test]
     fn an_explicit_access_method_and_opclass_survive() {
-        let d = def(
-            "create table t (tags text[], name text);\n\
+        let d = def("create table t (tags text[], name text);\n\
              create index t_tags on t using gin (tags array_ops);\n\
-             create index t_hnsw on t using hnsw (name);",
-        );
+             create index t_hnsw on t using hnsw (name);");
         assert_eq!(d.indexes[0].index_type, Some(IndexType::Gin));
         assert_eq!(d.indexes[0].columns[0].opclass.as_deref(), Some("array_ops"));
         assert_eq!(d.indexes[1].index_type, Some(IndexType::Other("hnsw".to_string())));
@@ -1082,10 +1052,8 @@ mod tests {
 
     #[test]
     fn sort_order_and_nulls_ordering_are_captured() {
-        let d = def(
-            "create table t (a int, b int);\n\
-             create index t_ix on t (a desc nulls last, b asc nulls first);",
-        );
+        let d = def("create table t (a int, b int);\n\
+             create index t_ix on t (a desc nulls last, b asc nulls first);");
         let cols = &d.indexes[0].columns;
         assert_eq!(cols[0].order, Some(SortOrder::Desc));
         assert_eq!(cols[0].nulls_first, Some(false));
@@ -1115,11 +1083,9 @@ mod tests {
 
     #[test]
     fn include_nulls_not_distinct_and_storage_parameters_are_captured() {
-        let d = def(
-            "create table t (a int, b int);\n\
+        let d = def("create table t (a int, b int);\n\
              create unique index t_ix on t (a) include (b) nulls not distinct \
-               with (fillfactor = 70, deduplicate_items = off);",
-        );
+               with (fillfactor = 70, deduplicate_items = off);");
         let ix = &d.indexes[0];
         assert_eq!(ix.include, vec!["b".to_string()]);
         assert!(ix.nulls_not_distinct);
@@ -1131,16 +1097,11 @@ mod tests {
     /// analyzed form `pg_get_expr` reports for the same index.
     #[test]
     fn a_partial_index_predicate_is_canonicalized() {
-        let d = def(
-            "create table t (id int, scope text);\n\
-             create index t_ix on t (id) where scope in ('user', 'project');",
-        );
+        let d = def("create table t (id int, scope text);\n\
+             create index t_ix on t (id) where scope in ('user', 'project');");
         assert_eq!(
             d.indexes[0].predicate.as_deref(),
-            crate::sql_expr::canonicalize_predicate(
-                "scope = ANY (ARRAY['user'::text, 'project'::text])"
-            )
-            .as_deref(),
+            crate::sql_expr::canonicalize_predicate("scope = ANY (ARRAY['user'::text, 'project'::text])").as_deref(),
         );
     }
 
@@ -1155,7 +1116,10 @@ mod tests {
             "create table t (id int primary key, r int4range,\
              exclude using gist (r with &&));",
         );
-        assert!(!e.errors.is_empty(), "an EXCLUDE constraint must not be dropped silently");
+        assert!(
+            !e.errors.is_empty(),
+            "an EXCLUDE constraint must not be dropped silently"
+        );
         assert!(
             e.table_def.is_none(),
             "a partially-read table must not reach the desired snapshot"
@@ -1198,7 +1162,10 @@ mod tests {
     /// `["public"]` default, because references are qualified against it.
     #[test]
     fn search_paths_survive_both_the_happy_and_the_error_path() {
-        assert_eq!(parse("set search_path to app;\ncreate table t (a int);").search_paths, vec!["app".to_string()]);
+        assert_eq!(
+            parse("set search_path to app;\ncreate table t (a int);").search_paths,
+            vec!["app".to_string()]
+        );
         assert_eq!(parse("create table t (").search_paths, vec!["public".to_string()]);
     }
 }

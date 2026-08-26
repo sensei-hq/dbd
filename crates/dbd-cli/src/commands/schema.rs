@@ -97,10 +97,7 @@ pub async fn cmd_inspect(
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(
-        design.entities(),
-        &design.config().source.dialect,
-    );
+    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
     print_enum_hints(&enum_hints);
 
     // Report first, then fail. The findings above are the useful output; an
@@ -128,7 +125,10 @@ async fn resolve_inspect_refs(
             .await
             .context("Failed to resolve references against database catalog")?;
         if dropped > 0 {
-            output::detail(verbosity, &format!("  resolved {dropped} reference(s) against database catalog"));
+            output::detail(
+                verbosity,
+                &format!("  resolved {dropped} reference(s) against database catalog"),
+            );
         }
 
         // Persist a project-local snapshot for offline use on subsequent runs.
@@ -165,7 +165,10 @@ fn report_scope_gaps(
         return Ok(());
     }
 
-    output::info(verbosity, &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()));
+    output::info(
+        verbosity,
+        &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()),
+    );
     for gap in &report.gaps {
         output::always(&format!(
             "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
@@ -184,7 +187,10 @@ fn report_scope_gaps(
             resolved.name
         ),
         dbd_core::config::DepsPolicy::Include => {
-            output::info(verbosity, &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()));
+            output::info(
+                verbosity,
+                &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()),
+            );
         }
     }
     Ok(())
@@ -217,9 +223,7 @@ fn print_report_findings(report: &dbd_core::design::Report, scope_name: Option<&
         // run would build a database missing it. `ensure_fully_parsed` refuses
         // rather than do that — say so here, or the report reads as advisory
         // and the refusal later looks like a new problem.
-        output::always(
-            "\n  → dbd apply / reconcile / deploy will refuse to run until these are fixed.",
-        );
+        output::always("\n  → dbd apply / reconcile / deploy will refuse to run until these are fixed.");
     }
 
     // Errored files the scope excludes. Not blocking this run, but never
@@ -248,8 +252,7 @@ fn print_report_findings(report: &dbd_core::design::Report, scope_name: Option<&
         }
     }
 
-    if report.issues.is_empty() && report.out_of_scope_issues.is_empty() && report.warnings.is_empty()
-    {
+    if report.issues.is_empty() && report.out_of_scope_issues.is_empty() && report.warnings.is_empty() {
         output::info(verbosity, "Everything looks ok");
     }
 }
@@ -325,12 +328,7 @@ fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     hints
         .iter()
         .map(|h| {
-            let set = h
-                .values
-                .iter()
-                .map(|v| format!("'{v}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let set = h.values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ");
             let schema = h.entity.split_once('.').map(|(s, _)| s).unwrap_or("public");
             format!(
                 "  {entity}.{column}: CHECK constrains to a fixed string set {{{set}}} — a \
@@ -365,7 +363,11 @@ pub fn cmd_combine(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
-    output::scope_filtered(&resolved, design.scoped_entities(&resolved)?.len(), design.entities().len());
+    output::scope_filtered(
+        &resolved,
+        design.scoped_entities(&resolved)?.len(),
+        design.entities().len(),
+    );
     design.combine(file, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
@@ -400,9 +402,14 @@ pub async fn cmd_apply(
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != dbd_core::EntityType::External)
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| resolved.is_all
-                || ws.contains(&e.name)
-                || matches!(e.entity_type, dbd_core::EntityType::Extension | dbd_core::EntityType::Role))
+            .filter(|e| {
+                resolved.is_all
+                    || ws.contains(&e.name)
+                    || matches!(
+                        e.entity_type,
+                        dbd_core::EntityType::Extension | dbd_core::EntityType::Role
+                    )
+            })
             .collect();
 
         for entity in &entities {
@@ -482,11 +489,11 @@ pub async fn cmd_apply(
     // cross-target design may declare schema grants yet apply to any target.
     if !schema_grants.is_empty() {
         if adapter.supports_schema_grants() {
-            if let Some(grants_sql) =
-                dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas)
-            {
+            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
                 output::info(verbosity, "Applying grants...");
-                adapter.execute_script(&grants_sql).await
+                adapter
+                    .execute_script(&grants_sql)
+                    .await
                     .context("Failed to apply grants")?;
                 output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
             }
@@ -703,9 +710,8 @@ mod tests {
         }];
         let out = render_enum_hints(&hints);
         assert!(
-            out.iter().any(|l| l.contains("config.lookups.status")
-                && l.contains("'active'")
-                && l.contains("enum")),
+            out.iter()
+                .any(|l| l.contains("config.lookups.status") && l.contains("'active'") && l.contains("enum")),
             "got: {out:?}"
         );
     }
@@ -715,8 +721,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_offline_on_fixture() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*fix*/ false, /*use_database*/ false, None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*fix*/ false,
+            /*use_database*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -728,7 +742,16 @@ mod tests {
     fn combine_writes_sql_file() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("combined.sql");
-        cmd_combine(&testutil::fixture_config(), "dev", &testutil::fixtures(), &out, None, None, Verbosity::Normal).unwrap();
+        cmd_combine(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            &out,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
         assert!(out.exists());
     }
 
@@ -737,9 +760,17 @@ mod tests {
     #[tokio::test]
     async fn apply_dry_run_lists_entities() {
         cmd_apply(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*dry_run*/ true,
+            /*with_policies*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -749,9 +780,18 @@ mod tests {
     /// "no policy files" path without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_without_policy_dir() {
-        cmd_policies(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, /*dry_run*/ true, None, None, Verbosity::Normal)
-            .await
-            .unwrap();
+        cmd_policies(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*dry_run*/ true,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// `format` (write mode) rewrites DDL in place; run against a copy and with
@@ -783,8 +823,15 @@ mod tests {
     #[tokio::test]
     async fn inspect_verbose_named_clean_entity_reports_all_clear() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ Some("config.lookups"), /*fix*/ false, /*use_database*/ false, None, None,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ Some("config.lookups"),
+            /*fix*/ false,
+            /*use_database*/ false,
+            None,
+            None,
             Verbosity::Verbose,
         )
         .await
@@ -797,8 +844,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_bails_on_scope_gap_with_report_policy() {
         let err = cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("incomplete"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -811,8 +866,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_reports_scope_gap_with_include_policy() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("incomplete_auto"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("incomplete_auto"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -824,9 +887,17 @@ mod tests {
     #[tokio::test]
     async fn apply_dry_run_lists_entities_for_named_scope() {
         cmd_apply(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
-            Some("config_only"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*dry_run*/ true,
+            /*with_policies*/ false,
+            /*allow_scope_change*/ false,
+            Some("config_only"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -840,9 +911,18 @@ mod tests {
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");
-        cmd_policies(&cfg, "dev", proj.path(), None, /*dry_run*/ true, None, None, Verbosity::Normal)
-            .await
-            .unwrap();
+        cmd_policies(
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            /*dry_run*/ true,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// Offline reference resolution drops a warning whose target is present
@@ -865,7 +945,10 @@ mod tests {
             .entities()
             .iter()
             .any(|e| e.warnings.iter().any(|w| w.contains("totally_missing")));
-        assert!(has_warning_before, "fixture setup should produce the unresolved-reference warning");
+        assert!(
+            has_warning_before,
+            "fixture setup should produce the unresolved-reference warning"
+        );
 
         resolve_inspect_refs(&mut design, &cfg, None, /*use_database*/ false, Verbosity::Normal)
             .await
@@ -903,8 +986,16 @@ mod tests {
         let before = std::fs::read_to_string(&target).unwrap();
 
         cmd_inspect(
-            &cfg, "dev", proj.path(), None,
-            /*name*/ None, /*fix*/ true, /*use_database*/ false, None, None, Verbosity::Normal,
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            /*name*/ None,
+            /*fix*/ true,
+            /*use_database*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -962,8 +1053,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_scoped_with_no_gaps_succeeds() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("config_wild"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("config_wild"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -1024,7 +1123,11 @@ mod tests {
         let names: Vec<&str> = selected.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["analytics.daily_sales", "analytics.weekly_sales", "reporting.monthly_totals"]
+            vec![
+                "analytics.daily_sales",
+                "analytics.weekly_sales",
+                "reporting.monthly_totals"
+            ]
         );
     }
 

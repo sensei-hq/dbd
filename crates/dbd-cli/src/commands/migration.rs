@@ -29,7 +29,13 @@ pub async fn cmd_reset(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let ResetOptions { dry_run, force, drop_schemas, drop_extensions, allow_scope_change } = opts;
+    let ResetOptions {
+        dry_run,
+        force,
+        drop_schemas,
+        drop_extensions,
+        allow_scope_change,
+    } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
 
@@ -43,7 +49,17 @@ pub async fn cmd_reset(
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    reset_with_adapter(&*adapter, &design, target, force, drop_schemas, drop_extensions, &resolved, allow_scope_change).await
+    reset_with_adapter(
+        &*adapter,
+        &design,
+        target,
+        force,
+        drop_schemas,
+        drop_extensions,
+        &resolved,
+        allow_scope_change,
+    )
+    .await
 }
 
 /// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
@@ -64,7 +80,9 @@ pub(crate) async fn reset_with_adapter(
 ) -> Result<()> {
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
-    design.reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved)).await?;
+    design
+        .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
+        .await?;
     Ok(())
 }
 
@@ -91,8 +109,14 @@ pub(crate) async fn migrate_status_with_adapter(
     let snapshots = dbd_core::snapshot::list_snapshots(project_dir);
     let latest_version = snapshots.last().map(|s| s.version).unwrap_or(0);
 
-    output::always(&format!("Database version: {}", dbd_core::snapshot::pad_version(db_version)));
-    output::always(&format!("Latest snapshot:  {}", dbd_core::snapshot::pad_version(latest_version)));
+    output::always(&format!(
+        "Database version: {}",
+        dbd_core::snapshot::pad_version(db_version)
+    ));
+    output::always(&format!(
+        "Latest snapshot:  {}",
+        dbd_core::snapshot::pad_version(latest_version)
+    ));
 
     let pending = dbd_core::snapshot::pending_migrations(db_version, project_dir);
     if pending.is_empty() {
@@ -126,8 +150,16 @@ pub fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
     }
 
     for s in &snapshots {
-        let ts = if s.timestamp.len() >= 10 { &s.timestamp[..10] } else { &s.timestamp };
-        let desc = if s.description.is_empty() { "(no description)" } else { &s.description };
+        let ts = if s.timestamp.len() >= 10 {
+            &s.timestamp[..10]
+        } else {
+            &s.timestamp
+        };
+        let desc = if s.description.is_empty() {
+            "(no description)"
+        } else {
+            &s.description
+        };
         output::info(
             verbosity,
             &format!("  {}  {}  {}", dbd_core::snapshot::pad_version(s.version), ts, desc),
@@ -142,8 +174,7 @@ pub fn cmd_snapshot_create(
     description: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let desc = description.unwrap_or("snapshot");
     let result = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config, desc)
         .context("Failed to create snapshot")?;
@@ -169,13 +200,15 @@ pub fn cmd_snapshot_create(
             let added = graph.map(|g| g.added.len()).unwrap_or(0);
             let altered = graph.map(|g| g.altered.len()).unwrap_or(0);
             let dropped = graph.map(|g| g.dropped.len()).unwrap_or(0);
-            output::info(verbosity, &format!(
-                "Snapshot v{version} created — {added} added, {altered} altered, {dropped} dropped."
-            ));
+            output::info(
+                verbosity,
+                &format!("Snapshot v{version} created — {added} added, {altered} altered, {dropped} dropped."),
+            );
         } else {
-            output::info(verbosity, &format!(
-                "\nSnapshot v{version} created (stage {} of {total_stages})", i + 1
-            ));
+            output::info(
+                verbosity,
+                &format!("\nSnapshot v{version} created (stage {} of {total_stages})", i + 1),
+            );
         }
 
         if !snap.migration_files.is_empty() {
@@ -222,7 +255,11 @@ mod tests {
     #[tokio::test]
     async fn reset_dry_run_needs_no_database() {
         cmd_reset(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None, "dev",
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            "dev",
             ResetOptions {
                 dry_run: true,
                 force: false,
@@ -230,7 +267,9 @@ mod tests {
                 drop_extensions: false,
                 allow_scope_change: false,
             },
-            None, None, Verbosity::Normal,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -357,19 +396,15 @@ mod tests {
     /// scope — the check that stops a scoped reset wiping another scope.
     #[tokio::test]
     async fn reset_is_blocked_when_pinned_to_another_scope() {
-        let design = Design::from_config_with_dir(
-            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
-        )
-        .unwrap();
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
         let resolved = design.resolve_scope(None, None).unwrap();
 
         let mock = MockAdapter::new().with_version(0).with_scope("a_different_scope");
 
-        let err = reset_with_adapter(
-            &mock, &design, "dev", false, false, false, &resolved, false,
-        )
-        .await
-        .unwrap_err();
+        let err = reset_with_adapter(&mock, &design, "dev", false, false, false, &resolved, false)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("a_different_scope"),
             "the guard must name the pinned scope: {err}"
@@ -388,10 +423,8 @@ mod tests {
     /// mask whether the scope override worked.
     #[tokio::test]
     async fn reset_proceeds_when_scope_change_allowed() {
-        let design = Design::from_config_with_dir(
-            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
-        )
-        .unwrap();
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
         let resolved = design.resolve_scope(None, None).unwrap();
 
         let mock = MockAdapter::new().with_version(0).with_scope("a_different_scope");
@@ -410,10 +443,8 @@ mod tests {
     /// clears it.
     #[tokio::test]
     async fn reset_is_blocked_when_db_has_applied_migrations() {
-        let design = Design::from_config_with_dir(
-            &testutil::fixture_config(), "dev", Some(&testutil::fixtures()),
-        )
-        .unwrap();
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
         let resolved = design.resolve_scope(None, None).unwrap();
 
         // Scope matches, so only the applied-migrations guard can fire.

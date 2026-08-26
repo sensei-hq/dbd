@@ -64,9 +64,7 @@ fn enum_values(sql: &str) -> Option<Vec<EnumValue>> {
 /// over the statements it recovers from inside a `DO` block.
 pub(crate) fn labels_from_parse_result(parsed: &pg_query::ParseResult) -> Option<Vec<EnumValue>> {
     for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::CreateEnumStmt(create)) =
-            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-        else {
+        let Some(pg_query::NodeEnum::CreateEnumStmt(create)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
         let values: Vec<EnumValue> = create
@@ -137,11 +135,7 @@ mod tests {
     fn invalid_sql_records_a_parse_error_naming_the_token() {
         let e = parse("create type status as enum (;;;");
         assert!(!e.errors.is_empty(), "invalid SQL must error");
-        assert!(
-            e.errors[0].contains("syntax error at or near"),
-            "got: {:?}",
-            e.errors
-        );
+        assert!(e.errors[0].contains("syntax error at or near"), "got: {:?}", e.errors);
         assert!(e.enum_values.is_empty());
     }
 

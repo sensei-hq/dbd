@@ -1,4 +1,3 @@
-
 use crate::config::RoleEntry;
 use crate::entity::{Entity, EntityType};
 
@@ -6,9 +5,17 @@ use crate::entity::{Entity, EntityType};
 /// Supabase exposes via PostgREST (on a plain `postgres` target `public` is an
 /// ordinary project schema and is droppable with `--schemas`).
 pub const SUPABASE_PROTECTED: &[&str] = &[
-    "public", "auth", "storage", "realtime", "graphql_public",
-    "supabase_functions", "pgbouncer", "pgsodium", "vault",
-    "extensions", "supabase_migrations",
+    "public",
+    "auth",
+    "storage",
+    "realtime",
+    "graphql_public",
+    "supabase_functions",
+    "pgbouncer",
+    "pgsodium",
+    "vault",
+    "extensions",
+    "supabase_migrations",
 ];
 
 /// Generate DDL SQL from an entity.
@@ -17,10 +24,7 @@ pub const SUPABASE_PROTECTED: &[&str] = &[
 /// For file-based entities (table, view, etc.): reads the DDL file.
 pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     match entity.entity_type {
-        EntityType::Schema => Some(format!(
-            "CREATE SCHEMA IF NOT EXISTS \"{}\";",
-            entity.name
-        )),
+        EntityType::Schema => Some(format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", entity.name)),
         EntityType::Extension => {
             let schema = entity.schema.as_deref().unwrap_or("public");
             Some(format!(
@@ -238,10 +242,7 @@ pub fn build_grants_script(
             if perms.contains(&"usage".to_string()) {
                 lines.push(format!("GRANT USAGE ON SCHEMA \"{}\" TO \"{}\";", schema, role));
             }
-            let table_perms: Vec<&String> = perms
-                .iter()
-                .filter(|p| *p != "usage")
-                .collect();
+            let table_perms: Vec<&String> = perms.iter().filter(|p| *p != "usage").collect();
             if !table_perms.is_empty() {
                 let perms_str = table_perms
                     .iter()
@@ -432,11 +433,9 @@ mod tests {
     fn reset_drop_schemas_postgres_drops_public() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "public".to_string()];
-        let script = build_reset_script(
-            &refs(&entities), &[], &[], "postgres", true, false, &schemas,
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", true, false, &schemas)
+            .unwrap()
+            .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(script.contains("DROP SCHEMA IF EXISTS \"public\" CASCADE"));
     }
@@ -445,11 +444,9 @@ mod tests {
     fn reset_drop_schemas_supabase_keeps_public_and_auth() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "public".to_string(), "auth".to_string()];
-        let script = build_reset_script(
-            &refs(&entities), &[], &[], "supabase", true, false, &schemas,
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &[], &[], "supabase", true, false, &schemas)
+            .unwrap()
+            .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"public\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"auth\" CASCADE"));
@@ -459,11 +456,9 @@ mod tests {
     fn reset_drop_schemas_always_excludes_system() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "pg_catalog".to_string()];
-        let script = build_reset_script(
-            &refs(&entities), &[], &[], "postgres", true, false, &schemas,
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", true, false, &schemas)
+            .unwrap()
+            .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"pg_catalog\" CASCADE"));
     }
@@ -472,11 +467,9 @@ mod tests {
     fn reset_drop_extensions() {
         let entities = sample_entities();
         let extensions = vec!["vector".to_string(), "uuid-ossp".to_string()];
-        let script = build_reset_script(
-            &refs(&entities), &[], &extensions, "postgres", false, true, &[],
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &[], &extensions, "postgres", false, true, &[])
+            .unwrap()
+            .unwrap();
         assert!(script.contains("DROP EXTENSION IF EXISTS \"vector\" CASCADE"));
         assert!(script.contains("DROP EXTENSION IF EXISTS \"uuid-ossp\" CASCADE"));
     }
@@ -487,11 +480,9 @@ mod tests {
         let schemas = vec!["config".to_string()];
         let extensions = vec!["vector".to_string()];
         // --clean ⇒ both drop_schemas and drop_extensions on.
-        let script = build_reset_script(
-            &refs(&entities), &[], &extensions, "postgres", true, true, &schemas,
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &[], &extensions, "postgres", true, true, &schemas)
+            .unwrap()
+            .unwrap();
         assert!(script.contains("DROP TABLE IF EXISTS \"public\".\"users\" CASCADE"));
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(script.contains("DROP EXTENSION IF EXISTS \"vector\" CASCADE"));
@@ -501,14 +492,18 @@ mod tests {
     fn reset_postgres_drops_roles_reverse_order() {
         let entities = sample_entities();
         let roles = vec![
-            RoleEntry { name: "basic".to_string(), refers: vec![] },
-            RoleEntry { name: "advanced".to_string(), refers: vec!["basic".to_string()] },
+            RoleEntry {
+                name: "basic".to_string(),
+                refers: vec![],
+            },
+            RoleEntry {
+                name: "advanced".to_string(),
+                refers: vec!["basic".to_string()],
+            },
         ];
-        let script = build_reset_script(
-            &refs(&entities), &roles, &[], "postgres", false, false, &[],
-        )
-        .unwrap()
-        .unwrap();
+        let script = build_reset_script(&refs(&entities), &roles, &[], "postgres", false, false, &[])
+            .unwrap()
+            .unwrap();
         let adv_pos = script.find("DROP ROLE IF EXISTS \"advanced\"").unwrap();
         let basic_pos = script.find("DROP ROLE IF EXISTS \"basic\"").unwrap();
         assert!(adv_pos < basic_pos);
@@ -524,10 +519,7 @@ mod tests {
     fn grants_script_basic() {
         let mut schema_grants = HashMap::new();
         let mut config_grants = HashMap::new();
-        config_grants.insert(
-            "anon".to_string(),
-            vec!["usage".to_string(), "select".to_string()],
-        );
+        config_grants.insert("anon".to_string(), vec!["usage".to_string(), "select".to_string()]);
         schema_grants.insert("config".to_string(), config_grants);
 
         let script = build_grants_script(&schema_grants, &[]).unwrap();

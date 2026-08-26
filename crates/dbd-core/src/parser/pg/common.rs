@@ -91,9 +91,7 @@ pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
         return vec![DEFAULT_SEARCH_PATH.to_string()];
     };
     for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::VariableSetStmt(set)) =
-            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-        else {
+        let Some(pg_query::NodeEnum::VariableSetStmt(set)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
         if !set.name.eq_ignore_ascii_case("search_path") {
@@ -144,10 +142,7 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
 /// how the result is later compared.
 ///
 /// [`extractors::extract_view_info`]: crate::parser::extractors::extract_view_info
-pub(in crate::parser) fn extract_view_refs_via_pg_query(
-    raw_sql: &str,
-    default_schema: &str,
-) -> Vec<Reference> {
+pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Reference> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return Vec::new();
     };
@@ -200,9 +195,7 @@ pub(in crate::parser) fn extract_proc_refs_via_pg_query(
         // A `query` may be a full statement, or a bare expression (e.g. an `IF`
         // condition). Parse it directly, else `SELECT`-wrap it so any subqueries
         // are still seen. A dynamic-SQL string literal yields no tables either way.
-        let Ok(parsed) =
-            pg_query::parse(query).or_else(|_| pg_query::parse(&format!("SELECT {query}")))
-        else {
+        let Ok(parsed) = pg_query::parse(query).or_else(|_| pg_query::parse(&format!("SELECT {query}"))) else {
             continue;
         };
         for table in parsed.select_tables() {
@@ -287,8 +280,7 @@ pub(in crate::parser) fn push_unique(v: &mut Vec<String>, item: String) {
 /// [`push_unique`]: `extractors.rs`'s sqlparser-side `qualify_relation` and
 /// `regex_table_after` also read it, and this keeps that a dependency on `pg`
 /// rather than the reverse.
-pub(in crate::parser) const SYSTEM_SCHEMAS: &[&str] =
-    &["information_schema", "pg_catalog", "pg_toast"];
+pub(in crate::parser) const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
 
 #[cfg(test)]
 mod tests {

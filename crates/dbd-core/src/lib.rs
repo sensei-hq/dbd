@@ -3,26 +3,26 @@ pub mod config;
 pub mod dbml;
 pub mod dbml_parse;
 pub mod dependency;
+pub mod deploy;
+pub mod design;
 pub mod diagram;
 pub mod diff;
 pub mod doctor;
-pub mod design;
 pub mod emit;
 pub mod entity;
 pub mod error;
-pub mod deploy;
 pub mod formatter;
 pub mod github;
 pub mod init;
 pub mod parser;
 pub mod reconcile;
-pub mod references;
 pub mod refcache;
+pub mod references;
+pub mod reverse;
 pub mod scanner;
 pub mod schema_diff;
 pub mod schema_model;
 pub mod scope;
-pub mod reverse;
 pub mod script;
 pub mod snapshot;
 pub mod sql_expr;
@@ -30,9 +30,9 @@ pub mod sql_expr;
 pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};
 pub use entity::{Entity, EntityType};
+pub use error::{DbdError, Result};
 pub use reconcile::{ReconcileComplete, ReconcilePlan};
 pub use schema_diff::SchemaDiff;
-pub use error::{DbdError, Result};
 pub use schema_model::SchemaModel;
 pub use scope::{ResolvedScope, ScopeGap};
 pub use snapshot::DataSqlTodo;
@@ -66,9 +66,7 @@ pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter
         Ok(Box::new(adapter))
     }
     #[cfg(not(feature = "postgres"))]
-    Err(DbdError::Config(format!(
-        "No adapter compiled in for URL: {url}"
-    )))
+    Err(DbdError::Config(format!("No adapter compiled in for URL: {url}")))
 }
 
 #[cfg(test)]

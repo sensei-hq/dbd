@@ -15,9 +15,7 @@
 //! the last `WITH` (if any) — tokenized, so an `as` inside a string, comment,
 //! or dollar-quoted body is never mistaken for the boundary.
 
-use crate::entity::{
-    Entity, IndexDef, REF_TYPE_FUNCTION, Reference, TableComments, TableDef,
-};
+use crate::entity::{Entity, IndexDef, REF_TYPE_FUNCTION, Reference, TableComments, TableDef};
 use crate::error::Result;
 
 use super::{common, tables};
@@ -131,9 +129,7 @@ fn extract_body(sql: &str, raw_stmt: &pg_query::protobuf::RawStmt) -> Option<Str
     };
 
     let scan = pg_query::scan(sql).ok()?;
-    let in_range = |t: &&pg_query::protobuf::ScanToken| {
-        (t.start as usize) >= start && (t.end as usize) <= end
-    };
+    let in_range = |t: &&pg_query::protobuf::ScanToken| (t.start as usize) >= start && (t.end as usize) <= end;
     let text_of = |t: &pg_query::protobuf::ScanToken| sql[t.start as usize..t.end as usize].to_lowercase();
 
     let as_token = scan.tokens.iter().filter(in_range).find(|t| text_of(t) == "as")?;
@@ -150,7 +146,13 @@ fn extract_body(sql: &str, raw_stmt: &pg_query::protobuf::RawStmt) -> Option<Str
         .map(|t| t.start as usize)
         .unwrap_or(end);
 
-    Some(sql[body_start..body_end].trim().trim_end_matches(';').trim().to_string())
+    Some(
+        sql[body_start..body_end]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Trailing `CREATE INDEX` statements, read by the table parser's extractor.
@@ -166,8 +168,7 @@ fn extract_indexes(
 ) -> std::result::Result<Vec<IndexDef>, String> {
     let mut indexes = Vec::new();
     for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::IndexStmt(ix)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-        else {
+        let Some(pg_query::NodeEnum::IndexStmt(ix)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
         indexes.push(tables::extract_index(ix, default_schema, functions)?);
@@ -192,18 +193,26 @@ mod tests {
     /// parser's re-rendering of it.
     #[test]
     fn the_body_is_verbatim_not_re_rendered() {
-        let e = body("set search_path to app;\ncreate materialized view m as\n  select a,\n         b\n  from t\nwith data;");
+        let e = body(
+            "set search_path to app;\ncreate materialized view m as\n  select a,\n         b\n  from t\nwith data;",
+        );
         assert_eq!(e, "select a,\n         b\n  from t");
     }
 
     #[test]
     fn with_no_data_is_not_part_of_the_body() {
-        assert_eq!(body("create materialized view m as select a from t with no data;"), "select a from t");
+        assert_eq!(
+            body("create materialized view m as select a from t with no data;"),
+            "select a from t"
+        );
     }
 
     #[test]
     fn a_missing_with_clause_still_yields_the_body() {
-        assert_eq!(body("create materialized view m as select a from t;"), "select a from t");
+        assert_eq!(
+            body("create materialized view m as select a from t;"),
+            "select a from t"
+        );
     }
 
     /// The tokenizer must not mistake an `as` inside a string for the keyword.
@@ -247,7 +256,11 @@ mod tests {
         assert_eq!(ix.len(), 1, "got {ix:?}");
         assert_eq!(ix[0].columns[0].opclass.as_deref(), Some("text_pattern_ops"));
         assert_eq!(ix[0].predicate.as_deref(), Some("a IS NOT NULL"));
-        assert!(e.warnings.is_empty(), "nothing was skipped, so nothing to warn about: {:?}", e.warnings);
+        assert!(
+            e.warnings.is_empty(),
+            "nothing was skipped, so nothing to warn about: {:?}",
+            e.warnings
+        );
     }
 
     #[test]

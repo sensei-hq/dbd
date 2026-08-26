@@ -9,9 +9,9 @@
 //! They drive the real `Design` API against a mock adapter, so they assert what
 //! the commands actually do — including that nothing is written.
 
+use dbd_core::Design;
 use dbd_core::adapter::mock::MockAdapter;
 use dbd_core::design::Progress;
-use dbd_core::Design;
 use std::path::PathBuf;
 
 /// Write a throwaway dbd project under `tests/.tmp/<name>` and load it.

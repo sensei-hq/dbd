@@ -1,17 +1,13 @@
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use dbd_core::config::FormatConfig;
 use dbd_core::reverse::{self, SchemaSelect};
 
 /// Returns schemas that appear in `written` but not in `declared`, sorted and deduped.
 fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
     let declared_set: std::collections::HashSet<&String> = declared.iter().collect();
-    let mut result: Vec<String> = written
-        .iter()
-        .filter(|s| !declared_set.contains(s))
-        .cloned()
-        .collect();
+    let mut result: Vec<String> = written.iter().filter(|s| !declared_set.contains(s)).cloned().collect();
     result.sort();
     result.dedup();
     result
@@ -54,7 +50,10 @@ pub(crate) enum MergeDecision {
 /// else (a foreign DB, or a managed DB at/ahead of the project) snapshots.
 pub(crate) fn merge_decision(managed: Option<u32>, project_version: u32) -> MergeDecision {
     match managed {
-        Some(d) if d < project_version => MergeDecision::Refuse { db: d, project: project_version },
+        Some(d) if d < project_version => MergeDecision::Refuse {
+            db: d,
+            project: project_version,
+        },
         _ => MergeDecision::Snapshot,
     }
 }
@@ -111,12 +110,7 @@ pub async fn cmd_init_from_db(
     // Roles are cluster-global and gated behind the `--roles` opt-in: append them
     // only when asked (introspect_roles is NOT part of introspect()).
     if roles {
-        entities.extend(
-            adapter
-                .introspect_roles()
-                .await
-                .context("role introspection failed")?,
-        );
+        entities.extend(adapter.introspect_roles().await.context("role introspection failed")?);
     }
     init_with_entities(
         project_dir,
@@ -150,20 +144,20 @@ pub fn cmd_init_from_dbml(
     dry_run: bool,
 ) -> Result<()> {
     if project_dir.join("design.yaml").exists() {
-        bail!("design.yaml already exists here — use `dbd merge --from-dbml <file>` to sync a DBML file into an existing project");
+        bail!(
+            "design.yaml already exists here — use `dbd merge --from-dbml <file>` to sync a DBML file into an existing project"
+        );
     }
     let entities = parse_dbml_file(dbml_path)?;
     // The project name is derived from --name or the file stem (there is no DB to
     // read it from).
-    let project_name = name
-        .map(String::from)
-        .unwrap_or_else(|| {
-            dbml_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| "project".into())
-        });
+    let project_name = name.map(String::from).unwrap_or_else(|| {
+        dbml_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "project".into())
+    });
     init_with_entities(
         project_dir,
         config_path,
@@ -245,10 +239,8 @@ fn init_with_entities(
     // on disk (and what `dbd apply` would later read), then write the baseline.
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
         .context("failed to reload project after writing DDL")?;
-    dbd_core::snapshot::create_baseline_snapshot(
-        design.entities(), project_dir, config_path, snapshot_label, version,
-    )
-    .context("failed to create baseline snapshot after writing DDL")?;
+    dbd_core::snapshot::create_baseline_snapshot(design.entities(), project_dir, config_path, snapshot_label, version)
+        .context("failed to create baseline snapshot after writing DDL")?;
     println!("baseline snapshot v{version} created");
     Ok(())
 }
@@ -274,8 +266,7 @@ pub async fn cmd_merge(
     // Load the existing project's config once: its `project.name` keys the per-project
     // meta read AND the live connection; its `format` settings drive emit-side
     // formatting; its declared schemas drive the undeclared-schema warning below.
-    let config = dbd_core::config::read(config_path)
-        .context("failed to read design.yaml")?;
+    let config = dbd_core::config::read(config_path).context("failed to read design.yaml")?;
     let project_name = config.project.name.clone();
     // Precedence: explicit positional conn > global -d/$DATABASE_URL.
     let candidate = conn.or(database_url);
@@ -306,16 +297,9 @@ pub async fn cmd_merge(
             // Roles are cluster-global and gated behind the `--roles` opt-in: append
             // them only when asked (introspect_roles is NOT part of introspect()).
             if roles {
-                entities.extend(
-                    adapter
-                        .introspect_roles()
-                        .await
-                        .context("role introspection failed")?,
-                );
+                entities.extend(adapter.introspect_roles().await.context("role introspection failed")?);
             }
-            merge_snapshot(
-                project_dir, config_path, env, &entities, sel, dry_run, &config,
-            )
+            merge_snapshot(project_dir, config_path, env, &entities, sel, dry_run, &config)
         }
     }
 }
@@ -338,8 +322,7 @@ pub fn cmd_merge_from_dbml(
     if !config_path.exists() {
         bail!("no design.yaml here — use `dbd init --from-dbml <file>` to start a new project");
     }
-    let config = dbd_core::config::read(config_path)
-        .context("failed to read design.yaml")?;
+    let config = dbd_core::config::read(config_path).context("failed to read design.yaml")?;
     let entities = parse_dbml_file(dbml_path)?;
     merge_snapshot(project_dir, config_path, env, &entities, sel, dry_run, &config)
 }
@@ -383,9 +366,7 @@ fn merge_snapshot(
     // `merge` never edits config — it surfaces the gap so the user adds the schema.
     let declared = config.schema_names();
     for schema in undeclared_schemas(&selected, &declared) {
-        eprintln!(
-            "  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files"
-        );
+        eprintln!("  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files");
     }
 
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
@@ -393,9 +374,21 @@ fn merge_snapshot(
     if dry_run {
         // Count straight off the plan — a dry-run writes nothing, so there's no
         // apply step to perform; the overwrite path has no conflict gate.
-        let created = plan.items.iter().filter(|i| i.action == reverse::FileAction::Create).count();
-        let unchanged = plan.items.iter().filter(|i| i.action == reverse::FileAction::Skip).count();
-        let conflicts = plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict).count();
+        let created = plan
+            .items
+            .iter()
+            .filter(|i| i.action == reverse::FileAction::Create)
+            .count();
+        let unchanged = plan
+            .items
+            .iter()
+            .filter(|i| i.action == reverse::FileAction::Skip)
+            .count();
+        let conflicts = plan
+            .items
+            .iter()
+            .filter(|i| i.action == reverse::FileAction::Conflict)
+            .count();
         println!(
             "[dry-run] {created} created · {unchanged} unchanged · {conflicts} conflict(s) (would overwrite, no .bak)"
         );
@@ -419,10 +412,7 @@ fn merge_snapshot(
         // previewed here as "would snapshot" yet the real run reports in-sync. The
         // overwrite still happens correctly either way — this is preview accuracy
         // only, not a data-safety gap.
-        let has_changes = plan
-            .items
-            .iter()
-            .any(|i| i.action != reverse::FileAction::Skip);
+        let has_changes = plan.items.iter().any(|i| i.action != reverse::FileAction::Skip);
         if has_changes {
             let n = dbd_core::snapshot::next_version(project_dir);
             println!("[dry-run] would capture changes as snapshot v{n}");
@@ -449,20 +439,19 @@ fn merge_snapshot(
     // NOTE: both calls below happen *after* apply_overwrite has written all DDL
     // files. A failure here leaves the project in a partial-apply state (files
     // overwritten, no snapshot). Recover via version control.
-    let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir))
-        .context("failed to reload project after writing DDL — recover via version control if files were partially written")?;
-    let snap = dbd_core::snapshot::create_snapshot(
-        design.entities(), project_dir, config_path, "merge from database",
-    )
-    .context("failed to create snapshot after writing DDL — recover via version control if files were partially written")?;
+    let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir)).context(
+        "failed to reload project after writing DDL — recover via version control if files were partially written",
+    )?;
+    let snap = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config_path, "merge from database")
+        .context(
+            "failed to create snapshot after writing DDL — recover via version control if files were partially written",
+        )?;
 
     // `create_snapshot` handles the no-previous-snapshot (baseline) case, so a
     // project without prior snapshots still snapshots cleanly. A single result
     // flagged `no_changes` means the DDL was already in sync with the latest snapshot.
     if snap.snapshots.len() == 1 && snap.snapshots[0].no_changes {
-        println!(
-            "{files_written} file(s) written — already in sync — no snapshot created"
-        );
+        println!("{files_written} file(s) written — already in sync — no snapshot created");
     } else {
         let version = snap.snapshots.last().map(|s| s.snapshot.version).unwrap_or(0);
         println!("{files_written} file(s) written · snapshot v{version} created");
@@ -478,10 +467,7 @@ fn merge_snapshot(
 /// get a stray `ddl/schema/<name>.ddl` file even though it's left out of
 /// design.yaml. Truly schema-less entities (e.g. roles) have no owning schema and
 /// are always kept.
-fn select_and_keep(
-    entities: &[dbd_core::Entity],
-    sel: &SchemaSelect,
-) -> (Vec<String>, Vec<dbd_core::Entity>) {
+fn select_and_keep(entities: &[dbd_core::Entity], sel: &SchemaSelect) -> (Vec<String>, Vec<dbd_core::Entity>) {
     let db_schemas: Vec<String> = {
         let mut s: Vec<String> = entities.iter().filter_map(|e| e.schema.clone()).collect();
         s.sort();
@@ -541,21 +527,26 @@ fn run_plan(
 
     // 3. write design.yaml (init only; only if absent; skip on dry-run)
     if write_config && !dry_run {
-        let project = name
-            .map(String::from)
-            .unwrap_or_else(|| "project".into());
+        let project = name.map(String::from).unwrap_or_else(|| "project".into());
         let yaml = reverse::design_yaml(&project, dialect, &selected, version.unwrap_or(1));
         // Write to the resolved config path (project_dir/<--config>), matching what the
         // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
         // diverge under `--config custom.yaml`).
-        std::fs::write(config_path, yaml)
-            .context("failed to write design.yaml")?;
+        std::fs::write(config_path, yaml).context("failed to write design.yaml")?;
     }
 
     // 4. apply + report
     if dry_run {
-        let created = plan.items.iter().filter(|i| i.action == reverse::FileAction::Create).count();
-        let unchanged = plan.items.iter().filter(|i| i.action == reverse::FileAction::Skip).count();
+        let created = plan
+            .items
+            .iter()
+            .filter(|i| i.action == reverse::FileAction::Create)
+            .count();
+        let unchanged = plan
+            .items
+            .iter()
+            .filter(|i| i.action == reverse::FileAction::Skip)
+            .count();
         println!(
             "[dry-run] {created} created · {unchanged} unchanged · {} orphan(s) left as-is",
             plan.orphans.len()
@@ -583,11 +574,7 @@ fn run_plan(
 fn db_name_from_conn(conn: &str) -> Option<String> {
     let after = conn.rsplit('/').next()?;
     let db = after.split(['?', '#']).next()?;
-    if db.is_empty() {
-        None
-    } else {
-        Some(db.to_string())
-    }
+    if db.is_empty() { None } else { Some(db.to_string()) }
 }
 
 #[cfg(test)]
@@ -684,7 +671,10 @@ mod tests {
     fn resolve_conn_none_bails() {
         let err = resolve_conn(None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+        assert!(
+            msg.contains("-d") || msg.contains("$DATABASE_URL"),
+            "message should mention -d or $DATABASE_URL: {msg}"
+        );
     }
 
     /// Empty string candidate bails (same as None — sentinel for bare --from-db with no fallback).
@@ -692,7 +682,10 @@ mod tests {
     fn resolve_conn_empty_bails() {
         let err = resolve_conn(Some("")).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("-d") || msg.contains("$DATABASE_URL"), "message should mention -d or $DATABASE_URL: {msg}");
+        assert!(
+            msg.contains("-d") || msg.contains("$DATABASE_URL"),
+            "message should mention -d or $DATABASE_URL: {msg}"
+        );
     }
 
     // ── db_name_from_conn ─────────────────────────────────────────────────────
@@ -706,7 +699,10 @@ mod tests {
     /// URL with query string → query stripped.
     #[test]
     fn db_name_from_conn_strips_query() {
-        assert_eq!(db_name_from_conn("postgres://host/mydb?sslmode=require"), Some("mydb".into()));
+        assert_eq!(
+            db_name_from_conn("postgres://host/mydb?sslmode=require"),
+            Some("mydb".into())
+        );
     }
 
     /// URL with trailing slash and no db name → None (falls back to "project" at call site).
@@ -722,12 +718,20 @@ mod tests {
     /// Write a minimal, schema-qualified DBML file and return its path.
     fn write_dbml(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("schema.dbml");
-        std::fs::write(&p, "Table \"config\".\"widgets\" {\n  \"id\" int [pk]\n  \"name\" text\n}\n").unwrap();
+        std::fs::write(
+            &p,
+            "Table \"config\".\"widgets\" {\n  \"id\" int [pk]\n  \"name\" text\n}\n",
+        )
+        .unwrap();
         p
     }
 
     fn all_schemas() -> SchemaSelect {
-        SchemaSelect { only: vec![], exclude: vec![], all: true }
+        SchemaSelect {
+            only: vec![],
+            exclude: vec![],
+            all: true,
+        }
     }
 
     /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.

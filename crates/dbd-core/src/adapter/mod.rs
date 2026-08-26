@@ -130,10 +130,7 @@ pub trait DatabaseAdapter: Send + Sync {
 
     /// Sync pg_cron refresh jobs for the given (qualified_name, ResolvedMatview)
     /// set. Default: no-op (targets without pg_cron support).
-    async fn sync_refresh_jobs(
-        &self,
-        _jobs: &[(String, crate::config::ResolvedMatview)],
-    ) -> Result<()> {
+    async fn sync_refresh_jobs(&self, _jobs: &[(String, crate::config::ResolvedMatview)]) -> Result<()> {
         Ok(())
     }
 
@@ -235,13 +232,7 @@ pub trait DatabaseAdapter: Send + Sync {
     /// before any version/guard read so those reads see consistent state.
     async fn heal_bookkeeping(&self) -> Result<()>;
     async fn get_db_version(&self) -> Result<u32>;
-    async fn apply_migration(
-        &self,
-        version: u32,
-        sql: &str,
-        description: &str,
-        checksum: &str,
-    ) -> Result<()>;
+    async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;
 
     // ── Internal dbd procedures ────────────────────────
@@ -281,9 +272,7 @@ mod tests {
     #[test]
     fn c1_pg_catalog_function_is_internal() {
         let mut catalog = CatalogData::default();
-        catalog
-            .functions
-            .insert("pg_catalog.array_agg".to_string());
+        catalog.functions.insert("pg_catalog.array_agg".to_string());
         assert!(catalog.functions.contains("pg_catalog.array_agg"));
     }
 
@@ -295,16 +284,80 @@ mod tests {
         for word in noise_words {
             assert!(
                 [
-                    "varchar", "int", "integer", "bigint", "smallint", "numeric", "decimal",
-                    "boolean", "text", "date", "timestamp", "timestamptz", "uuid", "jsonb",
-                    "json", "bytea", "float", "double", "real", "serial", "bigserial", "btree",
-                    "hash", "gin", "gist", "brin", "now", "coalesce", "nullif", "greatest",
-                    "least", "extract", "count", "sum", "avg", "min", "max", "string_agg",
-                    "row_number", "rank", "dense_rank", "lead", "lag", "upper", "lower", "trim",
-                    "length", "replace", "substring", "cast", "exists", "between", "like", "in",
-                    "not", "and", "or", "true", "false", "null", "default", "current_user",
-                    "localtime", "localtimestamp", "random", "floor", "ceil", "abs", "round",
-                    "enum", "record", "void", "trigger", "event_trigger",
+                    "varchar",
+                    "int",
+                    "integer",
+                    "bigint",
+                    "smallint",
+                    "numeric",
+                    "decimal",
+                    "boolean",
+                    "text",
+                    "date",
+                    "timestamp",
+                    "timestamptz",
+                    "uuid",
+                    "jsonb",
+                    "json",
+                    "bytea",
+                    "float",
+                    "double",
+                    "real",
+                    "serial",
+                    "bigserial",
+                    "btree",
+                    "hash",
+                    "gin",
+                    "gist",
+                    "brin",
+                    "now",
+                    "coalesce",
+                    "nullif",
+                    "greatest",
+                    "least",
+                    "extract",
+                    "count",
+                    "sum",
+                    "avg",
+                    "min",
+                    "max",
+                    "string_agg",
+                    "row_number",
+                    "rank",
+                    "dense_rank",
+                    "lead",
+                    "lag",
+                    "upper",
+                    "lower",
+                    "trim",
+                    "length",
+                    "replace",
+                    "substring",
+                    "cast",
+                    "exists",
+                    "between",
+                    "like",
+                    "in",
+                    "not",
+                    "and",
+                    "or",
+                    "true",
+                    "false",
+                    "null",
+                    "default",
+                    "current_user",
+                    "localtime",
+                    "localtimestamp",
+                    "random",
+                    "floor",
+                    "ceil",
+                    "abs",
+                    "round",
+                    "enum",
+                    "record",
+                    "void",
+                    "trigger",
+                    "event_trigger",
                 ]
                 .contains(&word),
                 "{word} should be SQL noise"
@@ -324,9 +377,7 @@ mod tests {
     #[test]
     fn c11_catalog_data_serialization_roundtrip() {
         let mut catalog = CatalogData::default();
-        catalog
-            .functions
-            .insert("pg_catalog.array_agg".to_string());
+        catalog.functions.insert("pg_catalog.array_agg".to_string());
         catalog
             .extension_objects
             .insert("st_distance".to_string(), "postgis".to_string());

@@ -121,6 +121,9 @@ mod tests {
     #[test]
     fn a_file_declaring_no_sequence_records_an_error() {
         let e = parse("select 1;");
-        assert!(!e.errors.is_empty(), "a sequence file with no CREATE SEQUENCE must error");
+        assert!(
+            !e.errors.is_empty(),
+            "a sequence file with no CREATE SEQUENCE must error"
+        );
     }
 }

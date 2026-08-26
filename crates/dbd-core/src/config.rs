@@ -242,8 +242,7 @@ pub struct ExternalEntry {
 
 // ── Import ──────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ImportConfig {
     #[serde(default)]
     pub staging: Vec<String>,
@@ -277,9 +276,7 @@ impl ImportConfig {
             .iter()
             .find(|t| t.name() == table_name)
             .and_then(|t| match t {
-                ImportTableEntry::WithOptions(map) => {
-                    map.values().next().and_then(|o| o.format.as_deref())
-                }
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.format.as_deref()),
                 ImportTableEntry::Name(_) => None,
             })
     }
@@ -292,9 +289,7 @@ impl ImportConfig {
             .iter()
             .find(|t| t.name() == table_name)
             .and_then(|t| match t {
-                ImportTableEntry::WithOptions(map) => {
-                    map.values().next().and_then(|o| o.null_value.as_deref())
-                }
+                ImportTableEntry::WithOptions(map) => map.values().next().and_then(|o| o.null_value.as_deref()),
                 ImportTableEntry::Name(_) => None,
             })
             .unwrap_or(&self.options.null_value)
@@ -478,9 +473,7 @@ impl MaterializedViewsConfig {
             refresh: ov
                 .and_then(|o| o.refresh.clone())
                 .or_else(|| self.options.refresh.clone()),
-            concurrently: ov
-                .and_then(|o| o.concurrently)
-                .unwrap_or(self.options.concurrently),
+            concurrently: ov.and_then(|o| o.concurrently).unwrap_or(self.options.concurrently),
         }
     }
 }
@@ -622,9 +615,8 @@ pub fn normalize_env(value: Option<&str>) -> Result<String> {
 /// Read and parse a design.yaml file.
 pub fn read(path: &Path) -> Result<DesignConfig> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", path.display(), e)))?;
     let config: DesignConfig = serde_yaml::from_str(&content)?;
     Ok(config)
 }
@@ -632,9 +624,8 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
 /// Update the `project.version` field in a design.yaml file.
 pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
     value["project"]["version"] = serde_yaml::Value::Number(serde_yaml::Number::from(version));
     let output = serde_yaml::to_string(&value)?;
@@ -646,9 +637,8 @@ pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
 /// Set the `project.released` flag in a design.yaml file.
 pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path).map_err(|e| {
-        DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e))
-    })?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
     value["project"]["released"] = serde_yaml::Value::Bool(released);
     let output = serde_yaml::to_string(&value)?;
@@ -702,8 +692,7 @@ mod tests {
     fn source_parser_is_optional_and_parses() {
         let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
         assert_eq!(cfg.source.parser, None);
-        let cfg: DesignConfig =
-            serde_yaml::from_str("project:\n  name: t\nsource:\n  parser: pg_query\n").unwrap();
+        let cfg: DesignConfig = serde_yaml::from_str("project:\n  name: t\nsource:\n  parser: pg_query\n").unwrap();
         assert_eq!(cfg.source.parser.as_deref(), Some("pg_query"));
         // SourceConfig carries both a manual Default impl and per-field serde
         // defaults; pin that they cannot drift apart for the new field.
@@ -873,8 +862,7 @@ import:
     fn released_defaults_to_false_and_parses_true() {
         let config: DesignConfig = serde_yaml::from_str("project:\n  name: test\n").unwrap();
         assert!(!config.project.released, "released should default to false");
-        let config: DesignConfig =
-            serde_yaml::from_str("project:\n  name: test\n  released: true\n").unwrap();
+        let config: DesignConfig = serde_yaml::from_str("project:\n  name: test\n  released: true\n").unwrap();
         assert!(config.project.released);
     }
 
@@ -1121,10 +1109,8 @@ schemas:
 
     #[test]
     fn a_bare_path_script_entry_parses() {
-        let cfg: DesignConfig = serde_yaml::from_str(
-            "project:\n  name: t\nimport:\n  after:\n    - import/loader.sql\n",
-        )
-        .unwrap();
+        let cfg: DesignConfig =
+            serde_yaml::from_str("project:\n  name: t\nimport:\n  after:\n    - import/loader.sql\n").unwrap();
         assert_eq!(cfg.import.after.len(), 1);
         assert_eq!(cfg.import.after[0].script(), "import/loader.sql");
         assert!(cfg.import.after[0].declared_writes().is_none());
@@ -1158,10 +1144,8 @@ schemas:
 
     #[test]
     fn the_apply_block_parses_before_and_after() {
-        let cfg: DesignConfig = serde_yaml::from_str(
-            "project:\n  name: t\napply:\n  before: [pre.sql]\n  after: [post.sql]\n",
-        )
-        .unwrap();
+        let cfg: DesignConfig =
+            serde_yaml::from_str("project:\n  name: t\napply:\n  before: [pre.sql]\n  after: [post.sql]\n").unwrap();
         assert_eq!(cfg.apply.before.len(), 1);
         assert_eq!(cfg.apply.after.len(), 1);
     }

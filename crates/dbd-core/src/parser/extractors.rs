@@ -8,8 +8,8 @@ use crate::entity::{EnumValue, REF_TYPE_FUNCTION, Reference};
 // nothing under `pg` depends back on this module. See `pg::common`'s module
 // doc comment.
 pub(in crate::parser) use super::pg::common::{
-    extract_enum_values_via_pg_query, extract_search_paths_via_pg_query,
-    extract_view_refs_via_pg_query, is_valid_postgres,
+    extract_enum_values_via_pg_query, extract_search_paths_via_pg_query, extract_view_refs_via_pg_query,
+    is_valid_postgres,
 };
 // `push_unique` and `SYSTEM_SCHEMAS` are generic, not libpg_query-specific, but
 // live in `pg::common` too so these two call sites depend on `pg` rather than
@@ -102,11 +102,7 @@ pub fn extract_view_body(statements: &[Statement]) -> Option<String> {
 ///
 /// CTE names are query-local, not real tables, so references that resolve to a
 /// CTE (the recursive term, `SELECT ... FROM cte`, etc.) are dropped afterwards.
-fn extract_table_refs_from_query(
-    query: &sqlparser::ast::Query,
-    default_schema: &str,
-    refs: &mut Vec<Reference>,
-) {
+fn extract_table_refs_from_query(query: &sqlparser::ast::Query, default_schema: &str, refs: &mut Vec<Reference>) {
     for reference in collect_table_refs(query, default_schema) {
         if !refs.iter().any(|r| r.name == reference.name) {
             refs.push(reference);
@@ -181,10 +177,7 @@ fn qualify_relation(name: &sqlparser::ast::ObjectName, default_schema: &str) -> 
 /// Works on any `Visit` node, so callers can pass a whole query or a single
 /// expression — a column `DEFAULT`, a `CHECK`, a generated-column expression or
 /// an index key (see `tables::extract_table`).
-pub(super) fn collect_function_refs<N: sqlparser::ast::Visit>(
-    node: &N,
-    default_schema: &str,
-) -> Vec<Reference> {
+pub(super) fn collect_function_refs<N: sqlparser::ast::Visit>(node: &N, default_schema: &str) -> Vec<Reference> {
     let mut visitor = FunctionRefVisitor {
         default_schema,
         refs: Vec::new(),
@@ -230,10 +223,7 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
     type Break = ();
 
     /// Record CTE names so their (query-local) references can be filtered out.
-    fn pre_visit_query(
-        &mut self,
-        query: &sqlparser::ast::Query,
-    ) -> core::ops::ControlFlow<Self::Break> {
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> core::ops::ControlFlow<Self::Break> {
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 self.cte_names.push(cte.alias.name.value.clone());
@@ -250,9 +240,7 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
         table_factor: &sqlparser::ast::TableFactor,
     ) -> core::ops::ControlFlow<Self::Break> {
         if let sqlparser::ast::TableFactor::Table {
-            name,
-            args: Some(_),
-            ..
+            name, args: Some(_), ..
         } = table_factor
             && let Some(qualified) = qualify_relation(name, self.default_schema)
         {
@@ -262,10 +250,7 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
     }
 
     /// Collect each relation (table) referenced anywhere in the query.
-    fn pre_visit_relation(
-        &mut self,
-        name: &sqlparser::ast::ObjectName,
-    ) -> core::ops::ControlFlow<Self::Break> {
+    fn pre_visit_relation(&mut self, name: &sqlparser::ast::ObjectName) -> core::ops::ControlFlow<Self::Break> {
         if let Some(qualified) = qualify_relation(name, self.default_schema)
             && !self.refs.iter().any(|r| r.name == qualified)
         {
@@ -282,15 +267,16 @@ impl sqlparser::ast::Visitor for TableRefVisitor<'_> {
 pub fn extract_enum_values(statements: &[Statement]) -> Vec<EnumValue> {
     for stmt in statements {
         if let Statement::CreateType { representation, .. } = stmt
-            && let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation {
-                return labels
-                    .iter()
-                    .map(|label| EnumValue {
-                        name: label.value.clone(),
-                        note: None,
-                    })
-                    .collect();
-            }
+            && let Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }) = representation
+        {
+            return labels
+                .iter()
+                .map(|label| EnumValue {
+                    name: label.value.clone(),
+                    note: None,
+                })
+                .collect();
+        }
     }
     Vec::new()
 }
@@ -328,22 +314,26 @@ pub struct ProcRefs {
 /// dependency, not a compile-time one, so it never affects whether the object
 /// can be created. Tiers 1 and 2 ignore it for free (it is a string literal);
 /// the tier-3 regex inherits the existing best-effort behavior.
-pub fn extract_proc_refs(
-    statements: &[Statement],
-    raw_sql: &str,
-    default_schema: &str,
-) -> ProcRefs {
+pub fn extract_proc_refs(statements: &[Statement], raw_sql: &str, default_schema: &str) -> ProcRefs {
     // 1. `LANGUAGE sql` bodies: re-parse with sqlparser + the view visitor.
     if let Some(refs) = extract_proc_refs_via_ast(statements, default_schema) {
         return refs;
     }
     // 2. PL/pgSQL: parse with libpg_query (the real Postgres parser).
     if let Some((reads, writes)) = common::extract_proc_refs_via_pg_query(raw_sql, default_schema) {
-        return ProcRefs { reads, writes, functions: Vec::new() };
+        return ProcRefs {
+            reads,
+            writes,
+            functions: Vec::new(),
+        };
     }
     // 3. Last resort: regex scan (bodies neither parser can handle).
     let (reads, writes) = extract_proc_reads_writes(raw_sql);
-    ProcRefs { reads, writes, functions: Vec::new() }
+    ProcRefs {
+        reads,
+        writes,
+        functions: Vec::new(),
+    }
 }
 
 /// Try to extract a `LANGUAGE sql` function body's dependencies via the AST.
@@ -352,10 +342,7 @@ pub fn extract_proc_refs(
 /// (even if it references nothing), so the caller knows the AST path applied
 /// and the regex fallback should be skipped. Returns `None` when no body could
 /// be parsed as SQL (e.g. PL/pgSQL), leaving the caller to fall back.
-fn extract_proc_refs_via_ast(
-    statements: &[Statement],
-    default_schema: &str,
-) -> Option<ProcRefs> {
+fn extract_proc_refs_via_ast(statements: &[Statement], default_schema: &str) -> Option<ProcRefs> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let mut refs = ProcRefs::default();
     let mut parsed_any = false;
@@ -541,8 +528,7 @@ pub fn extract_proc_reads_writes(sql: &str) -> (Vec<String>, Vec<String>) {
 /// Find qualified table names (schema.table) after a SQL keyword pattern.
 /// Excludes system schema references.
 fn regex_table_after(sql: &str, pattern: &str) -> Vec<String> {
-    let re = regex::Regex::new(&format!(r"{pattern}([a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)"))
-        .unwrap();
+    let re = regex::Regex::new(&format!(r"{pattern}([a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)")).unwrap();
     re.captures_iter(sql)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
@@ -553,11 +539,9 @@ fn regex_table_after(sql: &str, pattern: &str) -> Vec<String> {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     /// Parse a CREATE FUNCTION/PROCEDURE and extract its read/write deps.
     ///
@@ -590,9 +574,7 @@ mod tests {
     #[test]
     fn proc_sql_body_resolves_unqualified_with_default_schema() {
         // Differentiator vs regex: unqualified table resolves to default schema.
-        let (reads, _) = proc_refs(
-            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT id FROM orders $$;",
-        );
+        let (reads, _) = proc_refs("CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT id FROM orders $$;");
         assert!(reads.contains(&"public.orders".to_string()), "reads={reads:?}");
     }
 
@@ -604,7 +586,10 @@ mod tests {
         );
         assert!(writes.contains(&"sink.t".to_string()), "writes={writes:?}");
         assert!(reads.contains(&"nested.src".to_string()), "reads={reads:?}");
-        assert!(!reads.contains(&"sink.t".to_string()), "write target leaked into reads: {reads:?}");
+        assert!(
+            !reads.contains(&"sink.t".to_string()),
+            "write target leaked into reads: {reads:?}"
+        );
     }
 
     #[test]
@@ -693,7 +678,10 @@ mod tests {
         );
         assert!(reads.contains(&"real.src".to_string()), "reads={reads:?}");
         assert!(writes.contains(&"sink.t".to_string()), "writes={writes:?}");
-        assert!(!writes.contains(&"real.src".to_string()), "read leaked into writes: {writes:?}");
+        assert!(
+            !writes.contains(&"real.src".to_string()),
+            "read leaked into writes: {writes:?}"
+        );
     }
 
     #[test]
@@ -713,7 +701,13 @@ mod tests {
                RETURN QUERY SELECT id FROM report.summary; \
              END; $$;",
         );
-        for t in ["staging.lookups", "work.queue", "work.items", "audit.log", "report.summary"] {
+        for t in [
+            "staging.lookups",
+            "work.queue",
+            "work.items",
+            "audit.log",
+            "report.summary",
+        ] {
             assert!(reads.contains(&t.to_string()), "missing read {t}: {reads:?}");
         }
         assert!(writes.contains(&"work.items".to_string()), "writes={writes:?}");
@@ -730,8 +724,14 @@ mod tests {
              END; $$;",
         );
         assert!(writes.contains(&"real.audit".to_string()), "writes={writes:?}");
-        assert!(!reads.iter().any(|r| r.starts_with("dyn.")), "dynamic read leaked: {reads:?}");
-        assert!(!writes.iter().any(|w| w.starts_with("dyn.")), "dynamic write leaked: {writes:?}");
+        assert!(
+            !reads.iter().any(|r| r.starts_with("dyn.")),
+            "dynamic read leaked: {reads:?}"
+        );
+        assert!(
+            !writes.iter().any(|w| w.starts_with("dyn.")),
+            "dynamic write leaked: {writes:?}"
+        );
     }
 
     #[test]
@@ -778,20 +778,15 @@ mod tests {
             END; $$
         "#;
         let (reads, _) = extract_proc_reads_writes(sql);
-        assert_eq!(
-            reads.iter().filter(|r| *r == "staging.lookups").count(),
-            1
-        );
+        assert_eq!(reads.iter().filter(|r| *r == "staging.lookups").count(), 1);
     }
 
     #[test]
     fn extract_enum_from_statements() {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(
-            &dialect,
-            "CREATE TYPE status AS ENUM ('active', 'inactive');",
-        )
-        .unwrap();
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&dialect, "CREATE TYPE status AS ENUM ('active', 'inactive');")
+                .unwrap();
         let values = extract_enum_values(&stmts);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].name, "active");
@@ -824,27 +819,21 @@ mod tests {
 
     #[test]
     fn extract_view_collects_scalar_subquery_in_projection() {
-        let names = view_refs(
-            "CREATE VIEW v AS SELECT id, (SELECT max(amt) FROM real.payments) FROM main.a;",
-        );
+        let names = view_refs("CREATE VIEW v AS SELECT id, (SELECT max(amt) FROM real.payments) FROM main.a;");
         assert!(names.contains(&"main.a".to_string()), "{names:?}");
         assert!(names.contains(&"real.payments".to_string()), "{names:?}");
     }
 
     #[test]
     fn extract_view_collects_where_in_subquery() {
-        let names = view_refs(
-            "CREATE VIEW v AS SELECT id FROM main.a WHERE id IN (SELECT id FROM real.allow);",
-        );
+        let names = view_refs("CREATE VIEW v AS SELECT id FROM main.a WHERE id IN (SELECT id FROM real.allow);");
         assert!(names.contains(&"main.a".to_string()), "{names:?}");
         assert!(names.contains(&"real.allow".to_string()), "{names:?}");
     }
 
     #[test]
     fn extract_view_collects_where_not_in_subquery() {
-        let names = view_refs(
-            "CREATE VIEW v AS SELECT id FROM main.a WHERE id NOT IN (SELECT id FROM real.block);",
-        );
+        let names = view_refs("CREATE VIEW v AS SELECT id FROM main.a WHERE id NOT IN (SELECT id FROM real.block);");
         assert!(names.contains(&"main.a".to_string()), "{names:?}");
         assert!(names.contains(&"real.block".to_string()), "{names:?}");
     }
@@ -864,9 +853,7 @@ mod tests {
 
     #[test]
     fn extract_view_collects_where_scalar_subquery() {
-        let names = view_refs(
-            "CREATE VIEW v AS SELECT id FROM main.a WHERE id = (SELECT max(id) FROM real.cap);",
-        );
+        let names = view_refs("CREATE VIEW v AS SELECT id FROM main.a WHERE id = (SELECT max(id) FROM real.cap);");
         assert!(names.contains(&"main.a".to_string()), "{names:?}");
         assert!(names.contains(&"real.cap".to_string()), "{names:?}");
     }
@@ -951,8 +938,14 @@ mod tests {
         );
         assert!(names.contains(&"raw.events".to_string()), "{names:?}");
         assert!(names.contains(&"dim.users".to_string()), "{names:?}");
-        assert!(!names.contains(&"public.a".to_string()), "CTE name `a` leaked: {names:?}");
-        assert!(!names.contains(&"public.b".to_string()), "CTE name `b` leaked: {names:?}");
+        assert!(
+            !names.contains(&"public.a".to_string()),
+            "CTE name `a` leaked: {names:?}"
+        );
+        assert!(
+            !names.contains(&"public.b".to_string()),
+            "CTE name `b` leaked: {names:?}"
+        );
     }
 
     #[test]
@@ -1031,11 +1024,7 @@ mod tests {
     #[test]
     fn extract_search_paths_from_set() {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(
-            &dialect,
-            "SET search_path TO config, extensions;",
-        )
-        .unwrap();
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, "SET search_path TO config, extensions;").unwrap();
         let paths = extract_search_paths(&stmts);
         assert_eq!(paths, vec!["config", "extensions"]);
     }
@@ -1043,10 +1032,8 @@ mod tests {
     #[test]
     fn search_paths_default_to_public() {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let stmts =
-            sqlparser::parser::Parser::parse_sql(&dialect, "CREATE TABLE foo (id int);").unwrap();
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, "CREATE TABLE foo (id int);").unwrap();
         let paths = extract_search_paths(&stmts);
         assert_eq!(paths, vec!["public"]);
     }
 }
-
