@@ -1,0 +1,8 @@
+# The codebase was hand-formatted and writes wide lines: p99 is 106 chars, and
+# 275 lines exceed 120. Stock rustfmt (max_width = 100) wanted ~1200 changes;
+# 120 is the least-churn width that still leaves the house style recognisable.
+#
+# Everything else is stock on purpose — a config with many knobs is one more
+# thing to keep in step with contributors' editors.
+max_width = 120
+edition = "2024"

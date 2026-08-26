@@ -228,8 +228,16 @@ fn collect_table_refs(
         for (i, local) in fk.columns.iter().enumerate() {
             let remote = fk.ref_columns.get(i).cloned().unwrap_or_default();
             refs.push(Ref {
-                from: RefEnd { s: from_schema.clone(), t: from_table.clone(), c: local.clone() },
-                to: RefEnd { s: to_schema.clone(), t: fk.ref_table.clone(), c: remote },
+                from: RefEnd {
+                    s: from_schema.clone(),
+                    t: from_table.clone(),
+                    c: local.clone(),
+                },
+                to: RefEnd {
+                    s: to_schema.clone(),
+                    t: fk.ref_table.clone(),
+                    c: remote,
+                },
                 action: action.clone(),
             });
         }
@@ -241,7 +249,11 @@ fn collect_table_refs(
 fn note_first_line(def: &crate::entity::TableDef) -> Option<String> {
     def.comments.table.as_ref().and_then(|t| {
         let first = t.lines().next().unwrap_or("").trim();
-        if first.is_empty() { None } else { Some(first.to_string()) }
+        if first.is_empty() {
+            None
+        } else {
+            Some(first.to_string())
+        }
     })
 }
 
@@ -253,7 +265,11 @@ fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
     let mut out = Vec::new();
     for c in &def.constraints {
         if let TableConstraint::Unique { name, columns } = c {
-            out.push(Index { def: cols(columns), unique: true, name: name.clone() });
+            out.push(Index {
+                def: cols(columns),
+                unique: true,
+                name: name.clone(),
+            });
         }
     }
     for ix in &def.indexes {
@@ -266,18 +282,18 @@ fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        out.push(Index { def: format!("({spec})"), unique: ix.unique, name: ix.name.clone() });
+        out.push(Index {
+            def: format!("({spec})"),
+            unique: ix.unique,
+            name: ix.name.clone(),
+        });
     }
     out
 }
 
 /// All foreign keys on a table: inline column FKs + table-level FK constraints.
 fn collect_fks(def: &crate::entity::TableDef) -> Vec<crate::entity::ForeignKey> {
-    let mut out: Vec<crate::entity::ForeignKey> = def
-        .columns
-        .iter()
-        .filter_map(|c| c.inline_fk.clone())
-        .collect();
+    let mut out: Vec<crate::entity::ForeignKey> = def.columns.iter().filter_map(|c| c.inline_fk.clone()).collect();
     for c in &def.constraints {
         if let TableConstraint::ForeignKey(fk) = c {
             out.push(fk.clone());
@@ -315,17 +331,26 @@ mod tests {
         let m = build(&d, None);
         assert_eq!(m.project.name, "example");
         assert_eq!(m.project.db, "postgresql");
-        assert!(m.schemas.iter().all(|s| s.name != "auth"), "external-only auth schema must not appear");
+        assert!(
+            m.schemas.iter().all(|s| s.name != "auth"),
+            "external-only auth schema must not appear"
+        );
         let config = m.schemas.iter().find(|s| s.name == "config").expect("config schema");
         assert!(config.tables >= 2, "config has lookups + lookup_values");
-        let lookups = m.tables.iter().find(|t| t.schema == "config" && t.name == "lookups").expect("lookups");
+        let lookups = m
+            .tables
+            .iter()
+            .find(|t| t.schema == "config" && t.name == "lookups")
+            .expect("lookups");
         assert_eq!(lookups.kind, "table");
         assert!(lookups.columns.iter().any(|c| c.name == "id" && c.pk), "id is pk");
         assert!(
-            m.refs.iter().any(|r|
-                r.from.s == "config" && r.from.t == "lookup_values"
-                && r.to.s == "config" && r.to.t == "lookups"),
-            "FK edge present: {:?}", m.refs
+            m.refs.iter().any(|r| r.from.s == "config"
+                && r.from.t == "lookup_values"
+                && r.to.s == "config"
+                && r.to.t == "lookups"),
+            "FK edge present: {:?}",
+            m.refs
         );
         assert!(m.tables.iter().all(|t| t.kind == "table"));
     }
@@ -354,8 +379,16 @@ mod tests {
     #[test]
     fn serializes_to_dbd_schema_shape() {
         let model = SchemaModel {
-            project: ProjectInfo { name: "p".into(), db: "postgresql".into(), note: None },
-            schemas: vec![SchemaInfo { name: "config".into(), tables: 1, enums: 0 }],
+            project: ProjectInfo {
+                name: "p".into(),
+                db: "postgresql".into(),
+                note: None,
+            },
+            schemas: vec![SchemaInfo {
+                name: "config".into(),
+                tables: 1,
+                enums: 0,
+            }],
             tables: vec![TableNode {
                 schema: "config".into(),
                 name: "lookups".into(),
@@ -379,7 +412,10 @@ mod tests {
         assert_eq!(v["tables"][0]["columns"][0]["pk"], serde_json::json!(true));
         assert_eq!(v["tables"][0]["columns"][0]["type"], serde_json::json!("uuid"));
         assert!(v["tables"][0]["columns"][0].get("en").is_none(), "false flag omitted");
-        assert_eq!(v["tables"][0]["columns"][0]["def"], serde_json::json!("gen_random_uuid()"));
+        assert_eq!(
+            v["tables"][0]["columns"][0]["def"],
+            serde_json::json!("gen_random_uuid()")
+        );
         assert!(v["project"].get("note").is_none(), "None note omitted");
         assert_eq!(v["tables"][0]["columns"][0]["nn"], serde_json::json!(true));
     }

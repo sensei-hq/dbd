@@ -8,11 +8,7 @@ impl Design {
 
     /// Resolve a scope by name. `None` ⇒ `default` scope if defined, else `all`.
     /// `deps_override` (CLI `--deps`) wins over the scope's own `deps`.
-    pub fn resolve_scope(
-        &self,
-        name: Option<&str>,
-        deps_override: Option<DepsPolicy>,
-    ) -> Result<ResolvedScope> {
+    pub fn resolve_scope(&self, name: Option<&str>, deps_override: Option<DepsPolicy>) -> Result<ResolvedScope> {
         crate::scope::resolve(
             &self.config.scopes,
             name,

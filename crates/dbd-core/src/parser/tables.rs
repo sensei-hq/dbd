@@ -1,18 +1,15 @@
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, GeneratedAs, ReferentialAction,
-    Statement, TableConstraint as SqlTableConstraint,
+    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, GeneratedAs, ReferentialAction, Statement,
+    TableConstraint as SqlTableConstraint,
 };
 
 use crate::entity::{
-    ColumnDef, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, Reference, TableComments,
-    TableConstraint, TableDef,
+    ColumnDef, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, Reference, TableComments, TableConstraint,
+    TableDef,
 };
 
 /// Extract table definition and references from parsed statements.
-pub fn extract_table(
-    statements: &[Statement],
-    search_paths: &[String],
-) -> (TableDef, Vec<Reference>) {
+pub fn extract_table(statements: &[Statement], search_paths: &[String]) -> (TableDef, Vec<Reference>) {
     let mut columns = Vec::new();
     let mut constraints = Vec::new();
     let mut indexes = Vec::new();
@@ -94,7 +91,10 @@ fn process_create_table(
     for constraint in &create_table.constraints {
         if let Some((tc, tc_refs)) = extract_table_constraint(constraint, default_schema) {
             // Mark columns as PK if part of a table-level PRIMARY KEY
-            if let TableConstraint::PrimaryKey { columns: ref pk_cols, .. } = tc {
+            if let TableConstraint::PrimaryKey {
+                columns: ref pk_cols, ..
+            } = tc
+            {
                 mark_pk_columns(columns, pk_cols);
             }
             constraints.push(tc);
@@ -133,9 +133,7 @@ fn record_comment(
                 .map(|i| i.value.as_str())
                 .collect();
             if let Some(col_name) = parts.last() {
-                comments
-                    .columns
-                    .insert(col_name.to_string(), comment_text.to_string());
+                comments.columns.insert(col_name.to_string(), comment_text.to_string());
             }
         }
         _ => {}
@@ -144,10 +142,7 @@ fn record_comment(
 
 /// Extract a column definition from a sqlparser ColumnDef, along with any
 /// column-level `CHECK` constraints, which belong to the table.
-fn extract_column(
-    col_def: &SqlColumnDef,
-    default_schema: &str,
-) -> (ColumnDef, Vec<Reference>, Vec<TableConstraint>) {
+fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, Vec<Reference>, Vec<TableConstraint>) {
     let name = col_def.name.value.clone();
     let data_type = col_def.data_type.to_string();
     let mut nullable = true;
@@ -159,7 +154,12 @@ fn extract_column(
     let mut references = Vec::new();
     let mut checks = Vec::new();
 
-    for ColumnOptionDef { name: option_name, option, .. } in &col_def.options {
+    for ColumnOptionDef {
+        name: option_name,
+        option,
+        ..
+    } in &col_def.options
+    {
         match option {
             ColumnOption::PrimaryKey(_) => {
                 is_pk = true;
@@ -181,10 +181,7 @@ fn extract_column(
             ColumnOption::Check(chk) => {
                 // `col int constraint c check (…)` parks the name on the option,
                 // not on the inner constraint.
-                let name = option_name
-                    .as_ref()
-                    .or(chk.name.as_ref())
-                    .map(|n| n.value.clone());
+                let name = option_name.as_ref().or(chk.name.as_ref()).map(|n| n.value.clone());
                 push_function_refs(&chk.expr, default_schema, &mut references);
                 checks.push(TableConstraint::Check {
                     name,
@@ -192,24 +189,20 @@ fn extract_column(
                 });
             }
             ColumnOption::ForeignKey(fk_constraint) => {
-                let ref_table_parts: Vec<&str> =
-                    fk_constraint.foreign_table.0.iter().filter_map(|part| part.as_ident()).map(|i| i.value.as_str()).collect();
+                let ref_table_parts: Vec<&str> = fk_constraint
+                    .foreign_table
+                    .0
+                    .iter()
+                    .filter_map(|part| part.as_ident())
+                    .map(|i| i.value.as_str())
+                    .collect();
                 let (ref_schema, ref_table_name) = if ref_table_parts.len() > 1 {
-                    (
-                        Some(ref_table_parts[0].to_string()),
-                        ref_table_parts[1].to_string(),
-                    )
+                    (Some(ref_table_parts[0].to_string()), ref_table_parts[1].to_string())
                 } else {
-                    (
-                        Some(default_schema.to_string()),
-                        ref_table_parts[0].to_string(),
-                    )
+                    (Some(default_schema.to_string()), ref_table_parts[0].to_string())
                 };
 
-                let ref_cols: Vec<String> = fk_constraint.referred_columns
-                    .iter()
-                    .map(|i| i.value.clone())
-                    .collect();
+                let ref_cols: Vec<String> = fk_constraint.referred_columns.iter().map(|i| i.value.clone()).collect();
 
                 let qualified_ref = match &ref_schema {
                     Some(s) => format!("{s}.{ref_table_name}"),
@@ -315,18 +308,17 @@ fn extract_table_constraint(
         }
         SqlTableConstraint::ForeignKey(fk_constraint) => {
             let fk_cols: Vec<String> = fk_constraint.columns.iter().map(|c| c.value.clone()).collect();
-            let ref_table_parts: Vec<&str> =
-                fk_constraint.foreign_table.0.iter().filter_map(|part| part.as_ident()).map(|i| i.value.as_str()).collect();
+            let ref_table_parts: Vec<&str> = fk_constraint
+                .foreign_table
+                .0
+                .iter()
+                .filter_map(|part| part.as_ident())
+                .map(|i| i.value.as_str())
+                .collect();
             let (ref_schema, ref_table_name) = if ref_table_parts.len() > 1 {
-                (
-                    Some(ref_table_parts[0].to_string()),
-                    ref_table_parts[1].to_string(),
-                )
+                (Some(ref_table_parts[0].to_string()), ref_table_parts[1].to_string())
             } else {
-                (
-                    Some(default_schema.to_string()),
-                    ref_table_parts[0].to_string(),
-                )
+                (Some(default_schema.to_string()), ref_table_parts[0].to_string())
             };
             let ref_cols: Vec<String> = fk_constraint.referred_columns.iter().map(|c| c.value.clone()).collect();
 
@@ -377,11 +369,7 @@ fn extract_table_constraint(
 /// and `default gen_random_uuid()` are indistinguishable here from a call to a
 /// project-managed function, so the resolver keeps the ones naming a known
 /// entity and drops the rest without warning.
-fn push_function_refs(
-    expr: &sqlparser::ast::Expr,
-    default_schema: &str,
-    references: &mut Vec<Reference>,
-) {
+fn push_function_refs(expr: &sqlparser::ast::Expr, default_schema: &str, references: &mut Vec<Reference>) {
     for reference in super::extractors::collect_function_refs(expr, default_schema) {
         if !references.iter().any(|r| r.name == reference.name) {
             references.push(reference);
@@ -396,10 +384,13 @@ fn push_function_refs(
 /// is canonicalized so an authored `where status = 'active'` matches the
 /// `status = 'active'::sensei.memory_status` Postgres reports back.
 fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
-    let name = create_index
-        .name
-        .as_ref()
-        .map(|n| n.0.iter().filter_map(|part| part.as_ident()).map(|i| i.value.clone()).collect::<Vec<_>>().join("."));
+    let name = create_index.name.as_ref().map(|n| {
+        n.0.iter()
+            .filter_map(|part| part.as_ident())
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".")
+    });
 
     let columns: Vec<IndexColumn> = create_index
         .columns
@@ -449,9 +440,11 @@ fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
 fn with_option(expr: &sqlparser::ast::Expr) -> Option<(String, String)> {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-            Some((left.to_string().to_lowercase(), right.to_string()))
-        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => Some((left.to_string().to_lowercase(), right.to_string())),
         _ => None,
     }
 }
@@ -523,9 +516,7 @@ mod tests {
 
     #[test]
     fn extracts_inline_fk_with_schema_qualification() {
-        let stmts = parse(
-            "SET search_path TO config; CREATE TABLE bar (id int, foo_id int REFERENCES foo(id));",
-        );
+        let stmts = parse("SET search_path TO config; CREATE TABLE bar (id int, foo_id int REFERENCES foo(id));");
         let (def, refs) = extract_table(&stmts, &["config".to_string()]);
 
         let fk_col = def.columns.iter().find(|c| c.name == "foo_id").unwrap();
@@ -564,12 +555,13 @@ mod tests {
 
     #[test]
     fn extracts_unique_constraint() {
-        let stmts = parse(
-            "CREATE TABLE foo (id int, name varchar, UNIQUE (name));",
-        );
+        let stmts = parse("CREATE TABLE foo (id int, name varchar, UNIQUE (name));");
         let (def, _) = extract_table(&stmts, &["public".to_string()]);
 
-        let unique = def.constraints.iter().find(|c| matches!(c, TableConstraint::Unique { .. }));
+        let unique = def
+            .constraints
+            .iter()
+            .find(|c| matches!(c, TableConstraint::Unique { .. }));
         assert!(unique.is_some());
     }
 
@@ -709,10 +701,7 @@ mod tests {
 
         assert_eq!(
             def.indexes[0].predicate.as_deref(),
-            crate::sql_expr::canonicalize_predicate(
-                "scope = ANY (ARRAY['user'::text, 'project'::text])"
-            )
-            .as_deref(),
+            crate::sql_expr::canonicalize_predicate("scope = ANY (ARRAY['user'::text, 'project'::text])").as_deref(),
             "authored and introspected predicate spellings must canonicalize alike"
         );
     }

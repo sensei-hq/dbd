@@ -151,7 +151,10 @@ mod tests {
         assert!(!paths.contains(&"ddl/procedure/staging/import_jsonb_to_table.ddl".to_string()));
 
         // design.yaml has correct content
-        let config = files.iter().find(|f| f.path.display().to_string() == "design.yaml").unwrap();
+        let config = files
+            .iter()
+            .find(|f| f.path.display().to_string() == "design.yaml")
+            .unwrap();
         assert!(config.content.contains("name: myproject"));
         assert!(config.content.contains("postgres:"));
         assert!(config.content.contains("$DATABASE_URL"));
@@ -160,13 +163,22 @@ mod tests {
     #[test]
     fn generates_supabase_files() {
         let files = generate_init_files("myproject", "supabase");
-        let config = files.iter().find(|f| f.path.display().to_string() == "design.yaml").unwrap();
+        let config = files
+            .iter()
+            .find(|f| f.path.display().to_string() == "design.yaml")
+            .unwrap();
         assert!(config.content.contains("supabase:"));
         assert!(config.content.contains("auth.*"));
         assert!(config.content.contains("storage.*"));
         // Default external entities for Supabase
-        assert!(config.content.contains("auth.users"), "should include auth.users external");
-        assert!(config.content.contains("storage.objects"), "should include storage.objects external");
+        assert!(
+            config.content.contains("auth.users"),
+            "should include auth.users external"
+        );
+        assert!(
+            config.content.contains("storage.objects"),
+            "should include storage.objects external"
+        );
     }
 
     #[test]
@@ -179,7 +191,10 @@ mod tests {
     #[test]
     fn sample_ddl_follows_convention() {
         let files = generate_init_files("test", "postgres");
-        let ddl = files.iter().find(|f| f.path.display().to_string().contains("example.ddl")).unwrap();
+        let ddl = files
+            .iter()
+            .find(|f| f.path.display().to_string().contains("example.ddl"))
+            .unwrap();
         assert!(ddl.content.contains("create table if not exists"));
         assert!(ddl.content.contains("bigint generated always as identity"));
         assert!(ddl.content.contains(", name"));
@@ -194,7 +209,11 @@ mod tests {
         assert!(tmp.path().join("ddl/table/public/example.ddl").exists());
         assert!(tmp.path().join("ddl/view/.gitkeep").exists());
         // import_jsonb_to_table is managed internally — must NOT be written to user project
-        assert!(!tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+        assert!(
+            !tmp.path()
+                .join("ddl/procedure/staging/import_jsonb_to_table.ddl")
+                .exists()
+        );
         assert!(files.len() > 5);
     }
 
@@ -211,7 +230,10 @@ mod tests {
     fn default_project_name_from_dir() {
         // Just verify the function works with any name
         let files = generate_init_files("my-app", "postgres");
-        let config = files.iter().find(|f| f.path.display().to_string() == "design.yaml").unwrap();
+        let config = files
+            .iter()
+            .find(|f| f.path.display().to_string() == "design.yaml")
+            .unwrap();
         assert!(config.content.contains("name: my-app"));
     }
 }

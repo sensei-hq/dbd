@@ -93,13 +93,15 @@ impl ImportScan {
 pub fn scan_import(root: &Path, env: Option<&str>) -> Result<ImportScan> {
     let import_dir = root.join("import");
     if !import_dir.exists() {
-        return Ok(ImportScan { dir_missing: true, ..Default::default() });
+        return Ok(ImportScan {
+            dir_missing: true,
+            ..Default::default()
+        });
     }
 
     let mut scan = ImportScan::default();
     for entry in WalkDir::new(&import_dir) {
-        let entry = entry
-            .map_err(|e| DbdError::Config(format!("scan {}: {e}", import_dir.display())))?;
+        let entry = entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", import_dir.display())))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -169,7 +171,11 @@ mod tests {
         fs::write(root.join("ddl/table/config/lookups.ddl"), "CREATE TABLE").unwrap();
         fs::write(root.join("ddl/table/config/lookup_values.ddl"), "CREATE TABLE").unwrap();
         fs::write(root.join("ddl/view/config/genders.ddl"), "CREATE VIEW").unwrap();
-        fs::write(root.join("ddl/procedure/staging/import_lookups.ddl"), "CREATE PROCEDURE").unwrap();
+        fs::write(
+            root.join("ddl/procedure/staging/import_lookups.ddl"),
+            "CREATE PROCEDURE",
+        )
+        .unwrap();
         fs::write(root.join("ddl/enum/config/status.sql"), "CREATE TYPE").unwrap();
         fs::write(root.join("ddl/role/admin.ddl"), "CREATE ROLE").unwrap();
 
@@ -222,7 +228,10 @@ mod tests {
 
     /// File names of an `ImportScan`'s selected files, for terse assertions.
     fn selected_names(scan: &ImportScan) -> Vec<&str> {
-        scan.files.iter().filter_map(|f| f.file_name().and_then(|n| n.to_str())).collect()
+        scan.files
+            .iter()
+            .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+            .collect()
     }
 
     #[test]
@@ -276,9 +285,15 @@ mod tests {
         let names = selected_names(&scan);
         // Depth-1 files always included
         assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
-        assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
+        assert!(
+            names.contains(&"events.jsonl"),
+            "events.jsonl always included: {names:?}"
+        );
         // Dev-specific file included
-        assert!(names.contains(&"fixtures.csv"), "fixtures.csv included for dev: {names:?}");
+        assert!(
+            names.contains(&"fixtures.csv"),
+            "fixtures.csv included for dev: {names:?}"
+        );
         assert_eq!(files.len(), 3);
     }
 
@@ -290,7 +305,11 @@ mod tests {
         let tmp = create_test_project();
         let scan = scan_import(tmp.path(), Some("prod")).unwrap();
 
-        assert_eq!(scan.skipped_envs(), vec!["dev"], "dev fixtures must be reported as skipped");
+        assert_eq!(
+            scan.skipped_envs(),
+            vec!["dev"],
+            "dev fixtures must be reported as skipped"
+        );
         let skipped: Vec<&str> = scan
             .skipped_by_env
             .iter()
@@ -308,8 +327,14 @@ mod tests {
 
         let names = selected_names(&scan);
         assert!(names.contains(&"lookups.csv"), "lookups.csv always included: {names:?}");
-        assert!(names.contains(&"events.jsonl"), "events.jsonl always included: {names:?}");
-        assert!(!names.contains(&"fixtures.csv"), "fixtures.csv excluded for prod: {names:?}");
+        assert!(
+            names.contains(&"events.jsonl"),
+            "events.jsonl always included: {names:?}"
+        );
+        assert!(
+            !names.contains(&"fixtures.csv"),
+            "fixtures.csv excluded for prod: {names:?}"
+        );
         assert_eq!(files.len(), 2);
     }
 

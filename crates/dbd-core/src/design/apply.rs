@@ -130,17 +130,20 @@ impl Design {
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
+        let plan = build_execution_plan(
+            &scoped_entities,
+            db_version,
+            latest_version,
+            &pending,
+            working_set.as_ref(),
+        );
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();
 
         // Build entity lookup for ApplyEntity / CreateEntity steps
-        let entity_map: std::collections::HashMap<&str, &Entity> = self
-            .entities
-            .iter()
-            .map(|e| (e.name.as_str(), e))
-            .collect();
+        let entity_map: std::collections::HashMap<&str, &Entity> =
+            self.entities.iter().map(|e| (e.name.as_str(), e)).collect();
 
         // Materialized views this run applies (respecting the scope + name
         // filter). Capture which of them ALREADY exist before applying, so that
@@ -151,8 +154,7 @@ impl Design {
             .copied()
             .filter(|e| e.entity_type == EntityType::MaterializedView)
             .collect();
-        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty()
-        {
+        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty() {
             std::collections::HashSet::new()
         } else {
             adapter.matview_states().await?.into_keys().collect()
@@ -162,9 +164,8 @@ impl Design {
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
         // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
-        let use_txn = adapter.supports_transactional_apply()
-            && std::env::var_os("DBD_NO_TX").is_none()
-            && !plan.steps.is_empty();
+        let use_txn =
+            adapter.supports_transactional_apply() && std::env::var_os("DBD_NO_TX").is_none() && !plan.steps.is_empty();
 
         if use_txn {
             adapter.begin_batch().await?;
@@ -312,8 +313,13 @@ impl Design {
                     counts.applied += 1;
                 }
             }
-            ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
+            ExecutionStep::MigrateEntity {
+                entity_name,
+                migration_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
                     .map(|e| e.entity_type.tag())
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
@@ -334,8 +340,13 @@ impl Design {
                 report_step_result(&desc, on_done, result)?;
                 counts.migrated += 1;
             }
-            ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
+            ExecutionStep::DropEntity {
+                entity_name,
+                drop_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
                     .map(|e| e.entity_type.tag())
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
@@ -392,11 +403,16 @@ impl Design {
     where
         C: FnMut(DeployComplete),
     {
-        self.deploy_with_progress(adapter, dry_run, scope, Progress {
-            on_start: |_: &str| {},
-            on_done: |_: &str, _: Option<&str>| {},
-            on_complete,
-        })
+        self.deploy_with_progress(
+            adapter,
+            dry_run,
+            scope,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete,
+            },
+        )
         .await
     }
 
@@ -419,25 +435,37 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, scope, Progress {
-            on_start: &mut progress.on_start,
-            on_done: &mut progress.on_done,
-            on_complete: |s| {
-                apply_summary = Some(s);
+        self.apply(
+            adapter,
+            None,
+            dry_run,
+            scope,
+            Progress {
+                on_start: &mut progress.on_start,
+                on_done: &mut progress.on_done,
+                on_complete: |s| {
+                    apply_summary = Some(s);
+                },
             },
-        })
+        )
         .await?;
 
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
-        self.import_data(adapter, None, dry_run, scope, Progress {
-            on_start: &mut progress.on_start,
-            on_done: &mut progress.on_done,
-            on_complete: |s| {
-                import_summary = Some(s);
+        self.import_data(
+            adapter,
+            None,
+            dry_run,
+            scope,
+            Progress {
+                on_start: &mut progress.on_start,
+                on_done: &mut progress.on_done,
+                on_complete: |s| {
+                    import_summary = Some(s);
+                },
             },
-        })
+        )
         .await?;
 
         // A policy protects one table; a plane without that table has nothing

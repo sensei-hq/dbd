@@ -256,13 +256,7 @@ impl DatabaseAdapter for MockAdapter {
         Ok(self.meta.lock().unwrap().as_ref().map(|m| m.version).unwrap_or(0))
     }
 
-    async fn apply_migration(
-        &self,
-        _version: u32,
-        _sql: &str,
-        _description: &str,
-        _checksum: &str,
-    ) -> Result<()> {
+    async fn apply_migration(&self, _version: u32, _sql: &str, _description: &str, _checksum: &str) -> Result<()> {
         Ok(())
     }
 

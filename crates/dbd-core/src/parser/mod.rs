@@ -100,9 +100,7 @@ fn preprocess_sql(sql: &str) -> String {
     // Check:      Parser::parse_sql("CREATE PROCEDURE foo() LANGUAGE plpgsql AS $$ BEGIN END; $$")
     // Tracking:   https://github.com/apache/datafusion-sqlparser-rs/issues
     {
-        let re = regex::Regex::new(
-            r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b"
-        ).unwrap();
+        let re = regex::Regex::new(r"(?i)\b(create\s+(?:or\s+replace\s+)?)procedure\b").unwrap();
         if re.is_match(&result) {
             result = std::borrow::Cow::Owned(re.replace_all(&result, "${1}FUNCTION").to_string());
         }
@@ -284,16 +282,11 @@ fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
                     );
                 }
                 EntityType::View => {
-                    entity.references =
-                        extractors::extract_view_refs_via_pg_query(&cleaned, &default_schema);
+                    entity.references = extractors::extract_view_refs_via_pg_query(&cleaned, &default_schema);
                 }
                 _ => {}
             }
-            entity.refers = entity
-                .references
-                .iter()
-                .map(|r| r.name.clone())
-                .collect();
+            entity.refers = entity.references.iter().map(|r| r.name.clone()).collect();
             return Ok(entity);
         }
     };
@@ -335,11 +328,7 @@ fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
             entity.enum_values = extractors::extract_enum_values(&statements);
         }
         EntityType::Function | EntityType::Procedure => {
-            let default_schema = entity
-                .search_paths
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("public");
+            let default_schema = entity.search_paths.first().map(|s| s.as_str()).unwrap_or("public");
             let refs = extractors::extract_proc_refs(&statements, &cleaned, default_schema);
             apply_proc_refs(&mut entity, refs);
         }
@@ -347,11 +336,7 @@ fn parse_with_sqlparser(file: &Path, sql: &str) -> Result<Entity> {
     }
 
     // Build refers list from references (entity names only)
-    entity.refers = entity
-        .references
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
+    entity.refers = entity.references.iter().map(|r| r.name.clone()).collect();
 
     Ok(entity)
 }
@@ -445,11 +430,7 @@ mod tests {
 
     #[test]
     fn handles_parse_error_gracefully() {
-        let entity = parse_entity(
-            Path::new("ddl/table/config/broken.ddl"),
-            "THIS IS NOT SQL AT ALL ;;;",
-        )
-        .unwrap();
+        let entity = parse_entity(Path::new("ddl/table/config/broken.ddl"), "THIS IS NOT SQL AT ALL ;;;").unwrap();
         assert!(!entity.errors.is_empty());
     }
 
@@ -570,11 +551,7 @@ mod tests {
 
     #[test]
     fn sql_neither_parser_accepts_still_errors() {
-        let entity = parse_entity(
-            Path::new("ddl/view/app/broken.ddl"),
-            "create view v as SELECT * FROM ;",
-        )
-        .unwrap();
+        let entity = parse_entity(Path::new("ddl/view/app/broken.ddl"), "create view v as SELECT * FROM ;").unwrap();
         assert!(!entity.errors.is_empty(), "genuinely broken SQL must still error");
     }
 
@@ -617,22 +594,17 @@ mod tests {
 
     #[test]
     fn unparseable_enum_still_reports_an_error() {
-        let entity = parse_entity(
-            Path::new("ddl/enum/app/broken.ddl"),
-            "THIS IS NOT SQL AT ALL ;;;",
-        )
-        .unwrap();
-        assert!(!entity.errors.is_empty(), "a broken enum file must still surface a parse error");
+        let entity = parse_entity(Path::new("ddl/enum/app/broken.ddl"), "THIS IS NOT SQL AT ALL ;;;").unwrap();
+        assert!(
+            !entity.errors.is_empty(),
+            "a broken enum file must still surface a parse error"
+        );
         assert!(entity.enum_values.is_empty());
     }
 
     #[test]
     fn do_block_declaring_no_enum_keeps_its_parse_error() {
-        let entity = parse_entity(
-            Path::new("ddl/enum/app/empty.ddl"),
-            "do $$ begin perform 1; end $$;",
-        )
-        .unwrap();
+        let entity = parse_entity(Path::new("ddl/enum/app/empty.ddl"), "do $$ begin perform 1; end $$;").unwrap();
         assert!(
             !entity.errors.is_empty(),
             "a DO block with no CREATE TYPE declares no enum — the error must stand"
@@ -668,8 +640,8 @@ mod tests {
 
         // Now parse the emitted DDL back — this is the path `dbd apply` takes
         // when it re-reads a file written by `dbd merge --roles`.
-        let parsed = parse_entity(Path::new("ddl/role/app_ro.ddl"), &emitted)
-            .expect("parse_entity must not error on role DDL");
+        let parsed =
+            parse_entity(Path::new("ddl/role/app_ro.ddl"), &emitted).expect("parse_entity must not error on role DDL");
 
         assert_eq!(parsed.entity_type, EntityType::Role);
         assert_eq!(parsed.name, "app_ro");
@@ -722,8 +694,7 @@ mod tests {
                    SELECT date_trunc('day', created_at) AS day, sum(total) AS revenue\n\
                    FROM shop.orders GROUP BY 1 WITH DATA;\n\
                    CREATE UNIQUE INDEX daily_sales_day_uidx ON analytics.daily_sales(day);";
-        let entity =
-            parse_entity(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"), sql).unwrap();
+        let entity = parse_entity(Path::new("ddl/materialized_view/analytics/daily_sales.ddl"), sql).unwrap();
 
         assert_eq!(entity.entity_type, EntityType::MaterializedView);
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
@@ -749,15 +720,20 @@ mod tests {
     fn comment_on_materialized_view_is_stripped() {
         let sql = "COMMENT ON MATERIALIZED VIEW analytics.daily_sales IS 'daily rollup';";
         let cleaned = super::preprocess_sql(sql);
-        assert!(!cleaned.to_lowercase().contains("comment on materialized view"),
-            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}");
+        assert!(
+            !cleaned.to_lowercase().contains("comment on materialized view"),
+            "expected COMMENT ON MATERIALIZED VIEW to be stripped, got: {cleaned}"
+        );
     }
 
     // ── ParserChoice ────────────────────────────────────────────────────────
 
     #[test]
     fn postgres_dialects_default_to_pg_query() {
-        assert_eq!(ParserChoice::resolve("postgresql", None).unwrap(), ParserChoice::PgQuery);
+        assert_eq!(
+            ParserChoice::resolve("postgresql", None).unwrap(),
+            ParserChoice::PgQuery
+        );
         assert_eq!(ParserChoice::resolve("supabase", None).unwrap(), ParserChoice::PgQuery);
         // `dbd doctor --fix` migrates a legacy `project.database: Postgres`
         // to this spelling (doctor.rs:120-127), so it must not miss.
@@ -803,10 +779,7 @@ mod tests {
     fn sqlparser_ddl_is_usable_as_a_trait_object() {
         let parser: &dyn DdlParser = &SqlparserDdl;
         let entity = parser
-            .parse(
-                Path::new("ddl/enum/app/s.ddl"),
-                "create type s as enum ('a', 'b');",
-            )
+            .parse(Path::new("ddl/enum/app/s.ddl"), "create type s as enum ('a', 'b');")
             .unwrap();
         assert_eq!(entity.enum_values.len(), 2);
         assert!(entity.errors.is_empty(), "got: {:?}", entity.errors);

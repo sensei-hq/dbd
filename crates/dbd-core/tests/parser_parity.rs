@@ -5,8 +5,8 @@
 //! still delegates would compare `SqlparserDdl` against itself and pass for
 //! free — a green test proving nothing.
 
-use dbd_core::{Entity, EntityType};
 use dbd_core::parser::{ParserChoice, parse_entity_with, pg_native_types};
+use dbd_core::{Entity, EntityType};
 use std::path::{Path, PathBuf};
 
 /// Entity types with no independent second implementation to compare against.
@@ -42,10 +42,7 @@ fn ddl_files(root: &Path) -> Vec<PathBuf> {
         let path = entry.path();
         if path.is_dir() {
             out.extend(ddl_files(&path));
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("ddl") | Some("sql")
-        ) {
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("ddl") | Some("sql")) {
             out.push(path);
         }
     }

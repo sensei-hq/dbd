@@ -32,9 +32,7 @@ pub(in crate::parser) fn parse_role(mut entity: Entity, sql: &str) -> Result<Ent
     // search-path extraction either. Populating it here would be drift.
     let mut names: Vec<String> = Vec::new();
     for stmt in &parsed.protobuf.stmts {
-        let Some(pg_query::NodeEnum::GrantRoleStmt(grant)) =
-            stmt.stmt.as_ref().and_then(|s| s.node.as_ref())
-        else {
+        let Some(pg_query::NodeEnum::GrantRoleStmt(grant)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
         for role in &grant.granted_roles {
@@ -90,7 +88,8 @@ mod tests {
     /// this exclusion is structural rather than a text-matching lookahead.
     #[test]
     fn object_grants_are_not_memberships() {
-        let e = parse("GRANT SELECT ON TABLE t TO app_ro;\nGRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA app TO app_ro;");
+        let e =
+            parse("GRANT SELECT ON TABLE t TO app_ro;\nGRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA app TO app_ro;");
         assert!(e.refers.is_empty(), "object grants leaked: {:?}", e.refers);
     }
 
@@ -138,9 +137,15 @@ mod tests {
 
     #[test]
     fn a_role_file_with_no_grants_has_no_refers() {
-        let e = parse("DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'solo') THEN\n    CREATE ROLE \"solo\";\n  END IF;\nEND $$;\n");
+        let e = parse(
+            "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'solo') THEN\n    CREATE ROLE \"solo\";\n  END IF;\nEND $$;\n",
+        );
         assert!(e.refers.is_empty());
-        assert!(e.errors.is_empty(), "a role with no grants is valid, got {:?}", e.errors);
+        assert!(
+            e.errors.is_empty(),
+            "a role with no grants is valid, got {:?}",
+            e.errors
+        );
     }
 
     #[test]

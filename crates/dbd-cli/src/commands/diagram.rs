@@ -28,8 +28,7 @@ pub fn cmd_diagram(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let model = dbd_core::schema_model::build(&design, Some(&resolved));
 
@@ -51,7 +50,10 @@ pub fn cmd_diagram(
     // The URL is the command's data output — always to stdout (pipeable).
     println!("{url}");
     if !print_url && let Err(e) = open::that(&url) {
-        output::info(verbosity, &format!("(couldn't open a browser: {e}); open the URL above)"));
+        output::info(
+            verbosity,
+            &format!("(couldn't open a browser: {e}); open the URL above)"),
+        );
     }
     Ok(())
 }
@@ -74,7 +76,19 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
         let out = proj.path().join("model.json");
-        cmd_diagram(&cfg, "dev", proj.path(), true, &out, false, None, None, None, Verbosity::Normal).unwrap();
+        cmd_diagram(
+            &cfg,
+            "dev",
+            proj.path(),
+            true,
+            &out,
+            false,
+            None,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
         assert!(out.exists());
     }
 
@@ -83,9 +97,16 @@ mod tests {
     #[test]
     fn diagram_url_prints_without_opening_browser() {
         cmd_diagram(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(),
-            false, std::path::Path::new("unused.json"), /*print_url*/ true,
-            Some("http://localhost:5173"), None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            false,
+            std::path::Path::new("unused.json"),
+            /*print_url*/ true,
+            Some("http://localhost:5173"),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .unwrap();
     }

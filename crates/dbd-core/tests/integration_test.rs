@@ -6,13 +6,12 @@
 
 use std::path::PathBuf;
 
+use dbd_core::Design;
 use dbd_core::design::Progress;
 use dbd_core::entity::EntityType;
-use dbd_core::Design;
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
 fn design() -> Design {
@@ -146,14 +145,8 @@ fn discovers_and_emits_materialized_view_from_fixture() {
 #[test]
 fn schemas_come_before_extensions() {
     let d = design();
-    let first_ext = d
-        .entities()
-        .iter()
-        .position(|e| e.entity_type == EntityType::Extension);
-    let last_schema = d
-        .entities()
-        .iter()
-        .rposition(|e| e.entity_type == EntityType::Schema);
+    let first_ext = d.entities().iter().position(|e| e.entity_type == EntityType::Extension);
+    let last_schema = d.entities().iter().rposition(|e| e.entity_type == EntityType::Schema);
 
     if let (Some(last_s), Some(first_e)) = (last_schema, first_ext) {
         assert!(last_s < first_e, "Schemas must come before extensions");
@@ -163,10 +156,7 @@ fn schemas_come_before_extensions() {
 #[test]
 fn extensions_come_before_tables() {
     let d = design();
-    let first_table = d
-        .entities()
-        .iter()
-        .position(|e| e.entity_type == EntityType::Table);
+    let first_table = d.entities().iter().position(|e| e.entity_type == EntityType::Table);
     let last_ext = d
         .entities()
         .iter()
@@ -180,14 +170,8 @@ fn extensions_come_before_tables() {
 #[test]
 fn tables_come_before_views() {
     let d = design();
-    let first_view = d
-        .entities()
-        .iter()
-        .position(|e| e.entity_type == EntityType::View);
-    let last_table = d
-        .entities()
-        .iter()
-        .rposition(|e| e.entity_type == EntityType::Table);
+    let first_view = d.entities().iter().position(|e| e.entity_type == EntityType::View);
+    let last_table = d.entities().iter().rposition(|e| e.entity_type == EntityType::Table);
 
     if let (Some(last_t), Some(first_v)) = (last_table, first_view) {
         assert!(last_t < first_v, "Tables must come before views");
@@ -201,10 +185,7 @@ fn tables_come_before_functions() {
         .entities()
         .iter()
         .position(|e| e.entity_type == EntityType::Function || e.entity_type == EntityType::Procedure);
-    let last_table = d
-        .entities()
-        .iter()
-        .rposition(|e| e.entity_type == EntityType::Table);
+    let last_table = d.entities().iter().rposition(|e| e.entity_type == EntityType::Table);
 
     if let (Some(last_t), Some(first_f)) = (last_table, first_func) {
         assert!(last_t < first_f, "Tables must come before functions/procedures");
@@ -241,22 +222,14 @@ fn table_entities_have_table_def() {
         .collect();
     assert!(!tables.is_empty());
     for table in &tables {
-        assert!(
-            table.table_def.is_some(),
-            "Table {} should have a TableDef",
-            table.name
-        );
+        assert!(table.table_def.is_some(), "Table {} should have a TableDef", table.name);
     }
 }
 
 #[test]
 fn table_columns_are_extracted() {
     let d = design();
-    let lookups = d
-        .entities()
-        .iter()
-        .find(|e| e.name == "config.lookups")
-        .unwrap();
+    let lookups = d.entities().iter().find(|e| e.name == "config.lookups").unwrap();
     let table_def = lookups.table_def.as_ref().unwrap();
     assert!(table_def.columns.len() >= 8);
 
@@ -268,11 +241,7 @@ fn table_columns_are_extracted() {
 #[test]
 fn fk_references_extracted() {
     let d = design();
-    let lookup_values = d
-        .entities()
-        .iter()
-        .find(|e| e.name == "config.lookup_values")
-        .unwrap();
+    let lookup_values = d.entities().iter().find(|e| e.name == "config.lookup_values").unwrap();
     assert!(
         !lookup_values.refers.is_empty(),
         "lookup_values should reference other tables via FK"
@@ -282,10 +251,7 @@ fn fk_references_extracted() {
 #[test]
 fn enum_values_extracted() {
     let d = design();
-    let status = d
-        .entities()
-        .iter()
-        .find(|e| e.entity_type == EntityType::Enum);
+    let status = d.entities().iter().find(|e| e.entity_type == EntityType::Enum);
     if let Some(enum_entity) = status {
         assert!(!enum_entity.enum_values.is_empty());
     }
@@ -294,11 +260,7 @@ fn enum_values_extracted() {
 #[test]
 fn search_paths_extracted() {
     let d = design();
-    let lookups = d
-        .entities()
-        .iter()
-        .find(|e| e.name == "config.lookups")
-        .unwrap();
+    let lookups = d.entities().iter().find(|e| e.name == "config.lookups").unwrap();
     assert!(
         !lookups.search_paths.is_empty(),
         "Should have search_paths from SET search_path"
@@ -316,7 +278,10 @@ fn procedure_reads_writes_extracted() {
     if !procs.is_empty() {
         let has_reads = procs.iter().any(|p| !p.reads.is_empty());
         let has_writes = procs.iter().any(|p| !p.writes.is_empty());
-        assert!(has_reads || has_writes, "At least one procedure should have reads or writes");
+        assert!(
+            has_reads || has_writes,
+            "At least one procedure should have reads or writes"
+        );
     }
 }
 
@@ -331,7 +296,10 @@ fn validate_reports_no_errors_on_fixture() {
         // Only allow "File not found" for entities with relative paths
         // that don't exist outside the fixture dir
         assert!(
-            entity.errors.iter().all(|e| e.contains("File not found") || e.contains("Parse error")),
+            entity
+                .errors
+                .iter()
+                .all(|e| e.contains("File not found") || e.contains("Parse error")),
             "Unexpected error on {}: {:?}",
             entity.name,
             entity.errors
@@ -413,15 +381,9 @@ fn import_plan_pairs_tables_with_procedures() {
     if !plan.is_empty() {
         let has_proc = plan.iter().any(|e| e.procedure.is_some());
         // Only assert if there are actually procedures in the project
-        let has_procedures = d
-            .entities()
-            .iter()
-            .any(|e| e.entity_type == EntityType::Procedure);
+        let has_procedures = d.entities().iter().any(|e| e.entity_type == EntityType::Procedure);
         if has_procedures {
-            assert!(
-                has_proc,
-                "Import plan should match at least one procedure"
-            );
+            assert!(has_proc, "Import plan should match at least one procedure");
         }
     }
 }
@@ -614,7 +576,9 @@ async fn apply_executes_all_entities() {
 async fn apply_single_entity_by_name() {
     let d = design();
     let mock = dbd_core::adapter::mock::MockAdapter::new();
-    d.apply(&mock, Some("config.lookups"), false, None, Progress::none()).await.unwrap();
+    d.apply(&mock, Some("config.lookups"), false, None, Progress::none())
+        .await
+        .unwrap();
     let applied = mock.applied_names();
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0], "config.lookups");
@@ -630,7 +594,13 @@ fn diagram_model_json_round_trips() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["project"]["name"].is_string());
     assert!(v["schemas"].as_array().unwrap().iter().any(|s| s["name"] == "config"));
-    assert!(v["tables"].as_array().unwrap().iter().any(|t| t["schema"] == "config" && t["name"] == "lookups"));
+    assert!(
+        v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["schema"] == "config" && t["name"] == "lookups")
+    );
     assert!(v["refs"].is_array());
 }
 
@@ -638,8 +608,7 @@ fn diagram_model_json_round_trips() {
 
 #[test]
 fn scope_complete_has_no_gaps() {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let scope = design.resolve_scope(Some("config_only"), None).unwrap();
     let report = design.report(None, Some(&scope));
@@ -651,8 +620,7 @@ fn scope_complete_has_no_gaps() {
 #[test]
 fn scope_wildcard_include_matches_schema_token() {
     // `config.*` (wildcard) resolves to the same working set as bare `config`.
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let wild = design.resolve_scope(Some("config_wild"), None).unwrap();
     assert!(wild.entities.contains("config.lookups"));
@@ -664,8 +632,7 @@ fn scope_wildcard_include_matches_schema_token() {
 #[test]
 fn scope_wildcard_exclude_keeps_schema() {
     // `excludes: [staging.*]` drops staging's entities but keeps the schema.
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let scope = design.resolve_scope(Some("drop_staging"), None).unwrap();
     assert!(!scope.entities.iter().any(|n| n.starts_with("staging.")));
@@ -675,8 +642,7 @@ fn scope_wildcard_exclude_keeps_schema() {
 
 #[test]
 fn scope_incomplete_reports_gap() {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let mut design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let scope = design.resolve_scope(Some("incomplete"), None).unwrap();
     let report = design.report(None, Some(&scope));
@@ -687,8 +653,7 @@ fn scope_incomplete_reports_gap() {
 
 #[test]
 fn scope_include_policy_closes_gap() {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let scope = design.resolve_scope(Some("incomplete_auto"), None).unwrap();
     let ws = design.working_set(&scope).unwrap();
@@ -697,8 +662,7 @@ fn scope_include_policy_closes_gap() {
 
 #[test]
 fn no_scope_is_full_set() {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
     let scope = design.resolve_scope(None, None).unwrap();
     assert!(scope.is_all);
@@ -712,8 +676,7 @@ fn no_scope_is_full_set() {
 // that gate's behavior on the fixture scopes.
 #[test]
 fn check_scope_gaps_gates_report_but_not_include() {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/design.yaml");
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
     let design = dbd_core::Design::from_config(&config_path, "dev").unwrap();
 
     // report policy with a gap → Err

@@ -98,20 +98,13 @@ fn resolve_entity_refers(
     }
     entity.refers = resolved_refers;
     for ref_name in unresolved {
-        entity
-            .warnings
-            .push(format!("Unresolved reference: {ref_name}"));
+        entity.warnings.push(format!("Unresolved reference: {ref_name}"));
     }
 }
 
 /// (2) FK structs → `ref_schema` (consumed by emit/dbml/reconcile). Kept in
 /// step with the `refers` resolution above so the target schema agrees.
-fn resolve_entity_fks(
-    entity: &mut Entity,
-    default_schema: &str,
-    search_path: &[String],
-    known: &HashSet<String>,
-) {
+fn resolve_entity_fks(entity: &mut Entity, default_schema: &str, search_path: &[String], known: &HashSet<String>) {
     let Some(td) = entity.table_def.as_mut() else {
         return;
     };
@@ -150,18 +143,12 @@ fn recover_bare_target(
 /// Re-point a bare-qualified FK at the schema that actually holds its target,
 /// resolved along the referencing table's search_path. No-op when the FK already
 /// resolves as written or was explicitly qualified to a non-default schema.
-fn fix_fk_schema(
-    fk: &mut ForeignKey,
-    default_schema: &str,
-    search_path: &[String],
-    known: &HashSet<String>,
-) {
+fn fix_fk_schema(fk: &mut ForeignKey, default_schema: &str, search_path: &[String], known: &HashSet<String>) {
     let cur_schema = fk.ref_schema.as_deref().unwrap_or(default_schema);
     if known.contains(&format!("{cur_schema}.{}", fk.ref_table)) {
         return; // resolves as written
     }
-    if let Some(sch) = recover_bare_target(cur_schema, &fk.ref_table, default_schema, search_path, known)
-    {
+    if let Some(sch) = recover_bare_target(cur_schema, &fk.ref_table, default_schema, search_path, known) {
         fk.ref_schema = Some(sch);
     }
 }

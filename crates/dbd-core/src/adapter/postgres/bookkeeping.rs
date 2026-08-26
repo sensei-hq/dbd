@@ -128,9 +128,7 @@ impl Bookkeeping {
             (&mut *tx)
                 .execute(sql.as_str())
                 .await
-                .map_err(|e| {
-                    DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}"))
-                })?;
+                .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}")))?;
         }
 
         tx.commit()
@@ -203,8 +201,7 @@ impl Bookkeeping {
             // surface — swallowing it to `None` would silently disable the scope
             // AND prod guards.
             Err(e) => {
-                let undefined_column =
-                    e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42703");
+                let undefined_column = e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42703");
                 if !undefined_column {
                     return Err(DbdError::Config(format!("read meta failed: {e}")));
                 }
@@ -315,13 +312,11 @@ impl Bookkeeping {
             return Ok(None); // no bookkeeping anywhere → foreign DB
         };
         let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
-        let vrow = sqlx::query(&format!(
-            "SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"
-        ))
-        .bind(&self.project)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?;
+        let vrow = sqlx::query(&format!("SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"))
+            .bind(&self.project)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?;
         Ok(Some(vrow.map(|r| r.get::<i32, _>("version") as u32).unwrap_or(0)))
     }
 }

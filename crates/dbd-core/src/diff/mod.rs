@@ -11,7 +11,10 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{ColumnDef, EntityType, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, SortOrder, TableConstraint};
+    use crate::entity::{
+        ColumnDef, EntityType, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, SortOrder,
+        TableConstraint,
+    };
     use crate::snapshot::{EnumSnapshot, Snapshot, TableSnapshot};
 
     // ── Helpers ─────────────────────────────────────────────

@@ -256,8 +256,7 @@ pub(in crate::formatter) fn format_table_column(
 
     match config.comma_style {
         CommaStyle::Trailing => {
-            let base =
-                format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col);
+            let base = format_column_line(&indent, &col_name, &type_str, &constraints_str, type_col);
             if !is_last || has_trailing_constraints {
                 format!("{base},")
             } else {
@@ -295,11 +294,7 @@ pub(in crate::formatter) fn format_table_constraint_line(
         }
         CommaStyle::Trailing => {
             let base = format!("{indent}{constraint_str}");
-            if !is_last {
-                format!("{base},")
-            } else {
-                base
-            }
+            if !is_last { format!("{base},") } else { base }
         }
     }
 }
@@ -323,10 +318,7 @@ pub(in crate::formatter) fn pad_to_width(s: &str, width: usize) -> String {
     }
 }
 
-pub(in crate::formatter) fn format_column_type(
-    data_type: &sqlparser::ast::DataType,
-    config: &FormatConfig,
-) -> String {
+pub(in crate::formatter) fn format_column_type(data_type: &sqlparser::ast::DataType, config: &FormatConfig) -> String {
     let raw = data_type.to_string();
     apply_keyword_case(&raw, &config.keyword_case)
 }
@@ -344,12 +336,8 @@ pub(in crate::formatter) fn format_column_constraints(
     let mut parts = Vec::new();
     for opt in options {
         let s = match &opt.option {
-            sqlparser::ast::ColumnOption::PrimaryKey(_) => {
-                kw("PRIMARY KEY")
-            }
-            sqlparser::ast::ColumnOption::Unique(_) => {
-                kw("UNIQUE")
-            }
+            sqlparser::ast::ColumnOption::PrimaryKey(_) => kw("PRIMARY KEY"),
+            sqlparser::ast::ColumnOption::Unique(_) => kw("UNIQUE"),
             sqlparser::ast::ColumnOption::NotNull => kw("NOT NULL"),
             sqlparser::ast::ColumnOption::Null => kw("NULL"),
             sqlparser::ast::ColumnOption::Default(expr) => {
@@ -400,10 +388,7 @@ pub(in crate::formatter) fn format_table_constraint(
 
 // ── CREATE INDEX formatter ──────────────────────────────
 
-pub(in crate::formatter) fn format_create_index(
-    ci: &sqlparser::ast::CreateIndex,
-    config: &FormatConfig,
-) -> String {
+pub(in crate::formatter) fn format_create_index(ci: &sqlparser::ast::CreateIndex, config: &FormatConfig) -> String {
     let kw = |s: &str| match config.keyword_case {
         KeywordCase::Lower => s.to_lowercase(),
         KeywordCase::Upper => s.to_uppercase(),
@@ -424,7 +409,9 @@ pub(in crate::formatter) fn format_create_index(
     }
 
     if let Some(ref name) = ci.name {
-        let name_str = name.0.iter()
+        let name_str = name
+            .0
+            .iter()
             .filter_map(|part| part.as_ident())
             .map(|i| i.value.to_lowercase())
             .collect::<Vec<_>>()
@@ -432,11 +419,7 @@ pub(in crate::formatter) fn format_create_index(
         out.push_str(&format!(" {name_str}"));
     }
 
-    out.push_str(&format!(
-        " {} {}",
-        kw("ON"),
-        ci.table_name.to_string().to_lowercase()
-    ));
+    out.push_str(&format!(" {} {}", kw("ON"), ci.table_name.to_string().to_lowercase()));
 
     // Index method, e.g. `USING gin` (was previously dropped → silent btree).
     if let Some(ref using) = ci.using {

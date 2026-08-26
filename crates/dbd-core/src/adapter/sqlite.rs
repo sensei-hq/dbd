@@ -28,31 +28,159 @@ use crate::script;
 /// `classify_reference` for fully offline analysis. `binary_search`
 /// relies on the ordering — `s11_builtins_sorted_for_binary_search` guards it.
 const SQLITE_BUILTINS: &[&str] = &[
-    "abs", "acos", "acosh", "and", "asin", "asinh", "atan", "atan2", "atanh",
-    "avg", "between", "blob", "boolean", "ceil", "ceiling", "changes", "char",
-    "coalesce", "concat", "concat_ws", "cos", "cosh", "count", "cume_dist",
-    "current_date", "current_time", "current_timestamp", "date", "datetime",
-    "degrees", "dense_rank", "exists", "exp", "false", "first_value", "floor",
-    "format", "glob", "group_concat", "hex", "ifnull", "iif", "in", "instr",
-    "int", "integer", "is", "json", "json_array", "json_array_length",
-    "json_each", "json_error_position", "json_extract", "json_group_array",
-    "json_group_object", "json_insert", "json_object", "json_patch",
-    "json_pretty", "json_quote", "json_remove", "json_replace", "json_set",
-    "json_tree", "json_type", "json_valid", "json_valid_b", "jsonb",
-    "jsonb_array", "jsonb_extract", "jsonb_group_array", "jsonb_group_object",
-    "jsonb_insert", "jsonb_object", "jsonb_patch", "jsonb_remove",
-    "jsonb_replace", "jsonb_set", "julianday", "lag", "last_insert_rowid",
-    "last_value", "lead", "length", "like", "likelihood", "likely", "ln",
-    "load_extension", "log", "log10", "log2", "lower", "ltrim", "max", "min",
-    "mod", "not", "nth_value", "ntile", "null", "nullif", "numeric",
-    "octet_length", "or", "percent_rank", "pi", "pow", "power", "printf",
-    "quote", "radians", "random", "randomblob", "rank", "real", "replace",
-    "round", "row_number", "rtrim", "sign", "sin", "sinh", "soundex",
-    "sqlite_compileoption_get", "sqlite_compileoption_used", "sqlite_offset",
-    "sqlite_source_id", "sqlite_version", "sqrt", "strftime", "string_agg",
-    "substr", "substring", "sum", "tan", "tanh", "text", "time", "timediff",
-    "total", "total_changes", "trim", "true", "trunc", "typeof", "unhex",
-    "unicode", "unixepoch", "unlikely", "upper", "varchar", "zeroblob",
+    "abs",
+    "acos",
+    "acosh",
+    "and",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "avg",
+    "between",
+    "blob",
+    "boolean",
+    "ceil",
+    "ceiling",
+    "changes",
+    "char",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "cos",
+    "cosh",
+    "count",
+    "cume_dist",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "date",
+    "datetime",
+    "degrees",
+    "dense_rank",
+    "exists",
+    "exp",
+    "false",
+    "first_value",
+    "floor",
+    "format",
+    "glob",
+    "group_concat",
+    "hex",
+    "ifnull",
+    "iif",
+    "in",
+    "instr",
+    "int",
+    "integer",
+    "is",
+    "json",
+    "json_array",
+    "json_array_length",
+    "json_each",
+    "json_error_position",
+    "json_extract",
+    "json_group_array",
+    "json_group_object",
+    "json_insert",
+    "json_object",
+    "json_patch",
+    "json_pretty",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_set",
+    "json_tree",
+    "json_type",
+    "json_valid",
+    "json_valid_b",
+    "jsonb",
+    "jsonb_array",
+    "jsonb_extract",
+    "jsonb_group_array",
+    "jsonb_group_object",
+    "jsonb_insert",
+    "jsonb_object",
+    "jsonb_patch",
+    "jsonb_remove",
+    "jsonb_replace",
+    "jsonb_set",
+    "julianday",
+    "lag",
+    "last_insert_rowid",
+    "last_value",
+    "lead",
+    "length",
+    "like",
+    "likelihood",
+    "likely",
+    "ln",
+    "load_extension",
+    "log",
+    "log10",
+    "log2",
+    "lower",
+    "ltrim",
+    "max",
+    "min",
+    "mod",
+    "not",
+    "nth_value",
+    "ntile",
+    "null",
+    "nullif",
+    "numeric",
+    "octet_length",
+    "or",
+    "percent_rank",
+    "pi",
+    "pow",
+    "power",
+    "printf",
+    "quote",
+    "radians",
+    "random",
+    "randomblob",
+    "rank",
+    "real",
+    "replace",
+    "round",
+    "row_number",
+    "rtrim",
+    "sign",
+    "sin",
+    "sinh",
+    "soundex",
+    "sqlite_compileoption_get",
+    "sqlite_compileoption_used",
+    "sqlite_offset",
+    "sqlite_source_id",
+    "sqlite_version",
+    "sqrt",
+    "strftime",
+    "string_agg",
+    "substr",
+    "substring",
+    "sum",
+    "tan",
+    "tanh",
+    "text",
+    "time",
+    "timediff",
+    "total",
+    "total_changes",
+    "trim",
+    "true",
+    "trunc",
+    "typeof",
+    "unhex",
+    "unicode",
+    "unixepoch",
+    "unlikely",
+    "upper",
+    "varchar",
+    "zeroblob",
 ];
 
 /// SQLite adapter using a sqlx connection pool.
@@ -129,15 +257,15 @@ impl SqliteAdapter {
         )
         .await?;
         // SQLite has no `ADD COLUMN IF NOT EXISTS` — add `scope` only when missing.
-        let has_scope = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0)
-            > 0;
+        let has_scope =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info('_dbd_meta') WHERE name = 'scope'")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0)
+                > 0;
         if !has_scope {
-            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT").await?;
+            self.execute_script("ALTER TABLE _dbd_meta ADD COLUMN scope TEXT")
+                .await?;
         }
         Ok(())
     }
@@ -203,9 +331,10 @@ impl DatabaseAdapter for SqliteAdapter {
             return Ok(());
         }
 
-        let file_path = entity.file.as_ref().ok_or_else(|| {
-            DbdError::Config(format!("No file for import entity {}", entity.name))
-        })?;
+        let file_path = entity
+            .file
+            .as_ref()
+            .ok_or_else(|| DbdError::Config(format!("No file for import entity {}", entity.name)))?;
         let table = Self::bare_name(&entity.name);
         let format = entity.format.as_deref().unwrap_or("csv");
 
@@ -213,13 +342,9 @@ impl DatabaseAdapter for SqliteAdapter {
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
-            "csv" | "tsv" => {
-                self.import_delimited(&data, table, format == "tsv", null_value).await
-            }
+            "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
             "jsonl" => self.import_jsonl(&data, table).await,
-            _ => Err(DbdError::Config(format!(
-                "Unsupported sqlite import format: {format}"
-            ))),
+            _ => Err(DbdError::Config(format!("Unsupported sqlite import format: {format}"))),
         }
     }
 
@@ -244,9 +369,7 @@ impl DatabaseAdapter for SqliteAdapter {
                 output.push_str(&columns.join(&sep.to_string()));
                 output.push('\n');
                 for row in &rows {
-                    let cells: Vec<String> = (0..columns.len())
-                        .map(|i| sqlite_cell_to_text(row, i))
-                        .collect();
+                    let cells: Vec<String> = (0..columns.len()).map(|i| sqlite_cell_to_text(row, i)).collect();
                     output.push_str(&cells.join(&sep.to_string()));
                     output.push('\n');
                 }
@@ -262,9 +385,7 @@ impl DatabaseAdapter for SqliteAdapter {
                 }
             }
             _ => {
-                return Err(DbdError::Config(format!(
-                    "Unsupported sqlite export format: {format}"
-                )));
+                return Err(DbdError::Config(format!("Unsupported sqlite export format: {format}")));
             }
         }
 
@@ -300,13 +421,11 @@ impl DatabaseAdapter for SqliteAdapter {
 
     async fn resolve_entity(&self, name: &str) -> Result<Option<String>> {
         let bare = Self::bare_name(name);
-        let row = sqlx::query(
-            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
-        )
-        .bind(bare)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("resolve_entity query failed: {e}")))?;
+        let row = sqlx::query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1")
+            .bind(bare)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("resolve_entity query failed: {e}")))?;
         Ok(row.map(|_| name.to_string()))
     }
 
@@ -344,7 +463,9 @@ impl DatabaseAdapter for SqliteAdapter {
 
         for row in &table_rows {
             let name: String = row.get("name");
-            let Some(table_sql): Option<String> = row.get("sql") else { continue };
+            let Some(table_sql): Option<String> = row.get("sql") else {
+                continue;
+            };
 
             // Only user-created indexes carry a `sql`; auto PK/UNIQUE indexes are
             // NULL and ride inside the table definition.
@@ -369,15 +490,16 @@ impl DatabaseAdapter for SqliteAdapter {
             entities.push(e);
         }
 
-        let view_rows =
-            sqlx::query("SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("introspect views failed: {e}")))?;
+        let view_rows = sqlx::query("SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect views failed: {e}")))?;
 
         for row in &view_rows {
             let name: String = row.get("name");
-            let Some(sql): Option<String> = row.get("sql") else { continue };
+            let Some(sql): Option<String> = row.get("sql") else {
+                continue;
+            };
             let mut e = Entity::new(EntityType::View, &name);
             e.schema = None;
             e.raw_ddl = Some(sql.trim().to_string());
@@ -391,11 +513,10 @@ impl DatabaseAdapter for SqliteAdapter {
     /// (a `_dbd_meta` table exists), `None` if foreign. Version is 0 if the table
     /// exists but has no row for this project.
     async fn reverse_managed_version(&self) -> Result<Option<u32>> {
-        let exists =
-            sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_dbd_meta'")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("reverse_managed_version detect failed: {e}")))?;
+        let exists = sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_dbd_meta'")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reverse_managed_version detect failed: {e}")))?;
         if exists.is_none() {
             return Ok(None);
         }
@@ -416,12 +537,10 @@ impl DatabaseAdapter for SqliteAdapter {
         // `_dbd_meta` absent ⇒ fresh DB (version 0). Probe via pragma (empty for a
         // missing table, not an error) so a genuine read failure surfaces instead
         // of being masked as 0 and misplanning apply against a live DB.
-        let has_meta = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?
+        let has_meta = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?
             > 0;
         if !has_meta {
             return Ok(0);
@@ -434,13 +553,7 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(row.map(|r| r.get::<i64, _>("version") as u32).unwrap_or(0))
     }
 
-    async fn apply_migration(
-        &self,
-        version: u32,
-        sql: &str,
-        description: &str,
-        checksum: &str,
-    ) -> Result<()> {
+    async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {
         if !sql.is_empty() {
             self.execute_script(sql).await?;
         }
@@ -478,11 +591,10 @@ impl DatabaseAdapter for SqliteAdapter {
         // table — not an error), so we pick the right SELECT and let genuine read
         // failures surface instead of masking them as "no meta", which would
         // silently disable the scope AND prod guards.
-        let columns: Vec<String> =
-            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
+        let columns: Vec<String> = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
         if columns.is_empty() {
             return Ok(None); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
         }
@@ -528,13 +640,7 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
-    async fn import_delimited(
-        &self,
-        data: &str,
-        table: &str,
-        tab: bool,
-        null_value: &str,
-    ) -> Result<()> {
+    async fn import_delimited(&self, data: &str, table: &str, tab: bool, null_value: &str) -> Result<()> {
         let sep = if tab { '\t' } else { ',' };
         let mut lines = data.lines();
         let header_line = match lines.next() {
@@ -546,11 +652,7 @@ impl SqliteAdapter {
             return Ok(());
         }
         let col_count = columns.len();
-        let cols_clause = columns
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(",");
+        let cols_clause = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -612,8 +714,8 @@ impl SqliteAdapter {
             if line.is_empty() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_str(line)
-                .map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
+            let value: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
             let obj = value
                 .as_object()
                 .ok_or_else(|| DbdError::Config("jsonl line must be a JSON object".into()))?;
@@ -701,11 +803,7 @@ async fn flush_jsonl_batch(
     if rows.is_empty() {
         return Ok(());
     }
-    let cols_clause = cols
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(",");
+    let cols_clause = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
     let placeholders = multi_row_placeholders(cols.len(), rows.len());
     let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
     let mut q = sqlx::query(&sql);
@@ -813,9 +911,7 @@ mod tests {
     #[tokio::test]
     async fn s2_resolve_entity_qualified_name() {
         let a = mem().await;
-        a.execute_script("CREATE TABLE users (id INTEGER)")
-            .await
-            .unwrap();
+        a.execute_script("CREATE TABLE users (id INTEGER)").await.unwrap();
         // Qualified "default.users" should still resolve via bare name.
         let r = a.resolve_entity("default.users").await.unwrap();
         assert_eq!(r.as_deref(), Some("default.users"));
@@ -939,9 +1035,7 @@ mod tests {
     async fn s7_internal_tables_excluded_from_list() {
         let a = mem().await;
         a.heal_bookkeeping().await.unwrap();
-        a.execute_script("CREATE TABLE keep_me (id INTEGER)")
-            .await
-            .unwrap();
+        a.execute_script("CREATE TABLE keep_me (id INTEGER)").await.unwrap();
         let list = a.list_entities().await.unwrap();
         assert_eq!(list, vec!["keep_me".to_string()]);
     }
@@ -1122,9 +1216,7 @@ mod tests {
     async fn s15_import_csv_multi_batch_path() {
         use tempfile::NamedTempFile;
         let a = mem().await;
-        a.execute_script("CREATE TABLE big (id INTEGER, v TEXT)")
-            .await
-            .unwrap();
+        a.execute_script("CREATE TABLE big (id INTEGER, v TEXT)").await.unwrap();
 
         // 1500 rows exceeds the 500-row batch ceiling, so we exercise the
         // flush-then-continue path in addition to the trailing-flush path.
@@ -1221,8 +1313,16 @@ mod tests {
         ));
         // New builtins picked up via the expanded list.
         for name in &[
-            "json_extract", "row_number", "lag", "lead", "pi", "pow", "ceil",
-            "unixepoch", "concat_ws", "string_agg",
+            "json_extract",
+            "row_number",
+            "lag",
+            "lead",
+            "pi",
+            "pow",
+            "ceil",
+            "unixepoch",
+            "concat_ws",
+            "string_agg",
         ] {
             assert!(
                 matches!(adapter.classify_reference(name, &[]), ReferenceClass::Internal),
@@ -1277,18 +1377,27 @@ mod tests {
         let status_pos = raw.find("book_status_idx").expect("book_status_idx appended");
         assert!(author_pos < status_pos, "indexes ordered by name: {raw}");
         assert!(!raw.to_lowercase().contains("autoindex"));
-        assert!(!raw.contains("author_name_idx"), "another table's index must not leak: {raw}");
+        assert!(
+            !raw.contains("author_name_idx"),
+            "another table's index must not leak: {raw}"
+        );
         let author = by("author").expect("author table captured");
         let araw = author.raw_ddl.as_deref().unwrap();
         assert!(araw.contains("author_name_idx"), "author keeps its own index");
-        assert!(!araw.contains("book_"), "book indexes must not leak into author: {araw}");
+        assert!(
+            !araw.contains("book_"),
+            "book indexes must not leak into author: {araw}"
+        );
 
         // View captured; trigger NOT captured; internals excluded.
         let v = by("published").expect("view captured");
         assert_eq!(v.entity_type, EntityType::View);
         assert!(v.raw_ddl.as_deref().unwrap().to_uppercase().contains("CREATE VIEW"));
         assert!(by("trg").is_none(), "triggers are not captured in v1");
-        assert!(ents.iter().all(|e| e.name != "_dbd_meta" && !e.name.starts_with("sqlite_")));
+        assert!(
+            ents.iter()
+                .all(|e| e.name != "_dbd_meta" && !e.name.starts_with("sqlite_"))
+        );
     }
 
     #[tokio::test]

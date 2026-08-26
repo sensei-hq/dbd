@@ -235,11 +235,7 @@ fn builtin_function_calls_are_not_dependencies_and_do_not_warn() {
     );
     assert_no_errors(&design);
 
-    let view = design
-        .entities()
-        .iter()
-        .find(|e| e.name == "app.v_rollup")
-        .unwrap();
+    let view = design.entities().iter().find(|e| e.name == "app.v_rollup").unwrap();
     assert_eq!(
         view.refers,
         vec!["app.events".to_string()],
@@ -266,11 +262,7 @@ fn builtin_set_returning_function_in_from_clause_does_not_warn() {
     );
     assert_no_errors(&design);
 
-    let view = design
-        .entities()
-        .iter()
-        .find(|e| e.name == "app.v_series")
-        .unwrap();
+    let view = design.entities().iter().find(|e| e.name == "app.v_series").unwrap();
     assert!(
         view.warnings.is_empty(),
         "built-in SRF in FROM must not warn: {:?}",
@@ -430,11 +422,7 @@ fn function_body_from_clause_builtin_does_not_warn() {
     );
     assert_no_errors(&design);
 
-    let func = design
-        .entities()
-        .iter()
-        .find(|e| e.name == "app.search")
-        .unwrap();
+    let func = design.entities().iter().find(|e| e.name == "app.search").unwrap();
     assert!(
         func.warnings.is_empty(),
         "FROM-clause built-in in a function body must not warn: {:?}",
@@ -498,10 +486,7 @@ fn all_tables_precede_every_view_and_routine() {
         .position(|e| {
             matches!(
                 e.entity_type,
-                EntityType::View
-                    | EntityType::MaterializedView
-                    | EntityType::Function
-                    | EntityType::Procedure
+                EntityType::View | EntityType::MaterializedView | EntityType::Function | EntityType::Procedure
             )
         })
         .expect("no routines");
@@ -542,11 +527,7 @@ fn table_with_default_calling_function_is_applied_after_it() {
     );
     assert_no_errors(&design);
 
-    let table = design
-        .entities()
-        .iter()
-        .find(|e| e.name == "app.things")
-        .unwrap();
+    let table = design.entities().iter().find(|e| e.name == "app.things").unwrap();
     assert!(
         table.refers.contains(&"app.make_slug".to_string()),
         "DEFAULT function call should be a dependency: {:?}",
@@ -667,11 +648,7 @@ fn builtin_calls_in_table_defaults_do_not_warn() {
     );
     assert_no_errors(&design);
 
-    let table = design
-        .entities()
-        .iter()
-        .find(|e| e.name == "app.events")
-        .unwrap();
+    let table = design.entities().iter().find(|e| e.name == "app.events").unwrap();
     assert!(
         table.warnings.is_empty(),
         "built-in DEFAULT calls must not warn: {:?}",
@@ -762,10 +739,7 @@ fn deep_fk_chain_does_not_push_tables_past_routines() {
             .to_string(),
     ));
 
-    let borrowed: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
     let design = design_for("deep_chain", &borrowed);
     assert_no_errors(&design);
 

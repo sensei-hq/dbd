@@ -218,7 +218,11 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
         match con {
             TableConstraint::PrimaryKey { columns, .. } => {
                 has_table_pk = true;
-                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns })
+                push(
+                    &mut kept,
+                    &mut seen,
+                    TableConstraint::PrimaryKey { name: None, columns },
+                )
             }
             TableConstraint::Unique { columns, .. } => {
                 push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
@@ -237,10 +241,24 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
         // table has exactly one PK, so only synthesize one from a column flag
         // when no table-level PK exists (the inline single-column PK case).
         if c.is_pk && !has_table_pk {
-            push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name: None, columns: vec![c.name.clone()] });
+            push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec![c.name.clone()],
+                },
+            );
         }
         if c.is_unique {
-            push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns: vec![c.name.clone()] });
+            push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec![c.name.clone()],
+                },
+            );
         }
     }
     kept.extend(others);
@@ -298,9 +316,7 @@ pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String
         "char" | "bpchar" => "character".to_string(),
         "decimal" => "numeric".to_string(),
         // Qualify a bare enum reference to match introspection.
-        other if !other.contains('.') => {
-            enum_types.get(other).cloned().unwrap_or_else(|| other.to_string())
-        }
+        other if !other.contains('.') => enum_types.get(other).cloned().unwrap_or_else(|| other.to_string()),
         other => other.to_string(),
     };
     match args {
@@ -604,9 +620,9 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
             changes.push(FieldChange {
                 field_name: format!("fk:{}", fk.columns.join(",")),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
-                    TableConstraint::ForeignKey(fk.clone()),
-                ))),
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(
+                    fk.clone(),
+                )))),
             });
         }
 
@@ -644,8 +660,7 @@ fn table_checks(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
         .iter()
         .filter_map(|con| match con {
             TableConstraint::Check { expression, .. } => {
-                let key = crate::sql_expr::canonicalize_predicate(expression)
-                    .unwrap_or_else(|| expression.clone());
+                let key = crate::sql_expr::canonicalize_predicate(expression).unwrap_or_else(|| expression.clone());
                 Some((key, con))
             }
             _ => None,
@@ -937,7 +952,11 @@ fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
         .map(|c| IndexColumnShape {
             // An expression is case-significant (it can contain string literals);
             // a column name is not.
-            name: if c.is_expression { c.name.clone() } else { c.name.to_lowercase() },
+            name: if c.is_expression {
+                c.name.clone()
+            } else {
+                c.name.to_lowercase()
+            },
             is_expression: c.is_expression,
             descending: matches!(c.order, Some(SortOrder::Desc)),
             nulls_first: c.nulls_first,
@@ -946,7 +965,10 @@ fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
         .collect();
     IndexShape {
         unique: ix.unique,
-        method: ix.index_type.as_ref().map_or("btree".to_string(), |t| t.amname().to_string()),
+        method: ix
+            .index_type
+            .as_ref()
+            .map_or("btree".to_string(), |t| t.amname().to_string()),
         columns,
         predicate: ix.predicate.clone(),
         include: ix.include.iter().map(|c| c.to_lowercase()).collect(),
@@ -1079,10 +1101,7 @@ pub(crate) enum MatviewAction {
 ///   contract → **Restamp** to `v2` (not comparable, so never a drift signal).
 /// - `Some(None)` — it exists but carries no `dbd:hash` sentinel (created outside
 ///   dbd, or before this feature) → **Warn** (cannot verify its definition).
-pub(crate) fn decide_matview_action(
-    want_hash: &str,
-    live: Option<Option<Sentinel>>,
-) -> MatviewAction {
+pub(crate) fn decide_matview_action(want_hash: &str, live: Option<Option<Sentinel>>) -> MatviewAction {
     match live {
         None => MatviewAction::Create,
         Some(Some(Sentinel::V2(h))) if h == want_hash => MatviewAction::Skip,
@@ -1209,12 +1228,7 @@ fn matview_index_keys(e: &Entity) -> std::collections::BTreeSet<(bool, Vec<Strin
         .map(|d| d.indexes.as_slice())
         .unwrap_or(&[])
         .iter()
-        .map(|ix| {
-            (
-                ix.unique,
-                ix.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-            )
-        })
+        .map(|ix| (ix.unique, ix.columns.iter().map(|c| c.name.to_lowercase()).collect()))
         .collect()
 }
 
@@ -1318,7 +1332,10 @@ mod tests {
         };
         let mut entity = Entity::new(EntityType::Table, "public.users");
         entity.table_def = Some(TableDef {
-            columns: vec![ColumnDef { inline_fk: Some(fk), ..col("org_id", "uuid") }],
+            columns: vec![ColumnDef {
+                inline_fk: Some(fk),
+                ..col("org_id", "uuid")
+            }],
             constraints: vec![],
             indexes: vec![],
             comments: TableComments::default(),
@@ -1326,15 +1343,27 @@ mod tests {
         let entities = vec![entity];
 
         let raw = raw_snapshot_from_entities(&entities);
-        assert!(raw.tables[0].columns[0].inline_fk.is_some(), "raw builder must retain the inline FK");
+        assert!(
+            raw.tables[0].columns[0].inline_fk.is_some(),
+            "raw builder must retain the inline FK"
+        );
 
         let canon = snapshot_from_entities(&entities);
-        assert!(canon.tables[0].columns[0].inline_fk.is_none(), "canonicalize builder must strip the inline FK");
+        assert!(
+            canon.tables[0].columns[0].inline_fk.is_none(),
+            "canonicalize builder must strip the inline FK"
+        );
     }
 
     // ── Foreign-key convergence (issue #8) ──────────────────
 
-    fn ref_fk(name: Option<&str>, col: &str, ref_schema: Option<&str>, ref_table: &str, on_delete: Option<FkAction>) -> ForeignKey {
+    fn ref_fk(
+        name: Option<&str>,
+        col: &str,
+        ref_schema: Option<&str>,
+        ref_table: &str,
+        on_delete: Option<FkAction>,
+    ) -> ForeignKey {
         ForeignKey {
             name: name.map(str::to_string),
             columns: vec![col.to_string()],
@@ -1366,7 +1395,9 @@ mod tests {
         assert_eq!(plan.altered.len(), 1, "expected one altered table; got {plan:?}");
         assert_eq!(plan.altered[0].entity_name, "app.children");
         assert!(
-            plan.altered[0].sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id)"),
+            plan.altered[0]
+                .sql
+                .contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id)"),
             "expected unnamed ADD FOREIGN KEY; got: {}",
             plan.altered[0].sql
         );
@@ -1379,7 +1410,11 @@ mod tests {
     fn fk_convergence_drops_extra_fk_is_destructive() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            None,
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![table("app", "children", vec![col("parent_id", "uuid")])]);
@@ -1402,7 +1437,11 @@ mod tests {
     fn fk_convergence_in_sync_is_no_change() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", Some(FkAction::NoAction),
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            Some(FkAction::NoAction),
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![TableSnapshot {
@@ -1416,7 +1455,10 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_fk_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.is_empty() && !plan.destructive, "in-sync FK must reconcile to no change; got {plan:?}");
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "in-sync FK must reconcile to no change; got {plan:?}"
+        );
     }
 
     /// A changed FK action (design adds `ON DELETE CASCADE`) drops the old and
@@ -1425,12 +1467,22 @@ mod tests {
     fn fk_convergence_changed_action_replaces() {
         let mut live_t = table("app", "children", vec![col("parent_id", "uuid")]);
         live_t.table_constraints.push(TableConstraint::ForeignKey(ref_fk(
-            Some("children_parent_id_fkey"), "parent_id", Some("app"), "parents", None,
+            Some("children_parent_id_fkey"),
+            "parent_id",
+            Some("app"),
+            "parents",
+            None,
         )));
         let live = snap(vec![live_t]);
         let desired = snap(vec![TableSnapshot {
             columns: vec![ColumnDef {
-                inline_fk: Some(ref_fk(None, "parent_id", Some("app"), "parents", Some(FkAction::Cascade))),
+                inline_fk: Some(ref_fk(
+                    None,
+                    "parent_id",
+                    Some("app"),
+                    "parents",
+                    Some(FkAction::Cascade),
+                )),
                 ..col("parent_id", "uuid")
             }],
             ..table("app", "children", vec![])
@@ -1441,9 +1493,14 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP CONSTRAINT children_parent_id_fkey"), "must drop old FK; got: {sql}");
-        assert!(sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id) ON DELETE CASCADE"),
-            "must add the new FK with the action; got: {sql}");
+        assert!(
+            sql.contains("DROP CONSTRAINT children_parent_id_fkey"),
+            "must drop old FK; got: {sql}"
+        );
+        assert!(
+            sql.contains("ADD FOREIGN KEY (parent_id) REFERENCES app.parents(id) ON DELETE CASCADE"),
+            "must add the new FK with the action; got: {sql}"
+        );
         assert!(plan.destructive, "replacing an FK drops the old one → destructive");
     }
 
@@ -1477,7 +1534,10 @@ mod tests {
     // ── Column-comment convergence ───────────────────────────
 
     fn commented(name: &str, comment: Option<&str>) -> ColumnDef {
-        ColumnDef { comment: comment.map(str::to_string), ..col(name, "text") }
+        ColumnDef {
+            comment: comment.map(str::to_string),
+            ..col(name, "text")
+        }
     }
 
     fn docs_with(columns: Vec<ColumnDef>) -> Snapshot {
@@ -1510,7 +1570,11 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_comment_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.altered[0].sql.contains("IS 'new text';"), "got: {}", plan.altered[0].sql);
+        assert!(
+            plan.altered[0].sql.contains("IS 'new text';"),
+            "got: {}",
+            plan.altered[0].sql
+        );
     }
 
     /// The design dropped the comment → `IS NULL`, which is how Postgres removes
@@ -1577,7 +1641,10 @@ mod tests {
             &docs_with(vec![commented("title", None)]),
             &docs_with(vec![commented("title", None), commented("summary", Some("new col"))]),
         );
-        assert!(plan.is_empty(), "a new column's comment rides its ADD COLUMN; got {plan:?}");
+        assert!(
+            plan.is_empty(),
+            "a new column's comment rides its ADD COLUMN; got {plan:?}"
+        );
 
         // New table entirely.
         let mut plan = ReconcilePlan::default();
@@ -1659,7 +1726,10 @@ mod tests {
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("ADD CHECK (status <> '')"), "got: {sql}");
-        assert!(!sql.contains("unnamed"), "an unnamed CHECK must not be named \"unnamed\"; got: {sql}");
+        assert!(
+            !sql.contains("unnamed"),
+            "an unnamed CHECK must not be named \"unnamed\"; got: {sql}"
+        );
         assert!(!plan.destructive, "adding a CHECK is not destructive");
     }
 
@@ -1679,7 +1749,10 @@ mod tests {
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
-        assert!(!sql.contains("ck:"), "the expression key must never be used as a name; got: {sql}");
+        assert!(
+            !sql.contains("ck:"),
+            "the expression key must never be used as a name; got: {sql}"
+        );
         assert!(plan.destructive, "dropping a CHECK is gated as destructive");
     }
 
@@ -1753,7 +1826,10 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_check_convergence(&mut plan, &live, &desired);
 
-        assert!(plan.is_empty(), "a new table's CHECKs come with its CREATE; got {plan:?}");
+        assert!(
+            plan.is_empty(),
+            "a new table's CHECKs come with its CREATE; got {plan:?}"
+        );
     }
 
     // ── Index convergence (issue #12) ────────────────────────
@@ -1764,7 +1840,10 @@ mod tests {
             name: Some(name.to_string()),
             columns: cols
                 .iter()
-                .map(|c| IndexColumn { name: (*c).to_string(), ..Default::default() })
+                .map(|c| IndexColumn {
+                    name: (*c).to_string(),
+                    ..Default::default()
+                })
                 .collect(),
             unique,
             ..Default::default()
@@ -1783,7 +1862,10 @@ mod tests {
         let descending = || crate::entity::IndexDef {
             name: Some("runs_project_idx".to_string()),
             columns: vec![
-                IndexColumn { name: "project_id".to_string(), ..Default::default() },
+                IndexColumn {
+                    name: "project_id".to_string(),
+                    ..Default::default()
+                },
                 IndexColumn {
                     name: "started_at".to_string(),
                     order: Some(SortOrder::Desc),
@@ -1795,7 +1877,11 @@ mod tests {
         let table_with = |ix| {
             snap(vec![TableSnapshot {
                 indexes: vec![ix],
-                ..table("app", "runs", vec![col("project_id", "uuid"), col("started_at", "timestamptz")])
+                ..table(
+                    "app",
+                    "runs",
+                    vec![col("project_id", "uuid"), col("started_at", "timestamptz")],
+                )
             }])
         };
 
@@ -1860,7 +1946,10 @@ mod tests {
 
         let sql = &plan.altered[0].sql;
         assert!(sql.contains("DROP INDEX IF EXISTS"), "got: {sql}");
-        assert!(sql.contains("WHERE folder_id IS NULL"), "the new predicate must be created; got: {sql}");
+        assert!(
+            sql.contains("WHERE folder_id IS NULL"),
+            "the new predicate must be created; got: {sql}"
+        );
         assert!(plan.destructive);
     }
 
@@ -1921,8 +2010,16 @@ mod tests {
                 "app",
                 "memory_links",
                 vec![
-                    ColumnDef { is_pk: true, nullable: false, ..col("parent_id", "uuid") },
-                    ColumnDef { is_pk: true, nullable: false, ..col("child_id", "uuid") },
+                    ColumnDef {
+                        is_pk: true,
+                        nullable: false,
+                        ..col("parent_id", "uuid")
+                    },
+                    ColumnDef {
+                        is_pk: true,
+                        nullable: false,
+                        ..col("child_id", "uuid")
+                    },
                 ],
             );
             t.table_constraints.push(TableConstraint::PrimaryKey {
@@ -1940,7 +2037,11 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan_index_convergence(&mut plan, &live, &desired);
 
-        assert_eq!(plan.altered.len(), 1, "composite-PK member index must converge; got {plan:?}");
+        assert_eq!(
+            plan.altered.len(),
+            1,
+            "composite-PK member index must converge; got {plan:?}"
+        );
         assert!(
             plan.altered[0].sql.contains("memory_links_child_id_idx"),
             "got: {}",
@@ -1962,7 +2063,9 @@ mod tests {
             columns: vec!["parent_id".to_string(), "child_id".to_string()],
         });
         let mut desired_t = live_t.clone();
-        live_t.indexes.push(idx("memory_links_pkey", &["parent_id", "child_id"], true));
+        live_t
+            .indexes
+            .push(idx("memory_links_pkey", &["parent_id", "child_id"], true));
         desired_t.indexes.clear();
 
         let mut plan = ReconcilePlan::default();
@@ -1979,7 +2082,11 @@ mod tests {
     /// so the partial one must not be suppressed as "already a constraint".
     #[test]
     fn index_convergence_keeps_partial_unique_index_over_constrained_columns() {
-        let mut live_t = table("app", "libs", vec![col("library_id", "uuid"), col("project_id", "uuid")]);
+        let mut live_t = table(
+            "app",
+            "libs",
+            vec![col("library_id", "uuid"), col("project_id", "uuid")],
+        );
         live_t.table_constraints.push(TableConstraint::Unique {
             name: None,
             columns: vec!["library_id".to_string()],
@@ -2042,7 +2149,9 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         assert!(
-            plan.altered[0].sql.contains("DROP INDEX IF EXISTS \"app\".\"children_parent_id_idx\";"),
+            plan.altered[0]
+                .sql
+                .contains("DROP INDEX IF EXISTS \"app\".\"children_parent_id_idx\";"),
             "expected schema-qualified DROP INDEX with the live name; got: {}",
             plan.altered[0].sql
         );
@@ -2084,7 +2193,10 @@ mod tests {
             ..table("app", "users", vec![not_null("id", "uuid")])
         }]);
         let desired = snap(vec![TableSnapshot {
-            table_constraints: vec![TableConstraint::PrimaryKey { name: None, columns: vec!["id".to_string()] }],
+            table_constraints: vec![TableConstraint::PrimaryKey {
+                name: None,
+                columns: vec!["id".to_string()],
+            }],
             ..table("app", "users", vec![pk_col("id", "uuid")])
         }]);
 
@@ -2116,7 +2228,10 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP INDEX IF EXISTS \"app\".\"users_email_idx\";"), "must drop old index; got: {sql}");
+        assert!(
+            sql.contains("DROP INDEX IF EXISTS \"app\".\"users_email_idx\";"),
+            "must drop old index; got: {sql}"
+        );
         assert!(
             sql.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"users_email_idx\" ON \"app\".\"users\" (\"email\");"),
             "must create the new unique index; got: {sql}"
@@ -2160,7 +2275,11 @@ mod tests {
         use crate::entity::{IndexColumn, IndexDef, IndexType};
         let gin = IndexDef {
             name: Some("docs_tags_gin".to_string()),
-            columns: vec![IndexColumn { name: "tags".to_string(), order: None, ..Default::default() }],
+            columns: vec![IndexColumn {
+                name: "tags".to_string(),
+                order: None,
+                ..Default::default()
+            }],
             unique: false,
             index_type: Some(IndexType::Gin),
             ..Default::default()
@@ -2242,10 +2361,17 @@ mod tests {
     }
 
     fn pk_col(name: &str, ty: &str) -> ColumnDef {
-        ColumnDef { is_pk: true, nullable: false, ..col(name, ty) }
+        ColumnDef {
+            is_pk: true,
+            nullable: false,
+            ..col(name, ty)
+        }
     }
     fn not_null(name: &str, ty: &str) -> ColumnDef {
-        ColumnDef { nullable: false, ..col(name, ty) }
+        ColumnDef {
+            nullable: false,
+            ..col(name, ty)
+        }
     }
 
     /// The core cross-representation guarantee: a table as the parser sees it
@@ -2413,16 +2539,8 @@ mod tests {
     /// strips only the redundant cast, never a real change.
     #[test]
     fn canonicalize_still_detects_real_default_change() {
-        let mut desired = snap(vec![table(
-            "public",
-            "counter",
-            vec![col_default("n", "integer", "1")],
-        )]);
-        let mut live = snap(vec![table(
-            "public",
-            "counter",
-            vec![col_default("n", "integer", "0")],
-        )]);
+        let mut desired = snap(vec![table("public", "counter", vec![col_default("n", "integer", "1")])]);
+        let mut live = snap(vec![table("public", "counter", vec![col_default("n", "integer", "0")])]);
 
         canonicalize(&mut desired);
         canonicalize(&mut live);
@@ -2453,10 +2571,17 @@ mod tests {
         let mut snap = snap(vec![TableSnapshot {
             name: "orders".to_string(),
             schema: "public".to_string(),
-            columns: vec![ColumnDef { comment: Some("the total".to_string()), ..col("total", "int4") }],
+            columns: vec![ColumnDef {
+                comment: Some("the total".to_string()),
+                ..col("total", "int4")
+            }],
             indexes: vec![IndexDef {
                 name: Some("orders_total_idx".to_string()),
-                columns: vec![IndexColumn { name: "total".to_string(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "total".to_string(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: false,
                 index_type: None,
                 ..Default::default()
@@ -2471,7 +2596,10 @@ mod tests {
                     on_delete: None,
                     on_update: None,
                 }),
-                TableConstraint::Check { name: Some("ck".to_string()), expression: "total > 0".to_string() },
+                TableConstraint::Check {
+                    name: Some("ck".to_string()),
+                    expression: "total > 0".to_string(),
+                },
             ],
         }]);
         normalize_common(&mut snap);
@@ -2479,8 +2607,18 @@ mod tests {
         assert_eq!(t.columns[0].data_type, "integer", "types must still be normalized");
         assert_eq!(t.columns[0].comment.as_deref(), Some("the total"), "comment preserved");
         assert_eq!(t.indexes.len(), 1, "indexes preserved");
-        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::ForeignKey(_))), "FK preserved");
-        assert!(t.table_constraints.iter().any(|c| matches!(c, TableConstraint::Check { .. })), "CHECK preserved");
+        assert!(
+            t.table_constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::ForeignKey(_))),
+            "FK preserved"
+        );
+        assert!(
+            t.table_constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Check { .. })),
+            "CHECK preserved"
+        );
     }
 
     #[test]
@@ -2606,7 +2744,11 @@ mod tests {
             constraints: vec![],
             indexes: vec![IndexDef {
                 name: Some("m_x_idx".into()),
-                columns: vec![IndexColumn { name: "x".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "x".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: true,
                 index_type: None,
                 ..Default::default()

@@ -183,9 +183,7 @@ fn safe_relative_path(script: &str) -> Option<std::path::PathBuf> {
 /// in one would otherwise be handed straight to the database. Same containment
 /// rule `apply_policies` applies to `policies/`.
 fn read_hook(canon_root: &Path, script: &str, kind: HookKind) -> Result<String> {
-    let denied = |reason: String| {
-        DbdError::Config(format!("{} {script} could not be read: {reason}", kind.label()))
-    };
+    let denied = |reason: String| DbdError::Config(format!("{} {script} could not be read: {reason}", kind.label()));
 
     // Rebuild the path from plain names only, rather than trusting the declared
     // string and judging the result: a hook is always project-relative, so
@@ -232,11 +230,18 @@ where
     D: FnMut(&str, Option<&str>),
 {
     let plan = plan_hooks(project_dir, entries, kind, scope)?;
-    let mut outcome = HookOutcome { ran: 0, warnings: plan.warnings };
+    let mut outcome = HookOutcome {
+        ran: 0,
+        warnings: plan.warnings,
+    };
     for (script, sql) in &plan.runnable {
         let desc = format!("run {script}");
         (progress.on_start)(&desc);
-        let result = if dry_run { Ok(()) } else { adapter.execute_script(sql).await };
+        let result = if dry_run {
+            Ok(())
+        } else {
+            adapter.execute_script(sql).await
+        };
         super::report_step_result(&desc, &mut progress.on_done, result)?;
         outcome.ran += 1;
     }
@@ -277,17 +282,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("sql/absent.sql".to_string())];
-        let err = run_hooks(
-            &mock,
-            tmp.path(),
-            &entries,
-            HookKind::After,
-            None,
-            false,
-            &mut silent(),
-        )
-        .await
-        .unwrap_err();
+        let err = run_hooks(&mock, tmp.path(), &entries, HookKind::After, None, false, &mut silent())
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("sql/absent.sql"), "the error must name the script: {msg}");
     }
@@ -304,17 +301,9 @@ mod tests {
 
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("../secret.sql".to_string())];
-        let err = run_hooks(
-            &mock,
-            &project,
-            &entries,
-            HookKind::After,
-            None,
-            false,
-            &mut silent(),
-        )
-        .await
-        .unwrap_err();
+        let err = run_hooks(&mock, &project, &entries, HookKind::After, None, false, &mut silent())
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("relative"), "got: {err}");
         assert_eq!(mock.script_count(), 0, "nothing outside the project may execute");
@@ -389,7 +378,10 @@ mod tests {
         assert_eq!(mock.script_count(), 0);
         let warning = outcome.warnings.first().expect("a skip must be warned about");
         assert!(warning.contains("sql/loader.sql"), "got: {warning}");
-        assert!(warning.contains("staging.b"), "the offending table must be named: {warning}");
+        assert!(
+            warning.contains("staging.b"),
+            "the offending table must be named: {warning}"
+        );
         assert!(warning.contains("partial"), "the scope must be named: {warning}");
     }
 
@@ -420,7 +412,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome.ran, 1, "declared writes in scope must run: {:?}", outcome.warnings);
+        assert_eq!(
+            outcome.ran, 1,
+            "declared writes in scope must run: {:?}",
+            outcome.warnings
+        );
         assert_eq!(mock.script_count(), 1);
     }
 

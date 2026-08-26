@@ -32,8 +32,8 @@
 //! subtree therefore reads as *changed* (and callers surface an advisory), never
 //! as falsely equal.
 
-use pg_query::protobuf::{AExprKind, Node};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{AExprKind, Node};
 
 /// Canonicalize a boolean SQL expression, or `None` if it can't be parsed or
 /// re-deparsed.
@@ -176,8 +176,7 @@ fn any_array_to_in(node: &mut Node) {
 
     // `ANY`/`ALL` also take a subquery or a plain array column, neither of which
     // is an `IN` list — only the literal `ARRAY[…]` constructor converts.
-    let Some(NodeEnum::AArrayExpr(array)) = expr.rexpr.as_deref().and_then(|n| n.node.as_ref())
-    else {
+    let Some(NodeEnum::AArrayExpr(array)) = expr.rexpr.as_deref().and_then(|n| n.node.as_ref()) else {
         return;
     };
 
@@ -233,10 +232,7 @@ mod tests {
 
     #[test]
     fn enum_qualified_literal_casts_are_dropped() {
-        assert_converges(
-            "status = 'active'",
-            "status = 'active'::sensei.memory_status",
-        );
+        assert_converges("status = 'active'", "status = 'active'::sensei.memory_status");
     }
 
     #[test]

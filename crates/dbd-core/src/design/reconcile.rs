@@ -14,7 +14,7 @@ impl Design {
         desired_entities: &[&'a Entity],
         plan: &mut crate::reconcile::ReconcilePlan,
     ) -> Result<(Vec<(&'a Entity, String)>, Vec<(&'a Entity, String)>)> {
-        use crate::reconcile::{decide_matview_action, matview_hash, parse_dbd_hash, MatviewAction};
+        use crate::reconcile::{MatviewAction, decide_matview_action, matview_hash, parse_dbd_hash};
         let matviews: Vec<&'a Entity> = desired_entities
             .iter()
             .copied()
@@ -99,7 +99,7 @@ impl Design {
         D: FnMut(&str, Option<&str>),
     {
         use crate::reconcile::{
-            matview_create_sql, matview_hash_comment_sql, qualified_entity_name, ReconcileComplete,
+            ReconcileComplete, matview_create_sql, matview_hash_comment_sql, qualified_entity_name,
         };
         use std::collections::{HashMap, HashSet};
 
@@ -117,13 +117,8 @@ impl Design {
         //   enum/table: only when newly added (a full create).
         for e in desired_entities {
             let do_apply = match e.entity_type {
-                EntityType::Schema
-                | EntityType::Extension
-                | EntityType::Role
-                | EntityType::Sequence => true,
-                EntityType::Enum | EntityType::Table => {
-                    added.contains(qualified_entity_name(e).as_str())
-                }
+                EntityType::Schema | EntityType::Extension | EntityType::Role | EntityType::Sequence => true,
+                EntityType::Enum | EntityType::Table => added.contains(qualified_entity_name(e).as_str()),
                 _ => false,
             };
             if !do_apply {
@@ -253,16 +248,14 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_check_convergence, plan_comment_convergence, plan_fk_convergence,
-            plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
-            snapshot_from_entities,
+            plan_check_convergence, plan_comment_convergence, plan_fk_convergence, plan_index_convergence,
+            plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
             return Err(DbdError::Config(
-                "reconcile is not supported for this target (no live SQL schema to diff)"
-                    .to_string(),
+                "reconcile is not supported for this target (no live SQL schema to diff)".to_string(),
             ));
         }
 
@@ -294,8 +287,7 @@ impl Design {
         // above, so converge them from the RAW snapshots — adding declared FKs
         // the live DB lacks and dropping (destructive) ones the design removed.
         let desired_raw = raw_snapshot_from_entities(&desired_owned);
-        let live_raw =
-            restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
+        let live_raw = restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
         plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Secondary indexes (issue #12): canonicalize also strips indexes, so —
@@ -370,7 +362,9 @@ impl Design {
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         let version = self.config.project.version.unwrap_or(1);
-        adapter.set_project_meta(&self.env, version, scope.map(|s| s.name.as_str())).await?;
+        adapter
+            .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
+            .await?;
 
         (progress.on_complete)(summary);
         Ok(plan)
@@ -440,7 +434,7 @@ impl Design {
         live_entities: &[Entity],
         managed_schemas: &std::collections::HashSet<String>,
     ) -> Result<Vec<crate::schema_diff::MatviewDrift>> {
-        use crate::reconcile::{matview_hash, parse_dbd_hash, Sentinel, DEFAULT_SCHEMA};
+        use crate::reconcile::{DEFAULT_SCHEMA, Sentinel, matview_hash, parse_dbd_hash};
         use crate::schema_diff::{MatviewDrift, MatviewDriftKind};
         use std::collections::HashSet;
 
@@ -449,8 +443,7 @@ impl Design {
             .copied()
             .filter(|e| e.entity_type == EntityType::MaterializedView)
             .collect();
-        let design_mv_names: HashSet<&str> =
-            design_matviews.iter().map(|e| e.name.as_str()).collect();
+        let design_mv_names: HashSet<&str> = design_matviews.iter().map(|e| e.name.as_str()).collect();
 
         let mut drift: Vec<MatviewDrift> = Vec::new();
 
@@ -472,7 +465,10 @@ impl Design {
                     // `dbd reconcile` upgrades it to v2 silently on its next run.
                     Some(Some(Sentinel::V1(_))) | Some(None) => MatviewDriftKind::Unstamped,
                 };
-                drift.push(MatviewDrift { name: e.name.clone(), kind });
+                drift.push(MatviewDrift {
+                    name: e.name.clone(),
+                    kind,
+                });
             }
         }
 
@@ -487,7 +483,10 @@ impl Design {
                 if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
             };
             if managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str()) {
-                drift.push(MatviewDrift { name: e.name.clone(), kind: MatviewDriftKind::Orphan });
+                drift.push(MatviewDrift {
+                    name: e.name.clone(),
+                    kind: MatviewDriftKind::Orphan,
+                });
             }
         }
 
