@@ -180,7 +180,7 @@ pub async fn run(
         Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
 
         Commands::Policies { dry_run } => {
-            schema::cmd_policies(config, project_dir, database_url, *dry_run, verbosity).await
+            schema::cmd_policies(config, env, project_dir, database_url, *dry_run, scope, deps, verbosity).await
         }
 
         Commands::Diff { json, exit_code } => {
@@ -237,12 +237,19 @@ pub(super) fn format_import_summary(s: &ImportComplete) -> String {
 pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> String {
     let apply_line = format_apply_summary(&s.apply);
     let import_line = format_import_summary(&s.import);
+    // A scoped deploy skips policies whose table is not in this plane. That is
+    // deliberate, but it must still be visible — otherwise the summary reports
+    // only what ran and nothing accounts for the rest.
     let policy_line = format!(
-        "{} policy file(s) applied{}.",
+        "{} policy file(s) applied{}{}.",
         s.policies.applied.len(),
         match s.policies.failed.len() {
             0 => String::new(),
             n => format!(", {n} failed"),
+        },
+        match s.policies.skipped.len() {
+            0 => String::new(),
+            n => format!(", {n} skipped (out of scope)"),
         }
     );
     format!("{apply_line} {import_line} {policy_line}")
@@ -483,6 +490,7 @@ mod tests {
             policies: dbd_core::design::PolicyReport {
                 applied: vec![std::path::PathBuf::from("policies/users.sql")],
                 failed: Vec::new(),
+                skipped: Vec::new(),
             },
         };
         let out = format_deploy_summary(&s);
@@ -497,12 +505,43 @@ mod tests {
         let s = dbd_core::design::DeployComplete {
             policies: dbd_core::design::PolicyReport {
                 applied: Vec::new(),
+                skipped: Vec::new(),
                 failed: vec![(std::path::PathBuf::from("policies/bad.sql"), "boom".to_string())],
             },
             ..Default::default()
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("1 failed"), "failed policy count must be reported: {out}");
+    }
+
+    /// A scoped deploy skips policies whose table is not in the plane. The
+    /// `apply` and `policies` paths already print each skip; the deploy summary
+    /// must count them too, or `deploy --scope` reports "2 applied" on a project
+    /// with 5 policy files and nothing says the other 3 were deliberate.
+    #[test]
+    fn format_deploy_summary_reports_skipped_policies() {
+        let s = dbd_core::design::DeployComplete {
+            policies: dbd_core::design::PolicyReport {
+                applied: vec![std::path::PathBuf::from("policies/app/t.sql")],
+                failed: Vec::new(),
+                skipped: vec![(
+                    std::path::PathBuf::from("policies/dojo/repository_metrics.sql"),
+                    "dojo.repository_metrics is outside scope 'daemon'".to_string(),
+                )],
+            },
+            ..Default::default()
+        };
+        let out = format_deploy_summary(&s);
+        assert!(out.contains("1 skipped"), "skipped policy count must be reported: {out}");
+    }
+
+    /// A skip is not a failure: with nothing skipped the summary must not
+    /// mention skipping at all, so the phrase stays a real signal.
+    #[test]
+    fn format_deploy_summary_omits_skipped_when_none() {
+        let s = dbd_core::design::DeployComplete::default();
+        let out = format_deploy_summary(&s);
+        assert!(!out.contains("skipped"), "must not mention skipping when none: {out}");
     }
 
     /// `$VAR` is looked up (falling back to the literal when unset); a plain
