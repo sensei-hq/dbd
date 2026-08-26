@@ -259,6 +259,14 @@ dbd deploy --scope hub --database $HUB_URL
 - Per-scope migrations fall out automatically: pending-migration steps for
   out-of-scope entities are skipped while the per-database version still advances.
 
+`snapshot`, `release` and `migrate` deliberately ignore `--scope` and warn when
+given it. A snapshot records the *design*, not one database: a scoped baseline
+would omit entities, and every later `dbd snapshot` would diff against an
+incomplete record and emit a spurious `CREATE` for them on every plane. Scope
+decides which migration steps *run*, not which ones exist — `dbd deploy --scope
+daemon` on a released project applies only the in-scope migrations while the
+database's version still advances.
+
 Scopes are honored by every entity-selecting command. The write commands
 (`inspect`, `apply`, `import`, `deploy`) gate on dependency gaps. The
 documentation/read/destructive commands (`dbml`, `combine`, `graph`, `export`,

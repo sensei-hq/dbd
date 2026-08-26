@@ -15,6 +15,59 @@ use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete};
 use crate::cli::Commands;
 use crate::output::{self, Verbosity};
 
+/// Whether a command does anything with `--scope`.
+///
+/// `--scope` is a global flag, so every command accepts it and the ones that
+/// ignore it accept it silently — `dbd release --scope daemon` exits 0 having
+/// scoped nothing. That reads as a scoped release; it is not one.
+///
+/// The match is exhaustive on purpose. A new command cannot be added without
+/// stating which side it falls on, so this cannot quietly drift out of date.
+fn command_honors_scope(command: &Commands) -> bool {
+    match command {
+        // Entity-selecting: filter to the scope's working set.
+        Commands::Inspect { .. }
+        | Commands::Apply { .. }
+        | Commands::Combine { .. }
+        | Commands::Import { .. }
+        | Commands::Graph { .. }
+        | Commands::Dbml { .. }
+        | Commands::Diagram { .. }
+        | Commands::Deploy { .. }
+        | Commands::Reset { .. }
+        | Commands::Export { .. }
+        | Commands::Policies { .. }
+        | Commands::Diff { .. }
+        | Commands::Refresh { .. }
+        | Commands::Reconcile { .. } => true,
+
+        // Whole-design by design. A snapshot records the *design*, not one
+        // database: a scoped baseline would omit entities, and every later
+        // `dbd snapshot` would diff against an incomplete record and emit a
+        // spurious CREATE for them on every plane. Scope decides which
+        // migration steps *run* (see `deploy`), not which ones exist.
+        Commands::Snapshot { .. } | Commands::Release { .. } | Commands::Migrate { .. } => false,
+
+        // Nothing to scope: these do not read the entity set.
+        Commands::Doctor { .. }
+        | Commands::Init { .. }
+        | Commands::Merge { .. }
+        | Commands::Format { .. }
+        | Commands::Install { .. } => false,
+    }
+}
+
+/// Say so when `--scope` was passed to a command that ignores it.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
+    let Some(name) = scope else { return };
+    if command_honors_scope(command) {
+        return;
+    }
+    output::warn(&format!(
+        "--scope {name} ignored: this command operates on the whole design, not a scope"
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     command: &Commands,
@@ -27,6 +80,7 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    warn_if_scope_ignored(command, scope);
     match command {
         Commands::Inspect { name, fix, from_db } => {
             schema::cmd_inspect(
@@ -47,7 +101,17 @@ pub async fn run(
         Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity),
 
         Commands::Refresh { name } => {
-            schema::cmd_refresh(config, env, project_dir, database_url, name.as_deref(), verbosity).await
+            schema::cmd_refresh(
+                config,
+                env,
+                project_dir,
+                database_url,
+                name.as_deref(),
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Graph { name } => {
@@ -697,6 +761,32 @@ mod tests {
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("1 failed"), "failed policy count must be reported: {out}");
+    }
+
+    /// `--scope` is global, so a command that ignores it still accepts it.
+    /// These are the ones that legitimately operate on the whole design; the
+    /// warning is what stops `dbd release --scope daemon` reading as a scoped
+    /// release.
+    #[test]
+    fn snapshot_release_and_migrate_do_not_honor_scope() {
+        use crate::cli::Commands;
+        assert!(!command_honors_scope(&Commands::Release { name: None }));
+        assert!(!command_honors_scope(&Commands::Snapshot {
+            list: false,
+            name: None
+        }));
+        assert!(!command_honors_scope(&Commands::Migrate { status: true }));
+    }
+
+    /// `refresh` reads the entity set to find matviews, so it must filter:
+    /// refreshing a matview the scope excludes fails with "relation … does not
+    /// exist" on a plane that never built it.
+    #[test]
+    fn entity_selecting_commands_honor_scope() {
+        use crate::cli::Commands;
+        assert!(command_honors_scope(&Commands::Refresh { name: None }));
+        assert!(command_honors_scope(&Commands::Policies { dry_run: false }));
+        assert!(command_honors_scope(&Commands::Graph { name: None }));
     }
 
     /// A scoped deploy skips policies whose table is not in the plane. The

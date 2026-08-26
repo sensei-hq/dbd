@@ -151,9 +151,12 @@ Refresh materialized views now — `REFRESH MATERIALIZED VIEW [CONCURRENTLY]`, h
 dbd refresh                        # Refresh every materialized view
 dbd refresh -n analytics.daily_sales   # Refresh one matview
 dbd refresh -n analytics.*         # Refresh all matviews in the analytics schema
+dbd refresh --scope hub            # Only matviews the 'hub' scope builds
 ```
 
 Useful for the initial populate after a data load, or in CI — independent of the pg_cron schedule. Scheduled (recurring) refresh is managed in-database via pg_cron and configured under `materialized_views:` in design.yaml (see [design.yaml reference](03-design-yaml.md#materialized_views)). PostgreSQL/Supabase only.
+
+**`--scope` (honored from v0.12.0).** A matview the scope excludes was never built on that plane, so refreshing it failed with `schema "…" does not exist`. `refresh` now filters to the scope's working set like every other entity-selecting command, and announces the narrowing. Previously the flag was accepted and ignored.
 
 ---
 

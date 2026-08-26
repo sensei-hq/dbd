@@ -553,17 +553,27 @@ fn select_matviews<'a>(entities: &'a [Entity], name: Option<&str>) -> Vec<&'a En
 
 /// Refresh materialized views: `REFRESH MATERIALIZED VIEW [CONCURRENTLY] …`,
 /// honoring each view's resolved `concurrently` setting, in dependency order.
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_refresh(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
-    let selected = select_matviews(design.entities(), name);
+    // A matview the scope excludes does not exist on this plane, so refreshing
+    // it fails with `relation … does not exist` — an expected condition dressed
+    // as an error, the same failure the policy phase used to produce.
+    let resolved_scope = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let scoped = design.scoped_entities(&resolved_scope)?;
+    output::scope_filtered(&resolved_scope, scoped.len(), design.entities().len());
+
+    let selected = select_matviews(&scoped, name);
     if selected.is_empty() {
         output::info(verbosity, "No materialized views to refresh.");
         return Ok(());

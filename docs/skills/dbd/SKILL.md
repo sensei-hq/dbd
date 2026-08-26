@@ -53,7 +53,7 @@ the annotated schema.
 | `dbd snapshot` | Diff vs latest snapshot → migration SQL (smart multi-stage for renames/type changes) |
 | `dbd migrate --status` | Show migration status (read-only; `apply` runs them) |
 | `dbd import` / `export` | Load / dump table data (CSV/TSV/JSONL) via the `import/` & `export/` conventions. Env-scoped: `import/<env>/<schema>/<file>` loads only when `-e <env>` matches; `import/<schema>/<file>` loads always. Never skips silently — see the seed-data gotcha below |
-| `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
+| `dbd refresh` | `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` now (`-n <entity>`/`<schema>.*` for a subset). Scope-filtered — a matview the scope excludes was never built on that plane. Scheduled refresh is managed via pg_cron under `materialized_views:` in design.yaml |
 | `dbd dbml` / `graph` / `diagram` | DBML docs / dependency JSON / hosted interactive viewer |
 | `dbd policies` | Apply RLS from `policies/<schema>/<table>.sql` (idempotent, fail-forward). Honors `--scope`: a policy whose table the scope excludes is skipped and reported |
 | `dbd doctor [--fix]` | Audit/repair config + layout: old design.yaml, stale files, plural dirs (`--fix` migrates these). Also flags **misfiled view/matview DDL** (a `CREATE MATERIALIZED VIEW` under `ddl/view/`, or a plain view under `ddl/materialized_view/`) — reported with a move hint, **not** auto-fixed. Run it to verify layout before `reset`/`apply` |
@@ -61,9 +61,18 @@ the annotated schema.
 | `dbd format [--check]` | DDL formatter (river-style SELECT bodies; `--check` for pre-commit) |
 
 **Global scope flags** (honored by `inspect`/`apply`/`import`/`deploy`/`reconcile`
-and the filter-only `dbml`/`combine`/`graph`/`export`/`reset`):
+and the filter-only `dbml`/`combine`/`graph`/`export`/`reset`/`refresh`/`policies`/`diff`):
 `--scope <name>` selects a `scopes:` subset; `--deps report|include` overrides
 its gap policy. One design → many DBs: `dbd deploy --scope hub --database $HUB_URL`.
+
+**`snapshot`, `release` and `migrate` deliberately ignore `--scope`** and warn
+when given it (`⚠ --scope X ignored: this command operates on the whole
+design, not a scope`). A snapshot records the **design**, not one database: a
+scoped baseline would omit entities, and every later `dbd snapshot` would diff
+against an incomplete record and emit a spurious `CREATE` for them on every
+plane. Scope decides which migration steps *run*, not which ones exist — so
+`dbd deploy --scope daemon` on a released project applies only the in-scope
+migrations while the database's version still advances.
 
 **Scope guard**: the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on
 SQLite) records the scope a database was built with (nullable `scope` column; `NULL` =
