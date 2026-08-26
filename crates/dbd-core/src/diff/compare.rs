@@ -138,28 +138,24 @@ fn diff_columns(old: &[ColumnDef], new: &[ColumnDef]) -> Vec<FieldChange> {
 /// Stable key for a constraint: use name if present, else type+columns.
 fn constraint_key(c: &TableConstraint) -> String {
     match c {
-        TableConstraint::PrimaryKey { name, columns } => name
-            .clone()
-            .unwrap_or_else(|| format!("pk:{}", columns.join(","))),
-        TableConstraint::Unique { name, columns } => name
-            .clone()
-            .unwrap_or_else(|| format!("uq:{}", columns.join(","))),
+        TableConstraint::PrimaryKey { name, columns } => {
+            name.clone().unwrap_or_else(|| format!("pk:{}", columns.join(",")))
+        }
+        TableConstraint::Unique { name, columns } => {
+            name.clone().unwrap_or_else(|| format!("uq:{}", columns.join(",")))
+        }
         TableConstraint::ForeignKey(fk) => fk
             .name
             .clone()
             .unwrap_or_else(|| format!("fk:{}", fk.columns.join(","))),
-        TableConstraint::Check { name, expression } => name
-            .clone()
-            .unwrap_or_else(|| format!("ck:{expression}")),
+        TableConstraint::Check { name, expression } => name.clone().unwrap_or_else(|| format!("ck:{expression}")),
     }
 }
 
 /// Diff constraints by stable key: Add / Drop only (changed = Drop + Add).
 fn diff_constraints(old: &[TableConstraint], new: &[TableConstraint]) -> Vec<FieldChange> {
-    let old_map: HashMap<String, &TableConstraint> =
-        old.iter().map(|c| (constraint_key(c), c)).collect();
-    let new_map: HashMap<String, &TableConstraint> =
-        new.iter().map(|c| (constraint_key(c), c)).collect();
+    let old_map: HashMap<String, &TableConstraint> = old.iter().map(|c| (constraint_key(c), c)).collect();
+    let new_map: HashMap<String, &TableConstraint> = new.iter().map(|c| (constraint_key(c), c)).collect();
 
     let mut changes = Vec::new();
 
@@ -195,9 +191,7 @@ fn diff_constraints(old: &[TableConstraint], new: &[TableConstraint]) -> Vec<Fie
                     changes.push(FieldChange {
                         field_name: key.clone(),
                         field_type: FieldType::Constraint,
-                        action: ChangeAction::Add(Box::new(FieldDetail::Constraint(
-                            (*new_con).clone(),
-                        ))),
+                        action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*new_con).clone()))),
                     });
                 }
             }
@@ -253,9 +247,7 @@ fn diff_indexes(old: &[IndexDef], new: &[IndexDef]) -> Vec<FieldChange> {
                     changes.push(FieldChange {
                         field_name: key.clone(),
                         field_type: FieldType::Index,
-                        action: ChangeAction::Add(Box::new(FieldDetail::Index(
-                            (*new_idx).clone(),
-                        ))),
+                        action: ChangeAction::Add(Box::new(FieldDetail::Index((*new_idx).clone()))),
                     });
                 }
             }
@@ -277,10 +269,8 @@ fn diff_enums(old: &[EnumSnapshot], new: &[EnumSnapshot]) -> Vec<MigrationDiff> 
 
 /// Diff enum values between two versions of the same enum.
 fn diff_enum_values(old: &EnumSnapshot, new: &EnumSnapshot) -> Vec<FieldChange> {
-    let old_set: std::collections::HashSet<&str> =
-        old.values.iter().map(|v| v.as_str()).collect();
-    let new_set: std::collections::HashSet<&str> =
-        new.values.iter().map(|v| v.as_str()).collect();
+    let old_set: std::collections::HashSet<&str> = old.values.iter().map(|v| v.as_str()).collect();
+    let new_set: std::collections::HashSet<&str> = new.values.iter().map(|v| v.as_str()).collect();
 
     let mut changes = Vec::new();
 

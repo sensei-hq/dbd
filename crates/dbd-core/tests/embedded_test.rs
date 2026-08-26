@@ -19,8 +19,7 @@ use postgresql_embedded::{PostgreSQL, Settings};
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/embedded")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/embedded")
 }
 
 /// Start an embedded PostgreSQL instance and return it with a connection URL.
@@ -33,9 +32,7 @@ async fn start_pg() -> (PostgreSQL, String) {
     let mut pg = PostgreSQL::new(settings);
     pg.setup().await.expect("embedded postgres setup failed");
     pg.start().await.expect("embedded postgres start failed");
-    pg.create_database("testdb")
-        .await
-        .expect("failed to create testdb");
+    pg.create_database("testdb").await.expect("failed to create testdb");
     let url = pg.settings().url("testdb");
     (pg, url)
 }
@@ -43,20 +40,14 @@ async fn start_pg() -> (PostgreSQL, String) {
 /// Load the embedded fixture design.
 fn load_design() -> Design {
     let config = fixture_dir().join("design.yaml");
-    Design::from_config_with_dir(&config, "dev", Some(&fixture_dir()))
-        .expect("failed to load embedded fixture design")
+    Design::from_config_with_dir(&config, "dev", Some(&fixture_dir())).expect("failed to load embedded fixture design")
 }
 
 /// Run a catalog existence assertion via an anonymous `DO` block. Raises (and
 /// so fails the test) when `predicate` matches in the wrong direction:
 /// `should_exist == true` fails when it finds nothing, `false` fails when it
 /// finds something. `subject` is the human label, e.g. "table config.lookups".
-async fn assert_catalog(
-    adapter: &dyn dbd_core::DatabaseAdapter,
-    should_exist: bool,
-    predicate: &str,
-    subject: &str,
-) {
+async fn assert_catalog(adapter: &dyn dbd_core::DatabaseAdapter, should_exist: bool, predicate: &str, subject: &str) {
     let (guard, verb) = if should_exist {
         ("NOT EXISTS", "does not exist")
     } else {
@@ -88,12 +79,24 @@ fn column_predicate(schema: &str, table: &str, column: &str) -> String {
 
 /// Assert that a table exists; panics with a clear message if it doesn't.
 async fn assert_table_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str) {
-    assert_catalog(adapter, true, &table_predicate(schema, table), &format!("table {schema}.{table}")).await;
+    assert_catalog(
+        adapter,
+        true,
+        &table_predicate(schema, table),
+        &format!("table {schema}.{table}"),
+    )
+    .await;
 }
 
 /// Assert that a table does NOT exist; panics if it does.
 async fn assert_table_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str) {
-    assert_catalog(adapter, false, &table_predicate(schema, table), &format!("table {schema}.{table}")).await;
+    assert_catalog(
+        adapter,
+        false,
+        &table_predicate(schema, table),
+        &format!("table {schema}.{table}"),
+    )
+    .await;
 }
 
 /// Assert that a schema exists; panics if it doesn't.
@@ -109,23 +112,13 @@ async fn assert_schema_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &
 }
 
 /// Assert that a column exists on a table; panics if it doesn't.
-async fn assert_column_exists(
-    adapter: &dyn dbd_core::DatabaseAdapter,
-    schema: &str,
-    table: &str,
-    column: &str,
-) {
+async fn assert_column_exists(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str, column: &str) {
     let pred = column_predicate(schema, table, column);
     assert_catalog(adapter, true, &pred, &format!("column {schema}.{table}.{column}")).await;
 }
 
 /// Assert that a column does NOT exist on a table; panics if it does.
-async fn assert_column_absent(
-    adapter: &dyn dbd_core::DatabaseAdapter,
-    schema: &str,
-    table: &str,
-    column: &str,
-) {
+async fn assert_column_absent(adapter: &dyn dbd_core::DatabaseAdapter, schema: &str, table: &str, column: &str) {
     let pred = column_predicate(schema, table, column);
     assert_catalog(adapter, false, &pred, &format!("column {schema}.{table}.{column}")).await;
 }
@@ -147,11 +140,7 @@ async fn fresh_deploy_creates_schema() {
         .expect("deploy failed");
 
     let s = summary.unwrap();
-    assert_eq!(
-        s.apply.strategy,
-        ApplyStrategy::Fresh,
-        "first deploy should be Fresh"
-    );
+    assert_eq!(s.apply.strategy, ApplyStrategy::Fresh, "first deploy should be Fresh");
     assert!(s.apply.applied > 0, "should have applied entities");
     assert_eq!(s.apply.from_version, 0, "db starts at v0");
     assert_eq!(s.apply.to_version, 2, "design is at v2");
@@ -205,9 +194,7 @@ async fn deployed_tables_accept_data() {
         .expect("deploy failed");
 
     adapter
-        .execute_script(
-            "INSERT INTO app.items (name, quantity) VALUES ('widget', 10)",
-        )
+        .execute_script("INSERT INTO app.items (name, quantity) VALUES ('widget', 10)")
         .await
         .expect("insert into items failed");
 
@@ -252,10 +239,7 @@ async fn import_data_honors_null_value_sentinel() {
     entity.file = Some(path);
     entity.format = Some("csv".to_string());
 
-    adapter
-        .import_data(&entity, "\\N", false)
-        .await
-        .expect("import failed");
+    adapter.import_data(&entity, "\\N", false).await.expect("import failed");
 
     assert_catalog(
         &*adapter,
@@ -330,16 +314,22 @@ async fn migration_upgrades_schema() {
     )
     .unwrap();
 
-    let v1_design = Design::from_config_with_dir(
-        &v1_dir.join("design.yaml"),
-        "dev",
-        Some(v1_dir),
-    )
-    .expect("failed to load v1 design");
+    let v1_design = Design::from_config_with_dir(&v1_dir.join("design.yaml"), "dev", Some(v1_dir))
+        .expect("failed to load v1 design");
 
     let mut v1_summary = None;
     v1_design
-        .apply(&*adapter, None, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| v1_summary = Some(s) })
+        .apply(
+            &*adapter,
+            None,
+            false,
+            None,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| v1_summary = Some(s),
+            },
+        )
         .await
         .expect("v1 apply failed");
 
@@ -353,16 +343,22 @@ async fn migration_upgrades_schema() {
     let v2_design = load_design();
     let mut v2_summary = None;
     v2_design
-        .apply(&*adapter, None, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| v2_summary = Some(s) })
+        .apply(
+            &*adapter,
+            None,
+            false,
+            None,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| v2_summary = Some(s),
+            },
+        )
         .await
         .expect("v2 apply failed");
 
     let v2 = v2_summary.unwrap();
-    assert_eq!(
-        v2.strategy,
-        ApplyStrategy::Migrate,
-        "should use Migrate strategy"
-    );
+    assert_eq!(v2.strategy, ApplyStrategy::Migrate, "should use Migrate strategy");
     assert_eq!(v2.from_version, 1);
     assert_eq!(v2.to_version, 2);
     assert_eq!(v2.migrated, 1, "one entity migrated (items)");
@@ -382,6 +378,8 @@ async fn introspect_returns_fixture_entities() {
         CREATE SCHEMA revtest;
 
         CREATE TYPE revtest.color AS ENUM ('red', 'green');
+
+        CREATE TYPE revtest.empty_color AS ENUM ();
 
         CREATE TABLE revtest.owner (
             id uuid PRIMARY KEY DEFAULT gen_random_uuid()
@@ -412,23 +410,43 @@ async fn introspect_returns_fixture_entities() {
     let entities = adapter.introspect().await.expect("introspect failed");
 
     // ── Assert: schema revtest present ───────────────────────────────────────
-    let has_revtest_schema = entities.iter().any(|e| {
-        e.entity_type == dbd_core::EntityType::Schema && e.name == "revtest"
-    });
+    let has_revtest_schema = entities
+        .iter()
+        .any(|e| e.entity_type == dbd_core::EntityType::Schema && e.name == "revtest");
     assert!(has_revtest_schema, "schema 'revtest' not found in introspect output");
 
     // ── Assert: enum revtest.color present with values [red, green] ──────────
-    let color_enum = entities.iter().find(|e| {
-        e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.color"
-    });
+    let color_enum = entities
+        .iter()
+        .find(|e| e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.color");
     let color_enum = color_enum.expect("enum 'revtest.color' not found in introspect output");
     let enum_value_names: Vec<&str> = color_enum.enum_values.iter().map(|v| v.name.as_str()).collect();
-    assert_eq!(enum_value_names, vec!["red", "green"], "enum values should be [red, green]");
+    assert_eq!(
+        enum_value_names,
+        vec!["red", "green"],
+        "enum values should be [red, green]"
+    );
+
+    // ── Assert: label-less enum revtest.empty_color still introspects ─────────
+    // `CREATE TYPE e AS ENUM ()` is valid Postgres and creates a real type with
+    // zero pg_enum rows. introspect_enums used to INNER JOIN pg_enum, which made
+    // such a type invisible here — reconcile then saw it as permanently missing
+    // and recreated it on every run, never converging. It must be found, with
+    // an empty (not absent) values list.
+    let empty_enum = entities
+        .iter()
+        .find(|e| e.entity_type == dbd_core::EntityType::Enum && e.name == "revtest.empty_color");
+    let empty_enum = empty_enum.expect("label-less enum 'revtest.empty_color' not found in introspect output");
+    assert!(
+        empty_enum.enum_values.is_empty(),
+        "empty_color should introspect with zero values, got: {:?}",
+        empty_enum.enum_values
+    );
 
     // ── Assert: table revtest.widget present ──────────────────────────────────
-    let widget = entities.iter().find(|e| {
-        e.entity_type == dbd_core::EntityType::Table && e.name == "revtest.widget"
-    });
+    let widget = entities
+        .iter()
+        .find(|e| e.entity_type == dbd_core::EntityType::Table && e.name == "revtest.widget");
     let widget = widget.expect("table 'revtest.widget' not found in introspect output");
     let td = widget.table_def.as_ref().expect("widget should have a table_def");
 
@@ -470,7 +488,11 @@ async fn introspect_returns_fixture_entities() {
     });
     let fk = fk.expect("widget should have a FOREIGN KEY constraint");
     assert_eq!(fk.ref_table, "owner", "FK should reference 'owner'");
-    assert_eq!(fk.ref_schema.as_deref(), Some("revtest"), "FK ref_schema should be 'revtest'");
+    assert_eq!(
+        fk.ref_schema.as_deref(),
+        Some("revtest"),
+        "FK ref_schema should be 'revtest'"
+    );
     assert_eq!(
         fk.on_delete,
         Some(dbd_core::entity::FkAction::Cascade),
@@ -486,7 +508,10 @@ async fn introspect_returns_fixture_entities() {
     assert!(unique_cols.contains(&"name".to_string()), "UNIQUE should be on 'name'");
 
     // Non-constraint index widget_owner_idx (plain column — must be captured)
-    let idx = td.indexes.iter().find(|i| i.name.as_deref() == Some("widget_owner_idx"));
+    let idx = td
+        .indexes
+        .iter()
+        .find(|i| i.name.as_deref() == Some("widget_owner_idx"));
     assert!(idx.is_some(), "index 'widget_owner_idx' should be present");
 
     // GIN index widget_tags_idx — access method must be captured (a GIN index on a
@@ -533,9 +558,9 @@ async fn introspect_returns_fixture_entities() {
     );
 
     // ── Assert: view revtest.active present with SELECT body ──────────────────
-    let view = entities.iter().find(|e| {
-        e.entity_type == dbd_core::EntityType::View && e.name == "revtest.active"
-    });
+    let view = entities
+        .iter()
+        .find(|e| e.entity_type == dbd_core::EntityType::View && e.name == "revtest.active");
     let view = view.expect("view 'revtest.active' not found in introspect output");
     let body = view.writes.first().expect("view should have a body in writes[0]");
     assert!(
@@ -579,10 +604,7 @@ async fn introspect_captures_materialized_views() {
     );
 
     // Body carried in writes[0] (same contract as views); contains the SELECT.
-    let body = mv
-        .writes
-        .first()
-        .expect("matview should carry its body in writes[0]");
+    let body = mv.writes.first().expect("matview should carry its body in writes[0]");
     assert!(
         body.to_lowercase().contains("select"),
         "matview body should contain SELECT (case-insensitive), got: {body}"
@@ -701,7 +723,11 @@ async fn emitted_index_ddl_applies_to_postgres() {
             // method (and its position after `ON table`) must be correct.
             IndexDef {
                 name: Some("doc_tags_gin".into()),
-                columns: vec![IndexColumn { name: "tags".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "tags".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: false,
                 index_type: Some(IndexType::Gin),
                 ..Default::default()
@@ -709,7 +735,11 @@ async fn emitted_index_ddl_applies_to_postgres() {
             // HASH index on a plain column.
             IndexDef {
                 name: Some("doc_title_hash".into()),
-                columns: vec![IndexColumn { name: "title".into(), order: None, ..Default::default() }],
+                columns: vec![IndexColumn {
+                    name: "title".into(),
+                    order: None,
+                    ..Default::default()
+                }],
                 unique: false,
                 index_type: Some(IndexType::Hash),
                 ..Default::default()
@@ -832,11 +862,17 @@ async fn index_definitions_round_trip_through_postgres() {
     let echo = indexes_of(&*adapter, "echo").await;
     for (name, before) in &origin {
         let echoed_name = format!("{name}_echo");
-        let after = echo
-            .get(&echoed_name)
-            .unwrap_or_else(|| panic!("{echoed_name} missing after replay; got {:?}", echo.keys().collect::<Vec<_>>()));
+        let after = echo.get(&echoed_name).unwrap_or_else(|| {
+            panic!(
+                "{echoed_name} missing after replay; got {:?}",
+                echo.keys().collect::<Vec<_>>()
+            )
+        });
         // Compare everything but the (deliberately changed) name.
-        let expected = dbd_core::entity::IndexDef { name: after.name.clone(), ..before.clone() };
+        let expected = dbd_core::entity::IndexDef {
+            name: after.name.clone(),
+            ..before.clone()
+        };
         assert_eq!(
             &expected, after,
             "index {name} did not survive the emit/apply/introspect round trip"
@@ -914,10 +950,7 @@ async fn introspect_captures_functions_and_procedures() {
     );
 
     // ── overloaded function: ONE entity with TWO writes ──────────────────────
-    let greet_entities: Vec<_> = entities
-        .iter()
-        .filter(|e| e.name == "revfunc.greet")
-        .collect();
+    let greet_entities: Vec<_> = entities.iter().filter(|e| e.name == "revfunc.greet").collect();
     assert_eq!(
         greet_entities.len(),
         1,
@@ -938,18 +971,15 @@ async fn introspect_captures_functions_and_procedures() {
     );
     // Both signatures present across the two bodies.
     let joined = greet.writes.join("\n");
-    assert!(joined.contains("name text") , "first overload signature missing");
+    assert!(joined.contains("name text"), "first overload signature missing");
     assert!(joined.contains("loud boolean"), "second overload signature missing");
 
     // ── extension-provided functions must be EXCLUDED ────────────────────────
     // `tablefunc` installs regular functions (crosstab/connectby/normal_rand)
     // owned by the extension (pg_depend deptype 'e'); they must be filtered out.
     let has_ext_fn = entities.iter().any(|e| {
-        (e.entity_type == dbd_core::EntityType::Function
-            || e.entity_type == dbd_core::EntityType::Procedure)
-            && (e.name.contains("crosstab")
-                || e.name.contains("connectby")
-                || e.name.contains("normal_rand"))
+        (e.entity_type == dbd_core::EntityType::Function || e.entity_type == dbd_core::EntityType::Procedure)
+            && (e.name.contains("crosstab") || e.name.contains("connectby") || e.name.contains("normal_rand"))
     });
     assert!(
         !has_ext_fn,
@@ -1019,10 +1049,7 @@ async fn introspect_roles_captures_project_roles_and_memberships() {
         .await
         .expect("failed to create roles");
 
-    let roles = adapter
-        .introspect_roles()
-        .await
-        .expect("introspect_roles failed");
+    let roles = adapter.introspect_roles().await.expect("introspect_roles failed");
 
     // app_admin and app_ro captured as Role entities.
     let app_admin = roles
@@ -1236,7 +1263,10 @@ async fn introspect_captures_sequences_and_serial_identity() {
         .iter()
         .find(|c| c.name == "id")
         .expect("column 'id' not found");
-    assert_eq!(id_col.data_type, "bigserial", "bigserial PK should map to data_type bigserial");
+    assert_eq!(
+        id_col.data_type, "bigserial",
+        "bigserial PK should map to data_type bigserial"
+    );
     assert!(
         id_col.default_value.is_none(),
         "serial column must drop its owned-sequence default, got {:?}",
@@ -1257,7 +1287,11 @@ async fn introspect_captures_sequences_and_serial_identity() {
         .iter()
         .find(|c| c.name == "n")
         .expect("column 'n' not found");
-    assert_eq!(n_col.identity, Some(IdentityKind::Always), "n should be GENERATED ALWAYS AS IDENTITY");
+    assert_eq!(
+        n_col.identity,
+        Some(IdentityKind::Always),
+        "n should be GENERATED ALWAYS AS IDENTITY"
+    );
     assert!(
         n_col.default_value.is_none(),
         "identity column must carry no default, got {:?}",
@@ -1279,7 +1313,10 @@ async fn introspect_captures_sequences_and_serial_identity() {
         .expect("column 'c' not found");
     assert_ne!(c_col.data_type, "serial", "standalone-referencing column is not serial");
     assert!(
-        c_col.default_value.as_deref().is_some_and(|d| d.contains("nextval(") && d.contains("counter")),
+        c_col
+            .default_value
+            .as_deref()
+            .is_some_and(|d| d.contains("nextval(") && d.contains("counter")),
         "standalone-referencing column must keep its nextval('app.counter') default, got {:?}",
         c_col.default_value
     );
@@ -1439,10 +1476,7 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     let write_items = |body: &str| {
         std::fs::write(dir.join("ddl/table/app/items.ddl"), body).unwrap();
     };
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-            .expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     write_design(1);
 
@@ -1473,7 +1507,18 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     );
     let mut summary = None;
     load()
-        .reconcile(&*adapter, false, false, false, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| summary = Some(s) })
+        .reconcile(
+            &*adapter,
+            false,
+            false,
+            false,
+            None,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            },
+        )
         .await
         .expect("reconcile phase 2 failed");
     assert_column_exists(&*adapter, "app", "items", "qty").await;
@@ -1532,7 +1577,18 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     // With prune: the orphan is dropped.
     let mut prune_summary = None;
     load()
-        .reconcile(&*adapter, false, false, true, None, Progress { on_start: |_: &str| {}, on_done: |_: &str, _: Option<&str>| {}, on_complete: |s| prune_summary = Some(s) })
+        .reconcile(
+            &*adapter,
+            false,
+            false,
+            true,
+            None,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| prune_summary = Some(s),
+            },
+        )
         .await
         .expect("reconcile with prune failed");
     assert_eq!(prune_summary.unwrap().dropped, 1, "one table pruned");
@@ -1575,10 +1631,7 @@ async fn reconcile_warns_on_matview_definition_change() {
         )
         .unwrap();
     };
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-            .expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
     // Persist the current matview oid in a table (survives across pooled
     // connections) so a later DO block can compare against it. A drop+recreate
     // changes the oid; an untouched matview keeps it.
@@ -1614,7 +1667,11 @@ async fn reconcile_warns_on_matview_definition_change() {
         .await
         .expect("reconcile phase 1 (create matview) failed");
     assert_table_exists(&*adapter, "app", "items").await;
-    assert!(plan.warnings.is_empty(), "create must not warn; got {:?}", plan.warnings);
+    assert!(
+        plan.warnings.is_empty(),
+        "create must not warn; got {:?}",
+        plan.warnings
+    );
     adapter
         .execute_script(
             "DO $$ BEGIN \
@@ -1631,8 +1688,16 @@ async fn reconcile_warns_on_matview_definition_change() {
         .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 2 (no-change) failed");
-    assert!(plan.warnings.is_empty(), "unchanged matview must not warn; got {:?}", plan.warnings);
-    assert_oid_unchanged(&*adapter, "matview app.mv oid changed but an unchanged design must not touch it").await;
+    assert!(
+        plan.warnings.is_empty(),
+        "unchanged matview must not warn; got {:?}",
+        plan.warnings
+    );
+    assert_oid_unchanged(
+        &*adapter,
+        "matview app.mv oid changed but an unchanged design must not touch it",
+    )
+    .await;
 
     // ── Phase 3: change the definition → WARN, matview left untouched (oid same). ──
     stash_oid(&*adapter).await;
@@ -1641,9 +1706,15 @@ async fn reconcile_warns_on_matview_definition_change() {
         .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
         .expect("reconcile phase 3 (drift) failed");
-    assert_oid_unchanged(&*adapter, "matview app.mv was recreated on drift but dbd must only warn").await;
+    assert_oid_unchanged(
+        &*adapter,
+        "matview app.mv was recreated on drift but dbd must only warn",
+    )
+    .await;
     assert!(
-        plan.warnings.iter().any(|w| w.contains("app.mv") && w.contains("differs")),
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.mv") && w.contains("differs")),
         "a drifted matview must produce a warning; got {:?}",
         plan.warnings
     );
@@ -1682,9 +1753,7 @@ async fn reconcile_dry_run_previews_matview_create_without_writing() {
         "create materialized view app.mv as select id from app.items with data;\n",
     )
     .unwrap();
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // ── Dry-run: the plan PREVIEWS the matview create, but writes nothing. ──
     let plan = load()
@@ -1763,9 +1832,7 @@ async fn diff_live_reports_matview_drift_read_only() {
         )
         .unwrap();
     };
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // ── Setup: reconcile creates + stamps app.mv (and its source table). ──
     write_mv("select id from app.items");
@@ -1810,13 +1877,32 @@ async fn diff_live_reports_matview_drift_read_only() {
     let d = load().diff_live(&*adapter, None).await.expect("diff (drift) failed");
 
     let kind_of = |name: &str| d.matview_drift.iter().find(|m| m.name == name).map(|m| m.kind);
-    assert_eq!(kind_of("app.mv"), Some(MatviewDriftKind::Drifted), "got {:?}", d.matview_drift);
-    assert_eq!(kind_of("app.mv2"), Some(MatviewDriftKind::Missing), "got {:?}", d.matview_drift);
-    assert_eq!(kind_of("app.orphan"), Some(MatviewDriftKind::Orphan), "got {:?}", d.matview_drift);
+    assert_eq!(
+        kind_of("app.mv"),
+        Some(MatviewDriftKind::Drifted),
+        "got {:?}",
+        d.matview_drift
+    );
+    assert_eq!(
+        kind_of("app.mv2"),
+        Some(MatviewDriftKind::Missing),
+        "got {:?}",
+        d.matview_drift
+    );
+    assert_eq!(
+        kind_of("app.orphan"),
+        Some(MatviewDriftKind::Orphan),
+        "got {:?}",
+        d.matview_drift
+    );
     assert!(!d.is_empty(), "matview drift must make the diff non-empty");
     // Deterministic (name-sorted) order.
     let names: Vec<&str> = d.matview_drift.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, vec!["app.mv", "app.mv2", "app.orphan"], "matview drift must be name-sorted");
+    assert_eq!(
+        names,
+        vec!["app.mv", "app.mv2", "app.orphan"],
+        "matview drift must be name-sorted"
+    );
 
     // ── Read-only proof: diff wrote nothing. ──
     // The drifted matview was NOT recreated (oid unchanged).
@@ -1882,8 +1968,7 @@ async fn matview_ddl_reapply_is_idempotent() {
     )
     .unwrap();
 
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // Prerequisites: the schema and the table the matview selects from.
     adapter
@@ -1904,10 +1989,7 @@ async fn matview_ddl_reapply_is_idempotent() {
         .expect("matview entity discovered");
 
     // First apply CREATEs the matview + its unique index.
-    adapter
-        .apply_entity(mv)
-        .await
-        .expect("first matview apply failed");
+    adapter.apply_entity(mv).await.expect("first matview apply failed");
     // Second apply re-runs the SAME DDL — must be a clean no-op, not 42P07.
     adapter
         .apply_entity(mv)
@@ -1965,10 +2047,7 @@ async fn apply_stamps_matview_so_later_reconcile_does_not_warn() {
     )
     .unwrap();
 
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-            .expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // ── apply the whole design (creates the matview + stamps the sentinel). ──
     load()
@@ -2043,10 +2122,7 @@ async fn apply_does_not_restamp_pre_existing_matview() {
         )
         .unwrap();
     };
-    let load = || {
-        Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-            .expect("load design")
-    };
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // ── First apply: create + stamp the v1 hash. ──
     write_mv("select id from app.items");
@@ -2092,7 +2168,9 @@ async fn apply_does_not_restamp_pre_existing_matview() {
         .await
         .expect("reconcile failed");
     assert!(
-        plan.warnings.iter().any(|w| w.contains("app.mv") && w.contains("differs")),
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.mv") && w.contains("differs")),
         "drift on a pre-existing matview must still warn; got {:?}",
         plan.warnings
     );
@@ -2120,8 +2198,7 @@ async fn reconcile_dry_run_is_read_only() {
     )
     .unwrap();
 
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
     let plan = design
         .reconcile(&*adapter, true, false, false, None, Progress::none())
         .await
@@ -2153,11 +2230,13 @@ async fn diff_live_reports_drift_and_writes_nothing() {
     )
     .unwrap();
 
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
     let diff = design.diff_live(&*adapter, None).await.expect("diff_live failed");
 
-    assert!(!diff.is_empty(), "a design table absent from the live DB must show drift");
+    assert!(
+        !diff.is_empty(),
+        "a design table absent from the live DB must show drift"
+    );
     assert!(
         diff.changes.iter().any(|c| c.entity_name == "app.items"),
         "drift should name the missing table, got {:?}",
@@ -2176,8 +2255,8 @@ async fn diff_live_reports_drift_and_writes_nothing() {
 /// match nor the drift was ever computed.
 #[tokio::test]
 async fn diff_live_sees_foreign_keys_with_real_introspection() {
-    use dbd_core::diff::{DiffAction, FieldType};
     use dbd_core::SchemaDiff;
+    use dbd_core::diff::{DiffAction, FieldType};
 
     /// Whether the diff reports any constraint-level change on `table`.
     fn constraint_change_on(d: &SchemaDiff, table: &str) -> bool {
@@ -2216,8 +2295,7 @@ async fn diff_live_sees_foreign_keys_with_real_introspection() {
     )
     .unwrap();
 
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     // Apply the design → the live DB now has the FK (named children_parent_id_fkey).
     design
@@ -2278,8 +2356,7 @@ async fn reconcile_converges_foreign_keys() {
          );\n",
     )
     .unwrap();
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     let fk_pred = "SELECT 1 FROM pg_constraint c \
          JOIN pg_class cls ON cls.oid = c.conrelid \
@@ -2339,14 +2416,16 @@ async fn reconcile_converges_foreign_keys() {
          create table if not exists children (id uuid primary key, parent_id uuid);\n",
     )
     .unwrap();
-    let design2 = Design::from_config_with_dir(&dir2.join("design.yaml"), "dev", Some(dir2))
-        .expect("load design2");
+    let design2 = Design::from_config_with_dir(&dir2.join("design.yaml"), "dev", Some(dir2)).expect("load design2");
 
     // Without --allow-destructive → refused, FK untouched.
     let refused = design2
         .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await;
-    assert!(refused.is_err(), "dropping an FK without --allow-destructive must be refused");
+    assert!(
+        refused.is_err(),
+        "dropping an FK without --allow-destructive must be refused"
+    );
     assert_catalog(&*adapter, true, fk_pred, "FK on app.children").await;
 
     // With --allow-destructive → the FK is dropped.
@@ -2403,8 +2482,7 @@ async fn reconcile_converges_comments_and_keyword_defaults() {
          comment on column docs.body is 'The document''s body';\n",
     )
     .unwrap();
-    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
-        .expect("load design");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
 
     design
         .apply(&*adapter, None, false, None, Progress::none())
@@ -2412,10 +2490,7 @@ async fn reconcile_converges_comments_and_keyword_defaults() {
         .expect("apply failed");
 
     /// The reconcile plan's ALTER SQL, or an empty vec when it is in sync.
-    async fn plan_sql(
-        design: &Design,
-        adapter: &dyn dbd_core::DatabaseAdapter,
-    ) -> Vec<String> {
+    async fn plan_sql(design: &Design, adapter: &dyn dbd_core::DatabaseAdapter) -> Vec<String> {
         design
             .reconcile(adapter, true, true, false, None, Progress::none())
             .await
@@ -2446,7 +2521,12 @@ async fn reconcile_converges_comments_and_keyword_defaults() {
                 .into_iter()
                 .find(|e| e.name == "app.docs")
                 .and_then(|e| e.table_def)
-                .and_then(|td| td.columns.iter().find(|c| c.name == col).and_then(|c| c.comment.clone()))
+                .and_then(|td| {
+                    td.columns
+                        .iter()
+                        .find(|c| c.name == col)
+                        .and_then(|c| c.comment.clone())
+                })
         }
     };
     assert_eq!(comment_of("body").await.as_deref(), Some("The document's body"));
@@ -2552,11 +2632,7 @@ async fn batch_failure_mid_plan_rolls_back_prior_ddl() {
 // ── Bookkeeping lives in the `dbd` schema; heal folds legacy `_dbd_*` copies ───
 
 /// Assert `dbd.meta.version` for `project` equals `expected`.
-async fn assert_dbd_meta_version(
-    adapter: &dyn dbd_core::DatabaseAdapter,
-    project: &str,
-    expected: i32,
-) {
+async fn assert_dbd_meta_version(adapter: &dyn dbd_core::DatabaseAdapter, project: &str, expected: i32) {
     let sql = format!(
         "DO $$ DECLARE v integer; BEGIN \
            SELECT version INTO v FROM dbd.meta WHERE project = '{project}'; \
@@ -2699,13 +2775,16 @@ async fn heal_folds_legacy_public_meta_into_dbd() {
 async fn heal_folds_legacy_meta_without_scope_column() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "nolscope").await.unwrap();
-    adapter.execute_script(
-        "CREATE TABLE public._dbd_meta ( \
+    adapter
+        .execute_script(
+            "CREATE TABLE public._dbd_meta ( \
             project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
             version integer NOT NULL DEFAULT 0, \
             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
-         INSERT INTO public._dbd_meta (project, env, version) VALUES ('nolscope','prod',4);"
-    ).await.unwrap();
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('nolscope','prod',4);",
+        )
+        .await
+        .unwrap();
     adapter.heal_bookkeeping().await.unwrap();
     let m = adapter.get_project_meta().await.unwrap().unwrap();
     assert_eq!(m.version, 4);
@@ -2719,8 +2798,9 @@ async fn heal_folds_multiple_stray_copies_public_wins() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "p").await.unwrap();
     // public (canonical) v1 + stray dojo v2 for the same project.
-    adapter.execute_script(
-        "CREATE SCHEMA dojo; \
+    adapter
+        .execute_script(
+            "CREATE SCHEMA dojo; \
          CREATE TABLE public._dbd_meta (project varchar PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
             version integer NOT NULL DEFAULT 0, scope varchar, \
             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()); \
@@ -2731,8 +2811,10 @@ async fn heal_folds_multiple_stray_copies_public_wins() {
             description text, checksum text, PRIMARY KEY (project, version)); \
          CREATE TABLE dojo._dbd_migrations (LIKE public._dbd_migrations INCLUDING ALL); \
          INSERT INTO public._dbd_migrations (project, version) VALUES ('p',1); \
-         INSERT INTO dojo._dbd_migrations   (project, version) VALUES ('p',2);"
-    ).await.unwrap();
+         INSERT INTO dojo._dbd_migrations   (project, version) VALUES ('p',2);",
+        )
+        .await
+        .unwrap();
 
     adapter.heal_bookkeeping().await.unwrap();
 
@@ -2771,13 +2853,16 @@ async fn get_db_version_reads_legacy_without_healing() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "statusonly").await.unwrap();
     // Legacy public._dbd_meta at v5 — a read (as migrate --status does) must NOT relocate/drop it.
-    adapter.execute_script(
-        "CREATE TABLE public._dbd_meta ( \
+    adapter
+        .execute_script(
+            "CREATE TABLE public._dbd_meta ( \
             project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
             version integer NOT NULL DEFAULT 0, scope varchar, \
             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
-         INSERT INTO public._dbd_meta (project, env, version) VALUES ('statusonly','prod',5);"
-    ).await.unwrap();
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('statusonly','prod',5);",
+        )
+        .await
+        .unwrap();
     // The read returns the legacy version via the both-names path...
     assert_eq!(adapter.get_db_version().await.unwrap(), 5);
     // ...and does NOT heal: legacy table still present, dbd.meta NOT created.

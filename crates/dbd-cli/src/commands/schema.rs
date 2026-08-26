@@ -45,7 +45,13 @@ pub async fn cmd_inspect(
 
     report_scope_gaps(&resolved, &report, verbosity)?;
 
-    let total_entities = design.entities().len();
+    // Count what this run is actually about. Under a scope the whole-project
+    // total contradicts the "scope 'X': N entities" line printed just above.
+    let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
+    let total_entities = match scope_name {
+        Some(_) => resolved.entities.len(),
+        None => design.entities().len(),
+    };
 
     if verbosity.is_verbose()
         && let Some(entity) = &report.entity
@@ -53,7 +59,7 @@ pub async fn cmd_inspect(
         output::always(&serde_json::to_string_pretty(entity)?);
     }
 
-    print_report_findings(&report, verbosity);
+    print_report_findings(&report, scope_name, verbosity);
 
     // Auto-format DDL files when --fix is passed
     if fix {
@@ -79,19 +85,27 @@ pub async fn cmd_inspect(
     );
     print_matview_errors(&matview_errors);
 
-    output::summary(
-        report.issues.len() + todos.len() + matview_errors.len(),
-        report.warnings.len(),
-        total_entities,
-    );
+    let blocking = report.issues.len() + todos.len() + matview_errors.len();
+    output::summary(blocking, report.warnings.len(), total_entities);
+    if !report.out_of_scope_issues.is_empty() {
+        output::always(&format!(
+            "({} error(s) outside scope '{}')",
+            report.out_of_scope_issues.len(),
+            scope_name.unwrap_or("all"),
+        ));
+    }
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(
-        design.entities(),
-        &design.config().source.dialect,
-    );
+    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
     print_enum_hints(&enum_hints);
+
+    // Report first, then fail. The findings above are the useful output; an
+    // early return would print an "Error:" line instead of them.
+    let code = inspect_exit_code(blocking);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -111,7 +125,10 @@ async fn resolve_inspect_refs(
             .await
             .context("Failed to resolve references against database catalog")?;
         if dropped > 0 {
-            output::detail(verbosity, &format!("  resolved {dropped} reference(s) against database catalog"));
+            output::detail(
+                verbosity,
+                &format!("  resolved {dropped} reference(s) against database catalog"),
+            );
         }
 
         // Persist a project-local snapshot for offline use on subsequent runs.
@@ -148,7 +165,10 @@ fn report_scope_gaps(
         return Ok(());
     }
 
-    output::info(verbosity, &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()));
+    output::info(
+        verbosity,
+        &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()),
+    );
     for gap in &report.gaps {
         output::always(&format!(
             "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
@@ -167,27 +187,54 @@ fn report_scope_gaps(
             resolved.name
         ),
         dbd_core::config::DepsPolicy::Include => {
-            output::info(verbosity, &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()));
+            output::info(
+                verbosity,
+                &format!("{} gap(s) will be auto-included (--deps include)", report.gaps.len()),
+            );
         }
     }
     Ok(())
 }
 
 /// Print entity errors and warnings, or an all-clear message when there's neither.
-fn print_report_findings(report: &dbd_core::design::Report, verbosity: Verbosity) {
-    if !report.issues.is_empty() {
-        output::always("Errors:");
-        for entity in &report.issues {
-            let label = entity
-                .file
-                .as_ref()
-                .map(|f| f.display().to_string())
-                .unwrap_or_else(|| entity.name.clone());
-            output::always(&format!("\n{label} =>"));
-            for err in &entity.errors {
-                output::always(&format!("  {err}"));
-            }
+/// One `file =>` block per errored entity, then its messages.
+fn print_entity_problems(entities: &[dbd_core::Entity]) {
+    for entity in entities {
+        let label = entity
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| entity.name.clone());
+        output::always(&format!("\n{label} =>"));
+        for err in &entity.errors {
+            output::always(&format!("  {err}"));
         }
+    }
+}
+
+fn print_report_findings(report: &dbd_core::design::Report, scope_name: Option<&str>, verbosity: Verbosity) {
+    if !report.issues.is_empty() {
+        match scope_name {
+            Some(name) => output::always(&format!("Errors (blocking scope '{name}'):")),
+            None => output::always("Errors:"),
+        }
+        print_entity_problems(&report.issues);
+        // An entity that failed to parse is dropped from the desired set, so a
+        // run would build a database missing it. `ensure_fully_parsed` refuses
+        // rather than do that — say so here, or the report reads as advisory
+        // and the refusal later looks like a new problem.
+        output::always("\n  → dbd apply / reconcile / deploy will refuse to run until these are fixed.");
+    }
+
+    // Errored files the scope excludes. Not blocking this run, but never
+    // silent: a file no scope builds is exactly how a broken file survives.
+    if !report.out_of_scope_issues.is_empty() {
+        let name = scope_name.unwrap_or("the active scope");
+        output::always(&format!("\nOut of scope — not blocking '{name}':"));
+        print_entity_problems(&report.out_of_scope_issues);
+        output::always(&format!(
+            "\n  → these files are not built by '{name}', so it can run. They will block a run whose scope includes them."
+        ));
     }
 
     if !report.warnings.is_empty() {
@@ -205,9 +252,24 @@ fn print_report_findings(report: &dbd_core::design::Report, verbosity: Verbosity
         }
     }
 
-    if report.issues.is_empty() && report.warnings.is_empty() {
+    if report.issues.is_empty() && report.out_of_scope_issues.is_empty() && report.warnings.is_empty() {
         output::info(verbosity, "Everything looks ok");
     }
+}
+
+/// The process exit code for an inspect run.
+///
+/// Non-zero when the design carries anything that would stop a run, so a CI
+/// gate running `dbd inspect` fails on exactly what `dbd apply` would refuse
+/// on. It exited 0 here for every release up to v0.12.0, which made
+/// `apply`'s own "run `dbd inspect` for the full report" advice point at a
+/// command that passed green on the very file apply was rejecting.
+///
+/// Out-of-scope errors are deliberately excluded: the scoped run they do not
+/// belong to still succeeds, and failing it would punish the scope that is
+/// correct.
+pub(crate) fn inspect_exit_code(blocking_errors: usize) -> i32 {
+    if blocking_errors > 0 { 1 } else { 0 }
 }
 
 /// Auto-format every DDL file under `project_dir` in place (the `--fix` path).
@@ -266,12 +328,7 @@ fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     hints
         .iter()
         .map(|h| {
-            let set = h
-                .values
-                .iter()
-                .map(|v| format!("'{v}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let set = h.values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ");
             let schema = h.entity.split_once('.').map(|(s, _)| s).unwrap_or("public");
             format!(
                 "  {entity}.{column}: CHECK constrains to a fixed string set {{{set}}} — a \
@@ -306,6 +363,11 @@ pub fn cmd_combine(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    output::scope_filtered(
+        &resolved,
+        design.scoped_entities(&resolved)?.len(),
+        design.entities().len(),
+    );
     design.combine(file, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
@@ -340,9 +402,14 @@ pub async fn cmd_apply(
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != dbd_core::EntityType::External)
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| resolved.is_all
-                || ws.contains(&e.name)
-                || matches!(e.entity_type, dbd_core::EntityType::Extension | dbd_core::EntityType::Role))
+            .filter(|e| {
+                resolved.is_all
+                    || ws.contains(&e.name)
+                    || matches!(
+                        e.entity_type,
+                        dbd_core::EntityType::Extension | dbd_core::EntityType::Role
+                    )
+            })
             .collect();
 
         for entity in &entities {
@@ -382,6 +449,11 @@ pub async fn cmd_apply(
     result?;
 
     if let Some(s) = apply_summary {
+        // Always reported, whatever the verbosity: a hook a scope filtered out
+        // is the reason something the user expected to happen did not.
+        for warning in &s.warnings {
+            output::warn(warning);
+        }
         output::info(verbosity, &format_apply_summary(&s));
     }
 
@@ -417,11 +489,11 @@ pub async fn cmd_apply(
     // cross-target design may declare schema grants yet apply to any target.
     if !schema_grants.is_empty() {
         if adapter.supports_schema_grants() {
-            if let Some(grants_sql) =
-                dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas)
-            {
+            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
                 output::info(verbosity, "Applying grants...");
-                adapter.execute_script(&grants_sql).await
+                adapter
+                    .execute_script(&grants_sql)
+                    .await
                     .context("Failed to apply grants")?;
                 output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
             }
@@ -432,7 +504,21 @@ pub async fn cmd_apply(
 
     // Apply RLS policies if requested
     if with_policies {
-        let report = dbd_core::design::apply_policies(&*adapter, project_dir, false).await?;
+        let policy_ws = if resolved.is_all {
+            None
+        } else {
+            design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
+        };
+        let report = dbd_core::design::apply_policies(
+            &*adapter,
+            project_dir,
+            false,
+            policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+        )
+        .await?;
+        for (file, why) in &report.skipped {
+            output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+        }
         if !report.applied.is_empty() {
             output::info(verbosity, &format!("Applied {} policy file(s).", report.applied.len()));
         }
@@ -467,17 +553,27 @@ fn select_matviews<'a>(entities: &'a [Entity], name: Option<&str>) -> Vec<&'a En
 
 /// Refresh materialized views: `REFRESH MATERIALIZED VIEW [CONCURRENTLY] …`,
 /// honoring each view's resolved `concurrently` setting, in dependency order.
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_refresh(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
-    let selected = select_matviews(design.entities(), name);
+    // A matview the scope excludes does not exist on this plane, so refreshing
+    // it fails with `relation … does not exist` — an expected condition dressed
+    // as an error, the same failure the policy phase used to produce.
+    let resolved_scope = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let scoped = design.scoped_entities(&resolved_scope)?;
+    output::scope_filtered(&resolved_scope, scoped.len(), design.entities().len());
+
+    let selected = select_matviews(&scoped, name);
     if selected.is_empty() {
         output::info(verbosity, "No materialized views to refresh.");
         return Ok(());
@@ -497,11 +593,15 @@ pub async fn cmd_refresh(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_policies(
     config: &Path,
+    env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
     dry_run: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
     if dry_run {
@@ -518,9 +618,29 @@ pub async fn cmd_policies(
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    let report = dbd_core::design::apply_policies(&*adapter, project_dir, false).await?;
+    // `dbd policies` takes the global --scope like every other command; before
+    // this it silently applied every file, so a policy for a schema this plane
+    // does not have reported `schema "…" does not exist` on every run.
+    let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
+    let resolved = design.resolve_scope(scope, deps)?;
+    let policy_ws = if resolved.is_all {
+        None
+    } else {
+        design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
+    };
+    let report = dbd_core::design::apply_policies(
+        &*adapter,
+        project_dir,
+        false,
+        policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+    )
+    .await?;
 
-    if report.applied.is_empty() && report.failed.is_empty() {
+    for (file, why) in &report.skipped {
+        output::info(verbosity, &format!("Skipped {} — {why}", file.display()));
+    }
+
+    if report.applied.is_empty() && report.failed.is_empty() && report.skipped.is_empty() {
         output::info(verbosity, "No policy files found in policies/");
         return Ok(());
     }
@@ -600,9 +720,8 @@ mod tests {
         }];
         let out = render_enum_hints(&hints);
         assert!(
-            out.iter().any(|l| l.contains("config.lookups.status")
-                && l.contains("'active'")
-                && l.contains("enum")),
+            out.iter()
+                .any(|l| l.contains("config.lookups.status") && l.contains("'active'") && l.contains("enum")),
             "got: {out:?}"
         );
     }
@@ -612,8 +731,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_offline_on_fixture() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*fix*/ false, /*use_database*/ false, None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*fix*/ false,
+            /*use_database*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -625,7 +752,16 @@ mod tests {
     fn combine_writes_sql_file() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("combined.sql");
-        cmd_combine(&testutil::fixture_config(), "dev", &testutil::fixtures(), &out, None, None, Verbosity::Normal).unwrap();
+        cmd_combine(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            &out,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
         assert!(out.exists());
     }
 
@@ -634,9 +770,17 @@ mod tests {
     #[tokio::test]
     async fn apply_dry_run_lists_entities() {
         cmd_apply(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*dry_run*/ true,
+            /*with_policies*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -646,9 +790,18 @@ mod tests {
     /// "no policy files" path without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_without_policy_dir() {
-        cmd_policies(&testutil::fixture_config(), &testutil::fixtures(), None, /*dry_run*/ true, Verbosity::Normal)
-            .await
-            .unwrap();
+        cmd_policies(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*dry_run*/ true,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// `format` (write mode) rewrites DDL in place; run against a copy and with
@@ -680,8 +833,15 @@ mod tests {
     #[tokio::test]
     async fn inspect_verbose_named_clean_entity_reports_all_clear() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ Some("config.lookups"), /*fix*/ false, /*use_database*/ false, None, None,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ Some("config.lookups"),
+            /*fix*/ false,
+            /*use_database*/ false,
+            None,
+            None,
             Verbosity::Verbose,
         )
         .await
@@ -694,8 +854,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_bails_on_scope_gap_with_report_policy() {
         let err = cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("incomplete"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -708,8 +876,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_reports_scope_gap_with_include_policy() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("incomplete_auto"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("incomplete_auto"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -721,9 +897,17 @@ mod tests {
     #[tokio::test]
     async fn apply_dry_run_lists_entities_for_named_scope() {
         cmd_apply(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            /*name*/ None, /*dry_run*/ true, /*with_policies*/ false, /*allow_scope_change*/ false,
-            Some("config_only"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            /*name*/ None,
+            /*dry_run*/ true,
+            /*with_policies*/ false,
+            /*allow_scope_change*/ false,
+            Some("config_only"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -737,9 +921,18 @@ mod tests {
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");
-        cmd_policies(&cfg, proj.path(), None, /*dry_run*/ true, Verbosity::Normal)
-            .await
-            .unwrap();
+        cmd_policies(
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            /*dry_run*/ true,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// Offline reference resolution drops a warning whose target is present
@@ -762,7 +955,10 @@ mod tests {
             .entities()
             .iter()
             .any(|e| e.warnings.iter().any(|w| w.contains("totally_missing")));
-        assert!(has_warning_before, "fixture setup should produce the unresolved-reference warning");
+        assert!(
+            has_warning_before,
+            "fixture setup should produce the unresolved-reference warning"
+        );
 
         resolve_inspect_refs(&mut design, &cfg, None, /*use_database*/ false, Verbosity::Normal)
             .await
@@ -800,8 +996,16 @@ mod tests {
         let before = std::fs::read_to_string(&target).unwrap();
 
         cmd_inspect(
-            &cfg, "dev", proj.path(), None,
-            /*name*/ None, /*fix*/ true, /*use_database*/ false, None, None, Verbosity::Normal,
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            /*name*/ None,
+            /*fix*/ true,
+            /*use_database*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -819,11 +1023,38 @@ mod tests {
         let report = dbd_core::design::Report {
             entity: None,
             issues: vec![broken],
+            out_of_scope_issues: vec![],
             warnings: vec![],
             gaps: vec![],
         };
         // Exercises the issues-loop formatting (label fallback + per-error line).
-        print_report_findings(&report, Verbosity::Normal);
+        print_report_findings(&report, None, Verbosity::Normal);
+    }
+
+    /// The out-of-scope branch renders its own heading and does not touch the
+    /// blocking one — a scoped run with only excluded errors must not read as
+    /// if it were broken.
+    #[test]
+    fn print_report_findings_renders_out_of_scope_branch() {
+        let mut broken = dbd_core::Entity::new(dbd_core::EntityType::Table, "svc.broken");
+        broken.errors.push("parse error: unexpected token".to_string());
+        let report = dbd_core::design::Report {
+            entity: None,
+            issues: vec![],
+            out_of_scope_issues: vec![broken],
+            warnings: vec![],
+            gaps: vec![],
+        };
+        print_report_findings(&report, Some("daemon"), Verbosity::Normal);
+    }
+
+    /// The exit code is the contract a CI gate depends on: non-zero on exactly
+    /// what `apply` would refuse on, zero otherwise.
+    #[test]
+    fn inspect_exit_code_semantics() {
+        assert_eq!(inspect_exit_code(0), 0, "a clean design must exit 0");
+        assert_eq!(inspect_exit_code(1), 1, "a blocking error must exit non-zero");
+        assert_eq!(inspect_exit_code(9), 1);
     }
 
     /// A wildcard scope with every dependency present hits the "no gaps"
@@ -832,8 +1063,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_scoped_with_no_gaps_succeeds() {
         cmd_inspect(
-            &testutil::fixture_config(), "dev", &testutil::fixtures(), None,
-            None, false, false, Some("config_wild"), None, Verbosity::Normal,
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            false,
+            false,
+            Some("config_wild"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -894,7 +1133,11 @@ mod tests {
         let names: Vec<&str> = selected.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["analytics.daily_sales", "analytics.weekly_sales", "reporting.monthly_totals"]
+            vec![
+                "analytics.daily_sales",
+                "analytics.weekly_sales",
+                "reporting.monthly_totals"
+            ]
         );
     }
 

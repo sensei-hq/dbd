@@ -36,10 +36,7 @@ pub enum ExecutionStep {
         migration_version: u32,
     },
     /// Record that a migration version was applied.
-    RecordMigration {
-        version: u32,
-        checksum: String,
-    },
+    RecordMigration { version: u32, checksum: String },
     /// Set the project version to the latest.
     SetVersion(u32),
 }
@@ -151,11 +148,7 @@ fn plan_migrate(
             }
             steps.push(ExecutionStep::DropEntity {
                 entity_name: table_name.clone(),
-                drop_sql_path: migration_entity_sql_path(
-                    &migration.migration_dir,
-                    table_name,
-                    ".drop.sql",
-                ),
+                drop_sql_path: migration_entity_sql_path(&migration.migration_dir, table_name, ".drop.sql"),
                 migration_version: migration.to_version,
             });
         }
@@ -179,20 +172,12 @@ fn plan_migrate(
 }
 
 /// Push a `MigrateEntity` step for every pending migration that alters `entity_name`.
-fn push_migrate_steps_for(
-    entity_name: &str,
-    pending_migrations: &[PendingMigration],
-    steps: &mut Vec<ExecutionStep>,
-) {
+fn push_migrate_steps_for(entity_name: &str, pending_migrations: &[PendingMigration], steps: &mut Vec<ExecutionStep>) {
     for migration in pending_migrations {
         if migration.altered.iter().any(|a| a == entity_name) {
             steps.push(ExecutionStep::MigrateEntity {
                 entity_name: entity_name.to_string(),
-                migration_sql_path: migration_entity_sql_path(
-                    &migration.migration_dir,
-                    entity_name,
-                    ".sql",
-                ),
+                migration_sql_path: migration_entity_sql_path(&migration.migration_dir, entity_name, ".sql"),
                 migration_version: migration.to_version,
             });
         }

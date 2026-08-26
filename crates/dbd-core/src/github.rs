@@ -56,9 +56,7 @@ pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
         let rest = rest.trim_end_matches(".git");
         let parts: Vec<&str> = rest.splitn(4, '/').collect();
         if parts.len() < 2 {
-            return Err(DbdError::GitHubSource(format!(
-                "Invalid GitHub URL: \"{source}\""
-            )));
+            return Err(DbdError::GitHubSource(format!("Invalid GitHub URL: \"{source}\"")));
         }
         let owner = parts[0].to_string();
         let repo = parts[1].to_string();
@@ -86,16 +84,15 @@ pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
     let mut path_str = source.to_string();
 
     if let Some(at_idx) = source.rfind('@')
-        && at_idx > 0 {
-            git_ref = source[at_idx + 1..].to_string();
-            path_str = source[..at_idx].to_string();
-        }
+        && at_idx > 0
+    {
+        git_ref = source[at_idx + 1..].to_string();
+        path_str = source[..at_idx].to_string();
+    }
 
     let parts: Vec<&str> = path_str.split('/').collect();
     if parts.len() < 2 {
-        return Err(DbdError::GitHubSource(format!(
-            "Invalid GitHub source: \"{source}\""
-        )));
+        return Err(DbdError::GitHubSource(format!("Invalid GitHub source: \"{source}\"")));
     }
 
     let owner = parts[0].to_string();
@@ -118,9 +115,7 @@ pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
 
 fn validate_segments(owner: &str, repo: &str, git_ref: &str, subpath: Option<&str>) -> Result<()> {
     if !is_safe_segment(owner) {
-        return Err(DbdError::GitHubSource(format!(
-            "Invalid owner: \"{owner}\""
-        )));
+        return Err(DbdError::GitHubSource(format!("Invalid owner: \"{owner}\"")));
     }
     if !is_safe_segment(repo) {
         return Err(DbdError::GitHubSource(format!("Invalid repo: \"{repo}\"")));
@@ -129,11 +124,12 @@ fn validate_segments(owner: &str, repo: &str, git_ref: &str, subpath: Option<&st
         return Err(DbdError::GitHubSource(format!("Invalid ref: \"{git_ref}\"")));
     }
     if let Some(sp) = subpath
-        && !is_safe_subpath(sp) {
-            return Err(DbdError::GitHubSource(format!(
-                "Invalid subpath: \"{sp}\" — path traversal is not allowed"
-            )));
-        }
+        && !is_safe_subpath(sp)
+    {
+        return Err(DbdError::GitHubSource(format!(
+            "Invalid subpath: \"{sp}\" — path traversal is not allowed"
+        )));
+    }
     Ok(())
 }
 
@@ -212,8 +208,7 @@ mod tests {
 
     #[test]
     fn parse_full_url() {
-        let result =
-            parse_github_source("https://github.com/sensei-hq/daemon").unwrap();
+        let result = parse_github_source("https://github.com/sensei-hq/daemon").unwrap();
         assert_eq!(result.owner, "sensei-hq");
         assert_eq!(result.repo, "daemon");
         assert_eq!(result.git_ref, "HEAD");
@@ -221,10 +216,7 @@ mod tests {
 
     #[test]
     fn parse_full_url_with_tree() {
-        let result = parse_github_source(
-            "https://github.com/sensei-hq/daemon/tree/main/database",
-        )
-        .unwrap();
+        let result = parse_github_source("https://github.com/sensei-hq/daemon/tree/main/database").unwrap();
         assert_eq!(result.owner, "sensei-hq");
         assert_eq!(result.repo, "daemon");
         assert_eq!(result.git_ref, "main");
@@ -233,8 +225,7 @@ mod tests {
 
     #[test]
     fn parse_url_with_git_suffix() {
-        let result =
-            parse_github_source("https://github.com/sensei-hq/daemon.git").unwrap();
+        let result = parse_github_source("https://github.com/sensei-hq/daemon.git").unwrap();
         assert_eq!(result.repo, "daemon");
     }
 

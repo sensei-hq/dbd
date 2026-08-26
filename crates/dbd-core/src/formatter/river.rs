@@ -34,9 +34,7 @@ pub(in crate::formatter) fn river_select_lines(query: &sqlparser::ast::Query, co
     use sqlparser::ast::SetExpr;
 
     match &*query.body {
-        SetExpr::Select(select) => {
-            river_lines_from_select(select, query, config)
-        }
+        SetExpr::Select(select) => river_lines_from_select(select, query, config),
         _ => {
             // UNION / INTERSECT / EXCEPT — fall back to keyword-case only
             vec![apply_keyword_case(&query.to_string(), &config.keyword_case)]
@@ -53,7 +51,10 @@ pub(in crate::formatter) fn river_select_lines(query: &sqlparser::ast::Query, co
 /// mismatch — or a parse failure — it returns `None` so the caller falls back
 /// to a faithful rendering. Correctness over style: an unsupported query keeps
 /// its (non-river) formatting rather than being silently corrupted.
-pub(in crate::formatter) fn river_query_faithful(query: &sqlparser::ast::Query, config: &FormatConfig) -> Option<String> {
+pub(in crate::formatter) fn river_query_faithful(
+    query: &sqlparser::ast::Query,
+    config: &FormatConfig,
+) -> Option<String> {
     let text = river_select_lines(query, config).join("\n");
     let dialect = PostgreSqlDialect {};
     match Parser::parse_sql(&dialect, &text) {
@@ -88,9 +89,10 @@ pub(in crate::formatter) fn river_lines_from_select(
 
     // ── GROUP BY ──────────────────────────────────────────
     let group_exprs: Vec<String> = match &select.group_by {
-        GroupByExpr::Expressions(exprs, _) => {
-            exprs.iter().map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case)).collect()
-        }
+        GroupByExpr::Expressions(exprs, _) => exprs
+            .iter()
+            .map(|e| apply_keyword_case(&e.to_string(), &config.keyword_case))
+            .collect(),
         GroupByExpr::All(_) => vec![kw("all")],
     };
     if !group_exprs.is_empty() {
@@ -135,15 +137,17 @@ pub(in crate::formatter) fn river_emit_select_list(
                 let e = apply_keyword_case(&expr.to_string(), &config.keyword_case);
                 (e, Some(alias.value.to_lowercase()))
             }
-            SelectItem::UnnamedExpr(expr) => {
-                (apply_keyword_case(&expr.to_string(), &config.keyword_case), None)
-            }
+            SelectItem::UnnamedExpr(expr) => (apply_keyword_case(&expr.to_string(), &config.keyword_case), None),
             SelectItem::Wildcard(_) => ("*".to_string(), None),
             SelectItem::QualifiedWildcard(kind, _) => {
                 // `kind` already renders the trailing `.*` (e.g. `l.*`); keyword-
                 // case keeps identifier case like the expression arms above.
                 (apply_keyword_case(&kind.to_string(), &config.keyword_case), None)
             }
+            // `expr AS (a, b)` — a multi-alias projection (DuckDB/BigQuery
+            // struct expansion). No alias column to align on, so render the
+            // whole item and treat it as unaliased.
+            SelectItem::ExprWithAliases { .. } => (apply_keyword_case(&item.to_string(), &config.keyword_case), None),
         })
         .collect();
 
@@ -183,8 +187,7 @@ pub(in crate::formatter) fn river_emit_select_list(
 /// alignment. Returns `0` unless at least one relation has an alias.
 pub(in crate::formatter) fn from_clause_alias_width(select: &sqlparser::ast::Select) -> usize {
     let any_alias = select.from.iter().any(|twj| {
-        table_factor_has_alias(&twj.relation)
-            || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
+        table_factor_has_alias(&twj.relation) || twj.joins.iter().any(|j| table_factor_has_alias(&j.relation))
     });
     if !any_alias {
         return 0;
@@ -287,7 +290,11 @@ pub(in crate::formatter) fn river_emit_order_by(
 }
 
 /// Append the river-formatted LIMIT/OFFSET clause to `lines`.
-pub(in crate::formatter) fn river_emit_limit(query: &sqlparser::ast::Query, config: &FormatConfig, lines: &mut Vec<String>) {
+pub(in crate::formatter) fn river_emit_limit(
+    query: &sqlparser::ast::Query,
+    config: &FormatConfig,
+    lines: &mut Vec<String>,
+) {
     let g = config.gutter;
     let kw = |s: &str| kw_case(s, &config.keyword_case);
 
@@ -387,7 +394,9 @@ pub(in crate::formatter) fn extract_nested_or_parts(expr: &sqlparser::ast::Expr)
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
         Expr::Nested(inner) => match inner.as_ref() {
-            Expr::BinaryOp { op: BinaryOperator::Or, .. } => Some(split_or_conditions(inner)),
+            Expr::BinaryOp {
+                op: BinaryOperator::Or, ..
+            } => Some(split_or_conditions(inner)),
             _ => None,
         },
         _ => None,
@@ -474,9 +483,16 @@ pub(in crate::formatter) fn is_comparison_op(op: &sqlparser::ast::BinaryOperator
     use sqlparser::ast::BinaryOperator as B;
     matches!(
         op,
-        B::Eq | B::NotEq | B::Gt | B::Lt | B::GtEq | B::LtEq
-            | B::PGRegexMatch | B::PGRegexIMatch
-            | B::PGRegexNotMatch | B::PGRegexNotIMatch
+        B::Eq
+            | B::NotEq
+            | B::Gt
+            | B::Lt
+            | B::GtEq
+            | B::LtEq
+            | B::PGRegexMatch
+            | B::PGRegexIMatch
+            | B::PGRegexNotMatch
+            | B::PGRegexNotIMatch
     )
 }
 
@@ -499,9 +515,7 @@ pub(in crate::formatter) fn comparison_op_str(op: &sqlparser::ast::BinaryOperato
 
 pub(in crate::formatter) fn table_factor_name_len(tf: &sqlparser::ast::TableFactor) -> usize {
     match tf {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
-            name.to_string().to_lowercase().len()
-        }
+        sqlparser::ast::TableFactor::Table { name, .. } => name.to_string().to_lowercase().len(),
         _ => 0,
     }
 }
@@ -551,12 +565,8 @@ pub(in crate::formatter) fn extract_join_parts<'a>(
         // Exotic joins (semi/anti/apply/as-of/straight) don't appear in normal
         // DDL views; keep the bare keyword but still surface any ON below rather
         // than silently dropping it.
-        JoinOperator::Semi(c) | JoinOperator::LeftSemi(c) | JoinOperator::RightSemi(c) => {
-            (kw("join"), Some(c))
-        }
-        JoinOperator::Anti(c) | JoinOperator::LeftAnti(c) | JoinOperator::RightAnti(c) => {
-            (kw("join"), Some(c))
-        }
+        JoinOperator::Semi(c) | JoinOperator::LeftSemi(c) | JoinOperator::RightSemi(c) => (kw("join"), Some(c)),
+        JoinOperator::Anti(c) | JoinOperator::LeftAnti(c) | JoinOperator::RightAnti(c) => (kw("join"), Some(c)),
         JoinOperator::StraightJoin(c) => (kw("join"), Some(c)),
         _ => return (kw("join"), None),
     };
@@ -574,7 +584,11 @@ pub(in crate::formatter) fn extract_join_parts<'a>(
 pub(in crate::formatter) fn split_and_conditions(expr: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             let mut v = split_and_conditions(left);
             v.extend(split_and_conditions(right));
             v
@@ -588,7 +602,11 @@ pub(in crate::formatter) fn split_and_conditions(expr: &sqlparser::ast::Expr) ->
 pub(in crate::formatter) fn split_or_conditions(expr: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
             let mut v = split_or_conditions(left);
             v.extend(split_or_conditions(right));
             v
@@ -599,11 +617,18 @@ pub(in crate::formatter) fn split_or_conditions(expr: &sqlparser::ast::Expr) -> 
 
 /// Split a boolean expression into flat conditions, returning the continuation keyword.
 /// Top-level AND → (parts, "and"); top-level OR → (parts, "or"); single → (vec![expr], "and").
-pub(in crate::formatter) fn split_boolean_conditions(expr: &sqlparser::ast::Expr) -> (Vec<&sqlparser::ast::Expr>, &'static str) {
+pub(in crate::formatter) fn split_boolean_conditions(
+    expr: &sqlparser::ast::Expr,
+) -> (Vec<&sqlparser::ast::Expr>, &'static str) {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::BinaryOp { op: BinaryOperator::And, .. } => (split_and_conditions(expr), "and"),
-        Expr::BinaryOp { op: BinaryOperator::Or, .. } => (split_or_conditions(expr), "or"),
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            ..
+        } => (split_and_conditions(expr), "and"),
+        Expr::BinaryOp {
+            op: BinaryOperator::Or, ..
+        } => (split_or_conditions(expr), "or"),
         other => (vec![other], "and"),
     }
 }

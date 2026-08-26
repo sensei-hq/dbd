@@ -33,8 +33,12 @@ impl Design {
         }
 
         for env in self.import_scan_skips.skipped_envs() {
-            let count =
-                self.import_scan_skips.skipped_by_env.iter().filter(|(e, _)| e == env).count();
+            let count = self
+                .import_scan_skips
+                .skipped_by_env
+                .iter()
+                .filter(|(e, _)| e == env)
+                .count();
             warnings.push(format!(
                 "{count} data file(s) under import/{env}/ skipped — this run's env is '{}'",
                 self.env
@@ -51,6 +55,31 @@ impl Design {
         }
 
         warnings
+    }
+
+    /// The `import.after` hooks a run under `scope` would execute, and one
+    /// warning per hook it would skip.
+    ///
+    /// Public so `dbd import --dry-run` previews exactly what the real run does
+    /// without opening a connection — the same reason
+    /// [`import_entry_in_scope`](crate::design::import_entry_in_scope) is
+    /// public. Both share [`plan_hooks`](super::hooks::plan_hooks), so the
+    /// preview cannot drift from the run.
+    pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
+        let narrowed = match scope {
+            Some(s) if !s.is_all => Some((s.name.as_str(), self.working_set(s)?)),
+            _ => None,
+        };
+        let plan = hooks::plan_hooks(
+            &self.project_dir,
+            &self.config.import.after,
+            hooks::HookKind::After,
+            narrowed.as_ref().map(|(name, ws)| (*name, ws)),
+        )?;
+        Ok((
+            plan.runnable.into_iter().map(|(script, _)| script).collect(),
+            plan.warnings,
+        ))
     }
 
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
@@ -79,9 +108,7 @@ impl Design {
         let procedures: Vec<&Entity> = self
             .entities
             .iter()
-            .filter(|e| {
-                e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function
-            })
+            .filter(|e| e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function)
             .filter(|e| !e.reads.is_empty() || !e.writes.is_empty())
             .collect();
 
@@ -89,16 +116,14 @@ impl Design {
         let mut entries: Vec<ImportPlanEntry> = tables
             .iter()
             .map(|table| {
-                let matched_proc = procedures.iter().find(|proc| {
-                    proc.reads.iter().any(|r| r == &table.name)
-                });
+                let matched_proc = procedures
+                    .iter()
+                    .find(|proc| proc.reads.iter().any(|r| r == &table.name));
 
                 ImportPlanEntry {
                     table: (*table).clone(),
                     procedure: matched_proc.map(|p| p.name.clone()),
-                    writes: matched_proc
-                        .map(|p| p.writes.clone())
-                        .unwrap_or_default(),
+                    writes: matched_proc.map(|p| p.writes.clone()).unwrap_or_default(),
                 }
             })
             .collect();
@@ -140,9 +165,10 @@ impl Design {
                     let fk_deps = entity_refs.get(write_target).cloned().unwrap_or_default();
                     // All FK deps that are also write targets of other entries must be placed
                     fk_deps.iter().all(|dep| {
-                        !entries.iter().enumerate().any(|(j, other)| {
-                            !placed[j] && j != i && other.writes.contains(dep)
-                        })
+                        !entries
+                            .iter()
+                            .enumerate()
+                            .any(|(j, other)| !placed[j] && j != i && other.writes.contains(dep))
                     })
                 });
 
@@ -188,30 +214,39 @@ impl Design {
     {
         let mut warnings = self.import_warnings(name);
 
-        let plan = self.import_plan(name);
-        let plan: Vec<ImportPlanEntry> = match scope {
+        // Resolve the scope once. The plan filter and the after-script hooks
+        // must agree on what "in scope" means — the two disagreeing is exactly
+        // how a loader came to run against half-loaded data.
+        let narrowed = match scope {
             Some(s) if !s.is_all => {
                 self.check_scope_gaps(s)?;
-                let ws = self.working_set(s)?;
+                Some((s.name.as_str(), self.working_set(s)?))
+            }
+            _ => None,
+        };
+
+        let plan = self.import_plan(name);
+        let plan: Vec<ImportPlanEntry> = match &narrowed {
+            Some((scope_name, ws)) => {
                 let (kept, dropped): (Vec<_>, Vec<_>) =
-                    plan.into_iter().partition(|e| import_entry_in_scope(e, &ws, false));
+                    plan.into_iter().partition(|e| import_entry_in_scope(e, ws, false));
                 for entry in &dropped {
                     warnings.push(format!(
-                        "staging table {} not imported — outside scope '{}'",
-                        entry.table.name, s.name
+                        "staging table {} not imported — outside scope '{scope_name}'",
+                        entry.table.name
                     ));
                 }
                 kept
             }
-            _ => plan,
+            None => plan,
         };
 
         // Ensure internal dbd procedures are present before any JSONL import runs.
         // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
         if !dry_run {
-            let has_jsonl = plan.iter().any(|e| {
-                e.table.format.as_deref().is_some_and(|f| f == "json" || f == "jsonl")
-            });
+            let has_jsonl = plan
+                .iter()
+                .any(|e| e.table.format.as_deref().is_some_and(|f| f == "json" || f == "jsonl"));
             if has_jsonl {
                 adapter.ensure_import_procedure().await?;
             }
@@ -224,11 +259,25 @@ impl Design {
         let procedures = self
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
-        let after_scripts = self
-            .import_run_after_scripts(adapter, dry_run, &mut progress.on_start, &mut progress.on_done)
-            .await?;
+        let hook_scope = narrowed.as_ref().map(|(name, ws)| (*name, ws));
+        let after = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.import.after,
+            hooks::HookKind::After,
+            hook_scope,
+            dry_run,
+            &mut progress,
+        )
+        .await?;
+        warnings.extend(after.warnings);
 
-        (progress.on_complete)(ImportComplete { tables, procedures, after_scripts, warnings });
+        (progress.on_complete)(ImportComplete {
+            tables,
+            procedures,
+            after_scripts: after.ran,
+            warnings,
+        });
         Ok(())
     }
 
@@ -251,9 +300,7 @@ impl Design {
             for entry in plan {
                 if self.config.import.table_truncate(&entry.table.name) {
                     let qualified = entry.table.name.replace('.', "\".\"");
-                    adapter
-                        .execute_script(&format!("TRUNCATE \"{qualified}\""))
-                        .await?;
+                    adapter.execute_script(&format!("TRUNCATE \"{qualified}\"")).await?;
                 }
             }
         }
@@ -276,8 +323,11 @@ impl Design {
             let desc = format!("import {} ({})", table.name, fmt);
             on_start(&desc);
             let null_value = self.config.import.table_null_value(&entry.table.name);
-            let result =
-                if dry_run { Ok(()) } else { adapter.import_data(table, null_value, false).await };
+            let result = if dry_run {
+                Ok(())
+            } else {
+                adapter.import_data(table, null_value, false).await
+            };
             report_step_result(&desc, on_done, result)?;
             count += 1;
         }
@@ -303,42 +353,14 @@ impl Design {
             if let Some(ref proc_name) = entry.procedure {
                 let desc = format!("call {proc_name}()");
                 on_start(&desc);
-                let result = if dry_run { Ok(()) } else { adapter.execute_script(&format!("CALL {proc_name}();")).await };
+                let result = if dry_run {
+                    Ok(())
+                } else {
+                    adapter.execute_script(&format!("CALL {proc_name}();")).await
+                };
                 report_step_result(&desc, on_done, result)?;
                 count += 1;
             }
-        }
-        Ok(count)
-    }
-
-    /// Import phase: run the project-global `import.after` scripts. These are
-    /// intentionally NOT scope-filtered — they are post-import hooks, not tied to
-    /// individual entries; scoped callers ensure their after-scripts are safe.
-    /// Returns the number of scripts run.
-    async fn import_run_after_scripts<S, D>(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        dry_run: bool,
-        on_start: &mut S,
-        on_done: &mut D,
-    ) -> Result<u32>
-    where
-        S: FnMut(&str),
-        D: FnMut(&str, Option<&str>),
-    {
-        let mut count = 0;
-        for after_file in &self.config.import.after {
-            let full_path = self.project_dir.join(after_file);
-            let desc = format!("run {after_file}");
-            on_start(&desc);
-            let result = if dry_run {
-                Ok(())
-            } else {
-                let sql = std::fs::read_to_string(&full_path)?;
-                adapter.execute_script(&sql).await
-            };
-            report_step_result(&desc, on_done, result)?;
-            count += 1;
         }
         Ok(count)
     }

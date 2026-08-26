@@ -49,16 +49,20 @@ pub fn sql_to_convex_validator(sql_type: &str) -> String {
     let base_core = base.split('(').next().unwrap_or(&base).trim();
 
     let validator = match base_core {
-        "int" | "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint"
-        | "serial" | "bigserial" | "smallserial" | "real" | "double precision"
-        | "double" | "float" | "float4" | "float8" | "numeric" | "decimal" => "v.number()",
+        "int" | "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "serial" | "bigserial"
+        | "smallserial" | "real" | "double precision" | "double" | "float" | "float4" | "float8" | "numeric"
+        | "decimal" => "v.number()",
         "bool" | "boolean" => "v.boolean()",
-        "varchar" | "char" | "character varying" | "character" | "text"
-        | "citext" | "uuid" | "name" => "v.string()",
+        "varchar" | "char" | "character varying" | "character" | "text" | "citext" | "uuid" | "name" => "v.string()",
         // Timestamps stored as epoch-ms or ISO string — Convex has no native
         // date type, so we standardise on a number (epoch ms).
-        "timestamp" | "timestamptz" | "timestamp with time zone"
-        | "timestamp without time zone" | "date" | "time" | "timetz" => "v.number()",
+        "timestamp"
+        | "timestamptz"
+        | "timestamp with time zone"
+        | "timestamp without time zone"
+        | "date"
+        | "time"
+        | "timetz" => "v.number()",
         "json" | "jsonb" => "v.any()",
         "bytea" | "blob" => "v.bytes()",
         _ => "v.any()",
@@ -90,11 +94,7 @@ fn validator_for_type(sql_type: &str, enums: &HashMap<String, String>) -> String
         sql_to_convex_validator(&base)
     };
 
-    if is_array {
-        format!("v.array({inner})")
-    } else {
-        inner
-    }
+    if is_array { format!("v.array({inner})") } else { inner }
 }
 
 /// Render a single column line for `defineTable({...})`. The `fk_override`
@@ -110,11 +110,7 @@ fn render_column(
     let inner = fk_override
         .get(col.name.as_str())
         .cloned()
-        .or_else(|| {
-            col.inline_fk
-                .as_ref()
-                .and_then(|fk| fk_target_const(fk, tables))
-        })
+        .or_else(|| col.inline_fk.as_ref().and_then(|fk| fk_target_const(fk, tables)))
         .unwrap_or_else(|| validator_for_type(&col.data_type, enums));
     let wrapped = if col.nullable {
         format!("v.optional({inner})")
@@ -126,10 +122,7 @@ fn render_column(
 
 /// Resolve a foreign key into `v.id("convex_table_name")` if its target is
 /// a known table (qualified or bare name), else `None`.
-fn fk_target_const(
-    fk: &crate::entity::ForeignKey,
-    tables: &HashMap<String, String>,
-) -> Option<String> {
+fn fk_target_const(fk: &crate::entity::ForeignKey, tables: &HashMap<String, String>) -> Option<String> {
     let qualified = match &fk.ref_schema {
         Some(s) => format!("{}.{}", s.to_lowercase(), fk.ref_table.to_lowercase()),
         None => fk.ref_table.to_lowercase(),
@@ -148,9 +141,7 @@ fn json_key(name: &str) -> String {
             .next()
             .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
             .unwrap_or(false)
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
     if is_ident {
         name.to_string()
     } else {
@@ -162,11 +153,7 @@ fn json_key(name: &str) -> String {
 fn render_indexes(table: &TableDef) -> String {
     let mut out = String::new();
     for (i, idx) in table.indexes.iter().enumerate() {
-        let cols: Vec<String> = idx
-            .columns
-            .iter()
-            .map(|c| format!("\"{}\"", c.name))
-            .collect();
+        let cols: Vec<String> = idx.columns.iter().map(|c| format!("\"{}\"", c.name)).collect();
         let default_name = format!("by_{}", i + 1);
         let name = idx.name.clone().unwrap_or(default_name);
         out.push_str(&format!("    .index(\"{}\", [{}])\n", name, cols.join(", ")));
@@ -243,10 +230,7 @@ pub fn generate_schema_ts(entities: &[&Entity]) -> String {
     out.push_str("import { v } from \"convex/values\";\n\n");
 
     // Emit enum consts in sorted order for deterministic output.
-    let mut enum_entities: Vec<&&Entity> = entities
-        .iter()
-        .filter(|e| e.entity_type == EntityType::Enum)
-        .collect();
+    let mut enum_entities: Vec<&&Entity> = entities.iter().filter(|e| e.entity_type == EntityType::Enum).collect();
     enum_entities.sort_by(|a, b| a.name.cmp(&b.name));
     for e in &enum_entities {
         out.push_str(&render_enum_const(e));
@@ -269,11 +253,7 @@ pub fn generate_schema_ts(entities: &[&Entity]) -> String {
 }
 
 /// Render one `<name>: defineTable({ … }).index(…),` block for a table entity.
-fn render_table_def(
-    entity: &Entity,
-    enums: &HashMap<String, String>,
-    tables: &HashMap<String, String>,
-) -> String {
+fn render_table_def(entity: &Entity, enums: &HashMap<String, String>, tables: &HashMap<String, String>) -> String {
     let convex_name = convex_table_name(&entity.name);
     let mut out = format!("  {convex_name}: defineTable({{\n");
 
@@ -307,10 +287,7 @@ fn render_table_def(
 
 /// Map column name → `v.id("...")` for any single-column FK constraint at
 /// the table level whose target is in `tables`.
-fn fk_columns_for_table(
-    td: &TableDef,
-    tables: &HashMap<String, String>,
-) -> HashMap<String, String> {
+fn fk_columns_for_table(td: &TableDef, tables: &HashMap<String, String>) -> HashMap<String, String> {
     use crate::entity::TableConstraint;
     let mut map = HashMap::new();
     for c in &td.constraints {
@@ -364,19 +341,16 @@ fn load_state(output_dir: &Path) -> Result<ConvexState> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| DbdError::Config(format!("read convex state {}: {e}", path.display())))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| DbdError::Config(format!("parse convex state {}: {e}", path.display())))
+    serde_json::from_str(&contents).map_err(|e| DbdError::Config(format!("parse convex state {}: {e}", path.display())))
 }
 
 fn save_state(output_dir: &Path, state: &ConvexState) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| DbdError::Config(format!("create convex output dir: {e}")))?;
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| DbdError::Config(format!("serialize convex state: {e}")))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| DbdError::Config(format!("create convex output dir: {e}")))?;
+    let json =
+        serde_json::to_string_pretty(state).map_err(|e| DbdError::Config(format!("serialize convex state: {e}")))?;
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::write(state_path(output_dir), json)
-        .map_err(|e| DbdError::Config(format!("write convex state: {e}")))?;
+    std::fs::write(state_path(output_dir), json).map_err(|e| DbdError::Config(format!("write convex state: {e}")))?;
     Ok(())
 }
 
@@ -568,9 +542,7 @@ impl DatabaseAdapter for ConvexAdapter {
     }
 
     async fn execute_script(&self, _sql: &str) -> Result<()> {
-        Err(DbdError::Config(
-            "Convex adapter does not execute SQL scripts".into(),
-        ))
+        Err(DbdError::Config("Convex adapter does not execute SQL scripts".into()))
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
@@ -590,9 +562,7 @@ impl DatabaseAdapter for ConvexAdapter {
             }
             // Convex has no concept of these — silently ignore so that
             // cross-target projects can still apply.
-            EntityType::Schema | EntityType::View | EntityType::External | EntityType::Import => {
-                Ok(())
-            }
+            EntityType::Schema | EntityType::View | EntityType::External | EntityType::Import => Ok(()),
             EntityType::Extension
             | EntityType::Role
             | EntityType::Sequence
@@ -633,9 +603,9 @@ impl DatabaseAdapter for ConvexAdapter {
             .file
             .as_ref()
             .ok_or_else(|| DbdError::Config(format!("No file for import entity {}", entity.name)))?;
-        let file_str = file_path.to_str().ok_or_else(|| {
-            DbdError::Config(format!("Non-UTF8 import path for {}", entity.name))
-        })?;
+        let file_str = file_path
+            .to_str()
+            .ok_or_else(|| DbdError::Config(format!("Non-UTF8 import path for {}", entity.name)))?;
         // Convex CLI accepts JSONL or CSV; we pass through whatever the user
         // provided and let the CLI surface the error if it's something else.
         let table = convex_table_name(&entity.name);
@@ -692,13 +662,7 @@ impl DatabaseAdapter for ConvexAdapter {
         Ok(load_state(&self.output_dir)?.version)
     }
 
-    async fn apply_migration(
-        &self,
-        version: u32,
-        _sql: &str,
-        description: &str,
-        checksum: &str,
-    ) -> Result<()> {
+    async fn apply_migration(&self, version: u32, _sql: &str, description: &str, checksum: &str) -> Result<()> {
         let mut state = load_state(&self.output_dir)?;
         if state.migrations.iter().any(|m| m.version == version) {
             return Ok(());
@@ -751,8 +715,7 @@ impl DatabaseAdapter for ConvexAdapter {
 mod tests {
     use super::*;
     use crate::entity::{
-        ColumnDef, EnumValue, ForeignKey, IndexColumn, IndexDef, TableComments, TableConstraint,
-        TableDef,
+        ColumnDef, EnumValue, ForeignKey, IndexColumn, IndexDef, TableComments, TableConstraint, TableDef,
     };
     use tempfile::tempdir;
 
@@ -965,9 +928,7 @@ mod tests {
         let e = enum_entity("config.user_status", &["active", "inactive"]);
         let out = generate_schema_ts(&[&e]);
         assert!(
-            out.contains(
-                "export const config_user_status = v.union(v.literal(\"active\"), v.literal(\"inactive\"));"
-            ),
+            out.contains("export const config_user_status = v.union(v.literal(\"active\"), v.literal(\"inactive\"));"),
             "{out}"
         );
         // Const appears before defineSchema.
@@ -1019,11 +980,7 @@ mod tests {
             on_delete: None,
             on_update: None,
         });
-        let child_inline = table(
-            "auth.sessions_inline",
-            vec![col("id", "int8", false), fk_col],
-            vec![],
-        );
+        let child_inline = table("auth.sessions_inline", vec![col("id", "int8", false), fk_col], vec![]);
         let mut child_constraint = table(
             "auth.sessions_constraint",
             vec![col("id", "int8", false), col("user_id", "int8", true)],

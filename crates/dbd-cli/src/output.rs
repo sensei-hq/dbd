@@ -14,11 +14,7 @@ pub enum Verbosity {
 
 impl Verbosity {
     pub fn from_flag(verbose: bool) -> Self {
-        if verbose {
-            Self::Verbose
-        } else {
-            Self::Normal
-        }
+        if verbose { Self::Verbose } else { Self::Normal }
     }
 
     pub fn is_verbose(self) -> bool {
@@ -47,6 +43,21 @@ pub fn always(msg: &str) {
 /// Print a warning to stderr (always shown, yellow, `⚠` prefix).
 pub fn warn(msg: &str) {
     eprintln!("{}", style(format!("⚠ {msg}")).yellow());
+}
+
+/// Announce that output was narrowed to a scope, and by how much.
+///
+/// Every command that filters by scope calls this, so a narrowed run always
+/// says so. Without it, `dbd dbml --scope daemon` printed only "Generated DBML
+/// in design.dbml" — documentation silently missing a whole schema reads
+/// exactly like documentation that is complete.
+///
+/// No-op for the all-scope, which filters nothing.
+pub fn scope_filtered(scope: &dbd_core::ResolvedScope, kept: usize, total: usize) {
+    if scope.is_all {
+        return;
+    }
+    println!("scope '{}': {kept} of {total} entities", scope.name);
 }
 
 /// Print a summary line with counts.
@@ -82,17 +93,17 @@ fn colorize(desc: &str) -> String {
         .unwrap_or_else(|| desc.split_whitespace().next().unwrap_or(desc));
 
     match key {
-        "schema"    => style(desc).cyan().to_string(),
-        "table"     => style(desc).green().to_string(),
-        "view"      => style(desc).green().dim().to_string(),
-        "enum"      => style(desc).yellow().to_string(),
-        "function"  => style(desc).magenta().to_string(),
+        "schema" => style(desc).cyan().to_string(),
+        "table" => style(desc).green().to_string(),
+        "view" => style(desc).green().dim().to_string(),
+        "enum" => style(desc).yellow().to_string(),
+        "function" => style(desc).magenta().to_string(),
         "procedure" => style(desc).magenta().to_string(),
         "extension" => style(desc).blue().to_string(),
-        "role"      => style(desc).magenta().dim().to_string(),
-        "migrate"   => style(desc).yellow().to_string(),
-        "drop"      => style(desc).red().to_string(),
-        _           => desc.to_string(),
+        "role" => style(desc).magenta().dim().to_string(),
+        "migrate" => style(desc).yellow().to_string(),
+        "drop" => style(desc).red().to_string(),
+        _ => desc.to_string(),
     }
 }
 
@@ -151,6 +162,30 @@ impl StepSpinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The all-scope filters nothing, so announcing it would be noise on every
+    /// ordinary run. A named scope always announces.
+    #[test]
+    fn scope_filtered_is_silent_for_the_all_scope() {
+        let all = dbd_core::ResolvedScope {
+            is_all: true,
+            ..scope_named("all")
+        };
+        scope_filtered(&all, 5, 5); // no panic, prints nothing
+        let named = scope_named("daemon");
+        scope_filtered(&named, 3, 5); // prints
+    }
+
+    fn scope_named(name: &str) -> dbd_core::ResolvedScope {
+        dbd_core::ResolvedScope {
+            name: name.to_string(),
+            entities: Default::default(),
+            excluded: Default::default(),
+            deps: dbd_core::config::DepsPolicy::Report,
+            is_all: false,
+            extensions: None,
+        }
+    }
 
     #[test]
     fn verbosity_from_flag() {

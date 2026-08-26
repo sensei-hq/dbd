@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::diff::{self, MigrationDiff};
 use crate::entity::{FkAction, ForeignKey, IndexDef, TableConstraint};
-use crate::reconcile::{normalize_common, DEFAULT_SCHEMA};
+use crate::reconcile::{DEFAULT_SCHEMA, normalize_common};
 use crate::snapshot::Snapshot;
 
 /// The complete difference between a live database and the design.
@@ -65,7 +65,12 @@ impl SchemaDiff {
         let changes = diff::diff(&live, &desired);
         let warnings = diff::migration_warnings(&changes);
         // `compute` only sees tables+enums; matview drift is filled in by `diff_live`.
-        SchemaDiff { changes, warnings, advisories, matview_drift: Vec::new() }
+        SchemaDiff {
+            changes,
+            warnings,
+            advisories,
+            matview_drift: Vec::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,7 +87,9 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
 
     for t in &mut snap.tables {
         // Lift any inline column FK into a table constraint (introspection form).
-        let inline: Vec<TableConstraint> = t.columns.iter_mut()
+        let inline: Vec<TableConstraint> = t
+            .columns
+            .iter_mut()
             .filter_map(|c| c.inline_fk.take().map(TableConstraint::ForeignKey))
             .collect();
         t.table_constraints.extend(inline);
@@ -94,9 +101,13 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
 
         // Drop indexes that merely back a PK/UNIQUE constraint — introspection
         // reports them, the parsed design does not. Match by covered columns.
-        let constraint_cols: std::collections::HashSet<Vec<String>> = t.table_constraints.iter()
+        let constraint_cols: std::collections::HashSet<Vec<String>> = t
+            .table_constraints
+            .iter()
             .filter_map(|c| match c {
-                TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => Some(columns.clone()),
+                TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
+                    Some(columns.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -117,7 +128,9 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
                     Some(canon) => *expression = canon,
                     None => advisories.push(format!(
                         "CHECK {} on {}.{} couldn't be normalized — shown as changed; verify manually",
-                        name.as_deref().unwrap_or("(unnamed)"), t.schema, t.name
+                        name.as_deref().unwrap_or("(unnamed)"),
+                        t.schema,
+                        t.name
                     )),
                 }
                 // Postgres auto-names every CHECK; the parser leaves inline CHECKs
@@ -138,10 +151,7 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
 /// partial or expression index is a real index even when it covers exactly the
 /// constrained columns — `unique (library_id)` and
 /// `unique index (library_id) where project_id is null` enforce different things.
-pub(crate) fn backs_a_constraint(
-    ix: &IndexDef,
-    constraint_cols: &std::collections::HashSet<Vec<String>>,
-) -> bool {
+pub(crate) fn backs_a_constraint(ix: &IndexDef, constraint_cols: &std::collections::HashSet<Vec<String>>) -> bool {
     if ix.predicate.is_some() || ix.columns.iter().any(|c| c.is_expression) {
         return false;
     }
@@ -211,46 +221,102 @@ mod tests {
     use crate::snapshot::{Snapshot, TableSnapshot};
 
     fn col(name: &str, ty: &str) -> ColumnDef {
-        ColumnDef { name: name.into(), data_type: ty.into(), nullable: true, default_value: None,
-            is_pk: false, is_unique: false, identity: None, comment: None, inline_fk: None }
+        ColumnDef {
+            name: name.into(),
+            data_type: ty.into(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            comment: None,
+            inline_fk: None,
+        }
     }
 
     fn idx(name: &str, cols: &[&str], unique: bool) -> IndexDef {
-        IndexDef { name: Some(name.into()),
-            columns: cols.iter().map(|c| IndexColumn { name: (*c).into(), ..Default::default() }).collect(),
-            unique, ..Default::default() }
+        IndexDef {
+            name: Some(name.into()),
+            columns: cols
+                .iter()
+                .map(|c| IndexColumn {
+                    name: (*c).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique,
+            ..Default::default()
+        }
     }
     fn table(cols: Vec<ColumnDef>) -> TableSnapshot {
-        TableSnapshot { name: "users".into(), schema: "public".into(), columns: cols, indexes: vec![], table_constraints: vec![] }
+        TableSnapshot {
+            name: "users".into(),
+            schema: "public".into(),
+            columns: cols,
+            indexes: vec![],
+            table_constraints: vec![],
+        }
     }
     fn snap(t: TableSnapshot) -> Snapshot {
-        Snapshot { version: 0, description: String::new(), timestamp: String::new(), tables: vec![t], enums: vec![] }
+        Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![t],
+            enums: vec![],
+        }
     }
 
     fn fk(name: &str, col: &str, reft: &str, refc: &str, on_delete: Option<FkAction>) -> ForeignKey {
-        ForeignKey { name: Some(name.into()), columns: vec![col.into()], ref_schema: None,
-            ref_table: reft.into(), ref_columns: vec![refc.into()], on_delete, on_update: None }
+        ForeignKey {
+            name: Some(name.into()),
+            columns: vec![col.into()],
+            ref_schema: None,
+            ref_table: reft.into(),
+            ref_columns: vec![refc.into()],
+            on_delete,
+            on_update: None,
+        }
     }
 
     fn check(name: &str, expr: &str) -> TableConstraint {
-        TableConstraint::Check { name: Some(name.into()), expression: expr.into() }
+        TableConstraint::Check {
+            name: Some(name.into()),
+            expression: expr.into(),
+        }
     }
 
     /// The same CHECK written with different (but equivalent) parenthesization
     /// canonicalizes to the same form → no diff.
     #[test]
     fn equivalent_check_exprs_do_not_diff() {
-        let live = snap(TableSnapshot { table_constraints: vec![check("ck_total", "((total > 0))")], ..table(vec![col("total", "integer")]) });
-        let desired = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total > 0")], ..table(vec![col("total", "integer")]) });
+        let live = snap(TableSnapshot {
+            table_constraints: vec![check("ck_total", "((total > 0))")],
+            ..table(vec![col("total", "integer")])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![check("ck_total", "total > 0")],
+            ..table(vec![col("total", "integer")])
+        });
         let d = SchemaDiff::compute(live, desired);
-        assert!(d.is_empty(), "equivalent CHECK exprs must not diff, got {:?}", d.changes);
+        assert!(
+            d.is_empty(),
+            "equivalent CHECK exprs must not diff, got {:?}",
+            d.changes
+        );
     }
 
     /// A genuinely different CHECK predicate is still detected.
     #[test]
     fn changed_check_expr_is_detected() {
-        let live = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total > 0")], ..table(vec![col("total", "integer")]) });
-        let desired = snap(TableSnapshot { table_constraints: vec![check("ck_total", "total >= 0")], ..table(vec![col("total", "integer")]) });
+        let live = snap(TableSnapshot {
+            table_constraints: vec![check("ck_total", "total > 0")],
+            ..table(vec![col("total", "integer")])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![check("ck_total", "total >= 0")],
+            ..table(vec![col("total", "integer")])
+        });
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "changed CHECK predicate must surface");
     }
@@ -259,7 +325,10 @@ mod tests {
     #[test]
     fn unparseable_check_records_advisory() {
         let mut adv = Vec::new();
-        let mut s = snap(TableSnapshot { table_constraints: vec![check("ck", "%%% not sql %%%")], ..table(vec![col("x", "integer")]) });
+        let mut s = snap(TableSnapshot {
+            table_constraints: vec![check("ck", "%%% not sql %%%")],
+            ..table(vec![col("x", "integer")])
+        });
         normalize_for_diff(&mut s, &mut adv);
         assert!(!adv.is_empty(), "unparseable CHECK must record an advisory");
     }
@@ -275,11 +344,18 @@ mod tests {
             ..table(vec![col("total", "integer")])
         });
         let desired = snap(TableSnapshot {
-            table_constraints: vec![TableConstraint::Check { name: None, expression: "total > 0".into() }],
+            table_constraints: vec![TableConstraint::Check {
+                name: None,
+                expression: "total > 0".into(),
+            }],
             ..table(vec![col("total", "integer")])
         });
         let d = SchemaDiff::compute(live, desired);
-        assert!(d.is_empty(), "unnamed CHECK must match named introspected CHECK, got {:?}", d.changes);
+        assert!(
+            d.is_empty(),
+            "unnamed CHECK must match named introspected CHECK, got {:?}",
+            d.changes
+        );
     }
 
     /// The canonicalized CHECK stored back into the snapshot is the BARE predicate,
@@ -288,11 +364,15 @@ mod tests {
     #[test]
     fn canonicalized_check_is_bare_predicate() {
         let mut adv = Vec::new();
-        let mut s = snap(TableSnapshot { table_constraints: vec![check("ck", "((total > 0))")], ..table(vec![col("total", "integer")]) });
+        let mut s = snap(TableSnapshot {
+            table_constraints: vec![check("ck", "((total > 0))")],
+            ..table(vec![col("total", "integer")])
+        });
         normalize_for_diff(&mut s, &mut adv);
         match &s.tables[0].table_constraints[0] {
-            TableConstraint::Check { expression, .. } =>
-                assert_eq!(expression, "total > 0", "must store bare predicate, got: {expression}"),
+            TableConstraint::Check { expression, .. } => {
+                assert_eq!(expression, "total > 0", "must store bare predicate, got: {expression}")
+            }
             other => panic!("expected a CHECK, got {other:?}"),
         }
     }
@@ -312,22 +392,42 @@ mod tests {
             ..table(vec![col("org_id", "integer")])
         });
         let desired = snap(table(vec![ColumnDef {
-            inline_fk: Some(ForeignKey { name: None, ref_schema: None, ..fk("_", "org_id", "org", "id", None) }),
+            inline_fk: Some(ForeignKey {
+                name: None,
+                ref_schema: None,
+                ..fk("_", "org_id", "org", "id", None)
+            }),
             ..col("org_id", "integer")
         }]));
         let d = SchemaDiff::compute(live, desired);
-        assert!(d.is_empty(), "unnamed inline FK must match named introspected FK, got {:?}", d.changes);
+        assert!(
+            d.is_empty(),
+            "unnamed inline FK must match named introspected FK, got {:?}",
+            d.changes
+        );
     }
 
     /// A genuinely changed FK target is still detected.
     #[test]
     fn changed_fk_is_detected() {
         let live = snap(TableSnapshot {
-            table_constraints: vec![TableConstraint::ForeignKey(fk("users_org_fk", "org_id", "org", "id", None))],
+            table_constraints: vec![TableConstraint::ForeignKey(fk(
+                "users_org_fk",
+                "org_id",
+                "org",
+                "id",
+                None,
+            ))],
             ..table(vec![col("org_id", "integer")])
         });
         let desired = snap(TableSnapshot {
-            table_constraints: vec![TableConstraint::ForeignKey(fk("users_org_fk", "org_id", "team", "id", None))],
+            table_constraints: vec![TableConstraint::ForeignKey(fk(
+                "users_org_fk",
+                "org_id",
+                "team",
+                "id",
+                None,
+            ))],
             ..table(vec![col("org_id", "integer")])
         });
         let d = SchemaDiff::compute(live, desired);
@@ -346,8 +446,14 @@ mod tests {
     /// A comment change is detected (reconcile drops comments; diff keeps them).
     #[test]
     fn comment_change_is_detected() {
-        let live = snap(table(vec![ColumnDef { comment: Some("old".into()), ..col("id", "integer") }]));
-        let desired = snap(table(vec![ColumnDef { comment: Some("new".into()), ..col("id", "integer") }]));
+        let live = snap(table(vec![ColumnDef {
+            comment: Some("old".into()),
+            ..col("id", "integer")
+        }]));
+        let desired = snap(table(vec![ColumnDef {
+            comment: Some("new".into()),
+            ..col("id", "integer")
+        }]));
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "comment change must surface");
     }
@@ -357,24 +463,42 @@ mod tests {
     #[test]
     fn pk_backing_index_is_suppressed() {
         let live = snap(TableSnapshot {
-            table_constraints: vec![TableConstraint::PrimaryKey { name: Some("users_pkey".into()), columns: vec!["id".into()] }],
+            table_constraints: vec![TableConstraint::PrimaryKey {
+                name: Some("users_pkey".into()),
+                columns: vec!["id".into()],
+            }],
             indexes: vec![idx("users_pkey", &["id"], true)], // introspection reports the backing index
-            ..table(vec![ColumnDef { nullable: false, is_pk: true, ..col("id", "integer") }])
+            ..table(vec![ColumnDef {
+                nullable: false,
+                is_pk: true,
+                ..col("id", "integer")
+            }])
         });
         let desired = snap(TableSnapshot {
             table_constraints: vec![],
             indexes: vec![],
-            ..table(vec![ColumnDef { nullable: false, is_pk: true, ..col("id", "integer") }])
+            ..table(vec![ColumnDef {
+                nullable: false,
+                is_pk: true,
+                ..col("id", "integer")
+            }])
         });
         let d = SchemaDiff::compute(live, desired);
-        assert!(d.is_empty(), "PK-backing index must not surface as a diff, got {:?}", d.changes);
+        assert!(
+            d.is_empty(),
+            "PK-backing index must not surface as a diff, got {:?}",
+            d.changes
+        );
     }
 
     /// A genuine secondary index add is still detected.
     #[test]
     fn secondary_index_add_is_detected() {
         let live = snap(table(vec![col("email", "text")]));
-        let desired = snap(TableSnapshot { indexes: vec![idx("users_email_idx", &["email"], false)], ..table(vec![col("email", "text")]) });
+        let desired = snap(TableSnapshot {
+            indexes: vec![idx("users_email_idx", &["email"], false)],
+            ..table(vec![col("email", "text")])
+        });
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "new index must surface");
     }
@@ -388,7 +512,10 @@ mod tests {
         assert!(empty.is_empty(), "a fully empty diff must be in sync");
 
         let drift_only = SchemaDiff {
-            matview_drift: vec![MatviewDrift { name: "analytics.daily".into(), kind: MatviewDriftKind::Drifted }],
+            matview_drift: vec![MatviewDrift {
+                name: "analytics.daily".into(),
+                kind: MatviewDriftKind::Drifted,
+            }],
             ..SchemaDiff::default()
         };
         assert!(!drift_only.is_empty(), "matview-drift-only diff must not be in sync");

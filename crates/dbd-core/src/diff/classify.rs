@@ -18,17 +18,12 @@ fn normalize_type(t: &str) -> String {
 /// Categorize a normalized Postgres type into a broad category.
 fn type_category(normalized: &str) -> &'static str {
     match normalized {
-        "int" | "integer" | "int4" | "bigint" | "int8" | "smallint" | "int2" | "serial"
-        | "bigserial" | "smallserial" => "integer",
-        "numeric" | "decimal" | "real" | "float4" | "double precision" | "float8" | "money" => {
-            "numeric"
-        }
-        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name" => {
-            "text"
-        }
+        "int" | "integer" | "int4" | "bigint" | "int8" | "smallint" | "int2" | "serial" | "bigserial"
+        | "smallserial" => "integer",
+        "numeric" | "decimal" | "real" | "float4" | "double precision" | "float8" | "money" => "numeric",
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name" => "text",
         "boolean" | "bool" => "boolean",
-        "timestamp" | "timestamptz" | "timestamp with time zone"
-        | "timestamp without time zone" => "timestamp",
+        "timestamp" | "timestamptz" | "timestamp with time zone" | "timestamp without time zone" => "timestamp",
         "date" => "date",
         "time" | "timetz" | "time with time zone" | "time without time zone" => "time",
         "json" | "jsonb" => "json",
@@ -109,10 +104,7 @@ fn find_affected_columns(enum_name: &str, snapshot: &Snapshot) -> Vec<(String, S
 /// Returns `(simple_diffs, complex_changes)`:
 /// - Simple diffs can be applied with regular DDL.
 /// - Complex changes need data correction scripts.
-pub fn classify_changes(
-    diffs: &[MigrationDiff],
-    old_snapshot: &Snapshot,
-) -> (Vec<MigrationDiff>, Vec<ComplexChange>) {
+pub fn classify_changes(diffs: &[MigrationDiff], old_snapshot: &Snapshot) -> (Vec<MigrationDiff>, Vec<ComplexChange>) {
     let mut simple_diffs = Vec::new();
     let mut complex_changes = Vec::new();
 
@@ -123,21 +115,9 @@ pub fn classify_changes(
             }
             DiffAction::Change(changes) => {
                 if d.entity_type == EntityType::Table {
-                    classify_table_changes(
-                        d,
-                        changes,
-                        old_snapshot,
-                        &mut simple_diffs,
-                        &mut complex_changes,
-                    );
+                    classify_table_changes(d, changes, old_snapshot, &mut simple_diffs, &mut complex_changes);
                 } else if d.entity_type == EntityType::Enum {
-                    classify_enum_changes(
-                        d,
-                        changes,
-                        old_snapshot,
-                        &mut simple_diffs,
-                        &mut complex_changes,
-                    );
+                    classify_enum_changes(d, changes, old_snapshot, &mut simple_diffs, &mut complex_changes);
                 } else {
                     simple_diffs.push(d.clone());
                 }
@@ -176,8 +156,7 @@ fn classify_table_changes(
     }
 
     // Detect a column rename: exactly 1 drop + 1 add with the same data_type.
-    let rename_indices =
-        detect_column_rename(diff, &column_drops, &column_adds, old_snapshot, complex_changes);
+    let rename_indices = detect_column_rename(diff, &column_drops, &column_adds, old_snapshot, complex_changes);
 
     // Everything not consumed above is a simple change.
     let remaining_changes: Vec<FieldChange> = changes
@@ -207,8 +186,7 @@ fn detect_type_changes(
     for (i, change) in changes.iter().enumerate() {
         if change.field_type == FieldType::Column
             && let ChangeAction::Alter { ref old, ref new } = change.action
-            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
-                (old.as_ref(), new.as_ref())
+            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) = (old.as_ref(), new.as_ref())
             && old_col.data_type != new_col.data_type
         {
             complex_changes.push(ComplexChange::ColumnTypeChange {
@@ -241,8 +219,7 @@ fn detect_column_rename(
     let (drop_idx, drop_change) = column_drops[0];
     let (add_idx, add_change) = column_adds[0];
 
-    let old_col_type =
-        find_column_type_in_snapshot(&diff.entity_name, &drop_change.field_name, old_snapshot);
+    let old_col_type = find_column_type_in_snapshot(&diff.entity_name, &drop_change.field_name, old_snapshot);
     let added_col = added_column_def(add_change);
     let new_col_type = added_col.map(|cd| cd.data_type.clone());
 
@@ -274,11 +251,7 @@ fn added_column_def(change: &FieldChange) -> Option<&crate::entity::ColumnDef> {
 }
 
 /// Find a column's data_type in the old snapshot by table name and column name.
-fn find_column_type_in_snapshot(
-    table_name: &str,
-    column_name: &str,
-    snapshot: &Snapshot,
-) -> Option<String> {
+fn find_column_type_in_snapshot(table_name: &str, column_name: &str, snapshot: &Snapshot) -> Option<String> {
     for table in &snapshot.tables {
         let qualified = format!("{}.{}", table.schema, table.name);
         if qualified == table_name {
@@ -306,9 +279,7 @@ fn classify_enum_changes(
         .collect();
     let enum_adds: Vec<&FieldChange> = changes
         .iter()
-        .filter(|c| {
-            c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Add(_))
-        })
+        .filter(|c| c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Add(_)))
         .collect();
 
     // 1:1 swap (rename) → stays simple (PG17+ ALTER TYPE RENAME VALUE)
@@ -318,8 +289,7 @@ fn classify_enum_changes(
     }
 
     // Enum value removal: drops without matching adds
-    let added_names: std::collections::HashSet<&str> =
-        enum_adds.iter().map(|c| c.field_name.as_str()).collect();
+    let added_names: std::collections::HashSet<&str> = enum_adds.iter().map(|c| c.field_name.as_str()).collect();
     let removed: Vec<String> = enum_drops
         .iter()
         .filter(|c| !added_names.contains(c.field_name.as_str()))
@@ -333,12 +303,7 @@ fn classify_enum_changes(
             .iter()
             .find(|e| format!("{}.{}", e.schema, e.name) == diff.entity_name);
         let remaining_values = if let Some(old_e) = old_enum {
-            old_e
-                .values
-                .iter()
-                .filter(|v| !removed.contains(v))
-                .cloned()
-                .collect()
+            old_e.values.iter().filter(|v| !removed.contains(v)).cloned().collect()
         } else {
             Vec::new()
         };
@@ -355,10 +320,7 @@ fn classify_enum_changes(
         // Keep any non-removal changes as simple
         let simple_changes: Vec<FieldChange> = changes
             .iter()
-            .filter(|c| {
-                !(c.field_type == FieldType::EnumValue
-                    && matches!(c.action, ChangeAction::Drop))
-            })
+            .filter(|c| !(c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop)))
             .cloned()
             .collect();
 
@@ -429,15 +391,11 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
             affected_columns,
         } => {
             let mut sql = String::new();
-            sql.push_str(&format!("-- TODO: Map removed enum values to remaining values for {enum_name}.\n"));
             sql.push_str(&format!(
-                "-- Removed: {}\n",
-                removed_values.join(", ")
+                "-- TODO: Map removed enum values to remaining values for {enum_name}.\n"
             ));
-            sql.push_str(&format!(
-                "-- Remaining: {}\n",
-                remaining_values.join(", ")
-            ));
+            sql.push_str(&format!("-- Removed: {}\n", removed_values.join(", ")));
+            sql.push_str(&format!("-- Remaining: {}\n", remaining_values.join(", ")));
 
             for (table, col) in affected_columns {
                 for removed_val in removed_values {

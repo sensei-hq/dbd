@@ -36,8 +36,7 @@ fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<Strin
     for change in changes {
         if change.field_type == FieldType::Column
             && let ChangeAction::Alter { ref old, ref new } = change.action
-            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
-                (old.as_ref(), new.as_ref())
+            && let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) = (old.as_ref(), new.as_ref())
             && old_col.data_type != new_col.data_type
         {
             warnings.push(format!(
@@ -70,11 +69,7 @@ fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
                 warnings.push(format!(
                     "{}: column '{}' dropped and '{}' added — if this is a rename, \
                      consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
-                    entity_name,
-                    drop_col.field_name,
-                    add_col.field_name,
-                    add_col.field_name,
-                    drop_col.field_name,
+                    entity_name, drop_col.field_name, add_col.field_name, add_col.field_name, drop_col.field_name,
                 ));
             }
         }
@@ -129,12 +124,7 @@ pub fn generate_migration_sql(diffs: &[MigrationDiff]) -> String {
 }
 
 /// Generate SQL for a single field-level change.
-fn generate_field_sql(
-    entity_name: &str,
-    _entity_type: &EntityType,
-    change: &FieldChange,
-    lines: &mut Vec<String>,
-) {
+fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &FieldChange, lines: &mut Vec<String>) {
     match (&change.field_type, &change.action) {
         // ── Column ──────────────────────────────────────
         (FieldType::Column, ChangeAction::Add(detail)) => {
@@ -149,9 +139,7 @@ fn generate_field_sql(
             ));
         }
         (FieldType::Column, ChangeAction::Alter { old, new }) => {
-            if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) =
-                (old.as_ref(), new.as_ref())
-            {
+            if let (FieldDetail::Column(old_col), FieldDetail::Column(new_col)) = (old.as_ref(), new.as_ref()) {
                 push_column_alter_sql(entity_name, old_col, new_col, lines);
             }
         }
@@ -183,10 +171,7 @@ fn generate_field_sql(
         // ── EnumValue ───────────────────────────────────
         (FieldType::EnumValue, ChangeAction::Add(detail)) => {
             if let FieldDetail::EnumValue(val) = detail.as_ref() {
-                lines.push(format!(
-                    "ALTER TYPE {} ADD VALUE '{}';",
-                    entity_name, val
-                ));
+                lines.push(format!("ALTER TYPE {} ADD VALUE '{}';", entity_name, val));
             }
         }
         (FieldType::EnumValue, ChangeAction::Drop) => {
@@ -200,10 +185,7 @@ fn generate_field_sql(
 
 /// `ALTER TABLE … ADD COLUMN …` for a newly added column.
 fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
-    let mut stmt = format!(
-        "ALTER TABLE {} ADD COLUMN {} {}",
-        entity_name, col.name, col.data_type
-    );
+    let mut stmt = format!("ALTER TABLE {} ADD COLUMN {} {}", entity_name, col.name, col.data_type);
     if !col.nullable {
         stmt.push_str(" NOT NULL");
     }
@@ -222,10 +204,35 @@ fn push_column_alter_sql(
     new_col: &crate::entity::ColumnDef,
     lines: &mut Vec<String>,
 ) {
-    if old_col.data_type != new_col.data_type {
+    let type_changed = old_col.data_type != new_col.data_type;
+
+    // A default the new type can't absorb blocks the type change itself —
+    // `default for column "c" cannot be cast automatically to type status_t` —
+    // and that fires even with a `USING` clause, because Postgres re-casts the
+    // default separately. Stash the default before the alter and restore it
+    // after. Nothing used to be emitted at all when the default was equal on
+    // both sides, so `text default 'active'` → enum could never converge.
+    let stash_default = type_changed && old_col.default_value.is_some();
+    if stash_default {
         lines.push(format!(
-            "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
-            entity_name, new_col.name, new_col.data_type
+            "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+            entity_name, new_col.name
+        ));
+    }
+
+    if type_changed {
+        // Always spell the cast out. Postgres accepts the bare
+        // `ALTER COLUMN … TYPE t` only where an assignment cast exists, so
+        // `text → integer`, `text → <enum>`, `text → uuid`, `text → jsonb` and
+        // `integer → boolean` all failed with "cannot be cast automatically" —
+        // aborting reconcile after earlier passes had already committed, which
+        // left the database half-converged and every re-run failing the same
+        // way. `USING col::t` is a superset of the bare form (it still covers
+        // int → bigint), so it is unconditional rather than gated on a
+        // cast-safety guess that can drift from Postgres's own cast catalog.
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+            entity_name, new_col.name, new_col.data_type, new_col.name, new_col.data_type
         ));
     }
     if old_col.nullable != new_col.nullable {
@@ -241,35 +248,42 @@ fn push_column_alter_sql(
             ));
         }
     }
-    if old_col.default_value != new_col.default_value {
-        match &new_col.default_value {
-            Some(val) => lines.push(format!(
+    // Settle the default last, once the column is already the new type. A
+    // stashed default is restored even when it did not change; a default that
+    // was stashed and is now gone needs no second `DROP DEFAULT`.
+    match &new_col.default_value {
+        Some(val) if stash_default || old_col.default_value != new_col.default_value => {
+            lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                 entity_name, new_col.name, val
-            )),
-            None => lines.push(format!(
+            ));
+        }
+        None if !stash_default && old_col.default_value.is_some() => {
+            lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
                 entity_name, new_col.name
-            )),
+            ));
         }
+        _ => {}
     }
     if old_col.comment != new_col.comment {
         match &new_col.comment {
             Some(c) => lines.push(format!(
                 "COMMENT ON COLUMN {}.{} IS '{}';",
-                entity_name, new_col.name, esc(c)
+                entity_name,
+                new_col.name,
+                esc(c)
             )),
-            None => lines.push(format!(
-                "COMMENT ON COLUMN {}.{} IS NULL;",
-                entity_name, new_col.name
-            )),
+            None => lines.push(format!("COMMENT ON COLUMN {}.{} IS NULL;", entity_name, new_col.name)),
         }
     }
     if old_col.identity != new_col.identity {
         match (&old_col.identity, &new_col.identity) {
             (None, Some(kind)) => lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} ADD GENERATED {} AS IDENTITY;",
-                entity_name, new_col.name, identity_kind_sql(kind)
+                entity_name,
+                new_col.name,
+                identity_kind_sql(kind)
             )),
             (Some(_), None) => lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} DROP IDENTITY;",
@@ -277,7 +291,9 @@ fn push_column_alter_sql(
             )),
             (Some(_), Some(kind)) => lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} SET GENERATED {};",
-                entity_name, new_col.name, identity_kind_sql(kind)
+                entity_name,
+                new_col.name,
+                identity_kind_sql(kind)
             )),
             (None, None) => {} // unreachable: guarded by the inequality above
         }
@@ -374,11 +390,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             )
         }
         TableConstraint::ForeignKey(fk) => {
-            let ref_schema = fk
-                .ref_schema
-                .as_deref()
-                .map(|s| format!("{}.", s))
-                .unwrap_or_default();
+            let ref_schema = fk.ref_schema.as_deref().map(|s| format!("{}.", s)).unwrap_or_default();
             // An unnamed FK (e.g. the design's inline `references …`) is emitted
             // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
             // rather than literally naming the constraint "unnamed".
@@ -410,10 +422,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
             // rather than literally naming the constraint "unnamed", which is
             // what a shared name would then collide on. Mirrors the FK arm.
-            let con_clause = name
-                .as_deref()
-                .map(|n| format!("CONSTRAINT {n} "))
-                .unwrap_or_default();
+            let con_clause = name.as_deref().map(|n| format!("CONSTRAINT {n} ")).unwrap_or_default();
             format!("ALTER TABLE {entity_name} ADD {con_clause}CHECK ({expression});")
         }
     }

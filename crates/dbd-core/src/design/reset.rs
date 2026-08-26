@@ -44,21 +44,18 @@ impl Design {
         // — every ownership operation calls this up front.
         adapter.heal_bookkeeping().await?;
 
-        if !force
-            && let Some(meta) = adapter.get_project_meta().await? {
-                if meta.env == "prod" {
-                    return Err(DbdError::SafetyGuard(
-                        "reset is blocked — database is marked as prod. Use --force to override."
-                            .to_string(),
-                    ));
-                }
-                if meta.version >= 1 {
-                    return Err(DbdError::SafetyGuard(
-                        "reset is blocked — database has applied migrations. Use --force to override."
-                            .to_string(),
-                    ));
-                }
+        if !force && let Some(meta) = adapter.get_project_meta().await? {
+            if meta.env == "prod" {
+                return Err(DbdError::SafetyGuard(
+                    "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
+                ));
             }
+            if meta.version >= 1 {
+                return Err(DbdError::SafetyGuard(
+                    "reset is blocked — database has applied migrations. Use --force to override.".to_string(),
+                ));
+            }
+        }
 
         if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
             adapter.execute_script(&sql).await?;
@@ -86,12 +83,7 @@ impl Design {
         let roles: &[_] = if is_subset {
             &[]
         } else {
-            self.config
-                .target
-                .values()
-                .next()
-                .map(|t| &t.roles[..])
-                .unwrap_or(&[])
+            self.config.target.values().next().map(|t| &t.roles[..]).unwrap_or(&[])
         };
 
         // Data-model entities to drop individually (scope-filtered), in the

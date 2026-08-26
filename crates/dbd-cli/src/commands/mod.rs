@@ -15,6 +15,59 @@ use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete};
 use crate::cli::Commands;
 use crate::output::{self, Verbosity};
 
+/// Whether a command does anything with `--scope`.
+///
+/// `--scope` is a global flag, so every command accepts it and the ones that
+/// ignore it accept it silently — `dbd release --scope daemon` exits 0 having
+/// scoped nothing. That reads as a scoped release; it is not one.
+///
+/// The match is exhaustive on purpose. A new command cannot be added without
+/// stating which side it falls on, so this cannot quietly drift out of date.
+fn command_honors_scope(command: &Commands) -> bool {
+    match command {
+        // Entity-selecting: filter to the scope's working set.
+        Commands::Inspect { .. }
+        | Commands::Apply { .. }
+        | Commands::Combine { .. }
+        | Commands::Import { .. }
+        | Commands::Graph { .. }
+        | Commands::Dbml { .. }
+        | Commands::Diagram { .. }
+        | Commands::Deploy { .. }
+        | Commands::Reset { .. }
+        | Commands::Export { .. }
+        | Commands::Policies { .. }
+        | Commands::Diff { .. }
+        | Commands::Refresh { .. }
+        | Commands::Reconcile { .. } => true,
+
+        // Whole-design by design. A snapshot records the *design*, not one
+        // database: a scoped baseline would omit entities, and every later
+        // `dbd snapshot` would diff against an incomplete record and emit a
+        // spurious CREATE for them on every plane. Scope decides which
+        // migration steps *run* (see `deploy`), not which ones exist.
+        Commands::Snapshot { .. } | Commands::Release { .. } | Commands::Migrate { .. } => false,
+
+        // Nothing to scope: these do not read the entity set.
+        Commands::Doctor { .. }
+        | Commands::Init { .. }
+        | Commands::Merge { .. }
+        | Commands::Format { .. }
+        | Commands::Install { .. } => false,
+    }
+}
+
+/// Say so when `--scope` was passed to a command that ignores it.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
+    let Some(name) = scope else { return };
+    if command_honors_scope(command) {
+        return;
+    }
+    output::warn(&format!(
+        "--scope {name} ignored: this command operates on the whole design, not a scope"
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     command: &Commands,
@@ -27,36 +80,103 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    warn_if_scope_ignored(command, scope);
     match command {
         Commands::Inspect { name, fix, from_db } => {
-            schema::cmd_inspect(config, env, project_dir, database_url, name.as_deref(), *fix, *from_db, scope, deps, verbosity).await
+            schema::cmd_inspect(
+                config,
+                env,
+                project_dir,
+                database_url,
+                name.as_deref(),
+                *fix,
+                *from_db,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
-        Commands::Combine { file } => {
-            schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity)
-        }
+        Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity),
 
         Commands::Refresh { name } => {
-            schema::cmd_refresh(config, env, project_dir, database_url, name.as_deref(), verbosity).await
+            schema::cmd_refresh(
+                config,
+                env,
+                project_dir,
+                database_url,
+                name.as_deref(),
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Graph { name } => {
             project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
         }
 
-        Commands::Apply { name, dry_run, with_policies, allow_scope_change } => {
-            schema::cmd_apply(config, env, project_dir, database_url, name.as_deref(), *dry_run, *with_policies, *allow_scope_change, scope, deps, verbosity).await
+        Commands::Apply {
+            name,
+            dry_run,
+            with_policies,
+            allow_scope_change,
+        } => {
+            schema::cmd_apply(
+                config,
+                env,
+                project_dir,
+                database_url,
+                name.as_deref(),
+                *dry_run,
+                *with_policies,
+                *allow_scope_change,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Import { name, file, dry_run } => {
             if *dry_run {
-                data::cmd_import_dry_run(config, env, project_dir, name.as_deref(), file.as_deref(), scope, deps, verbosity)
+                data::cmd_import_dry_run(
+                    config,
+                    env,
+                    project_dir,
+                    name.as_deref(),
+                    file.as_deref(),
+                    scope,
+                    deps,
+                    verbosity,
+                )
             } else {
-                data::cmd_import(config, env, project_dir, database_url, name.as_deref(), file.as_deref(), scope, deps, verbosity).await
+                data::cmd_import(
+                    config,
+                    env,
+                    project_dir,
+                    database_url,
+                    name.as_deref(),
+                    file.as_deref(),
+                    scope,
+                    deps,
+                    verbosity,
+                )
+                .await
             }
         }
 
-        Commands::Reset { target, dry_run, force, schemas, extensions, clean, allow_scope_change } => {
+        Commands::Reset {
+            target,
+            dry_run,
+            force,
+            schemas,
+            extensions,
+            clean,
+            allow_scope_change,
+        } => {
             let opts = migration::ResetOptions {
                 dry_run: *dry_run,
                 force: *force,
@@ -64,7 +184,18 @@ pub async fn run(
                 drop_extensions: *extensions || *clean,
                 allow_scope_change: *allow_scope_change,
             };
-            migration::cmd_reset(config, env, project_dir, database_url, target, opts, scope, deps, verbosity).await
+            migration::cmd_reset(
+                config,
+                env,
+                project_dir,
+                database_url,
+                target,
+                opts,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Snapshot { list, name } => {
@@ -79,30 +210,86 @@ pub async fn run(
             if *status {
                 migration::cmd_migrate_status(config, database_url, project_dir, verbosity).await
             } else {
-                output::info(verbosity, "Use --status to check migration state. Use 'dbd apply' to run migrations.");
+                output::info(
+                    verbosity,
+                    "Use --status to check migration state. Use 'dbd apply' to run migrations.",
+                );
                 Ok(())
             }
         }
 
-        Commands::Deploy { dry_run, no_cache, clear_cache, allow_scope_change } => {
-            project::cmd_deploy(source, config, env, database_url, *dry_run, *no_cache, *clear_cache, *allow_scope_change, scope, deps, verbosity).await
+        Commands::Deploy {
+            dry_run,
+            no_cache,
+            clear_cache,
+            allow_scope_change,
+        } => {
+            project::cmd_deploy(
+                source,
+                config,
+                env,
+                database_url,
+                *dry_run,
+                *no_cache,
+                *clear_cache,
+                *allow_scope_change,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Export { name, format, output } => {
-            data::cmd_export(config, env, project_dir, database_url, name.as_deref(), format, output.as_deref(), scope, deps, verbosity).await
+            data::cmd_export(
+                config,
+                env,
+                project_dir,
+                database_url,
+                name.as_deref(),
+                format,
+                output.as_deref(),
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
-        Commands::Dbml { file } => {
-            project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity)
-        }
+        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity),
 
-        Commands::Diagram { json, file, print_url, site } => diagram::cmd_diagram(
-            config, env, project_dir, *json, file, *print_url, site.as_deref(), scope, deps, verbosity,
+        Commands::Diagram {
+            json,
+            file,
+            print_url,
+            site,
+        } => diagram::cmd_diagram(
+            config,
+            env,
+            project_dir,
+            *json,
+            file,
+            *print_url,
+            site.as_deref(),
+            scope,
+            deps,
+            verbosity,
         ),
 
         Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
 
-        Commands::Init { name, target, from_db, from_dbml, version, schemas, exclude_schemas, all_schemas, roles, dry_run } => {
+        Commands::Init {
+            name,
+            target,
+            from_db,
+            from_dbml,
+            version,
+            schemas,
+            exclude_schemas,
+            all_schemas,
+            roles,
+            dry_run,
+        } => {
             if let Some(dbml_path) = from_dbml {
                 if target != "postgres" {
                     anyhow::bail!(
@@ -150,19 +337,25 @@ pub async fn run(
                     sel,
                     *roles,
                     *dry_run,
-                ).await
+                )
+                .await
             } else {
-                let project_name = name.as_deref().unwrap_or_else(|| {
-                    project_dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("my-project")
-                });
+                let project_name = name
+                    .as_deref()
+                    .unwrap_or_else(|| project_dir.file_name().and_then(|n| n.to_str()).unwrap_or("my-project"));
                 project::cmd_init(project_dir, project_name, target, verbosity)
             }
         }
 
-        Commands::Merge { conn, from_dbml, schemas, exclude_schemas, all_schemas, roles, dry_run } => {
+        Commands::Merge {
+            conn,
+            from_dbml,
+            schemas,
+            exclude_schemas,
+            all_schemas,
+            roles,
+            dry_run,
+        } => {
             let sel = dbd_core::reverse::SchemaSelect {
                 only: schemas.clone(),
                 exclude: exclude_schemas.clone(),
@@ -174,42 +367,80 @@ pub async fn run(
             }
             // Fix 1: thread database_url so the global -d flag is honoured.
             // Precedence: explicit positional conn > global -d/$DATABASE_URL.
-            reverse::cmd_merge(project_dir, conn.as_deref(), database_url, env, config, sel, *roles, *dry_run).await
+            reverse::cmd_merge(
+                project_dir,
+                conn.as_deref(),
+                database_url,
+                env,
+                config,
+                sel,
+                *roles,
+                *dry_run,
+            )
+            .await
         }
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
 
         Commands::Policies { dry_run } => {
-            schema::cmd_policies(config, project_dir, database_url, *dry_run, verbosity).await
+            schema::cmd_policies(config, env, project_dir, database_url, *dry_run, scope, deps, verbosity).await
         }
 
         Commands::Diff { json, exit_code } => {
-            diff::cmd_diff(config, env, project_dir, database_url, *json, *exit_code, scope, deps, verbosity).await
+            diff::cmd_diff(
+                config,
+                env,
+                project_dir,
+                database_url,
+                *json,
+                *exit_code,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
-        Commands::Reconcile { dry_run, allow_destructive, prune, allow_scope_change } => {
-            project::cmd_reconcile(config, env, project_dir, database_url, *dry_run, *allow_destructive, *prune, *allow_scope_change, scope, deps, verbosity).await
+        Commands::Reconcile {
+            dry_run,
+            allow_destructive,
+            prune,
+            allow_scope_change,
+        } => {
+            project::cmd_reconcile(
+                config,
+                env,
+                project_dir,
+                database_url,
+                *dry_run,
+                *allow_destructive,
+                *prune,
+                *allow_scope_change,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
-        Commands::Release { name } => {
-            project::cmd_release(config, env, project_dir, name.as_deref(), verbosity)
-        }
+        Commands::Release { name } => project::cmd_release(config, env, project_dir, name.as_deref(), verbosity),
 
-        Commands::Install { project, dry_run } => {
-            install::cmd_install(*project, *dry_run, project_dir, verbosity)
-        }
+        Commands::Install { project, dry_run } => install::cmd_install(*project, *dry_run, project_dir, verbosity),
     }
 }
 
 // ── Summary formatting helpers ────────────────────────────────────────────────
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
-    match s.strategy {
+    let entities = match s.strategy {
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
         ApplyStrategy::Current => {
-            format!("Already up to date (v{}) — {} entities applied.", s.from_version, s.applied)
+            format!(
+                "Already up to date (v{}) — {} entities applied.",
+                s.from_version, s.applied
+            )
         }
         ApplyStrategy::Migrate => {
             format!(
@@ -217,6 +448,13 @@ pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
                 s.from_version, s.to_version, s.applied, s.migrated, s.created, s.dropped
             )
         }
+    };
+    // Only mentioned when a project actually has hooks — a line reading
+    // "0 hook script(s)" on every apply would be noise for the projects
+    // (currently most of them) that declare none.
+    match s.before_scripts + s.after_scripts {
+        0 => entities,
+        n => format!("{entities} {n} hook script(s) run."),
     }
 }
 
@@ -230,12 +468,19 @@ pub(super) fn format_import_summary(s: &ImportComplete) -> String {
 pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> String {
     let apply_line = format_apply_summary(&s.apply);
     let import_line = format_import_summary(&s.import);
+    // A scoped deploy skips policies whose table is not in this plane. That is
+    // deliberate, but it must still be visible — otherwise the summary reports
+    // only what ran and nothing accounts for the rest.
     let policy_line = format!(
-        "{} policy file(s) applied{}.",
+        "{} policy file(s) applied{}{}.",
         s.policies.applied.len(),
         match s.policies.failed.len() {
             0 => String::new(),
             n => format!(", {n} failed"),
+        },
+        match s.policies.skipped.len() {
+            0 => String::new(),
+            n => format!(", {n} skipped (out of scope)"),
         }
     );
     format!("{apply_line} {import_line} {policy_line}")
@@ -247,15 +492,15 @@ pub(super) async fn get_adapter(
     config: &Path,
     database_url: Option<&str>,
 ) -> Result<Box<dyn dbd_core::DatabaseAdapter>> {
-    let design_config = dbd_core::config::read(config)
-        .context("Failed to read config")?;
+    let design_config = dbd_core::config::read(config).context("Failed to read config")?;
 
     let url = match database_url {
         Some(u) => u.to_string(),
         None => {
-            let target = design_config.get_target(None)
-                .context("No target configured")?;
-            target.url.clone()
+            let target = design_config.get_target(None).context("No target configured")?;
+            target
+                .url
+                .clone()
                 .map(|u| resolve_env_vars(&u))
                 .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?
         }
@@ -278,7 +523,8 @@ fn resolve_env_vars(s: &str) -> String {
 // ── Safe file helpers ─────────────────────────────────────────────────────────
 
 pub(super) fn safe_canonicalize_within(root: &Path, file: &Path) -> Result<PathBuf> {
-    let canon_root = root.canonicalize()
+    let canon_root = root
+        .canonicalize()
         .with_context(|| format!("Cannot resolve project root: {}", root.display()))?;
     // Resolve the file. If it already exists, canonicalize it directly. If it
     // doesn't (a new output file like `schema.json`), canonicalize its parent
@@ -294,7 +540,8 @@ pub(super) fn safe_canonicalize_within(root: &Path, file: &Path) -> Result<PathB
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => root,
             };
-            let canon_parent = parent.canonicalize()
+            let canon_parent = parent
+                .canonicalize()
                 .with_context(|| format!("Cannot resolve directory for: {}", file.display()))?;
             canon_parent.join(file_name)
         }
@@ -323,7 +570,8 @@ pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()>
 pub(super) fn safe_copy(root: &Path, src: &Path, dst: &Path) -> Result<()> {
     let canon_src = safe_canonicalize_within(root, src)?;
     let parent = dst.parent().unwrap_or(root);
-    let canon_parent = parent.canonicalize()
+    let canon_parent = parent
+        .canonicalize()
         .with_context(|| format!("Cannot resolve backup directory: {}", parent.display()))?;
     anyhow::ensure!(
         canon_parent.starts_with(root.canonicalize()?),
@@ -416,7 +664,16 @@ mod tests {
     }
 
     fn apply_complete(strategy: ApplyStrategy) -> ApplyComplete {
-        ApplyComplete { strategy, from_version: 1, to_version: 2, applied: 3, migrated: 1, created: 2, dropped: 0 }
+        ApplyComplete {
+            strategy,
+            from_version: 1,
+            to_version: 2,
+            applied: 3,
+            migrated: 1,
+            created: 2,
+            dropped: 0,
+            ..Default::default()
+        }
     }
 
     /// Each apply strategy renders its own distinct summary line, and every
@@ -435,7 +692,10 @@ mod tests {
 
         let migrate = format_apply_summary(&apply_complete(ApplyStrategy::Migrate));
         assert!(migrate.contains("Migrated"));
-        assert!(migrate.contains("v1") && migrate.contains("v2"), "expected version range in: {migrate}");
+        assert!(
+            migrate.contains("v1") && migrate.contains("v2"),
+            "expected version range in: {migrate}"
+        );
         assert!(migrate.contains("3 applied"), "expected applied count in: {migrate}");
         assert!(migrate.contains("1 migrated"), "expected migrated count in: {migrate}");
         assert!(migrate.contains("2 created"), "expected created count in: {migrate}");
@@ -444,7 +704,12 @@ mod tests {
 
     #[test]
     fn format_import_summary_reports_counts() {
-        let s = ImportComplete { tables: 3, procedures: 2, after_scripts: 1, ..Default::default() };
+        let s = ImportComplete {
+            tables: 3,
+            procedures: 2,
+            after_scripts: 1,
+            ..Default::default()
+        };
         let out = format_import_summary(&s);
         assert!(out.contains("3 table"), "expected table count in: {out}");
         assert!(out.contains("2 procedure"), "expected procedure count in: {out}");
@@ -463,15 +728,23 @@ mod tests {
     fn format_deploy_summary_combines_apply_import_and_policies() {
         let s = dbd_core::design::DeployComplete {
             apply: apply_complete(ApplyStrategy::Fresh),
-            import: ImportComplete { tables: 2, procedures: 1, ..Default::default() },
+            import: ImportComplete {
+                tables: 2,
+                procedures: 1,
+                ..Default::default()
+            },
             policies: dbd_core::design::PolicyReport {
                 applied: vec![std::path::PathBuf::from("policies/users.sql")],
                 failed: Vec::new(),
+                skipped: Vec::new(),
             },
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("Fresh") && out.contains("table"));
-        assert!(out.contains("1 policy file(s) applied"), "policy phase must be reported: {out}");
+        assert!(
+            out.contains("1 policy file(s) applied"),
+            "policy phase must be reported: {out}"
+        );
     }
 
     /// Failed policy files are non-fatal, so the summary must say how many
@@ -481,6 +754,7 @@ mod tests {
         let s = dbd_core::design::DeployComplete {
             policies: dbd_core::design::PolicyReport {
                 applied: Vec::new(),
+                skipped: Vec::new(),
                 failed: vec![(std::path::PathBuf::from("policies/bad.sql"), "boom".to_string())],
             },
             ..Default::default()
@@ -489,12 +763,74 @@ mod tests {
         assert!(out.contains("1 failed"), "failed policy count must be reported: {out}");
     }
 
+    /// `--scope` is global, so a command that ignores it still accepts it.
+    /// These are the ones that legitimately operate on the whole design; the
+    /// warning is what stops `dbd release --scope daemon` reading as a scoped
+    /// release.
+    #[test]
+    fn snapshot_release_and_migrate_do_not_honor_scope() {
+        use crate::cli::Commands;
+        assert!(!command_honors_scope(&Commands::Release { name: None }));
+        assert!(!command_honors_scope(&Commands::Snapshot {
+            list: false,
+            name: None
+        }));
+        assert!(!command_honors_scope(&Commands::Migrate { status: true }));
+    }
+
+    /// `refresh` reads the entity set to find matviews, so it must filter:
+    /// refreshing a matview the scope excludes fails with "relation … does not
+    /// exist" on a plane that never built it.
+    #[test]
+    fn entity_selecting_commands_honor_scope() {
+        use crate::cli::Commands;
+        assert!(command_honors_scope(&Commands::Refresh { name: None }));
+        assert!(command_honors_scope(&Commands::Policies { dry_run: false }));
+        assert!(command_honors_scope(&Commands::Graph { name: None }));
+    }
+
+    /// A scoped deploy skips policies whose table is not in the plane. The
+    /// `apply` and `policies` paths already print each skip; the deploy summary
+    /// must count them too, or `deploy --scope` reports "2 applied" on a project
+    /// with 5 policy files and nothing says the other 3 were deliberate.
+    #[test]
+    fn format_deploy_summary_reports_skipped_policies() {
+        let s = dbd_core::design::DeployComplete {
+            policies: dbd_core::design::PolicyReport {
+                applied: vec![std::path::PathBuf::from("policies/app/t.sql")],
+                failed: Vec::new(),
+                skipped: vec![(
+                    std::path::PathBuf::from("policies/dojo/repository_metrics.sql"),
+                    "dojo.repository_metrics is outside scope 'daemon'".to_string(),
+                )],
+            },
+            ..Default::default()
+        };
+        let out = format_deploy_summary(&s);
+        assert!(
+            out.contains("1 skipped"),
+            "skipped policy count must be reported: {out}"
+        );
+    }
+
+    /// A skip is not a failure: with nothing skipped the summary must not
+    /// mention skipping at all, so the phrase stays a real signal.
+    #[test]
+    fn format_deploy_summary_omits_skipped_when_none() {
+        let s = dbd_core::design::DeployComplete::default();
+        let out = format_deploy_summary(&s);
+        assert!(!out.contains("skipped"), "must not mention skipping when none: {out}");
+    }
+
     /// `$VAR` is looked up (falling back to the literal when unset); a plain
     /// value passes through untouched.
     #[test]
     fn resolve_env_vars_passthrough_and_fallback() {
         assert_eq!(resolve_env_vars("postgres://x/db"), "postgres://x/db");
-        assert_eq!(resolve_env_vars("$definitely_unset_var_xyz"), "$definitely_unset_var_xyz");
+        assert_eq!(
+            resolve_env_vars("$definitely_unset_var_xyz"),
+            "$definitely_unset_var_xyz"
+        );
     }
 
     /// The `run` dispatcher routes a non-DB command (Doctor) to its handler.
@@ -505,8 +841,15 @@ mod tests {
         let cmd = Commands::Doctor { fix: false };
         let fixtures = testutil::fixtures();
         run(
-            &cmd, &testutil::fixture_config(), "dev", None, &fixtures,
-            fixtures.to_str().unwrap(), None, None, Verbosity::Normal,
+            &cmd,
+            &testutil::fixture_config(),
+            "dev",
+            None,
+            &fixtures,
+            fixtures.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -521,14 +864,18 @@ mod tests {
 
     /// Dispatch `cmd` against a throwaway copy of the fixture project, returning
     /// the result and keeping the temp dir alive for the caller's assertions.
-    async fn run_in_copy(
-        cmd: &crate::cli::Commands,
-        tmp: &tempfile::TempDir,
-    ) -> Result<()> {
+    async fn run_in_copy(cmd: &crate::cli::Commands, tmp: &tempfile::TempDir) -> Result<()> {
         let dir = tmp.path();
         run(
-            cmd, &dir.join("design.yaml"), "dev", None, dir,
-            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+            cmd,
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
     }
@@ -539,7 +886,9 @@ mod tests {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
         let out = tmp.path().join("combined.sql");
-        run_in_copy(&Commands::Combine { file: out.clone() }, &tmp).await.unwrap();
+        run_in_copy(&Commands::Combine { file: out.clone() }, &tmp)
+            .await
+            .unwrap();
         let written = std::fs::read_to_string(&out).expect("combine should write the file");
         assert!(
             written.to_lowercase().contains("create table"),
@@ -565,7 +914,12 @@ mod tests {
         let tmp = testutil::copy_fixture_project();
         let out = tmp.path().join("diagram.json");
         run_in_copy(
-            &Commands::Diagram { json: true, file: out.clone(), print_url: false, site: None },
+            &Commands::Diagram {
+                json: true,
+                file: out.clone(),
+                print_url: false,
+                site: None,
+            },
             &tmp,
         )
         .await
@@ -583,14 +937,22 @@ mod tests {
     async fn run_dispatches_snapshot_create_then_list() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
-        run_in_copy(&Commands::Snapshot { list: false, name: Some("via run".into()) }, &tmp)
-            .await
-            .unwrap();
+        run_in_copy(
+            &Commands::Snapshot {
+                list: false,
+                name: Some("via run".into()),
+            },
+            &tmp,
+        )
+        .await
+        .unwrap();
         assert!(
             !dbd_core::snapshot::list_snapshots(tmp.path()).is_empty(),
             "snapshot dispatch should have created one"
         );
-        run_in_copy(&Commands::Snapshot { list: true, name: None }, &tmp).await.unwrap();
+        run_in_copy(&Commands::Snapshot { list: true, name: None }, &tmp)
+            .await
+            .unwrap();
     }
 
     /// `dbd import --dry-run` routes to the dry-run handler, not the DB one —
@@ -599,9 +961,16 @@ mod tests {
     async fn run_dispatches_import_dry_run_without_a_database() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
-        run_in_copy(&Commands::Import { name: None, file: None, dry_run: true }, &tmp)
-            .await
-            .unwrap();
+        run_in_copy(
+            &Commands::Import {
+                name: None,
+                file: None,
+                dry_run: true,
+            },
+            &tmp,
+        )
+        .await
+        .unwrap();
     }
 
     /// `dbd reset --dry-run` likewise returns before any adapter is built.
@@ -668,7 +1037,15 @@ mod tests {
     async fn run_dispatches_install_dry_run() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
-        run_in_copy(&Commands::Install { project: true, dry_run: true }, &tmp).await.unwrap();
+        run_in_copy(
+            &Commands::Install {
+                project: true,
+                dry_run: true,
+            },
+            &tmp,
+        )
+        .await
+        .unwrap();
     }
 
     /// `dbd init --from-dbml` with a non-Postgres target is rejected in the
@@ -720,8 +1097,14 @@ mod tests {
                 roles: false,
                 dry_run: false,
             },
-            &dir.join("design.yaml"), "dev", None, dir,
-            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -761,8 +1144,14 @@ mod tests {
                 roles: false,
                 dry_run: true,
             },
-            &dir.join("design.yaml"), "dev", None, dir,
-            dir.to_str().unwrap(), None, None, Verbosity::Normal,
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -779,7 +1168,9 @@ mod tests {
         use crate::cli::Commands;
         let proj = testutil::copy_fixture_project();
         let dbml = proj.path().join("schema.dbml");
-        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &proj).await.unwrap();
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &proj)
+            .await
+            .unwrap();
 
         run_in_copy(
             &Commands::Merge {
@@ -802,9 +1193,14 @@ mod tests {
     async fn run_dispatches_release() {
         use crate::cli::Commands;
         let proj = testutil::copy_fixture_project();
-        run_in_copy(&Commands::Release { name: Some("v1".to_string()) }, &proj)
-            .await
-            .unwrap();
+        run_in_copy(
+            &Commands::Release {
+                name: Some("v1".to_string()),
+            },
+            &proj,
+        )
+        .await
+        .unwrap();
     }
 
     // ── get_adapter ───────────────────────────────────────────────────────────

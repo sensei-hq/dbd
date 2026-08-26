@@ -63,6 +63,64 @@ dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live 
 
 **Suggestions (advisory).** On a Postgres/Supabase project, `inspect` prints a `Suggestions:` section when it finds a `CHECK` constraint that pins a column to a fixed set of string literals (`status IN ('active','inactive')`, `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — a Postgres `enum` (`ddl/enum/<schema>/<name>.ddl`) models that with type safety and cleaner introspection. Suggestions are **advisory only**: they never count as errors and never affect the exit code.
 
+### Exit code
+
+**Changed in v0.12.0.** `inspect` exits **1** when the design carries a blocking
+error, and 0 otherwise. It previously always exited 0, which meant a CI step
+running `dbd inspect` passed green on a file that `dbd apply` would refuse —
+and apply's own error says *"run `dbd inspect` for the full report"*, pointing
+at the command that had just passed.
+
+If you have a pipeline that runs `dbd inspect` for its output only, it will now
+fail on a broken design. That is the intent; it is a breaking change, hence the
+minor bump.
+
+Warnings and suggestions never affect the exit code.
+
+### Parse errors say what they cost
+
+A file dbd cannot parse is dropped from the desired set, so a run would build a
+database missing that object. `apply`, `reconcile` and `deploy` refuse rather
+than do that, and `inspect` now names the consequence with the error:
+
+```
+Errors:
+
+./ddl/table/app/broken.ddl =>
+  Parse error: Invalid statement: syntax error at or near ","
+
+  → dbd apply / reconcile / deploy will refuse to run until these are fixed.
+```
+
+### Errors under `--scope`
+
+A scoped run only builds the entities in its working set, so only those errors
+block it. `inspect --scope` splits its report the same way, using the same rule
+the run itself uses — so `inspect` and `apply` never disagree about what is
+broken:
+
+```
+$ dbd inspect --scope daemon
+scope 'daemon': 2 entities
+
+Out of scope — not blocking 'daemon':
+
+./ddl/table/svc/broken.ddl =>
+  Parse error: Invalid statement: syntax error at or near ","
+
+  → these files are not built by 'daemon', so it can run. They will block a run whose scope includes them.
+2 entities — no issues
+(1 error(s) outside scope 'daemon')
+```
+
+Exit code is **0** here, matching `apply --scope daemon`, which applies cleanly.
+Move the same broken file into a schema the scope *does* build and it becomes
+`Errors (blocking scope 'daemon')` with exit 1.
+
+Out-of-scope errors are reported, never suppressed: a file that no scope builds
+is exactly how a broken file survives unnoticed. The entity count in the summary
+is also scope-aware, so it agrees with the `scope '…': N entities` line.
+
 ---
 
 ## `dbd apply`
@@ -93,9 +151,12 @@ Refresh materialized views now — `REFRESH MATERIALIZED VIEW [CONCURRENTLY]`, h
 dbd refresh                        # Refresh every materialized view
 dbd refresh -n analytics.daily_sales   # Refresh one matview
 dbd refresh -n analytics.*         # Refresh all matviews in the analytics schema
+dbd refresh --scope hub            # Only matviews the 'hub' scope builds
 ```
 
 Useful for the initial populate after a data load, or in CI — independent of the pg_cron schedule. Scheduled (recurring) refresh is managed in-database via pg_cron and configured under `materialized_views:` in design.yaml (see [design.yaml reference](03-design-yaml.md#materialized_views)). PostgreSQL/Supabase only.
+
+**`--scope` (honored from v0.12.0).** A matview the scope excludes was never built on that plane, so refreshing it failed with `schema "…" does not exist`. `refresh` now filters to the scope's working set like every other entity-selecting command, and announces the narrowing. Previously the flag was accepted and ignored.
 
 ---
 
@@ -191,9 +252,11 @@ dbd graph -n config.lookups        # Subgraph reachable from one entity
 dbd graph --scope hub              # Only the 'hub' scope's working set
 ```
 
-Output: `{ "nodes": [...], "edges": [...], "layers": [...] }`
+Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`
 
 `--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose.
+
+**`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. The other scope-filtering commands (`dbml`, `combine`, `export`) print `scope '<name>': <kept> of <total> entities` instead; unscoped runs print nothing.
 
 ---
 
@@ -689,7 +752,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.10.12
+  rev: v0.12.0
   hooks:
     - id: dbd-format
 ```
@@ -705,6 +768,7 @@ Apply RLS (Row-Level Security) policies from the `policies/` directory.
 ```sh
 dbd policies                       # Apply all policy files
 dbd policies --dry-run             # Show what would be applied
+dbd policies --scope hub           # Only policies whose table is in the scope
 dbd apply --with-policies          # Apply entities + policies in one step
 ```
 
@@ -717,6 +781,33 @@ create policy "users_select_own" on config.users for select using (auth.uid() = 
 ```
 
 Failed policies are logged and skipped (fail-forward). Exit code 1 if any failures.
+
+### Policies under `--scope`
+
+A scoped run applies only the policies whose table is in the working set. The
+target comes from the file's own path — `policies/<schema>/<table>.sql` names
+`<schema>.<table>` — so no parsing is involved and the rule is the layout you
+already follow.
+
+A policy for a table the scope excludes is skipped with a warning naming the
+file, its target, and the scope:
+
+```
+Skipped ./policies/dojo/repository_metrics.sql — dojo.repository_metrics is
+outside scope 'daemon'
+```
+
+This matters when one design serves several planes. Without it, a policy for a
+schema that a given plane does not have runs anyway and reports
+`FAILED … schema dojo does not exist` on every deploy — an expected condition
+dressed as an error, which is how real failures stop being read.
+
+Runs without `--scope` are unaffected: every policy file applies. `--dry-run`
+filters before previewing, so the preview matches what a real run would do.
+
+A file that is not in `policies/<schema>/<table>.sql` form has no derivable
+target and always applies — scope filtering is a correctness aid, not a
+security boundary. Do not rely on a scope to *prevent* a policy running.
 
 ---
 

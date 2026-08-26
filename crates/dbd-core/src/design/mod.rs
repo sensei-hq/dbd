@@ -1,27 +1,28 @@
 use std::path::{Path, PathBuf};
 
 use crate::adapter::DatabaseAdapter;
-use crate::config::{self, DesignConfig, DepsPolicy, MaterializedViewsConfig};
+use crate::config::{self, DepsPolicy, DesignConfig, MaterializedViewsConfig};
 use crate::dependency;
 use crate::entity::{Entity, EntityType, TableConstraint};
 use crate::error::{DbdError, Result};
 use crate::parser;
-use crate::references;
 use crate::refcache::RefCache;
+use crate::references;
 use crate::scanner;
 use crate::scope::ResolvedScope;
 use crate::script;
 use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
-mod scope;
 mod apply;
-mod reconcile;
+mod hooks;
 mod import;
-mod reset;
 mod plan;
+mod reconcile;
+mod reset;
+mod scope;
 
-pub use plan::{build_execution_plan, ApplyStrategy, ExecutionPlan, ExecutionStep};
+pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]
@@ -37,6 +38,14 @@ pub struct ApplyComplete {
     pub created: u32,
     /// Entities dropped via migration.
     pub dropped: u32,
+    /// `apply.before` hook scripts run.
+    pub before_scripts: u32,
+    /// `apply.after` hook scripts run.
+    pub after_scripts: u32,
+    /// Non-fatal diagnostics — currently, hooks a scope filtered out. Mirrors
+    /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
+    /// Realtime must say so, not report a clean success.
+    pub warnings: Vec<String>,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
@@ -76,14 +85,26 @@ pub struct DeployComplete {
 
 impl DeployComplete {
     /// Every non-fatal diagnostic from the deploy, ready to print as warnings:
-    /// the import's own warnings followed by one line per failed policy file.
+    /// each phase's own warnings in pipeline order, then one line per failed
+    /// policy file, then one per policy a scope excluded.
+    ///
+    /// Scope skips belong here for the same reason import's do: the deploy
+    /// left something out on purpose, and a summary that only counts what ran
+    /// never says which files those were.
     pub fn warnings(&self) -> Vec<String> {
-        let mut out = self.import.warnings.clone();
+        let mut out = self.apply.warnings.clone();
+        out.extend(self.import.warnings.iter().cloned());
         out.extend(
             self.policies
                 .failed
                 .iter()
                 .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
+        );
+        out.extend(
+            self.policies
+                .skipped
+                .iter()
+                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
         );
         out
     }
@@ -106,7 +127,11 @@ fn noop_complete<C>(_: C) {}
 impl<C> Progress<fn(&str), fn(&str, Option<&str>), fn(C)> {
     /// A no-op progress sink — for tests and silent runs.
     pub fn none() -> Self {
-        Progress { on_start: noop_start, on_done: noop_done, on_complete: noop_complete::<C> }
+        Progress {
+            on_start: noop_start,
+            on_done: noop_done,
+            on_complete: noop_complete::<C>,
+        }
     }
 }
 
@@ -138,10 +163,7 @@ fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
 
 /// Refuse a destructive reconcile (dropped columns, constraints, foreign keys,
 /// or indexes) unless the caller explicitly opted in with `allow_destructive`.
-fn ensure_reconcile_not_destructive(
-    plan: &crate::reconcile::ReconcilePlan,
-    allow_destructive: bool,
-) -> Result<()> {
+fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allow_destructive: bool) -> Result<()> {
     if !plan.destructive || allow_destructive {
         return Ok(());
     }
@@ -222,7 +244,15 @@ pub fn import_entry_in_scope(
 #[derive(Debug, Clone)]
 pub struct Report {
     pub entity: Option<Entity>,
+    /// Errored entities the active scope actually builds. These are exactly
+    /// what [`Design::ensure_fully_parsed`] refuses on, so `inspect` and
+    /// `apply` agree about what is broken.
     pub issues: Vec<Entity>,
+    /// Errored entities the active scope excludes. A scoped run never touches
+    /// them, so they must not be reported as blocking it — but they are still
+    /// reported, because a file that no scope builds is how a broken file goes
+    /// unnoticed. Always empty without a scope, or under `all`.
+    pub out_of_scope_issues: Vec<Entity>,
     pub warnings: Vec<Entity>,
     pub gaps: Vec<crate::scope::ScopeGap>,
 }
@@ -245,28 +275,66 @@ pub struct ImportPlanEntry {
 pub struct PolicyReport {
     pub applied: Vec<PathBuf>,
     pub failed: Vec<(PathBuf, String)>,
+    /// Files a scope excluded, with the reason. Not failures — the table the
+    /// policy protects is not part of this plane, so the file has nothing to
+    /// act on. Reported so a skip is visible rather than silent.
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+/// The entity a policy file protects, from its path.
+///
+/// The layout is `policies/<schema>/<table>.sql`, so the target is
+/// `<schema>.<table>` — the same convention `Entity::from_file` uses for
+/// `ddl/<type>/<schema>/<name>.ddl`. Returns `None` for a file that does not
+/// follow it (a loose `policies/foo.sql`, a README), which is then treated as
+/// unscopable and always applied.
+pub(crate) fn policy_target(file: &Path, project_dir: &Path) -> Option<String> {
+    let rel = file.strip_prefix(project_dir).ok()?.strip_prefix("policies").ok()?;
+    let parts: Vec<&str> = rel.components().filter_map(|c| c.as_os_str().to_str()).collect();
+    let [schema, table] = parts.as_slice() else {
+        return None;
+    };
+    let table = table.strip_suffix(".sql").or_else(|| table.strip_suffix(".ddl"))?;
+    Some(format!("{schema}.{table}"))
 }
 
 /// Apply RLS policy files from the policies/ directory.
 ///
 /// Files are executed in alphabetical order. Failed files are logged and skipped.
+///
+/// `scope` filters them the way it filters everything else: a policy protects
+/// one table, and a plane that does not have that table has nothing for the file
+/// to do. Applying it anyway reported `schema "dojo" does not exist` on every
+/// deploy of the other plane — an expected condition dressed as an error, which
+/// is how real failures stop being read. A file whose path does not follow
+/// `policies/<schema>/<table>.sql` is unscopable and always applied.
 pub async fn apply_policies(
     adapter: &dyn DatabaseAdapter,
     project_dir: &Path,
     dry_run: bool,
+    scope: Option<(&str, &std::collections::HashSet<String>)>,
 ) -> Result<PolicyReport> {
     let files = crate::scanner::scan_policies(project_dir)?;
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
+        skipped: Vec::new(),
     };
 
     // Canonicalize the project root once so path-traversal checks are reliable.
-    let canon_root = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let canon_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
 
     for file in &files {
+        if let Some((scope_name, working_set)) = scope
+            && let Some(target) = policy_target(file, project_dir)
+            && !working_set.contains(&target)
+        {
+            report
+                .skipped
+                .push((file.clone(), format!("{target} is outside scope '{scope_name}'")));
+            continue;
+        }
+
         if dry_run {
             report.applied.push(file.clone());
             continue;
@@ -304,11 +372,7 @@ pub async fn apply_policies(
 ///
 /// On success: calls `on_done(desc, None)` and returns `Ok(())`.
 /// On failure: calls `on_done(desc, Some(msg))` and returns `Err(DbdError::Config(msg))`.
-fn report_step_result(
-    desc: &str,
-    on_done: &mut dyn FnMut(&str, Option<&str>),
-    result: Result<()>,
-) -> Result<()> {
+fn report_step_result(desc: &str, on_done: &mut dyn FnMut(&str, Option<&str>), result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => {
             on_done(desc, None);
@@ -368,27 +432,25 @@ impl Design {
 
     /// Create a Design with an explicit project directory.
     /// If `project_dir` is None, uses the config file's parent directory.
-    pub fn from_config_with_dir(
-        config_path: &Path,
-        env: &str,
-        project_dir: Option<&Path>,
-    ) -> Result<Self> {
+    pub fn from_config_with_dir(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
         let project_dir = project_dir
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| {
-                config_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .to_path_buf()
-            });
+            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         let design_config = config::read(config_path)?;
+
+        // Validate and resolve the parser before reading any file, so a bad
+        // `source.parser` fails at load rather than partway through the scan.
+        let parser_choice = crate::parser::ParserChoice::resolve(
+            &design_config.source.dialect,
+            design_config.source.parser.as_deref(),
+        )?;
 
         // Scan and parse DDL entities. A file that fails to read must not
         // silently vanish from the desired set — a live table could be
         // dropped by `reconcile --prune` — so propagate the read error.
-        // `parse_entity`'s own Err (unparseable DDL) still drops the entity,
-        // unchanged from prior behavior.
+        // `parse_entity_with`'s own Err (unparseable DDL) still drops the
+        // entity, unchanged from prior behavior.
         let ddl_files = scanner::scan_ddl(&project_dir)?;
         let mut entities: Vec<Entity> = Vec::new();
         for file in &ddl_files {
@@ -397,7 +459,7 @@ impl Design {
             // Use relative path for entity type/name derivation, but
             // store the absolute path so the file is readable regardless of CWD.
             let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-            if let Ok(mut entity) = parser::parse_entity(relative, &sql) {
+            if let Ok(mut entity) = parser::parse_entity_with(parser_choice, relative, &sql) {
                 entity.file = Some(file.clone());
                 entities.push(entity);
             }
@@ -405,18 +467,21 @@ impl Design {
 
         // Add schema entities
         for schema_name in design_config.schema_names() {
-            if !entities.iter().any(|e| e.entity_type == EntityType::Schema && e.name == schema_name) {
+            if !entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Schema && e.name == schema_name)
+            {
                 entities.push(Entity::schema(&schema_name));
             }
         }
 
         // Auto-add schemas from entity file paths
-        let entity_schemas: Vec<String> = entities
-            .iter()
-            .filter_map(|e| e.schema.clone())
-            .collect();
+        let entity_schemas: Vec<String> = entities.iter().filter_map(|e| e.schema.clone()).collect();
         for schema in entity_schemas {
-            if !entities.iter().any(|e| e.entity_type == EntityType::Schema && e.name == schema) {
+            if !entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Schema && e.name == schema)
+            {
                 entities.push(Entity::schema(&schema));
             }
         }
@@ -446,11 +511,7 @@ impl Design {
         }
 
         // Add external entities for reference resolution
-        let external_names: Vec<String> = design_config
-            .external
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
+        let external_names: Vec<String> = design_config.external.iter().map(|e| e.name.clone()).collect();
         for ext in &design_config.external {
             entities.push(Entity::external(&ext.name));
         }
@@ -557,10 +618,7 @@ impl Design {
     /// Returns the number of warnings dropped. Used by `inspect --from-db`
     /// to silence warnings that resolve against a real DB but not against
     /// the project's external entity list.
-    pub async fn resolve_unknown_refs_via_db(
-        &mut self,
-        adapter: &dyn DatabaseAdapter,
-    ) -> Result<usize> {
+    pub async fn resolve_unknown_refs_via_db(&mut self, adapter: &dyn DatabaseAdapter) -> Result<usize> {
         const PREFIX: &str = "Unresolved reference: ";
 
         let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -579,9 +637,11 @@ impl Design {
             }
         }
 
-        Ok(Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
-            resolved.contains(name)
-        }))
+        Ok(Self::drop_resolved_ref_warnings(
+            &mut self.entities,
+            &mut self.import_tables,
+            |name| resolved.contains(name),
+        ))
     }
 
     /// Capture the full set of user-defined entities (tables, views, enums)
@@ -592,11 +652,7 @@ impl Design {
     /// "Unresolved reference" warnings via [`resolve_unknown_refs_via_cache`].
     ///
     /// Returns the number of entities written to the cache.
-    pub async fn write_ref_cache(
-        &self,
-        adapter: &dyn DatabaseAdapter,
-        source: &str,
-    ) -> Result<usize> {
+    pub async fn write_ref_cache(&self, adapter: &dyn DatabaseAdapter, source: &str) -> Result<usize> {
         let names = adapter.list_entities().await?;
         let count = names.len();
         let cache = RefCache::new(source, names);
@@ -617,9 +673,8 @@ impl Design {
         };
         let size = cache.len();
 
-        let dropped = Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| {
-            cache.contains(name)
-        });
+        let dropped =
+            Self::drop_resolved_ref_warnings(&mut self.entities, &mut self.import_tables, |name| cache.contains(name));
         Ok((dropped, Some(size)))
     }
 
@@ -689,8 +744,23 @@ impl Design {
 
         let entity = name.and_then(|n| self.entities.iter().find(|e| e.name == n).cloned());
 
-        let issues = self.filtered_entities(name, |e| !e.errors.is_empty());
+        let all_issues = self.filtered_entities(name, |e| !e.errors.is_empty());
         let warnings = self.filtered_entities(name, |e| !e.warnings.is_empty());
+
+        // Split the errors the same way `ensure_fully_parsed` does, so the
+        // report agrees with what a run would actually refuse on. Reporting an
+        // out-of-scope parse error as blocking sends people to fix a file the
+        // scoped run never reads.
+        let (issues, out_of_scope_issues) = match scope {
+            Some(s) if !s.is_all => match self.working_set(s) {
+                Ok(ws) => all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                // Working set unavailable: treat every error as blocking. The
+                // conservative direction — a spurious error is a nuisance, a
+                // hidden one is the failure this reporting exists to prevent.
+                Err(_) => (all_issues, Vec::new()),
+            },
+            _ => (all_issues, Vec::new()),
+        };
 
         let gaps = match scope {
             Some(s) => crate::scope::analyze_gaps(s, &self.entities, &self.external_names()),
@@ -700,6 +770,7 @@ impl Design {
         Report {
             entity,
             issues,
+            out_of_scope_issues,
             warnings,
             gaps,
         }
@@ -728,11 +799,7 @@ impl Design {
 
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
-    pub fn graph(
-        &self,
-        name: Option<&str>,
-        scope: Option<&ResolvedScope>,
-    ) -> Result<dependency::GraphResult> {
+    pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
         let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
@@ -932,8 +999,7 @@ fn string_set_from_ast(ast: &sqlparser::ast::Expr) -> Option<(String, Vec<String
         }
         // col = 'a' OR col = 'b' OR …  — every leaf must be `<same col> = <string>`.
         Expr::BinaryOp {
-            op: BinaryOperator::Or,
-            ..
+            op: BinaryOperator::Or, ..
         } => {
             let mut col: Option<String> = None;
             let mut vals = Vec::new();
@@ -949,11 +1015,7 @@ fn string_set_from_ast(ast: &sqlparser::ast::Expr) -> Option<(String, Vec<String
 
 /// Walk an `OR` tree, collecting `<col> = <string literal>` leaves. Fails (returns
 /// `false`) if any leaf is a different column or not a column-equals-string test.
-fn collect_or_equalities(
-    expr: &sqlparser::ast::Expr,
-    col: &mut Option<String>,
-    vals: &mut Vec<String>,
-) -> bool {
+fn collect_or_equalities(expr: &sqlparser::ast::Expr, col: &mut Option<String>, vals: &mut Vec<String>) -> bool {
     use sqlparser::ast::{BinaryOperator, Expr};
 
     match expr {
@@ -1214,6 +1276,258 @@ mod tests {
         assert!(!mock.applied_names().is_empty());
     }
 
+    // ── Lifecycle script hooks ────────────────────────────
+
+    /// A project shaped like the real one this feature was built for: a scope
+    /// that excludes one staging table, an `import.after` hook whose dependency
+    /// on it is *derivable*, and a second whose table name is data and so must
+    /// declare its `writes:`.
+    fn hooks_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for sub in ["ddl/table/app", "ddl/table/staging", "sql"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            r#"
+project:
+  name: hooks
+  version: 1
+source:
+  dialect: postgresql
+schemas:
+  - app
+  - staging
+scopes:
+  partial:
+    excludes: [staging.b]
+    deps: include
+apply:
+  before:
+    - sql/pre_ddl.sql
+  after:
+    - sql/post_ddl.sql
+import:
+  staging: [staging]
+  after:
+    - sql/loader.sql
+    - script: sql/dynamic.sql
+      writes: [app.target]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/target.ddl"),
+            "create table if not exists app.target (id int primary key, n int);\n",
+        )
+        .unwrap();
+        for t in ["a", "b"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/staging/{t}.ddl")),
+                format!("create table if not exists staging.{t} (id int primary key);\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("sql/pre_ddl.sql"), "-- MARK pre_ddl\nselect 1;\n").unwrap();
+        std::fs::write(dir.join("sql/post_ddl.sql"), "-- MARK post_ddl\nselect 1;\n").unwrap();
+        // Derivable: names staging.a and staging.b as SQL identifiers.
+        std::fs::write(
+            dir.join("sql/loader.sql"),
+            "-- MARK loader\ninsert into app.target (id, n)\n\
+             select a.id, 1 from staging.a a join staging.b b on b.id = a.id;\n",
+        )
+        .unwrap();
+        // NOT derivable: the table name lives in a format() string.
+        std::fs::write(
+            dir.join("sql/dynamic.sql"),
+            "-- MARK dynamic\ndo $$ begin\n  execute format('insert into %I.target values (1, 1)', 'app');\nend $$;\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Which hook scripts an adapter was actually handed, by marker.
+    fn markers_run(mock: &MockAdapter) -> Vec<String> {
+        let scripts = mock.scripts.lock().unwrap();
+        scripts
+            .iter()
+            .filter_map(|s| s.lines().next())
+            .filter_map(|l| l.strip_prefix("-- MARK ").map(|m| m.to_string()))
+            .collect()
+    }
+
+    /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
+    /// alone, so an `import.after` hook never runs on it. `apply.after` does.
+    #[tokio::test]
+    async fn apply_alone_runs_its_own_hooks_and_not_the_import_ones() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+        let mut summary: Option<ApplyComplete> = None;
+
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(markers_run(&mock), vec!["pre_ddl", "post_ddl"]);
+        let summary = summary.expect("apply must report a summary");
+        assert_eq!(summary.before_scripts, 1);
+        assert_eq!(summary.after_scripts, 1);
+    }
+
+    /// `apply.before` runs before the first entity and `apply.after` only after
+    /// they all succeed — so an entity that fails leaves the before-hook run and
+    /// the after-hook not.
+    #[tokio::test]
+    async fn a_failing_entity_stops_between_the_before_and_after_hooks() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new().fail_on_entity("app.target");
+
+        design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("the injected entity failure must propagate");
+
+        assert_eq!(markers_run(&mock), vec!["pre_ddl"]);
+    }
+
+    /// Publications and grants attach to objects that must already exist, and
+    /// RLS is independent of them — so `apply.after` runs before `policies/`.
+    #[tokio::test]
+    async fn apply_after_runs_before_policies() {
+        let tmp = hooks_project();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(tmp.path().join("policies/rls.sql"), "-- MARK policy\nselect 1;\n").unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let markers = markers_run(&mock);
+        let post = markers
+            .iter()
+            .position(|m| m == "post_ddl")
+            .expect("apply.after must run");
+        let policy = markers.iter().position(|m| m == "policy").expect("policies must run");
+        assert!(post < policy, "apply.after must precede policies/: {markers:?}");
+    }
+
+    /// The contrast that is the whole feature: under a scope excluding
+    /// `staging.b`, the derivable loader is skipped with a warning naming the
+    /// table, while the `writes:`-declared hook still runs.
+    #[tokio::test]
+    async fn a_scoped_import_skips_the_derivable_hook_and_keeps_the_declared_one() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let scope = design.resolve_scope(Some("partial"), None).unwrap();
+        let mock = MockAdapter::new();
+        let mut summary: Option<ImportComplete> = None;
+
+        design
+            .import_data(
+                &mock,
+                None,
+                false,
+                Some(&scope),
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            markers_run(&mock),
+            vec!["dynamic"],
+            "only the declared-writes hook may run"
+        );
+        let summary = summary.expect("import must report a summary");
+        assert_eq!(summary.after_scripts, 1);
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| { w.contains("sql/loader.sql") && w.contains("staging.b") && w.contains("partial") }),
+            "the skip must name the script, the table and the scope: {:?}",
+            summary.warnings
+        );
+    }
+
+    /// Unscoped, both after-scripts run — scope filtering must not cost the
+    /// common path anything.
+    #[tokio::test]
+    async fn an_unscoped_import_runs_every_after_script() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .unwrap();
+
+        assert_eq!(markers_run(&mock), vec!["loader", "dynamic"]);
+    }
+
+    /// A declared hook dbd cannot find is a misconfiguration — apply must
+    /// refuse rather than continue as if the script were optional.
+    #[tokio::test]
+    async fn apply_refuses_when_a_hook_file_is_missing() {
+        let tmp = hooks_project();
+        std::fs::remove_file(tmp.path().join("sql/post_ddl.sql")).unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        let err = design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("a missing hook file must fail the apply");
+        assert!(err.to_string().contains("sql/post_ddl.sql"), "got: {err}");
+    }
+
+    /// `--dry-run` names every hook it would run without executing one.
+    #[tokio::test]
+    async fn apply_dry_run_reports_hooks_without_executing_them() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+        let mut steps: Vec<String> = Vec::new();
+
+        design
+            .apply(
+                &mock,
+                None,
+                /*dry_run*/ true,
+                None,
+                Progress {
+                    on_start: |d: &str| steps.push(d.to_string()),
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |_| {},
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mock.script_count(), 0, "a dry run must execute nothing");
+        assert!(steps.iter().any(|s| s.contains("sql/pre_ddl.sql")), "got {steps:?}");
+        assert!(steps.iter().any(|s| s.contains("sql/post_ddl.sql")), "got {steps:?}");
+    }
+
     // ── diff_live (read-only) ──────────────────────────────
 
     /// diff_live is read-only and reports drift: an empty live DB (MockAdapter's
@@ -1250,9 +1564,7 @@ mod tests {
         let live: Vec<Entity> = design
             .entities()
             .iter()
-            .filter(|e| {
-                matches!(e.entity_type, EntityType::Table | EntityType::Enum) && e.errors.is_empty()
-            })
+            .filter(|e| matches!(e.entity_type, EntityType::Table | EntityType::Enum) && e.errors.is_empty())
             .cloned()
             .map(|mut e| {
                 if e.name == "config.lookup_values"
@@ -1485,7 +1797,10 @@ mod tests {
 
         // staging.lookups should match staging.import_lookups
         let lookups_entry = plan.iter().find(|e| e.table.name == "staging.lookups");
-        assert!(lookups_entry.is_some(), "staging.lookups should appear in the import plan");
+        assert!(
+            lookups_entry.is_some(),
+            "staging.lookups should appear in the import plan"
+        );
         let entry = lookups_entry.unwrap();
         assert_eq!(
             entry.procedure,
@@ -1536,18 +1851,11 @@ mod tests {
         // staging.import_lookup_values writes config.lookup_values
         // config.lookup_values has FK to config.lookups (lookup_id references lookups(id))
         // Therefore import_lookups must come before import_lookup_values
-        let lookups_pos = plan
-            .iter()
-            .position(|e| e.table.name == "staging.lookups");
-        let lookup_values_pos = plan
-            .iter()
-            .position(|e| e.table.name == "staging.lookup_values");
+        let lookups_pos = plan.iter().position(|e| e.table.name == "staging.lookups");
+        let lookup_values_pos = plan.iter().position(|e| e.table.name == "staging.lookup_values");
 
         assert!(lookups_pos.is_some(), "staging.lookups should be in plan");
-        assert!(
-            lookup_values_pos.is_some(),
-            "staging.lookup_values should be in plan"
-        );
+        assert!(lookup_values_pos.is_some(), "staging.lookup_values should be in plan");
         assert!(
             lookups_pos.unwrap() < lookup_values_pos.unwrap(),
             "staging.lookups (pos {}) should come before staging.lookup_values (pos {}) due to FK dependency",
@@ -1661,17 +1969,26 @@ mod tests {
         std::fs::write(dir.join("import/staging/lookups.csv"), "id,name\n1,a\n").unwrap();
 
         let design = load_project(dir, "dev");
-        assert!(!design.import_tables().is_empty(), "the staging file must be discovered");
+        assert!(
+            !design.import_tables().is_empty(),
+            "the staging file must be discovered"
+        );
 
         let scope = design.resolve_scope(Some("config_only"), None).unwrap();
         let mock = MockAdapter::new();
         let mut summary: Option<ImportComplete> = None;
         design
-            .import_data(&mock, None, /*dry_run*/ true, Some(&scope), Progress {
-                on_start: |_: &str| {},
-                on_done: |_: &str, _: Option<&str>| {},
-                on_complete: |s| summary = Some(s),
-            })
+            .import_data(
+                &mock,
+                None,
+                /*dry_run*/ true,
+                Some(&scope),
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
             .await
             .unwrap();
 
@@ -1697,11 +2014,17 @@ mod tests {
         let mock = MockAdapter::new();
         let mut summary: Option<ImportComplete> = None;
         design
-            .import_data(&mock, Some("staging.does_not_exist"), true, None, Progress {
-                on_start: |_: &str| {},
-                on_done: |_: &str, _: Option<&str>| {},
-                on_complete: |s| summary = Some(s),
-            })
+            .import_data(
+                &mock,
+                Some("staging.does_not_exist"),
+                true,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
             .await
             .unwrap();
 
@@ -1724,11 +2047,17 @@ mod tests {
         let mock = MockAdapter::new();
         let mut summary: Option<ImportComplete> = None;
         design
-            .import_data(&mock, None, false, None, Progress {
-                on_start: |_: &str| {},
-                on_done: |_: &str, _: Option<&str>| {},
-                on_complete: |s| summary = Some(s),
-            })
+            .import_data(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
             .await
             .unwrap();
 
@@ -1753,7 +2082,8 @@ mod tests {
 
         // Check that TRUNCATE was issued for staging tables
         let scripts = mock.scripts.lock().unwrap();
-        let truncate_scripts: Vec<&String> = scripts.iter()
+        let truncate_scripts: Vec<&String> = scripts
+            .iter()
             .filter(|s| s.to_uppercase().contains("TRUNCATE"))
             .collect();
         // Should have at least one truncate if there are import tables
@@ -1790,20 +2120,21 @@ mod tests {
 
     #[test]
     fn a1_fresh_env_applies_all_and_sets_version() {
-        let entities = vec![
-            test_entity("config.users"),
-            test_entity("config.orders"),
-        ];
+        let entities = vec![test_entity("config.users"), test_entity("config.orders")];
 
         let plan = build_execution_plan(&entities, 0, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
 
         // Should have ApplyEntity for each entity + SetVersion
-        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let apply_names: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(apply_names.contains(&"config.users"));
         assert!(apply_names.contains(&"config.orders"));
 
@@ -1815,20 +2146,21 @@ mod tests {
 
     #[test]
     fn a2_current_applies_all_no_set_version() {
-        let entities = vec![
-            test_entity("config.users"),
-            test_entity("config.orders"),
-        ];
+        let entities = vec![test_entity("config.users"), test_entity("config.orders")];
 
         let plan = build_execution_plan(&entities, 2, 2, &[], None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Current);
 
         // All entities get ApplyEntity
-        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let apply_names: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(apply_names.contains(&"config.users"));
         assert!(apply_names.contains(&"config.orders"));
 
@@ -1840,25 +2172,26 @@ mod tests {
 
     #[test]
     fn a3_behind_by_one_has_migrate_entity() {
-        let entities = vec![
-            test_entity("config.users"),
-            test_entity("config.orders"),
-        ];
-        let migrations = vec![
-            test_migration(1, 2, vec![], vec!["config.users"], vec![]),
-        ];
+        let entities = vec![test_entity("config.users"), test_entity("config.orders")];
+        let migrations = vec![test_migration(1, 2, vec![], vec!["config.users"], vec![])];
 
         let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
         // Should have a MigrateEntity step for config.users
-        let migrate_steps: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::MigrateEntity { entity_name, migration_version, .. } => {
-                Some((entity_name.as_str(), *migration_version))
-            }
-            _ => None,
-        }).collect();
+        let migrate_steps: Vec<(&str, u32)> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_version,
+                    ..
+                } => Some((entity_name.as_str(), *migration_version)),
+                _ => None,
+            })
+            .collect();
         assert!(migrate_steps.contains(&("config.users", 2)));
 
         // Should also have SetVersion
@@ -1869,10 +2202,7 @@ mod tests {
 
     #[test]
     fn a4_behind_by_multiple_has_record_per_migration() {
-        let entities = vec![
-            test_entity("config.users"),
-            test_entity("config.orders"),
-        ];
+        let entities = vec![test_entity("config.users"), test_entity("config.orders")];
         let migrations = vec![
             test_migration(1, 2, vec![], vec!["config.users"], vec![]),
             test_migration(2, 3, vec![], vec!["config.orders"], vec![]),
@@ -1883,10 +2213,14 @@ mod tests {
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
         // Should have RecordMigration for both v2 and v3
-        let record_versions: Vec<u32> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::RecordMigration { version, .. } => Some(*version),
-            _ => None,
-        }).collect();
+        let record_versions: Vec<u32> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::RecordMigration { version, .. } => Some(*version),
+                _ => None,
+            })
+            .collect();
         assert!(record_versions.contains(&2));
         assert!(record_versions.contains(&3));
 
@@ -1897,23 +2231,22 @@ mod tests {
 
     #[test]
     fn a5_new_table_gets_create_entity() {
-        let entities = vec![
-            test_entity("config.users"),
-            test_entity("config.audit_log"),
-        ];
-        let migrations = vec![
-            test_migration(1, 2, vec!["config.audit_log"], vec![], vec![]),
-        ];
+        let entities = vec![test_entity("config.users"), test_entity("config.audit_log")];
+        let migrations = vec![test_migration(1, 2, vec!["config.audit_log"], vec![], vec![])];
 
         let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
         // Should have CreateEntity for the new table
-        let created: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::CreateEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let created: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::CreateEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(created.contains(&"config.audit_log"));
     }
 
@@ -1921,24 +2254,26 @@ mod tests {
 
     #[test]
     fn a6_dropped_table_gets_drop_entity() {
-        let entities = vec![
-            test_entity("config.users"),
-        ];
-        let migrations = vec![
-            test_migration(1, 2, vec![], vec![], vec!["config.legacy"]),
-        ];
+        let entities = vec![test_entity("config.users")];
+        let migrations = vec![test_migration(1, 2, vec![], vec![], vec!["config.legacy"])];
 
         let plan = build_execution_plan(&entities, 1, 2, &migrations, None);
 
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
         // Should have DropEntity for the dropped table
-        let dropped: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::DropEntity { entity_name, migration_version, .. } => {
-                Some((entity_name.as_str(), *migration_version))
-            }
-            _ => None,
-        }).collect();
+        let dropped: Vec<(&str, u32)> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::DropEntity {
+                    entity_name,
+                    migration_version,
+                    ..
+                } => Some((entity_name.as_str(), *migration_version)),
+                _ => None,
+            })
+            .collect();
         assert!(dropped.contains(&("config.legacy", 2)));
     }
 
@@ -1957,12 +2292,19 @@ mod tests {
         let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
         // Only the good entity should appear in the plan
-        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let apply_names: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(apply_names.contains(&"config.users"));
-        assert!(!apply_names.contains(&"config.broken"), "entity with errors should be filtered out");
+        assert!(
+            !apply_names.contains(&"config.broken"),
+            "entity with errors should be filtered out"
+        );
     }
 
     // M5.2: External entity filtered
@@ -1974,12 +2316,19 @@ mod tests {
 
         let plan = build_execution_plan(&entities, 0, 1, &[], None);
 
-        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let apply_names: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(apply_names.contains(&"config.users"));
-        assert!(!apply_names.contains(&"pg_catalog.pg_type"), "external entity should be filtered out");
+        assert!(
+            !apply_names.contains(&"pg_catalog.pg_type"),
+            "external entity should be filtered out"
+        );
     }
 
     // M5.3: DB ahead of latest
@@ -2001,10 +2350,14 @@ mod tests {
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should have ApplyEntity + SetVersion(0)
-        let apply_names: Vec<&str> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let apply_names: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(apply_names.contains(&"config.users"));
         assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(0))));
     }
@@ -2023,12 +2376,18 @@ mod tests {
         assert_eq!(plan.strategy, ApplyStrategy::Migrate);
 
         // Should have TWO MigrateEntity steps for config.users
-        let migrate_steps: Vec<(&str, u32)> = plan.steps.iter().filter_map(|s| match s {
-            ExecutionStep::MigrateEntity { entity_name, migration_version, .. } => {
-                Some((entity_name.as_str(), *migration_version))
-            }
-            _ => None,
-        }).collect();
+        let migrate_steps: Vec<(&str, u32)> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_version,
+                    ..
+                } => Some((entity_name.as_str(), *migration_version)),
+                _ => None,
+            })
+            .collect();
         assert!(migrate_steps.contains(&("config.users", 2)));
         assert!(migrate_steps.contains(&("config.users", 3)));
         assert_eq!(
@@ -2047,7 +2406,11 @@ mod tests {
 
         assert_eq!(plan.strategy, ApplyStrategy::Fresh);
         // Should only have SetVersion step (no entities to apply)
-        let apply_count = plan.steps.iter().filter(|s| matches!(s, ExecutionStep::ApplyEntity(_))).count();
+        let apply_count = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s, ExecutionStep::ApplyEntity(_)))
+            .count();
         assert_eq!(apply_count, 0, "no entities means no ApplyEntity steps");
         assert!(matches!(plan.steps.last(), Some(ExecutionStep::SetVersion(1))));
     }
@@ -2078,9 +2441,11 @@ mod tests {
             s, ExecutionStep::ApplyEntity(name) if name == "b"
         )));
         // Migration is recorded and SetVersion still advances
-        assert!(plan.steps.iter().any(|s| matches!(
-            s, ExecutionStep::RecordMigration { version: 2, .. }
-        )));
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, ExecutionStep::RecordMigration { version: 2, .. }))
+        );
         assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
     }
 
@@ -2114,18 +2479,11 @@ mod tests {
         )
         .unwrap();
 
-        let design = Design::from_config_with_dir(
-            &project_dir.join("design.yaml"),
-            "dev",
-            Some(project_dir),
-        )
-        .unwrap();
+        let design = Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
 
         // DB is at v1 → migration v2 is pending
         let mock = crate::adapter::mock::MockAdapter::new().with_meta("dev", 1);
-        let result = design
-            .apply(&mock, None, false, None, Progress::none())
-            .await;
+        let result = design.apply(&mock, None, false, None, Progress::none()).await;
 
         assert!(result.is_err(), "apply should be blocked by unresolved TODO");
         let msg = result.unwrap_err().to_string();
@@ -2158,18 +2516,11 @@ mod tests {
         )
         .unwrap();
 
-        let design = Design::from_config_with_dir(
-            &project_dir.join("design.yaml"),
-            "dev",
-            Some(project_dir),
-        )
-        .unwrap();
+        let design = Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
 
         // Fresh DB — v1 migration is pending but data.sql has no TODOs
         let mock = crate::adapter::mock::MockAdapter::new();
-        let result = design
-            .apply(&mock, None, false, None, Progress::none())
-            .await;
+        let result = design.apply(&mock, None, false, None, Progress::none()).await;
 
         assert!(result.is_ok(), "should not be blocked: {:?}", result);
     }
@@ -2187,8 +2538,7 @@ mod tests {
             "project:\n  name: test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
         )
         .unwrap();
-        let design =
-            Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
+        let design = Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
 
         assert_eq!(
             design.authored_entity_count(),
@@ -2222,8 +2572,7 @@ mod tests {
             "create table if not exists public.widgets (id bigint primary key);\n",
         )
         .unwrap();
-        let design =
-            Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
+        let design = Design::from_config_with_dir(&project_dir.join("design.yaml"), "dev", Some(project_dir)).unwrap();
 
         assert_eq!(
             design.authored_entity_count(),
@@ -2241,9 +2590,9 @@ mod tests {
 
     #[tokio::test]
     async fn apply_with_report_gaps_errors_before_writing() {
+        use crate::config::DepsPolicy;
         use crate::scope::ResolvedScope;
         use std::collections::HashSet;
-        use crate::config::DepsPolicy;
 
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
@@ -2259,9 +2608,7 @@ mod tests {
             extensions: None,
         };
 
-        let result = design
-            .apply(&mock, None, false, Some(&scope), Progress::none())
-            .await;
+        let result = design.apply(&mock, None, false, Some(&scope), Progress::none()).await;
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("dependency gap"), "expected gap error, got: {msg}");
         assert!(mock.applied_names().is_empty()); // no writes
@@ -2269,9 +2616,9 @@ mod tests {
 
     #[tokio::test]
     async fn apply_with_scope_filters_entities() {
+        use crate::config::DepsPolicy;
         use crate::scope::ResolvedScope;
         use std::collections::HashSet;
-        use crate::config::DepsPolicy;
 
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
@@ -2335,7 +2682,10 @@ mod tests {
             .await
             .unwrap();
         let applied = mock.applied_names();
-        assert!(applied.iter().any(|n| n == "config.lookups"), "in-scope tables still apply: {applied:?}");
+        assert!(
+            applied.iter().any(|n| n == "config.lookups"),
+            "in-scope tables still apply: {applied:?}"
+        );
         assert!(
             !applied.iter().any(|n| n == "uuid-ossp" || n == "postgis"),
             "empty allowlist must skip all extensions, got: {applied:?}"
@@ -2356,8 +2706,14 @@ mod tests {
             .await
             .unwrap();
         let applied = mock.applied_names();
-        assert!(applied.iter().any(|n| n == "uuid-ossp"), "listed extension applies: {applied:?}");
-        assert!(!applied.iter().any(|n| n == "postgis"), "unlisted extension dropped: {applied:?}");
+        assert!(
+            applied.iter().any(|n| n == "uuid-ossp"),
+            "listed extension applies: {applied:?}"
+        );
+        assert!(
+            !applied.iter().any(|n| n == "postgis"),
+            "unlisted extension dropped: {applied:?}"
+        );
     }
 
     #[test]
@@ -2367,7 +2723,10 @@ mod tests {
             Entity::new(EntityType::Table, "auth.sessions"),
         ];
         let skip = ["auth".to_string()];
-        entities.retain(|e| match &e.schema { Some(s) => !skip.contains(s), None => true });
+        entities.retain(|e| match &e.schema {
+            Some(s) => !skip.contains(s),
+            None => true,
+        });
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "config.users");
     }
@@ -2411,18 +2770,17 @@ mod tests {
         )
         .unwrap();
 
-        let design =
-            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
-                .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
         let mock = MockAdapter::new();
         let mut summary = None;
-        design
-            .deploy(&mock, false, None, |s| summary = Some(s))
-            .await
-            .unwrap();
+        design.deploy(&mock, false, None, |s| summary = Some(s)).await.unwrap();
 
         let summary: DeployComplete = summary.expect("deploy must report a summary");
-        assert_eq!(summary.policies.applied.len(), 1, "policy file must be applied by the export");
+        assert_eq!(
+            summary.policies.applied.len(),
+            1,
+            "policy file must be applied by the export"
+        );
         assert!(summary.policies.failed.is_empty());
     }
 
@@ -2433,15 +2791,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
 
-        let design =
-            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
-                .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
         let mock = MockAdapter::new();
         let mut summary = None;
-        design
-            .deploy(&mock, false, None, |s| summary = Some(s))
-            .await
-            .unwrap();
+        design.deploy(&mock, false, None, |s| summary = Some(s)).await.unwrap();
 
         let summary: DeployComplete = summary.expect("deploy must report a summary even with no data");
         assert_eq!(summary.import.tables, 0);
@@ -2461,22 +2814,155 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
         std::fs::write(tmp.path().join("policies/broken.sql"), "THIS IS NOT SQL;").unwrap();
 
-        let design =
-            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
-                .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
         let mock = MockAdapter::new().fail_script_containing("THIS IS NOT SQL");
         let mut summary = None;
-        let result = design
-            .deploy(&mock, false, None, |s| summary = Some(s))
-            .await;
+        let result = design.deploy(&mock, false, None, |s| summary = Some(s)).await;
 
         assert!(result.is_ok(), "a failed policy file must not fail the deploy");
         let summary: DeployComplete = summary.expect("deploy must report a summary");
         assert_eq!(summary.policies.failed.len(), 1, "the failure must be recorded");
         let warnings = summary.warnings();
         assert!(
-            warnings.iter().any(|w| w.contains("policy not applied") && w.contains("broken.sql")),
+            warnings
+                .iter()
+                .any(|w| w.contains("policy not applied") && w.contains("broken.sql")),
             "failed policy must surface as a warning: {warnings:?}"
+        );
+    }
+
+    /// End-to-end on the deploy path: a scope that excludes a schema must skip
+    /// that schema's policy files and *say so*. Counting only what ran would
+    /// let `deploy --scope` report "1 applied" with nothing accounting for the
+    /// rest — the silent-omission failure this reporting exists to prevent.
+    #[tokio::test]
+    async fn a_scoped_deploy_surfaces_skipped_policies_as_warnings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id int primary key);",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/app")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/svc")).unwrap();
+        std::fs::write(tmp.path().join("policies/app/t.sql"), "select 1;").unwrap();
+        std::fs::write(tmp.path().join("policies/svc/metrics.sql"), "select 1;").unwrap();
+
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).expect("scope must resolve");
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .deploy(&mock, false, Some(&scope), |s| summary = Some(s))
+            .await
+            .expect("deploy must succeed");
+
+        let summary: DeployComplete = summary.expect("deploy must report a summary");
+        assert_eq!(
+            summary.policies.skipped.len(),
+            1,
+            "svc policy must be skipped: {summary:?}"
+        );
+        assert_eq!(summary.policies.applied.len(), 1, "app policy must still apply");
+        assert!(summary.policies.failed.is_empty(), "a skip is not a failure");
+        let warnings = summary.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("policy skipped") && w.contains("metrics.sql")),
+            "skipped policy must surface as a warning: {warnings:?}"
+        );
+    }
+
+    /// The report's error split must be the same judgement `ensure_fully_parsed`
+    /// makes, or `inspect` and `apply` disagree about what is broken. Before
+    /// this, `inspect --scope daemon` reported a parse error in an excluded
+    /// schema while `apply --scope daemon` applied cleanly and exited 0.
+    #[test]
+    fn scoped_report_blocks_on_exactly_what_apply_refuses_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/svc")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id int primary key);",
+        )
+        .unwrap();
+        // Broken, and in the schema the scope excludes.
+        std::fs::write(
+            tmp.path().join("ddl/table/svc/broken.ddl"),
+            "set search_path to svc;\ncreate table if not exists broken (id int,,,);",
+        )
+        .unwrap();
+
+        let mut design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+
+        let report = design.report(None, Some(&scope));
+        assert!(
+            report.issues.is_empty(),
+            "the excluded file must not block scope 'daemon': {:?}",
+            report.issues.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(report.out_of_scope_issues.len(), 1, "but it must still be reported");
+        assert_eq!(report.out_of_scope_issues[0].name, "svc.broken");
+
+        // The property under test: the scoped run agrees.
+        assert!(
+            design.ensure_fully_parsed(Some(&scope), Some(&ws), None).is_ok(),
+            "apply --scope daemon must not refuse when nothing in scope is broken"
+        );
+        // And unscoped, the same file does block.
+        assert!(
+            design.ensure_fully_parsed(None, None, None).is_err(),
+            "an unscoped run must still refuse"
+        );
+    }
+
+    /// The inverse: a broken file the scope *does* build must block it, and
+    /// must not be filed as out-of-scope.
+    #[test]
+    fn scoped_report_blocks_on_an_in_scope_parse_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\nschemas: [app, svc]\nscopes:\n  daemon:\n    excludes: [svc]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/broken.ddl"),
+            "set search_path to app;\ncreate table if not exists broken (id int,,,);",
+        )
+        .unwrap();
+
+        let mut design =
+            Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let scope = design.resolve_scope(Some("daemon"), None).unwrap();
+        let ws = design.working_set(&scope).unwrap();
+
+        let report = design.report(None, Some(&scope));
+        assert_eq!(report.issues.len(), 1, "an in-scope parse error must block");
+        assert!(
+            report.out_of_scope_issues.is_empty(),
+            "and must not be filed as out-of-scope"
+        );
+        assert!(
+            design.ensure_fully_parsed(Some(&scope), Some(&ws), None).is_err(),
+            "apply --scope daemon must refuse"
         );
     }
 
@@ -2541,7 +3027,7 @@ mod tests {
         .unwrap();
 
         let mock = MockAdapter::new();
-        let report = apply_policies(&mock, tmp.path(), false).await.unwrap();
+        let report = apply_policies(&mock, tmp.path(), false, None).await.unwrap();
         assert_eq!(report.applied.len(), 1);
         assert!(report.failed.is_empty());
         assert_eq!(mock.script_count(), 1);
@@ -2555,9 +3041,87 @@ mod tests {
         std::fs::write(policies_dir.join("users.sql"), "-- policy").unwrap();
 
         let mock = MockAdapter::new();
-        let report = apply_policies(&mock, tmp.path(), true).await.unwrap();
+        let report = apply_policies(&mock, tmp.path(), true, None).await.unwrap();
         assert_eq!(report.applied.len(), 1);
         assert_eq!(mock.script_count(), 0, "dry run should not execute");
+    }
+
+    /// A policy protects one table. A plane whose scope excludes that table has
+    /// nothing for the file to do, and applying it anyway reported
+    /// `schema "…" does not exist` on every deploy — an expected condition
+    /// dressed as an error.
+    #[tokio::test]
+    async fn a_policy_for_an_out_of_scope_table_is_skipped_not_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/dojo")).unwrap();
+        std::fs::write(tmp.path().join("policies/dojo/repository_metrics.sql"), "select 1;").unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> = ["app.other".to_string()].into_iter().collect();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("daemon", &ws)))
+            .await
+            .unwrap();
+
+        assert!(report.applied.is_empty(), "must not apply: {:?}", report.applied);
+        assert!(report.failed.is_empty(), "a skip is not a failure: {:?}", report.failed);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(
+            report.skipped[0].1.contains("dojo.repository_metrics"),
+            "got {:?}",
+            report.skipped
+        );
+        assert!(
+            report.skipped[0].1.contains("daemon"),
+            "must name the scope: {:?}",
+            report.skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_for_an_in_scope_table_is_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies/dojo")).unwrap();
+        std::fs::write(tmp.path().join("policies/dojo/relay_inbox.sql"), "select 1;").unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> = ["dojo.relay_inbox".to_string()].into_iter().collect();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("dojo", &ws)))
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 1);
+        assert!(report.skipped.is_empty());
+    }
+
+    /// A file off the `policies/<schema>/<table>.sql` convention has no derivable
+    /// target, so it is unscopable and must still run — silently dropping it
+    /// would be the worse failure.
+    #[tokio::test]
+    async fn a_policy_file_off_convention_is_always_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(tmp.path().join("policies/loose.sql"), "select 1;").unwrap();
+        let mock = MockAdapter::new();
+
+        let ws: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let report = apply_policies(&mock, tmp.path(), false, Some(("anything", &ws)))
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied.len(), 1, "off-convention file must still apply");
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn policy_target_reads_schema_and_table_from_the_path() {
+        let root = std::path::Path::new("/p");
+        assert_eq!(
+            policy_target(std::path::Path::new("/p/policies/dojo/repository_metrics.sql"), root),
+            Some("dojo.repository_metrics".to_string())
+        );
+        // off-convention shapes have no target
+        assert_eq!(policy_target(std::path::Path::new("/p/policies/loose.sql"), root), None);
+        assert_eq!(policy_target(std::path::Path::new("/p/policies/a/b/c.sql"), root), None);
     }
 
     #[tokio::test]
@@ -2565,18 +3129,9 @@ mod tests {
         // Use a minimal design (no import tables, no after scripts) so
         // import_data succeeds with a MockAdapter.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("design.yaml"),
-            "project:\n  name: test\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
 
-        let design = Design::from_config_with_dir(
-            &tmp.path().join("design.yaml"),
-            "dev",
-            Some(tmp.path()),
-        )
-        .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
 
         let mock = MockAdapter::new();
         design.deploy(&mock, false, None, |_| {}).await.unwrap();
@@ -2587,8 +3142,7 @@ mod tests {
     fn empty_design() -> Design {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("design.yaml"), "project:\n  name: test\n").unwrap();
-        Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
-            .unwrap()
+        Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap()
     }
 
     #[tokio::test]
@@ -2632,10 +3186,7 @@ mod tests {
         let dropped = design.resolve_unknown_refs_via_db(&mock).await.unwrap();
 
         assert_eq!(dropped, 1);
-        assert_eq!(
-            design.entities.last().unwrap().warnings,
-            vec!["Some other warning"]
-        );
+        assert_eq!(design.entities.last().unwrap().warnings, vec!["Some other warning"]);
     }
 
     // ── refcache (offline reference cache) ───────────────
@@ -2760,10 +3311,7 @@ mod tests {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
         let all = design.resolve_scope(Some("all"), None).unwrap();
-        assert_eq!(
-            design.scoped_entities(&all).unwrap().len(),
-            design.entities().len()
-        );
+        assert_eq!(design.scoped_entities(&all).unwrap().len(), design.entities().len());
     }
 
     #[test]
@@ -2968,7 +3516,11 @@ mod tests {
 
         let ordered = order_entities_for_test(ents);
         let pos = |name: &str| ordered.iter().position(|e| e.name == name).unwrap();
-        assert!(pos("app.f") < pos("app.v"), "got {:?}", ordered.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert!(
+            pos("app.f") < pos("app.v"),
+            "got {:?}",
+            ordered.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         assert!(ordered.iter().all(|e| e.errors.is_empty()));
     }
 
@@ -3131,8 +3683,7 @@ mod tests {
         assert_eq!(both, vec!["app.m1", "app.m2"]);
 
         // Both already existed → nothing stamped (no drift masked).
-        let all_pre: HashSet<String> =
-            ["app.m1".to_string(), "app.m2".to_string()].into_iter().collect();
+        let all_pre: HashSet<String> = ["app.m1".to_string(), "app.m2".to_string()].into_iter().collect();
         assert!(matviews_to_stamp(&applied, &all_pre).is_empty());
     }
 

@@ -33,6 +33,12 @@ external:
   - name: auth.users
     note: Supabase managed authentication table
 
+apply:
+  after:
+    - sql/realtime.sql
+    - script: sql/grants.sql
+      writes: [config.lookups]
+
 import:
   staging: [staging]
   options:
@@ -43,6 +49,8 @@ import:
     - staging.lookups
     - staging.lookup_values:
         truncate: false
+  after:
+    - import/loader.sql
 
 export:
   - config.lookups
@@ -74,6 +82,7 @@ ignore:
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
 | `dialect` | string | `postgresql` | SQL dialect of the DDL files |
+| `parser`  | string | (from `dialect`) | Override the DDL parser: `pg_query` or `sqlparser` |
 
 ### `target`
 
@@ -238,6 +247,21 @@ Two choices worth understanding:
 - **`excludes: [hive]` vs `excludes: [hive.*]`.** The bare token drops hive's entities *and* the `CREATE SCHEMA hive` statement, so the main DB never creates the schema — usually what you want. Use `hive.*` instead if the empty schema should still exist on the main DB.
 - **`deps: include` on `hive`.** If hive tables reference shared tables in other schemas, a `report`-policy `--scope hive` would fail with a dependency gap. `deps: include` expands the working set to pull those dependencies in automatically; alternatively list them in `includes` or declare them under [`external`](#external). Run `dbd inspect --scope hive` to see any gaps before deploying.
 
+### `apply`
+
+Lifecycle hooks around the DDL phase, for SQL dbd does not model — attaching a table to a publication, granting on objects.
+
+| Field    | Type | Description |
+|----------|------|-------------|
+| `before` | list | Scripts run after the design and scope checks pass, before the first entity is applied |
+| `after`  | list | Scripts run once every entity is applied and every matview stamped — and **before** `policies/` |
+
+`apply.after` runs before `policies/` because publications and grants attach to objects that must already exist, while RLS policies are independent of them. A hook that needs a policy to exist will not find one.
+
+Unlike `import.after`, these run on `dbd apply` as well as `dbd deploy`. If you have post-DDL SQL living in `import.after` today, `apply.after` is where it belongs: `dbd apply` never runs the import phase, so an `import.after` hook silently does nothing on it.
+
+See [Hook scripts](#hook-scripts) for the entry format and how scopes filter them.
+
 ### `import`
 
 | Field     | Type   | Description |
@@ -245,7 +269,7 @@ Two choices worth understanding:
 | `staging` | list   | Schemas allowed for import (import fails for other schemas) |
 | `options` | object | Default options: `truncate`, `null_value`, `format` |
 | `tables`  | list   | Explicit table list (string, or `{name: options}` for per-table overrides of `truncate`/`format`/`null_value`) |
-| `after`   | list   | SQL scripts (project-relative paths) run after data load — e.g. `import/loader.sql` |
+| `after`   | list   | SQL scripts run after data load — e.g. `import/loader.sql`. See [Hook scripts](#hook-scripts) |
 
 `null_value` is the sentinel string that means SQL NULL in a CSV/TSV data file. It defaults to `''` (empty string), so by default an empty cell loads as NULL — this is unchanged unless you configure a sentinel. Set a non-empty sentinel (e.g. `\N`, Postgres's own COPY default) when your data files need to distinguish a genuine empty string from NULL: once configured, only a cell matching the sentinel exactly becomes NULL, and a plain empty cell loads as a literal empty string. A per-table `null_value` under `tables:` overrides the global `options.null_value` for that table only:
 
@@ -259,6 +283,32 @@ import:
 ```
 
 > **Environment-specific data** is by folder, not config: files under `import/<env>/<schema>/<file>` load only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment (see [Commands → import](04-commands.md#dbd-import)).
+
+### Hook scripts
+
+`apply.before`, `apply.after` and `import.after` all take the same entry format — a project-relative path, or an object that declares the tables the script touches:
+
+```yaml
+apply:
+  after:
+    - sql/realtime.sql                 # dependencies derived from the SQL
+    - script: sql/grants.sql           # dependencies declared explicitly
+      writes: [app.messages]
+```
+
+Scripts run in the order written. A path dbd cannot find is an error, not a skip — a hook you declared and dbd cannot locate is a misconfiguration, and continuing past it is how a declared hook comes to do nothing without saying so. Paths must stay inside the project: `..` and absolute paths are refused.
+
+**Scope filtering.** Under `--scope`, a hook runs only when every table it depends on is in the working set — the same rule that already governs staging entries. A hook whose table the scope excludes is skipped and reported:
+
+```
+⚠ after-script import/loader.sql skipped — needs staging.values, which is outside scope 'partial'
+```
+
+The run continues; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out.
+
+**Where `writes:` is needed.** dbd derives a script's tables by parsing it, which works when they appear as SQL identifiers. It cannot work when they are *data* — inside a `format()` string or an `array[…]` literal, as a realtime-publication hook typically is. No parser can recover those, so declare them with `writes:`.
+
+> **Scope filtering is a correctness aid, not a security boundary.** A script whose dependencies cannot be derived and that declares no `writes:` always runs — the safe direction, since silently skipping a hook because analysis came up short would hide, say, a realtime hook quietly not firing. Never use a scope to *prevent* a hook from running.
 
 ### `export`
 

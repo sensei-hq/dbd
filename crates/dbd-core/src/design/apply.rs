@@ -28,9 +28,51 @@ impl Design {
         // the valid, in-scope, name-matching entities. The gate runs even under
         // `dry_run`: a gappy scope is misconfigured regardless of writes.
         let working_set = self.scope_working_set(scope)?;
+        // Refuse a design with a file dbd could not read, before any write.
+        // `entities_in_scope` drops those entities silently, which is how apply
+        // used to report success while never creating the object. Like the scope
+        // gate above, this runs under `dry_run` too: an incomplete design is
+        // incomplete whether or not we are about to write.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
         let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
 
+        // A hook is filtered against the same working set the entities were.
+        // `None` — unscoped or the all-scope — runs every hook, and skips the
+        // derivation cost entirely on that common path.
+        let hook_scope = match (scope, working_set.as_ref()) {
+            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), ws)),
+            _ => None,
+        };
+
+        // `apply.before` runs here: after the scope and parse gates, so a bad
+        // design still refuses before any hook fires, and before the first
+        // entity, so a hook can prepare the ground the DDL lands on.
+        let before = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+            dry_run,
+            &mut progress,
+        )
+        .await?;
+
         if dry_run {
+            // A dry run executes nothing but must still name every script the
+            // real run would — including the after-hooks, which the early
+            // return below would otherwise hide, and including a missing file,
+            // which is a misconfiguration whether or not we are about to write.
+            hooks::run_hooks(
+                adapter,
+                &self.project_dir,
+                &self.config.apply.after,
+                hooks::HookKind::After,
+                hook_scope,
+                dry_run,
+                &mut progress,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -50,6 +92,19 @@ impl Design {
             adapter
                 .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
                 .await?;
+            // Batch adapters take this shortcut past the execution plan, but a
+            // hook is a hook: leaving `apply.after` out here would recreate, for
+            // one backend, exactly the silent no-op this feature removes.
+            let after = hooks::run_hooks(
+                adapter,
+                &self.project_dir,
+                &self.config.apply.after,
+                hooks::HookKind::After,
+                hook_scope,
+                dry_run,
+                &mut progress,
+            )
+            .await?;
             (progress.on_complete)(ApplyComplete {
                 strategy: ApplyStrategy::Current,
                 from_version: 0,
@@ -58,6 +113,9 @@ impl Design {
                 migrated: 0,
                 created: 0,
                 dropped: 0,
+                before_scripts: before.ran,
+                after_scripts: after.ran,
+                warnings: [before.warnings, after.warnings].concat(),
             });
             return Ok(());
         }
@@ -72,17 +130,20 @@ impl Design {
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(&scoped_entities, db_version, latest_version, &pending, working_set.as_ref());
+        let plan = build_execution_plan(
+            &scoped_entities,
+            db_version,
+            latest_version,
+            &pending,
+            working_set.as_ref(),
+        );
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();
 
         // Build entity lookup for ApplyEntity / CreateEntity steps
-        let entity_map: std::collections::HashMap<&str, &Entity> = self
-            .entities
-            .iter()
-            .map(|e| (e.name.as_str(), e))
-            .collect();
+        let entity_map: std::collections::HashMap<&str, &Entity> =
+            self.entities.iter().map(|e| (e.name.as_str(), e)).collect();
 
         // Materialized views this run applies (respecting the scope + name
         // filter). Capture which of them ALREADY exist before applying, so that
@@ -93,8 +154,7 @@ impl Design {
             .copied()
             .filter(|e| e.entity_type == EntityType::MaterializedView)
             .collect();
-        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty()
-        {
+        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty() {
             std::collections::HashSet::new()
         } else {
             adapter.matview_states().await?.into_keys().collect()
@@ -104,9 +164,8 @@ impl Design {
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
         // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
-        let use_txn = adapter.supports_transactional_apply()
-            && std::env::var_os("DBD_NO_TX").is_none()
-            && !plan.steps.is_empty();
+        let use_txn =
+            adapter.supports_transactional_apply() && std::env::var_os("DBD_NO_TX").is_none() && !plan.steps.is_empty();
 
         if use_txn {
             adapter.begin_batch().await?;
@@ -185,6 +244,21 @@ impl Design {
         // databases (and non-Postgres targets) without the extension.
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
+        // `apply.after` closes with the phase: every entity is applied, every
+        // matview stamped, and — critically — `policies/` has not run yet.
+        // Publications and grants attach to objects that must already exist;
+        // RLS is independent of them, so it stays last (see `deploy_with_progress`).
+        let after = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.after,
+            hooks::HookKind::After,
+            hook_scope,
+            dry_run,
+            &mut progress,
+        )
+        .await?;
+
         (progress.on_complete)(ApplyComplete {
             strategy: plan.strategy,
             from_version: db_version,
@@ -193,6 +267,9 @@ impl Design {
             migrated: counts.migrated,
             created: counts.created,
             dropped: counts.dropped,
+            before_scripts: before.ran,
+            after_scripts: after.ran,
+            warnings: [before.warnings, after.warnings].concat(),
         });
         Ok(())
     }
@@ -236,8 +313,13 @@ impl Design {
                     counts.applied += 1;
                 }
             }
-            ExecutionStep::MigrateEntity { entity_name, migration_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
+            ExecutionStep::MigrateEntity {
+                entity_name,
+                migration_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
                     .map(|e| e.entity_type.tag())
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("migrate {type_tag}:{entity_name} → v{migration_version}");
@@ -258,8 +340,13 @@ impl Design {
                 report_step_result(&desc, on_done, result)?;
                 counts.migrated += 1;
             }
-            ExecutionStep::DropEntity { entity_name, drop_sql_path, migration_version } => {
-                let type_tag = entity_map.get(entity_name.as_str())
+            ExecutionStep::DropEntity {
+                entity_name,
+                drop_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
                     .map(|e| e.entity_type.tag())
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
@@ -316,11 +403,16 @@ impl Design {
     where
         C: FnMut(DeployComplete),
     {
-        self.deploy_with_progress(adapter, dry_run, scope, Progress {
-            on_start: |_: &str| {},
-            on_done: |_: &str, _: Option<&str>| {},
-            on_complete,
-        })
+        self.deploy_with_progress(
+            adapter,
+            dry_run,
+            scope,
+            Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete,
+            },
+        )
         .await
     }
 
@@ -343,28 +435,52 @@ impl Design {
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 
-        self.apply(adapter, None, dry_run, scope, Progress {
-            on_start: &mut progress.on_start,
-            on_done: &mut progress.on_done,
-            on_complete: |s| {
-                apply_summary = Some(s);
+        self.apply(
+            adapter,
+            None,
+            dry_run,
+            scope,
+            Progress {
+                on_start: &mut progress.on_start,
+                on_done: &mut progress.on_done,
+                on_complete: |s| {
+                    apply_summary = Some(s);
+                },
             },
-        })
+        )
         .await?;
 
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
-        self.import_data(adapter, None, dry_run, scope, Progress {
-            on_start: &mut progress.on_start,
-            on_done: &mut progress.on_done,
-            on_complete: |s| {
-                import_summary = Some(s);
+        self.import_data(
+            adapter,
+            None,
+            dry_run,
+            scope,
+            Progress {
+                on_start: &mut progress.on_start,
+                on_done: &mut progress.on_done,
+                on_complete: |s| {
+                    import_summary = Some(s);
+                },
             },
-        })
+        )
         .await?;
 
-        let policies = super::apply_policies(adapter, &self.project_dir, dry_run).await?;
+        // A policy protects one table; a plane without that table has nothing
+        // for the file to do. Filter it the way every other phase is filtered.
+        let policy_ws = match scope {
+            Some(sc) if !sc.is_all => self.working_set(sc).ok().map(|ws| (sc.name.clone(), ws)),
+            _ => None,
+        };
+        let policies = super::apply_policies(
+            adapter,
+            &self.project_dir,
+            dry_run,
+            policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
+        )
+        .await?;
 
         (progress.on_complete)(DeployComplete {
             apply: apply_summary.unwrap_or_default(),

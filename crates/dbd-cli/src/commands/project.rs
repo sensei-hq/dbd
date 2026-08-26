@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::design::Progress;
 use dbd_core::Design;
+use dbd_core::design::Progress;
 
 use super::{format_deploy_summary, get_adapter, safe_copy, safe_read, safe_write};
 use crate::output::{self, Verbosity};
@@ -29,12 +29,22 @@ pub fn cmd_graph(
             "from": e.from, "to": e.to,
         })).collect::<Vec<_>>(),
         "layers": graph.layers,
+        // Named in the document rather than printed beside it: stdout here is a
+        // JSON contract (`dbd graph | jq`), and a graph that silently omits a
+        // schema is indistinguishable from a complete one. Null for the
+        // all-scope, which filters nothing.
+        "scope": (!resolved.is_all).then(|| resolved.name.clone()),
     });
 
     output::always(&serde_json::to_string_pretty(&json)?);
     output::detail(
         verbosity,
-        &format!("{} nodes, {} edges, {} layers", graph.nodes.len(), graph.edges.len(), graph.layers.len()),
+        &format!(
+            "{} nodes, {} edges, {} layers",
+            graph.nodes.len(),
+            graph.edges.len(),
+            graph.layers.len()
+        ),
     );
     Ok(())
 }
@@ -48,13 +58,13 @@ pub fn cmd_dbml(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     // Filter to the scope's working set so the generated DBML documents only the
     // entities that deploy under this scope. The all-scope keeps everything.
     let resolved = design.resolve_scope(scope, deps)?;
     let entities = design.scoped_entities(&resolved)?;
+    output::scope_filtered(&resolved, entities.len(), design.entities().len());
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
@@ -213,16 +223,11 @@ fn report_doctor_issues(
 
 /// Migrate an old-format config in place, validating the result and backing up
 /// the original to a `.yaml.bak` sibling first.
-fn fix_config_migration(
-    config: &Path,
-    project_dir: &Path,
-    content: &str,
-    verbosity: Verbosity,
-) -> Result<()> {
+fn fix_config_migration(config: &Path, project_dir: &Path, content: &str, verbosity: Verbosity) -> Result<()> {
     let migrated = dbd_core::doctor::migrate_config(content).context("Config migration failed")?;
 
-    let _: dbd_core::config::DesignConfig = serde_yaml::from_str(&migrated)
-        .context("Migrated config failed to parse — please report this as a bug")?;
+    let _: dbd_core::config::DesignConfig =
+        serde_yaml::from_str(&migrated).context("Migrated config failed to parse — please report this as a bug")?;
 
     let backup = config.with_extension("yaml.bak");
     safe_copy(project_dir, config, &backup)?;
@@ -267,7 +272,12 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
                     output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
                     fixed += 1;
                 }
-                DdlMoveOutcome::BackedUp { winner, loser, final_path, backup } => {
+                DdlMoveOutcome::BackedUp {
+                    winner,
+                    loser,
+                    final_path,
+                    backup,
+                } => {
                     output::always(&format!(
                         "Collision at {}: kept newer (from {}), backed up older (from {}) → {}",
                         final_path.display(),
@@ -287,8 +297,7 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
 }
 
 pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosity) -> Result<()> {
-    let files = dbd_core::init::create_project(project_dir, name, target)
-        .context("Failed to initialize project")?;
+    let files = dbd_core::init::create_project(project_dir, name, target).context("Failed to initialize project")?;
 
     output::info(verbosity, &format!("Initialized dbd project '{name}' ({target})"));
     for file in &files {
@@ -353,12 +362,15 @@ pub async fn cmd_deploy(
                 ));
             }
         }
-        output::info(verbosity, &format!(
-            "{} entities found, {} errors, {} warnings",
-            design.entities().len(),
-            report.issues.len(),
-            report.warnings.len(),
-        ));
+        output::info(
+            verbosity,
+            &format!(
+                "{} entities found, {} errors, {} warnings",
+                design.entities().len(),
+                report.issues.len(),
+                report.warnings.len(),
+            ),
+        );
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
@@ -413,7 +425,10 @@ pub async fn cmd_deploy(
 
     let summary = summary.unwrap_or_default();
     if !summary.policies.applied.is_empty() {
-        output::info(verbosity, &format!("Applied {} policy file(s).", summary.policies.applied.len()));
+        output::info(
+            verbosity,
+            &format!("Applied {} policy file(s).", summary.policies.applied.len()),
+        );
     }
     // Non-fatal diagnostics — skipped imports and failed policy files — are
     // always surfaced, regardless of verbosity. A deploy that quietly loaded
@@ -443,8 +458,7 @@ pub async fn cmd_reconcile(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if design.config().project.released {
         anyhow::bail!(
@@ -458,7 +472,14 @@ pub async fn cmd_reconcile(
 
     if dry_run {
         let plan = design
-            .reconcile(&*adapter, true, allow_destructive, prune, Some(&resolved), Progress::none())
+            .reconcile(
+                &*adapter,
+                true,
+                allow_destructive,
+                prune,
+                Some(&resolved),
+                Progress::none(),
+            )
             .await
             .context("Reconcile planning failed")?;
         print_reconcile_plan(&plan, prune, verbosity);
@@ -508,8 +529,8 @@ pub async fn cmd_reconcile(
         output::info(
             verbosity,
             &format!(
-                "Reconciled — {} created, {} altered, {} re-applied, {} pruned.",
-                s.created, s.altered, s.reapplied, s.dropped
+                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned.",
+                s.created, s.altered, s.reapplied, s.restamped, s.dropped
             ),
         );
     }
@@ -529,9 +550,10 @@ fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
 /// its summary line; normal mode shows only the one-line-per-entity summary,
 /// matching the CLI convention that SQL is a `-v` detail.
 fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) -> Vec<String> {
-    // `is_empty()` already covers added/altered/dropped/matview_creates, but
-    // warnings live in their own channel — a plan whose ONLY content is a matview
-    // drift warning must still print it rather than falsely claiming "in sync".
+    // `is_empty()` already covers added/altered/dropped/matview_creates/
+    // matview_restamps, but warnings live in their own channel — a plan whose
+    // ONLY content is a matview drift warning must still print it rather than
+    // falsely claiming "in sync".
     if plan.is_empty() && plan.dropped.is_empty() && plan.warnings.is_empty() {
         return vec!["Already in sync — no changes.".to_string()];
     }
@@ -541,6 +563,14 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
     }
     for name in &plan.matview_creates {
         lines.push(format!("  + create materialized view {name}"));
+    }
+    for name in &plan.matview_restamps {
+        // Not a `~ alter` (no structural change) and not a `⚠` (not drift): a
+        // v1 sentinel's hash isn't comparable to a current one, so upgrading it
+        // is a metadata-only write — but still a live write worth previewing.
+        lines.push(format!(
+            "  ↻ restamp materialized view {name} (v1 hash sentinel upgraded to v2, no drift)"
+        ));
     }
     for s in &plan.altered {
         lines.push(format!("  ~ alter  {}", s.entity_name));
@@ -576,8 +606,7 @@ pub fn cmd_release(
     name: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))
-        .context("Failed to load design")?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
 
     if design.config().project.released {
         anyhow::bail!("Project is already released.");
@@ -591,9 +620,7 @@ pub fn cmd_release(
 
     let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
     if error_count > 0 {
-        anyhow::bail!(
-            "Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`)."
-        );
+        anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
     }
 
     let version = design.config().project.version.unwrap_or(1);
@@ -634,7 +661,10 @@ mod tests {
     #[test]
     fn reconcile_plan_verbose_emits_alter_sql() {
         let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Verbose).join("\n");
-        assert!(out.contains("~ alter") && out.contains("public.users"), "summary line missing:\n{out}");
+        assert!(
+            out.contains("~ alter") && out.contains("public.users"),
+            "summary line missing:\n{out}"
+        );
         assert!(
             out.contains("ADD COLUMN email text"),
             "verbose output must include the ALTER SQL; got:\n{out}"
@@ -645,14 +675,29 @@ mod tests {
     #[test]
     fn reconcile_plan_normal_hides_alter_sql() {
         let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Normal).join("\n");
-        assert!(out.contains("~ alter") && out.contains("public.users"), "summary line missing:\n{out}");
-        assert!(!out.contains("ADD COLUMN"), "normal output must NOT include ALTER SQL; got:\n{out}");
+        assert!(
+            out.contains("~ alter") && out.contains("public.users"),
+            "summary line missing:\n{out}"
+        );
+        assert!(
+            !out.contains("ADD COLUMN"),
+            "normal output must NOT include ALTER SQL; got:\n{out}"
+        );
     }
 
     /// `graph` loads the fixture design and emits the node/edge/layer JSON.
     #[test]
     fn graph_emits_json_from_fixture() {
-        cmd_graph(&testutil::fixture_config(), "dev", &testutil::fixtures(), None, None, None, Verbosity::Verbose).unwrap();
+        cmd_graph(
+            &testutil::fixture_config(),
+            "dev",
+            &testutil::fixtures(),
+            None,
+            None,
+            None,
+            Verbosity::Verbose,
+        )
+        .unwrap();
     }
 
     /// `dbml` writes generated document(s) under the project — run against a
@@ -693,9 +738,17 @@ mod tests {
     async fn deploy_dry_run_from_local_source() {
         let src = testutil::fixtures();
         cmd_deploy(
-            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            src.to_str().unwrap(),
+            &testutil::fixture_config(),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -711,9 +764,17 @@ mod tests {
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");
         cmd_deploy(
-            proj.path().to_str().unwrap(), &cfg, "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            proj.path().to_str().unwrap(),
+            &cfg,
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -773,8 +834,17 @@ mod tests {
         cmd_release(&cfg, "dev", proj.path(), Some("v1"), Verbosity::Normal).unwrap();
 
         let err = cmd_reconcile(
-            &cfg, "dev", proj.path(), None, /*dry_run*/ true, /*allow_destructive*/ false,
-            /*prune*/ false, /*allow_scope_change*/ false, None, None, Verbosity::Normal,
+            &cfg,
+            "dev",
+            proj.path(),
+            None,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -787,9 +857,17 @@ mod tests {
     async fn deploy_clears_cache_before_dry_run() {
         let src = testutil::fixtures();
         cmd_deploy(
-            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ true, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            src.to_str().unwrap(),
+            &testutil::fixture_config(),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ true,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -801,9 +879,17 @@ mod tests {
     async fn deploy_bails_when_source_has_no_design_yaml() {
         let empty = tempfile::tempdir().unwrap();
         let err = cmd_deploy(
-            empty.path().to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
-            None, None, Verbosity::Normal,
+            empty.path().to_str().unwrap(),
+            &testutil::fixture_config(),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap_err();
@@ -818,9 +904,17 @@ mod tests {
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
         let src = testutil::fixtures();
         cmd_deploy(
-            src.to_str().unwrap(), &testutil::fixture_config(), "dev", None,
-            /*dry_run*/ true, /*no_cache*/ true, /*clear_cache*/ false, /*allow_scope_change*/ false,
-            Some("incomplete_auto"), None, Verbosity::Normal,
+            src.to_str().unwrap(),
+            &testutil::fixture_config(),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            Some("incomplete_auto"),
+            None,
+            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -836,9 +930,17 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("ddl/procedure/staging")).unwrap();
-        std::fs::write(dir.join("ddl/procedure/staging/import_jsonb_to_table.ddl"), "-- stale\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/procedure/staging/import_jsonb_to_table.ddl"),
+            "-- stale\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join("ddl/tables/public")).unwrap();
-        std::fs::write(dir.join("ddl/tables/public/thing.ddl"), "create table public.thing (id int);\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/tables/public/thing.ddl"),
+            "create table public.thing (id int);\n",
+        )
+        .unwrap();
         config
     }
 
@@ -852,7 +954,11 @@ mod tests {
 
         // Report-only: nothing on disk changes.
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+        assert!(
+            tmp.path()
+                .join("ddl/procedure/staging/import_jsonb_to_table.ddl")
+                .exists()
+        );
         assert!(tmp.path().join("ddl/tables").exists());
     }
 
@@ -873,7 +979,11 @@ mod tests {
         dbd_core::config::read(&config).expect("migrated config should parse as DesignConfig");
 
         // The stale file is gone.
-        assert!(!tmp.path().join("ddl/procedure/staging/import_jsonb_to_table.ddl").exists());
+        assert!(
+            !tmp.path()
+                .join("ddl/procedure/staging/import_jsonb_to_table.ddl")
+                .exists()
+        );
 
         // The plural folder was renamed to its singular form.
         assert!(!tmp.path().join("ddl/tables").exists());
@@ -888,7 +998,10 @@ mod tests {
         let cfg_path = proj.path().join("design.yaml");
         let original = std::fs::read_to_string(&cfg_path).unwrap();
         let needle = "dbml:\n  base:\n    exclude:\n      schemas:\n        - staging\n        - extensions\n";
-        assert!(original.contains(needle), "fixture dbml block shape changed — update this test's patch");
+        assert!(
+            original.contains(needle),
+            "fixture dbml block shape changed — update this test's patch"
+        );
         let patched = original.replace(
             needle,
             "dbml:\n  base:\n    exclude:\n      schemas:\n        - staging\n        - extensions\n  extra:\n    output: extra.dbml\n    include:\n      schemas:\n        - config\n",
@@ -902,8 +1015,14 @@ mod tests {
         let extra_path = proj.path().join("extra.dbml");
         assert!(extra_path.exists());
         let extra_content = std::fs::read_to_string(&extra_path).unwrap();
-        assert!(extra_content.contains("config"), "extra.dbml should contain the config-schema tables");
-        assert!(!extra_content.contains("staging"), "extra.dbml should be filtered to the config schema only");
+        assert!(
+            extra_content.contains("config"),
+            "extra.dbml should contain the config-schema tables"
+        );
+        assert!(
+            !extra_content.contains("staging"),
+            "extra.dbml should be filtered to the config schema only"
+        );
     }
 
     /// `reconcile_plan_lines` on an empty plan reports the in-sync message —
@@ -922,6 +1041,7 @@ mod tests {
         let plan = dbd_core::ReconcilePlan {
             added: vec!["public.new_table".to_string()],
             matview_creates: vec!["analytics.daily_sales".to_string()],
+            matview_restamps: vec!["analytics.legacy_report".to_string()],
             altered: vec![ReconcileStatement {
                 entity_name: "public.users".to_string(),
                 sql: "ALTER TABLE public.users ADD COLUMN email text;".to_string(),
@@ -939,6 +1059,10 @@ mod tests {
         assert!(
             pruned.contains("+ create materialized view analytics.daily_sales"),
             "got: {pruned}"
+        );
+        assert!(
+            pruned.contains("restamp materialized view analytics.legacy_report"),
+            "the plan must preview a pending v1→v2 restamp; got: {pruned}"
         );
         assert!(pruned.contains("~ alter  public.users"), "got: {pruned}");
         assert!(pruned.contains("- prune  public.orphan"), "got: {pruned}");

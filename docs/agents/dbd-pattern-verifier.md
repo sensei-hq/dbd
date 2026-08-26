@@ -10,9 +10,11 @@ description: >-
   reset emit DROP VIEW), string-set CHECK constraints that should be Postgres
   enums, materialized-view drift misuse, seed data that can never load (an
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
-  convention, or a `--scope` that drops them), and RLS expected from `dbd apply`
-  without `--with-policies`. Reviews from the files (no DB needed); corroborates
-  with `dbd doctor`/`dbd inspect`/`dbd diff` only if the binary is present.
+  convention, or a `--scope` that drops them), RLS expected from `dbd apply`
+  without `--with-policies`, and post-DDL SQL parked in `import.after` (which
+  never runs on `dbd apply`) instead of `apply.after`. Reviews from the files
+  (no DB needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only
+  if the binary is present.
 
   <example>
   Context: A developer changed some DDL in a dbd project and is about to apply it.
@@ -90,6 +92,26 @@ judging the workflow, and state which one you concluded and why (the file eviden
    `apply` covers policies. `dbd deploy` applies them unconditionally; `dbd apply` does not.
    Note that a *failed* policy file is non-fatal on deploy (warned + counted, exit 0), so
    "the deploy succeeded" is not evidence that RLS is in place.
+   - Also flag a **policy file off the `policies/<schema>/<table>.sql` layout** (a loose
+     `policies/foo.sql`, or a deeper nesting). dbd reads a policy's target from its path, so an
+     off-layout file has no derivable target and is **never scope-filtered** — it runs on every
+     plane, including ones lacking its schema.
+   - Do **not** flag a policy for a schema some plane lacks as a bug in itself: since v0.12.0 a
+     scoped run skips it and reports it. Flag only hand-rolled guards written to work around the
+     old behaviour (a `policies/` file wrapped in `if exists (select from information_schema…)`
+     purely to survive the wrong plane) — those can now be deleted in favour of `--scope`.
+9. **Post-DDL SQL in the wrong hook** — an `import.after` entry whose job is schema-adjacent
+   setup rather than data loading: attaching tables to a publication (Supabase realtime),
+   `grant`s, or anything whose own comment says it must "run once every entity exists".
+   `import.after` runs **only on `dbd deploy`** — the import phase is the only thing that
+   executes it — so on `dbd apply` it silently does nothing. The fix is `apply.after`, which
+   runs on both and lands after every entity is applied and before `policies/`.
+   - When moving such a hook, check whether it needs an explicit `writes:`. dbd derives a
+     script's tables by parsing it; a realtime hook typically names its tables as *data* inside
+     `array['a','b']` and `format('… %I', t)`, where derivation returns empty. A script with no
+     derivable deps and no `writes:` **always runs** (the safe direction) — so it is not broken,
+     but it is also not scope-filtered until `writes:` is declared.
+   - Evidence: the `import.after` list in `design.yaml` plus the script's own content/comments.
 
 ## How to work
 
@@ -100,6 +122,9 @@ judging the workflow, and state which one you concluded and why (the file eviden
    files, plural folders, and **misfiled view/matview DDL**; `--fix` repairs all but the
    misfilings, which it reports with a move hint). Optionally also run `dbd inspect` (and `dbd
    diff` when a DB URL is available) and fold their findings/suggestions in.
+   - `dbd inspect` exits **1** on blocking errors (v0.12.0+), so read its output, not just its
+     status. Under `--scope` it separates errors blocking that scope from out-of-scope ones;
+     an out-of-scope error still matters to *some* plane, so report it rather than dismissing it.
 4. Report. For each finding: **severity**, one-line **what**, the **evidence** (`file:line`), and
    the **fix** (cite the `dbd` skill's rule). End with a one-line verdict. If the project is
    conformant, say so explicitly: **"conformant — no issues found."** Do not invent findings to

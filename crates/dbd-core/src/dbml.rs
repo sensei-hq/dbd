@@ -1,7 +1,5 @@
 use crate::config::DbmlDocConfig;
-use crate::entity::{
-    ColumnDef, Entity, EntityType, ForeignKey, IndexDef, TableConstraint, TableDef,
-};
+use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexDef, TableConstraint, TableDef};
 
 /// Parameters for DBML generation.
 pub struct DbmlParams<'a> {
@@ -51,7 +49,9 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
     ));
 
     // Filter entities by include/exclude rules
-    let filtered: Vec<&Entity> = params.entities.iter()
+    let filtered: Vec<&Entity> = params
+        .entities
+        .iter()
         .filter(|e| matches!(e.entity_type, EntityType::Table | EntityType::Enum))
         .filter(|e| is_included(e, params))
         .collect();
@@ -66,13 +66,14 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
     // Tables
     for entity in &filtered {
         if entity.entity_type == EntityType::Table
-            && let Some(ref table_def) = entity.table_def {
-                sections.push(emit_table(
-                    &entity.name,
-                    entity.schema.as_deref().unwrap_or("public"),
-                    table_def,
-                ));
-            }
+            && let Some(ref table_def) = entity.table_def
+        {
+            sections.push(emit_table(
+                &entity.name,
+                entity.schema.as_deref().unwrap_or("public"),
+                table_def,
+            ));
+        }
     }
 
     // Refs (standalone, from all FK constraints — only from filtered tables)
@@ -94,11 +95,7 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         .copied()
         .filter(|e| e.entity_type == EntityType::Table)
         .collect();
-    let table_groups = emit_table_groups(
-        &included_tables,
-        &params.groups,
-        params.auto_group_by_schema,
-    );
+    let table_groups = emit_table_groups(&included_tables, &params.groups, params.auto_group_by_schema);
     if !table_groups.is_empty() {
         sections.push(table_groups);
     }
@@ -174,10 +171,7 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
             groups,
             auto_group_by_schema: cfg.auto_group_by_schema,
         });
-        doc.file_name = cfg
-            .output
-            .clone()
-            .unwrap_or_else(|| format!("{key}.dbml"));
+        doc.file_name = cfg.output.clone().unwrap_or_else(|| format!("{key}.dbml"));
         out.push(doc);
     }
     out
@@ -185,13 +179,8 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
 
 /// Emit `TableGroup` blocks for the given filtered tables. Returns an
 /// empty string when no groups would have any tables.
-fn emit_table_groups(
-    included_tables: &[&Entity],
-    explicit_groups: &[DbmlGroup],
-    auto_group_by_schema: bool,
-) -> String {
-    let included_names: std::collections::HashSet<&str> =
-        included_tables.iter().map(|e| e.name.as_str()).collect();
+fn emit_table_groups(included_tables: &[&Entity], explicit_groups: &[DbmlGroup], auto_group_by_schema: bool) -> String {
+    let included_names: std::collections::HashSet<&str> = included_tables.iter().map(|e| e.name.as_str()).collect();
 
     let mut blocks: Vec<String> = Vec::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -210,8 +199,7 @@ fn emit_table_groups(
     }
 
     if auto_group_by_schema {
-        let mut by_schema: std::collections::BTreeMap<String, Vec<&String>> =
-            std::collections::BTreeMap::new();
+        let mut by_schema: std::collections::BTreeMap<String, Vec<&String>> = std::collections::BTreeMap::new();
         for e in included_tables {
             let schema = e.schema.as_deref().unwrap_or("public").to_string();
             by_schema.entry(schema).or_default().push(&e.name);
@@ -454,10 +442,7 @@ fn qualify_columns(schema: &str, table: &str, cols: &[String]) -> String {
             "\"{}\".\"{}\".({})",
             schema,
             table,
-            cols.iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ")
+            cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
         )
     }
 }
@@ -566,10 +551,7 @@ fn record_external_fk<'a>(
 
 /// Render a DBML stub `Table` block for one external entity and its referenced
 /// columns (typed generically as `varchar`, since the real types are unknown).
-fn emit_external_stub_block(
-    ext_name: &str,
-    cols: &std::collections::HashSet<String>,
-) -> String {
+fn emit_external_stub_block(ext_name: &str, cols: &std::collections::HashSet<String>) -> String {
     let (schema, table_name) = match ext_name.split_once('.') {
         Some((s, t)) => (s, t),
         None => ("public", ext_name),
@@ -679,8 +661,14 @@ mod tests {
     fn enum_block() {
         let mut entity = Entity::new(EntityType::Enum, "config.status");
         entity.enum_values = vec![
-            EnumValue { name: "active".to_string(), note: Some("Currently active".to_string()) },
-            EnumValue { name: "inactive".to_string(), note: None },
+            EnumValue {
+                name: "active".to_string(),
+                note: Some("Currently active".to_string()),
+            },
+            EnumValue {
+                name: "inactive".to_string(),
+                note: None,
+            },
         ];
         let block = emit_enum(&entity);
         assert!(block.contains("Enum \"config\".\"status\""));
@@ -734,11 +722,7 @@ mod tests {
 
     #[test]
     fn table_with_indexes() {
-        let mut entity = make_table_entity(
-            "config.lookups",
-            vec![col("name", "VARCHAR(100)")],
-            vec![],
-        );
+        let mut entity = make_table_entity("config.lookups", vec![col("name", "VARCHAR(100)")], vec![]);
         entity.table_def.as_mut().unwrap().indexes = vec![IndexDef {
             name: Some("idx_lookups_name".to_string()),
             columns: vec![IndexColumn {
@@ -759,11 +743,7 @@ mod tests {
 
     #[test]
     fn table_with_note() {
-        let mut entity = make_table_entity(
-            "config.lookups",
-            vec![col("id", "INT")],
-            vec![],
-        );
+        let mut entity = make_table_entity("config.lookups", vec![col("id", "INT")], vec![]);
         entity.table_def.as_mut().unwrap().comments.table = Some("Lookup categories".to_string());
 
         let table_def = entity.table_def.as_ref().unwrap();
@@ -808,8 +788,14 @@ mod tests {
     fn full_generation() {
         let mut enum_entity = Entity::new(EntityType::Enum, "config.status");
         enum_entity.enum_values = vec![
-            EnumValue { name: "active".to_string(), note: None },
-            EnumValue { name: "inactive".to_string(), note: None },
+            EnumValue {
+                name: "active".to_string(),
+                note: None,
+            },
+            EnumValue {
+                name: "inactive".to_string(),
+                note: None,
+            },
         ];
 
         let table_entity = make_table_entity(
@@ -872,10 +858,7 @@ mod tests {
             line.contains("\"auth\".\"memberships\".(\"user_id\", \"tenant_id\")"),
             "target side missing composite tuple: {line}"
         );
-        assert!(
-            line.contains("[delete: cascade]"),
-            "expected delete action: {line}"
-        );
+        assert!(line.contains("[delete: cascade]"), "expected delete action: {line}");
     }
 
     #[test]
@@ -884,15 +867,15 @@ mod tests {
         // should surface as a single composite Ref line.
         let mut child = make_table_entity(
             "shop.orders",
-            vec![
-                pk_col("id", "UUID"),
-                col("user_id", "UUID"),
-                col("tenant_id", "UUID"),
-            ],
+            vec![pk_col("id", "UUID"), col("user_id", "UUID"), col("tenant_id", "UUID")],
             vec![],
         );
-        child.table_def.as_mut().unwrap().constraints.push(
-            TableConstraint::ForeignKey(ForeignKey {
+        child
+            .table_def
+            .as_mut()
+            .unwrap()
+            .constraints
+            .push(TableConstraint::ForeignKey(ForeignKey {
                 name: None,
                 columns: vec!["user_id".into(), "tenant_id".into()],
                 ref_schema: Some("auth".into()),
@@ -900,14 +883,10 @@ mod tests {
                 ref_columns: vec!["user_id".into(), "tenant_id".into()],
                 on_delete: None,
                 on_update: None,
-            }),
-        );
+            }));
         let parent = make_table_entity(
             "auth.memberships",
-            vec![
-                pk_col("user_id", "UUID"),
-                pk_col("tenant_id", "UUID"),
-            ],
+            vec![pk_col("user_id", "UUID"), pk_col("tenant_id", "UUID")],
             vec![],
         );
         let entities = vec![child, parent];
@@ -1076,18 +1055,23 @@ mod tests {
             auto_group_by_schema: false,
         });
 
-        assert!(doc.content.contains("Table \"auth\".\"users\""), "should have stub table for auth.users");
-        assert!(doc.content.contains("\"id\" varchar"), "stub should contain referenced column");
-        assert!(doc.content.contains("External entity"), "stub should have external note");
+        assert!(
+            doc.content.contains("Table \"auth\".\"users\""),
+            "should have stub table for auth.users"
+        );
+        assert!(
+            doc.content.contains("\"id\" varchar"),
+            "stub should contain referenced column"
+        );
+        assert!(
+            doc.content.contains("External entity"),
+            "stub should have external note"
+        );
     }
 
     #[test]
     fn external_entity_without_fk_refs_skipped() {
-        let table_entity = make_table_entity(
-            "config.profiles",
-            vec![pk_col("id", "UUID")],
-            vec![],
-        );
+        let table_entity = make_table_entity("config.profiles", vec![pk_col("id", "UUID")], vec![]);
         // auth.uid is a function, not a FK target
         let external_entity = Entity::new(EntityType::External, "auth.uid");
 
@@ -1105,8 +1089,14 @@ mod tests {
             auto_group_by_schema: false,
         });
 
-        assert!(!doc.content.contains("auth.uid"), "external without FK refs should not appear");
-        assert!(!doc.content.contains("\"auth\".\"uid\""), "external without FK refs should not appear as table");
+        assert!(
+            !doc.content.contains("auth.uid"),
+            "external without FK refs should not appear"
+        );
+        assert!(
+            !doc.content.contains("\"auth\".\"uid\""),
+            "external without FK refs should not appear as table"
+        );
     }
 
     // ── TableGroup tests ───────────────────────────────
@@ -1284,9 +1274,7 @@ mod tests {
 
     #[test]
     fn no_groups_when_neither_explicit_nor_auto() {
-        let entities = vec![
-            make_table_entity("config.users", vec![col("id", "INT")], vec![]),
-        ];
+        let entities = vec![make_table_entity("config.users", vec![col("id", "INT")], vec![])];
         let doc = generate_dbml(&DbmlParams {
             entities: &entities,
             project_name: "G",

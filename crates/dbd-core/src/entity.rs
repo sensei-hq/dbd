@@ -32,11 +32,7 @@ pub const TYPES_WITH_SCHEMA: &[EntityType] = &[
 ];
 
 /// Entity types without schema qualification (file path: ddl/<type>/<name>.ddl)
-pub const TYPES_WITHOUT_SCHEMA: &[EntityType] = &[
-    EntityType::Role,
-    EntityType::Schema,
-    EntityType::Extension,
-];
+pub const TYPES_WITHOUT_SCHEMA: &[EntityType] = &[EntityType::Role, EntityType::Schema, EntityType::Extension];
 
 impl EntityType {
     /// Parse a type string from a folder name.
@@ -44,9 +40,7 @@ impl EntityType {
         match name {
             "table" | "tables" => Some(Self::Table),
             "view" | "views" => Some(Self::View),
-            "materialized_view" | "materialized_views" | "matview" | "matviews" => {
-                Some(Self::MaterializedView)
-            }
+            "materialized_view" | "materialized_views" | "matview" | "matviews" => Some(Self::MaterializedView),
             "function" | "functions" => Some(Self::Function),
             "procedure" | "procedures" => Some(Self::Procedure),
             "enum" | "enums" => Some(Self::Enum),
@@ -173,19 +167,10 @@ impl FkAction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TableConstraint {
-    PrimaryKey {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
-    Unique {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
+    PrimaryKey { name: Option<String>, columns: Vec<String> },
+    Unique { name: Option<String>, columns: Vec<String> },
     ForeignKey(ForeignKey),
-    Check {
-        name: Option<String>,
-        expression: String,
-    },
+    Check { name: Option<String>, expression: String },
 }
 
 /// How an identity column generates its value (`GENERATED … AS IDENTITY`).
@@ -401,9 +386,7 @@ impl Entity {
     /// Path format: `ddl/<type>/<schema>/<name>.ddl` (schema-scoped)
     ///              `ddl/<type>/<name>.ddl` (non-schema types like role)
     pub fn from_file(path: &Path) -> Self {
-        let parts: Vec<&str> = path.components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect();
+        let parts: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
 
         // Find the "ddl" component and use everything after it.
         // This supports both relative paths ("ddl/table/...") and
@@ -420,15 +403,9 @@ impl Entity {
         let recognized_type = EntityType::from_folder_name(folder);
         let entity_type = recognized_type.unwrap_or(EntityType::Table);
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ddl");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("ddl");
 
         let (name, schema) = if entity_type.has_schema() && parts.len() >= 3 {
             let schema = parts[1].to_string();
@@ -465,10 +442,7 @@ impl Entity {
     /// Path format: `import/<schema>/<name>.<ext>` or `import/<env>/<schema>/<name>.<ext>`
     /// Returns the entity with the file path set, format derived from extension.
     pub fn from_import_file(path: &Path) -> Self {
-        let parts: Vec<&str> = path
-            .components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect();
+        let parts: Vec<&str> = path.components().filter_map(|c| c.as_os_str().to_str()).collect();
 
         // Find "import" in the path and work from there
         let import_pos = parts.iter().rposition(|&p| p == "import");
@@ -479,23 +453,16 @@ impl Entity {
 
         // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
         // vs import/staging/file.csv → env=None, schema=staging
-        let (_env, schema_and_rest) = if after_import.len() >= 3
-            && (after_import[0] == "dev" || after_import[0] == "prod")
-        {
-            (Some(after_import[0].to_string()), &after_import[1..])
-        } else {
-            (None, after_import)
-        };
+        let (_env, schema_and_rest) =
+            if after_import.len() >= 3 && (after_import[0] == "dev" || after_import[0] == "prod") {
+                (Some(after_import[0].to_string()), &after_import[1..])
+            } else {
+                (None, after_import)
+            };
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("csv");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("csv");
 
         let (name, schema) = if schema_and_rest.len() >= 2 {
             let schema = schema_and_rest[0].to_string();
@@ -685,10 +652,22 @@ mod tests {
 
     #[test]
     fn entity_type_from_folder_name_matview() {
-        assert_eq!(EntityType::from_folder_name("materialized_view"), Some(EntityType::MaterializedView));
-        assert_eq!(EntityType::from_folder_name("materialized_views"), Some(EntityType::MaterializedView));
-        assert_eq!(EntityType::from_folder_name("matview"), Some(EntityType::MaterializedView));
-        assert_eq!(EntityType::from_folder_name("matviews"), Some(EntityType::MaterializedView));
+        assert_eq!(
+            EntityType::from_folder_name("materialized_view"),
+            Some(EntityType::MaterializedView)
+        );
+        assert_eq!(
+            EntityType::from_folder_name("materialized_views"),
+            Some(EntityType::MaterializedView)
+        );
+        assert_eq!(
+            EntityType::from_folder_name("matview"),
+            Some(EntityType::MaterializedView)
+        );
+        assert_eq!(
+            EntityType::from_folder_name("matviews"),
+            Some(EntityType::MaterializedView)
+        );
     }
 
     #[test]
