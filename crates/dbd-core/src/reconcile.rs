@@ -264,8 +264,16 @@ fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<
 /// spelling, and schema-qualify a bare enum name using `enum_types`.
 fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String {
     let mut s = raw.trim().to_lowercase();
-    if let Some(rest) = s.strip_prefix("public.") {
-        s = rest.to_string();
+    // `public.` and `pg_catalog.` are the implicit search path — a type named
+    // through either is the same type as the bare form. Postgres rewrites
+    // SQL-standard names into pg_catalog-qualified internals at parse time
+    // (`int` → `pg_catalog.int4`), so without this the alias table below never
+    // sees them and every such column reads as drifted.
+    for prefix in ["public.", "pg_catalog."] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.to_string();
+            break;
+        }
     }
     // Split "base(args)" so parameterized aliases (varchar(255)) normalize too.
     let (base, args) = match s.split_once('(') {
@@ -1252,6 +1260,42 @@ mod tests {
         let plan = plan_reconcile(&live, &desired);
         assert!(plan.is_empty());
         assert!(!plan.destructive);
+    }
+
+    // ── pg_catalog-qualified type names ─────────────────────────────────────
+
+    /// Postgres rewrites SQL-standard type names at parse time, so libpg_query
+    /// reports `pg_catalog.int4` where sqlparser reports `INT`. Both name the
+    /// same type; the alias table below already knows `int4`, it just never saw
+    /// it because the qualified form does not reach the match.
+    #[test]
+    fn pg_catalog_qualified_types_normalize_like_their_bare_form() {
+        let e = std::collections::HashMap::new();
+        for (qualified, bare) in [
+            ("pg_catalog.int4", "int"),
+            ("pg_catalog.int8", "bigint"),
+            ("pg_catalog.int2", "smallint"),
+            ("pg_catalog.bool", "boolean"),
+            ("pg_catalog.varchar(30)", "varchar(30)"),
+            ("pg_catalog.bpchar(2)", "char(2)"),
+            ("pg_catalog.numeric(10,2)", "numeric(10,2)"),
+            ("pg_catalog.timestamptz", "timestamp with time zone"),
+        ] {
+            assert_eq!(
+                canonical_type(qualified, &e),
+                canonical_type(bare, &e),
+                "{qualified} and {bare} must canonicalize alike"
+            );
+        }
+    }
+
+    /// Only the two system schemas are stripped. A user type keeps its schema —
+    /// `app.status_t` and `other.status_t` are different types.
+    #[test]
+    fn a_user_schema_qualification_is_preserved() {
+        let e = std::collections::HashMap::new();
+        assert_eq!(canonical_type("app.status_t", &e), "app.status_t");
+        assert_ne!(canonical_type("app.status_t", &e), canonical_type("other.status_t", &e));
     }
 
     /// Issue #8: the read-only diff builder retains foreign keys; the reconcile
