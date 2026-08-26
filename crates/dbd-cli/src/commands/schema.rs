@@ -85,7 +85,16 @@ pub async fn cmd_inspect(
     );
     print_matview_errors(&matview_errors);
 
+    // Advisory only — string-set CHECK constraints that could be a Postgres enum.
+    // Report-only: NOT added to the summary error count, never affects the exit code.
+    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
+    print_enum_hints(&enum_hints);
+
+    // Summary last, so the counts are the final thing on screen. Printed before
+    // the advisory section it would scroll away behind it, which is backwards:
+    // the tally is what a reader is looking for.
     let blocking = report.issues.len() + todos.len() + matview_errors.len();
+    output::always("");
     output::summary(blocking, report.warnings.len(), total_entities);
     if !report.out_of_scope_issues.is_empty() {
         output::always(&format!(
@@ -94,11 +103,11 @@ pub async fn cmd_inspect(
             scope_name.unwrap_or("all"),
         ));
     }
-
-    // Advisory only — string-set CHECK constraints that could be a Postgres enum.
-    // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
-    print_enum_hints(&enum_hints);
+    // Named in the tally so a reader knows the advisory block was counted
+    // separately rather than folded into the error count.
+    if !enum_hints.is_empty() {
+        output::always(&format!("({} enum suggestion(s) — advisory)", enum_hints.len()));
+    }
 
     // Report first, then fail. The findings above are the useful output; an
     // early return would print an "Error:" line instead of them.
@@ -323,22 +332,121 @@ fn print_matview_errors(errors: &[String]) {
     }
 }
 
-/// Render one advisory line per enum-candidate hint (pure, so it's unit-testable).
-fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
-    hints
-        .iter()
-        .map(|h| {
-            let set = h.values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ");
-            let schema = h.entity.split_once('.').map(|(s, _)| s).unwrap_or("public");
-            format!(
-                "  {entity}.{column}: CHECK constrains to a fixed string set {{{set}}} — a \
-                 Postgres enum (ddl/enum/{schema}/{column}.ddl) gives type safety + cleaner \
-                 introspection. Not required.",
-                entity = h.entity,
-                column = h.column,
-            )
+/// One proposed enum: the columns that would share it, and the name to file it under.
+struct EnumProposal {
+    schema: String,
+    type_name: String,
+    values: Vec<String>,
+    /// Qualified `schema.table.column` for each column with this exact set.
+    columns: Vec<String>,
+    /// True when the column name was already claimed by a different value set,
+    /// so the type is named after its table instead.
+    renamed: bool,
+}
+
+/// Group enum-candidate hints into one proposal per distinct value set.
+///
+/// Two things the old per-column rendering got wrong. It repeated the same
+/// rationale on every line, and it derived the filename from the *column*
+/// (`ddl/enum/<schema>/<column>.ddl`) — so columns that share a name but not a
+/// domain all pointed at one file. In a real project three different `state`
+/// sets and two different `source` sets collided, and following the advice
+/// literally would have produced one file with conflicting definitions.
+///
+/// Grouping is by exact value list, not by a set: Postgres enums are ordered,
+/// so two columns listing the same values in a different order are not
+/// self-evidently the same type, and merging them would be a guess.
+fn group_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<EnumProposal> {
+    // Preserve first-seen order so output is deterministic for a given design.
+    let mut order: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut columns: std::collections::HashMap<(String, String, Vec<String>), Vec<String>> =
+        std::collections::HashMap::new();
+
+    for h in hints {
+        let (schema, table) = h.entity.split_once('.').unwrap_or(("public", h.entity.as_str()));
+        let key = (schema.to_string(), h.column.clone(), h.values.clone());
+        if !columns.contains_key(&key) {
+            order.push(key.clone());
+        }
+        columns
+            .entry(key)
+            .or_default()
+            .push(format!("{schema}.{table}.{}", h.column));
+    }
+
+    // A column name is ambiguous when two different value sets both want it.
+    let mut claims: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    for (schema, column, _) in &order {
+        *claims.entry((schema.clone(), column.clone())).or_default() += 1;
+    }
+
+    let mut proposals: Vec<EnumProposal> = order
+        .into_iter()
+        .map(|key| {
+            let (schema, column, values) = key.clone();
+            let cols = columns.remove(&key).unwrap_or_default();
+            let ambiguous = claims.get(&(schema.clone(), column.clone())).copied().unwrap_or(0) > 1;
+            // Disambiguate with the table that owns it. Only reached for a real
+            // collision, so the plainer name is kept whenever it is unambiguous.
+            let type_name = if ambiguous {
+                let table = cols
+                    .first()
+                    .and_then(|c| c.split('.').nth(1))
+                    .unwrap_or(column.as_str());
+                format!("{table}_{column}")
+            } else {
+                column.clone()
+            };
+            EnumProposal {
+                schema,
+                type_name,
+                values,
+                columns: cols,
+                renamed: ambiguous,
+            }
         })
-        .collect()
+        .collect();
+
+    // Scan order is deterministic but arbitrary to read. Sorting groups each
+    // schema's proposals together and makes the list scannable.
+    proposals.sort_by(|a, b| (&a.schema, &a.type_name).cmp(&(&b.schema, &b.type_name)));
+    proposals
+}
+
+/// Render the advisory enum-candidate section: one rationale, then the
+/// instances (pure, so it's unit-testable).
+fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
+    let proposals = group_enum_hints(hints);
+    if proposals.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = vec![
+        "  A CHECK that pins a column to a fixed set of strings can be a Postgres enum instead —".to_string(),
+        "  the type is enforced by the database and introspects as a real type. Advisory only:".to_string(),
+        "  never counted as an error, never affects the exit code.".to_string(),
+        String::new(),
+    ];
+
+    for p in &proposals {
+        let set = p.values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ");
+        out.push(format!("  ddl/enum/{}/{}.ddl — {set}", p.schema, p.type_name));
+        out.push(format!("      {}", p.columns.join(", ")));
+    }
+
+    // Only mention renaming if it actually happened, and say why — a reader who
+    // sees `sync_state_state` should know it is a collision-avoidance name and
+    // not dbd's idea of good taste.
+    let renamed: Vec<&EnumProposal> = proposals.iter().filter(|p| p.renamed).collect();
+    if !renamed.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "  {} type(s) named after their table because the column name covers more than one",
+            renamed.len()
+        ));
+        out.push("  value set in that schema — rename to whatever reads better.".to_string());
+    }
+    out
 }
 
 /// Print the advisory `Suggestions:` section (enum candidates). Report-only.
@@ -711,19 +819,97 @@ mod tests {
     use super::*;
     use crate::commands::testutil;
 
+    fn hint(entity: &str, column: &str, values: &[&str]) -> dbd_core::design::EnumHint {
+        dbd_core::design::EnumHint {
+            entity: entity.into(),
+            column: column.into(),
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn render_enum_hints_renders_advisory_line() {
-        let hints = vec![dbd_core::design::EnumHint {
-            entity: "config.lookups".into(),
-            column: "status".into(),
-            values: vec!["active".into(), "inactive".into()],
-        }];
-        let out = render_enum_hints(&hints);
-        assert!(
-            out.iter()
-                .any(|l| l.contains("config.lookups.status") && l.contains("'active'") && l.contains("enum")),
-            "got: {out:?}"
+        let out = render_enum_hints(&[hint("config.lookups", "status", &["active", "inactive"])]);
+        let body = out.join("\n");
+        assert!(body.contains("config.lookups.status"), "names the column: {body}");
+        assert!(body.contains("'active'"), "lists the values: {body}");
+        assert!(body.contains("ddl/enum/config/status.ddl"), "proposes a path: {body}");
+    }
+
+    /// The rationale is stated once, not repeated per column — the whole point
+    /// of grouping. Fourteen candidates used to mean fourteen copies of it.
+    #[test]
+    fn render_enum_hints_states_the_rationale_once() {
+        let out = render_enum_hints(&[
+            hint("app.a", "kind", &["x", "y"]),
+            hint("app.b", "flavour", &["p", "q"]),
+            hint("app.c", "mode", &["m", "n"]),
+        ]);
+        let body = out.join("\n");
+        assert_eq!(
+            body.matches("Postgres enum").count(),
+            1,
+            "rationale must appear once: {body}"
         );
+    }
+
+    /// Columns sharing an identical value set are one enum, listed together —
+    /// the signal worth acting on.
+    #[test]
+    fn columns_with_the_same_value_set_become_one_proposal() {
+        let out = render_enum_hints(&[
+            hint("sensei.intake_guide", "source", &["builtin", "org", "learned"]),
+            hint("sensei.playbooks", "source", &["builtin", "org", "learned"]),
+            hint("sensei.playbook_rules", "source", &["builtin", "org", "learned"]),
+        ]);
+        let body = out.join("\n");
+        assert_eq!(
+            body.matches("ddl/enum/sensei/source.ddl").count(),
+            1,
+            "one shared enum, not three: {body}"
+        );
+        for c in [
+            "sensei.intake_guide.source",
+            "sensei.playbooks.source",
+            "sensei.playbook_rules.source",
+        ] {
+            assert!(body.contains(c), "must list {c}: {body}");
+        }
+    }
+
+    /// The bug this replaced: the path came from the column name, so three
+    /// different `state` domains all pointed at `ddl/enum/sensei/state.ddl`.
+    /// Following that literally yields one file with conflicting definitions.
+    #[test]
+    fn different_value_sets_sharing_a_column_name_get_distinct_paths() {
+        let out = render_enum_hints(&[
+            hint("sensei.sync_state", "state", &["pending", "synced"]),
+            hint("sensei.dojo_inbox", "state", &["pending", "applied"]),
+            hint("sensei.dojo_outbox", "state", &["pending", "sent"]),
+        ]);
+        let body = out.join("\n");
+        let paths: Vec<&str> = body.lines().filter(|l| l.contains("ddl/enum/")).collect();
+        assert_eq!(paths.len(), 3, "three distinct domains: {body}");
+        let unique: std::collections::HashSet<_> = paths
+            .iter()
+            .map(|l| l.split(" — ").next().unwrap_or(l).trim())
+            .collect();
+        assert_eq!(unique.len(), 3, "each needs its own file, got collisions: {paths:?}");
+        assert!(body.contains("rename"), "must say why the names look like that: {body}");
+    }
+
+    /// An unambiguous column keeps its plain name — disambiguation only fires
+    /// on a real collision, so the common case stays readable.
+    #[test]
+    fn an_unambiguous_column_keeps_its_plain_name() {
+        let out = render_enum_hints(&[hint("dojo.repositories", "visibility", &["private", "public"])]);
+        let body = out.join("\n");
+        assert!(body.contains("ddl/enum/dojo/visibility.ddl"), "got: {body}");
+        assert!(
+            !body.contains("repositories_visibility"),
+            "must not over-qualify: {body}"
+        );
+        assert!(!body.contains("rename"), "no collision, so no rename note: {body}");
     }
 
     /// Offline `inspect` (no `--from-db`) validates the fixture against the
