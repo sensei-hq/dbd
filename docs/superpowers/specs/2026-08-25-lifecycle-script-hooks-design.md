@@ -21,6 +21,24 @@ after-script regardless. A loader doing
 wrong results when `staging_b` was scoped out. dbd warns about the exclusion and
 then runs the script against partial data anyway.
 
+**1b. `import.after` runs on `deploy` but not on `apply`.** `cmd_apply` calls
+`Design::apply` alone; only the deploy path continues into `import_data`, which
+is what executes `import.after`. So a project using an after-script for
+schema-adjacent post-processing gets it on `dbd deploy` and silently not on
+`dbd apply`.
+
+The real `sensei` project hits this: its realtime-publication hook lives in
+`import.after` because that was the only hook available, so `dbd apply` leaves
+Realtime unconfigured. Its own comment says it must "run once every entity
+exists" — which is `apply.after` semantics, not import semantics.
+
+That comment also gives a reason now obsolete: *"dbd's SQL parser cannot read a
+`do $$ … $$` block, and a file it cannot parse is dropped from the entity set
+SILENTLY."* Both halves were fixed in v0.11.0 — DO-blocks parse natively, and an
+unparseable file now refuses the run rather than vanishing. It still belongs as a
+hook rather than an entity, being post-processing; it is simply in the wrong
+phase.
+
 **2. There is no hook around the DDL phase at all.** The pipeline is
 apply (DDL) → import (data) → policies (RLS). `policies/` is the only post-DDL
 hook and is constrained to RLS policies. So schema-adjacent operations dbd does
