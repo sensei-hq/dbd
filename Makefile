@@ -45,8 +45,8 @@ help:
 	@echo "  make sweep         Prune stale/old-version artifacts (needs cargo-sweep)"
 	@echo ""
 	@echo "All bump targets refuse to run if the working tree has uncommitted"
-	@echo "changes or local HEAD differs from origin/main, and require tests,"
-	@echo "clippy and rustfmt to pass first. After a successful push, bump"
+	@echo "changes or local HEAD differs from origin/<current branch>, and require"
+	@echo "tests, clippy and rustfmt to pass first. After a successful push, bump"
 	@echo "installs the released binary into ~/.cargo/bin, then runs"
 	@echo "'cargo clean' to reclaim disk (next dev build recompiles fresh)."
 	@echo ""
@@ -87,25 +87,52 @@ sweep:
 ##    PATH) but *before* `cargo clean`. `cargo install --path` reuses the
 ##    workspace target/, so the artifacts it builds are wiped by the clean that
 ##    follows; installing after the clean instead strands a fresh target/release.
+##  - The two share one shell statement so the clean is unconditional. Left as
+##    separate recipe lines, a failed install aborts the rule and leaves target/
+##    behind, with the tag already public and no way to finish the release —
+##    re-running `make bump` would cut a new version rather than resume this one.
+##  - It spells out `cargo install` rather than recursing into the `install`
+##    target: make runs any recipe line containing `$(MAKE)` even under `-n`, so
+##    `$(MAKE) install` here would make a dry run really execute the `cargo
+##    clean` that shares this statement, wiping target/ from a supposed no-op.
 bump: _check-clean _check-ci
 	@echo "Bumping $(VERSION) → $(NEW) ($(KIND))"
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
+	@sed -i '' 's|dbd-core = { path = "crates/dbd-core", version = "$(VERSION)" }|dbd-core = { path = "crates/dbd-core", version = "$(NEW)" }|' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
 	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
-	@cargo build -q 2>&1 | grep -v "^warning" || true
-	@git add Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt
+	@cargo build -q
+	@git add Cargo.lock Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt
 	@git commit -m "chore: bump version to v$(NEW)"
 	@git tag -a "v$(NEW)" -m "v$(NEW)"
 	@echo "Pushing $(BRANCH) and v$(NEW)..."
-	@git push origin $(BRANCH)
-	@git push origin "v$(NEW)"
+	@git push origin $(BRANCH) && git push origin "v$(NEW)" || { \
+	   echo ""; \
+	   echo "Push incomplete. If the branch landed but the tag did not, resume with:"; \
+	   echo "    git push origin v$(NEW)"; \
+	   echo "Do NOT re-run 'make bump' — the version is already committed, so it"; \
+	   echo "would cut $(NEW)+1 and leave v$(NEW) untagged forever."; \
+	   exit 1; \
+	 }
 	@echo "Released v$(NEW) on $(BRANCH). Now merge $(BRANCH) → main."
 	@echo "Installing v$(NEW) into ~/.cargo/bin..."
-	@$(MAKE) install
-	@echo "Reclaiming disk: removing debug + stale build artifacts..."
-	@cargo clean
-	@echo "target/ cleaned; next build recompiles against the current lockfile."
-	@echo "dbd v$(NEW) is on your PATH."
+	@trap 'echo ""; echo "Interrupted. v$(NEW) is tagged and pushed, so the release itself is"; echo "complete. Run: make install   (do NOT run make bump)"; exit 130' INT; \
+	 cargo install --path . --locked --force; ok=$$?; \
+	 echo "Reclaiming disk: removing debug + stale build artifacts..."; \
+	 if cargo clean; then \
+	   echo "target/ cleaned; next build recompiles against the current lockfile."; \
+	 else \
+	   echo "WARNING: cargo clean failed — target/ is still on disk."; \
+	   if [ $$ok -eq 0 ]; then ok=1; fi; \
+	 fi; \
+	 if [ $$ok -ne 0 ]; then \
+	   echo ""; \
+	   echo "v$(NEW) is tagged and pushed — the release itself is complete."; \
+	   echo "Only the local step failed. Re-run 'make install' once resolved;"; \
+	   echo "do NOT re-run 'make bump', which would cut another version."; \
+	   exit $$ok; \
+	 fi; \
+	 echo "dbd v$(NEW) is on your PATH."
 
 # Refuse to bump if the working tree has uncommitted changes or untracked
 # files. Also require local HEAD to be in sync with origin/<current branch>
