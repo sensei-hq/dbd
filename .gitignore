@@ -1,7 +1,18 @@
 /target
-Cargo.lock
 .DS_Store
 /.claude
+
+# Cargo.lock is deliberately NOT ignored. The root package is a binary, so the
+# lockfile is committed (the library convention of ignoring it applies to
+# crates whose consumers resolve their own versions). `make install` and the
+# release recipe both pass --locked, which requires it to already exist.
+
+# Local secrets — CARGO_REGISTRY_TOKEN and friends. The repo root is also the
+# dbd-cli package root, so these are two separate leaks to keep shut: git here,
+# and Cargo.toml's `include` for what reaches crates.io.
+.env
+.env.*
+!.env.example
 
 # git worktrees (superpowers)
 .worktrees/
