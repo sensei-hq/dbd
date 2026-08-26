@@ -96,11 +96,43 @@ fn canonicalize_reference_order(mut entity: Entity) -> Entity {
     entity
 }
 
+/// Canonicalise column type SPELLING before comparing.
+///
+/// The two parsers cannot agree on the text of a type and never will. sqlparser
+/// echoes the keyword the author typed, uppercased (`int` → `INT`, `integer` →
+/// `INTEGER`); libpg_query reports the type Postgres actually resolved to, in
+/// Postgres's own spelling (both → `int`). The same split covers `VARCHAR(30)`
+/// vs `varchar(30)`, `CHARACTER VARYING(10)` vs `varchar(10)` and
+/// `TIMESTAMPTZ` vs `timestamptz`.
+///
+/// The difference is inert, because no comparison dbd makes reads `data_type`
+/// raw: reconcile, diff and snapshot all put both sides through
+/// [`dbd_core::reconcile::canonical_type`] first — which is what
+/// `fix(reconcile): canonicalize pg_catalog-qualified type names` measured at
+/// 12-of-12 convergence between the two parsers' spellings.
+///
+/// Like [`canonicalize_reference_order`] and unlike [`without_soft_refs`], this
+/// maps rather than drops: both sides go through the same total function, so a
+/// genuine type difference (`int` vs `bigint`, `varchar(30)` vs `varchar(60)`)
+/// still fails the gate.
+fn canonicalize_column_types(mut entity: Entity) -> Entity {
+    // No enum map: `canonical_type` uses one only to schema-qualify a bare enum
+    // name against introspection, and here both sides are parsers, which report
+    // the same bare name.
+    let no_enums = std::collections::HashMap::new();
+    if let Some(def) = entity.table_def.as_mut() {
+        for column in &mut def.columns {
+            column.data_type = dbd_core::reconcile::canonical_type(&column.data_type, &no_enums);
+        }
+    }
+    entity
+}
+
 /// The comparison view of an `Entity`: soft refs excluded, then reference
-/// order canonicalised. See the two functions above for what each step does
-/// and does not do to the underlying data.
+/// order and column type spelling canonicalised. See the three functions above
+/// for what each step does and does not do to the underlying data.
 fn comparable(entity: &Entity) -> serde_json::Value {
-    let e = canonicalize_reference_order(without_soft_refs(entity));
+    let e = canonicalize_column_types(canonicalize_reference_order(without_soft_refs(entity)));
     serde_json::to_value(&e).expect("Entity serializes")
 }
 
@@ -112,7 +144,16 @@ fn native_types_match_sqlparser_on_every_corpus_file() {
     for file in corpus() {
         let sql = std::fs::read_to_string(&file).expect("corpus file is readable");
         // The path decides the entity type, exactly as the scan loop does.
-        let entity_type = Entity::from_file(&file).entity_type;
+        let identity = Entity::from_file(&file);
+        // A file whose path names no DDL entity — a migration script under
+        // `migrations/`, say — gets a fallback type and a complaint from
+        // `Entity::from_file` before either parser runs. Both parsers inherit
+        // that complaint verbatim, so the "improvement" assertion below could
+        // never be satisfied by any parser: the file is not this gate's subject.
+        if !identity.errors.is_empty() {
+            continue;
+        }
+        let entity_type = identity.entity_type;
         if !covered.contains(&entity_type) {
             continue;
         }
