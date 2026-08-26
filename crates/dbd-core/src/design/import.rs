@@ -328,6 +328,7 @@ impl Design {
     {
         let mut count = 0;
         for after_file in &self.config.import.after {
+            let after_file = after_file.script();
             let full_path = self.project_dir.join(after_file);
             let desc = format!("run {after_file}");
             on_start(&desc);

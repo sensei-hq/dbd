@@ -79,8 +79,14 @@ pub(in crate::parser) fn is_valid_postgres(raw_sql: &str) -> bool {
 /// `t` to `public.t` — a plausibly-wrong edge pointing at a different table,
 /// which is worse than no edge at all.
 ///
+/// `pub(crate)`, wider than this file's other libpg_query helpers, because
+/// [`design::hooks`] — outside `crate::parser` entirely — resolves an
+/// after-script's `search_path` the same way a view or routine body does, to
+/// qualify the table names a hook script depends on.
+///
 /// [`extractors::extract_search_paths`]: crate::parser::extractors::extract_search_paths
-pub(in crate::parser) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
+/// [`design::hooks`]: crate::design::hooks
+pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return vec![DEFAULT_SEARCH_PATH.to_string()];
     };
@@ -242,11 +248,14 @@ fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
 /// Qualify a `schema.table` / `table` string (as returned by libpg_query):
 /// apply the default schema to unqualified names, drop system-schema refs.
 ///
-/// `pub(in crate::parser)`, matching this file's other libpg_query helpers,
-/// because `pg::views` (a real caller, not a lint workaround) qualifies
-/// `call_functions()` names with it the same way this module already
-/// qualifies `select_tables()` names.
-pub(in crate::parser) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
+/// `pub(crate)`, wider than this file's other libpg_query helpers: `pg::views`
+/// (within `crate::parser`) qualifies `call_functions()` names with it the same
+/// way this module already qualifies `select_tables()` names, and
+/// [`design::hooks`] (outside `crate::parser`) qualifies a hook script's
+/// derived table references the same way.
+///
+/// [`design::hooks`]: crate::design::hooks
+pub(crate) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
     let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [.., schema, table] => {
