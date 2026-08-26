@@ -432,6 +432,40 @@ fn group_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<EnumProposal> {
 /// Identifiers and CHECK literals are printed verbatim. An ANSI escape among
 /// them can clear the screen or recolour the lines around it, rewriting the
 /// paths and counts the reader is being asked to act on.
+/// The exit code a finished policy phase should produce.
+///
+/// A failed policy file leaves the schema applied with RLS only partially in
+/// place. That is a security-relevant difference, and a zero exit hides it —
+/// "the deploy succeeded" then stops being evidence that RLS is in place.
+///
+/// Shared so `dbd policies` and `dbd apply --with-policies` cannot disagree:
+/// they used to, the first exiting 1 and the second returning `Ok(())` for the
+/// identical report, so whether a pipeline caught a broken policy depended on
+/// which command it happened to call.
+fn policy_phase_exit_code(report: &dbd_core::design::PolicyReport) -> i32 {
+    i32::from(!report.failed.is_empty())
+}
+
+/// The scope's working set for the policy phase, or `None` for the all-scope.
+///
+/// A failure here must propagate rather than collapse to `None`:
+/// `apply_policies` reads `None` as "no scope filter" and executes *every* file
+/// under `policies/` against the live database. Discarding a closure conflict
+/// would therefore widen the run instead of narrowing it — the opposite of what
+/// `--scope` was asked for, and visible only as a count with no baseline.
+fn policy_working_set(
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<Option<(String, std::collections::HashSet<String>)>> {
+    if resolved.is_all {
+        return Ok(None);
+    }
+    let working_set = design
+        .working_set(resolved)
+        .with_context(|| format!("Failed to resolve scope '{}' for policies", resolved.name))?;
+    Ok(Some((resolved.name.clone(), working_set)))
+}
+
 /// Characters that must never reach a terminal or a suggested path.
 ///
 /// `char::is_control` covers only Unicode category Cc. Format characters (Cf)
@@ -768,11 +802,7 @@ pub async fn cmd_apply(
 
     // Apply RLS policies if requested
     if with_policies {
-        let policy_ws = if resolved.is_all {
-            None
-        } else {
-            design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
-        };
+        let policy_ws = policy_working_set(&design, &resolved)?;
         let report = dbd_core::design::apply_policies(
             &*adapter,
             project_dir,
@@ -788,6 +818,12 @@ pub async fn cmd_apply(
         }
         for (file, err) in &report.failed {
             output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
+        }
+        // Report first, then fail — same order as inspect, so the reason is on
+        // screen before the non-zero exit.
+        let code = policy_phase_exit_code(&report);
+        if code != 0 {
+            std::process::exit(code);
         }
     }
 
@@ -887,11 +923,7 @@ pub async fn cmd_policies(
     // does not have reported `schema "…" does not exist` on every run.
     let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
-    let policy_ws = if resolved.is_all {
-        None
-    } else {
-        design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
-    };
+    let policy_ws = policy_working_set(&design, &resolved)?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
@@ -925,8 +957,9 @@ pub async fn cmd_policies(
         ),
     );
 
-    if !report.failed.is_empty() {
-        std::process::exit(1);
+    let code = policy_phase_exit_code(&report);
+    if code != 0 {
+        std::process::exit(code);
     }
 
     Ok(())
@@ -1007,6 +1040,55 @@ mod tests {
                 "a control character reached the output: {line:?}"
             );
         }
+    }
+
+    /// A failed policy file must fail the run, whichever command applied it.
+    ///
+    /// It leaves the schema applied with RLS only partially in place — a
+    /// security-relevant difference a zero exit code hides. `dbd policies` has
+    /// always exited 1 for this; `apply --with-policies` returned `Ok(())`, so
+    /// the identical condition produced opposite exit codes depending on which
+    /// command ran it, and "the deploy succeeded" stopped being evidence that
+    /// RLS is in place.
+    #[test]
+    fn a_failed_policy_file_fails_either_command() {
+        use std::path::PathBuf;
+        let mut report = dbd_core::design::PolicyReport::default();
+        assert_eq!(policy_phase_exit_code(&report), 0, "a clean run passes");
+
+        report.applied.push(PathBuf::from("policies/config/lookups.sql"));
+        assert_eq!(policy_phase_exit_code(&report), 0, "applied files are not failures");
+
+        report
+            .skipped
+            .push((PathBuf::from("policies/svc/x.sql"), "out of scope".into()));
+        assert_eq!(policy_phase_exit_code(&report), 0, "a scope skip is not a failure");
+
+        report
+            .failed
+            .push((PathBuf::from("policies/app/bad.sql"), "syntax error".into()));
+        assert_eq!(policy_phase_exit_code(&report), 1, "a failed policy must fail the run");
+    }
+
+    /// A scope-closure conflict must abort the run, not widen it.
+    ///
+    /// `apply_policies` reads `None` as "no scope filter" and executes *every*
+    /// file under `policies/` against the live database. So discarding the
+    /// error applies more than `--scope` asked for — the opposite of narrowing
+    /// — and the only tell is a count the operator has no baseline for.
+    #[test]
+    fn a_scope_closure_conflict_is_not_swallowed() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("conflicting"), None).unwrap();
+        assert!(
+            design.working_set(&resolved).is_err(),
+            "sanity: this scope excludes an entity its in-scope entity requires"
+        );
+        assert!(
+            policy_working_set(&design, &resolved).is_err(),
+            "the conflict must propagate; None would run every policy file"
+        );
     }
 
     /// Every clause of the path gate is load-bearing. A quoted Postgres
