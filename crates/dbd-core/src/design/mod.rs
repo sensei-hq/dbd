@@ -38,6 +38,14 @@ pub struct ApplyComplete {
     pub created: u32,
     /// Entities dropped via migration.
     pub dropped: u32,
+    /// `apply.before` hook scripts run.
+    pub before_scripts: u32,
+    /// `apply.after` hook scripts run.
+    pub after_scripts: u32,
+    /// Non-fatal diagnostics — currently, hooks a scope filtered out. Mirrors
+    /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
+    /// Realtime must say so, not report a clean success.
+    pub warnings: Vec<String>,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
@@ -77,9 +85,11 @@ pub struct DeployComplete {
 
 impl DeployComplete {
     /// Every non-fatal diagnostic from the deploy, ready to print as warnings:
-    /// the import's own warnings followed by one line per failed policy file.
+    /// each phase's own warnings in pipeline order, then one line per failed
+    /// policy file.
     pub fn warnings(&self) -> Vec<String> {
-        let mut out = self.import.warnings.clone();
+        let mut out = self.apply.warnings.clone();
+        out.extend(self.import.warnings.iter().cloned());
         out.extend(
             self.policies
                 .failed
@@ -1220,6 +1230,229 @@ mod tests {
 
         design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
         assert!(!mock.applied_names().is_empty());
+    }
+
+    // ── Lifecycle script hooks ────────────────────────────
+
+    /// A project shaped like the real one this feature was built for: a scope
+    /// that excludes one staging table, an `import.after` hook whose dependency
+    /// on it is *derivable*, and a second whose table name is data and so must
+    /// declare its `writes:`.
+    fn hooks_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for sub in ["ddl/table/app", "ddl/table/staging", "sql"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            r#"
+project:
+  name: hooks
+  version: 1
+source:
+  dialect: postgresql
+schemas:
+  - app
+  - staging
+scopes:
+  partial:
+    excludes: [staging.b]
+    deps: include
+apply:
+  before:
+    - sql/pre_ddl.sql
+  after:
+    - sql/post_ddl.sql
+import:
+  staging: [staging]
+  after:
+    - sql/loader.sql
+    - script: sql/dynamic.sql
+      writes: [app.target]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/target.ddl"),
+            "create table if not exists app.target (id int primary key, n int);\n",
+        )
+        .unwrap();
+        for t in ["a", "b"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/staging/{t}.ddl")),
+                format!("create table if not exists staging.{t} (id int primary key);\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("sql/pre_ddl.sql"), "-- MARK pre_ddl\nselect 1;\n").unwrap();
+        std::fs::write(dir.join("sql/post_ddl.sql"), "-- MARK post_ddl\nselect 1;\n").unwrap();
+        // Derivable: names staging.a and staging.b as SQL identifiers.
+        std::fs::write(
+            dir.join("sql/loader.sql"),
+            "-- MARK loader\ninsert into app.target (id, n)\n\
+             select a.id, 1 from staging.a a join staging.b b on b.id = a.id;\n",
+        )
+        .unwrap();
+        // NOT derivable: the table name lives in a format() string.
+        std::fs::write(
+            dir.join("sql/dynamic.sql"),
+            "-- MARK dynamic\ndo $$ begin\n  execute format('insert into %I.target values (1, 1)', 'app');\nend $$;\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Which hook scripts an adapter was actually handed, by marker.
+    fn markers_run(mock: &MockAdapter) -> Vec<String> {
+        let scripts = mock.scripts.lock().unwrap();
+        scripts
+            .iter()
+            .filter_map(|s| s.lines().next())
+            .filter_map(|l| l.strip_prefix("-- MARK ").map(|m| m.to_string()))
+            .collect()
+    }
+
+    /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
+    /// alone, so an `import.after` hook never runs on it. `apply.after` does.
+    #[tokio::test]
+    async fn apply_alone_runs_its_own_hooks_and_not_the_import_ones() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+        let mut summary: Option<ApplyComplete> = None;
+
+        design
+            .apply(&mock, None, false, None, Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(markers_run(&mock), vec!["pre_ddl", "post_ddl"]);
+        let summary = summary.expect("apply must report a summary");
+        assert_eq!(summary.before_scripts, 1);
+        assert_eq!(summary.after_scripts, 1);
+    }
+
+    /// `apply.before` runs before the first entity and `apply.after` only after
+    /// they all succeed — so an entity that fails leaves the before-hook run and
+    /// the after-hook not.
+    #[tokio::test]
+    async fn a_failing_entity_stops_between_the_before_and_after_hooks() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new().fail_on_entity("app.target");
+
+        design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("the injected entity failure must propagate");
+
+        assert_eq!(markers_run(&mock), vec!["pre_ddl"]);
+    }
+
+    /// Publications and grants attach to objects that must already exist, and
+    /// RLS is independent of them — so `apply.after` runs before `policies/`.
+    #[tokio::test]
+    async fn apply_after_runs_before_policies() {
+        let tmp = hooks_project();
+        std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+        std::fs::write(tmp.path().join("policies/rls.sql"), "-- MARK policy\nselect 1;\n").unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let markers = markers_run(&mock);
+        let post = markers.iter().position(|m| m == "post_ddl").expect("apply.after must run");
+        let policy = markers.iter().position(|m| m == "policy").expect("policies must run");
+        assert!(post < policy, "apply.after must precede policies/: {markers:?}");
+    }
+
+    /// The contrast that is the whole feature: under a scope excluding
+    /// `staging.b`, the derivable loader is skipped with a warning naming the
+    /// table, while the `writes:`-declared hook still runs.
+    #[tokio::test]
+    async fn a_scoped_import_skips_the_derivable_hook_and_keeps_the_declared_one() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let scope = design.resolve_scope(Some("partial"), None).unwrap();
+        let mock = MockAdapter::new();
+        let mut summary: Option<ImportComplete> = None;
+
+        design
+            .import_data(&mock, None, false, Some(&scope), Progress {
+                on_start: |_: &str| {},
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |s| summary = Some(s),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(markers_run(&mock), vec!["dynamic"], "only the declared-writes hook may run");
+        let summary = summary.expect("import must report a summary");
+        assert_eq!(summary.after_scripts, 1);
+        assert!(
+            summary.warnings.iter().any(|w| {
+                w.contains("sql/loader.sql") && w.contains("staging.b") && w.contains("partial")
+            }),
+            "the skip must name the script, the table and the scope: {:?}",
+            summary.warnings
+        );
+    }
+
+    /// Unscoped, both after-scripts run — scope filtering must not cost the
+    /// common path anything.
+    #[tokio::test]
+    async fn an_unscoped_import_runs_every_after_script() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        design.import_data(&mock, None, false, None, Progress::none()).await.unwrap();
+
+        assert_eq!(markers_run(&mock), vec!["loader", "dynamic"]);
+    }
+
+    /// A declared hook dbd cannot find is a misconfiguration — apply must
+    /// refuse rather than continue as if the script were optional.
+    #[tokio::test]
+    async fn apply_refuses_when_a_hook_file_is_missing() {
+        let tmp = hooks_project();
+        std::fs::remove_file(tmp.path().join("sql/post_ddl.sql")).unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+
+        let err = design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("a missing hook file must fail the apply");
+        assert!(err.to_string().contains("sql/post_ddl.sql"), "got: {err}");
+    }
+
+    /// `--dry-run` names every hook it would run without executing one.
+    #[tokio::test]
+    async fn apply_dry_run_reports_hooks_without_executing_them() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new();
+        let mut steps: Vec<String> = Vec::new();
+
+        design
+            .apply(&mock, None, /*dry_run*/ true, None, Progress {
+                on_start: |d: &str| steps.push(d.to_string()),
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |_| {},
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(mock.script_count(), 0, "a dry run must execute nothing");
+        assert!(steps.iter().any(|s| s.contains("sql/pre_ddl.sql")), "got {steps:?}");
+        assert!(steps.iter().any(|s| s.contains("sql/post_ddl.sql")), "got {steps:?}");
     }
 
     // ── diff_live (read-only) ──────────────────────────────

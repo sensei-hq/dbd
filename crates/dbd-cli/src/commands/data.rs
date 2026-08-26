@@ -91,12 +91,17 @@ pub fn cmd_import_dry_run(
         }
     }
 
-    // Step 3: After scripts
-    if !design.config().import.after.is_empty() {
+    // Step 3: After scripts — resolved through the same scope filter the real
+    // run applies, so the preview never lists a hook that would be skipped.
+    let (after_scripts, after_warnings) = design.import_after_preview(Some(&resolved))?;
+    if !after_scripts.is_empty() {
         output::info(verbosity, "");
-        for after_file in &design.config().import.after {
-            output::info(verbosity, &format!("  run {}", after_file.script()));
+        for script in &after_scripts {
+            output::info(verbosity, &format!("  run {script}"));
         }
+    }
+    for warning in &after_warnings {
+        output::warn(warning);
     }
 
     output::summary(0, 0, plan.len());

@@ -33,7 +33,7 @@ Pure config + logic. No pipeline changes, so nothing is unwired — `ImportConfi
 - Create: `crates/dbd-core/src/design/hooks.rs` — resolution + scope filtering
 - Modify: `crates/dbd-core/src/design/mod.rs` — register the module
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `config.rs`'s `mod tests`:
 
@@ -160,12 +160,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p dbd-core --lib "config::tests::a_bare_path" > /tmp/t.log 2>&1; echo "exit: $?"; tail -6 /tmp/t.log`
 Expected: non-zero — `ScriptEntry` / `apply` do not exist.
 
-- [ ] **Step 3: Implement the config types**
+- [x] **Step 3: Implement the config types**
 
 In `config.rs`:
 
@@ -215,7 +215,7 @@ Add `#[serde(default)] pub apply: ApplyConfig,` to `DesignConfig`, and change `I
 
 Fix the fallout: `config.rs:724`'s existing test asserts `config.import.after == vec!["import/loader.sql"]`. Update it to compare `.script()`. **Report every other call site the type change breaks** — `design/import.rs` iterates it, and `commands/data.rs:95-97` does too.
 
-- [ ] **Step 4: Implement resolution**
+- [x] **Step 4: Implement resolution**
 
 Create `crates/dbd-core/src/design/hooks.rs`:
 
@@ -285,14 +285,14 @@ pub(crate) fn dependencies_of(entry: &ScriptEntry, sql: &str) -> Vec<String> {
 
 Register `mod hooks;` in `design/mod.rs`.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 - `cargo test -p dbd-core --lib config > /tmp/t.log 2>&1; echo "exit: $?"` → 0
 - `cargo test -p dbd-core --lib design::hooks > /tmp/t.log 2>&1; echo "exit: $?"` → 0
 - `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"` → 0
 - `cargo clippy --workspace --all-targets -- -D warnings > /tmp/c.log 2>&1; echo "exit: $?"` → 0
 
-- [ ] **Step 6: Verify against the real project — parse only, no database**
+- [x] **Step 6: Verify against the real project — parse only, no database**
 
 ```bash
 cd ~/Developer/sensei-hq/sensei/database
@@ -303,7 +303,7 @@ Read-only. **Required:** the real project still loads with its existing
 `import.after: [import/after/realtime_publication.sql]` — the type change must
 not break a shipped config. Report the actual output.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```
 feat(config): add ScriptEntry and the apply hook block
@@ -330,7 +330,7 @@ are untouched.
 - Modify: `crates/dbd-core/src/design/mod.rs` — `ApplyComplete` counts
 - Modify: `crates/dbd-cli/src/commands/project.rs` — summary rendering
 
-- [ ] **Step 1: Add the shared runner**
+- [x] **Step 1: Add the shared runner**
 
 One function all three sites call. It must:
 
@@ -349,7 +349,7 @@ Warning text, matching the existing staging-table warning's voice:
 after-script import/loader.sql skipped — needs staging.values, which is outside scope 'partial'
 ```
 
-- [ ] **Step 2: Wire `apply.before` and `apply.after`**
+- [x] **Step 2: Wire `apply.before` and `apply.after`**
 
 In `Design::apply`:
 - `before` — after `ensure_fully_parsed` and scope resolution, before the first
@@ -359,7 +359,7 @@ In `Design::apply`:
 **`apply.after` must run before `policies/`.** In the deploy path
 (`design/apply.rs:373`), policies come last; keep it that way.
 
-- [ ] **Step 3: Scope-filter `import.after`**
+- [x] **Step 3: Scope-filter `import.after`**
 
 `import_run_after_scripts` currently takes no scope. Give it the working set and
 `is_all`, and replace its doc comment — the existing one states the opposite of
@@ -367,18 +367,18 @@ the new behaviour:
 
 > *"These are intentionally NOT scope-filtered — they are post-import hooks, not tied to individual entries; scoped callers ensure their after-scripts are safe."*
 
-- [ ] **Step 4: Counts and rendering**
+- [x] **Step 4: Counts and rendering**
 
 `ApplyComplete` gains `before_scripts` / `after_scripts`. Skipped hooks go
 through the existing `warnings` channel. Follow the house style in
 `commands/project.rs` for the summary line.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 - `cargo test --workspace > /tmp/t.log 2>&1; echo "exit: $?"` → 0
 - `cargo clippy --workspace --all-targets -- -D warnings > /tmp/c.log 2>&1; echo "exit: $?"` → 0
 
-- [ ] **Step 6: Verify live — a throwaway database, built from the real scenario**
+- [x] **Step 6: Verify live — a throwaway database, built from the real scenario**
 
 This models `sensei`'s actual shape: a scoped project where a hook depends on a
 table the scope excludes.
@@ -461,7 +461,7 @@ psql -q -d postgres -c 'DROP DATABASE IF EXISTS dbd_hooks'
 
 That last contrast is the whole feature in one run. Report the ACTUAL output.
 
-- [ ] **Step 7: Verify the real project still works — read-only**
+- [x] **Step 7: Verify the real project still works — read-only**
 
 ```bash
 cd ~/Developer/sensei-hq/sensei/database
@@ -472,7 +472,7 @@ cd ~/Developer/sensei-hq/sensei/database
 **Read-only. Do NOT apply, reconcile, deploy or import against any sensei
 database.** Required: both load cleanly, as they do today.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```
 feat(design): scope-aware lifecycle hooks around apply and import
@@ -497,13 +497,13 @@ objects that must already exist.
 
 ## Verification checklist
 
-- [ ] `cargo test --workspace` exits 0
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `dbd apply` alone runs `apply.after` (the deploy-vs-apply gap)
-- [ ] A derivable hook is skipped when its table is out of scope, warning by name
-- [ ] A `writes:`-declared hook still runs when its declared tables are in scope
-- [ ] The real sensei project loads unchanged, default and `dojo` scopes
-- [ ] No sensei database was written to
+- [x] `cargo test --workspace` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `dbd apply` alone runs `apply.after` (the deploy-vs-apply gap)
+- [x] A derivable hook is skipped when its table is out of scope, warning by name
+- [x] A `writes:`-declared hook still runs when its declared tables are in scope
+- [x] The real sensei project loads unchanged, default and `dojo` scopes
+- [x] No sensei database was written to
 
 ## Follow-up this does not do
 
