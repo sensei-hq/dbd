@@ -465,6 +465,8 @@ On a Postgres/Supabase project, `inspect` also prints an advisory **`Suggestions
 `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — better modeled as a Postgres `enum`. Advisory
 only: never an error, never affects the exit code.
 
+Columns sharing a value set become one proposal. Where the plain column name would name two different files, the type is named `<table>_<column>` instead (and `_2`, `_3` if that still collides) — the footer says how many were renamed and why. An identifier that is not a single ordinary path segment gets no path at all, just the candidate; likewise values needing escaping are printed unquoted and flagged, since escaped text is not the literal it came from.
+
 **Exit code (changed in v0.12.0).** `inspect` exits **1** when the design carries
 a blocking error, 0 otherwise. It previously always exited 0, so a CI step
 running `dbd inspect` passed green on a file `dbd apply` refuses — while apply's
@@ -540,6 +542,30 @@ environment; files at `import/<env>/<schema>/file` load only when `-e <env>`
 matches. So `import/dev/staging/seed.csv` loads under `-e dev` but not `prod`.
 Import procedures are matched to staging tables by reads/writes analysis, not by
 naming convention.
+
+### dbd export
+
+```sh
+dbd export
+dbd export -n config.lookups
+dbd export -n config.lookups -f jsonl
+dbd export -o import/                 # write straight into the import/ tree
+```
+
+Reads table data out of the live database into files — the inverse of `import`.
+
+`-n`/`--name <table>` exports one table; omitted, every table listed under
+`export:` in `design.yaml` is written. `-f`/`--format <csv|tsv|jsonl>` selects
+the format (default `csv`) — note the asymmetry with `import`, where `-f` is a
+file path. `-o`/`--output <dir>` writes the selected tables flat as
+`<dir>/<name>.<fmt>`; without it, files land at `export/<schema>/<name>.<fmt>`.
+
+Pointing `-o` at `import/` produces a round-trip: what `export` writes,
+`import` reads back under the `import/<schema>/<table>.<fmt>` convention.
+
+Per-table `export_data` is not available on Convex — `npx convex export` only
+supports whole-deployment dumps, so the command errors with that explanation
+rather than writing a partial file.
 
 ### dbd deploy
 
@@ -828,8 +854,13 @@ The splitter understands two atomic-body kinds: PG `$$ ... $$` blocks (function 
 
 `.pre-commit-hooks.yaml` at the repo root exposes two hooks:
 
-- `dbd-format` — `language: rust`; pre-commit clones the repo, runs `cargo install --path .`, caches afterward.
-- `dbd-format-system` — `language: system`; expects `dbd` already on PATH.
+- `dbd-format` — `language: rust`; pre-commit clones the repo at the pinned `rev`, runs
+  `cargo install --path .`, caches afterward. **Needs v0.12.3 or later**: earlier tags
+  have a virtual manifest at the repo root, so that install aborts with `found a virtual
+  manifest instead of a package manifest` during environment setup, before anything is
+  formatted. Use `dbd-format-system` with an older `rev`.
+- `dbd-format-system` — `language: system`; expects `dbd` already on PATH (`cargo install
+  dbd-cli`). Works at any `rev`.
 
 Both set `pass_filenames: false` because `dbd format` scans the project itself. Consumers add to their `.pre-commit-config.yaml`:
 

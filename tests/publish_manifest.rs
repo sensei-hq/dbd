@@ -5,6 +5,7 @@
 //! publish time, which is the worst moment to discover it, so it is asserted
 //! here against `cargo metadata` (the resolved view, not the manifest text).
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -67,6 +68,68 @@ fn the_repo_root_is_an_installable_package() {
     assert!(
         has_dbd_bin,
         "the root package must produce the `dbd` binary that the hook's `entry` invokes"
+    );
+}
+
+/// The "exhaustive" full reference must actually list every command.
+///
+/// `docs/skills/dbd/SKILL.md` points readers at `llms-full.txt` as the
+/// "exhaustive, always current" reference, and that claim ships embedded in the
+/// binary — `dbd install` writes it into every user's config. A completeness
+/// claim that is false is worse than no claim: it stops a reader looking
+/// further, so a missing command reads as a missing feature.
+#[test]
+fn the_full_reference_documents_every_command() {
+    let help = Command::new(env!("CARGO_BIN_EXE_dbd"))
+        .arg("--help")
+        .output()
+        .expect("the dbd binary must build");
+    assert!(help.status.success(), "dbd --help failed");
+    let help = String::from_utf8_lossy(&help.stdout);
+
+    let commands: Vec<&str> = help
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .take_while(|l| !l.starts_with("Options:"))
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter(|l| !l.starts_with(' '))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|c| *c != "help")
+        .collect();
+    assert!(commands.len() > 15, "parsed too few commands from --help: {commands:?}");
+
+    let reference = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/llms/llms-full.txt"))
+        .expect("llms-full.txt");
+
+    // Match the command token, not the whole heading — several carry a suffix
+    // (`### dbd release (alias: dbd baseline)`), and an exact-line match would
+    // report those as missing.
+    let documented: std::collections::HashSet<&str> = reference
+        .lines()
+        .filter_map(|l| l.strip_prefix("### dbd "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+
+    let missing: Vec<&&str> = commands.iter().filter(|c| !documented.contains(*c)).collect();
+    assert!(
+        missing.is_empty(),
+        "llms-full.txt is documented as exhaustive but has no section for: {missing:?}"
+    );
+
+    // The README's Commands table is the repo front page's command inventory.
+    // A reader treats it as the complete list, so a gap reads as a missing
+    // feature and sends them to a worse tool for the job.
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md")).expect("README.md");
+    // A row may carry flags (`dbd migrate --status`), so accept the command
+    // followed by a backtick or a space — not the bare backticked form only.
+    let is_listed = |c: &str| readme.contains(&format!("`dbd {c}`")) || readme.contains(&format!("`dbd {c} "));
+    let listed: Vec<&&str> = commands.iter().filter(|c| is_listed(c)).collect();
+    let unlisted: Vec<&&str> = commands.iter().filter(|c| !is_listed(c)).collect();
+    assert!(
+        unlisted.is_empty(),
+        "README lists {} of {} commands; missing: {unlisted:?}",
+        listed.len(),
+        commands.len()
     );
 }
 
