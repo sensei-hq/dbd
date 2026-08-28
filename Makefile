@@ -36,7 +36,7 @@ export CARGO_INCREMENTAL := 0
 ## Show this help.
 help:
 	@echo "Targets:"
-	@echo "  make bump          Bump patch (default), commit, tag, push"
+	@echo "  make bump          Bump patch (default), commit, tag, push (CI then publishes)"
 	@echo "  make bump patch    Same as 'make bump'"
 	@echo "  make bump minor    Bump minor, commit, tag, push"
 	@echo "  make bump major    Bump major, commit, tag, push"
@@ -115,6 +115,11 @@ bump: _check-clean _check-ci
 	   exit 1; \
 	 }
 	@echo "Released v$(NEW) on $(BRANCH). Now merge $(BRANCH) → main."
+	@echo "Pushing the tag triggers .github/workflows/release.yml, which re-runs the"
+	@echo "suite on the tagged tree and publishes to crates.io. Watch it with:"
+	@echo "    gh run list --workflow=release.yml"
+	@echo "If it fails, re-run it on the same tag (never delete and re-push a tag):"
+	@echo "    gh workflow run release.yml -f tag=v$(NEW)"
 	@echo "Installing v$(NEW) into ~/.cargo/bin..."
 	@trap 'echo ""; echo "Interrupted. v$(NEW) is tagged and pushed, so the release itself is"; echo "complete. Run: make install   (do NOT run make bump)"; exit 130' INT; \
 	 cargo install --path . --locked --force; ok=$$?; \
