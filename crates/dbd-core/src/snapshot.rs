@@ -382,6 +382,43 @@ pub struct TodoItem {
     pub message: String,
 }
 
+/// A copy of `snap` with every column type in its `format_type` spelling.
+///
+/// **For comparison only.** A snapshot on disk is the historical record of what
+/// version N's DDL said, so it keeps the spelling its parser produced; rewriting
+/// it would restate history, and `varchar(30)` vs `character varying(30)` is
+/// exactly the sort of detail someone reads an old snapshot to recover. The
+/// canonical form is the key the two are matched on, nothing more — the same
+/// split `schema_diff::normalize_index` makes for index predicates.
+///
+/// Without it, a snapshot-to-snapshot diff was the one comparison in dbd that
+/// read `data_type` raw. Reconcile and diff both normalize through
+/// `reconcile::canonical_type`; this path did not, so when
+/// `ParserChoice::resolve` began defaulting Postgres projects to libpg_query,
+/// the next `dbd snapshot` compared its spellings (`int`, `varchar(30)`) against
+/// the ones sqlparser had written (`INTEGER`, `VARCHAR(30)`) and emitted an
+/// `ALTER COLUMN … TYPE` — with a risky-type-change warning — for every column
+/// in the project, none of which had changed.
+///
+/// No enum map, for the reason the parser-parity harness gives: `canonical_type`
+/// uses one only to schema-qualify a bare enum against *introspection*, and both
+/// sides here are parser output, which spell an enum the same way.
+///
+/// One visible consequence: a genuine type change now emits the canonical
+/// spelling, so widening a column reads `TYPE character varying(60)` rather than
+/// `TYPE varchar(60)`. Both are the same type; this matches what `dbd diff`
+/// already emits.
+fn canonical_types(snap: &Snapshot) -> Snapshot {
+    let no_enums = std::collections::HashMap::new();
+    let mut out = snap.clone();
+    for table in &mut out.tables {
+        for column in &mut table.columns {
+            column.data_type = crate::reconcile::canonical_type(&column.data_type, &no_enums);
+        }
+    }
+    out
+}
+
 /// Prepare a snapshot from entities, optionally diffing against a previous snapshot.
 ///
 /// This is pure logic — no I/O. The caller is responsible for writing files.
@@ -426,7 +463,9 @@ pub fn prepare_snapshot(
             }
         }
         Some(prev) => {
-            let diffs = diff::diff(prev, &snapshot);
+            // Compared in canonical spelling, stored as authored — see
+            // [`canonical_types`] for why the two must not be the same thing.
+            let diffs = diff::diff(&canonical_types(prev), &canonical_types(&snapshot));
 
             if diffs.is_empty() {
                 return SnapshotResult {
@@ -584,7 +623,20 @@ pub fn prepare_multi_snapshot(
         };
     };
 
-    // Diff previous vs final
+    // Diff previous vs final, in canonical spelling — see [`canonical_types`].
+    // This is the diff `dbd snapshot` actually runs, and the one that matters
+    // most: `classify_changes` treats a column type change as a *complex* change,
+    // so an unnormalized spelling difference here does not merely emit a no-op
+    // `ALTER` — it splits into a two-stage column rebuild with a data-migration
+    // script, for a column whose type never changed.
+    //
+    // `prev` is rebound to the canonical form for everything downstream, not just
+    // the diff. `classify_changes` re-reads column types out of it to pair a drop
+    // with an add into a rename, and the stage builders derive their snapshots
+    // from it — feed those a raw `prev` beside canonical diffs and `TEXT` no
+    // longer equals `text`, so a genuine rename stops being detected.
+    let prev = &canonical_types(prev);
+    let final_snapshot = canonical_types(&final_snapshot);
     let diffs = diff::diff(prev, &final_snapshot);
 
     if diffs.is_empty() {
@@ -1474,6 +1526,144 @@ mod tests {
         assert!(!result.is_baseline);
         assert!(result.diffs.is_empty());
         assert!(result.graph.is_none());
+    }
+
+    /// A snapshot written by the old parser must not read as a schema change.
+    ///
+    /// sqlparser echoed the author's keyword, uppercased (`VARCHAR(30)`, `INT`);
+    /// libpg_query reports what Postgres resolved to (`varchar(30)`, `int`). Every
+    /// Postgres project now defaults to libpg_query, so the first snapshot taken
+    /// after that switch compares new spellings against old ones — and nothing on
+    /// this path normalized them, unlike reconcile and diff. The result was a
+    /// migration full of `ALTER COLUMN … TYPE varchar(30)` for columns nobody
+    /// touched, plus a risky-type-change warning on each.
+    #[test]
+    fn a_parser_spelling_change_is_not_a_schema_change() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                // What sqlparser stored.
+                columns: vec![col("id", "INTEGER"), col("name", "VARCHAR(30)")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+
+        // What libpg_query stores for the very same DDL.
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "int"), col("name", "varchar(30)")],
+        )];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "no changes");
+        assert!(
+            result.no_changes,
+            "a spelling difference must not produce a migration, got {:?}",
+            result.diffs
+        );
+    }
+
+    /// The same, through the function `dbd snapshot` actually calls.
+    ///
+    /// `create_snapshot` goes through [`prepare_multi_snapshot`], which does its
+    /// own diff — so fixing only [`prepare_snapshot`] left the CLI untouched. Its
+    /// classifier reads a type change as a *complex* change, so the spelling
+    /// difference did not merely emit a no-op `ALTER`: it produced a two-stage
+    /// column rebuild (`ADD COLUMN name_new` … `DROP COLUMN name; RENAME`) plus a
+    /// data-migration script warning that the cast "may truncate data" — for a
+    /// column whose type never changed.
+    #[test]
+    fn the_cli_path_also_ignores_a_parser_spelling_change() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INTEGER"), col("name", "VARCHAR(30)")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "int"), col("name", "varchar(30)")],
+        )];
+
+        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "no changes");
+        assert_eq!(result.snapshots.len(), 1, "a no-op must not split into stages");
+        assert!(
+            result.snapshots[0].no_changes,
+            "a spelling difference must not produce a migration, got {:?}",
+            result.snapshots[0].diffs
+        );
+        assert!(
+            result.todos.is_empty(),
+            "no data-correction todo should be raised, got {:?}",
+            result.todos.iter().map(|t| &t.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// …but the snapshot written to disk keeps the spelling the parser produced.
+    ///
+    /// Canonicalization is a comparison key, not a storage format: a snapshot is
+    /// the historical record of what version N's DDL said. Rewriting it would
+    /// silently restate history, and `varchar(30)` vs `character varying(30)` is
+    /// exactly the kind of detail someone reads a snapshot to recover.
+    #[test]
+    fn canonicalization_does_not_rewrite_the_stored_snapshot() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("name", "VARCHAR(30)")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("name", "varchar(30)")])];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "no changes");
+        assert_eq!(
+            result.snapshot.tables[0].columns[0].data_type, "varchar(30)",
+            "the stored snapshot must record the authored spelling, not the comparison key"
+        );
+    }
+
+    /// A real type change still surfaces — the normalization must not swallow it.
+    #[test]
+    fn a_real_type_change_still_produces_a_migration() {
+        let prev = Snapshot {
+            version: 1,
+            description: "initial".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("name", "VARCHAR(30)")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity("config.users", vec![col("name", "varchar(60)")])];
+
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "widen name");
+        assert!(
+            !result.no_changes,
+            "varchar(30) → varchar(60) is a real change and must still be reported"
+        );
     }
 
     // ── SC4: New table added ────────────────────────────────
