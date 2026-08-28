@@ -166,6 +166,12 @@ pub(crate) fn backs_a_constraint(ix: &IndexDef, constraint_cols: &std::collectio
 /// - btree is the default access method, so an explicit `using btree` collapses
 ///   to "no `USING` clause";
 /// - `ASC` is the default direction, so an explicit `asc` collapses to unset.
+/// - a partial index's `WHERE` predicate and an expression key are canonicalized
+///   here rather than at parse/introspection time, so the lossy canonical form
+///   stays a **matching key** and never reaches `emit_index_sql`.
+///
+/// Callers must apply this to a COPY. Both do: `normalize_for_diff` works on the
+/// throwaway snapshots it diffs, and `reconcile::index_shape` clones first.
 pub(crate) fn normalize_index(ix: &mut IndexDef) {
     use crate::entity::{IndexType, SortOrder};
     if ix.index_type == Some(IndexType::Btree) {
@@ -175,6 +181,19 @@ pub(crate) fn normalize_index(ix: &mut IndexDef) {
         if col.order == Some(SortOrder::Asc) {
             col.order = None;
         }
+        // An expression key reaches dbd as `(context ->> 'module')` from the design
+        // and `(context ->> 'module'::text)` from Postgres — the same normalization
+        // the predicate needs, and for the same reason.
+        if col.is_expression
+            && let Some(canon) = crate::sql_expr::canonicalize_expression(&col.name)
+        {
+            col.name = canon;
+        }
+    }
+    if let Some(pred) = ix.predicate.as_ref()
+        && let Some(canon) = crate::sql_expr::canonicalize_predicate(pred)
+    {
+        ix.predicate = Some(canon);
     }
 }
 
@@ -501,6 +520,122 @@ mod tests {
         });
         let d = SchemaDiff::compute(live, desired);
         assert!(!d.is_empty(), "new index must surface");
+    }
+
+    /// The whole of `sensei.schedules` — the table that made `dbd diff --scope
+    /// default` report drift on every run against a database that was already in
+    /// sync, with no DDL spelling able to silence it.
+    ///
+    /// `live` is what introspection reports (`format_type` for the types,
+    /// pretty-printed `pg_get_constraintdef` for the CHECKs, the PK decomposed
+    /// into a named constraint plus its backing index); `desired` is what the
+    /// parser produces for the authored DDL (`time`, `timestamptz`, unnamed
+    /// inline CHECKs, an `is_pk` flag). Nothing differs but the spelling, so the
+    /// diff must be empty.
+    #[test]
+    fn an_in_sync_schedules_table_shows_no_drift() {
+        let not_null = |c: ColumnDef| ColumnDef { nullable: false, ..c };
+        let defaulted = |c: ColumnDef, d: &str| ColumnDef {
+            nullable: false,
+            default_value: Some(d.into()),
+            ..c
+        };
+        let days_check_live = "days IS NULL OR array_length(days, 1) >= 1 AND array_length(days, 1) <= 7 \
+             AND days <@ ARRAY[1::smallint, 2::smallint, 3::smallint, 4::smallint, \
+             5::smallint, 6::smallint, 7::smallint]";
+        let days_check_authored = "days is null or (array_length(days, 1) between 1 and 7 \
+             and days <@ array[1,2,3,4,5,6,7]::smallint[])";
+
+        let live = Snapshot {
+            tables: vec![TableSnapshot {
+                name: "schedules".into(),
+                schema: "sensei".into(),
+                columns: vec![
+                    not_null(col("name", "text")),
+                    defaulted(col("enabled", "boolean"), "true"),
+                    not_null(col("interval_secs", "integer")),
+                    col("window_start", "time without time zone"),
+                    col("window_end", "time without time zone"),
+                    col("days", "smallint[]"),
+                    col("last_run_at", "timestamp with time zone"),
+                    col("last_ok", "boolean"),
+                    col("last_error", "text"),
+                    defaulted(col("created_at", "timestamp with time zone"), "now()"),
+                    defaulted(col("modified_at", "timestamp with time zone"), "now()"),
+                ],
+                indexes: vec![idx("schedules_pkey", &["name"], true)],
+                table_constraints: vec![
+                    TableConstraint::PrimaryKey {
+                        name: Some("schedules_pkey".into()),
+                        columns: vec!["name".into()],
+                    },
+                    check("schedules_interval_secs_check", "interval_secs > 0"),
+                    check("schedules_days_check", days_check_live),
+                ],
+            }],
+            ..snap(table(vec![]))
+        };
+
+        let desired = Snapshot {
+            tables: vec![TableSnapshot {
+                name: "schedules".into(),
+                schema: "sensei".into(),
+                columns: vec![
+                    ColumnDef {
+                        is_pk: true,
+                        ..not_null(col("name", "text"))
+                    },
+                    defaulted(col("enabled", "boolean"), "true"),
+                    not_null(col("interval_secs", "integer")),
+                    col("window_start", "time"),
+                    col("window_end", "time"),
+                    col("days", "smallint[]"),
+                    col("last_run_at", "timestamptz"),
+                    col("last_ok", "boolean"),
+                    col("last_error", "text"),
+                    defaulted(col("created_at", "timestamptz"), "now()"),
+                    defaulted(col("modified_at", "timestamptz"), "now()"),
+                ],
+                indexes: vec![],
+                table_constraints: vec![
+                    TableConstraint::Check {
+                        name: None,
+                        expression: "interval_secs > 0".into(),
+                    },
+                    TableConstraint::Check {
+                        name: None,
+                        expression: days_check_authored.into(),
+                    },
+                ],
+            }],
+            ..snap(table(vec![]))
+        };
+
+        let d = SchemaDiff::compute(live, desired);
+        assert!(
+            d.is_empty(),
+            "an in-sync schedules table must diff clean, got {:?}",
+            d.changes
+        );
+        assert!(
+            d.advisories.is_empty(),
+            "no CHECK here should defeat normalization, got {:?}",
+            d.advisories
+        );
+    }
+
+    /// The same table with a genuinely time-zone-aware `window_start` still
+    /// surfaces — the phantom fix must not have blunted the real signal.
+    #[test]
+    fn a_real_time_type_change_still_surfaces() {
+        let live = snap(TableSnapshot {
+            ..table(vec![col("window_start", "time without time zone")])
+        });
+        let desired = snap(TableSnapshot {
+            ..table(vec![col("window_start", "timetz")])
+        });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(!d.is_empty(), "time → time with time zone must surface as a change");
     }
 
     /// `is_empty()` accounts for matview drift: a diff with no table/enum changes

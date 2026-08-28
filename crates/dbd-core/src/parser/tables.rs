@@ -423,10 +423,9 @@ fn extract_index(create_index: &sqlparser::ast::CreateIndex) -> IndexDef {
         columns,
         unique: create_index.unique,
         index_type: convert_index_type(create_index.using.as_ref()),
-        predicate: create_index.predicate.as_ref().map(|p| {
-            let raw = p.to_string();
-            crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw)
-        }),
+        // Stored AS AUTHORED — see the pg parser's note; canonicalization for
+        // matching happens in `schema_diff::normalize_index`, on a copy.
+        predicate: create_index.predicate.as_ref().map(|p| p.to_string()),
         include: create_index.include.iter().map(|i| i.value.clone()).collect(),
         // `NULLS DISTINCT` is the default, so only `NOT DISTINCT` is recorded.
         nulls_not_distinct: create_index.nulls_distinct == Some(false),
@@ -689,10 +688,10 @@ mod tests {
         assert_eq!(ix.predicate, Some("folder_id IS NOT NULL".to_string()));
     }
 
-    /// The authored predicate is canonicalized on the way in, so it matches the
-    /// analyzed form Postgres reports for the same index.
+    /// The authored predicate is kept verbatim; convergence with the analyzed form
+    /// Postgres reports happens in `normalize_index`, on a copy.
     #[test]
-    fn canonicalizes_the_partial_index_predicate() {
+    fn stores_the_partial_index_predicate_raw_and_matches_it_canonically() {
         let stmts = parse(
             "CREATE TABLE foo (id int, scope text);
              CREATE INDEX foo_scope ON foo (id) where scope in ('user', 'project');",
@@ -701,7 +700,19 @@ mod tests {
 
         assert_eq!(
             def.indexes[0].predicate.as_deref(),
-            crate::sql_expr::canonicalize_predicate("scope = ANY (ARRAY['user'::text, 'project'::text])").as_deref(),
+            Some("scope IN ('user', 'project')"),
+            "the authored spelling must be stored, not dbd's canonical form"
+        );
+
+        let mut authored = def.indexes[0].clone();
+        let mut introspected = crate::entity::IndexDef {
+            predicate: Some("scope = ANY (ARRAY['user'::text, 'project'::text])".into()),
+            ..authored.clone()
+        };
+        crate::schema_diff::normalize_index(&mut authored);
+        crate::schema_diff::normalize_index(&mut introspected);
+        assert_eq!(
+            authored.predicate, introspected.predicate,
             "authored and introspected predicate spellings must canonicalize alike"
         );
     }
