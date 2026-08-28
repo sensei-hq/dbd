@@ -102,19 +102,20 @@ fn canonicalize_reference_order(mut entity: Entity) -> Entity {
 /// vs `varchar(30)`, `CHARACTER VARYING(10)` vs `varchar(10)` and
 /// `TIMESTAMPTZ` vs `timestamptz`.
 ///
-/// The difference is inert for the LIVE comparisons: reconcile and diff both put
-/// each side through [`dbd_core::reconcile::canonical_type`] first (via
-/// `normalize_common`) — which is what `fix(reconcile): canonicalize
-/// pg_catalog-qualified type names` measured at 12-of-12 convergence between the
-/// two parsers' spellings.
+/// The difference is inert, because no comparison dbd makes reads `data_type`
+/// raw: reconcile and diff put each side through
+/// [`dbd_core::reconcile::canonical_type`] via `normalize_common`, and
+/// `snapshot::prepare_snapshot` does the same through its own `canonical_types`
+/// — which is what `fix(reconcile): canonicalize pg_catalog-qualified type
+/// names` measured at 12-of-12 convergence between the two parsers' spellings.
 ///
-/// It is NOT inert for `dbd snapshot`. `snapshot::prepare_snapshot` diffs the
-/// previous snapshot against the new one with no normalization at all, so a
-/// project holding snapshots written by the old sqlparser backend (`VARCHAR(30)`)
-/// gets a spurious `ALTER COLUMN … TYPE varchar(30)` on its next snapshot now
-/// that `ParserChoice::resolve` defaults Postgres projects to libpg_query. This
-/// gate does not cover that path; erasing the spelling here is still right for
-/// what it does compare, but it is not evidence that the snapshot path is safe.
+/// The snapshot path is the one that had to be fixed to make that sentence true.
+/// It diffed the previous snapshot against the new one with no normalization, so
+/// once `ParserChoice::resolve` began defaulting Postgres projects to
+/// libpg_query, a project holding sqlparser-written snapshots (`VARCHAR(30)`)
+/// got a spurious `ALTER COLUMN … TYPE varchar(30)` for every column. Erasing
+/// the spelling in this gate is only sound while all three paths normalize; if
+/// one stops, this comment is the thing that lied first.
 ///
 /// Like [`canonicalize_reference_order`] and unlike [`without_soft_refs`], this
 /// maps rather than drops: both sides go through the same total function, so a
