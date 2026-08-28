@@ -277,9 +277,22 @@ fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<
     }
 }
 
-/// Normalize a column type for cross-representation comparison: lowercase, drop a
-/// redundant `public.` prefix, map common Postgres aliases to the `format_type`
-/// spelling, and schema-qualify a bare enum name using `enum_types`.
+/// Normalize a column type for cross-representation comparison, toward the
+/// `format_type` spelling introspection reports:
+///
+/// - lowercase, and drop a redundant `public.` / `pg_catalog.` prefix;
+/// - collapse any array suffix to a single `[]` over the normalized element type
+///   — Postgres records neither dimensionality nor a bound, so `text[][]` and
+///   `text[3]` are both just `text[]`;
+/// - re-spell the whole date/time family, which means ADDING a qualifier the
+///   author never wrote: `time` → `time without time zone`;
+/// - map common Postgres aliases (`int4` → `integer`, `varchar` → `character
+///   varying`);
+/// - schema-qualify a bare enum name using `enum_types`.
+///
+/// The last three are more than an alias swap, and the result is user-visible:
+/// `diff::generate` emits `ALTER … TYPE {data_type}`, so a real change to a
+/// `time` column now prints `TYPE time without time zone`.
 ///
 /// Public for the same reason as [`crate::parser::pg_native_types`]: the parser
 /// parity harness is an integration test in a separate crate, and comparing two
@@ -298,10 +311,46 @@ pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String
             break;
         }
     }
+    // An array suffix has to come off before the alias table sees the name,
+    // otherwise `int4[]` never matches `int4` and every array column reads as
+    // drifted against the `integer[]` introspection reports.
+    let (element, array_suffix) = split_array_suffix(&s);
+    format!("{}{array_suffix}", canonical_element_type(element, enum_types))
+}
+
+/// Split a trailing array suffix off a type name, returning the element type and
+/// the canonical suffix to put back (`"[]"` or `""`).
+///
+/// `format_type` spells every array as `element[]` regardless of how many
+/// dimensions — or what bounds — were declared, because Postgres does not track
+/// them: a column declared `text[][]` or `text[3]` is the same one-and-only
+/// `text[]` type. So peel every `[…]` off and re-emit a single `[]`.
+fn split_array_suffix(s: &str) -> (&str, &'static str) {
+    let mut rest = s.trim_end();
+    let mut is_array = false;
+    while let Some(inner) = rest.strip_suffix(']') {
+        // Only a dimension marker peels: `[]` and `[3]` are array syntax, but
+        // anything else between the brackets is part of some other type's name.
+        let Some(open) = inner.rfind('[') else { break };
+        if !inner[open + 1..].chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        rest = inner[..open].trim_end();
+        is_array = true;
+    }
+    (rest, if is_array { "[]" } else { "" })
+}
+
+/// Normalize a scalar (non-array) type name to its `format_type` spelling.
+fn canonical_element_type(s: &str, enum_types: &HashMap<String, String>) -> String {
+    // The date/time family needs more than a base-name swap — see below.
+    if let Some(canonical) = canonical_datetime(s) {
+        return canonical;
+    }
     // Split "base(args)" so parameterized aliases (varchar(255)) normalize too.
     let (base, args) = match s.split_once('(') {
         Some((b, rest)) => (b.trim().to_string(), Some(format!("({rest}"))),
-        None => (s.clone(), None),
+        None => (s.to_string(), None),
     };
     let base = match base.as_str() {
         "int" | "int4" => "integer".to_string(),
@@ -310,8 +359,6 @@ pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String
         "bool" => "boolean".to_string(),
         "float8" => "double precision".to_string(),
         "float4" => "real".to_string(),
-        "timestamptz" => "timestamp with time zone".to_string(),
-        "timetz" => "time with time zone".to_string(),
         "varchar" => "character varying".to_string(),
         "char" | "bpchar" => "character".to_string(),
         "decimal" => "numeric".to_string(),
@@ -323,6 +370,59 @@ pub fn canonical_type(raw: &str, enum_types: &HashMap<String, String>) -> String
         Some(a) => format!("{base}{a}"),
         None => base,
     }
+}
+
+/// Re-spell a date/time type the way `format_type` does, or `None` if this is
+/// not one — in which case the caller falls back to the plain alias table.
+///
+/// This family cannot go through that table because its three parts move
+/// independently. `format_type` always writes the base word, then the modifier,
+/// then the time zone spelled out in full (`timetz(3)` → `time(3) with time
+/// zone`), while the design side arrives in whatever libpg_query's deparser
+/// produced. A base-name swap gets both halves wrong: it cannot express
+/// `timetz` → `time … with time zone` with a modifier wedged in the middle
+/// (yielding `time with time zone(3)`), and it never fires at all on the
+/// already-spelled-out forms, whose "base name" is the entire string.
+///
+/// The case that made this load-bearing is plain `time`. The deparser renders
+/// both `time` and `time without time zone` as bare `time`, so *no* DDL spelling
+/// could match the `time without time zone` introspection reports — every `time`
+/// column showed a permanent `ALTER COLUMN … TYPE` that changed nothing, and
+/// `dbd diff --exit-code` could never come back clean.
+///
+/// `interval` is deliberately not in the family: its qualifier is a field list
+/// (`interval hour to minute`), not a time zone, and both sides already spell it
+/// the same way.
+fn canonical_datetime(s: &str) -> Option<String> {
+    // Peel the spelled-out qualifier first — it is the only part that can be
+    // absent, and its absence means "without" for the SQL-standard names.
+    let (head, spelled_tz) = if let Some(h) = s.strip_suffix("without time zone") {
+        (h.trim_end(), Some(false))
+    } else if let Some(h) = s.strip_suffix("with time zone") {
+        (h.trim_end(), Some(true))
+    } else {
+        (s, None)
+    };
+
+    // Then the modifier. The deparser writes `time (3) with time zone` with a
+    // space that `format_type` does not, so trim around the paren.
+    let (word, modifier) = match head.split_once('(') {
+        Some((w, rest)) => (w.trim_end(), format!("({rest}")),
+        None => (head, String::new()),
+    };
+
+    // A `tz` base word carries its own answer; the spelled-out qualifier only
+    // ever appears on the SQL-standard spellings.
+    let (family, tz) = match word {
+        "time" => ("time", spelled_tz.unwrap_or(false)),
+        "timetz" => ("time", true),
+        "timestamp" => ("timestamp", spelled_tz.unwrap_or(false)),
+        "timestamptz" => ("timestamp", true),
+        _ => return None,
+    };
+
+    let zone = if tz { "with time zone" } else { "without time zone" };
+    Some(format!("{family}{modifier} {zone}"))
 }
 
 /// Normalize a column default so a **parsed** literal and Postgres's
@@ -1306,6 +1406,120 @@ mod tests {
                 "{qualified} and {bare} must canonicalize alike"
             );
         }
+    }
+
+    /// A column's type reaches dbd in two spellings that have to converge or the
+    /// diff never comes back clean. The **design** side is whatever libpg_query's
+    /// deparser emits for the authored DDL (`time`, `timestamptz(3)`); the
+    /// **live** side is `format_type`, which always spells the time zone out and
+    /// puts the modifier on the base word (`time without time zone`,
+    /// `timestamp(3) with time zone`). Both columns below were read off a real
+    /// parse and a real `pg_attribute` row.
+    ///
+    /// `time` is the case that bit: the deparser renders BOTH `time` and
+    /// `time without time zone` as plain `time`, so no DDL spelling could ever
+    /// match the live side — every `time` column read as a permanent
+    /// `ALTER COLUMN … TYPE` that changed nothing.
+    #[test]
+    fn datetime_spellings_converge_on_the_format_type_form() {
+        let e = std::collections::HashMap::new();
+        for (design, live) in [
+            ("time", "time without time zone"),
+            ("time(3)", "time(3) without time zone"),
+            ("timestamp", "timestamp without time zone"),
+            ("timestamp(6)", "timestamp(6) without time zone"),
+            ("timetz", "time with time zone"),
+            ("timetz(3)", "time(3) with time zone"),
+            ("timestamptz", "timestamp with time zone"),
+            ("timestamptz(3)", "timestamp(3) with time zone"),
+            // The deparser leaves a space before the modifier on the spelled-out
+            // form: `time(3) with time zone` comes back `time (3) with time zone`.
+            ("time (3) with time zone", "time(3) with time zone"),
+            ("timestamp (3) with time zone", "timestamp(3) with time zone"),
+        ] {
+            assert_eq!(
+                canonical_type(design, &e),
+                live,
+                "{design} must canonicalize to the format_type spelling"
+            );
+            assert_eq!(
+                canonical_type(live, &e),
+                live,
+                "{live} is already canonical and must survive unchanged"
+            );
+        }
+    }
+
+    /// Time zone awareness is a real type difference, not a spelling — collapsing
+    /// it would hide a genuine `ALTER COLUMN … TYPE` instead of a phantom one.
+    #[test]
+    fn time_zone_awareness_is_not_normalized_away() {
+        let e = std::collections::HashMap::new();
+        assert_ne!(canonical_type("time", &e), canonical_type("timetz", &e));
+        assert_ne!(canonical_type("timestamp", &e), canonical_type("timestamptz", &e));
+        assert_ne!(canonical_type("time", &e), canonical_type("timestamp", &e));
+        assert_ne!(canonical_type("time(3)", &e), canonical_type("time(6)", &e));
+    }
+
+    /// The alias table has to reach through an array suffix too. `format_type`
+    /// spells an array as its normalized element type plus `[]`, so an authored
+    /// `int[]` has to become `integer[]` — and because Postgres does not track
+    /// array dimensionality, a declared `text[][]` IS just `text[]`.
+    #[test]
+    fn array_types_normalize_through_their_element_type() {
+        let e = std::collections::HashMap::new();
+        for (design, live) in [
+            ("int[]", "integer[]"),
+            ("int4[]", "integer[]"),
+            ("bigint[]", "bigint[]"),
+            ("varchar(30)[]", "character varying(30)[]"),
+            ("boolean[]", "boolean[]"),
+            ("numeric(10,2)[]", "numeric(10,2)[]"),
+            ("smallint[]", "smallint[]"),
+            ("time[]", "time without time zone[]"),
+            ("timestamp[]", "timestamp without time zone[]"),
+            ("timestamptz[]", "timestamp with time zone[]"),
+            ("timetz[]", "time with time zone[]"),
+            ("text[][]", "text[]"),
+            // A declared BOUND is as inert as a declared dimension — Postgres
+            // records neither, and dbd's own parser emits the bounded spelling
+            // (`create table t (a text[3])` parses to `text[3]`), so without
+            // these the digit branch in `split_array_suffix` never sees a digit
+            // and every bounded-array column reads as permanently drifted.
+            ("text[3]", "text[]"),
+            ("int[3]", "integer[]"),
+            ("varchar(4)[2]", "character varying(4)[]"),
+        ] {
+            assert_eq!(
+                canonical_type(design, &e),
+                live,
+                "{design} must canonicalize to the format_type spelling"
+            );
+            assert_eq!(
+                canonical_type(live, &e),
+                live,
+                "{live} is already canonical and must survive unchanged"
+            );
+        }
+    }
+
+    /// An array of an enum still gets the bare name schema-qualified — the array
+    /// suffix must not shadow the enum lookup that plain columns get.
+    #[test]
+    fn array_of_enum_is_still_schema_qualified() {
+        let mut e = std::collections::HashMap::new();
+        e.insert("status_t".to_string(), "app.status_t".to_string());
+        assert_eq!(canonical_type("status_t[]", &e), "app.status_t[]");
+        assert_eq!(canonical_type("status_t", &e), "app.status_t");
+    }
+
+    /// `interval` carries its qualifier as fields, not as a time-zone suffix, and
+    /// both sides already agree on it — the datetime rewrite must not touch it.
+    #[test]
+    fn interval_is_left_alone() {
+        let e = std::collections::HashMap::new();
+        assert_eq!(canonical_type("interval", &e), "interval");
+        assert_eq!(canonical_type("interval hour to minute", &e), "interval hour to minute");
     }
 
     /// Only the two system schemas are stripped. A user type keeps its schema —

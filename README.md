@@ -68,6 +68,7 @@ myproject/
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
 | `dbd reconcile` | Pre-release: diff the live DB against the design and apply ALTER/CREATE in place (no snapshots) |
+| `dbd diff` | Read-only: the complete difference between the live DB and the design — columns, keys, constraints, indexes, comments, enums (everything `reconcile --dry-run` omits) |
 | `dbd release` (alias `baseline`) | Write a baseline snapshot and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
@@ -249,12 +250,14 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.12.2
+  rev: v0.12.4
   hooks:
     - id: dbd-format
 ```
 
-The `dbd-format` hook builds dbd from source via cargo on first install (slow once, cached after). For contributors who already have `dbd` on PATH (via `cargo install dbd-cli`, brew, or a release binary), use `dbd-format-system` instead — it skips the build and runs the installed binary.
+The `dbd-format` hook builds dbd from source via cargo on first install (slow once, cached after). It builds from the tag you pin, so that tag needs an installable Cargo package at the repo root — **v0.12.3 and later**. On an earlier `rev` pre-commit aborts during environment setup with `found a virtual manifest instead of a package manifest`; use `dbd-format-system` with those.
+
+For contributors who already have `dbd` on PATH (via `cargo install dbd-cli`), `dbd-format-system` is the faster choice at any `rev` — it skips the build and runs the installed binary.
 
 Both hooks scan the project's `ddl/` tree themselves, so pre-commit invokes them with no positional args (`pass_filenames: false` in the shipped hook spec).
 

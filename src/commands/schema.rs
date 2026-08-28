@@ -105,8 +105,8 @@ pub async fn cmd_inspect(
     }
     // Named in the tally so a reader knows the advisory block was counted
     // separately rather than folded into the error count.
-    if !enum_hints.is_empty() {
-        output::always(&format!("({} enum suggestion(s) — advisory)", enum_hints.len()));
+    if let Some(line) = enum_advisory_tally(&enum_hints) {
+        output::always(&line);
     }
 
     // Report first, then fail. The findings above are the useful output; an
@@ -364,7 +364,17 @@ fn group_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<EnumProposal> {
 
     for h in hints {
         let (schema, table) = h.entity.split_once('.').unwrap_or(("public", h.entity.as_str()));
-        let key = (schema.to_string(), h.column.clone(), h.values.clone());
+        // A CHECK may repeat a literal; a `CREATE TYPE ... AS ENUM` label list
+        // may not. Dedup first — preserving first-seen order, since enums are
+        // ordered — so the key and the rendered list are both a valid label
+        // set, and two CHECKs differing only by a repeat read as one domain.
+        let mut values: Vec<String> = Vec::with_capacity(h.values.len());
+        for v in &h.values {
+            if !values.contains(v) {
+                values.push(v.clone());
+            }
+        }
+        let key = (schema.to_string(), h.column.clone(), values);
         if !columns.contains_key(&key) {
             order.push(key.clone());
         }
@@ -407,10 +417,152 @@ fn group_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<EnumProposal> {
         })
         .collect();
 
+    // Qualifying can itself collide, so uniqueness is settled on the final
+    // names rather than assumed from the column names.
+    resolve_name_collisions(&mut proposals);
+
     // Scan order is deterministic but arbitrary to read. Sorting groups each
     // schema's proposals together and makes the list scannable.
     proposals.sort_by(|a, b| (&a.schema, &a.type_name).cmp(&(&b.schema, &b.type_name)));
     proposals
+}
+
+/// Render user-authored text for a terminal with control characters escaped.
+///
+/// Identifiers and CHECK literals are printed verbatim. An ANSI escape among
+/// them can clear the screen or recolour the lines around it, rewriting the
+/// paths and counts the reader is being asked to act on.
+/// The exit code a finished policy phase should produce.
+///
+/// A failed policy file leaves the schema applied with RLS only partially in
+/// place. That is a security-relevant difference, and a zero exit hides it —
+/// "the deploy succeeded" then stops being evidence that RLS is in place.
+///
+/// Shared so `dbd policies` and `dbd apply --with-policies` cannot disagree:
+/// they used to, the first exiting 1 and the second returning `Ok(())` for the
+/// identical report, so whether a pipeline caught a broken policy depended on
+/// which command it happened to call.
+fn policy_phase_exit_code(report: &dbd_core::design::PolicyReport) -> i32 {
+    i32::from(!report.failed.is_empty())
+}
+
+/// The scope's working set for the policy phase, or `None` for the all-scope.
+///
+/// A failure here must propagate rather than collapse to `None`:
+/// `apply_policies` reads `None` as "no scope filter" and executes *every* file
+/// under `policies/` against the live database. Discarding a closure conflict
+/// would therefore widen the run instead of narrowing it — the opposite of what
+/// `--scope` was asked for, and visible only as a count with no baseline.
+fn policy_working_set(
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<Option<(String, std::collections::HashSet<String>)>> {
+    if resolved.is_all {
+        return Ok(None);
+    }
+    let working_set = design
+        .working_set(resolved)
+        .with_context(|| format!("Failed to resolve scope '{}' for policies", resolved.name))?;
+    Ok(Some((resolved.name.clone(), working_set)))
+}
+
+/// Characters that must never reach a terminal or a suggested path.
+///
+/// `char::is_control` covers only Unicode category Cc. Format characters (Cf)
+/// are not control characters but do the same damage: `U+202E` renders
+/// everything after it right-to-left, zero-width characters hide inside an
+/// identifier, and `U+2044` reads as `/` without being one. Each lets a name
+/// look like something it is not, in output the reader is asked to act on —
+/// so a bidi-reversed column name can render as `ddl/enum/app/../../etc/passwd`.
+fn is_display_hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}'                            // soft hyphen
+            | '\u{200B}'..='\u{200F}'             // zero-width, LRM/RLM
+            | '\u{202A}'..='\u{202E}'             // bidi embedding and override
+            | '\u{2060}'..='\u{2064}'             // invisible operators
+            | '\u{2066}'..='\u{2069}'             // bidi isolates
+            | '\u{FEFF}'                          // BOM / ZWNBSP
+            | '\u{2044}' | '\u{2215}' | '\u{29F8}' // `/` look-alikes
+        )
+}
+
+fn display_safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_display_hostile(c) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether an identifier is safe to interpolate into the suggested filename.
+///
+/// Schema, table and column names are lifted from user-authored DDL, where a
+/// quoted identifier may contain a path separator, a `..`, or a control
+/// character. `ddl/enum/<schema>/<name>.ddl` is advice a reader follows
+/// literally, so anything that is not a single ordinary path segment must not
+/// reach it — the point of grouping is to stop this output breaking the schema
+/// it is trying to improve.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.chars().any(is_display_hostile)
+}
+
+/// Force every `(schema, type_name)` pair to be unique.
+///
+/// Qualifying a contested column with its table is not enough on its own: the
+/// qualified name can be one another column already holds — `app.job.state`
+/// becomes `job_state`, which a column literally named `job_state` already
+/// claimed — putting two `CREATE TYPE`s back in one file. Uniqueness has to be
+/// a property of the *final* name, not of the column name it was derived from.
+fn resolve_name_collisions(proposals: &mut [EnumProposal]) {
+    // One qualification round: a plain name colliding with a qualified one
+    // becomes qualified itself, which separates the two.
+    // Keyed case-insensitively: the key names a file, and macOS and Windows
+    // filesystems fold case, so `State` and `state` are one file even though
+    // Postgres treats those quoted identifiers as two distinct columns.
+    fn fold(schema: &str, name: &str) -> (String, String) {
+        (schema.to_lowercase(), name.to_lowercase())
+    }
+
+    let mut counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    for p in proposals.iter() {
+        *counts.entry(fold(&p.schema, &p.type_name)).or_default() += 1;
+    }
+    for p in proposals.iter_mut() {
+        if counts.get(&fold(&p.schema, &p.type_name)).copied().unwrap_or(0) > 1
+            && !p.renamed
+            && let Some(table) = p.columns.first().and_then(|c| c.split('.').nth(1))
+        {
+            p.type_name = format!("{table}_{}", p.type_name);
+            p.renamed = true;
+        }
+    }
+
+    // Last resort, for a column carrying more than one string-set CHECK: two
+    // hints on the same table and column qualify to the same name. Suffix them
+    // so no two proposals can ever name one file.
+    let mut used: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for p in proposals.iter_mut() {
+        let base = p.type_name.clone();
+        let mut n = 2;
+        while !used.insert(fold(&p.schema, &p.type_name)) {
+            p.type_name = format!("{base}_{n}");
+            n += 1;
+            // A suffixed file is not named after its column either, so it is a
+            // rename like any other — the footer must count and explain it,
+            // otherwise a bare `_2` appears with nothing accounting for it.
+            p.renamed = true;
+        }
+    }
 }
 
 /// Render the advisory enum-candidate section: one rationale, then the
@@ -430,9 +582,34 @@ fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     ];
 
     for p in &proposals {
-        let set = p.values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ");
-        out.push(format!("  ddl/enum/{}/{}.ddl — {set}", p.schema, p.type_name));
-        out.push(format!("      {}", p.columns.join(", ")));
+        // Double any embedded quote: this line is copied into a CREATE TYPE, so
+        // an unescaped `'` closes the literal and the rest becomes SQL.
+        // Escaped text is not the literal it came from: pasting `'a\u{a}b'`
+        // creates an eight-character label, not the three the CHECK held. When
+        // anything had to be escaped, drop the quotes so the line cannot read
+        // as SQL, and say so — the same refusal the path branch makes.
+        let set = if p.values.iter().any(|v| v.chars().any(is_display_hostile)) {
+            format!(
+                "values shown escaped, transcribe from the CHECK: {}",
+                p.values.iter().map(|v| display_safe(v)).collect::<Vec<_>>().join(", ")
+            )
+        } else {
+            p.values
+                .iter()
+                .map(|v| format!("'{}'", display_safe(&v.replace('\'', "''"))))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if is_safe_path_component(&p.schema) && is_safe_path_component(&p.type_name) {
+            out.push(format!("  ddl/enum/{}/{}.ddl — {set}", p.schema, p.type_name));
+        } else {
+            // Report the candidate, but never print a path the reader would
+            // follow outside the project.
+            out.push(format!(
+                "  (name this one yourself — the identifier is not path-safe) — {set}"
+            ));
+        }
+        out.push(format!("      {}", display_safe(&p.columns.join(", "))));
     }
 
     // Only mention renaming if it actually happened, and say why — a reader who
@@ -441,13 +618,25 @@ fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     let renamed: Vec<&EnumProposal> = proposals.iter().filter(|p| p.renamed).collect();
     if !renamed.is_empty() {
         out.push(String::new());
+        // One reason, true of every type counted. Naming the ambiguity case
+        // specifically ("the column name covers more than one value set") was
+        // false for the collision- and suffix-renamed ones, and a reader who
+        // checked would conclude the rename was spurious and undo it.
         out.push(format!(
-            "  {} type(s) named after their table because the column name covers more than one",
+            "  {} type(s) are not named after their column alone: the plain name was already",
             renamed.len()
         ));
-        out.push("  value set in that schema — rename to whatever reads better.".to_string());
+        out.push("  taken in that schema — rename to whatever reads better.".to_string());
     }
     out
+}
+
+/// The advisory tally line, or `None` when there is nothing to advise.
+///
+/// It names the `Suggestions:` block, so it must count what that block lists.
+fn enum_advisory_tally(hints: &[dbd_core::design::EnumHint]) -> Option<String> {
+    let n = group_enum_hints(hints).len();
+    (n > 0).then(|| format!("({n} enum suggestion(s) — advisory)"))
 }
 
 /// Print the advisory `Suggestions:` section (enum candidates). Report-only.
@@ -613,11 +802,7 @@ pub async fn cmd_apply(
 
     // Apply RLS policies if requested
     if with_policies {
-        let policy_ws = if resolved.is_all {
-            None
-        } else {
-            design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
-        };
+        let policy_ws = policy_working_set(&design, &resolved)?;
         let report = dbd_core::design::apply_policies(
             &*adapter,
             project_dir,
@@ -633,6 +818,12 @@ pub async fn cmd_apply(
         }
         for (file, err) in &report.failed {
             output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
+        }
+        // Report first, then fail — same order as inspect, so the reason is on
+        // screen before the non-zero exit.
+        let code = policy_phase_exit_code(&report);
+        if code != 0 {
+            std::process::exit(code);
         }
     }
 
@@ -732,11 +923,7 @@ pub async fn cmd_policies(
     // does not have reported `schema "…" does not exist` on every run.
     let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
-    let policy_ws = if resolved.is_all {
-        None
-    } else {
-        design.working_set(&resolved).ok().map(|ws| (resolved.name.clone(), ws))
-    };
+    let policy_ws = policy_working_set(&design, &resolved)?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
@@ -770,8 +957,9 @@ pub async fn cmd_policies(
         ),
     );
 
-    if !report.failed.is_empty() {
-        std::process::exit(1);
+    let code = policy_phase_exit_code(&report);
+    if code != 0 {
+        std::process::exit(code);
     }
 
     Ok(())
@@ -837,6 +1025,338 @@ mod tests {
         assert!(body.contains("ddl/enum/config/status.ddl"), "proposes a path: {body}");
     }
 
+    /// Identifiers and CHECK literals are printed verbatim from user-authored
+    /// DDL. An ANSI escape among them rewrites what the reader sees — the very
+    /// paths and counts they are being asked to act on — so no control
+    /// character may reach the terminal.
+    #[test]
+    fn control_characters_never_reach_the_output() {
+        let out = render_enum_hints(&[hint("app.t", "c\u{1b}[2J", &["a\u{1b}[31m", "b"])]);
+        // Per line, not on a joined body — joining reintroduces newlines, which
+        // are themselves control characters and would mask the real assertion.
+        for line in &out {
+            assert!(
+                !line.chars().any(char::is_control),
+                "a control character reached the output: {line:?}"
+            );
+        }
+    }
+
+    /// A failed policy file must fail the run, whichever command applied it.
+    ///
+    /// It leaves the schema applied with RLS only partially in place — a
+    /// security-relevant difference a zero exit code hides. `dbd policies` has
+    /// always exited 1 for this; `apply --with-policies` returned `Ok(())`, so
+    /// the identical condition produced opposite exit codes depending on which
+    /// command ran it, and "the deploy succeeded" stopped being evidence that
+    /// RLS is in place.
+    #[test]
+    fn a_failed_policy_file_fails_either_command() {
+        use std::path::PathBuf;
+        let mut report = dbd_core::design::PolicyReport::default();
+        assert_eq!(policy_phase_exit_code(&report), 0, "a clean run passes");
+
+        report.applied.push(PathBuf::from("policies/config/lookups.sql"));
+        assert_eq!(policy_phase_exit_code(&report), 0, "applied files are not failures");
+
+        report
+            .skipped
+            .push((PathBuf::from("policies/svc/x.sql"), "out of scope".into()));
+        assert_eq!(policy_phase_exit_code(&report), 0, "a scope skip is not a failure");
+
+        report
+            .failed
+            .push((PathBuf::from("policies/app/bad.sql"), "syntax error".into()));
+        assert_eq!(policy_phase_exit_code(&report), 1, "a failed policy must fail the run");
+    }
+
+    /// A scope-closure conflict must abort the run, not widen it.
+    ///
+    /// `apply_policies` reads `None` as "no scope filter" and executes *every*
+    /// file under `policies/` against the live database. So discarding the
+    /// error applies more than `--scope` asked for — the opposite of narrowing
+    /// — and the only tell is a count the operator has no baseline for.
+    #[test]
+    fn a_scope_closure_conflict_is_not_swallowed() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("conflicting"), None).unwrap();
+        assert!(
+            design.working_set(&resolved).is_err(),
+            "sanity: this scope excludes an entity its in-scope entity requires"
+        );
+        assert!(
+            policy_working_set(&design, &resolved).is_err(),
+            "the conflict must propagate; None would run every policy file"
+        );
+    }
+
+    /// Every clause of the path gate is load-bearing. A quoted Postgres
+    /// identifier may legally be empty, `.`, `..`, or hold a backslash, and each
+    /// yields a path a reader should not create: a dotfile, a traversal, or a
+    /// Windows traversal. Table-driven so a clause cannot be dropped silently.
+    #[test]
+    fn no_identifier_shape_escapes_the_path_gate() {
+        for column in ["", ".", "..", "..\\..\\pwn", "a/b", "x\u{202E}y", "z\u{2044}w"] {
+            let out = render_enum_hints(&[hint("app.t", column, &["a", "b"])]);
+            assert!(
+                !out.iter().any(|l| l.contains("ddl/enum/")),
+                "column {column:?} reached a suggested path: {out:#?}"
+            );
+        }
+        // The schema half is interpolated too: an entity with an empty schema
+        // would render `ddl/enum//name.ddl`.
+        let out = render_enum_hints(&[hint(".t", "col", &["a", "b"])]);
+        assert!(
+            !out.iter().any(|l| l.contains("ddl/enum/")),
+            "an empty schema reached a suggested path: {out:#?}"
+        );
+    }
+
+    /// An escaped value is not the value. `'a\u{a}b'` is a perfectly valid SQL
+    /// literal — for an eight-character label, not the three the CHECK held. So
+    /// it must not be printed in the shape of something to paste into the
+    /// `CREATE TYPE` this line is telling the reader to write.
+    #[test]
+    fn escaped_values_are_not_presented_as_pastable_sql() {
+        let out = render_enum_hints(&[hint("s.t", "lbl", &["a\nb", "c"])]);
+        let line = out.iter().find(|l| l.contains("ddl/enum/")).expect("a proposal line");
+        assert!(
+            !line.contains("'a\\u{a}b'"),
+            "escaped text quoted as if it were the literal: {line}"
+        );
+        assert!(
+            line.contains("escaped"),
+            "an escaped value must be flagged as one: {line}"
+        );
+    }
+
+    /// Bidi overrides and invisibles are not control characters, so a guard
+    /// written against `char::is_control` passes them. They reorder or hide
+    /// what follows: `\u{202E}` renders the rest of a line right-to-left, and
+    /// `\u{2044}` reads as a slash without being one — enough to make a
+    /// suggested path look like it escapes the project when it does not, or
+    /// the reverse.
+    #[test]
+    fn bidi_and_invisible_characters_never_reach_the_output() {
+        // Named independently of the implementation's own predicate.
+        const HOSTILE: [char; 7] = [
+            '\u{202E}', // right-to-left override
+            '\u{202A}', // left-to-right embedding
+            '\u{2066}', // left-to-right isolate
+            '\u{200B}', // zero-width space
+            '\u{00AD}', // soft hyphen
+            '\u{FEFF}', // BOM / zero-width no-break space
+            '\u{2044}', // fraction slash — a `/` look-alike
+        ];
+
+        let out = render_enum_hints(&[hint(
+            "app.t",
+            "st\u{202E}ldd.nwp\u{2044}\u{2044}..\u{200B}ate",
+            &["a\u{202E}b", "c\u{FEFF}d"],
+        )]);
+        for line in &out {
+            if let Some(bad) = line.chars().find(|c| HOSTILE.contains(c)) {
+                panic!("{bad:?} (U+{:04X}) reached the output: {line:?}", bad as u32);
+            }
+        }
+    }
+
+    /// The uniqueness key names a file, and macOS and Windows filesystems are
+    /// case-insensitive. Postgres preserves the case of a quoted identifier, so
+    /// `"State"` and `state` are two real columns needing two types — but one
+    /// file on the disk of the person following the advice.
+    #[test]
+    fn names_differing_only_by_case_do_not_share_a_file() {
+        let out = render_enum_hints(&[
+            hint("s.job", "State", &["queued", "done"]),
+            hint("s.run", "state", &["ok", "fail"]),
+        ]);
+        let paths: Vec<String> = out
+            .iter()
+            .filter(|l| l.contains("ddl/enum/"))
+            .map(|l| l.split(" — ").next().unwrap_or(l).trim().to_lowercase())
+            .collect();
+        assert_eq!(paths.len(), 2, "sanity: two proposals: {out:#?}");
+        let unique: std::collections::HashSet<&String> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            2,
+            "these name one file on a case-insensitive filesystem: {paths:?}"
+        );
+    }
+
+    /// A CHECK may list a literal twice; a `CREATE TYPE ... AS ENUM` label list
+    /// may not (`ERROR: label "x" used more than once`). The advised list must
+    /// be a valid label set, and two columns whose CHECKs differ only by a
+    /// repeat are one domain, not two.
+    #[test]
+    fn repeated_check_literals_collapse_to_one_label() {
+        let out = render_enum_hints(&[hint("s.a", "status", &["x", "x", "y"])]);
+        let body = out.join("\n");
+        assert!(body.contains("'x', 'y'"), "the label list must not repeat: {body}");
+        assert!(!body.contains("'x', 'x'"), "duplicate label survived: {body}");
+
+        // Same domain, one written with a repeat: one proposal, not two.
+        let merged = render_enum_hints(&[
+            hint("s.a", "status", &["x", "x", "y"]),
+            hint("s.b", "status", &["x", "y"]),
+        ]);
+        let paths = merged.iter().filter(|l| l.contains("ddl/enum/")).count();
+        assert_eq!(paths, 1, "a repeat does not make a different domain: {merged:#?}");
+    }
+
+    /// A numeric-suffixed name is a rename too — it is not the column's own
+    /// name — so it must be counted and explained like any other. Otherwise a
+    /// bare `_2` appears with nothing in the output accounting for it.
+    #[test]
+    fn the_footer_counts_every_renamed_type_including_suffixed() {
+        let out = render_enum_hints(&[
+            hint("s.job", "state", &["queued", "running"]),
+            hint("s.run", "state", &["open", "closed"]),
+            hint("s.audit", "job_state", &["ok", "failed"]),
+            hint("s.log", "audit_job_state", &["p", "q"]),
+        ]);
+        let body = out.join("\n");
+        assert!(
+            body.contains("ddl/enum/s/audit_job_state_2.ddl"),
+            "sanity: this fixture must reach the suffix path: {body}"
+        );
+        assert!(
+            body.contains("4 type(s)"),
+            "all four files differ from their plain column name: {body}"
+        );
+    }
+
+    /// The footer counts the types that were actually renamed, not every
+    /// proposal. On a mixed schema the two are different numbers, and reporting
+    /// the total points the reader at plainly-named types with a claim about
+    /// their name that is not true.
+    #[test]
+    fn the_footer_counts_only_the_renamed_types() {
+        let out = render_enum_hints(&[
+            hint("sensei.sync_state", "state", &["pending", "synced"]),
+            hint("sensei.dojo_inbox", "state", &["pending", "applied"]),
+            hint("sensei.repositories", "visibility", &["private", "public"]),
+        ]);
+        let body = out.join("\n");
+        // Anchored on the count, not the sentence — the count is the property.
+        assert!(
+            body.contains("2 type(s)"),
+            "only the two `state` types collide, so only they were renamed: {body}"
+        );
+        assert!(
+            body.contains("ddl/enum/sensei/visibility.ddl"),
+            "the unambiguous one keeps its plain name: {body}"
+        );
+    }
+
+    /// Schema, table and column names come from user-authored DDL and can be
+    /// quoted identifiers holding anything at all. The suggested path is advice
+    /// a reader (or an agent) follows literally, so an identifier carrying a
+    /// separator, a `..`, or a terminal escape must never reach it.
+    #[test]
+    fn an_unsafe_identifier_never_becomes_a_path() {
+        let out = render_enum_hints(&[hint("public.trav", "../../../../tmp/pwn", &["a", "b"])]);
+        let body = out.join("\n");
+        for line in body.lines().filter(|l| l.contains("ddl/enum/")) {
+            let path = line.split(" — ").next().unwrap_or(line).trim();
+            assert!(!path.contains(".."), "suggested path escapes the project: {path}");
+            assert_eq!(
+                path.matches('/').count(),
+                3,
+                "only the separators the template supplies: {path}"
+            );
+        }
+        assert!(body.contains("'a', 'b'"), "the candidate is still reported: {body}");
+    }
+
+    /// Qualifying a contested column with its table can land on a name some
+    /// other column already holds: `app.job.state` becomes `job_state`, which
+    /// a column literally named `job_state` elsewhere in the schema already
+    /// claimed. That puts two `CREATE TYPE`s back in one file — the exact
+    /// failure grouping exists to prevent, surviving one level up.
+    #[test]
+    fn a_table_qualified_name_does_not_collide_with_a_plain_one() {
+        let out = render_enum_hints(&[
+            hint("app.job", "state", &["queued", "running"]),
+            hint("app.run", "state", &["open", "closed"]),
+            hint("app.audit", "job_state", &["ok", "failed"]),
+        ]);
+        let body = out.join("\n");
+        let paths: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("ddl/enum/"))
+            .map(|l| l.split(" — ").next().unwrap_or(l).trim())
+            .collect();
+        assert_eq!(paths.len(), 3, "three distinct domains: {body}");
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 3, "each needs its own file, got a collision: {paths:?}");
+    }
+
+    /// Grouping is by exact value list, not by set. Postgres enums are ordered,
+    /// so the same values in a different order are not self-evidently the same
+    /// type — merging them would be a guess, and would lose one column's order.
+    #[test]
+    fn same_values_in_a_different_order_stay_separate() {
+        let out = render_enum_hints(&[
+            hint("app.jobs", "state", &["pending", "done"]),
+            hint("app.tasks", "state", &["done", "pending"]),
+        ]);
+        let body = out.join("\n");
+        let paths: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("ddl/enum/"))
+            .map(|l| l.split(" — ").next().unwrap_or(l).trim())
+            .collect();
+        assert_eq!(paths.len(), 2, "a reorder must not merge two enums: {body}");
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 2, "and each needs its own file: {paths:?}");
+    }
+
+    /// The tally names the `Suggestions:` block, so it counts what that block
+    /// lists — proposals. Three columns sharing one value set are shown as one
+    /// suggestion, so the tally reads 1, not 3.
+    #[test]
+    fn advisory_tally_counts_proposals_not_candidates() {
+        let hints = [
+            hint("sensei.intake_guide", "source", &["builtin", "org", "learned"]),
+            hint("sensei.playbooks", "source", &["builtin", "org", "learned"]),
+            hint("sensei.playbook_rules", "source", &["builtin", "org", "learned"]),
+        ];
+        let rendered = render_enum_hints(&hints);
+        let listed = rendered.iter().filter(|l| l.contains("ddl/enum/")).count();
+        assert_eq!(listed, 1, "sanity: the block lists one proposal");
+        assert_eq!(
+            enum_advisory_tally(&hints).as_deref(),
+            Some("(1 enum suggestion(s) — advisory)"),
+            "tally must equal what the block lists ({listed})"
+        );
+    }
+
+    /// No candidates, no tally line — the advisory section is absent entirely.
+    #[test]
+    fn advisory_tally_is_absent_without_candidates() {
+        assert_eq!(enum_advisory_tally(&[]), None);
+    }
+
+    /// A CHECK literal can itself contain a quote. Rendered without doubling
+    /// it, the `CREATE TYPE` the reader is being told to write terminates its
+    /// literal early — advice that breaks the schema it is trying to improve.
+    #[test]
+    fn enum_values_double_an_embedded_quote() {
+        let out = render_enum_hints(&[hint("app.orders", "label", &["ok", "a'); drop schema public; --"])]);
+        let body = out.join("\n");
+        assert!(
+            body.contains("'a''); drop schema public; --'"),
+            "embedded quote must be doubled: {body}"
+        );
+        assert!(
+            !body.contains("'a');"),
+            "an undoubled quote closes the literal early: {body}"
+        );
+    }
+
     /// The rationale is stated once, not repeated per column — the whole point
     /// of grouping. Fourteen candidates used to mean fourteen copies of it.
     #[test]
@@ -846,14 +1366,36 @@ mod tests {
             hint("app.b", "flavour", &["p", "q"]),
             hint("app.c", "mode", &["m", "n"]),
         ]);
-        let body = out.join("\n");
-        // Anchored on the tag rather than a prose phrase: the rationale wraps
-        // across lines, so matching words inside it breaks on any reflow.
+        // Structural, not textual. Counting a marker only catches the preamble
+        // vanishing or being duplicated wholesale — it cannot see the rationale
+        // creeping back onto the instance lines, which is the regression this
+        // actually guards. The shape says it: a fixed preamble, then exactly
+        // two lines per proposal, and every instance line is pure data.
+        assert_eq!(out.len(), 3 + 2 * 3, "preamble + two lines per proposal: {out:#?}");
+        // Shape alone cannot see the rationale go missing — blanking the
+        // preamble keeps the line count and leaves every instance line pure
+        // data. The tag is what marks the block advisory rather than an error,
+        // so anchor on it too: present, and exactly once.
         assert_eq!(
-            body.matches("[Advisory]").count(),
+            out.iter().filter(|l| l.contains("[Advisory]")).count(),
             1,
-            "rationale must appear once: {body}"
+            "the advisory tag must appear on exactly one line: {out:#?}"
         );
+        for line in out.iter().skip(3) {
+            match line.split_once(" — ") {
+                Some((path, values)) => {
+                    assert!(
+                        path.trim_start().starts_with("ddl/enum/"),
+                        "not a proposal line: {line}"
+                    );
+                    assert!(
+                        values.split(", ").all(|v| v.starts_with('\'') && v.ends_with('\'')),
+                        "a proposal line carries a path and quoted values, nothing else: {line}"
+                    );
+                }
+                None => assert!(line.starts_with("      "), "unexpected extra line: {line}"),
+            }
+        }
     }
 
     /// Columns sharing an identical value set are one enum, listed together —

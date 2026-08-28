@@ -74,6 +74,8 @@ judging the workflow, and state which one you concluded and why (the file eviden
 5. **String-set `CHECK` → enum** — a `CHECK (col IN ('a','b',…))` (or `= ANY(ARRAY[…])`, or an
    `OR`-chain of `col = '…'`) on a fixed set of string literals is better modeled as a Postgres
    `enum` (`ddl/enum/<schema>/<name>.ddl`). Advisory (same rule `dbd inspect` suggests).
+   Proposals group by value set; a name clash qualifies the type as `<table>_<column>`,
+   and an identifier that is not a single safe path segment is reported without a path.
 6. **Materialized-view drift misuse** — code/docs that expect `reconcile` to auto-recreate a
    drifted matview (it only warns; a recreate is a manual `DROP … CASCADE` + re-apply), or a
    matview created outside dbd that will read as `unstamped`.

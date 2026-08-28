@@ -50,7 +50,10 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report --workspace
           cargo llvm-cov --no-report -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
-          cargo llvm-cov report --lcov --output-path target/lcov.info --ignore-filename-regex 'dbd-cli/src/main\.rs'
+          # llvm-cov records absolute paths, so this is anchored at the end
+          # only — a leading ^ would never match, silently letting main.rs
+          # back into the metric with CI still green.
+          cargo llvm-cov report --lcov --output-path target/lcov.info --ignore-filename-regex 'src/main\.rs$'
       - name: cargo test (doctests)
         run: cargo test --workspace --doc
       - name: cargo clippy
