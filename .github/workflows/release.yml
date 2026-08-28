@@ -1,0 +1,102 @@
+name: Release
+
+# The tag is this project's release artifact — `make bump` creates and pushes it,
+# and the pre-commit `rev: vX.Y.Z` channel consumes it directly. crates.io is the
+# other half: README leads with `cargo install dbd-cli`, so a tag that never
+# reaches the registry leaves that channel a version behind while claiming
+# otherwise (exactly what happened at v0.12.4).
+#
+# This runs here rather than in `make bump` on purpose. Publishing from the
+# recipe makes the release depend on whichever token happens to be in the
+# maintainer's ~/.cargo/credentials.toml, and a rejected token strands the
+# release *after* the tag is already public. Here the credential is a repo
+# secret, the tree is the tagged one, and a failure is replayable.
+on:
+  push:
+    tags: ['v*']
+  # A publish can fail for reasons unrelated to the code — a rejected token, a
+  # registry outage — and a public tag must never be deleted and re-pushed to
+  # retry. This lets an existing tag be published again by hand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish (e.g. v0.12.4)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: this job reads the repo and talks to crates.io with its own
+# token. It never pushes, comments, or creates a release.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    # A tag name is attacker-influenceable by anyone who can push one, so it is
+    # never interpolated into a `run:` script. It reaches the shell only through
+    # the environment, quoted — see the GitHub Actions script-injection guidance.
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # The tag, not the branch head — a tag can be pushed from a commit that
+          # is no longer the tip, and the release is the tag's tree.
+          ref: ${{ inputs.tag || github.ref_name }}
+          # Nothing here needs git auth after checkout; persisting the token only
+          # risks leaking it into artifacts (zizmor artipacked).
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `git tag` and the version `sed` are separate steps in `make bump`, so
+      # nothing structural keeps them equal. A mismatch here would upload a
+      # version nobody tagged, under a tag naming something else — and neither
+      # can be withdrawn.
+      - name: tag must match the workspace version
+        run: |
+          set -euo pipefail
+          manifest="v$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          echo "tag=$RELEASE_TAG manifest=$manifest"
+          if [ "$RELEASE_TAG" != "$manifest" ]; then
+            echo "::error::tag $RELEASE_TAG does not match Cargo.toml $manifest — refusing to publish"
+            exit 1
+          fi
+
+      # The gate. `make bump` runs the suite locally and *before* the version
+      # seds land, so it never sees the tree that ships. Since the upload cannot
+      # be undone, re-run it here on the tagged tree.
+      - name: cargo test
+        run: cargo test --workspace --locked
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # Published one crate at a time, in dependency order, skipping any version
+      # already on the registry. `cargo publish --workspace` would refuse the
+      # whole set if either crate were already up — which is precisely the state
+      # a retry starts from after a partial failure.
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          for crate in dbd-core dbd-cli; do
+            if curl -sf "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
+              echo "${crate} ${version} is already on crates.io — skipping"
+              continue
+            fi
+            echo "publishing ${crate} ${version}"
+            # `-p` works for the root package (dbd-cli) as well as the member.
+            # cargo waits for the new version to appear in the index before
+            # returning, so dbd-cli resolves the dbd-core it just uploaded.
+            cargo publish -p "${crate}" --locked
+          done
