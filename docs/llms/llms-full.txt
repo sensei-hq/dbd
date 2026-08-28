@@ -663,9 +663,12 @@ dbd diff -d $DATABASE_URL --exit-code  # 0 in sync, 2 on drift, 1 on error
 ```
 
 The desired schema is parsed from DDL, the live schema introspected; dbd
-normalizes representation noise (type aliases, default casts, enum
-qualification, PK/UNIQUE-backing indexes, FK `NO ACTION`/auto-generated names,
-CHECK-expression parenthesization via libpg_query) so only real drift shows. An
+normalizes representation noise (type aliases plus array and date-time spellings
+— `int4`→`integer`, `text[3]`→`text[]`, `time`→`time without time zone`; default
+casts, enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION`/auto-generated
+names, and CHECK-expression spelling via libpg_query — parens/case, `IN` ↔
+`= ANY (ARRAY[…])`, literal casts, `BETWEEN` ↔ its `>=`/`<=` expansion, casts on
+`ARRAY[…]` constructors, and `AND`/`OR` nesting) so only real drift shows. An
 unparseable CHECK is shown flagged `advisory`. Covers tables + enums
 structurally, plus **materialized-view drift** (each matview reported
 `missing`/`drifted`/`unstamped`/`orphan` via its `dbd:hash` sentinel; in `--json`

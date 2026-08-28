@@ -430,10 +430,14 @@ dbd diff --scope hub -d $HUB_URL          # Restrict to a scope's working set
 ```
 
 The desired schema is parsed from your DDL; the live schema is introspected. dbd normalizes
-representation noise (type aliases, default casts, enum qualification, PK/UNIQUE-backing
-indexes, FK `NO ACTION` defaults and auto-generated FK names, and CHECK-expression
-parenthesization via the Postgres parser) so only real drift is reported. A CHECK expression
-that can't be parsed is still shown, flagged `advisory` so you verify it by hand.
+representation noise so only real drift is reported: type aliases and array/date-time
+spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
+default casts, enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION` defaults and
+auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
+and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
+Postgres stores in its place, casts on `ARRAY[…]` constructors, and `AND`/`OR` nesting.
+A CHECK expression that can't be parsed is still shown, flagged `advisory` so you verify it
+by hand.
 
 **Scope:** diff covers **tables and enums** (all their attributes) plus
 **materialized-view drift** — each matview is reported as `missing` (in the
