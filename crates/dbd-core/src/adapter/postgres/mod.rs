@@ -840,9 +840,10 @@ impl PostgresAdapter {
                 let (name, is_expression) = match col_names.get(pos).and_then(Option::as_ref) {
                     Some(col) => (col.clone(), false),
                     None => {
-                        let raw = col_defs.get(pos).cloned().unwrap_or_default();
-                        let expr = crate::sql_expr::canonicalize_expression(&raw).unwrap_or(raw);
-                        (expr, true)
+                        // Stored as Postgres reports it; `schema_diff::normalize_index`
+                        // canonicalizes a copy for matching. Keeping the raw form here
+                        // means anything that re-emits this index writes real SQL.
+                        (col_defs.get(pos).cloned().unwrap_or_default(), true)
                     }
                 };
                 let opt = coloptions.get(pos).copied().unwrap_or(0);
@@ -868,10 +869,8 @@ impl PostgresAdapter {
                 })
                 .collect();
 
-            let predicate = ix
-                .try_get::<Option<String>, _>("predicate")
-                .unwrap_or(None)
-                .map(|raw| crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw));
+            // As reported, not canonicalized — see the expression-column note above.
+            let predicate = ix.try_get::<Option<String>, _>("predicate").unwrap_or(None);
             let with_options = ix
                 .try_get::<Option<Vec<String>>, _>("reloptions")
                 .unwrap_or(None)

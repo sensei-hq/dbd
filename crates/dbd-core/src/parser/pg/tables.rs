@@ -532,11 +532,15 @@ pub(super) fn extract_index(
 
     let predicate = match ix.where_clause.as_ref() {
         Some(w) => {
-            let raw = expr_text(w)
-                .ok_or_else(|| format!("index {label:?}: dbd could not render its WHERE predicate back to SQL"))?;
-            // Canonicalized so an authored `where status = 'active'` matches the
-            // `status = 'active'::app.status_t` Postgres reports back.
-            Some(crate::sql_expr::canonicalize_predicate(&raw).unwrap_or(raw))
+            // Stored AS AUTHORED. Matching against the `status = 'active'::app.status_t`
+            // Postgres reports back happens in `schema_diff::normalize_index`, on a
+            // copy: the canonical form erases casts, and `emit_index_sql` writes this
+            // field straight into `WHERE …`, so canonicalizing here published lossy
+            // text as DDL.
+            Some(
+                expr_text(w)
+                    .ok_or_else(|| format!("index {label:?}: dbd could not render its WHERE predicate back to SQL"))?,
+            )
         }
         None => None,
     };
@@ -758,6 +762,28 @@ mod tests {
                 "app.status_t",
                 "serial",
             ]
+        );
+    }
+
+    /// The parser stores the predicate the author WROTE, not dbd's canonical form.
+    ///
+    /// The canonical form is deliberately lossy — it erases casts so two spellings
+    /// of one predicate compare equal — and that is safe only while it stays a
+    /// comparison key. `IndexDef.predicate` is not a key: `emit_index_sql` writes
+    /// it straight into `WHERE …`, so storing the canonical form here published the
+    /// lossy text as DDL. For `days <@ ARRAY[1,2,3]::smallint[]` over a `smallint[]`
+    /// column that emitted `WHERE days <@ ARRAY[1, 2, 3]`, which Postgres rejects
+    /// with `operator does not exist: smallint[] <@ integer[]`; with a truncating
+    /// cast it silently matched no rows, so a UNIQUE index was created that
+    /// enforced nothing.
+    #[test]
+    fn an_index_predicate_is_stored_as_authored() {
+        let d = def("create table t (code text, days smallint[]);\n\
+             create unique index u on t (code) where days <@ array[1,2,3]::smallint[];");
+        assert_eq!(
+            d.indexes[0].predicate.as_deref(),
+            Some("days <@ ARRAY[1, 2, 3]::smallint[]"),
+            "the authored cast must survive into the stored predicate"
         );
     }
 
@@ -1093,15 +1119,31 @@ mod tests {
         assert_eq!(ix.with_options.get("deduplicate_items"), Some(&"off".to_string()));
     }
 
-    /// The authored predicate is canonicalized on the way in so it matches the
-    /// analyzed form `pg_get_expr` reports for the same index.
+    /// The authored predicate is kept verbatim, and converges with the analyzed
+    /// form `pg_get_expr` reports only once `normalize_index` canonicalizes a copy
+    /// for matching. Both halves are asserted: the old test checked only the
+    /// second and passed by coincidence, because this particular predicate is
+    /// spelled identically to its own canonical form.
     #[test]
-    fn a_partial_index_predicate_is_canonicalized() {
+    fn a_partial_index_predicate_is_stored_raw_and_matched_canonically() {
         let d = def("create table t (id int, scope text);\n\
              create index t_ix on t (id) where scope in ('user', 'project');");
         assert_eq!(
             d.indexes[0].predicate.as_deref(),
-            crate::sql_expr::canonicalize_predicate("scope = ANY (ARRAY['user'::text, 'project'::text])").as_deref(),
+            Some("scope IN ('user', 'project')"),
+            "the authored spelling must be stored, not dbd's canonical form"
+        );
+
+        let mut authored = d.indexes[0].clone();
+        let mut introspected = crate::entity::IndexDef {
+            predicate: Some("scope = ANY (ARRAY['user'::text, 'project'::text])".into()),
+            ..authored.clone()
+        };
+        crate::schema_diff::normalize_index(&mut authored);
+        crate::schema_diff::normalize_index(&mut introspected);
+        assert_eq!(
+            authored.predicate, introspected.predicate,
+            "authored and introspected spellings must match after normalization"
         );
     }
 

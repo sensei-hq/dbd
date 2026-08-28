@@ -61,7 +61,7 @@ dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live 
 
 **`--from-db`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums), using the `-d`/`--database` connection — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
 
-**Suggestions (advisory).** On a Postgres/Supabase project, `inspect` prints a `Suggestions:` section when it finds a `CHECK` constraint that pins a column to a fixed set of string literals (`status IN ('active','inactive')`, `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — a Postgres `enum` (`ddl/enum/<schema>/<name>.ddl`) models that with type safety and cleaner introspection. Suggestions are **advisory only**: they never count as errors and never affect the exit code.
+**Suggestions (advisory).** On a Postgres/Supabase project, `inspect` prints a `Suggestions:` section when it finds a `CHECK` constraint that pins a column to a fixed set of string literals (`status IN ('active','inactive')`, `= ANY(ARRAY[…])`, or an `OR`-chain of `col = '…'`) — a Postgres `enum` (`ddl/enum/<schema>/<name>.ddl`) models that with type safety and cleaner introspection. Suggestions are **advisory only**: they never count as errors and never affect the exit code. Columns sharing a value set become one proposal. Where the plain column name would name two different files, the type is named `<table>_<column>` instead (and `_2`, `_3` if that still collides) — the footer says how many were renamed and why. An identifier that is not a single ordinary path segment gets no path at all, just the candidate; likewise values needing escaping are printed unquoted and flagged, since escaped text is not the literal it came from.
 
 ### Exit code
 
@@ -430,10 +430,14 @@ dbd diff --scope hub -d $HUB_URL          # Restrict to a scope's working set
 ```
 
 The desired schema is parsed from your DDL; the live schema is introspected. dbd normalizes
-representation noise (type aliases, default casts, enum qualification, PK/UNIQUE-backing
-indexes, FK `NO ACTION` defaults and auto-generated FK names, and CHECK-expression
-parenthesization via the Postgres parser) so only real drift is reported. A CHECK expression
-that can't be parsed is still shown, flagged `advisory` so you verify it by hand.
+representation noise so only real drift is reported: type aliases and array/date-time
+spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
+default casts, enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION` defaults and
+auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
+and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
+Postgres stores in its place, casts on `ARRAY[…]` constructors, and `AND`/`OR` nesting.
+A CHECK expression that can't be parsed is still shown, flagged `advisory` so you verify it
+by hand.
 
 **Scope:** diff covers **tables and enums** (all their attributes) plus
 **materialized-view drift** — each matview is reported as `missing` (in the
@@ -745,14 +749,16 @@ inner join lookup_values lv
 
 | Hook id | Language | Use when |
 |---------|----------|----------|
-| `dbd-format` | `rust` (cargo install on first run, cached after) | Contributors don't have `dbd` installed |
-| `dbd-format-system` | `system` (expects `dbd` on PATH) | Contributors already installed dbd locally |
+| `dbd-format` | `rust` (cargo install on first run, cached after) | Contributors don't have `dbd` installed — **needs v0.12.3 or later** |
+| `dbd-format-system` | `system` (expects `dbd` on PATH) | Contributors already installed dbd locally — works at any `rev` |
+
+`dbd-format` builds dbd from the tag you pin, so that tag must carry an installable Cargo package at the repo root. Tags before v0.12.3 have a virtual manifest there, and pre-commit aborts during environment setup with `found a virtual manifest instead of a package manifest` — before it formats anything. Use `dbd-format-system` with those.
 
 User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.12.2
+  rev: v0.12.4
   hooks:
     - id: dbd-format
 ```

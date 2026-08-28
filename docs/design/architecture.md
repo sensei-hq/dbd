@@ -143,30 +143,21 @@ dbd-rs/
 │   │           ├── sqlite.rs       # SQLite (rusqlite, subset features)
 │   │           └── convex.rs       # Convex (generates TypeScript schema, no SQL)
 │   │
-│   └── dbd-cli/                # Binary crate — thin CLI shell
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs             # Entry point, tokio runtime bootstrap
-│           ├── cli.rs              # clap argument structs
-│           └── commands.rs         # Command handlers (maps CLI args → dbd_core calls)
+│   └── tests/                  # dbd-core integration tests
 │
-└── tests/                      # Integration tests (against dbd-core)
-    ├── config_test.rs
-    ├── entity_test.rs
-    ├── scanner_test.rs
-    ├── dependency_test.rs
-    ├── references_test.rs
-    ├── snapshot_test.rs
-    ├── migration_test.rs
-    ├── github_test.rs
-    ├── parser/
-    │   ├── tables_test.rs
-    │   ├── views_test.rs
-    │   └── procedures_test.rs
-    ├── adapter/
-    │   ├── classify_test.rs    # Tests adapter.classify_reference()
-    │   └── postgres_test.rs    # Adapter integration tests (requires DB)
-    └── fixtures/               # Test DDL files, design.yaml samples
+├── src/                        # The CLI — the ROOT package (`dbd-cli`, bin `dbd`)
+│   ├── main.rs                     # Entry point, tokio runtime bootstrap
+│   ├── cli.rs                      # clap argument structs
+│   ├── output.rs                   # Verbosity-aware printing
+│   ├── commands/                   # Command handlers (map CLI args → dbd_core calls)
+│   └── assets/                     # Skill + agent embedded into the binary
+│
+└── tests/                      # CLI integration tests — drive the real binary
+    ├── install.rs              # `dbd install` writes the embedded skill/agent
+    ├── inspect_advisory.rs     # placement and counting of inspect's advisory block
+    ├── publish_manifest.rs     # what reaches crates.io; docs command coverage
+    ├── release_recipe.rs       # `make bump` shape and dry-run safety
+    └── fixtures/               # Shared by both crates: DDL files, design.yaml samples
         ├── design.yaml
         ├── ddl/
         │   ├── table/config/lookups.ddl
@@ -851,18 +842,35 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 ### `dbd-cli` (binary)
 
+This is the **root** manifest — `Cargo.toml` at the repo root is both the
+workspace and the `dbd-cli` package, so `cargo install --path .` resolves there.
+(pre-commit's `language: rust` can only install from the repo root, and a second
+package producing a `dbd` binary would collide with this one on
+`target/debug/dbd`.)
+
 ```toml
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+# The version requirement lives here, once. `cargo publish` strips the `path`
+# and resolves the `version`, so a path-only dep cannot be published.
+dbd-core = { path = "crates/dbd-core", version = "0.12.2" }
+
 [package]
 name = "dbd-cli"
 version.workspace = true
 edition.workspace = true
+# The package root is the repo root, so name what ships. These are
+# gitignore-style patterns: unanchored, `README.md` matches at ANY depth.
+include = ["/src/**/*", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "dbd"
 path = "src/main.rs"
 
 [dependencies]
-dbd-core = { path = "../dbd-core" }
+dbd-core = { workspace = true, features = ["postgres", "sqlite"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio.workspace = true
 anyhow.workspace = true
@@ -871,6 +879,7 @@ anyhow.workspace = true
 assert_cmd = "2"         # CLI integration tests
 predicates = "3"
 tempfile = "3"
+serde_json.workspace = true
 ```
 
 Note: `clap`, `anyhow`, and CLI-specific deps live only in `dbd-cli`. Library consumers don't pull them in.
@@ -1666,7 +1675,7 @@ fn generates_reset_script() {
 
 ### CLI integration tests — `dbd-cli` (assert_cmd)
 
-Test the binary end-to-end. Lives in `crates/dbd-cli/tests/`.
+Test the binary end-to-end. Lives in `tests/`.
 
 ```rust
 #[test]

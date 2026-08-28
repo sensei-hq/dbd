@@ -86,3 +86,9 @@ scopes:
   drop_staging:
     excludes:
       - staging.*         # wildcard: drop staging's entities, keep the schema
+  conflicting:
+    includes:
+      - config.lookup_values
+    excludes:
+      - config.lookups    # lookup_values requires it -> closure conflict
+    deps: include

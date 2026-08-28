@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.12.2"
+version = "0.12.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/sensei-hq/dbd"
@@ -13,9 +13,61 @@ keywords = ["database", "schema", "migration", "postgresql", "ddl"]
 categories = ["database", "command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+# Declared here so the crates.io version requirement lives in exactly one
+# place. `cargo publish` strips the `path` and resolves the `version`, so a
+# path-only dep is unpublishable; `make bump` moves this line with the
+# workspace version and publish_manifest.rs fails if the two ever drift.
+dbd-core = { path = "crates/dbd-core", version = "0.12.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 anyhow = "1"
+
+# The CLI is the root package, not a workspace member, so `cargo install
+# --path .` resolves at the repo root — which is the only thing pre-commit's
+# `language: rust` will install (it has no way to name a member). Keeping it
+# here also means exactly one target produces the `dbd` binary; a root shim
+# alongside a `crates/dbd-cli` bin would collide on target/debug/dbd, which
+# cargo warns about today and says may become a hard error.
+[package]
+name = "dbd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Database schema management CLI — dbd command"
+readme = "README.md"
+# The package root is the repo root, so name what ships rather than trying to
+# exclude the rest (docs/, site/, crates/dbd-core/, tests/fixtures/).
+#
+# Every pattern is anchored with a leading `/`. These are gitignore-style, so
+# an unanchored `README.md` matches at *any* depth — which pulled in 677 files,
+# including the `.claude/` symlink to the developer's home config. A crates.io
+# publish is public and cannot be deleted, only yanked.
+include = ["/src/**/*", "/README.md", "/LICENSE"]
+
+[[bin]]
+name = "dbd"
+path = "src/main.rs"
+
+[dependencies]
+dbd-core = { workspace = true, features = ["postgres", "sqlite"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+indicatif = "0.17"
+console = "0.15"
+open = "5"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+serde_json.workspace = true

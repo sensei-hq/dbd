@@ -157,7 +157,7 @@ mod tests {
     /// installed binaries would ship stale content — this test fails first.
     #[test]
     fn embedded_assets_match_docs() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let skill =
             fs::read_to_string(repo.join("docs/skills/dbd/SKILL.md")).expect("read canonical docs/skills/dbd/SKILL.md");
         let agent = fs::read_to_string(repo.join("docs/agents/dbd-pattern-verifier.md"))
@@ -165,12 +165,12 @@ mod tests {
         assert_eq!(
             SKILL_MD, skill,
             "embedded SKILL.md drifted from docs/skills/dbd/SKILL.md — re-copy it into \
-             crates/dbd-cli/src/assets/skills/dbd/SKILL.md"
+             src/assets/skills/dbd/SKILL.md"
         );
         assert_eq!(
             AGENT_MD, agent,
             "embedded agent drifted from docs/agents/dbd-pattern-verifier.md — re-copy it into \
-             crates/dbd-cli/src/assets/agents/dbd-pattern-verifier.md"
+             src/assets/agents/dbd-pattern-verifier.md"
         );
     }
 
