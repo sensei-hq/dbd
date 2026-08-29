@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.12.4"
+version = "0.12.5"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/sensei-hq/dbd"
@@ -17,7 +17,7 @@ categories = ["database", "command-line-utilities", "development-tools"]
 # place. `cargo publish` strips the `path` and resolves the `version`, so a
 # path-only dep is unpublishable; `make bump` moves this line with the
 # workspace version and publish_manifest.rs fails if the two ever drift.
-dbd-core = { path = "crates/dbd-core", version = "0.12.4" }
+dbd-core = { path = "crates/dbd-core", version = "0.12.5" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
