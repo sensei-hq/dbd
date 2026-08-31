@@ -148,7 +148,7 @@ fn classify_table_changes(
         }
         if change.field_type == FieldType::Column {
             match &change.action {
-                ChangeAction::Drop => column_drops.push((i, change)),
+                ChangeAction::Drop(_) => column_drops.push((i, change)),
                 ChangeAction::Add(_) => column_adds.push((i, change)),
                 _ => {}
             }
@@ -275,7 +275,7 @@ fn classify_enum_changes(
 ) {
     let enum_drops: Vec<&FieldChange> = changes
         .iter()
-        .filter(|c| c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop))
+        .filter(|c| c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop(_)))
         .collect();
     let enum_adds: Vec<&FieldChange> = changes
         .iter()
@@ -320,7 +320,7 @@ fn classify_enum_changes(
         // Keep any non-removal changes as simple
         let simple_changes: Vec<FieldChange> = changes
             .iter()
-            .filter(|c| !(c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop)))
+            .filter(|c| !(c.field_type == FieldType::EnumValue && matches!(c.action, ChangeAction::Drop(_))))
             .cloned()
             .collect();
 
