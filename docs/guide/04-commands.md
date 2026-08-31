@@ -407,8 +407,16 @@ shape (unique flag, access method incl. `USING gin/gist/brin/hash`, ordered colu
 index under a different name is no change; a declared index the live DB lacks is added
 (`CREATE INDEX IF NOT EXISTS …`) and one the design dropped is removed (`DROP INDEX …`, gated behind
 `--allow-destructive`). Indexes that merely back a PK/UNIQUE constraint are ignored on both sides.
-**Not** reconciled on existing tables: check constraints — their introspected and parsed forms differ
-too much to diff reliably, so change those via `dbd snapshot` (they're still created with the initial `CREATE`).
+Check constraints converge too, matched by canonicalized expression rather than name (an authored
+`status in ('a','b')` matches the `status = ANY (ARRAY[…])` Postgres reports).
+
+**Primary keys and unique constraints** are matched by their **columns**, never by their name, so the
+design's unnamed `primary key (a, b)` and the live DB's auto-named `t_pkey` over the same columns
+reconcile to no change. Changing which columns a PK covers is a replacement — `DROP CONSTRAINT IF
+EXISTS "<live name>"` followed by `ADD PRIMARY KEY (…)`, in that order, gated behind
+`--allow-destructive`. It runs in place on a table that already holds rows; no table rebuild and no
+snapshot are needed. The new key columns must already be `NOT NULL` and unique across existing rows,
+or Postgres rejects the `ADD` and the whole reconcile rolls back.
 Because introspected and hand-written DDL can spell a default or exotic type differently,
 reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
 `--dry-run` first.

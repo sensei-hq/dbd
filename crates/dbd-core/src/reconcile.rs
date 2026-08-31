@@ -196,9 +196,18 @@ pub fn canonicalize(snap: &mut Snapshot) {
 }
 
 /// Collapse a table's PK/UNIQUE (from inline column flags + table constraints)
-/// into name-stripped, structurally-deduped table constraints, leaving any
-/// FK/CHECK constraints already present untouched (reconcile's `canonicalize`
-/// strips those afterward; the diff path keeps them).
+/// into structurally-deduped table constraints, leaving any FK/CHECK constraints
+/// already present untouched (reconcile's `canonicalize` strips those afterward;
+/// the diff path keeps them).
+///
+/// The constraint **name is preserved**, unlike the FK/CHECK normalizers which
+/// clear it. Those match by shape and can afford to drop the name because their
+/// convergence passes re-read it from the raw snapshot; PK/UNIQUE are diffed here,
+/// so this is the only place the live name survives to reach `DROP CONSTRAINT`.
+/// Stripping it is what made reconcile emit the matching key as an identifier
+/// (`DROP CONSTRAINT pk:tenant_id,metric_id`), which blocked every PK replacement.
+/// Matching stays name-agnostic regardless: `diff::constraint_key` keys PK/UNIQUE
+/// on their columns and never on their name.
 fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
     let mut kept: Vec<TableConstraint> = Vec::new();
     let mut seen: HashSet<(char, String)> = HashSet::new();
@@ -216,16 +225,12 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
     let mut others: Vec<TableConstraint> = Vec::new();
     for con in std::mem::take(&mut t.table_constraints) {
         match con {
-            TableConstraint::PrimaryKey { columns, .. } => {
+            TableConstraint::PrimaryKey { name, columns } => {
                 has_table_pk = true;
-                push(
-                    &mut kept,
-                    &mut seen,
-                    TableConstraint::PrimaryKey { name: None, columns },
-                )
+                push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name, columns })
             }
-            TableConstraint::Unique { columns, .. } => {
-                push(&mut kept, &mut seen, TableConstraint::Unique { name: None, columns })
+            TableConstraint::Unique { name, columns } => {
+                push(&mut kept, &mut seen, TableConstraint::Unique { name, columns })
             }
             other => others.push(other), // FK / CHECK preserved
         }
@@ -606,7 +611,7 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
 /// separately via pruning.
 fn has_column_drop(d: &MigrationDiff) -> bool {
     matches!(&d.action, DiffAction::Change(changes)
-        if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop)))
+        if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop(_))))
 }
 
 // ── Foreign-key convergence (issue #8) ──────────────────────
@@ -700,17 +705,16 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
         let mut changes: Vec<FieldChange> = Vec::new();
 
         // Drops first (destructive): a live FK the design no longer declares.
-        // Use the live constraint's real name — that's what `DROP CONSTRAINT`
-        // needs, and it's why FKs can't simply be name-stripped before diffing.
+        // The drop carries the live constraint, so the emitter names it from the
+        // real `conname` — the reason FKs can't simply be name-stripped before
+        // diffing.
         for fk in live_fks.iter().filter(|fk| !desired_shapes.contains(&fk_shape(fk))) {
-            let name = fk
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("fk:{}", fk.columns.join(",")));
             changes.push(FieldChange {
-                field_name: name,
+                field_name: format!("fk:{}", fk.columns.join(",")),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(
+                    fk.clone(),
+                )))),
             });
             plan.destructive = true;
         }
@@ -811,23 +815,24 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         // Drops first (destructive). `DROP CONSTRAINT` needs the live constraint's
         // real name — the reason CHECKs can't simply be name-stripped before
         // diffing, and why the read-only diff path used to emit an unusable
-        // `DROP CONSTRAINT ck:<expression>`.
+        // `DROP CONSTRAINT ck:<expression>`. The drop carries the live constraint
+        // so the emitter reads that name off it.
         for (key, con) in live_checks.iter().filter(|(k, _)| !desired_keys.contains(k.as_str())) {
             let TableConstraint::Check { name, .. } = con else {
                 continue;
             };
             // Without a name there is no statement to issue; warn rather than
             // emit SQL that cannot run.
-            let Some(name) = name else {
+            if name.is_none() {
                 plan.warnings.push(format!(
                     "CHECK ({key}) on {qname} is not in the design but has no constraint name — drop it manually"
                 ));
                 continue;
-            };
+            }
             changes.push(FieldChange {
-                field_name: format!("\"{name}\""),
+                field_name: format!("ck:{key}"),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
             });
             plan.destructive = true;
         }
@@ -1638,7 +1643,9 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         assert!(
-            plan.altered[0].sql.contains("DROP CONSTRAINT children_parent_id_fkey"),
+            plan.altered[0]
+                .sql
+                .contains("DROP CONSTRAINT IF EXISTS \"children_parent_id_fkey\""),
             "expected DROP CONSTRAINT with the live name; got: {}",
             plan.altered[0].sql
         );
@@ -1708,7 +1715,7 @@ mod tests {
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
         assert!(
-            sql.contains("DROP CONSTRAINT children_parent_id_fkey"),
+            sql.contains("DROP CONSTRAINT IF EXISTS \"children_parent_id_fkey\""),
             "must drop old FK; got: {sql}"
         );
         assert!(
@@ -1962,7 +1969,10 @@ mod tests {
 
         assert_eq!(plan.altered.len(), 1);
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
+        assert!(
+            sql.contains("DROP CONSTRAINT IF EXISTS \"docs_status_check\""),
+            "got: {sql}"
+        );
         assert!(
             !sql.contains("ck:"),
             "the expression key must never be used as a name; got: {sql}"
@@ -2010,7 +2020,10 @@ mod tests {
         plan_check_convergence(&mut plan, &live, &desired);
 
         let sql = &plan.altered[0].sql;
-        assert!(sql.contains("DROP CONSTRAINT \"docs_status_check\""), "got: {sql}");
+        assert!(
+            sql.contains("DROP CONSTRAINT IF EXISTS \"docs_status_check\""),
+            "got: {sql}"
+        );
         assert!(sql.contains("ADD CHECK"), "got: {sql}");
         assert!(plan.destructive);
     }
@@ -2710,6 +2723,135 @@ mod tests {
         assert!(
             plan.is_empty() && !plan.destructive,
             "composite PK must reconcile to no changes (no spurious single-column PK adds); got {plan:?}"
+        );
+    }
+
+    /// A table whose PRIMARY KEY covers `pk_cols`, named `pk_name` when the live
+    /// database named it (introspection always does; the parsed design does not).
+    fn table_with_pk(pk_name: Option<&str>, pk_cols: &[&str]) -> TableSnapshot {
+        TableSnapshot {
+            table_constraints: vec![TableConstraint::PrimaryKey {
+                name: pk_name.map(str::to_string),
+                columns: pk_cols.iter().map(|c| c.to_string()).collect(),
+            }],
+            ..table(
+                "app",
+                "metrics",
+                vec![
+                    col("tenant_id", "uuid"),
+                    col("metric_id", "uuid"),
+                    col("bucket", "date"),
+                ],
+            )
+        }
+    }
+
+    /// Replacing a composite PRIMARY KEY must produce SQL Postgres can actually
+    /// run: the drop names the constraint's REAL live name, and it runs BEFORE the
+    /// add. The bug this pins emitted the internal matching key as an identifier
+    /// (`DROP CONSTRAINT pk:tenant_id,metric_id`) — the same defect
+    /// [`plan_check_convergence`] already fixed for `ck:<expression>` — and ordered
+    /// the add first, which Postgres rejects with "multiple primary keys".
+    #[test]
+    fn pk_replacement_drops_by_real_live_name_before_adding() {
+        let mut live = snap(vec![table_with_pk(Some("metrics_pkey"), &["tenant_id", "metric_id"])]);
+        let mut desired = snap(vec![table_with_pk(None, &["tenant_id", "metric_id", "bucket"])]);
+
+        canonicalize(&mut live);
+        canonicalize(&mut desired);
+        let plan = plan_reconcile(&live, &desired);
+
+        assert_eq!(plan.altered.len(), 1, "got {plan:?}");
+        let sql = &plan.altered[0].sql;
+        assert!(
+            !sql.contains("pk:"),
+            "the internal matching key must never be used as an identifier; got: {sql}"
+        );
+        assert!(
+            !sql.contains("unnamed"),
+            "an unnamed PK must not be named \"unnamed\"; got: {sql}"
+        );
+        let drop_at = sql
+            .find("DROP CONSTRAINT")
+            .unwrap_or_else(|| panic!("no DROP CONSTRAINT; got: {sql}"));
+        let add_at = sql
+            .find("PRIMARY KEY (tenant_id, metric_id, bucket)")
+            .unwrap_or_else(|| panic!("no PK add; got: {sql}"));
+        assert!(
+            sql[drop_at..].starts_with("DROP CONSTRAINT IF EXISTS \"metrics_pkey\""),
+            "drop must name the real live constraint; got: {sql}"
+        );
+        assert!(
+            drop_at < add_at,
+            "the old PK must be dropped before the new one is added; got: {sql}"
+        );
+        assert!(plan.destructive, "replacing a PK is gated as destructive");
+    }
+
+    /// The matching guarantee that makes the drop-by-real-name fix safe: a live PK
+    /// that Postgres auto-named and the design's unnamed PK over the SAME columns
+    /// are the same constraint. Preserving the live name for the emitter must not
+    /// make a name difference read as drift and churn a destructive drop+add.
+    #[test]
+    fn pk_name_difference_alone_is_not_drift() {
+        let mut live = snap(vec![table_with_pk(Some("metrics_pkey"), &["tenant_id", "metric_id"])]);
+        let mut desired = snap(vec![table_with_pk(None, &["tenant_id", "metric_id"])]);
+
+        canonicalize(&mut live);
+        canonicalize(&mut desired);
+        let plan = plan_reconcile(&live, &desired);
+
+        assert!(
+            plan.is_empty() && !plan.destructive,
+            "an auto-named live PK and the design's unnamed PK over the same columns \
+             are the same constraint; got {plan:?}"
+        );
+    }
+
+    /// Name-agnostic matching must not swallow a rename the design asked for.
+    /// The DDL parser captures an explicit `constraint <name> primary key (…)`, so
+    /// when BOTH sides name the constraint a difference is deliberate and has to be
+    /// expressed as a drop of the live name plus an add under the declared one.
+    #[test]
+    fn explicitly_renamed_pk_is_still_replaced() {
+        let mut live = snap(vec![table_with_pk(Some("metrics_pkey"), &["tenant_id", "metric_id"])]);
+        let mut desired = snap(vec![table_with_pk(Some("metrics_pk"), &["tenant_id", "metric_id"])]);
+
+        canonicalize(&mut live);
+        canonicalize(&mut desired);
+        let plan = plan_reconcile(&live, &desired);
+
+        assert_eq!(
+            plan.altered.len(),
+            1,
+            "an explicit PK rename must be acted on; got {plan:?}"
+        );
+        let sql = &plan.altered[0].sql;
+        assert!(sql.contains("DROP CONSTRAINT IF EXISTS \"metrics_pkey\""), "got: {sql}");
+        assert!(sql.contains("ADD CONSTRAINT metrics_pk PRIMARY KEY"), "got: {sql}");
+    }
+
+    /// A live PK with no name at all cannot be dropped by any statement. Reconcile
+    /// must say so rather than emit SQL that fails the whole transactional apply —
+    /// mirroring [`plan_check_convergence`]'s unnamed-CHECK warning.
+    #[test]
+    fn pk_replacement_warns_when_live_constraint_has_no_name() {
+        let mut live = snap(vec![table_with_pk(None, &["tenant_id", "metric_id"])]);
+        let mut desired = snap(vec![table_with_pk(None, &["tenant_id", "metric_id", "bucket"])]);
+
+        canonicalize(&mut live);
+        canonicalize(&mut desired);
+        let plan = plan_reconcile(&live, &desired);
+
+        let sql: String = plan.altered.iter().map(|s| s.sql.as_str()).collect();
+        assert!(
+            !sql.contains("DROP CONSTRAINT"),
+            "no DROP statement is possible for a constraint that has no name; got: {sql}"
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("no constraint name")),
+            "an undroppable live PK must be warned about; got {:?}",
+            plan.warnings
         );
     }
 

@@ -106,12 +106,12 @@ fn diff_columns(old: &[ColumnDef], new: &[ColumnDef]) -> Vec<FieldChange> {
     }
 
     // Dropped columns
-    for name in old_map.keys() {
+    for (name, col) in &old_map {
         if !new_map.contains_key(name) {
             changes.push(FieldChange {
                 field_name: name.to_string(),
                 field_type: FieldType::Column,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Column((*col).clone()))),
             });
         }
     }
@@ -135,15 +135,22 @@ fn diff_columns(old: &[ColumnDef], new: &[ColumnDef]) -> Vec<FieldChange> {
     changes
 }
 
-/// Stable key for a constraint: use name if present, else type+columns.
+/// Stable key for a constraint — a **matching key only**, never a SQL identifier.
+///
+/// PRIMARY KEY and UNIQUE are keyed by their columns and never by their name, so
+/// a live constraint Postgres auto-named (`metrics_pkey`) matches the design's
+/// unnamed declaration over the same columns. That is the whole point: reconcile
+/// must see them as one constraint, not as a drop plus an add. FK and CHECK reach
+/// here already name-stripped (`reconcile::canonicalize`,
+/// `schema_diff::normalize_for_diff`), so every constraint kind matches by shape.
+///
+/// The corollary is that this key is synthetic whenever the object is unnamed, so
+/// callers must take the real name from the constraint itself — see
+/// [`ChangeAction::Drop`].
 fn constraint_key(c: &TableConstraint) -> String {
     match c {
-        TableConstraint::PrimaryKey { name, columns } => {
-            name.clone().unwrap_or_else(|| format!("pk:{}", columns.join(",")))
-        }
-        TableConstraint::Unique { name, columns } => {
-            name.clone().unwrap_or_else(|| format!("uq:{}", columns.join(",")))
-        }
+        TableConstraint::PrimaryKey { columns, .. } => format!("pk:{}", columns.join(",")),
+        TableConstraint::Unique { columns, .. } => format!("uq:{}", columns.join(",")),
         TableConstraint::ForeignKey(fk) => fk
             .name
             .clone()
@@ -152,49 +159,77 @@ fn constraint_key(c: &TableConstraint) -> String {
     }
 }
 
+/// Whether two constraints that share a [`constraint_key`] actually differ.
+///
+/// For PRIMARY KEY and UNIQUE the key *is* the full column list, so a shared key
+/// leaves only the name free to differ. Comparing those by `PartialEq` (which
+/// includes the name) made every in-sync PK read as changed, churning a
+/// destructive drop+add on every run — because the live side is auto-named and the
+/// design side usually is not.
+///
+/// "Usually" is why this is not simply `false`: the DDL parser *does* capture an
+/// explicit `constraint <name> primary key (…)`, so when BOTH sides name the
+/// constraint, a difference is a deliberate rename and must still be expressed.
+/// An unnamed side means "any name will do" and never reads as drift.
+fn constraint_differs(old: &TableConstraint, new: &TableConstraint) -> bool {
+    let renamed = |old_name: &Option<String>, new_name: &Option<String>| match (old_name, new_name) {
+        (Some(o), Some(n)) => o != n,
+        _ => false,
+    };
+    match (old, new) {
+        (TableConstraint::PrimaryKey { name: o, .. }, TableConstraint::PrimaryKey { name: n, .. })
+        | (TableConstraint::Unique { name: o, .. }, TableConstraint::Unique { name: n, .. }) => renamed(o, n),
+        _ => old != new,
+    }
+}
+
 /// Diff constraints by stable key: Add / Drop only (changed = Drop + Add).
+///
+/// Every drop is emitted before every add. Replacing a constraint in place is not
+/// something Postgres can do, and the two halves are not interchangeable: adding a
+/// second PRIMARY KEY before dropping the first fails with "multiple primary keys
+/// for table are not allowed". Keys are also walked in sorted order so the SQL for
+/// a given diff is byte-identical run to run rather than following `HashMap`'s
+/// randomized iteration.
 fn diff_constraints(old: &[TableConstraint], new: &[TableConstraint]) -> Vec<FieldChange> {
     let old_map: HashMap<String, &TableConstraint> = old.iter().map(|c| (constraint_key(c), c)).collect();
     let new_map: HashMap<String, &TableConstraint> = new.iter().map(|c| (constraint_key(c), c)).collect();
 
     let mut changes = Vec::new();
+    let mut old_keys: Vec<&String> = old_map.keys().collect();
+    old_keys.sort();
+    let mut new_keys: Vec<&String> = new_map.keys().collect();
+    new_keys.sort();
 
-    // Added constraints
-    for (key, con) in &new_map {
-        if !old_map.contains_key(key) {
+    // Dropped constraints first (including the drop half of a changed one).
+    for key in &old_keys {
+        let old_con = old_map[*key];
+        let replaced = match new_map.get(*key) {
+            None => true,
+            Some(new_con) => constraint_differs(old_con, new_con),
+        };
+        if replaced {
             changes.push(FieldChange {
-                field_name: key.clone(),
+                field_name: (*key).clone(),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*con).clone()))),
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(old_con.clone()))),
             });
         }
     }
 
-    // Dropped constraints (including changed ones: drop old)
-    for (key, old_con) in &old_map {
-        match new_map.get(key) {
-            None => {
-                changes.push(FieldChange {
-                    field_name: key.clone(),
-                    field_type: FieldType::Constraint,
-                    action: ChangeAction::Drop,
-                });
-            }
-            Some(new_con) => {
-                if old_con != new_con {
-                    // Changed constraint = drop + add
-                    changes.push(FieldChange {
-                        field_name: key.clone(),
-                        field_type: FieldType::Constraint,
-                        action: ChangeAction::Drop,
-                    });
-                    changes.push(FieldChange {
-                        field_name: key.clone(),
-                        field_type: FieldType::Constraint,
-                        action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*new_con).clone()))),
-                    });
-                }
-            }
+    // Then adds: constraints new to this table, plus the add half of a changed one.
+    for key in &new_keys {
+        let new_con = new_map[*key];
+        let added = match old_map.get(*key) {
+            None => true,
+            Some(old_con) => constraint_differs(old_con, new_con),
+        };
+        if added {
+            changes.push(FieldChange {
+                field_name: (*key).clone(),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint(new_con.clone()))),
+            });
         }
     }
 
@@ -234,7 +269,7 @@ fn diff_indexes(old: &[IndexDef], new: &[IndexDef]) -> Vec<FieldChange> {
                 changes.push(FieldChange {
                     field_name: key.clone(),
                     field_type: FieldType::Index,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Index((*old_idx).clone()))),
                 });
             }
             Some(new_idx) => {
@@ -242,7 +277,7 @@ fn diff_indexes(old: &[IndexDef], new: &[IndexDef]) -> Vec<FieldChange> {
                     changes.push(FieldChange {
                         field_name: key.clone(),
                         field_type: FieldType::Index,
-                        action: ChangeAction::Drop,
+                        action: ChangeAction::Drop(Box::new(FieldDetail::Index((*old_idx).clone()))),
                     });
                     changes.push(FieldChange {
                         field_name: key.clone(),
@@ -291,7 +326,7 @@ fn diff_enum_values(old: &EnumSnapshot, new: &EnumSnapshot) -> Vec<FieldChange> 
             changes.push(FieldChange {
                 field_name: val.clone(),
                 field_type: FieldType::EnumValue,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue(val.clone()))),
             });
         }
     }

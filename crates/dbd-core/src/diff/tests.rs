@@ -70,7 +70,7 @@
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].field_name, "email");
             assert_eq!(changes[0].field_type, FieldType::Column);
-            assert!(matches!(changes[0].action, ChangeAction::Drop));
+            assert!(matches!(changes[0].action, ChangeAction::Drop(_)));
         } else {
             panic!("expected Change action");
         }
@@ -156,9 +156,19 @@
         assert_eq!(diffs.len(), 1);
         if let DiffAction::Change(ref changes) = diffs[0].action {
             assert_eq!(changes.len(), 1);
-            assert_eq!(changes[0].field_name, "uq_id");
+            // A matching key, not an identifier: UNIQUE is keyed by its columns so
+            // a live auto-named constraint matches the design's unnamed one.
+            assert_eq!(changes[0].field_name, "uq:id");
             assert_eq!(changes[0].field_type, FieldType::Constraint);
-            assert!(matches!(changes[0].action, ChangeAction::Drop));
+            // The drop carries the constraint, so the real name is still available
+            // to `DROP CONSTRAINT` — the whole point of the payload.
+            let ChangeAction::Drop(ref detail) = changes[0].action else {
+                panic!("expected Drop; got {:?}", changes[0].action);
+            };
+            assert!(
+                matches!(**detail, FieldDetail::Constraint(TableConstraint::Unique { name: Some(ref n), .. }) if n == "uq_id"),
+                "the dropped constraint must carry its real name; got {detail:?}"
+            );
         } else {
             panic!("expected Change action");
         }
@@ -187,7 +197,7 @@
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].field_name, "idx_id");
             assert_eq!(changes[0].field_type, FieldType::Index);
-            assert!(matches!(changes[0].action, ChangeAction::Drop));
+            assert!(matches!(changes[0].action, ChangeAction::Drop(_)));
         } else {
             panic!("expected Change action");
         }
@@ -215,7 +225,7 @@
             assert_eq!(changes.len(), 2);
             let drop_count = changes
                 .iter()
-                .filter(|c| matches!(c.action, ChangeAction::Drop))
+                .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
                 .count();
             let add_count = changes
                 .iter()
@@ -223,7 +233,13 @@
                 .count();
             assert_eq!(drop_count, 1);
             assert_eq!(add_count, 1);
-            assert!(changes.iter().all(|c| c.field_name == "uq_email"));
+            // Keyed by columns, so widening (email) → (email, id) reads as one key
+            // going away and another arriving. The drop must come first: Postgres
+            // cannot swap a constraint in place.
+            assert_eq!(changes[0].field_name, "uq:email");
+            assert!(matches!(changes[0].action, ChangeAction::Drop(_)));
+            assert_eq!(changes[1].field_name, "uq:email,id");
+            assert!(matches!(changes[1].action, ChangeAction::Add(_)));
         } else {
             panic!("expected Change action");
         }
@@ -263,7 +279,7 @@
             assert_eq!(changes.len(), 2);
             let drop_count = changes
                 .iter()
-                .filter(|c| matches!(c.action, ChangeAction::Drop))
+                .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
                 .count();
             let add_count = changes
                 .iter()
@@ -388,9 +404,9 @@
             assert!(matches!(col_add.action, ChangeAction::Add(_)));
             let con_drop = changes
                 .iter()
-                .find(|c| c.field_type == FieldType::Constraint && c.field_name == "uq_email")
+                .find(|c| c.field_type == FieldType::Constraint && c.field_name == "uq:email")
                 .expect("should have constraint drop");
-            assert!(matches!(con_drop.action, ChangeAction::Drop));
+            assert!(matches!(con_drop.action, ChangeAction::Drop(_)));
             let idx_add = changes
                 .iter()
                 .find(|c| c.field_type == FieldType::Index && c.field_name == "idx_name")
@@ -561,7 +577,7 @@
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].field_name, "inactive");
             assert_eq!(changes[0].field_type, FieldType::EnumValue);
-            assert!(matches!(changes[0].action, ChangeAction::Drop));
+            assert!(matches!(changes[0].action, ChangeAction::Drop(_)));
         } else {
             panic!("expected Change action");
         }
@@ -700,7 +716,7 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "email".to_string(),
                 field_type: FieldType::Column,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("email", "TEXT")))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
@@ -1125,11 +1141,17 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "uq_email".to_string(),
                 field_type: FieldType::Constraint,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(TableConstraint::Unique {
+                    name: Some("uq_email".to_string()),
+                    columns: vec!["email".to_string()],
+                }))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
-        assert_eq!(sql, "ALTER TABLE public.users DROP CONSTRAINT uq_email;");
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users DROP CONSTRAINT IF EXISTS \"uq_email\";"
+        );
     }
 
     // ── S12: Index add SQL ──────────────────────────────────
@@ -1195,11 +1217,14 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "idx_email".to_string(),
                 field_type: FieldType::Index,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Index(IndexDef {
+                    name: Some("idx_email".to_string()),
+                    ..Default::default()
+                }))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs);
-        assert_eq!(sql, "DROP INDEX idx_email;");
+        assert_eq!(sql, "DROP INDEX IF EXISTS \"idx_email\";");
     }
 
     // ── S14: Enum value add / drop SQL ──────────────────────
@@ -1228,7 +1253,7 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "inactive".to_string(),
                 field_type: FieldType::EnumValue,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue("inactive".to_string()))),
             }]),
         }];
         let sql = generate_migration_sql(&diffs_drop);
@@ -1561,7 +1586,7 @@
                 FieldChange {
                     field_name: "name".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("name", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "display_name".to_string(),
@@ -1582,7 +1607,7 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "deleted".to_string(),
                 field_type: FieldType::EnumValue,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue("deleted".to_string()))),
             }]),
         }];
         let warnings = migration_warnings(&diffs);
@@ -1696,7 +1721,7 @@
                 FieldChange {
                     field_name: "age".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("age", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "idx_email".to_string(),
@@ -1768,7 +1793,7 @@
                 FieldChange {
                     field_name: "name".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("name", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "display_name".to_string(),
@@ -1802,7 +1827,7 @@
                 FieldChange {
                     field_name: "name".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("name", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "age".to_string(),
@@ -1839,12 +1864,12 @@
                 FieldChange {
                     field_name: "first_name".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("first_name", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "last_name".to_string(),
                     field_type: FieldType::Column,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(col("last_name", "TEXT")))),
                 },
                 FieldChange {
                     field_name: "given_name".to_string(),
@@ -1885,7 +1910,7 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "deleted".to_string(),
                 field_type: FieldType::EnumValue,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue("deleted".to_string()))),
             }]),
         }];
 
@@ -1926,7 +1951,7 @@
             action: DiffAction::Change(vec![FieldChange {
                 field_name: "deleted".to_string(),
                 field_type: FieldType::EnumValue,
-                action: ChangeAction::Drop,
+                action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue("deleted".to_string()))),
             }]),
         }];
 
@@ -1962,7 +1987,7 @@
                 FieldChange {
                     field_name: "deleted".to_string(),
                     field_type: FieldType::EnumValue,
-                    action: ChangeAction::Drop,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::EnumValue("deleted".to_string()))),
                 },
                 FieldChange {
                     field_name: "archived".to_string(),

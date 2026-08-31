@@ -637,16 +637,27 @@ project is released** (`project.released: true`) — see `dbd release`.
 
 Reconcile compares the introspected live schema against the design and
 canonicalizes the two representations first: it lifts inline PK/UNIQUE to
-structural constraints, strips constraint names, schema-qualifies bare enum types
-(`status` → `config.status`) to match introspection, and normalizes type aliases
-(`int4` → `integer`, `timestamptz` → `timestamp with time zone`). It reconciles
-**columns** (name/type/nullability/default/identity), **PK/UNIQUE** constraints,
-and **foreign keys** — FKs are matched by shape, so a declared FK the live DB
-lacks is added and a removed one is dropped (`DROP CONSTRAINT`, gated behind
-`--allow-destructive`). Check constraints and indexes are **not** diffed on
-existing tables (introspected vs parsed forms diverge) — change those via
-`dbd snapshot`. Generated ALTERs run with the managed schemas on `search_path`,
-mirroring the DDL files.
+structural constraints, schema-qualifies bare enum types (`status` →
+`config.status`) to match introspection, and normalizes type aliases (`int4` →
+`integer`, `timestamptz` → `timestamp with time zone`). It reconciles **columns**
+(name/type/nullability/default/identity), **PK/UNIQUE** constraints, **foreign
+keys**, **CHECK** constraints, **indexes** and **column comments**.
+
+Everything is matched by shape, never by name — Postgres auto-names what the
+design leaves unnamed, so a name difference is not drift. PK/UNIQUE match on their
+columns, FKs on (columns, referenced table/columns, actions), CHECKs on the
+canonicalized expression, indexes on (unique flag, access method, ordered
+columns). A declared object the live DB lacks is added; one the design dropped is
+removed (`DROP CONSTRAINT IF EXISTS "<live name>"` / `DROP INDEX IF EXISTS`, gated
+behind `--allow-destructive`). Constraint names are read off the live object for
+the drop, which is why they survive canonicalization.
+
+Changing which columns a PRIMARY KEY covers is a replacement: the old constraint
+is dropped by its real live name and the new one added, in that order, in place on
+a table that already holds rows. The new key columns must already be `NOT NULL`
+and unique across existing rows or Postgres rejects the `ADD` and the whole
+reconcile rolls back. Generated ALTERs run with the managed schemas on
+`search_path`, mirroring the DDL files.
 
 ### dbd diff
 

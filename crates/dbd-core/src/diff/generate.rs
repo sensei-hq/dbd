@@ -25,8 +25,39 @@ pub fn migration_warnings(diffs: &[MigrationDiff]) -> Vec<String> {
         warnings.extend(type_change_warnings(&d.entity_name, changes));
         warnings.extend(rename_warnings(&d.entity_name, changes));
         warnings.extend(enum_value_drop_warnings(&d.entity_name, changes));
+        warnings.extend(unnamed_constraint_drop_warnings(&d.entity_name, changes));
     }
 
+    warnings
+}
+
+/// Warn about a constraint that must go but cannot be dropped, because neither
+/// side of the diff knows a name for it.
+///
+/// `DROP CONSTRAINT` takes a name and nothing else. Rather than emit a statement
+/// that cannot run — the defect that produced
+/// `DROP CONSTRAINT pk:tenant_id,metric_id` — [`generate_field_sql`] writes a
+/// comment, and this surfaces the same fact where a caller will actually see it.
+fn unnamed_constraint_drop_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        if change.field_type != FieldType::Constraint {
+            continue;
+        }
+        let ChangeAction::Drop(ref detail) = change.action else {
+            continue;
+        };
+        let FieldDetail::Constraint(ref con) = **detail else {
+            continue;
+        };
+        if constraint_name(con).is_none() {
+            warnings.push(format!(
+                "{}: {} must be dropped but has no constraint name — drop it manually",
+                entity_name,
+                constraint_description(con)
+            ));
+        }
+    }
     warnings
 }
 
@@ -53,7 +84,7 @@ fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<Strin
 fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
     let dropped: Vec<&FieldChange> = changes
         .iter()
-        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop))
+        .filter(|c| c.field_type == FieldType::Column && matches!(c.action, ChangeAction::Drop(_)))
         .collect();
     let added: Vec<&FieldChange> = changes
         .iter()
@@ -81,7 +112,7 @@ fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
 fn enum_value_drop_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
     let mut warnings = Vec::new();
     for change in changes {
-        if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop) {
+        if change.field_type == FieldType::EnumValue && matches!(change.action, ChangeAction::Drop(_)) {
             warnings.push(format!(
                 "{}: enum value '{}' dropped — ensure no rows reference this value",
                 entity_name, change.field_name
@@ -123,6 +154,36 @@ pub fn generate_migration_sql(diffs: &[MigrationDiff]) -> String {
     lines.join("\n")
 }
 
+/// A constraint's real SQL identifier, or `None` when it has none.
+///
+/// Only a name can appear in `DROP CONSTRAINT`. Postgres auto-names every
+/// constraint it creates, so a constraint read back from a live database always
+/// has one; a constraint parsed from a design usually does not.
+fn constraint_name(con: &TableConstraint) -> Option<&str> {
+    match con {
+        TableConstraint::PrimaryKey { name, .. } | TableConstraint::Unique { name, .. } => name.as_deref(),
+        TableConstraint::ForeignKey(fk) => fk.name.as_deref(),
+        TableConstraint::Check { name, .. } => name.as_deref(),
+    }
+}
+
+/// The `CONSTRAINT <name> ` prefix for an `ALTER TABLE … ADD …`, or an empty
+/// string when the constraint is unnamed so Postgres auto-names it.
+fn constraint_clause(name: Option<&str>) -> String {
+    name.map(|n| format!("CONSTRAINT {n} ")).unwrap_or_default()
+}
+
+/// A human-readable description of an unnamed constraint, for the comment and
+/// warning that stand in for DDL that cannot be written.
+fn constraint_description(con: &TableConstraint) -> String {
+    match con {
+        TableConstraint::PrimaryKey { columns, .. } => format!("PRIMARY KEY ({})", columns.join(", ")),
+        TableConstraint::Unique { columns, .. } => format!("UNIQUE ({})", columns.join(", ")),
+        TableConstraint::ForeignKey(fk) => format!("FOREIGN KEY ({})", fk.columns.join(", ")),
+        TableConstraint::Check { expression, .. } => format!("CHECK ({expression})"),
+    }
+}
+
 /// Generate SQL for a single field-level change.
 fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &FieldChange, lines: &mut Vec<String>) {
     match (&change.field_type, &change.action) {
@@ -132,7 +193,7 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                 lines.push(column_add_sql(entity_name, col));
             }
         }
-        (FieldType::Column, ChangeAction::Drop) => {
+        (FieldType::Column, ChangeAction::Drop(_)) => {
             lines.push(format!(
                 "ALTER TABLE {} DROP COLUMN {};",
                 entity_name, change.field_name
@@ -151,11 +212,27 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                 lines.push(sql);
             }
         }
-        (FieldType::Constraint, ChangeAction::Drop) => {
-            lines.push(format!(
-                "ALTER TABLE {} DROP CONSTRAINT {};",
-                entity_name, change.field_name
-            ));
+        (FieldType::Constraint, ChangeAction::Drop(detail)) => {
+            let FieldDetail::Constraint(con) = detail.as_ref() else {
+                return;
+            };
+            // The real name off the dropped constraint, never `change.field_name`
+            // — that is a matching key and is synthetic for anything the design
+            // left unnamed (`pk:tenant_id,metric_id`).
+            match constraint_name(con) {
+                // `IF EXISTS` because a constraint can already be gone by the time
+                // this runs: dropping a column earlier in the same batch takes the
+                // PRIMARY KEY covering it along with it.
+                Some(name) => lines.push(format!(
+                    "ALTER TABLE {} DROP CONSTRAINT IF EXISTS \"{}\";",
+                    entity_name, name
+                )),
+                None => lines.push(format!(
+                    "-- {}: cannot drop {} — the constraint has no name; drop it manually",
+                    entity_name,
+                    constraint_description(con)
+                )),
+            }
         }
 
         // ── Index ───────────────────────────────────────
@@ -164,8 +241,22 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                 lines.push(index_add_sql(entity_name, idx));
             }
         }
-        (FieldType::Index, ChangeAction::Drop) => {
-            lines.push(format!("DROP INDEX {};", change.field_name));
+        (FieldType::Index, ChangeAction::Drop(detail)) => {
+            let FieldDetail::Index(idx) = detail.as_ref() else {
+                return;
+            };
+            match &idx.name {
+                Some(name) => lines.push(format!("DROP INDEX IF EXISTS \"{name}\";")),
+                None => lines.push(format!(
+                    "-- {}: cannot drop the index on ({}) — it has no name; drop it manually",
+                    entity_name,
+                    idx.columns
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
         }
 
         // ── EnumValue ───────────────────────────────────
@@ -174,7 +265,7 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                 lines.push(format!("ALTER TYPE {} ADD VALUE '{}';", entity_name, val));
             }
         }
-        (FieldType::EnumValue, ChangeAction::Drop) => {
+        (FieldType::EnumValue, ChangeAction::Drop(_)) => {
             // No SQL for enum value drop — warning only
         }
 
@@ -371,21 +462,25 @@ fn fk_action_to_sql(action: &crate::entity::FkAction) -> &'static str {
 /// Generate ADD CONSTRAINT SQL for a table constraint.
 fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
     match con {
+        // An unnamed PK/UNIQUE (the design's inline `primary key` / `unique`) is
+        // emitted without a `CONSTRAINT` clause so Postgres auto-names it, exactly
+        // as the FK arm below does. Naming it literally "unnamed" was worse than
+        // ugly: a PK's backing index takes the constraint name and index names are
+        // schema-scoped, so the second table in a schema to converge this way
+        // failed with `relation "unnamed" already exists`.
         TableConstraint::PrimaryKey { name, columns } => {
-            let con_name = name.as_deref().unwrap_or("unnamed");
             format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({});",
+                "ALTER TABLE {} ADD {}PRIMARY KEY ({});",
                 entity_name,
-                con_name,
+                constraint_clause(name.as_deref()),
                 columns.join(", ")
             )
         }
         TableConstraint::Unique { name, columns } => {
-            let con_name = name.as_deref().unwrap_or("unnamed");
             format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({});",
+                "ALTER TABLE {} ADD {}UNIQUE ({});",
                 entity_name,
-                con_name,
+                constraint_clause(name.as_deref()),
                 columns.join(", ")
             )
         }
@@ -394,11 +489,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             // An unnamed FK (e.g. the design's inline `references …`) is emitted
             // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
             // rather than literally naming the constraint "unnamed".
-            let con_clause = fk
-                .name
-                .as_deref()
-                .map(|n| format!("CONSTRAINT {n} "))
-                .unwrap_or_default();
+            let con_clause = constraint_clause(fk.name.as_deref());
             let mut sql = format!(
                 "ALTER TABLE {} ADD {}FOREIGN KEY ({}) REFERENCES {}{}({})",
                 entity_name,

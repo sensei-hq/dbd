@@ -204,7 +204,7 @@ Otherwise it is **pre-release**.
 | Change a schema | edit DDL, then **`dbd reconcile`** (diffs live↔design, applies `CREATE`/`ALTER` in place — no snapshot, no version bump) | edit DDL, then **`dbd snapshot`** (writes the migration) → **`dbd apply`** (runs it) |
 | Fresh DB | `dbd apply` | `dbd apply` (runs all migrations) |
 | `dbd reconcile` | ✅ the whole point | ❌ **disabled** — do not use |
-| Drops | `reconcile --allow-destructive` (columns) / `--prune` (orphan tables) | expressed as migrations via `dbd snapshot` |
+| Drops | `reconcile --allow-destructive` (columns, and constraints incl. replacing a PK in place) / `--prune` (orphan tables) | expressed as migrations via `dbd snapshot` |
 
 - **Pre-release example:** you renamed a column in `ddl/table/app/orders.ddl`; run
   `dbd reconcile -d $DATABASE_URL` to converge the dev DB. No snapshot is written.
