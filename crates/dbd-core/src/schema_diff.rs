@@ -305,6 +305,66 @@ mod tests {
         }
     }
 
+    fn pk(name: Option<&str>, cols: &[&str]) -> TableConstraint {
+        TableConstraint::PrimaryKey {
+            name: name.map(str::to_string),
+            columns: cols.iter().map(|c| (*c).into()).collect(),
+        }
+    }
+
+    /// `dbd diff` previews the SQL it would take to converge, so it reaches the
+    /// same emitter reconcile does — and used to print the same unrunnable
+    /// `DROP CONSTRAINT pk:<columns>`. The preview must name the real live
+    /// constraint and drop it before adding the replacement.
+    #[test]
+    fn pk_replacement_preview_uses_the_real_live_name() {
+        let live = snap(TableSnapshot {
+            table_constraints: vec![pk(Some("users_pkey"), &["tenant_id"])],
+            ..table(vec![col("tenant_id", "uuid"), col("email", "text")])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![pk(None, &["tenant_id", "email"])],
+            ..table(vec![col("tenant_id", "uuid"), col("email", "text")])
+        });
+
+        let d = SchemaDiff::compute(live, desired);
+        let sql: String = d
+            .changes
+            .iter()
+            .map(|c| crate::diff::generate_migration_sql(std::slice::from_ref(c)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!sql.contains("pk:"), "matching key leaked into the preview: {sql}");
+        assert!(!sql.contains("unnamed"), "unnamed PK named \"unnamed\": {sql}");
+        let drop_at = sql.find("DROP CONSTRAINT").unwrap_or_else(|| panic!("no drop: {sql}"));
+        let add_at = sql
+            .find("PRIMARY KEY (tenant_id, email)")
+            .unwrap_or_else(|| panic!("no add: {sql}"));
+        assert!(
+            sql[drop_at..].starts_with("DROP CONSTRAINT IF EXISTS \"users_pkey\""),
+            "got: {sql}"
+        );
+        assert!(drop_at < add_at, "drop must precede add; got: {sql}");
+    }
+
+    /// The matching half of the same guarantee: a live PK Postgres auto-named and
+    /// the design's unnamed PK over the same columns must not read as drift, or
+    /// `dbd diff` reports a change on every run against an in-sync database.
+    #[test]
+    fn pk_name_difference_alone_is_not_reported_as_drift() {
+        let live = snap(TableSnapshot {
+            table_constraints: vec![pk(Some("users_pkey"), &["tenant_id"])],
+            ..table(vec![col("tenant_id", "uuid")])
+        });
+        let desired = snap(TableSnapshot {
+            table_constraints: vec![pk(None, &["tenant_id"])],
+            ..table(vec![col("tenant_id", "uuid")])
+        });
+        let d = SchemaDiff::compute(live, desired);
+        assert!(d.is_empty(), "PK name difference is not drift; got {:?}", d.changes);
+    }
+
     /// The same CHECK written with different (but equivalent) parenthesization
     /// canonicalizes to the same form → no diff.
     #[test]
