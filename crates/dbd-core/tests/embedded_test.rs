@@ -2900,3 +2900,144 @@ async fn dbd_schema_excluded_from_introspect_and_survives() {
     assert_table_exists(&*adapter, "dbd", "meta").await;
     assert_table_exists(&*adapter, "dbd", "migrations").await;
 }
+
+// ── Reconcile convergence: PRIMARY KEY replacement ────────────────────────────
+
+/// End-to-end: `dbd reconcile` must be able to REPLACE a composite PRIMARY KEY on
+/// a table that already holds rows.
+///
+/// It could not. Reconcile diffs name-stripped snapshots, so a PK's identity was
+/// the internal matching key `pk:<columns>` — and that key was then emitted as a
+/// SQL identifier, producing `DROP CONSTRAINT pk:tenant_id,metric_id`. Postgres
+/// rejects it, and because reconcile applies in one transaction the whole change
+/// was blocked; the only way through was dropping and recreating the table, which
+/// a table with data cannot afford. Two further defects sat behind that one: the
+/// replacement PK was emitted as `ADD CONSTRAINT unnamed PRIMARY KEY` (a PK's
+/// backing index takes the constraint name, and index names are schema-scoped, so
+/// the second table to converge this way collided), and the add was ordered before
+/// the drop, which Postgres rejects with "multiple primary keys".
+///
+/// This asserts against a real server, with real rows: the new PK exists, the old
+/// one is gone, every row survived, and a second reconcile is a no-op.
+#[tokio::test]
+async fn reconcile_replaces_primary_key_on_table_with_data() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_pk_test").await.unwrap();
+
+    let write_design = |dir: &std::path::Path, pk: &str| {
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: reconcile_pk_test\n  version: 1\n\
+             source:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/metrics.ddl"),
+            format!(
+                "set search_path to app;\n\
+                 create table if not exists metrics (\n\
+                   tenant_id uuid not null\n\
+                 , metric_id uuid not null\n\
+                 , bucket date not null\n\
+                 , value integer\n\
+                 , primary key ({pk})\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    // A predicate matching the PK of app.metrics over exactly `cols`, in order.
+    let pk_over = |cols: &str| {
+        format!(
+            "SELECT 1 FROM pg_constraint c \
+               JOIN pg_class cls ON cls.oid = c.conrelid \
+               JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+             WHERE c.contype = 'p' AND ns.nspname = 'app' AND cls.relname = 'metrics' \
+               AND (SELECT array_agg(a.attname ORDER BY k.ord) \
+                    FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) \
+                   = ARRAY[{cols}]::name[]"
+        )
+    };
+    let old_pk = pk_over("'tenant_id','metric_id'");
+    let new_pk = pk_over("'tenant_id','metric_id','bucket'");
+
+    // ── Apply the original design, then put real data behind the PK ──
+    let tmp = tempfile::tempdir().unwrap();
+    write_design(tmp.path(), "tenant_id, metric_id");
+    let design =
+        Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).expect("load design");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    assert_catalog(&*adapter, true, &old_pk, "PK on (tenant_id, metric_id)").await;
+
+    adapter
+        .execute_script(
+            "INSERT INTO app.metrics (tenant_id, metric_id, bucket, value) VALUES \
+               ('11111111-1111-1111-1111-111111111111','22222222-2222-2222-2222-222222222222','2026-01-01',1), \
+               ('11111111-1111-1111-1111-111111111111','33333333-3333-3333-3333-333333333333','2026-01-02',2);",
+        )
+        .await
+        .expect("seed rows failed");
+
+    // In-sync: the live PK Postgres auto-named must match the design's unnamed
+    // declaration, or reconcile churns a destructive drop+add every run.
+    let plan = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("dry-run reconcile failed");
+    assert!(
+        !plan.altered.iter().any(|s| s.sql.contains("PRIMARY KEY")),
+        "an in-sync PK must not produce reconcile churn; got {:?}",
+        plan.altered
+    );
+
+    // ── Widen the PK to (tenant_id, metric_id, bucket) ──
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_design(tmp2.path(), "tenant_id, metric_id, bucket");
+    let design2 =
+        Design::from_config_with_dir(&tmp2.path().join("design.yaml"), "dev", Some(tmp2.path())).expect("load design2");
+
+    // Replacing a PK drops a constraint, so it is gated as destructive.
+    let refused = design2
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await;
+    assert!(
+        refused.is_err(),
+        "replacing a PK without --allow-destructive must be refused"
+    );
+    assert_catalog(&*adapter, true, &old_pk, "PK on (tenant_id, metric_id)").await;
+
+    // With --allow-destructive it must actually apply — this is what the
+    // `DROP CONSTRAINT pk:tenant_id,metric_id` defect made impossible.
+    design2
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("PK replacement reconcile failed");
+    assert_catalog(&*adapter, true, &new_pk, "PK on (tenant_id, metric_id, bucket)").await;
+    assert_catalog(&*adapter, false, &old_pk, "old PK on (tenant_id, metric_id)").await;
+
+    // The rows the table was carrying are still there — a PK replacement must not
+    // be a table rebuild.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.metrics HAVING count(*) = 2",
+        "both seeded rows",
+    )
+    .await;
+
+    // And it converges: a second reconcile has nothing left to do.
+    let settled = design2
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("post-replacement dry-run reconcile failed");
+    assert!(
+        settled.is_empty(),
+        "reconcile must settle after replacing the PK; got {settled:?}"
+    );
+}

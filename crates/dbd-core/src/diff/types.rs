@@ -36,10 +36,17 @@ pub enum FieldType {
 }
 
 /// What happened to a specific field.
+///
+/// `Drop` carries the object that was dropped, symmetrically with `Add`. It has
+/// to: [`FieldChange::field_name`] is a *matching key*, and for an object matched
+/// name-agnostically (every constraint kind is — Postgres auto-names what the
+/// design leaves unnamed) that key is synthetic, e.g. `pk:tenant_id,metric_id`.
+/// Emitting it as an identifier produced `DROP CONSTRAINT pk:tenant_id,metric_id`,
+/// which no database can run. The payload is where the real name comes from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChangeAction {
     Add(Box<FieldDetail>),
-    Drop,
+    Drop(Box<FieldDetail>),
     Alter {
         old: Box<FieldDetail>,
         new: Box<FieldDetail>,
