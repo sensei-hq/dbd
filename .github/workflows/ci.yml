@@ -63,6 +63,15 @@ jobs:
       # house style, and the whole tree was normalised in one commit.
       - name: cargo fmt
         run: cargo fmt --all --check
+      # Advisory scan over Cargo.lock. Exceptions live in .cargo/audit.toml and
+      # are limited to crates that are in the lock but never compiled (Cargo.lock
+      # is feature-agnostic); each one records the check that proved it.
+      # No workflow inputs are interpolated here — the command is a constant.
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
       - name: upload coverage to qlty
         uses: qltysh/qlty-action/coverage@08a0a862c159eae9b9003081da6663d96efef637 # v2.3.0
         with:

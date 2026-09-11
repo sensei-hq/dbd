@@ -62,7 +62,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-indicatif = "0.17"
+indicatif = "0.18"
 console = "0.15"
 open = "5"
 
