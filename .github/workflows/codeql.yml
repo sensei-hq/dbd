@@ -1,0 +1,64 @@
+name: CodeQL
+
+# Static analysis for the three things this repo actually ships or runs:
+# the Rust crates, the docs site's TypeScript, and the workflows themselves.
+#
+# `actions` is not an afterthought here — this repo pins every action to a
+# commit SHA and sets `persist-credentials: false` by hand, and the `actions`
+# pack is what checks that posture mechanically (unpinned refs, injectable
+# interpolation into `run:`, over-broad permissions) instead of relying on a
+# reviewer noticing.
+#
+# Written as a workflow rather than code scanning's "default setup" so the
+# languages, schedule and action SHA are reviewable in the diff like every
+# other gate in this repo.
+#
+# This workflow has no `run:` steps and interpolates no github.event.* values;
+# the only expression is matrix.language, which is defined immediately below.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a newly published CodeQL query finds existing code without
+    # waiting for the next push. Offset off the hour to avoid the scheduling
+    # spike GitHub drops on :00.
+    - cron: '37 4 * * 1'
+
+# Least privilege at the top; the analyse job adds only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload the SARIF results to the Security tab.
+      security-events: write
+      # Required by the `actions` pack to read workflow definitions.
+      actions: read
+      contents: read
+    strategy:
+      # One language failing should not hide the other two results.
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          languages: ${{ matrix.language }}
+      # autobuild runs `cargo build` for rust and is a no-op for the
+      # interpreted languages. The site's TypeScript is analysed from source,
+      # so no bun install is needed here.
+      - name: autobuild
+        uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+      - name: analyze
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          category: /language:${{ matrix.language }}
