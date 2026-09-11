@@ -2104,7 +2104,7 @@
             col_def: Box::new(col("display_name", "TEXT")),
         };
         let sql = generate_data_sql(&change);
-        assert_eq!(sql, "UPDATE config.users SET display_name = name;\n");
+        assert_eq!(sql, "UPDATE \"config\".\"users\" SET \"display_name\" = \"name\";\n");
     }
 
     #[test]
@@ -2118,7 +2118,7 @@
             new_col: Box::new(col("total_text", "TEXT")),
         };
         let sql = generate_data_sql(&change);
-        assert!(sql.contains("UPDATE config.orders SET total_text = total::TEXT;"));
+        assert!(sql.contains("UPDATE \"config\".\"orders\" SET \"total_text\" = \"total\"::TEXT;"));
     }
 
     #[test]
@@ -2146,7 +2146,48 @@
         let sql = generate_data_sql(&change);
         assert!(sql.contains("Removed: deleted"), "sql: {sql}");
         assert!(sql.contains("Remaining: active, inactive"), "sql: {sql}");
-        assert!(sql.contains("UPDATE public.users SET status = '???' WHERE status = 'deleted';"));
+        assert!(sql.contains("UPDATE \"public\".\"users\" SET \"status\" = '???' WHERE \"status\" = 'deleted';"));
+    }
+
+    /// The removed enum label is interpolated into a `WHERE … = '…'`. Labels come
+    /// from the database catalog, and a generated data script is usually run by
+    /// hand with high privileges — so a label carrying a quote must come back as
+    /// one inert literal, not as a literal plus a statement.
+    #[test]
+    fn an_enum_label_containing_a_quote_cannot_escape_its_literal() {
+        let change = ComplexChange::EnumValueRemoval {
+            enum_name: "public.status_type".to_string(),
+            removed_values: vec!["x'; DROP TABLE users; --".to_string()],
+            remaining_values: vec!["active".to_string()],
+            affected_columns: vec![("public.users".to_string(), "status".to_string())],
+        };
+        let sql = generate_data_sql(&change);
+        assert!(
+            sql.contains("= 'x''; DROP TABLE users; --'"),
+            "the label must be one escaped literal; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("= 'x'; DROP TABLE users; --'"),
+            "the statement must not be re-openable; got:\n{sql}"
+        );
+    }
+
+    /// Table and column names reach the same script from the same catalog, and a
+    /// quoted identifier may hold a `"`. Each name must be quoted as one
+    /// identifier rather than pasted in bare.
+    #[test]
+    fn a_table_or_column_name_containing_a_quote_cannot_escape_its_identifier() {
+        let change = ComplexChange::ColumnRename {
+            table_name: r#"public.u"; DROP TABLE x; --"#.to_string(),
+            old_name: "name".to_string(),
+            new_name: "display_name".to_string(),
+            col_def: Box::new(col("display_name", "TEXT")),
+        };
+        let sql = generate_data_sql(&change);
+        assert!(
+            sql.contains(r#""u""; DROP TABLE x; --""#),
+            "the name must be one escaped identifier; got:\n{sql}"
+        );
     }
 
     #[test]

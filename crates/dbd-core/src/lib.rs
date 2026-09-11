@@ -15,6 +15,7 @@ pub mod formatter;
 pub mod github;
 pub mod init;
 pub mod parser;
+pub mod path_safe;
 pub mod reconcile;
 pub mod refcache;
 pub mod references;
