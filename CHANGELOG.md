@@ -7,12 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html); whil
 the crates are `0.x`, the **minor** position is the breaking one, so
 `0.12.x → 0.13.0` may require changes in code that embeds `dbd-core`.
 
-## [0.13.1] — 2026-09-11
+## [Unreleased]
 
 **No change to `dbd-core` or the `dbd` CLI.** The Rust tree is byte-identical to
-0.13.0; upgrading the crate gains you nothing and skipping it costs you nothing.
-This release is the documentation site, CI and repo metadata, versioned together
-because one version number covers the whole repo.
+0.13.0, which is why these changes carry no version bump: a tag is this repo's
+release artifact and publishes to crates.io, and cutting one here would push a
+version whose crate code is identical to the one before it. The documentation
+site, CI and repo metadata changed; they ship on merge to `main`, and the next
+tag will fold this section into its release notes.
 
 ### Security
 
@@ -168,5 +170,5 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 
 [#12]: https://github.com/sensei-hq/dbd/issues/12
 [#13]: https://github.com/sensei-hq/dbd/issues/13
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.0...main
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0
-[0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
