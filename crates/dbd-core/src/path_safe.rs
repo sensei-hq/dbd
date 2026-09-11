@@ -29,6 +29,10 @@ use std::path::{Component, Path, PathBuf};
 /// spaces, dots and non-ASCII, and rejecting those would refuse to reverse
 /// perfectly ordinary databases. What must not get through is a separator, the
 /// two relative-directory names, and the NUL that truncates a C path.
+///
+/// This is therefore **not** the right rule for a value that also reaches a URL
+/// or a command line — see [`crate::github::is_safe_github_ident`], which
+/// allow-lists instead, for that case.
 pub fn is_safe_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\') && !s.contains('\0')
 }
