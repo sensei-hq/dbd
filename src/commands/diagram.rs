@@ -15,6 +15,29 @@ fn resolve_site(site: Option<&str>) -> &str {
     site.unwrap_or(DEFAULT_SITE)
 }
 
+/// Whether a URL may be handed to the platform's URL opener.
+///
+/// The base comes from `--site` or `$DBD_DIAGRAM_URL`, so the string that
+/// reaches [`open::that`] is not one dbd composed end to end. That matters
+/// because the opener is not uniform: on Windows it goes through
+/// `cmd /c start`, where a metacharacter in the argument is a command rather
+/// than text, and every platform's opener will happily act on a non-web scheme
+/// (`file://`, `javascript:`, a UNC path) by launching whatever is registered
+/// for it.
+///
+/// So this allows exactly the two schemes a diagram can be served over and
+/// nothing else. The URL is printed to stdout unconditionally, so a refusal
+/// costs the operator a click, not the output.
+fn is_browsable_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        Some(rest) => rest,
+        None => return false,
+    };
+    // A shell metacharacter cannot appear in a host or in a correctly-encoded
+    // path/fragment, so its presence means the string is not just a URL.
+    !rest.is_empty() && !rest.contains(['&', '|', ';', '"', '\'', '`', '\n', '\r', '\0'])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_diagram(
     config: &Path,
@@ -49,11 +72,18 @@ pub fn cmd_diagram(
     }
     // The URL is the command's data output — always to stdout (pipeable).
     println!("{url}");
-    if !print_url && let Err(e) = open::that(&url) {
-        output::info(
-            verbosity,
-            &format!("(couldn't open a browser: {e}); open the URL above)"),
-        );
+    if !print_url {
+        if !is_browsable_url(&url) {
+            output::info(
+                verbosity,
+                "(not opening a browser: --site/$DBD_DIAGRAM_URL is not a plain http(s) URL); open the URL above)",
+            );
+        } else if let Err(e) = open::that(&url) {
+            output::info(
+                verbosity,
+                &format!("(couldn't open a browser: {e}); open the URL above)"),
+            );
+        }
     }
     Ok(())
 }
@@ -61,6 +91,28 @@ pub fn cmd_diagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--site` / `$DBD_DIAGRAM_URL` is operator-supplied and reaches the
+    /// platform's URL opener, which on Windows runs `cmd /c start` — where a
+    /// metacharacter in the argument is a command, not text. Only the two schemes
+    /// a diagram can actually be served over may be handed over; the URL is
+    /// printed to stdout regardless, so refusing to auto-open costs nothing.
+    #[test]
+    fn only_http_urls_are_handed_to_the_browser_opener() {
+        assert!(is_browsable_url("https://dbd.sensei-hq.com/#x"));
+        assert!(is_browsable_url("http://localhost:5173/#x"));
+
+        for hostile in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "https:evil & calc.exe",
+            "\\\\attacker\\share\\payload.exe",
+            "",
+        ] {
+            assert!(!is_browsable_url(hostile), "{hostile:?} must not be opened");
+        }
+    }
 
     #[test]
     fn resolve_site_prefers_explicit_then_default() {
