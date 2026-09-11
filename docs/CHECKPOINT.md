@@ -1,57 +1,55 @@
 # Checkpoint
 
-**Slice:** Issue #12 + the Aikido security sweep — shipped as **v0.13.0**.
+**Slice:** JS advisory backlog + CI/security hardening + library manifest (#13).
+Merging to `main` as **Unreleased** — deliberately no version bump.
 
 ## Done
 
-Released v0.13.0: tagged on `develop`, merged to `main` (merge commit `c3653d2`),
-release workflow green, `dbd-core` and `dbd-cli` both published at 0.13.0, CI
-green on `main` including the new `cargo audit` step.
+Five commits on `develop`; PR #14 green on all 10 checks (new site job, CodeQL
+rust/ts/actions, test+clippy+coverage, qlty, Cloudflare build). CodeQL: 0 alerts.
 
-**Minor, not patch.** `TableConstraint::Unique` gained a field, which is
-compile-breaking for embedders, and on a `0.x` crate minor is the breaking
-position — a patch would have told `dbd-core = "0.12"` consumers it was a safe
-auto-upgrade. `generate_data_sql`'s output is now quoted, same reason.
+- **devalue 5.8.1 → 5.9.2** ("reject out-of-bounds indices", AIKIDO-2026-869882).
+  The fix was already inside kit's `^5.8.1`; only the lockfile was stale.
+- **undici override 7.29.0 → 8.10.2.** The old pin was itself the finding — it
+  dragged `jsdom@30` off its declared `^8.9.0`. Bun rejects nested overrides
+  (verified: it warns and ignores), so one version must serve both parents.
+- **`bun run check` was fatally broken** — svelte-check 4.x refuses a bare
+  TypeScript 7. Fixed with `typescript@~6.0.3` + `@typescript/native` + `--tsgo`.
+  It survived because nothing in CI ran the site. Now gated.
+- **Both Rust findings were non-issues**, verified not assumed: `rand` 0.8.8/0.10.2
+  are past every patched version; `der` has zero advisories and rides the
+  `rsa ← sqlx-mysql` path `.cargo/audit.toml` already documents as never compiled.
+- **cookie: no version change.** Pinned because kit still declares `^0.6.0` and
+  every 0.6.x carries GHSA-pxg6-pf52-xh8x. Renovate now caps it `<1.0.0` — 1.0
+  delegates quote-parsing to `decode` (kit passes an identity decoder), 2.0
+  renames `parse`/`serialize`. It ships in the worker, so a bad bump is a prod break.
+- **Repo:** secret scanning + push protection on; Renovate owns security PRs
+  (`vulnerabilityAlerts` + `osvVulnerabilityAlerts`); 7-day cooldown on every rule.
+- **#13:** manifest completed per spec. `install` names `dbd install` — the issue's
+  suggested `dbd skills add` does not exist. `make bump` now syncs `documents`/`ref`.
 
-- **#12.1 `unique nulls not distinct` reduced to a plain unique on the ALTER
-  path.** The clause had nowhere to live on `TableConstraint::Unique`, and
-  UNIQUE was compared by name alone — so reconcile applied a weaker constraint
-  and `diff` then certified it in sync. Carried through entity → both parsers →
-  introspection → compare → emit.
-- **#12.2 enum value removal never applied.** `plan_enum_recreation` performs
-  the type swap: drop managed dependent views (deepest first) → drop defaults →
-  rename aside → `CREATE TYPE` → `ALTER COLUMN … USING ::text::` → restore
-  defaults → drop old. One transaction, so every failure is total and named.
-  Declines only on a dependent matview, with the manual steps.
-- **Security.** Both `export_data` impls joined a live catalog name into a path
-  unchecked; `path_safe` now contains them (the rule previously existed as two
-  private copies covering two of four sites). `sql_quote` closes
-  identifier/literal injection in both exports and `generate_data_sql`.
-  `open::that` takes only plain http(s). `github.rs`'s same-named-but-stricter
-  helper renamed to `is_safe_github_ident` so the two rules can't be confused.
-- **Dependencies.** `cargo audit` 4+4 → 0; `bun audit` 21 → 0.
-
-Verified four ways: 1013 lib + 49 embedded-Postgres + 196 integration tests;
-mutation checks (removing either #12 fix fails its e2e with the original
-symptom); the **registry artifact** — `cargo install dbd-cli@0.13.0` re-runs
-both halves of the issue's repro correctly; and CHANGELOG + docs + skill (all
-tracked copies byte-identical) synced.
+**No version bump:** a tag publishes to crates.io and the Rust tree is
+byte-identical to 0.13.0. `ref: v0.13.0` stays accurate — docs/llms, docs/skills
+and docs/agents hash-match at the tag, on main, and in the site's served copy.
 
 ## Next
 
-Nothing pending. `develop` == v0.13.0, `main` merged, released.
+Merge PR #14 → main, confirm CI green on main. Then open the rokkit issue
+mirroring this work (dep upgrades + the svelte-check/TS 7 note).
 
 ## Open questions
 
-None blocking.
+Secret-scanning **validity checks** could not be enabled — org `sensei-hq` is on
+the free plan with Advanced Security off. Needs paid Secret Protection.
 
 ## Known-broken / carried forward
 
-- `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa`, via `sqlx-mysql`, never
-  compiled — proved by `cargo tree` + zero build artifacts). Re-check on sqlx bumps.
-- `site/package.json` `overrides` pin six transitive deps above their parents'
-  ranges; drop each once the parent catches up.
+- `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`, never
+  compiled). Re-check on sqlx bumps.
+- `site/package.json` `overrides` pin six transitive deps; `dompurify` and `sharp`
+  are now redundant (parents' ranges caught up) and can be dropped.
+- 8 Rust majors available (sqlx 0.9, reqwest 0.13, dirs 7, sha2 0.11, …), none
+  security-driven. sqlx 0.9 deserves its own slice with real Postgres testing.
 - `ARRAY[col]::t[]` where the column is already type `t` still reads as drift.
 - `generate_data_sql` warns "may truncate data" on a *widening* cast.
-- Local leftovers from verification: databases `dbd_repro12` and
-  `dbd_v13_verify` (drop when convenient).
+- Local leftovers: databases `dbd_repro12` and `dbd_v13_verify` (drop when convenient).
