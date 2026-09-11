@@ -1,50 +1,39 @@
 # Checkpoint
 
-**Slice:** PRIMARY KEY replacement in reconcile — shipped as **v0.12.6**.
+**Slice:** Issue #12 (reconcile non-convergence) + Aikido security sweep.
 
 ## Done
 
-Released v0.12.6: tag pushed, crates.io published (`dbd-cli` + `dbd-core` both
-at 0.12.6), develop merged to main, CI green on main.
-
-The fix — a constraint's *matching key* must never reach SQL as an identifier:
-
-- `ChangeAction::Drop` now carries the dropped object (symmetric with `Add`), so
-  the emitter names a drop from the live constraint instead of from
-  `field_name`, which is a match key and is synthetic (`pk:tenant_id,metric_id`)
-  for anything the design left unnamed.
-- `lift_pk_unique_keep_others` **keeps** the PK/UNIQUE name; `constraint_key`
-  moved to columns-only so matching stays name-agnostic. Both sides explicitly
-  named + different still reads as a deliberate rename.
-- Unnamed PK/UNIQUE add drops the `CONSTRAINT` clause (was literally `unnamed`;
-  a PK's backing index is schema-scoped, so the 2nd table in a schema collided).
-- Constraint drops precede adds, keys walked sorted → deterministic SQL.
-  `DROP CONSTRAINT/INDEX IF EXISTS` (a dropped column takes its PK with it).
-- Unnamed-and-undroppable → comment + warning, never unrunnable SQL.
-- Same fix reaches `dbd diff` (previewed the bad statement) and `dbd migrate`
-  (wrote it to a migration file).
-- Docs corrected: guide + llms-full claimed CHECK/indexes are not reconciled on
-  existing tables; both have convergence passes.
-
-Verified three ways: 1332 tests incl. embedded-Postgres e2e; mutation checks
-(reverting either the naming or the ordering fix fails the e2e with the original
-Postgres errors); and the **registry** artifact — `cargo install dbd-cli`
-v0.12.6 replaced a PK on a table holding rows, rows preserved, converges.
+- **#12.1 — `NULLS NOT DISTINCT` dropped on the ALTER path.** Committed
+  (`ab28685`). `TableConstraint::Unique` had nowhere to hold the clause, so it
+  died at parse time: `apply` ran the DDL verbatim and kept it, `reconcile`
+  re-derived a plain UNIQUE, and `constraint_differs` compared UNIQUE by name
+  alone so `diff` reported "in sync" over a weaker constraint. Carried through
+  entity → both parsers → introspection (`pg_index.indnullsnotdistinct` via
+  `to_jsonb`, PG<15-safe) → compare → generate/emit. Two embedded-Postgres e2e
+  tests, including the issue's duplicate-row repro and the reverse direction
+  (design stops declaring it → constraint must be weakened).
 
 ## Next
 
-Nothing pending. `develop` == `main` == v0.12.6.
+1. `#12.2` — enum value removal. `generate_field_sql` emits nothing for an
+   EnumValue drop (`diff/generate.rs:268`), so `plan_reconcile` skips the empty
+   SQL and reports `0 altered` forever. **Decision taken: implement full type
+   recreation** (drop dependent managed views → `ALTER TYPE RENAME` → `CREATE
+   TYPE` → per-column `DROP DEFAULT` / `TYPE … USING ::text::new` / `SET
+   DEFAULT` → `DROP TYPE` old; pass C re-applies views).
+   Next command: `cargo test -p dbd-core --features embedded-tests --test embedded_test enum_value`
+2. Path-traversal hardening (Aikido critical: `mod.rs`, `sqlite.rs` + 7 others).
+3. `classify.rs` `generate_data_sql` — quote literals/identifiers.
+4. Dependency advisories (Rust ~18, JS 4 in `site/`).
 
 ## Open questions
 
-- `dbd diff --json` shape changed: `"Drop"` → `{"Drop": {…}}`. No doc pins the
-  field shape and a Drop now carries what was dropped, but it shipped in a patch
-  release with no release note — the repo has no CHANGELOG to put one in.
+- `dbd diff --json` shape changed in v0.12.6 (`"Drop"` → `{"Drop": {…}}`) with
+  no release note; repo still has no CHANGELOG.
 
 ## Known-broken / carried forward
 
-- **No CHANGELOG exists.** The CLAUDE.md release checklist calls for one; four
-  releases have shipped without it. Either add one or drop the checklist item.
+- **No CHANGELOG exists.** The CLAUDE.md release checklist calls for one.
 - `ARRAY[col]::t[]` where the column is already type `t` still reads as drift.
-- Pre-existing, unrelated: `generate_data_sql` warns "may truncate data" on a
-  *widening* cast (varchar(30) → varchar(60)). Cosmetic; own slice.
+- `generate_data_sql` warns "may truncate data" on a *widening* cast.

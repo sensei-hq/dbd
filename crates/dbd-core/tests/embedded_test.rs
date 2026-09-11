@@ -3221,3 +3221,214 @@ async fn reconcile_drops_nulls_not_distinct_when_the_design_stops_declaring_it()
         .expect("post-alter dry-run reconcile failed");
     assert!(settled.is_empty(), "reconcile must settle; got {settled:?}");
 }
+
+/// Issue #12.2: `reconcile` must converge when an enum loses a value.
+///
+/// Postgres has no `ALTER TYPE … DROP VALUE`, so the diff engine emitted no SQL,
+/// `plan_reconcile` skipped the empty statement, and reconcile reported
+/// `0 altered` while `dbd diff` flagged the same drift on every subsequent run —
+/// it could not converge and never said so.
+///
+/// Covers the parts that make the swap non-trivial: a dependent view (which
+/// blocks `ALTER … TYPE` and must be dropped and re-created), a column default
+/// (typed against the old type), and the rows surviving the rewrite.
+#[tokio::test]
+async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_value_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/enum/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: enum_value_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_enum = |values: &str| {
+        std::fs::write(
+            dir.join("ddl/enum/app/colour.ddl"),
+            format!("set search_path to app;\ncreate type colour as enum ({values});\n"),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\n\
+         create table if not exists t (\n\
+           id int primary key\n\
+         , c  colour not null default 'red'\n\
+         );\n",
+    )
+    .unwrap();
+    // A view over the enum column: this is what blocks `ALTER … TYPE` and has to
+    // be dropped first, then restored by pass C.
+    std::fs::write(
+        dir.join("ddl/view/app/t_v.ddl"),
+        "set search_path to app;\n\
+         create or replace view t_v as select id, c from t;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    let enum_is = |values: &str| format!("SELECT 1 WHERE (SELECT enum_range(NULL::app.colour)::text) = '{{{values}}}'");
+
+    // ── Phase 1: create the three-value enum, the table, and the view ──
+    write_enum("'red', 'green', 'blue'");
+    load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    assert_catalog(&*adapter, true, &enum_is("red,green,blue"), "enum app.colour").await;
+    adapter
+        .execute_script("INSERT INTO app.t (id, c) VALUES (1, 'red'), (2, 'green')")
+        .await
+        .expect("seed rows failed");
+
+    // ── Phase 2: drop a value — refused without allow_destructive ──
+    write_enum("'red', 'green'");
+    let refused = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await;
+    assert!(
+        refused.is_err(),
+        "removing an enum value can reject existing rows, so it must be gated"
+    );
+    assert_catalog(&*adapter, true, &enum_is("red,green,blue"), "enum app.colour").await;
+
+    // ── Phase 3: with allow_destructive it actually applies ──
+    load()
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 3 failed");
+    assert_catalog(&*adapter, true, &enum_is("red,green"), "enum app.colour").await;
+
+    // The displaced type must not be left behind.
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_type ty JOIN pg_namespace ns ON ns.oid = ty.typnamespace \
+          WHERE ns.nspname = 'app' AND ty.typname = 'colour__dbd_old'",
+        "displaced type app.colour__dbd_old",
+    )
+    .await;
+
+    // The rows survive the rewrite, the default survives the drop/restore, and
+    // the view pass C re-applied is queryable again.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.t WHERE id = 1 AND c = 'red' AND EXISTS (SELECT 1 FROM app.t WHERE id = 2 AND c = 'green')",
+        "both seeded rows with their values",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef d \
+           JOIN pg_class cl ON cl.oid = d.adrelid \
+           JOIN pg_namespace ns ON ns.oid = cl.relnamespace \
+           JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = d.adnum \
+          WHERE ns.nspname = 'app' AND cl.relname = 't' AND a.attname = 'c' \
+            AND pg_get_expr(d.adbin, d.adrelid) LIKE '%red%'",
+        "default on app.t.c",
+    )
+    .await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.t_v WHERE id = 1", "view app.t_v").await;
+
+    // ── Phase 4: it converges — the drift `diff` reported forever is gone ──
+    let settled = load()
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("post-recreation dry-run reconcile failed");
+    assert!(
+        settled.is_empty(),
+        "reconcile must settle after recreating the enum; got {settled:?}"
+    );
+    // `dbd diff` is what the issue reported as stuck, and it computes its own
+    // snapshots rather than reusing the plan — so assert on it directly.
+    let live_diff = load().diff_live(&*adapter, None).await.expect("diff_live failed");
+    assert!(
+        live_diff.is_empty(),
+        "diff must stop reporting the enum drift; got {:?}",
+        live_diff.changes
+    );
+}
+
+/// A row still holding the removed value cannot be silently rewritten — there is
+/// no value to rewrite it to. The `USING` cast fails, and because the whole
+/// recreation runs in one implicit transaction the database is left exactly as it
+/// was: the old type, the old rows, and the view still in place.
+#[tokio::test]
+async fn removing_an_enum_value_still_in_use_fails_without_half_applying() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_in_use_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/enum/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: enum_in_use_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_enum = |values: &str| {
+        std::fs::write(
+            dir.join("ddl/enum/app/colour.ddl"),
+            format!("set search_path to app;\ncreate type colour as enum ({values});\n"),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id int primary key, c colour not null);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/view/app/t_v.ddl"),
+        "set search_path to app;\ncreate or replace view t_v as select id, c from t;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    write_enum("'red', 'green', 'blue'");
+    load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    adapter
+        .execute_script("INSERT INTO app.t (id, c) VALUES (1, 'blue')")
+        .await
+        .expect("seed row failed");
+
+    write_enum("'red', 'green'");
+    let failed = load()
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await;
+    assert!(failed.is_err(), "a row holding the removed value must fail the run");
+
+    // Nothing half-applied: the type, the row and the view are all as they were.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.colour)::text) = '{red,green,blue}'",
+        "enum app.colour unchanged",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_type ty JOIN pg_namespace ns ON ns.oid = ty.typnamespace \
+          WHERE ns.nspname = 'app' AND ty.typname = 'colour__dbd_old'",
+        "displaced type app.colour__dbd_old",
+    )
+    .await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.t WHERE c = 'blue'", "the blue row").await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.t_v WHERE id = 1", "view app.t_v").await;
+}

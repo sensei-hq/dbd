@@ -26,6 +26,7 @@ pub mod scope;
 pub mod script;
 pub mod snapshot;
 pub mod sql_expr;
+pub mod sql_quote;
 
 pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};
