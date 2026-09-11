@@ -345,6 +345,9 @@ fn extract_table_constraint(
         ConstrUnique => Ok(TableConstraint::Unique {
             name: constraint_name(c),
             columns: string_list(&c.keys),
+            // `NULLS NOT DISTINCT` changes what the constraint enforces, so it is
+            // part of the constraint's identity rather than a formatting detail.
+            nulls_not_distinct: c.nulls_not_distinct,
         }),
         ConstrCheck => {
             let label = constraint_name(c).unwrap_or_else(|| "<unnamed>".to_string());
@@ -1009,11 +1012,41 @@ mod tests {
         assert_eq!(fk.on_update, None);
     }
 
+    /// `NULLS NOT DISTINCT` on an inline table constraint is load-bearing — it is
+    /// what makes NULL rows collide. Losing it at parse time is what let
+    /// reconcile's ALTER path apply a weaker constraint than declared (issue #12).
+    #[test]
+    fn a_unique_table_constraint_keeps_nulls_not_distinct() {
+        let d = def("create table t (id int, grp text, name text, unique nulls not distinct (grp, name));");
+        assert!(
+            d.constraints.iter().any(|c| matches!(
+                c,
+                TableConstraint::Unique { columns, nulls_not_distinct: true, .. }
+                    if columns == &["grp".to_string(), "name".to_string()]
+            )),
+            "expected a NULLS NOT DISTINCT unique constraint; got {:?}",
+            d.constraints
+        );
+    }
+
+    /// Omitting the clause is the `NULLS DISTINCT` default and must stay `false`.
+    #[test]
+    fn a_plain_unique_table_constraint_is_nulls_distinct() {
+        let d = def("create table t (id int, grp text, unique (grp));");
+        assert!(d.constraints.iter().any(|c| matches!(
+            c,
+            TableConstraint::Unique {
+                nulls_not_distinct: false,
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn unnamed_table_constraints_have_no_name() {
         let d = def("create table t (a int, b int, unique (a), check (a < b));");
         assert!(d.constraints.iter().any(|c| matches!(
-            c, TableConstraint::Unique { name: None, columns } if columns == &["a".to_string()]
+            c, TableConstraint::Unique { name: None, columns, .. } if columns == &["a".to_string()]
         )));
         assert!(d.constraints.iter().any(|c| matches!(
             c, TableConstraint::Check { name: None, expression } if expression == "a < b"

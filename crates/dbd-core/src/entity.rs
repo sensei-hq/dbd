@@ -167,10 +167,28 @@ impl FkAction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TableConstraint {
-    PrimaryKey { name: Option<String>, columns: Vec<String> },
-    Unique { name: Option<String>, columns: Vec<String> },
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+        /// `UNIQUE NULLS NOT DISTINCT (…)` — NULLs collide instead of duplicating,
+        /// so it changes what the constraint enforces and two UNIQUEs that differ
+        /// only here are not the same constraint. Mirrors [`IndexDef::nulls_not_distinct`]
+        /// for the inline-constraint spelling.
+        ///
+        /// `#[serde(default)]` so snapshots written before this field existed still
+        /// deserialize as the `NULLS DISTINCT` default.
+        #[serde(default)]
+        nulls_not_distinct: bool,
+    },
     ForeignKey(ForeignKey),
-    Check { name: Option<String>, expression: String },
+    Check {
+        name: Option<String>,
+        expression: String,
+    },
 }
 
 /// How an identity column generates its value (`GENERATED … AS IDENTITY`).

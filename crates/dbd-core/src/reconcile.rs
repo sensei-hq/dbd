@@ -229,9 +229,21 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
                 has_table_pk = true;
                 push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name, columns })
             }
-            TableConstraint::Unique { name, columns } => {
-                push(&mut kept, &mut seen, TableConstraint::Unique { name, columns })
-            }
+            // `nulls_not_distinct` rides along: the diff compares it, so dropping it
+            // during canonicalization would hide the very drift it detects.
+            TableConstraint::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } => push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::Unique {
+                    name,
+                    columns,
+                    nulls_not_distinct,
+                },
+            ),
             other => others.push(other), // FK / CHECK preserved
         }
     }
@@ -262,6 +274,10 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
                 TableConstraint::Unique {
                     name: None,
                     columns: vec![c.name.clone()],
+                    // A column's `is_unique` flag cannot carry the clause, so an
+                    // inline `unique nulls not distinct` reaches here only as a
+                    // table-level constraint — where the arm above preserves it.
+                    nulls_not_distinct: false,
                 },
             );
         }
@@ -2317,6 +2333,7 @@ mod tests {
         live_t.table_constraints.push(TableConstraint::Unique {
             name: None,
             columns: vec!["library_id".to_string()],
+            nulls_not_distinct: false,
         });
         let mut desired_t = live_t.clone();
         desired_t.indexes.push(crate::entity::IndexDef {
