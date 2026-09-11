@@ -77,3 +77,50 @@ jobs:
         with:
           token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
           files: target/lcov.info
+
+  # The docs site was ungated until now: nothing ran its type-check, tests, or
+  # build, which is how `bun run check` stayed fatally broken (svelte-check 4.x
+  # refuses a bare TypeScript 7) without anyone noticing. It runs as its own job
+  # rather than a step on `test` so a site failure is legible on its own and does
+  # not wait on the Rust toolchain, cargo build, and coverage upload.
+  #
+  # Every `run:` below is a constant string — no workflow inputs and no
+  # github.event.* values are interpolated anywhere in this job.
+  site:
+    name: site check + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Same reasoning as the `test` job: nothing here needs git auth after
+          # checkout, so persisting the token only risks leaking it.
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # Pinned rather than `latest` to match the rest of the repo's posture
+          # (SHA-pinned actions, `cargo install --locked`): a bun release should
+          # not be able to change what CI proves without a commit.
+          bun-version: 1.3.14
+      # --frozen-lockfile is the gate, not a speed-up: it fails when bun.lock and
+      # package.json disagree, so a stale lock (which is exactly how devalue sat
+      # on a superseded release while the range already allowed the fix) cannot
+      # reach main unnoticed.
+      - name: bun install
+        run: bun install --frozen-lockfile
+        working-directory: site
+      - name: svelte-check
+        run: bun run check
+        working-directory: site
+      - name: vitest
+        run: bun run test
+        working-directory: site
+      # Builds the target that actually ships. CF_PAGES is what svelte.config.js
+      # reads to select @sveltejs/adapter-cloudflare; without it adapter-auto
+      # takes over and CI would green-light a build the deploy never performs.
+      # The prebuild step pulls docs/ and sensei.library.json from the repo root,
+      # so this also catches content-sync breakage.
+      - name: build (cloudflare target, as deployed)
+        run: bun run build
+        working-directory: site
+        env:
+          CF_PAGES: '1'
