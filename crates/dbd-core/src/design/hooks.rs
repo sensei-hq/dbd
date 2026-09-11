@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::adapter::DatabaseAdapter;
 use crate::config::ScriptEntry;
 use crate::error::{DbdError, Result};
+use crate::path_safe::safe_relative_path;
 
 /// Tables a script references, derived from its SQL.
 ///
@@ -151,31 +152,6 @@ pub(in crate::design) fn plan_hooks(
     Ok(plan)
 }
 
-/// A declared hook path rebuilt from ordinary path segments alone, or `None` if
-/// it contains anything else.
-///
-/// Rebuilding rather than inspecting-and-passing-through means the value that
-/// reaches the filesystem is constructed from components this function has
-/// individually accepted, so there is no route by which an unexamined byte of
-/// the original string becomes part of a path.
-fn safe_relative_path(script: &str) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    let mut any = false;
-    for component in Path::new(script).components() {
-        match component {
-            Component::Normal(part) => {
-                out.push(part);
-                any = true;
-            }
-            // `./foo` is a harmless way to write `foo`.
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    any.then_some(out)
-}
-
 /// Read a hook script, refusing one that resolves outside the project.
 ///
 /// `dbd deploy <github-source>` runs a design.yaml dbd downloaded, so a hook
@@ -204,6 +180,10 @@ fn read_hook(canon_root: &Path, script: &str, kind: HookKind) -> Result<String> 
             canon_root.display()
         )));
     }
+    // `path` is the project root joined with a path rebuilt from `Normal`
+    // components only, then canonicalized and re-checked against that root — the
+    // two checks above. The taint rule cannot see either, so it reports the read.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::read_to_string(&path).map_err(|e| denied(e.to_string()))
 }
 

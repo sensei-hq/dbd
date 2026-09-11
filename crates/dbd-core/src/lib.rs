@@ -15,6 +15,7 @@ pub mod formatter;
 pub mod github;
 pub mod init;
 pub mod parser;
+pub mod path_safe;
 pub mod reconcile;
 pub mod refcache;
 pub mod references;
@@ -26,6 +27,7 @@ pub mod scope;
 pub mod script;
 pub mod snapshot;
 pub mod sql_expr;
+pub mod sql_quote;
 
 pub use adapter::DatabaseAdapter;
 pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};

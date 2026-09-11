@@ -248,8 +248,8 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_check_convergence, plan_comment_convergence, plan_fk_convergence, plan_index_convergence,
-            plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
+            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_fk_convergence,
+            plan_index_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -307,6 +307,14 @@ impl Design {
         // never act on the comment drift `dbd diff` kept reporting. Metadata only,
         // so never destructive.
         plan_comment_convergence(&mut plan, &live_raw, &desired_raw);
+
+        // Enum value removal (issue #12): Postgres has no `ALTER TYPE … DROP
+        // VALUE`, so the diff engine emitted no SQL and reconcile reported
+        // `0 altered` while `dbd diff` flagged the same drift forever. Plan the
+        // type-swap that does converge. Needs the entity list, not just the
+        // snapshots: the managed views to drop first come from the dependency
+        // graph, and pass C re-applies them afterwards.
+        plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates, restamps, AND drift warnings.

@@ -71,8 +71,8 @@ fn claude_base(project: bool, project_dir: &Path) -> Result<PathBuf> {
 /// `$CLAUDE_CONFIG_DIR`/`$HOME`/`--project`). No untrusted input reaches this
 /// path, so the traversal warning below is a false positive for a local CLI.
 fn classify(dest: &Path, contents: &str) -> Result<Action> {
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     match fs::read(dest) {
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         Ok(existing) if existing == contents.as_bytes() => Ok(Action::Unchanged),
         Ok(_) => Ok(Action::Update),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Action::Create),

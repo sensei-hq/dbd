@@ -29,7 +29,8 @@ dbd reconcile --prune -d $DATABASE_URL     # also drop orphaned tables (removed 
 Reconcile only diffs within the schemas the design declares, so it never touches tables in other
 schemas. Two kinds of destruction each need their own opt-in:
 
-- **`--allow-destructive`** — drop a *column* or constraint from a managed table.
+- **`--allow-destructive`** — drop a *column* or constraint from a managed table, or remove a
+  *value* from an enum (the type is recreated; dependent managed views are dropped and re-applied).
 - **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
   design (an orphan). Without `--prune`, orphans are reported and left in place.
 

@@ -229,9 +229,21 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
                 has_table_pk = true;
                 push(&mut kept, &mut seen, TableConstraint::PrimaryKey { name, columns })
             }
-            TableConstraint::Unique { name, columns } => {
-                push(&mut kept, &mut seen, TableConstraint::Unique { name, columns })
-            }
+            // `nulls_not_distinct` rides along: the diff compares it, so dropping it
+            // during canonicalization would hide the very drift it detects.
+            TableConstraint::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } => push(
+                &mut kept,
+                &mut seen,
+                TableConstraint::Unique {
+                    name,
+                    columns,
+                    nulls_not_distinct,
+                },
+            ),
             other => others.push(other), // FK / CHECK preserved
         }
     }
@@ -262,6 +274,10 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
                 TableConstraint::Unique {
                     name: None,
                     columns: vec![c.name.clone()],
+                    // A column's `is_unique` flag cannot carry the clause, so an
+                    // inline `unique nulls not distinct` reaches here only as a
+                    // table-level constraint — where the arm above preserves it.
+                    nulls_not_distinct: false,
                 },
             );
         }
@@ -937,6 +953,269 @@ fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
             sql,
         });
     }
+}
+
+// ── Enum value removal (issue #12) ──────────────────────────
+
+/// Suffix the displaced enum type carries between the rename and the drop.
+///
+/// A fixed suffix rather than a generated one: the whole recreation runs in a
+/// single implicit transaction, so the name exists only inside it, and a fixed
+/// name is what an operator reading a failed run's SQL can act on.
+const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
+
+/// Converge an enum whose declared value set **lost** a member.
+///
+/// Postgres has no `ALTER TYPE … DROP VALUE`, so `generate_field_sql` emitted
+/// nothing for an enum-value drop. `plan_reconcile` then skipped the empty SQL,
+/// reconcile reported `0 altered`, and `dbd diff` reported the same drift on
+/// every subsequent run — reconcile could not converge and never said so.
+///
+/// The convergent form is the type-swap Postgres does leave open:
+///
+/// ```text
+/// DROP VIEW   … ;                 -- managed dependents, deepest first
+/// ALTER TABLE … DROP DEFAULT;     -- the default is typed against the old type
+/// ALTER TYPE  … RENAME TO x__dbd_old;
+/// CREATE TYPE … AS ENUM (…);      -- exactly the declared values, in order
+/// ALTER TABLE … TYPE … USING c::text::…;
+/// ALTER TABLE … SET DEFAULT …;
+/// DROP TYPE   x__dbd_old;
+/// ```
+///
+/// Every failure this can hit is a *loud* one, inside the single implicit
+/// transaction `execute_script` runs the batch in: a row holding a removed value
+/// fails the `USING` cast, a default naming a removed value fails the
+/// `SET DEFAULT`, and an unmanaged dependent view fails the `ALTER … TYPE`.
+/// None of them can half-apply, and all of them name the object.
+///
+/// The one case it declines is a dependent **materialized view**: dbd never
+/// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
+/// with it), so recreation is reported as blocked rather than attempted.
+///
+/// Dropped views are not re-created here — reconcile's pass C re-applies every
+/// managed view on every run, which is exactly what restores them.
+pub fn plan_enum_recreation(
+    plan: &mut ReconcilePlan,
+    live: &Snapshot,
+    desired: &Snapshot,
+    desired_entities: &[Entity],
+) {
+    use crate::sql_quote::literal;
+
+    let desired_by_name: HashMap<String, &crate::snapshot::EnumSnapshot> = desired
+        .enums
+        .iter()
+        .map(|e| (format!("{}.{}", e.schema, e.name), e))
+        .collect();
+
+    for le in &live.enums {
+        let qname = format!("{}.{}", le.schema, le.name);
+        let Some(de) = desired_by_name.get(&qname) else {
+            // Absent from the design entirely — that is an orphan, reported by
+            // `plan_reconcile`'s warnings and never auto-dropped.
+            continue;
+        };
+        let kept: HashSet<&str> = de.values.iter().map(String::as_str).collect();
+        let removed: Vec<&str> = le
+            .values
+            .iter()
+            .map(String::as_str)
+            .filter(|v| !kept.contains(v))
+            .collect();
+        if removed.is_empty() {
+            // Pure additions are `ALTER TYPE … ADD VALUE`, which needs no rewrite
+            // of the dependent columns.
+            continue;
+        }
+
+        let columns = enum_columns(live, &qname);
+        let roots: HashSet<String> = columns.iter().map(|c| c.table.clone()).collect();
+
+        // A matview over an affected table blocks the swap and dbd will not drop
+        // it. Say so, and plan nothing — a partial script would fail mid-batch
+        // with a Postgres message that names the view but not the cause.
+        let dependents = dependent_entities(desired_entities, &roots);
+        let blocking: Vec<&str> = dependents
+            .iter()
+            .filter(|(_, e)| e.entity_type == EntityType::MaterializedView)
+            .map(|(_, e)| e.name.as_str())
+            .collect();
+        if !blocking.is_empty() {
+            plan.warnings.push(format!(
+                "{qname}: cannot drop enum value{} {} — materialized view{} {} depend{} on a column of this type, \
+                 and dbd never drops a materialized view. Drop {} by hand, re-run reconcile, then re-create {}",
+                if removed.len() == 1 { "" } else { "s" },
+                removed.join(", "),
+                if blocking.len() == 1 { "" } else { "s" },
+                blocking.join(", "),
+                if blocking.len() == 1 { "s" } else { "" },
+                blocking.join(", "),
+                if blocking.len() == 1 { "it" } else { "them" },
+            ));
+            continue;
+        }
+
+        let old_type = format!("{qname}{ENUM_RECREATE_SUFFIX}");
+        let mut lines: Vec<String> = vec![format!(
+            "-- {qname}: Postgres has no ALTER TYPE … DROP VALUE, so the type is recreated \
+             (dropping {}).",
+            removed.join(", ")
+        )];
+
+        // Deepest dependents first: a view over a view has to go before the view
+        // it selects from.
+        for (_, e) in &dependents {
+            lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
+        }
+
+        for c in columns.iter().filter(|c| c.default_value.is_some()) {
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                c.table, c.column
+            ));
+        }
+
+        lines.push(format!(
+            "ALTER TYPE {qname} RENAME TO {}{ENUM_RECREATE_SUFFIX};",
+            le.name
+        ));
+        lines.push(format!(
+            "CREATE TYPE {qname} AS ENUM ({});",
+            de.values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
+        ));
+
+        for c in &columns {
+            // An array column cannot cast element-wise through the scalar text
+            // type — `c::text::app.colour` is a type error on `app.colour[]`.
+            let (via, to) = if c.is_array {
+                (format!("{}::text[]", c.column), format!("{qname}[]"))
+            } else {
+                (format!("{}::text", c.column), qname.clone())
+            };
+            lines.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
+                c.table, c.column
+            ));
+        }
+
+        for c in &columns {
+            if let Some(default) = &c.default_value {
+                lines.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {default};",
+                    c.table, c.column
+                ));
+            }
+        }
+
+        lines.push(format!("DROP TYPE {old_type};"));
+
+        // The recreation IS the whole change for this enum: `CREATE TYPE` already
+        // carries any added values, so an `ALTER TYPE … ADD VALUE` that
+        // `plan_reconcile` planned would now run against a type that already has
+        // them. Replace rather than merge.
+        let sql = lines.join("\n");
+        match plan.altered.iter_mut().find(|s| s.entity_name == qname) {
+            Some(stmt) => stmt.sql = sql,
+            None => plan.altered.push(ReconcileStatement {
+                entity_name: qname.clone(),
+                sql,
+            }),
+        }
+
+        // Losing a value can reject rows the table already holds, so this is
+        // gated behind `--allow-destructive` like any other data-losing change.
+        plan.destructive = true;
+    }
+}
+
+/// A live column whose type is the enum being recreated.
+struct EnumColumn {
+    /// Qualified table name (`schema.table`).
+    table: String,
+    column: String,
+    default_value: Option<String>,
+    /// Whether the column is `enum[]` rather than plain `enum`.
+    is_array: bool,
+}
+
+/// Every live column typed by `qname`, scalar or array.
+///
+/// Reads the canonicalized snapshot, where an enum column's type is already
+/// schema-qualified and lowercased and an array collapsed to a single `[]` — so
+/// an exact match is enough and there is no spelling to re-derive here.
+fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
+    let array = format!("{qname}[]");
+    let mut out = Vec::new();
+    for t in &live.tables {
+        for c in &t.columns {
+            let is_array = c.data_type == array;
+            if !is_array && c.data_type != qname {
+                continue;
+            }
+            out.push(EnumColumn {
+                table: format!("{}.{}", t.schema, t.name),
+                column: c.name.clone(),
+                default_value: c.default_value.clone(),
+                is_array,
+            });
+        }
+    }
+    out
+}
+
+/// Managed entities that transitively depend on any of `roots`, deepest first.
+///
+/// Depth is the longest path from a root, so a view over a view sorts ahead of
+/// the view it selects from — which is the order they have to be dropped in.
+/// The iteration is bounded by the entity count so a `refers` cycle terminates
+/// rather than spinning.
+fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+    // A `refers` entry may or may not be schema-qualified, so each entity is
+    // reachable under both spellings — matching how `build_dependency_map`
+    // compares refs against `Entity::name` verbatim.
+    let mut depth: HashMap<String, usize> = roots.iter().map(|r| (r.clone(), 0)).collect();
+    for root in roots {
+        if let Some((_, short)) = root.split_once('.') {
+            depth.entry(short.to_string()).or_insert(0);
+        }
+    }
+
+    for _ in 0..entities.len() {
+        let mut changed = false;
+        for e in entities {
+            let qname = qualified_entity_name(e);
+            let schema = e.schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+            let deepest = e
+                .refers
+                .iter()
+                .filter(|r| **r != qname && **r != e.name)
+                .filter_map(|r| {
+                    depth
+                        .get(r.as_str())
+                        .or_else(|| depth.get(format!("{schema}.{r}").as_str()))
+                })
+                .max()
+                .copied();
+            let Some(d) = deepest else { continue };
+            if depth.get(&qname).is_none_or(|existing| *existing < d + 1) {
+                depth.insert(qname, d + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut out: Vec<(usize, &Entity)> = entities
+        .iter()
+        .filter_map(|e| depth.get(&qualified_entity_name(e)).map(|d| (*d, e)))
+        .filter(|(d, _)| *d > 0)
+        .collect();
+    // Deepest first; name breaks ties so the emitted SQL is byte-stable run to run.
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    out
 }
 
 // ── Index convergence (issue #12) ───────────────────────────
@@ -2317,6 +2596,7 @@ mod tests {
         live_t.table_constraints.push(TableConstraint::Unique {
             name: None,
             columns: vec!["library_id".to_string()],
+            nulls_not_distinct: false,
         });
         let mut desired_t = live_t.clone();
         desired_t.indexes.push(crate::entity::IndexDef {
@@ -3241,5 +3521,269 @@ mod tests {
             ..Default::default()
         };
         assert!(!plan.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod enum_recreation_tests {
+    use super::*;
+    use crate::entity::{ColumnDef, Entity};
+    use crate::snapshot::{EnumSnapshot, TableSnapshot};
+
+    fn col(name: &str, data_type: &str, default_value: Option<&str>) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default_value: default_value.map(str::to_string),
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            comment: None,
+            inline_fk: None,
+        }
+    }
+
+    fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
+        TableSnapshot {
+            name: name.to_string(),
+            schema: schema.to_string(),
+            columns,
+            indexes: vec![],
+            table_constraints: vec![],
+        }
+    }
+
+    fn enum_snap(schema: &str, name: &str, values: &[&str]) -> EnumSnapshot {
+        EnumSnapshot {
+            name: name.to_string(),
+            schema: schema.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn snap(tables: Vec<TableSnapshot>, enums: Vec<EnumSnapshot>) -> Snapshot {
+        Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables,
+            enums,
+        }
+    }
+
+    fn entity(entity_type: EntityType, name: &str, refers: &[&str]) -> Entity {
+        let mut e = Entity::new(entity_type, name);
+        e.refers = refers.iter().map(|r| r.to_string()).collect();
+        e
+    }
+
+    /// The whole point of issue #12.2: Postgres has no `ALTER TYPE … DROP VALUE`,
+    /// so reconcile has to recreate the type. Before this, `generate_field_sql`
+    /// emitted nothing for an enum-value drop, `plan_reconcile` skipped the empty
+    /// SQL, and reconcile reported `0 altered` while `diff` reported the same
+    /// drift forever.
+    #[test]
+    fn removing_an_enum_value_plans_a_type_recreation() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+
+        let stmt = plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the enum must get a recreation statement");
+        let sql = &stmt.sql;
+
+        // Rename out of the way, create the declared type, move the column across
+        // by text, drop the old type. Order is load-bearing.
+        let rename = sql.find("ALTER TYPE app.colour RENAME TO").expect("rename");
+        let create = sql
+            .find("CREATE TYPE app.colour AS ENUM ('red', 'green')")
+            .expect("create with exactly the declared values, in declared order");
+        let alter = sql
+            .find("ALTER TABLE app.t ALTER COLUMN c TYPE app.colour USING c::text::app.colour")
+            .expect("column moved across by text");
+        let drop = sql.find("DROP TYPE app.colour__dbd_old").expect("old type dropped");
+        assert!(rename < create && create < alter && alter < drop, "wrong order:\n{sql}");
+
+        assert!(plan.destructive, "losing an enum value can reject existing rows");
+    }
+
+    /// A column default is typed against the old enum, so it has to come off
+    /// before the swap and go back on after — otherwise the `ALTER … TYPE` fails
+    /// with "default for column cannot be cast automatically".
+    #[test]
+    fn a_defaulted_column_has_its_default_dropped_and_restored() {
+        let live = snap(
+            vec![table(
+                "app",
+                "t",
+                vec![col("c", "app.colour", Some("'red'::app.colour"))],
+            )],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table(
+                "app",
+                "t",
+                vec![col("c", "app.colour", Some("'red'::app.colour"))],
+            )],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        let sql = &plan.altered[0].sql;
+
+        let drop_default = sql
+            .find("ALTER TABLE app.t ALTER COLUMN c DROP DEFAULT")
+            .expect("default dropped");
+        let type_swap = sql.find("ALTER TABLE app.t ALTER COLUMN c TYPE").expect("type swap");
+        let set_default = sql
+            .find("ALTER TABLE app.t ALTER COLUMN c SET DEFAULT 'red'::app.colour")
+            .expect("default restored");
+        assert!(
+            drop_default < type_swap && type_swap < set_default,
+            "the default must come off before the swap and go back after:\n{sql}"
+        );
+    }
+
+    /// An array column holds the type too, and `c::text::app.colour` is a type
+    /// error on `app.colour[]`. It has to round-trip through `text[]`.
+    #[test]
+    fn an_array_column_casts_through_the_array_text_type() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour[]", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour[]", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        let sql = &plan.altered[0].sql;
+        assert!(
+            sql.contains("ALTER COLUMN c TYPE app.colour[] USING c::text[]::app.colour[]"),
+            "an array column must cast through text[]:\n{sql}"
+        );
+    }
+
+    /// A view over the affected table blocks `ALTER TABLE … ALTER COLUMN … TYPE`
+    /// ("cannot alter type of a column used by a view or rule"). Managed views are
+    /// dropped first and re-created by reconcile's pass C, which re-applies every
+    /// view on every run anyway. Transitive dependents count: a view over a view.
+    #[test]
+    fn managed_views_over_the_affected_table_are_dropped_first() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let entities = vec![
+            entity(EntityType::Table, "app.t", &[]),
+            entity(EntityType::View, "app.v", &["app.t"]),
+            entity(EntityType::View, "app.v2", &["app.v"]),
+            entity(EntityType::View, "app.unrelated", &["app.other"]),
+        ];
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &entities);
+        let sql = &plan.altered[0].sql;
+
+        // Anchored on the terminator: `…app.v` is also a prefix of `…app.v2`.
+        let v2 = sql.find("DROP VIEW IF EXISTS app.v2;").expect("transitive dependent");
+        let v = sql.find("DROP VIEW IF EXISTS app.v;").expect("direct dependent");
+        let swap = sql.find("ALTER TABLE app.t ALTER COLUMN c TYPE").expect("type swap");
+        assert!(v2 < v, "dependents must be dropped before what they depend on:\n{sql}");
+        assert!(v < swap, "views must be gone before the column type changes:\n{sql}");
+        assert!(
+            !sql.contains("app.unrelated"),
+            "a view that does not depend on the table must be left alone:\n{sql}"
+        );
+    }
+
+    /// dbd never auto-drops a materialized view — a `DROP … CASCADE` would
+    /// repopulate it and take its dependents with it. So a matview over the
+    /// affected table is the one case recreation cannot do, and it must say so
+    /// rather than emit SQL Postgres will reject halfway through.
+    #[test]
+    fn a_dependent_materialized_view_refuses_loudly_instead_of_half_applying() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let entities = vec![
+            entity(EntityType::Table, "app.t", &[]),
+            entity(EntityType::MaterializedView, "app.mv", &["app.t"]),
+        ];
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &entities);
+
+        assert!(
+            plan.altered.iter().all(|s| s.entity_name != "app.colour"),
+            "no partial recreation may be planned"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("app.mv") && w.contains("app.colour")),
+            "the blocked recreation must be reported; got {:?}",
+            plan.warnings
+        );
+    }
+
+    /// Adding values needs no recreation — `ALTER TYPE … ADD VALUE` handles it,
+    /// and recreating would be a needless rewrite of every dependent column.
+    #[test]
+    fn adding_an_enum_value_plans_no_recreation() {
+        let live = snap(vec![], vec![enum_snap("app", "colour", &["red"])]);
+        let desired = snap(vec![], vec![enum_snap("app", "colour", &["red", "green"])]);
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        assert!(plan.altered.is_empty(), "got {:?}", plan.altered);
+        assert!(!plan.destructive);
+    }
+
+    /// When values are both added and removed, the recreation is the whole
+    /// change: `CREATE TYPE` already carries the added value. Leaving the
+    /// `ALTER TYPE … ADD VALUE` that `plan_reconcile` emitted would then fail
+    /// against the freshly-created type, which already has it.
+    #[test]
+    fn a_recreation_replaces_the_add_value_statement_for_the_same_enum() {
+        let live = snap(vec![], vec![enum_snap("app", "colour", &["red", "blue"])]);
+        let desired = snap(vec![], vec![enum_snap("app", "colour", &["red", "green"])]);
+        let mut plan = plan_reconcile(&live, &desired);
+        assert!(
+            plan.altered.iter().any(|s| s.sql.contains("ADD VALUE")),
+            "precondition: the value add is planned first"
+        );
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+
+        let stmt = plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("recreation statement");
+        assert!(
+            !stmt.sql.contains("ADD VALUE"),
+            "the recreation subsumes the add; got:\n{}",
+            stmt.sql
+        );
+        assert!(stmt.sql.contains("CREATE TYPE app.colour AS ENUM ('red', 'green')"));
     }
 }

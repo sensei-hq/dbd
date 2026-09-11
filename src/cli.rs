@@ -299,7 +299,7 @@ pub enum Commands {
         /// Preview the plan without executing
         #[arg(long)]
         dry_run: bool,
-        /// Allow destructive changes (dropping columns/constraints)
+        /// Allow destructive changes (dropping columns/constraints, removing an enum value)
         #[arg(long)]
         allow_destructive: bool,
         /// Drop orphaned tables — those in a managed schema but no longer in the design

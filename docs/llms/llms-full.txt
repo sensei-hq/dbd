@@ -629,7 +629,8 @@ entity — the exact column-level change, before applying.
 
 The diff is scoped to the schemas the design declares — reconcile never touches
 tables in other schemas. Two kinds of destruction each need an explicit opt-in:
-`--allow-destructive` drops a **column**/constraint from a managed table;
+`--allow-destructive` drops a **column**/constraint from a managed table, or
+removes an enum **value** (see below);
 `--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
 design). Without `--prune`, orphans are reported and left in place. Orphaned
 enums are only warned about, never auto-dropped. Reconcile is **disabled once the
@@ -880,7 +881,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.12.6
+  rev: v0.13.0
   hooks:
     - id: dbd-format
 ```

@@ -178,7 +178,15 @@ fn constraint_clause(name: Option<&str>) -> String {
 fn constraint_description(con: &TableConstraint) -> String {
     match con {
         TableConstraint::PrimaryKey { columns, .. } => format!("PRIMARY KEY ({})", columns.join(", ")),
-        TableConstraint::Unique { columns, .. } => format!("UNIQUE ({})", columns.join(", ")),
+        TableConstraint::Unique {
+            columns,
+            nulls_not_distinct,
+            ..
+        } => format!(
+            "UNIQUE{} ({})",
+            if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
+            columns.join(", ")
+        ),
         TableConstraint::ForeignKey(fk) => format!("FOREIGN KEY ({})", fk.columns.join(", ")),
         TableConstraint::Check { expression, .. } => format!("CHECK ({expression})"),
     }
@@ -476,11 +484,20 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
                 columns.join(", ")
             )
         }
-        TableConstraint::Unique { name, columns } => {
+        // `NULLS NOT DISTINCT` sits between the keyword and the column list, and is
+        // the difference between NULL rows colliding and duplicating freely.
+        // Omitting it here applied a constraint weaker than the design declared —
+        // silently, because `diff` then compared the two as equal (issue #12).
+        TableConstraint::Unique {
+            name,
+            columns,
+            nulls_not_distinct,
+        } => {
             format!(
-                "ALTER TABLE {} ADD {}UNIQUE ({});",
+                "ALTER TABLE {} ADD {}UNIQUE{} ({});",
                 entity_name,
                 constraint_clause(name.as_deref()),
+                if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
                 columns.join(", ")
             )
         }

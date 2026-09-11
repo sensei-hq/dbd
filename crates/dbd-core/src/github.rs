@@ -25,8 +25,16 @@ impl GitHubSource {
     }
 }
 
-// Only allow safe characters in GitHub path segments
-fn is_safe_segment(s: &str) -> bool {
+/// Whether `s` is usable as a GitHub owner, repository or ref.
+///
+/// An **allow-list**, deliberately stricter than [`crate::path_safe::is_safe_segment`]
+/// and NOT interchangeable with it. These values are interpolated into an API
+/// URL as well as into a cache path, so the set of acceptable characters is the
+/// set GitHub itself permits — anything outside it is refused rather than
+/// escaped. `path_safe`'s rule is a separator deny-list, which is right for a
+/// database object name (those legitimately contain spaces and non-ASCII) and
+/// would be too permissive here.
+fn is_safe_github_ident(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
@@ -34,7 +42,11 @@ fn is_safe_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-fn is_safe_subpath(s: &str) -> bool {
+/// Whether `s` is usable as the multi-segment subpath of a GitHub source.
+///
+/// Same allow-list as [`is_safe_github_ident`], plus `/` so it can span
+/// directories — see that function on why this is not `path_safe`'s rule.
+fn is_safe_github_subpath(s: &str) -> bool {
     !s.contains("..") && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
 }
 
@@ -114,17 +126,17 @@ pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
 }
 
 fn validate_segments(owner: &str, repo: &str, git_ref: &str, subpath: Option<&str>) -> Result<()> {
-    if !is_safe_segment(owner) {
+    if !is_safe_github_ident(owner) {
         return Err(DbdError::GitHubSource(format!("Invalid owner: \"{owner}\"")));
     }
-    if !is_safe_segment(repo) {
+    if !is_safe_github_ident(repo) {
         return Err(DbdError::GitHubSource(format!("Invalid repo: \"{repo}\"")));
     }
-    if !is_safe_segment(git_ref) {
+    if !is_safe_github_ident(git_ref) {
         return Err(DbdError::GitHubSource(format!("Invalid ref: \"{git_ref}\"")));
     }
     if let Some(sp) = subpath
-        && !is_safe_subpath(sp)
+        && !is_safe_github_subpath(sp)
     {
         return Err(DbdError::GitHubSource(format!(
             "Invalid subpath: \"{sp}\" — path traversal is not allowed"

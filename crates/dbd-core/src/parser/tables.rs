@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, GeneratedAs, ReferentialAction, Statement,
-    TableConstraint as SqlTableConstraint,
+    ColumnDef as SqlColumnDef, ColumnOption, ColumnOptionDef, GeneratedAs, NullsDistinctOption, ReferentialAction,
+    Statement, TableConstraint as SqlTableConstraint,
 };
 
 use crate::entity::{
@@ -302,6 +302,10 @@ fn extract_table_constraint(
                 TableConstraint::Unique {
                     name: uc.name.as_ref().map(|n| n.value.clone()),
                     columns: col_names,
+                    // Only the explicit `NULLS NOT DISTINCT` strengthens the
+                    // constraint; both `NULLS DISTINCT` and an omitted clause are
+                    // the Postgres default.
+                    nulls_not_distinct: matches!(uc.nulls_distinct, NullsDistinctOption::NotDistinct),
                 },
                 Vec::new(),
             ))
@@ -686,6 +690,46 @@ mod tests {
         assert!(!ix.columns[0].is_expression);
         assert!(ix.nulls_not_distinct, "NULLS NOT DISTINCT changes what UNIQUE enforces");
         assert_eq!(ix.predicate, Some("folder_id IS NOT NULL".to_string()));
+    }
+
+    /// `NULLS NOT DISTINCT` on an inline table constraint changes what the
+    /// constraint enforces, exactly as it does on a standalone index. Dropping it
+    /// at parse time is what let reconcile's ALTER path apply a *weaker*
+    /// constraint than the one declared (issue #12).
+    #[test]
+    fn extracts_nulls_not_distinct_on_a_table_level_unique_constraint() {
+        let stmts = parse("CREATE TABLE thing (id int, grp text, name text, UNIQUE NULLS NOT DISTINCT (grp, name));");
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        let uq = def
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                TableConstraint::Unique {
+                    columns,
+                    nulls_not_distinct,
+                    ..
+                } => Some((columns, *nulls_not_distinct)),
+                _ => None,
+            })
+            .expect("UNIQUE table constraint");
+        assert_eq!(uq.0, &["grp".to_string(), "name".to_string()]);
+        assert!(uq.1, "NULLS NOT DISTINCT changes what the UNIQUE constraint enforces");
+    }
+
+    /// The absence of the clause is the default and must stay `false`, so a plain
+    /// `unique (…)` never gains a stronger constraint than it declared.
+    #[test]
+    fn a_plain_unique_table_constraint_is_nulls_distinct() {
+        let stmts = parse("CREATE TABLE thing (id int, grp text, UNIQUE (grp));");
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+        assert!(def.constraints.iter().any(|c| matches!(
+            c,
+            TableConstraint::Unique {
+                nulls_not_distinct: false,
+                ..
+            }
+        )));
     }
 
     /// The authored predicate is kept verbatim; convergence with the analyzed form
