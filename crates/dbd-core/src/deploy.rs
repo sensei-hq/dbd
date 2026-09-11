@@ -32,7 +32,10 @@ fn clear_cache_dir(root: &Path) -> Result<()> {
 /// tarball is re-downloaded fresh. Local sources ignore `no_cache`.
 pub async fn resolve_source(source: &str, no_cache: bool) -> Result<PathBuf> {
     if !github::is_github_source(source) {
-        // Local path
+        // Local path: `source` is the operator's own `--source` argument. A CLI
+        // opening the directory its user named is the intended behaviour, not a
+        // traversal — there is no privilege boundary here to cross.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let path = PathBuf::from(source);
         if !path.exists() {
             return Err(DbdError::Config(format!("Source directory not found: {source}")));
@@ -190,6 +193,12 @@ fn extract_tarball(bytes: &[u8], cache_dir: &Path) -> Result<()> {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // `dest` is `cache_dir` joined with a path whose every component the
+            // check above proved to be `Normal` or `CurDir`, so it cannot leave
+            // `cache_dir`. Symlink and hardlink entries carry no data section and
+            // so land here as empty regular files — no link is ever created, which
+            // is what closes the second half of the extraction attack.
+            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
             let mut file = std::fs::File::create(&dest)?;
             std::io::copy(&mut entry, &mut file)
                 .map_err(|e| DbdError::GitHubSource(format!("Failed to extract file: {e}")))?;

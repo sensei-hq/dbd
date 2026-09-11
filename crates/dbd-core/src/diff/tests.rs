@@ -102,6 +102,7 @@
         t_new.table_constraints.push(TableConstraint::Unique {
             name: Some("uq_id".to_string()),
             columns: vec!["id".to_string()],
+            nulls_not_distinct: false,
         });
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
@@ -150,6 +151,7 @@
         t_old.table_constraints.push(TableConstraint::Unique {
             name: Some("uq_id".to_string()),
             columns: vec!["id".to_string()],
+            nulls_not_distinct: false,
         });
         let t_new = table("public", "users", vec![col("id", "int")]);
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
@@ -211,12 +213,14 @@
         t_old.table_constraints.push(TableConstraint::Unique {
             name: Some("uq_email".to_string()),
             columns: vec!["email".to_string()],
+            nulls_not_distinct: false,
         });
         let mut t_new = table("public", "users", vec![col("id", "int"), col("email", "text")]);
         // Same name, but now covers both columns
         t_new.table_constraints.push(TableConstraint::Unique {
             name: Some("uq_email".to_string()),
             columns: vec!["email".to_string(), "id".to_string()],
+            nulls_not_distinct: false,
         });
         let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
         assert_eq!(diffs.len(), 1);
@@ -243,6 +247,88 @@
         } else {
             panic!("expected Change action");
         }
+    }
+
+    // ── D11b: UNIQUE whose NULLS NOT DISTINCT differs (issue #12) ──
+
+    /// The live constraint is a plain UNIQUE; the design declares
+    /// `NULLS NOT DISTINCT` over the same columns. Those enforce different things,
+    /// so this is drift and must read as Drop + Add.
+    ///
+    /// `constraint_differs` used to compare UNIQUE by name alone, so this compared
+    /// equal and `dbd diff` reported "in sync" over a constraint materially weaker
+    /// than the declared one.
+    #[test]
+    fn d11b_unique_differing_only_in_nulls_not_distinct_is_drift() {
+        let mut t_old = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("thing_grp_name_key".to_string()),
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: false,
+        });
+        let mut t_new = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_new.table_constraints.push(TableConstraint::Unique {
+            name: None,
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: true,
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert_eq!(diffs.len(), 1, "a weaker live constraint is drift, not in sync");
+        let DiffAction::Change(ref changes) = diffs[0].action else {
+            panic!("expected Change action; got {:?}", diffs[0].action);
+        };
+        assert_eq!(changes.len(), 2, "replacing a constraint is Drop + Add");
+        assert!(matches!(changes[0].action, ChangeAction::Drop(_)));
+        assert!(matches!(changes[1].action, ChangeAction::Add(_)));
+    }
+
+    /// The converse: two sides that agree on the clause are not drift. Guards the
+    /// fix against over-reporting, which would churn a destructive drop+add on
+    /// every reconcile of an in-sync table.
+    #[test]
+    fn d11c_unique_agreeing_on_nulls_not_distinct_is_in_sync() {
+        let mut t_old = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("thing_grp_name_key".to_string()),
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: true,
+        });
+        let mut t_new = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_new.table_constraints.push(TableConstraint::Unique {
+            name: None,
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: true,
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        assert!(diffs.is_empty(), "matching constraints must not churn; got {diffs:?}");
+    }
+
+    /// The generated ALTER must carry the clause, or reconcile applies a weaker
+    /// constraint than the design declares and `diff` then certifies the result.
+    #[test]
+    fn s_constraint_add_sql_preserves_nulls_not_distinct() {
+        let mut t_old = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_old.table_constraints.push(TableConstraint::Unique {
+            name: Some("thing_grp_name_key".to_string()),
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: false,
+        });
+        let mut t_new = table("public", "thing", vec![col("grp", "text"), col("name", "text")]);
+        t_new.table_constraints.push(TableConstraint::Unique {
+            name: None,
+            columns: vec!["grp".to_string(), "name".to_string()],
+            nulls_not_distinct: true,
+        });
+        let diffs = diff(&snap(vec![t_old], vec![]), &snap(vec![t_new], vec![]));
+        let sql = generate_migration_sql(&diffs);
+        assert!(
+            sql.contains("ADD UNIQUE NULLS NOT DISTINCT (grp, name);"),
+            "the ALTER must declare NULLS NOT DISTINCT; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("DROP CONSTRAINT IF EXISTS \"thing_grp_name_key\""),
+            "the weaker live constraint must be dropped by its real name; got:\n{sql}"
+        );
     }
 
     // ── D12: index changed (same name, different type → Drop + Add) ──
@@ -372,6 +458,7 @@
         t_old.table_constraints.push(TableConstraint::Unique {
             name: Some("uq_email".to_string()),
             columns: vec!["email".to_string()],
+            nulls_not_distinct: false,
         });
 
         let mut t_new = table(
@@ -1041,6 +1128,7 @@
                     TableConstraint::Unique {
                         name: Some("uq_email".to_string()),
                         columns: vec!["email".to_string()],
+                        nulls_not_distinct: false,
                     },
                 ))),
             }]),
@@ -1144,6 +1232,7 @@
                 action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(TableConstraint::Unique {
                     name: Some("uq_email".to_string()),
                     columns: vec!["email".to_string()],
+                    nulls_not_distinct: false,
                 }))),
             }]),
         }];
@@ -2015,7 +2104,7 @@
             col_def: Box::new(col("display_name", "TEXT")),
         };
         let sql = generate_data_sql(&change);
-        assert_eq!(sql, "UPDATE config.users SET display_name = name;\n");
+        assert_eq!(sql, "UPDATE \"config\".\"users\" SET \"display_name\" = \"name\";\n");
     }
 
     #[test]
@@ -2029,7 +2118,7 @@
             new_col: Box::new(col("total_text", "TEXT")),
         };
         let sql = generate_data_sql(&change);
-        assert!(sql.contains("UPDATE config.orders SET total_text = total::TEXT;"));
+        assert!(sql.contains("UPDATE \"config\".\"orders\" SET \"total_text\" = \"total\"::TEXT;"));
     }
 
     #[test]
@@ -2057,7 +2146,48 @@
         let sql = generate_data_sql(&change);
         assert!(sql.contains("Removed: deleted"), "sql: {sql}");
         assert!(sql.contains("Remaining: active, inactive"), "sql: {sql}");
-        assert!(sql.contains("UPDATE public.users SET status = '???' WHERE status = 'deleted';"));
+        assert!(sql.contains("UPDATE \"public\".\"users\" SET \"status\" = '???' WHERE \"status\" = 'deleted';"));
+    }
+
+    /// The removed enum label is interpolated into a `WHERE … = '…'`. Labels come
+    /// from the database catalog, and a generated data script is usually run by
+    /// hand with high privileges — so a label carrying a quote must come back as
+    /// one inert literal, not as a literal plus a statement.
+    #[test]
+    fn an_enum_label_containing_a_quote_cannot_escape_its_literal() {
+        let change = ComplexChange::EnumValueRemoval {
+            enum_name: "public.status_type".to_string(),
+            removed_values: vec!["x'; DROP TABLE users; --".to_string()],
+            remaining_values: vec!["active".to_string()],
+            affected_columns: vec![("public.users".to_string(), "status".to_string())],
+        };
+        let sql = generate_data_sql(&change);
+        assert!(
+            sql.contains("= 'x''; DROP TABLE users; --'"),
+            "the label must be one escaped literal; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("= 'x'; DROP TABLE users; --'"),
+            "the statement must not be re-openable; got:\n{sql}"
+        );
+    }
+
+    /// Table and column names reach the same script from the same catalog, and a
+    /// quoted identifier may hold a `"`. Each name must be quoted as one
+    /// identifier rather than pasted in bare.
+    #[test]
+    fn a_table_or_column_name_containing_a_quote_cannot_escape_its_identifier() {
+        let change = ComplexChange::ColumnRename {
+            table_name: r#"public.u"; DROP TABLE x; --"#.to_string(),
+            old_name: "name".to_string(),
+            new_name: "display_name".to_string(),
+            col_def: Box::new(col("display_name", "TEXT")),
+        };
+        let sql = generate_data_sql(&change);
+        assert!(
+            sql.contains(r#""u""; DROP TABLE x; --""#),
+            "the name must be one escaped identifier; got:\n{sql}"
+        );
     }
 
     #[test]

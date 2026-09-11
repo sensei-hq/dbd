@@ -387,7 +387,8 @@ the exact column-level change before applying.
 The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
 schemas. Two kinds of destruction each need an explicit opt-in:
 
-- **`--allow-destructive`** — drop a *column*, constraint, foreign key, or index from a managed table.
+- **`--allow-destructive`** — drop a *column*, constraint, foreign key, or index from a managed table,
+  or remove a *value* from an enum (see **Enum value removal** below).
 - **`--prune`** — drop a whole *table* still in a managed schema but no longer in the design (an
   orphan). Without `--prune`, orphans are reported and left in place.
 
@@ -409,6 +410,21 @@ index under a different name is no change; a declared index the live DB lacks is
 `--allow-destructive`). Indexes that merely back a PK/UNIQUE constraint are ignored on both sides.
 Check constraints converge too, matched by canonicalized expression rather than name (an authored
 `status in ('a','b')` matches the `status = ANY (ARRAY[…])` Postgres reports).
+
+**Enum value removal** is the other change reconcile performs in place. Postgres has no
+`ALTER TYPE … DROP VALUE`, so removing a value from an enum in the design recreates the type:
+dependent managed views are dropped (deepest dependent first), column defaults are taken off, the
+type is renamed aside and recreated with exactly the declared values in declared order, each
+dependent column is moved across with `USING <col>::text::<type>` (`::text[]` for an array column),
+the defaults are restored, and the displaced type is dropped. The dropped views are restored by the
+pass that re-applies every managed view on every run. Gated behind `--allow-destructive`.
+
+The whole batch runs in a single transaction, so every way it can fail is total and names the
+object: a row still holding the removed value fails the cast, a default naming a removed value fails
+the `SET DEFAULT`, and a dependent view dbd does not manage fails the `ALTER … TYPE`. A dependent
+*materialized view* is declined rather than attempted — dbd never auto-drops one — and reported with
+the manual steps. (This is distinct from an *orphaned* enum, i.e. the whole type gone from the
+design, which is only ever warned about.)
 
 **Primary keys and unique constraints** are matched by their **columns**, never by their name, so the
 design's unnamed `primary key (a, b)` and the live DB's auto-named `t_pkey` over the same columns
@@ -766,7 +782,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.12.6
+  rev: v0.13.0
   hooks:
     - id: dbd-format
 ```

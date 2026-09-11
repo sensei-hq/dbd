@@ -1251,6 +1251,7 @@ mod tests {
         )
         .unwrap();
         // SAFETY: single-threaded test setup; the var is unique to this test.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("DBD_TEST_URL_VAR", "postgres://user@127.0.0.1:1/nope");
         }
@@ -1262,6 +1263,7 @@ mod tests {
             "the env var should have been expanded, not passed through: {msg}"
         );
 
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("DBD_TEST_URL_VAR");
         }

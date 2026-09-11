@@ -55,9 +55,11 @@ impl RefCache {
         if !path.exists() {
             return Ok(None);
         }
+        // `path` is `<project_dir>/.dbd/refcache.json` — two compile-time constants
+        // joined onto a directory the operator chose. Nothing external names it.
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| DbdError::Config(format!("Read refcache failed: {e}")))?;
+        let raw = std::fs::read_to_string(&path);
+        let content = raw.map_err(|e| DbdError::Config(format!("Read refcache failed: {e}")))?;
         let cache: Self =
             serde_json::from_str(&content).map_err(|e| DbdError::Config(format!("Parse refcache failed: {e}")))?;
         Ok(Some(cache))

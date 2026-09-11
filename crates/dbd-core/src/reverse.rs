@@ -107,22 +107,8 @@ pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String>
         .collect()
 }
 
-/// Returns `true` iff `s` is safe to use as a path segment on disk.
-///
-/// A segment is considered unsafe if it is:
-/// - empty,
-/// - the current-directory alias `.`,
-/// - the parent-directory alias `..`,
-/// - or contains any of `/`, `\`, or a NUL byte.
-///
-/// Entity names and schema names are written verbatim into file-system paths
-/// (`ddl/<kind>/<schema>/<name>.ddl`).  Without this check a pathological but
-/// technically-legal SQL identifier could escape the project root.
-fn is_safe_segment(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\') && !s.contains('\0')
-}
-
 use crate::entity::{Entity, EntityType};
+use crate::path_safe::is_safe_segment;
 use std::path::PathBuf;
 
 /// Map an entity to its DDL file path: `ddl/<kind>/<schema>/<name>.ddl` for

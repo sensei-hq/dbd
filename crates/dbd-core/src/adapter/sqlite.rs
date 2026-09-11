@@ -352,7 +352,19 @@ impl DatabaseAdapter for SqliteAdapter {
         let table = Self::bare_name(&entity.name);
         let format = entity.format.as_deref().unwrap_or("csv");
 
-        let rows = sqlx::query(&format!("SELECT * FROM \"{table}\""))
+        // The file is named after the table, and a quoted identifier may hold path
+        // separators — with an absolute one `Path::join` discards the export
+        // directory outright. Checked before the query so an unfilable table costs
+        // nothing to refuse.
+        if !crate::path_safe::is_safe_segment(table) {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: its name is not usable as a file name (it contains a path separator, \
+                 or is '.' or '..'). Rename the table, or export it by hand",
+                entity.name
+            )));
+        }
+
+        let rows = sqlx::query(&format!("SELECT * FROM {}", crate::sql_quote::ident(table)))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
@@ -1409,5 +1421,74 @@ mod tests {
         a.heal_bookkeeping().await.unwrap();
         a.set_project_meta("prod", 3, None).await.unwrap();
         assert_eq!(a.reverse_managed_version().await.unwrap(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod export_containment_tests {
+    use super::*;
+    use crate::entity::EntityType;
+
+    async fn mem() -> SqliteAdapter {
+        SqliteAdapter::new("sqlite::memory:", "test").await.unwrap()
+    }
+
+    /// A table name is a quoted identifier, so SQLite accepts one holding path
+    /// separators and `..`. Joined into the export directory unchecked, it writes
+    /// outside it — so the export must refuse rather than escape.
+    /// A table name is a quoted identifier, so SQLite accepts one holding path
+    /// separators. `bare_name` splits at the first `.`, so everything after it is
+    /// used verbatim as the file stem — and `Path::join` with an absolute path
+    /// *discards the base entirely*, so the export lands wherever the name says.
+    ///
+    /// The table really exists and the export directory really is elsewhere: this
+    /// has to reach the write, or it would pass on a query error and pin nothing.
+    #[tokio::test]
+    async fn export_refuses_a_table_name_that_escapes_the_export_directory() {
+        let adapter = mem().await;
+        let escape_dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let escaping = escape_dir.path().join("pwned");
+        let table = escaping.display().to_string();
+        adapter
+            .execute_script(&format!(r#"CREATE TABLE "{table}" (id integer);"#))
+            .await
+            .expect("sqlite accepts a quoted identifier containing separators");
+
+        let mut e = Entity::new(EntityType::Table, &format!("x.{table}"));
+        e.format = Some("csv".to_string());
+        let err = adapter
+            .export_data(&e, Some(out.path()))
+            .await
+            .expect_err("an escaping table name must be refused");
+
+        assert!(
+            err.to_string().contains("pwned"),
+            "the refusal must name the offending object; got: {err}"
+        );
+        assert!(
+            !escape_dir.path().join("pwned.csv").exists(),
+            "nothing may be written outside the export directory"
+        );
+    }
+
+    /// The containment check must not cost ordinary exports: a plain name still
+    /// lands where it always did.
+    #[tokio::test]
+    async fn export_still_writes_an_ordinary_table_name() {
+        let adapter = mem().await;
+        adapter
+            .execute_script("CREATE TABLE items (id integer, name text); INSERT INTO items VALUES (1, 'a');")
+            .await
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let mut e = Entity::new(EntityType::Table, "items");
+        e.format = Some("csv".to_string());
+        adapter.export_data(&e, Some(out.path())).await.expect("export failed");
+
+        let written = std::fs::read_to_string(out.path().join("items.csv")).expect("items.csv");
+        assert!(written.contains("id,name"), "got: {written}");
     }
 }
