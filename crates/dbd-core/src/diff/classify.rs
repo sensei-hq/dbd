@@ -340,7 +340,20 @@ fn classify_enum_changes(
 // ── Data SQL generation ────────────────────────────────
 
 /// Generate a data correction SQL script for a complex change.
+///
+/// Every name and value here comes from a database catalog, and the script this
+/// returns is written to a file an operator runs by hand — usually with more
+/// privilege than dbd itself holds. So names are rendered as quoted identifiers
+/// and values as quoted literals rather than pasted in bare: a table called
+/// `u"; DROP TABLE x; --` or an enum label called `x'; DROP TABLE users; --` is
+/// a legal object name in Postgres, and interpolating either one unescaped turns
+/// this script into whatever the name says.
+///
+/// Type names are the exception and stay verbatim — `varchar(50)` and `int[]`
+/// are type expressions, not identifiers, and quoting them would break the cast.
 pub fn generate_data_sql(change: &ComplexChange) -> String {
+    use crate::sql_quote::{ident, literal, qualified};
+
     match change {
         ComplexChange::ColumnRename {
             table_name,
@@ -348,7 +361,12 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
             new_name,
             ..
         } => {
-            format!("UPDATE {table_name} SET {new_name} = {old_name};\n")
+            format!(
+                "UPDATE {} SET {} = {};\n",
+                qualified(table_name),
+                ident(new_name),
+                ident(old_name)
+            )
         }
         ComplexChange::ColumnTypeChange {
             table_name,
@@ -371,8 +389,10 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
                     ));
                 }
                 sql.push_str(&format!(
-                    "UPDATE {table_name} SET {} = {}::{};\n",
-                    new_col.name, old_col.name, new_type
+                    "UPDATE {} SET {} = {}::{new_type};\n",
+                    qualified(table_name),
+                    ident(&new_col.name),
+                    ident(&old_col.name)
                 ));
                 sql
             } else {
@@ -400,7 +420,11 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
             for (table, col) in affected_columns {
                 for removed_val in removed_values {
                     sql.push_str(&format!(
-                        "UPDATE {table} SET {col} = '???' WHERE {col} = '{removed_val}';\n"
+                        "UPDATE {} SET {} = '???' WHERE {} = {};\n",
+                        qualified(table),
+                        ident(col),
+                        ident(col),
+                        literal(removed_val)
                     ));
                 }
             }

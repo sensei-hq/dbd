@@ -1347,15 +1347,32 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
-        let qualified = entity.name.replace('.', "\".\"");
         let format = entity.format.as_deref().unwrap_or("csv");
 
+        // The file is named after the table (and, without `--out`, the directory
+        // after its schema). A quoted identifier may hold path separators, and
+        // `Path::join` with an absolute one discards the export directory
+        // outright — so refuse before running the COPY.
+        let (schema, name) = split_qualified(&entity.name);
+        let filable = crate::path_safe::is_safe_segment(name)
+            && (out_dir.is_some() || schema.is_empty() || crate::path_safe::is_safe_segment(schema));
+        if !filable {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: its name is not usable as a file name (it contains a path separator, \
+                 or is '.' or '..'). Rename the table, or export it by hand",
+                entity.name
+            )));
+        }
+
+        // Quoted part by part rather than by string-replacing the dot: that left
+        // an embedded `"` free to close the quoting and continue the statement.
+        let qualified = crate::sql_quote::qualified(&entity.name);
         let copy_sql = match format {
-            "tsv" => format!(
-                "COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
-            ),
-            "jsonl" => format!("COPY (SELECT row_to_json(t) FROM \"{qualified}\" t) TO STDOUT"),
-            _ => format!("COPY (SELECT * FROM \"{qualified}\") TO STDOUT WITH (FORMAT csv, HEADER true)"),
+            "tsv" => {
+                format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')")
+            }
+            "jsonl" => format!("COPY (SELECT row_to_json(t) FROM {qualified} t) TO STDOUT"),
+            _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
         };
 
         let mut conn = self
@@ -1375,9 +1392,6 @@ impl DatabaseAdapter for PostgresAdapter {
             let chunk = chunk.map_err(|e| DbdError::Config(format!("COPY OUT read failed: {e}")))?;
             data.extend_from_slice(&chunk);
         }
-
-        // Resolve the bare table name (strip any `schema.` prefix).
-        let (schema, name) = split_qualified(&entity.name);
 
         // `Some(dir)` → write `dir/<name>.<format>` (flat).
         // `None`      → folder convention `export/<schema>/<name>.<format>`.
