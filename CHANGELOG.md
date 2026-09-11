@@ -7,6 +7,75 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html); whil
 the crates are `0.x`, the **minor** position is the breaking one, so
 `0.12.x → 0.13.0` may require changes in code that embeds `dbd-core`.
 
+## [0.13.1] — 2026-09-11
+
+**No change to `dbd-core` or the `dbd` CLI.** The Rust tree is byte-identical to
+0.13.0; upgrading the crate gains you nothing and skipping it costs you nothing.
+This release is the documentation site, CI and repo metadata, versioned together
+because one version number covers the whole repo.
+
+### Security
+
+- **`devalue` 5.8.1 → 5.9.2 in the docs site** — "reject out-of-bounds indices"
+  (AIKIDO-2026-869882). The fix was already inside `@sveltejs/kit`'s declared
+  `^5.8.1`; only the lockfile was stale. `devalue` is an external import in the
+  deployed worker (`output/server/index.js`), so this reaches production, not
+  just the build. Exposure was low regardless — every route is prerendered, so
+  it only ever parsed build-time-static payloads.
+
+- **`undici` override 7.29.0 → 8.10.2.** The old pin dragged `jsdom@30` off its
+  own declared `^8.9.0` and onto the 7 line, and `miniflare` pins 7.29.0
+  exactly, which is vulnerable to the 2026-09-04 advisory batch (patched at
+  7.29.1 and 8.10.2). Bun does not support nested overrides — it warns and
+  ignores them — so one version serves both parents; 8.10.2 is the only fully
+  patched release that also satisfies jsdom. Crossing miniflare's major is
+  contained: nothing in this repo invokes miniflare, and the deployed worker
+  runs on workerd.
+
+- Secret scanning and push protection enabled on the repository. Renovate now
+  owns security PRs (`vulnerabilityAlerts` + `osvVulnerabilityAlerts`, the
+  latter being what actually covers crates.io) rather than adding Dependabot
+  security updates as a second bot on the same job. Every Renovate rule gained a
+  7-day `minimumReleaseAge` — the `@rokkit/*` group auto-merges, and automerge
+  with no cooldown turns one compromised publish into a merged commit.
+
+### Fixed
+
+- **`bun run check` could not run at all.** `svelte-check` 4.x refuses to start
+  when the `typescript` package is major 7; the site had been on `typescript@7`
+  with nothing in CI to notice. `typescript` is now `~6.0.3` with TypeScript 7
+  alongside as `@typescript/native` and `--tsgo` on the script, which is the
+  pairing svelte-check documents. It reports 46 files, 0 errors.
+
+- **The `cookie` override was mis-documented.** It was grouped with the
+  build-time-only pins, but `cookie` is an external import in the deployed
+  worker. It is pinned because `@sveltejs/kit` 2.70.3 still declares `^0.6.0`
+  and every 0.6.x carries GHSA-pxg6-pf52-xh8x; 0.7.0 changed no API, so kit is
+  safe on it. Renovate is now capped at `<1.0.0` for `cookie`, because 1.0
+  delegates quote-parsing to `decode` (kit passes an identity decoder) and 2.0
+  renames `parse`/`serialize` outright. No version changed — only the reasoning
+  is now recorded and enforced.
+
+### Added
+
+- **CI gates the docs site** — `bun install --frozen-lockfile`, `check`, `test`,
+  and a build with `CF_PAGES=1` so it exercises the adapter that actually ships.
+  Nothing ran the site before, which is how the broken type-check survived. The
+  frozen lockfile is the gate, not a speed-up: it fails when `bun.lock` and
+  `package.json` disagree, which is exactly how `devalue` went stale.
+
+- **CodeQL** over `rust`, `javascript-typescript` and `actions`. The `actions`
+  pack is deliberate — this repo pins every action to a SHA by hand, and that
+  pack checks the posture mechanically.
+
+- **`sensei.library.json` completed against the manifest spec** ([#13]):
+  `llms` (pointing at `/llms-full.txt`, the 1103-line corpus, not the 147-line
+  summary), `documents`, `ref`, `ecosystem`, `packages` and `install`. The
+  `install` block names `dbd install`, the command that exists — the issue's
+  suggested `dbd skills add <name>` was a template from another library.
+  `make bump` now rewrites `documents` and `ref`, so they cannot silently rot
+  into claiming docs describe a release they do not.
+
 ## [0.13.0] — 2026-09-11
 
 Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
@@ -98,4 +167,6 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
   that file is feature-agnostic, so no feature selection can remove it.
 
 [#12]: https://github.com/sensei-hq/dbd/issues/12
+[#13]: https://github.com/sensei-hq/dbd/issues/13
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0
+[0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
