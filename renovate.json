@@ -1,13 +1,40 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "description": [
+    "GitHub's Dependabot ALERTS are on, but its security UPDATES are deliberately off: Renovate already watches the same manifests, so enabling both puts two bots on one job and yields duplicate PRs for the same advisory. Renovate consumes those same alerts via vulnerabilityAlerts and opens the fix PR itself, keeping one bot and the package rules below.",
+    "osvVulnerabilityAlerts adds the OSV database, which is what actually covers crates.io — the Rust half of this repo is invisible to a GitHub-advisories-only feed.",
+    "The minimumReleaseAge cooldown on each rule is the defence against a compromised publish (hijacked maintainer token, typosquat republish) being pulled in before anyone notices. It applies to the auto-merged @rokkit group too — automerge with no cooldown is precisely the combination that turns one bad publish into a merged commit with no human in the loop. vulnerabilityAlerts sets it to null on purpose: a cooldown on the fix for a KNOWN advisory would leave the repo knowingly exposed for the length of the cooldown, which is the opposite of the intent."
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"],
+    "minimumReleaseAge": null,
+    "automerge": false
+  },
+  "osvVulnerabilityAlerts": true,
   "packageRules": [
     {
-      "description": "First-party Rokkit design system (published in lockstep). Group all @rokkit/* bumps into one PR and auto-merge non-major updates; majors open a PR for manual review/migration.",
+      "description": "First-party Rokkit design system (published in lockstep). Group all @rokkit/* bumps into one PR and auto-merge non-major updates; majors open a PR for manual review/migration. First-party is not a reason to skip the cooldown — the threat is a stolen publish token, which does not care who owns the package.",
       "matchPackageNames": ["@rokkit/**"],
       "groupName": "rokkit",
       "matchUpdateTypes": ["minor", "patch"],
+      "minimumReleaseAge": "7 days",
       "automerge": true
+    },
+    {
+      "description": "cookie is capped below 1.0 on purpose, and this is a correctness constraint rather than a preference: @sveltejs/kit calls parse(header, { decode: (value) => value }), and cookie 1.0 delegates quote-parsing to `decode` and returns a null-prototype object, while 2.0 renames parse/serialize to parseCookie/stringifySetCookie and breaks kit's import outright. cookie ships in the deployed worker as an external import, so a bad bump is a production break, not a build break. Lift this cap only when @sveltejs/kit's own range moves off ^0.6.0. See comment:overrides-cookie in site/package.json.",
+      "matchPackageNames": ["cookie"],
+      "allowedVersions": "<1.0.0",
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Transitive pins in site/package.json overrides (undici, dompurify, ws, esbuild, cookie, sharp) exist only because a parent has not re-published past a patched release. Label them so the override comment gets re-read on each bump — an override its parent's own range has caught up to should be deleted, not advanced.",
+      "matchFileNames": ["site/package.json"],
+      "matchDepTypes": ["overrides"],
+      "minimumReleaseAge": "7 days",
+      "labels": ["dependencies", "overrides"],
+      "automerge": false
     }
   ]
 }
