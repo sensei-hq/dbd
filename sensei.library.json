@@ -1,9 +1,17 @@
 {
   "library": "dbd",
   "version": ">=0.10",
+  "documents": "0.13.0",
+  "ecosystem": "cargo",
   "repo": "https://github.com/sensei-hq/dbd",
-  "branch": "main",
+  "ref": "v0.13.0",
   "site": "https://dbd.sensei-hq.com",
+  "packages": ["dbd-core", "dbd-cli"],
+  "llms": {
+    "index": "/llms-full.txt",
+    "path": "docs/llms",
+    "focus": "schema-as-code reference — commands, DDL layout, deploy"
+  },
   "skills": [
     {
       "name": "dbd",
@@ -19,5 +27,9 @@
       "path": "docs/agents/dbd-pattern-verifier.md",
       "url": "/agents/dbd-pattern-verifier.md"
     }
-  ]
+  ],
+  "install": {
+    "skills": "dbd install",
+    "agents": "dbd install"
+  }
 }

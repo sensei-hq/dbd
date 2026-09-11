@@ -101,8 +101,18 @@ bump: _check-clean _check-ci
 	@sed -i '' 's|dbd-core = { path = "crates/dbd-core", version = "$(VERSION)" }|dbd-core = { path = "crates/dbd-core", version = "$(NEW)" }|' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
 	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
+##  sensei.library.json carries two version-coupled fields that consumers rely on
+##  to answer "are these docs for the release I depend on?": `documents` (the
+##  concrete release the published docs describe) and `ref` (the tag to fetch the
+##  corpus at). Both are wrong the moment a release ships without them, and wrong
+##  here is worse than absent — a consumer trusts the label and serves docs for
+##  the wrong version silently. `version` is a RANGE (">=0.10") and is
+##  deliberately NOT touched: it says which releases the capabilities apply to,
+##  which is a different question and does not move every bump.
+	@sed -i '' 's/"documents": "[^"]*"/"documents": "$(NEW)"/' sensei.library.json
+	@sed -i '' 's/"ref": "v[0-9]*\.[0-9]*\.[0-9]*"/"ref": "v$(NEW)"/' sensei.library.json
 	@cargo build -q
-	@git add Cargo.lock Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt
+	@git add Cargo.lock Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt sensei.library.json
 	@git commit -m "chore: bump version to v$(NEW)"
 	@git tag -a "v$(NEW)" -m "v$(NEW)"
 	@echo "Pushing $(BRANCH) and v$(NEW)..."
