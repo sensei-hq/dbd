@@ -634,8 +634,14 @@ impl PostgresAdapter {
     ) -> crate::error::Result<(Vec<crate::entity::TableConstraint>, std::collections::HashSet<i64>)> {
         use crate::entity::{ForeignKey, TableConstraint};
 
+        // `indnullsnotdistinct` decides whether a UNIQUE constraint's NULL rows
+        // collide, so it is part of the constraint rather than a display detail.
+        // It only exists on PG 15+; reading it through `to_jsonb` yields NULL
+        // instead of erroring on older servers, matching `introspect_indexes`.
         let cons_sql = "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
                     c.conindid::int8 AS conindid, \
+                    coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false) \
+                        AS nulls_not_distinct, \
                     pg_get_constraintdef(c.oid, true) AS condef, \
                     (SELECT array_agg(a.attname ORDER BY pos.ord) \
                      FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
@@ -652,6 +658,7 @@ impl PostgresAdapter {
              JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
              LEFT JOIN pg_class ref_cls ON ref_cls.oid = c.confrelid \
              LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
+             LEFT JOIN pg_index ix ON ix.indexrelid = c.conindid \
              WHERE ns.nspname = $1 AND cls.relname = $2 \
                AND c.contype IN ('p', 'u', 'f', 'c') \
              ORDER BY c.contype, c.conname";
@@ -693,6 +700,7 @@ impl PostgresAdapter {
                     constraints.push(TableConstraint::Unique {
                         name: Some(conname),
                         columns: col_names,
+                        nulls_not_distinct: con.try_get("nulls_not_distinct").unwrap_or(false),
                     });
                 }
                 "f" => {

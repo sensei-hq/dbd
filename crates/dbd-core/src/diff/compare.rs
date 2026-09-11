@@ -171,14 +171,31 @@ fn constraint_key(c: &TableConstraint) -> String {
 /// explicit `constraint <name> primary key (…)`, so when BOTH sides name the
 /// constraint, a difference is a deliberate rename and must still be expressed.
 /// An unnamed side means "any name will do" and never reads as drift.
+///
+/// UNIQUE has one attribute beyond its columns that the key cannot carry:
+/// `NULLS NOT DISTINCT`. It decides whether NULL rows collide, so two UNIQUEs
+/// that differ only there enforce different things and must read as drift —
+/// ignoring it is what let a live plain UNIQUE stand in for a declared
+/// `NULLS NOT DISTINCT` one while `dbd diff` reported "in sync" (issue #12).
 fn constraint_differs(old: &TableConstraint, new: &TableConstraint) -> bool {
     let renamed = |old_name: &Option<String>, new_name: &Option<String>| match (old_name, new_name) {
         (Some(o), Some(n)) => o != n,
         _ => false,
     };
     match (old, new) {
-        (TableConstraint::PrimaryKey { name: o, .. }, TableConstraint::PrimaryKey { name: n, .. })
-        | (TableConstraint::Unique { name: o, .. }, TableConstraint::Unique { name: n, .. }) => renamed(o, n),
+        (TableConstraint::PrimaryKey { name: o, .. }, TableConstraint::PrimaryKey { name: n, .. }) => renamed(o, n),
+        (
+            TableConstraint::Unique {
+                name: o,
+                nulls_not_distinct: o_nnd,
+                ..
+            },
+            TableConstraint::Unique {
+                name: n,
+                nulls_not_distinct: n_nnd,
+                ..
+            },
+        ) => o_nnd != n_nnd || renamed(o, n),
         _ => old != new,
     }
 }

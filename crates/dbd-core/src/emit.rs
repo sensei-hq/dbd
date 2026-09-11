@@ -150,8 +150,19 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
         TableConstraint::PrimaryKey { columns, .. } => {
             format!("  PRIMARY KEY ({})", quote_cols(columns))
         }
-        TableConstraint::Unique { columns, .. } => {
-            format!("  UNIQUE ({})", quote_cols(columns))
+        // `NULLS NOT DISTINCT` precedes the column list, mirroring the index
+        // emitter. Dropping it here would make every emitted/reverse-engineered
+        // DDL file declare a weaker constraint than the database holds.
+        TableConstraint::Unique {
+            columns,
+            nulls_not_distinct,
+            ..
+        } => {
+            format!(
+                "  UNIQUE{} ({})",
+                if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
+                quote_cols(columns)
+            )
         }
         TableConstraint::ForeignKey(fk) => {
             let ref_schema = fk.ref_schema.as_deref().unwrap_or(schema);

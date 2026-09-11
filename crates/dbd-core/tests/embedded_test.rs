@@ -3041,3 +3041,183 @@ async fn reconcile_replaces_primary_key_on_table_with_data() {
         "reconcile must settle after replacing the PK; got {settled:?}"
     );
 }
+
+/// Issue #12.1: `unique nulls not distinct` must survive the ALTER path.
+///
+/// `dbd apply` on a fresh database ran the DDL file verbatim and kept the clause;
+/// `dbd reconcile` altering an existing table re-derived the constraint from the
+/// parsed model, which had nowhere to hold it. The constraint that landed was
+/// materially weaker than the one declared — NULL rows no longer collided — and
+/// `dbd diff` then compared UNIQUE by name alone and certified the result as
+/// in sync, so nothing anywhere reported the difference.
+///
+/// The check is `pg_index.indnullsnotdistinct` rather than a duplicate-insert
+/// attempt, because it pins the property directly: an insert test would also pass
+/// against a constraint that merely happened to reject that one pair of rows.
+#[tokio::test]
+async fn reconcile_preserves_nulls_not_distinct_on_a_unique_constraint() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nnd_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nnd_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_thing = |body: &str| std::fs::write(dir.join("ddl/table/app/thing.ddl"), body).unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    // `indnullsnotdistinct` is PG15+; read through `to_jsonb` so the predicate is
+    // false rather than an error on an older server.
+    let nnd_on = |cols: &str| {
+        format!(
+            "SELECT 1 FROM pg_index ix \
+               JOIN pg_class i ON i.oid = ix.indexrelid \
+               JOIN pg_class t ON t.oid = ix.indrelid \
+               JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+              WHERE ns.nspname = 'app' AND t.relname = 'thing' \
+                AND pg_get_indexdef(ix.indexrelid) LIKE '%({cols})%' \
+                AND coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false)"
+        )
+    };
+
+    // ── Phase 1: fresh create — the clause is preserved (this always worked) ──
+    write_thing(
+        "set search_path to app;\n\
+         create table if not exists thing (\n\
+           id   int primary key\n\
+         , grp  text\n\
+         , name text not null\n\
+         , unique nulls not distinct (grp, name)\n\
+         );\n",
+    );
+    load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    assert_catalog(
+        &*adapter,
+        true,
+        &nnd_on("grp, name"),
+        "NULLS NOT DISTINCT on (grp, name)",
+    )
+    .await;
+
+    // ── Phase 2: add a column and re-key onto it, keeping the clause ──
+    // This is the ALTER path: the constraint is dropped and re-added from the
+    // parsed model, so the clause has to survive parse → diff → generate.
+    write_thing(
+        "set search_path to app;\n\
+         create table if not exists thing (\n\
+           id    int primary key\n\
+         , grp   text\n\
+         , scope text\n\
+         , name  text not null\n\
+         , unique nulls not distinct (grp, scope, name)\n\
+         );\n",
+    );
+    load()
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 2 failed");
+    assert_catalog(
+        &*adapter,
+        true,
+        &nnd_on("grp, scope, name"),
+        "NULLS NOT DISTINCT on (grp, scope, name)",
+    )
+    .await;
+
+    // The declared constraint permits exactly one (NULL, NULL, 'x') row. Proving
+    // the second insert is rejected is what the issue actually cared about.
+    //
+    // Columns are named rather than positional: `ALTER TABLE ADD COLUMN` appends,
+    // so the live order is (id, grp, name, scope) while the DDL file declares
+    // (id, grp, scope, name).
+    adapter
+        .execute_script("INSERT INTO app.thing (id, grp, scope, name) VALUES (1, NULL, NULL, 'x')")
+        .await
+        .expect("first row must be accepted");
+    assert!(
+        adapter
+            .execute_script("INSERT INTO app.thing (id, grp, scope, name) VALUES (2, NULL, NULL, 'x')")
+            .await
+            .is_err(),
+        "a second (NULL, NULL, 'x') row violates the declared constraint and must be rejected"
+    );
+
+    // ── Phase 3: it converges — a re-run has nothing left to do ──
+    let settled = load()
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("post-alter dry-run reconcile failed");
+    assert!(
+        settled.is_empty(),
+        "reconcile must settle after preserving the clause; got {settled:?}"
+    );
+}
+
+/// The converse of the above: a live `NULLS NOT DISTINCT` constraint against a
+/// design that declares a *plain* unique is drift, and reconcile must weaken it
+/// rather than leave the stronger constraint in place. Without this, the fix
+/// would only be half a fix — convergence has to work in both directions.
+#[tokio::test]
+async fn reconcile_drops_nulls_not_distinct_when_the_design_stops_declaring_it() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nnd_drop_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nnd_drop_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_thing = |body: &str| std::fs::write(dir.join("ddl/table/app/thing.ddl"), body).unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    let any_nnd = "SELECT 1 FROM pg_index ix \
+           JOIN pg_class t ON t.oid = ix.indrelid \
+           JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+          WHERE ns.nspname = 'app' AND t.relname = 'thing' \
+            AND coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false)";
+
+    write_thing(
+        "set search_path to app;\n\
+         create table if not exists thing (\n\
+           id int primary key, grp text, name text not null\n\
+         , unique nulls not distinct (grp, name)\n\
+         );\n",
+    );
+    load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    assert_catalog(&*adapter, true, any_nnd, "NULLS NOT DISTINCT constraint").await;
+
+    // Same columns, clause removed → the constraint must be replaced, not kept.
+    write_thing(
+        "set search_path to app;\n\
+         create table if not exists thing (\n\
+           id int primary key, grp text, name text not null\n\
+         , unique (grp, name)\n\
+         );\n",
+    );
+    load()
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 2 failed");
+    assert_catalog(&*adapter, false, any_nnd, "NULLS NOT DISTINCT constraint").await;
+
+    let settled = load()
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("post-alter dry-run reconcile failed");
+    assert!(settled.is_empty(), "reconcile must settle; got {settled:?}");
+}

@@ -264,7 +264,7 @@ fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
     let cols = |columns: &[String]| format!("({})", columns.join(", "));
     let mut out = Vec::new();
     for c in &def.constraints {
-        if let TableConstraint::Unique { name, columns } = c {
+        if let TableConstraint::Unique { name, columns, .. } = c {
             out.push(Index {
                 def: cols(columns),
                 unique: true,
