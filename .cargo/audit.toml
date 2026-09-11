@@ -1,0 +1,25 @@
+# `cargo audit` configuration.
+#
+# Every entry here is an advisory against a crate that is present in Cargo.lock
+# but never compiled. Cargo.lock is feature-agnostic — it records the union of
+# every dependency any feature combination could select — so an optional
+# dependency dbd does not enable still appears in it and still gets scanned.
+#
+# The bar for adding an ignore is: `cargo tree --target all -i <crate>` prints
+# nothing AND a full `cargo build --workspace` produces no artifact for it.
+# Anything that fails that bar gets fixed, not listed.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack (timing sidechannel) in `rsa`.
+    #
+    # Reached only via `sqlx-mysql`. dbd enables `sqlx/postgres` and
+    # `sqlx/sqlite` and never `sqlx/mysql`, so neither crate is in the build
+    # graph: `cargo tree --target all -i sqlx-mysql` prints nothing, and a full
+    # workspace build produces zero `rsa` artifacts.
+    #
+    # There is no fixed release to upgrade to, and the advisory cannot be
+    # resolved by feature selection — it will clear when sqlx drops the
+    # dependency or `rsa` ships a constant-time fix. Re-check on each sqlx bump.
+    "RUSTSEC-2023-0071",
+]
