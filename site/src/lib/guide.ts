@@ -10,17 +10,41 @@ const raws = import.meta.glob('./content/guide/*.md', {
 
 marked.setOptions({ gfm: true });
 
-// Give headings slug ids so in-page anchors (e.g. #dbml) resolve.
-function addHeadingIds(html: string): string {
-	return html.replace(/<(h[1-6])>(.*?)<\/\1>/g, (_full, tag, inner) => {
-		const text = inner.replace(/<[^>]+>/g, '');
-		const id = text
-			.toLowerCase()
-			.trim()
-			.replace(/[^\w]+/g, '-')
-			.replace(/^-+|-+$/g, '');
-		return `<${tag} id="${id}">${inner}</${tag}>`;
-	});
+/** Derive an anchor slug from a heading's rendered inner HTML.
+ *
+ *  `inner` is markup, not text. marked wraps inline code in `<code>` and escapes
+ *  the angle brackets this guide uses constantly (`<type>` becomes `&lt;type&gt;`).
+ *  Both have to go, but not the same way:
+ *
+ *    - Tags are removed outright, because inline emphasis can run through the
+ *      middle of a word — `mid<strong>dle</strong>` is one word, and turning the
+ *      tags into separators would slug it as `mid-dle`.
+ *    - An entity reference stands in for punctuation, so it becomes a separator.
+ *      Left alone it leaks its own name into the anchor, which is how
+ *      "The `<type>` folder" used to slug as `the-lt-type-gt-folder`.
+ *
+ *  Entities are deliberately NOT decoded back to characters: that would put a
+ *  literal `<` into a value about to be interpolated into an `id="…"` attribute.
+ *  Mapping them straight to a separator keeps markup from ever re-entering the
+ *  string, and the final `[^\w]` pass leaves only `[a-z0-9_-]`.
+ */
+function headingSlug(inner: string): string {
+	return inner
+		.replace(/<[^>]*>/g, '')
+		.replace(/&(?:[a-z][a-z0-9]*|#\d+|#x[0-9a-f]+);/gi, '-')
+		.toLowerCase()
+		.trim()
+		.replace(/[^\w]+/g, '-')
+		.replace(/^-+|-+$/g, '');
+}
+
+// Give headings slug ids so in-page anchors (e.g. #dbml) resolve. Only the id is
+// derived — `inner` is re-emitted exactly as marked rendered it.
+export function addHeadingIds(html: string): string {
+	return html.replace(
+		/<(h[1-6])>(.*?)<\/\1>/g,
+		(_full, tag, inner) => `<${tag} id="${headingSlug(inner)}">${inner}</${tag}>`
+	);
 }
 
 // Rewrite inter-doc markdown links like `03-design-yaml.md#dbml` (relative to
