@@ -9,6 +9,15 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Security
+
+- **`rustls` 0.23.44 → 0.23.45** — RUSTSEC-2026-0285, "TLS 1.3 handshake messages
+  incorrectly accepted across encryption level boundaries" (medium, 5.3). The
+  advisory was published 2026-09-14 and the pin predates 0.13.0, so `cargo audit`
+  went red on the first push to `main` after it landed rather than on any change
+  of ours. Lockfile only — `rustls` reaches the tree transitively through
+  `reqwest`/`tokio-rustls`, and nothing in this repo declares it directly.
+
 ## [0.13.1] — 2026-09-17
 
 Two reconcile convergence fixes in `dbd-core` (#16, #17), released alongside the
