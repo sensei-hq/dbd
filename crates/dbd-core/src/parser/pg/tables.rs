@@ -233,6 +233,7 @@ fn extract_column(
     let mut is_pk = false;
     let mut is_unique = false;
     let mut identity = None;
+    let mut generated: Option<String> = None;
     let mut default_value = None;
     let mut inline_fk = None;
     let mut checks = Vec::new();
@@ -291,12 +292,15 @@ fn extract_column(
                 });
                 nullable = false;
             }
-            // `GENERATED ALWAYS AS (expr) STORED` — a computed column. The
-            // expression has nowhere to live on `ColumnDef`, but a function it
-            // calls must exist before the table is created.
+            // `GENERATED ALWAYS AS (expr) STORED` — a computed column. Stored on
+            // `ColumnDef::generated`, NOT `default_value`: the live side reads the
+            // same expression out of `pg_attrdef`, and the two only converge if
+            // both sides keep it in the same place (issue #16). A function it
+            // calls must also exist before the table is created.
             ConstrGenerated => {
                 let rendered = constraint_expr(c, &name, "GENERATED")?;
                 collect_function_refs(&rendered, default_schema, functions);
+                generated = Some(rendered);
             }
             // Deferrability modifiers carry no payload of their own.
             ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {}
@@ -323,6 +327,7 @@ fn extract_column(
         is_pk,
         is_unique,
         identity,
+        generated,
         comment: None,
         inline_fk,
     };
@@ -854,6 +859,11 @@ mod tests {
         let d = e.table_def.as_ref().unwrap();
         assert_eq!(d.columns[1].identity, None);
         assert!(e.refers.contains(&"app.doubled".to_string()), "got {:?}", e.refers);
+        // The expression lands on `generated`, NOT `default_value` — the live
+        // side reads the same one out of `pg_attrdef`, and they only converge if
+        // both sides keep it in the same place (issue #16).
+        assert_eq!(d.columns[1].generated.as_deref(), Some("app.doubled(a)"));
+        assert_eq!(d.columns[1].default_value, None);
     }
 
     // ── 2. Inline column constraints: PK, unique, FK, CHECK ─────────────────
@@ -1172,12 +1182,33 @@ mod tests {
             predicate: Some("scope = ANY (ARRAY['user'::text, 'project'::text])".into()),
             ..authored.clone()
         };
-        crate::schema_diff::normalize_index(&mut authored);
-        crate::schema_diff::normalize_index(&mut introspected);
+        let cols = crate::reconcile::coercible_columns(&d.columns);
+        crate::schema_diff::normalize_index(&mut authored, &cols);
+        crate::schema_diff::normalize_index(&mut introspected, &cols);
         assert_eq!(
             authored.predicate, introspected.predicate,
             "authored and introspected spellings must match after normalization"
         );
+    }
+
+    /// A partial index over a `varchar` column drifts for exactly the reason a
+    /// CHECK does (issue #17): Postgres stores the predicate with the `::text`
+    /// cast it inserted, and without the column's declared type the two spellings
+    /// can never meet.
+    #[test]
+    fn a_partial_index_predicate_over_varchar_converges() {
+        let d = def("create table t (id int, name varchar(100));\n\
+             create index t_ix on t (id) where name = lower(name);");
+
+        let mut authored = d.indexes[0].clone();
+        let mut introspected = crate::entity::IndexDef {
+            predicate: Some("(name)::text = lower((name)::text)".into()),
+            ..authored.clone()
+        };
+        let cols = crate::reconcile::coercible_columns(&d.columns);
+        crate::schema_diff::normalize_index(&mut authored, &cols);
+        crate::schema_diff::normalize_index(&mut introspected, &cols);
+        assert_eq!(authored.predicate, introspected.predicate);
     }
 
     // ── Refusal: a table that cannot be fully read must error, not degrade ───

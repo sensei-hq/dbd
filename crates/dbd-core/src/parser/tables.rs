@@ -149,6 +149,7 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
     let mut is_pk = false;
     let mut is_unique = false;
     let mut identity: Option<IdentityKind> = None;
+    let mut generated: Option<String> = None;
     let mut default_value = None;
     let mut inline_fk = None;
     let mut references = Vec::new();
@@ -244,14 +245,17 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
                 };
                 nullable = false;
             }
-            // `GENERATED ALWAYS AS (expr) STORED` — a computed column. The
-            // expression is not stored on `ColumnDef`, but a function it calls
-            // must exist before the table is created.
+            // `GENERATED ALWAYS AS (expr) STORED` — a computed column. Stored on
+            // `ColumnDef::generated`, NOT `default_value`: the live side reads the
+            // same expression out of `pg_attrdef`, and the two only converge if
+            // both sides keep it in the same place (issue #16). A function it
+            // calls must also exist before the table is created.
             ColumnOption::Generated {
                 generation_expr: Some(expr),
                 ..
             } => {
                 push_function_refs(expr, default_schema, &mut references);
+                generated = Some(expr.to_string());
             }
             _ => {}
         }
@@ -273,6 +277,7 @@ fn extract_column(col_def: &SqlColumnDef, default_schema: &str) -> (ColumnDef, V
         is_pk,
         is_unique,
         identity,
+        generated,
         comment: None,
         inline_fk,
     };
@@ -506,6 +511,26 @@ mod tests {
         assert!(!def.columns[0].nullable);
         assert_eq!(def.columns[1].name, "name");
         assert!(!def.columns[1].nullable);
+    }
+
+    /// The sqlparser path is user-selectable via `source.parser`, so it has to
+    /// put the generation expression in the same place the pg-native path does —
+    /// `generated`, not `default_value` (issue #16).
+    #[test]
+    fn extracts_a_stored_generated_column_as_generated_not_a_default() {
+        let stmts = parse(
+            "CREATE TABLE foo (content text, \
+             tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED);",
+        );
+        let (def, _) = extract_table(&stmts, &["public".to_string()]);
+
+        assert_eq!(def.columns[1].name, "tsv");
+        assert_eq!(
+            def.columns[1].generated.as_deref(),
+            Some("to_tsvector('english', content)")
+        );
+        assert_eq!(def.columns[1].default_value, None);
+        assert_eq!(def.columns[1].identity, None, "STORED is not an identity column");
     }
 
     #[test]
@@ -753,8 +778,9 @@ mod tests {
             predicate: Some("scope = ANY (ARRAY['user'::text, 'project'::text])".into()),
             ..authored.clone()
         };
-        crate::schema_diff::normalize_index(&mut authored);
-        crate::schema_diff::normalize_index(&mut introspected);
+        let cols = crate::reconcile::coercible_columns(&def.columns);
+        crate::schema_diff::normalize_index(&mut authored, &cols);
+        crate::schema_diff::normalize_index(&mut introspected, &cols);
         assert_eq!(
             authored.predicate, introspected.predicate,
             "authored and introspected predicate spellings must canonicalize alike"

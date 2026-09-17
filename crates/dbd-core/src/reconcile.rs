@@ -293,9 +293,27 @@ fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<
     for c in &mut t.columns {
         c.data_type = canonical_type(&c.data_type, enum_types);
         c.default_value = c.default_value.as_deref().map(canonical_default);
+        c.generated = c.generated.as_deref().map(canonical_generated);
         c.is_pk = false;
         c.is_unique = false;
     }
+}
+
+/// Canonicalize a `GENERATED ALWAYS AS (…) STORED` expression so the authored
+/// spelling and the one `pg_get_expr` reports compare equal.
+///
+/// NOT [`canonical_default`]: that strips a single *trailing* top-level cast,
+/// which is the right shape for a default literal but leaves the casts Postgres
+/// pushes *inside* a generation expression —
+/// `to_tsvector('english'::regconfig, COALESCE(content, ''::text))` against an
+/// authored `to_tsvector('english', coalesce(content,''))`. Those are erased by
+/// the same parse/normalize/deparse round-trip an index expression key uses,
+/// which also settles case and parens on both sides at once.
+///
+/// An expression that will not parse keeps its raw text, so it compares only
+/// against an identical spelling: it may read as drift, never as falsely equal.
+fn canonical_generated(raw: &str) -> String {
+    crate::sql_expr::canonicalize_expression(raw).unwrap_or_else(|| raw.trim().to_string())
 }
 
 /// Normalize a column type for cross-representation comparison, toward the
@@ -776,15 +794,50 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
 /// compares only against an identical spelling: it may read as drift, but it can
 /// never be mistaken for a different constraint and dropped.
 fn table_checks(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
+    let cols = coercible_columns(&t.columns);
     t.table_constraints
         .iter()
         .filter_map(|con| match con {
             TableConstraint::Check { expression, .. } => {
-                let key = crate::sql_expr::canonicalize_predicate(expression).unwrap_or_else(|| expression.clone());
+                let key = crate::sql_expr::canonicalize_predicate_for_columns(expression, &cols)
+                    .unwrap_or_else(|| expression.clone());
                 Some((key, con))
             }
             _ => None,
         })
+        .collect()
+}
+
+/// The columns of `columns` whose declared type Postgres **binary-coerces** to
+/// `text`, lower-cased — the input to
+/// [`crate::sql_expr::canonicalize_predicate_for_columns`].
+///
+/// `varchar` alone: `pg_cast` records `varchar → text` as `castmethod = 'b'`, so
+/// the cast Postgres inserts is a runtime no-op and erasing it cannot change what
+/// a predicate accepts. Deliberately NOT here:
+///
+/// - **`char(n)`/`bpchar`** — `castmethod = 'f'`, running `rtrim1`. The cast
+///   strips trailing spaces, so it is load-bearing. A CHECK on a `char` column
+///   keeps reading as drift, which is the safe failure.
+/// - **`varchar[]`** — an array cast changes the operand's shape, and
+///   `canonical_type` keeps the `[]` suffix so it never matches here.
+/// - **`text`** — Postgres inserts no cast in the first place.
+pub(crate) fn coercible_columns(columns: &[crate::entity::ColumnDef]) -> crate::sql_expr::CoercibleColumns {
+    let no_enums = HashMap::new();
+    columns
+        .iter()
+        .filter(|c| {
+            let ty = canonical_type(&c.data_type, &no_enums);
+            // `canonical_type` always spells an array with a trailing `[]`, and it
+            // lands AFTER the length modifier — `character varying(10)[]` — so the
+            // array test has to come before the base-name one, not after it.
+            !ty.ends_with("[]")
+                && ty
+                    .split('(')
+                    .next()
+                    .is_some_and(|base| base.trim_end() == "character varying")
+        })
+        .map(|c| c.name.to_lowercase())
         .collect()
 }
 
@@ -1259,8 +1312,14 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
 
         let desired_ix = secondary_indexes(dt);
         let live_ix = secondary_indexes(lt);
-        let desired_shapes: HashSet<IndexShape> = desired_ix.iter().map(|i| index_shape(i)).collect();
-        let live_shapes: HashSet<IndexShape> = live_ix.iter().map(|i| index_shape(i)).collect();
+        // Each side's predicate is canonicalized against its OWN declared types.
+        // They agree whenever the column has not drifted, which is the case the
+        // matching is for; when it has, the column diff reports it and the index
+        // reading as changed is the conservative answer.
+        let desired_cols = coercible_columns(&dt.columns);
+        let live_cols = coercible_columns(&lt.columns);
+        let desired_shapes: HashSet<IndexShape> = desired_ix.iter().map(|i| index_shape(i, &desired_cols)).collect();
+        let live_shapes: HashSet<IndexShape> = live_ix.iter().map(|i| index_shape(i, &live_cols)).collect();
 
         let mut lines: Vec<String> = Vec::new();
 
@@ -1268,7 +1327,10 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         // Use the live index's real name — that's what `DROP INDEX` needs. An
         // index lives in its table's schema, so qualify the drop with it. Drops
         // precede adds so a shape-change on a shared name doesn't collide.
-        for ix in live_ix.iter().filter(|ix| !desired_shapes.contains(&index_shape(ix))) {
+        for ix in live_ix
+            .iter()
+            .filter(|ix| !desired_shapes.contains(&index_shape(ix, &live_cols)))
+        {
             if let Some(name) = &ix.name {
                 lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
                 plan.destructive = true;
@@ -1280,7 +1342,10 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         // `IF NOT EXISTS`, correct `USING <method>`), so a GIN/GiST index
         // converges as its real access method, not a plain btree.
         let qtable = format!("\"{}\".\"{}\"", dt.schema, dt.name);
-        for ix in desired_ix.iter().filter(|ix| !live_shapes.contains(&index_shape(ix))) {
+        for ix in desired_ix
+            .iter()
+            .filter(|ix| !live_shapes.contains(&index_shape(ix, &desired_cols)))
+        {
             lines.push(crate::emit::emit_index_sql(ix, &qtable, &dt.name, true));
         }
 
@@ -1323,12 +1388,16 @@ struct IndexColumnShape {
 }
 
 /// The name-agnostic shape of an index for cross-representation matching.
-fn index_shape(ix: &crate::entity::IndexDef) -> IndexShape {
+///
+/// `cols` carries the table's binary-coercible columns so a partial index over a
+/// `varchar` column matches the predicate Postgres reports back — see
+/// [`coercible_columns`].
+fn index_shape(ix: &crate::entity::IndexDef, cols: &crate::sql_expr::CoercibleColumns) -> IndexShape {
     use crate::entity::SortOrder;
     // Collapse the default spellings (`using btree`, `asc`) first, so the shape
     // of an authored index matches the shape of the introspected one.
     let mut ix = ix.clone();
-    crate::schema_diff::normalize_index(&mut ix);
+    crate::schema_diff::normalize_index(&mut ix, cols);
 
     let columns = ix
         .columns
@@ -1631,9 +1700,88 @@ mod tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: None,
         }
+    }
+
+    // ── issue #17: varchar's implicit ::text cast ────────────────
+
+    /// A `varchar` column and one CHECK — the shape of the repro.
+    fn checked_varchar_table(expression: &str) -> TableSnapshot {
+        let mut t = table("app", "chk", vec![col("name", "varchar(100)"), col("n", "integer")]);
+        t.table_constraints = vec![TableConstraint::Check {
+            name: Some("chk_name_lower".to_string()),
+            expression: expression.to_string(),
+        }];
+        t
+    }
+
+    fn only_key(t: &TableSnapshot) -> String {
+        table_checks(t).first().expect("one check").0.clone()
+    }
+
+    /// The property #17 is about, asserted on the function reconcile actually
+    /// calls: the authored spelling and the one `pg_get_constraintdef` reports
+    /// must produce one key, or the CHECK is dropped and re-added forever.
+    #[test]
+    fn a_varchar_check_keys_identically_from_both_sides() {
+        assert_eq!(
+            only_key(&checked_varchar_table("name = lower(name)")),
+            only_key(&checked_varchar_table("name::text = lower(name::text)")),
+        );
+    }
+
+    /// `n` is `integer`, so its `::text` is the author's and stays — keying on
+    /// the declared type is what separates the two cases.
+    #[test]
+    fn a_check_on_a_non_coercible_column_keeps_its_cast() {
+        assert!(only_key(&checked_varchar_table("n::text <> ''")).contains("::text"));
+    }
+
+    // ── issue #16: STORED generated columns ──────────────────────
+
+    /// Issue #16: the authored generation expression and the analyzed form
+    /// `pg_attrdef` reports must converge. Without this, moving the expression
+    /// off `default_value` only trades the `DROP DEFAULT` abort for perpetual
+    /// drift on the expression instead.
+    ///
+    /// The introspected string is real `pg_get_expr` output from PG 17 for the
+    /// authored column above it.
+    #[test]
+    fn a_generated_expression_converges_with_its_introspected_form() {
+        let authored = canonical_generated("to_tsvector('english', coalesce(content,''))");
+        let introspected = canonical_generated("to_tsvector('english'::regconfig, COALESCE(content, ''::text))");
+        assert_eq!(authored, introspected);
+    }
+
+    /// A genuinely different expression must still read as changed.
+    #[test]
+    fn a_changed_generated_expression_stays_different() {
+        assert_ne!(canonical_generated("upper(name)"), canonical_generated("lower(name)"));
+    }
+
+    #[test]
+    fn only_binary_coercible_columns_qualify() {
+        let cols = vec![
+            col("name", "varchar(100)"),
+            col("alias", "character varying"),
+            col("code", "char(8)"),
+            col("txt", "text"),
+            col("n", "integer"),
+            col("tags", "varchar(10)[]"),
+        ];
+        let set = coercible_columns(&cols);
+        assert!(set.contains("name"), "varchar(n) is binary-coercible");
+        assert!(set.contains("alias"), "unparameterized varchar too");
+        // bpchar → text runs `rtrim1`, which strips trailing spaces. Erasing that
+        // cast would change what the predicate accepts.
+        assert!(!set.contains("code"), "char(n) must NOT qualify");
+        assert!(!set.contains("txt"), "text needs no cast to begin with");
+        assert!(!set.contains("n"));
+        // An array cast relabels the shape, not just the element type.
+        assert!(!set.contains("tags"), "varchar[] must NOT qualify");
     }
 
     fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
@@ -3539,6 +3687,7 @@ mod enum_recreation_tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: None,
         }

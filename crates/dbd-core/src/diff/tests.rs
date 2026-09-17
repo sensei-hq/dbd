@@ -877,6 +877,64 @@
         );
     }
 
+    // ── Generated columns: never DEFAULT verbs (issue #16) ───
+    //
+    // Postgres exposes a `GENERATED ALWAYS AS (…) STORED` expression through
+    // `pg_attrdef`, the same catalog an ordinary DEFAULT lives in. Reading it as
+    // a default made reconcile plan `ALTER COLUMN … DROP DEFAULT`, which Postgres
+    // refuses ("column … is a generated column"), aborting the whole run.
+
+    /// The repro: the column matches the design exactly, so nothing at all is
+    /// emitted — above all not a `DROP DEFAULT`.
+    #[test]
+    fn an_unchanged_generated_column_emits_nothing() {
+        let old = col_generated("tsv", "tsvector", "to_tsvector('english', content)");
+        let new = col_generated("tsv", "tsvector", "to_tsvector('english', content)");
+        let sql = generate_migration_sql(&[alter_col("public.docs", "tsv", old, new)]);
+        assert!(sql.trim().is_empty(), "expected no DDL, got: {sql}");
+    }
+
+    /// A changed expression uses the verb Postgres accepts. `SET EXPRESSION AS`
+    /// is PG17+, which is dbd's declared minimum.
+    #[test]
+    fn a_changed_generated_expression_sets_the_expression() {
+        let old = col_generated("tsv", "tsvector", "to_tsvector('english', title)");
+        let new = col_generated("tsv", "tsvector", "to_tsvector('english', body)");
+        let sql = generate_migration_sql(&[alter_col("public.docs", "tsv", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.docs ALTER COLUMN tsv SET EXPRESSION AS (to_tsvector('english', body));"
+        );
+        assert!(!sql.contains("DEFAULT"), "a generated column never takes a DEFAULT verb");
+    }
+
+    /// Dropping the generation makes it an ordinary column — `DROP EXPRESSION`,
+    /// never `DROP DEFAULT`.
+    #[test]
+    fn dropping_the_generation_uses_drop_expression() {
+        let old = col_generated("tsv", "tsvector", "to_tsvector('english', body)");
+        let new = col("tsv", "tsvector");
+        let sql = generate_migration_sql(&[alter_col("public.docs", "tsv", old, new)]);
+        assert_eq!(sql, "ALTER TABLE public.docs ALTER COLUMN tsv DROP EXPRESSION;");
+    }
+
+    /// A plain column cannot be promoted in place — Postgres rejects
+    /// `SET EXPRESSION` on one ("is not a generated column"), so the column is
+    /// rebuilt. Safe for this shape alone: a generated column's values are
+    /// derived, so the rebuild recomputes exactly what was dropped.
+    #[test]
+    fn promoting_a_plain_column_to_generated_rebuilds_it() {
+        let old = col("tsv", "tsvector");
+        let new = col_generated("tsv", "tsvector", "to_tsvector('english', body)");
+        let sql = generate_migration_sql(&[alter_col("public.docs", "tsv", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.docs DROP COLUMN tsv;\n\
+             ALTER TABLE public.docs ADD COLUMN tsv tsvector \
+             GENERATED ALWAYS AS (to_tsvector('english', body)) STORED;"
+        );
+    }
+
     // ── S7c: a changed default settles after the new type ────
 
     #[test]
@@ -1422,10 +1480,12 @@
     fn d_column_is_identity_changed() {
         let old_col = ColumnDef {
             identity: None,
+            generated: None,
             ..col("id", "int")
         };
         let new_col = ColumnDef {
             identity: Some(IdentityKind::Always),
+            generated: None,
             ..col("id", "int")
         };
         let a = snap(vec![table("public", "users", vec![old_col])], vec![]);
