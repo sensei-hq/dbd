@@ -295,6 +295,55 @@ fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
     stmt
 }
 
+/// Push the statements for a column where either side is a `GENERATED ALWAYS AS
+/// (…) STORED` computed column.
+///
+/// Three shapes, each with the only verb Postgres accepts for it:
+///
+/// | old → new | statement |
+/// |---|---|
+/// | generated → generated (same expr) | nothing |
+/// | generated → generated (changed) | `ALTER COLUMN … SET EXPRESSION AS (…)` |
+/// | generated → plain | `ALTER COLUMN … DROP EXPRESSION` |
+/// | plain → generated | `DROP COLUMN` + `ADD COLUMN … GENERATED …` |
+///
+/// `SET EXPRESSION AS` is PG17+, which is dbd's declared minimum (the enum-value
+/// rename path already depends on the same floor).
+///
+/// The rebuild in the last row is the only DDL Postgres offers — it rejects
+/// `SET EXPRESSION` on a column that is not already generated. It is safe for
+/// precisely this shape: the rebuilt column is computed, so Postgres recomputes
+/// every value from the surviving columns rather than losing them.
+fn push_generated_alter_sql(
+    entity_name: &str,
+    old_col: &crate::entity::ColumnDef,
+    new_col: &crate::entity::ColumnDef,
+    lines: &mut Vec<String>,
+) {
+    match (&old_col.generated, &new_col.generated) {
+        (Some(old_expr), Some(new_expr)) => {
+            if old_expr != new_expr {
+                lines.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET EXPRESSION AS ({new_expr});",
+                    entity_name, new_col.name
+                ));
+            }
+        }
+        (Some(_), None) => lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} DROP EXPRESSION;",
+            entity_name, new_col.name
+        )),
+        (None, Some(expr)) => {
+            lines.push(format!("ALTER TABLE {} DROP COLUMN {};", entity_name, new_col.name));
+            lines.push(format!(
+                "ALTER TABLE {} ADD COLUMN {} {} GENERATED ALWAYS AS ({expr}) STORED;",
+                entity_name, new_col.name, new_col.data_type
+            ));
+        }
+        (None, None) => unreachable!("caller checks at least one side is generated"),
+    }
+}
+
 /// Push the `ALTER TABLE … ALTER COLUMN …` statements for a column whose type,
 /// nullability, or default value changed.
 fn push_column_alter_sql(
@@ -303,6 +352,16 @@ fn push_column_alter_sql(
     new_col: &crate::entity::ColumnDef,
     lines: &mut Vec<String>,
 ) {
+    // A `GENERATED ALWAYS AS (…) STORED` column is settled on its own terms and
+    // then left alone: its value comes from the expression, so every DEFAULT verb
+    // below is one Postgres refuses outright ("column … is a generated column").
+    // Postgres stores the expression in `pg_attrdef` — the same catalog a real
+    // DEFAULT uses — which is how it came to be read as one (issue #16).
+    if old_col.generated.is_some() || new_col.generated.is_some() {
+        push_generated_alter_sql(entity_name, old_col, new_col, lines);
+        return;
+    }
+
     let type_changed = old_col.data_type != new_col.data_type;
 
     // A default the new type can't absorb blocks the type change itself —

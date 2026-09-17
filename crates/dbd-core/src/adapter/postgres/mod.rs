@@ -534,6 +534,7 @@ impl PostgresAdapter {
         let cols_sql = "SELECT a.attname AS column_name, \
                     a.attnotnull, \
                     a.attidentity::text AS attidentity, \
+                    a.attgenerated::text AS attgenerated, \
                     pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
                     format_type(a.atttypid, a.atttypmod) AS col_type, \
                     a.atttypid::regtype::text AS underlying_type, \
@@ -570,6 +571,7 @@ impl PostgresAdapter {
                 let attnotnull: bool = row.get("attnotnull");
                 let default_value: Option<String> = row.get("column_default");
                 let attidentity: String = row.get("attidentity");
+                let attgenerated: String = row.get("attgenerated");
                 let underlying_type: String = row.get("underlying_type");
                 let owns_default_seq: bool = row.get("owns_default_seq");
                 let comment: Option<String> = row.get("col_comment");
@@ -580,6 +582,21 @@ impl PostgresAdapter {
                     "a" => Some(crate::entity::IdentityKind::Always),
                     "d" => Some(crate::entity::IdentityKind::ByDefault),
                     _ => None,
+                };
+
+                // `GENERATED ALWAYS AS (expr) STORED` ('s'). A DIFFERENT feature
+                // from `attidentity` above, but Postgres stores its expression in
+                // `pg_attrdef` — the very place an ordinary DEFAULT lives, and the
+                // same place `column_default` was just read from. Claim it as the
+                // generation expression and leave no default behind, or reconcile
+                // sees a default the design never declared and plans
+                // `ALTER COLUMN … DROP DEFAULT`, which Postgres rejects outright:
+                // *"column … is a generated column"* (issue #16).
+                let is_generated = attgenerated == "s";
+                let (generated, default_value) = if is_generated {
+                    (default_value, None)
+                } else {
+                    (None, default_value)
                 };
 
                 // Serial detection: a `nextval('…'::regclass)` default whose sequence is
@@ -615,6 +632,7 @@ impl PostgresAdapter {
                     is_pk: false,     // filled from constraints
                     is_unique: false, // filled from constraints
                     identity,
+                    generated,
                     comment,
                     inline_fk: None,
                 }
