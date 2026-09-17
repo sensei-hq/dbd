@@ -216,6 +216,22 @@ pub struct ColumnDef {
     /// carried `is_identity`) still deserialize — the obsolete field is ignored.
     #[serde(default)]
     pub identity: Option<IdentityKind>,
+    /// The expression of a `GENERATED ALWAYS AS (<expr>) STORED` computed column
+    /// (`pg_attribute.attgenerated = 's'`), or `None`.
+    ///
+    /// Distinct from [`Self::identity`], which is the sequence-backed
+    /// `GENERATED … AS IDENTITY`, and it must stay distinct from
+    /// [`Self::default_value`]: Postgres exposes the generation expression
+    /// through `pg_attrdef`, exactly where an ordinary `DEFAULT` lives. Reading
+    /// it as a default made reconcile plan
+    /// `ALTER COLUMN … DROP DEFAULT`, which Postgres refuses with
+    /// *"column … is a generated column"* — aborting every reconcile on any
+    /// project containing one (issue #16).
+    ///
+    /// `#[serde(default)]` so snapshots written before this field existed still
+    /// deserialize.
+    #[serde(default)]
+    pub generated: Option<String>,
     pub comment: Option<String>,
     pub inline_fk: Option<ForeignKey>,
 }

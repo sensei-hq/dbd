@@ -688,6 +688,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 is_pk: false,
                 is_unique: false,
                 identity: None,
+                generated: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -699,6 +700,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 is_pk: false,
                 is_unique: false,
                 identity: None,
+                generated: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -710,6 +712,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 is_pk: false,
                 is_unique: false,
                 identity: None,
+                generated: None,
                 comment: None,
                 inline_fk: None,
             },
@@ -3431,4 +3434,114 @@ async fn removing_an_enum_value_still_in_use_fails_without_half_applying() {
     .await;
     assert_catalog(&*adapter, true, "SELECT 1 FROM app.t WHERE c = 'blue'", "the blue row").await;
     assert_catalog(&*adapter, true, "SELECT 1 FROM app.t_v WHERE id = 1", "view app.t_v").await;
+}
+
+// ── Reconcile convergence: generated columns and varchar CHECKs ───────────────
+
+/// The reconcile plan's ALTER SQL, or an empty vec when it is in sync.
+async fn altered_sql(design: &Design, adapter: &dyn dbd_core::DatabaseAdapter) -> Vec<String> {
+    design
+        .reconcile(adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("dry-run reconcile failed")
+        .altered
+        .into_iter()
+        .map(|s| s.sql)
+        .collect()
+}
+
+/// Issues #16 and #17, checked against a real server because neither is
+/// reproducible from unit tests: both come from the asymmetry between what the
+/// design says and what Postgres stores, which only a live catalog exhibits.
+///
+/// - **#16** — `GENERATED ALWAYS AS (…) STORED` keeps its expression in
+///   `pg_attrdef`, the same catalog an ordinary `DEFAULT` uses. Read as a default,
+///   reconcile planned `ALTER COLUMN … DROP DEFAULT`, which Postgres refuses
+///   ("column … is a generated column"), aborting the run.
+/// - **#17** — a `CHECK`/index predicate over a `varchar` column is stored with
+///   the `::text` cast Postgres inserts, so the design key and the live key never
+///   matched and the constraint was dropped and re-added on every run.
+///
+/// `n::text <> ''` on an `integer` column is in the fixture deliberately: that
+/// cast is the author's and must survive, so this also pins the line between the
+/// two cases.
+#[tokio::test]
+async fn reconcile_converges_generated_columns_and_varchar_checks() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_gen_check_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_gen_check_test\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/chk.ddl"),
+        "set search_path to app;\n\
+         create table if not exists chk (\n\
+           name varchar(100) not null\n\
+         , kind varchar(20)  not null\n\
+         , n    integer\n\
+         , constraint chk_name_lower check (name = lower(name))\n\
+         , constraint chk_kind_in    check (kind in ('a', 'b'))\n\
+         , constraint chk_name_len   check (length(name) > 2)\n\
+         , constraint chk_n_text     check (n::text <> '')\n\
+         );\n\
+         create index if not exists chk_partial_ix on chk (n) where name = lower(name);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/gen.ddl"),
+        "set search_path to app;\n\
+         create table if not exists gen (\n\
+           content text\n\
+         , tsv tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored\n\
+         );\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    // Freshly applied → nothing to do. Before the fix this produced a
+    // `DROP DEFAULT` on the generated column plus a drop/re-add of all three
+    // varchar CHECKs and a drop/re-create of the partial index.
+    let sql = altered_sql(&design, &*adapter).await;
+    assert!(
+        sql.is_empty(),
+        "a freshly applied design must reconcile to no change; got {sql:?}"
+    );
+
+    // The generated column really is generated on the server — proving the
+    // convergence came from reading it correctly, not from dbd dropping the
+    // clause on both sides.
+    let generated: Option<String> = adapter
+        .introspect()
+        .await
+        .expect("introspect failed")
+        .into_iter()
+        .find(|e| e.name == "app.gen")
+        .and_then(|e| e.table_def)
+        .and_then(|td| td.columns.iter().find(|c| c.name == "tsv").cloned())
+        .and_then(|c| c.generated);
+    assert!(
+        generated.is_some_and(|g| g.contains("to_tsvector")),
+        "the STORED expression must be read as `generated`, not as a default"
+    );
+
+    // Convergence is a two-run property: one pass can restore drift while still
+    // churning, and a single clean run looks identical to a real fix.
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile failed");
+    let sql = altered_sql(&design, &*adapter).await;
+    assert!(sql.is_empty(), "reconcile must be idempotent; second pass got {sql:?}");
 }
