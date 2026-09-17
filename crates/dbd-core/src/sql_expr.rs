@@ -53,6 +53,15 @@
 
 use pg_query::NodeEnum;
 use pg_query::protobuf::{AArrayExpr, AExpr, AExprKind, BoolExpr, BoolExprType, Node, TypeCast, TypeName};
+use std::collections::HashSet;
+
+/// Columns whose declared type Postgres **binary-coerces** to `text`, so a
+/// `(col)::text` in an introspected expression is a cast Postgres inserted for
+/// its own bookkeeping and erasing it changes nothing at runtime.
+///
+/// Empty means "types unknown" — every column cast is then kept, which is the
+/// safe reading and the behaviour of [`canonicalize_predicate`].
+pub type CoercibleColumns = HashSet<String>;
 
 /// Canonicalize a boolean SQL expression, or `None` if it can't be parsed or
 /// re-deparsed.
@@ -61,9 +70,34 @@ use pg_query::protobuf::{AArrayExpr, AExpr, AExprKind, BoolExpr, BoolExprType, N
 /// back and emit it in generated DDL. `None` means "leave the raw text alone and
 /// tell the user", never "assume unchanged".
 pub fn canonicalize_predicate(expr: &str) -> Option<String> {
+    canonicalize_predicate_for_columns(expr, &CoercibleColumns::new())
+}
+
+/// [`canonicalize_predicate`], plus rewrite 6: erase the `::text` cast Postgres
+/// inserts on a reference to a column it binary-coerces to `text`.
+///
+/// A `CHECK (name = lower(name))` on a `varchar` column is stored by Postgres as
+/// `CHECK ((name)::text = lower((name)::text))` — `lower()` returns `text`, so
+/// analysis coerces the column to match. Without this the design key and the
+/// live key never meet and the constraint reads as drift on every reconcile,
+/// forever (issue #17).
+///
+/// **Only binary-coercible columns qualify, and that is the whole point.**
+/// `pg_cast` records `varchar → text` as `castmethod = 'b'`: the two share a
+/// representation, so the cast is a runtime no-op. `bpchar → text` is
+/// `castmethod = 'f'` running `rtrim1`, which *strips trailing spaces* — erasing
+/// that one would change what the predicate accepts, so `char(n)` columns are
+/// deliberately excluded and keep reading as drift. A cast on any other column
+/// (`n::text` where `n` is `integer`) is one the author wrote and it stays, which
+/// is the rule [`canonicalize_predicate`] already enforced for every column.
+///
+/// `cols` holds the bare, lower-cased names of the qualifying columns — see
+/// [`crate::reconcile::coercible_columns`], which derives it from a table's
+/// declared types.
+pub fn canonicalize_predicate_for_columns(expr: &str, cols: &CoercibleColumns) -> Option<String> {
     // `SELECT 1 WHERE (<expr>)` — the wrapper makes a bare predicate parseable
     // and the added parens keep a top-level `OR` from re-associating.
-    canonicalize_wrapped(&format!("SELECT 1 WHERE ({expr})"), "SELECT 1 WHERE ")
+    canonicalize_wrapped(&format!("SELECT 1 WHERE ({expr})"), "SELECT 1 WHERE ", cols)
 }
 
 /// Canonicalize a non-boolean SQL expression — an index key like
@@ -74,15 +108,22 @@ pub fn canonicalize_predicate(expr: &str) -> Option<String> {
 /// legal. Used so an authored expression index matches the
 /// `(context ->> 'module'::text)` Postgres reports back.
 pub fn canonicalize_expression(expr: &str) -> Option<String> {
-    canonicalize_wrapped(&format!("SELECT ({expr})"), "SELECT ")
+    canonicalize_expression_for_columns(expr, &CoercibleColumns::new())
+}
+
+/// [`canonicalize_expression`] with the binary-coercible column rewrite applied —
+/// see [`canonicalize_predicate_for_columns`]. An expression index over a
+/// `varchar` column drifts for exactly the same reason a CHECK does.
+pub fn canonicalize_expression_for_columns(expr: &str, cols: &CoercibleColumns) -> Option<String> {
+    canonicalize_wrapped(&format!("SELECT ({expr})"), "SELECT ", cols)
 }
 
 /// Parse `sql`, normalize its expression tree, re-deparse, and strip `prefix`.
-fn canonicalize_wrapped(sql: &str, prefix: &str) -> Option<String> {
+fn canonicalize_wrapped(sql: &str, prefix: &str, cols: &CoercibleColumns) -> Option<String> {
     let mut parsed = pg_query::parse(sql).ok()?;
     for stmt in &mut parsed.protobuf.stmts {
         if let Some(node) = stmt.stmt.as_mut() {
-            normalize(node);
+            normalize(node, cols);
         }
     }
     let deparsed = pg_query::deparse(&parsed.protobuf).ok()?;
@@ -92,7 +133,7 @@ fn canonicalize_wrapped(sql: &str, prefix: &str) -> Option<String> {
 /// Rewrite `node` in place, then recurse into the expression children of the
 /// node kinds that can appear in a predicate. Node kinds that cannot are left
 /// untouched — see the module note on failing safe.
-fn normalize(node: &mut Node) {
+fn normalize(node: &mut Node, cols: &CoercibleColumns) {
     any_array_to_in(node);
     between_to_comparisons(node);
     lift_array_element_casts(node);
@@ -100,48 +141,48 @@ fn normalize(node: &mut Node) {
     match node.node.as_mut() {
         Some(NodeEnum::SelectStmt(s)) => {
             if let Some(w) = s.where_clause.as_mut() {
-                normalize(w);
+                normalize(w, cols);
             }
-            normalize_each(&mut s.target_list);
+            normalize_each(&mut s.target_list, cols);
         }
         Some(NodeEnum::ResTarget(t)) => {
-            drop_literal_cast(&mut t.val);
+            drop_erasable_cast(&mut t.val, cols);
             if let Some(val) = t.val.as_mut() {
-                normalize(val);
+                normalize(val, cols);
             }
         }
         Some(NodeEnum::AExpr(e)) => {
             for slot in [&mut e.lexpr, &mut e.rexpr] {
-                drop_literal_cast(slot);
+                drop_erasable_cast(slot, cols);
                 if let Some(child) = slot.as_mut() {
-                    normalize(child);
+                    normalize(child, cols);
                 }
             }
         }
-        Some(NodeEnum::BoolExpr(e)) => normalize_each(&mut e.args),
-        Some(NodeEnum::CoalesceExpr(e)) => normalize_each(&mut e.args),
-        Some(NodeEnum::FuncCall(f)) => normalize_each(&mut f.args),
-        Some(NodeEnum::AArrayExpr(a)) => normalize_each(&mut a.elements),
-        Some(NodeEnum::List(l)) => normalize_each(&mut l.items),
-        Some(NodeEnum::RowExpr(r)) => normalize_each(&mut r.args),
+        Some(NodeEnum::BoolExpr(e)) => normalize_each(&mut e.args, cols),
+        Some(NodeEnum::CoalesceExpr(e)) => normalize_each(&mut e.args, cols),
+        Some(NodeEnum::FuncCall(f)) => normalize_each(&mut f.args, cols),
+        Some(NodeEnum::AArrayExpr(a)) => normalize_each(&mut a.elements, cols),
+        Some(NodeEnum::List(l)) => normalize_each(&mut l.items, cols),
+        Some(NodeEnum::RowExpr(r)) => normalize_each(&mut r.args, cols),
         Some(NodeEnum::NullTest(t)) => {
-            drop_literal_cast(&mut t.arg);
+            drop_erasable_cast(&mut t.arg, cols);
             if let Some(arg) = t.arg.as_mut() {
-                normalize(arg);
+                normalize(arg, cols);
             }
         }
         Some(NodeEnum::BooleanTest(t)) => {
-            drop_literal_cast(&mut t.arg);
+            drop_erasable_cast(&mut t.arg, cols);
             if let Some(arg) = t.arg.as_mut() {
-                normalize(arg);
+                normalize(arg, cols);
             }
         }
         // A cast dbd keeps (its argument is not a bare literal) — normalize
         // beneath it so a nested `('x'::text)::varchar` still loses the inner one.
         Some(NodeEnum::TypeCast(c)) => {
-            drop_literal_cast(&mut c.arg);
+            drop_erasable_cast(&mut c.arg, cols);
             if let Some(arg) = c.arg.as_mut() {
-                normalize(arg);
+                normalize(arg, cols);
             }
         }
         _ => {}
@@ -203,22 +244,68 @@ fn flatten_bool_chain(node: &mut Node) {
     }
 }
 
-/// Strip literal casts from, then recurse into, every element of a child list.
-fn normalize_each(nodes: &mut [Node]) {
+/// Strip erasable casts from, then recurse into, every element of a child list.
+fn normalize_each(nodes: &mut [Node], cols: &CoercibleColumns) {
     for n in nodes.iter_mut() {
-        if let Some(inner) = literal_cast_arg(n) {
+        if let Some(inner) = erasable_cast_arg(n, cols) {
             *n = inner;
         }
-        normalize(n);
+        normalize(n, cols);
     }
 }
 
-/// Replace a `TypeCast` over a bare literal with the literal itself.
-fn drop_literal_cast(slot: &mut Option<Box<Node>>) {
+/// Replace a `TypeCast` dbd can erase with its argument.
+fn drop_erasable_cast(slot: &mut Option<Box<Node>>, cols: &CoercibleColumns) {
     let Some(node) = slot.as_deref() else { return };
-    if let Some(inner) = literal_cast_arg(node) {
+    if let Some(inner) = erasable_cast_arg(node, cols) {
         *slot = Some(Box::new(inner));
     }
+}
+
+/// The argument of a `TypeCast` dbd may erase: a cast over a bare literal
+/// (rewrite 2), or a `::text` over a column Postgres binary-coerces to `text`
+/// (rewrite 6). Anything else is meaningful and is reported as `None` so the
+/// caller keeps it.
+fn erasable_cast_arg(node: &Node, cols: &CoercibleColumns) -> Option<Node> {
+    literal_cast_arg(node).or_else(|| coercible_column_cast_arg(node, cols))
+}
+
+/// The column inside a `(col)::text` where `col`'s declared type is
+/// binary-coercible to `text` — the cast Postgres itself inserted, which erasing
+/// cannot change the meaning of. See [`canonicalize_predicate_for_columns`].
+fn coercible_column_cast_arg(node: &Node, cols: &CoercibleColumns) -> Option<Node> {
+    if cols.is_empty() {
+        return None;
+    }
+    let Some(NodeEnum::TypeCast(cast)) = &node.node else {
+        return None;
+    };
+    if !is_bare_text_type(cast.type_name.as_ref()?) {
+        return None;
+    }
+    let arg = cast.arg.as_deref()?;
+    let Some(NodeEnum::ColumnRef(cref)) = &arg.node else {
+        return None;
+    };
+    // A qualified `t.name` names the same column as a bare `name`; a CHECK body
+    // and an index predicate are both single-table, so the last field is it.
+    let Some(NodeEnum::String(field)) = &cref.fields.last()?.node else {
+        return None;
+    };
+    cols.contains(&field.sval.to_lowercase()).then(|| arg.clone())
+}
+
+/// Is this the scalar type `text` (`text`, or `pg_catalog.text` as Postgres
+/// spells it back)? An array type (`text[]`) is not — erasing a cast to an array
+/// would change the operand's shape, not just its label.
+fn is_bare_text_type(ty: &TypeName) -> bool {
+    if !ty.array_bounds.is_empty() {
+        return false;
+    }
+    matches!(
+        ty.names.last().and_then(|n| n.node.as_ref()),
+        Some(NodeEnum::String(s)) if s.sval.eq_ignore_ascii_case("text")
+    )
 }
 
 /// The literal inside a `TypeCast` over an `A_Const`, if that's what this is.
@@ -251,18 +338,54 @@ fn any_array_to_in(node: &mut Node) {
     };
 
     // `ANY`/`ALL` also take a subquery or a plain array column, neither of which
-    // is an `IN` list — only the literal `ARRAY[…]` constructor converts.
-    let Some(NodeEnum::AArrayExpr(array)) = expr.rexpr.as_deref().and_then(|n| n.node.as_ref()) else {
+    // is an `IN` list — only the `ARRAY[…]` constructor converts.
+    let Some(items) = expr.rexpr.as_deref().and_then(in_list_elements) else {
         return;
     };
 
     expr.kind = AExprKind::AexprIn as i32;
     expr.rexpr = Some(Box::new(Node {
-        node: Some(NodeEnum::List(pg_query::protobuf::List {
-            items: array.elements.clone(),
-        })),
+        node: Some(NodeEnum::List(pg_query::protobuf::List { items })),
     }));
     debug_assert_eq!(operator_name(expr).as_deref(), Some(op));
+}
+
+/// The `IN` list hiding inside the right operand of an `= ANY`/`<> ALL`, if
+/// there is one.
+///
+/// A bare `ARRAY[…]` is one directly. Postgres also wraps the constructor in a
+/// cast when it coerced the left operand to match — `name in ('a','b')` on a
+/// `varchar` column is stored as
+/// `(name)::text = ANY ((ARRAY['a','b'])::text[])`, and rewrite 6 erasing the
+/// left cast is not enough on its own: the right side still reads as drift. That
+/// cast belongs to Postgres's analysis, and `IN` re-derives its element type from
+/// the left operand, so it comes off with the `ANY`.
+///
+/// **Only over a constructor of bare literals.** With a column or a call among
+/// the elements the cast can be load-bearing — `days <@ ARRAY[1,2,3]::smallint[]`
+/// in rewrite 4 — so those are left for rewrite 4 and read as changed rather than
+/// be rewritten into something that means something else.
+fn in_list_elements(node: &Node) -> Option<Vec<Node>> {
+    let mut cur = node;
+    let mut through_cast = false;
+    loop {
+        match cur.node.as_ref()? {
+            NodeEnum::AArrayExpr(array) => {
+                let all_literals = array.elements.iter().all(is_literal_element);
+                return (!through_cast || all_literals).then(|| array.elements.clone());
+            }
+            NodeEnum::TypeCast(cast) if !cast.type_name.as_ref()?.array_bounds.is_empty() => {
+                through_cast = true;
+                cur = cast.arg.as_deref()?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// A literal, with or without a cast Postgres put on it.
+fn is_literal_element(node: &Node) -> bool {
+    matches!(node.node, Some(NodeEnum::AConst(_))) || literal_cast_arg(node).is_some()
 }
 
 /// Expand `BETWEEN` into the comparison pair Postgres stores in its place.
@@ -586,10 +709,77 @@ mod tests {
     }
 
     /// A cast on a column changes comparison semantics, so it is NOT drift-erased.
+    /// With no column types supplied, dbd cannot know the cast is a no-op.
     #[test]
     fn column_casts_are_preserved() {
         let canon = canonicalize_predicate("(code)::text = 'x'").expect("parses");
         assert!(canon.contains("::text"), "column cast must survive; got {canon}");
+    }
+
+    // ── varchar's implicit ::text cast (issue #17) ───────────────
+    //
+    // Every `introspected` string below is real `pg_get_constraintdef(oid, true)`
+    // output captured from PG 17 for the matching authored CHECK on a
+    // `varchar(100)` column — not a guess at what Postgres emits.
+
+    /// Both spellings converge once the binary-coercible columns are known.
+    fn assert_converges_for(authored: &str, introspected: &str, cols: &[&str]) {
+        let cols: HashSet<String> = cols.iter().map(|c| (*c).to_string()).collect();
+        let a = canonicalize_predicate_for_columns(authored, &cols)
+            .unwrap_or_else(|| panic!("authored form did not canonicalize: {authored}"));
+        let i = canonicalize_predicate_for_columns(introspected, &cols)
+            .unwrap_or_else(|| panic!("introspected form did not canonicalize: {introspected}"));
+        assert_eq!(a, i, "\n  authored:     {authored}\n  introspected: {introspected}");
+    }
+
+    #[test]
+    fn varchar_check_converges_with_the_cast_postgres_inserts() {
+        assert_converges_for("name = lower(name)", "name::text = lower(name::text)", &["name"]);
+    }
+
+    #[test]
+    fn varchar_cast_inside_a_function_argument_converges() {
+        assert_converges_for("length(name) > 2", "length(name::text) > 2", &["name"]);
+    }
+
+    #[test]
+    fn varchar_in_list_converges_with_the_analyzed_any_array() {
+        assert_converges_for(
+            "name in ('a', 'b')",
+            "name::text = ANY (ARRAY['a'::character varying, 'b'::character varying]::text[])",
+            &["name"],
+        );
+    }
+
+    /// The whole point of keying on the column: `n` is `integer`, so `n::text` is
+    /// a cast the AUTHOR wrote and it changes what the predicate compares. Only
+    /// columns Postgres binary-coerces to text may lose their cast.
+    #[test]
+    fn a_cast_on_a_non_coercible_column_still_survives() {
+        let cols: HashSet<String> = ["name".to_string()].into();
+        let canon = canonicalize_predicate_for_columns("n::text <> ''", &cols).expect("parses");
+        assert!(canon.contains("::text"), "semantic cast must survive; got {canon}");
+    }
+
+    /// Dropping the cast must not make two different predicates compare equal.
+    #[test]
+    fn coercing_does_not_collapse_different_predicates() {
+        let cols: HashSet<String> = ["name".to_string()].into();
+        let canon = |e: &str| canonicalize_predicate_for_columns(e, &cols).expect("parses");
+        assert_ne!(canon("name = lower(name)"), canon("name = upper(name)"));
+        assert_ne!(canon("name = 'a'"), canon("other::text = 'a'"));
+    }
+
+    /// The canonical form is EMITTED, so it has to survive a second pass
+    /// unchanged — otherwise reconcile churns on its own output.
+    #[test]
+    fn coerced_form_is_idempotent() {
+        let cols: HashSet<String> = ["name".to_string()].into();
+        for expr in ["name::text = lower(name::text)", "length(name::text) > 2"] {
+            let once = canonicalize_predicate_for_columns(expr, &cols).expect("parses");
+            let twice = canonicalize_predicate_for_columns(&once, &cols).expect("re-parses");
+            assert_eq!(once, twice, "not idempotent for {expr}");
+        }
     }
 
     /// Two genuinely different predicates must not collapse into one form.

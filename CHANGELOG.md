@@ -9,12 +9,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-**No change to `dbd-core` or the `dbd` CLI.** The Rust tree is byte-identical to
-0.13.0, which is why these changes carry no version bump: a tag is this repo's
-release artifact and publishes to crates.io, and cutting one here would push a
-version whose crate code is identical to the one before it. The documentation
-site, CI and repo metadata changed; they ship on merge to `main`, and the next
-tag will fold this section into its release notes.
+## [0.13.1] — 2026-09-17
+
+Two reconcile convergence fixes in `dbd-core` (#16, #17), released alongside the
+docs-site, CI and repo-metadata work that had been accumulating unversioned. That
+work alone left the Rust tree byte-identical to 0.13.0 and so carried no bump;
+these two fixes change `dbd-core`, which is what makes this a patch release.
 
 ### Security
 
@@ -42,6 +42,34 @@ tag will fold this section into its release notes.
   with no cooldown turns one compromised publish into a merged commit.
 
 ### Fixed
+
+- **`reconcile` aborted on any project containing a `STORED` generated column**
+  ([#16]). Postgres keeps a `GENERATED ALWAYS AS (…) STORED` expression in
+  `pg_attrdef` — the same catalog an ordinary `DEFAULT` lives in — and
+  introspection read it as one. Reconcile then saw a default the design never
+  declared and planned `ALTER COLUMN … DROP DEFAULT`, which Postgres refuses
+  outright (*"column … is a generated column"*), failing the whole run even
+  when the column matched the design exactly. Introspection now reads
+  `pg_attribute.attgenerated` and both parsers keep the expression on the new
+  `ColumnDef::generated`, so the two sides converge. A genuinely changed
+  expression now emits the verb Postgres accepts — `SET EXPRESSION AS` (PG17+),
+  or `DROP EXPRESSION` when the generation is removed — and the emitter renders
+  the `GENERATED … STORED` clause, which stops `reset`/`diff` from silently
+  recreating a computed column as a plain one.
+
+- **A `CHECK` or partial-index predicate over a `varchar` column never
+  converged** ([#17]). Postgres rewrites such a predicate to add the implicit
+  `::text` cast before storing it (`name = lower(name)` becomes
+  `(name)::text = lower((name)::text)`), so the design key and the live key
+  could never match: the constraint was dropped and re-added with an identical
+  definition on every single run. Because those are drops, an otherwise additive
+  change could not be applied without also authorising `--allow-destructive`.
+  Canonicalization now erases a `::text` cast on a column Postgres
+  **binary-coerces** to `text`, which is `varchar` alone — `pg_cast` records it
+  as `castmethod = 'b'`, a runtime no-op. `char(n)` is deliberately excluded:
+  its cast runs `rtrim1` and strips trailing spaces, so erasing it would change
+  what the predicate accepts. A cast on any other column (`n::text` where `n` is
+  `integer`) is the author's and still stands.
 
 - **`bun run check` could not run at all.** `svelte-check` 4.x refuses to start
   when the `typescript` package is major 7; the site had been on `typescript@7`
@@ -170,5 +198,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 
 [#12]: https://github.com/sensei-hq/dbd/issues/12
 [#13]: https://github.com/sensei-hq/dbd/issues/13
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.0...main
+[#16]: https://github.com/sensei-hq/dbd/issues/16
+[#17]: https://github.com/sensei-hq/dbd/issues/17
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0

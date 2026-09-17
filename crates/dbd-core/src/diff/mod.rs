@@ -29,6 +29,7 @@ mod tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: None,
         }
@@ -46,6 +47,14 @@ mod tests {
     fn col_with_default(name: &str, data_type: &str, default: &str) -> ColumnDef {
         ColumnDef {
             default_value: Some(default.to_string()),
+            ..col(name, data_type)
+        }
+    }
+
+    /// `GENERATED ALWAYS AS (expr) STORED` computed column.
+    fn col_generated(name: &str, data_type: &str, expr: &str) -> ColumnDef {
+        ColumnDef {
+            generated: Some(expr.to_string()),
             ..col(name, data_type)
         }
     }

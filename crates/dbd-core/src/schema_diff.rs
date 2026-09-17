@@ -113,10 +113,15 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
             .collect();
         t.indexes.retain(|i| !backs_a_constraint(i, &constraint_cols));
 
+        // The columns whose `::text` cast Postgres inserted itself, so an index
+        // predicate and a CHECK over a `varchar` column converge with the form
+        // introspection reports (issue #17).
+        let coercible = crate::reconcile::coercible_columns(&t.columns);
+
         // Settle each index's default spellings (explicit `using btree`, explicit
         // `asc`) so an authored index and an introspected one compare equal.
         for ix in &mut t.indexes {
-            normalize_index(ix);
+            normalize_index(ix, &coercible);
         }
 
         // Canonicalize CHECK expressions so equivalent spellings (extra parens,
@@ -124,7 +129,7 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
         // expression we can't parse is left raw and flagged, never silently hidden.
         for con in &mut t.table_constraints {
             if let TableConstraint::Check { name, expression } = con {
-                match canonicalize_check_expr(expression) {
+                match canonicalize_check_expr(expression, &coercible) {
                     Some(canon) => *expression = canon,
                     None => advisories.push(format!(
                         "CHECK {} on {}.{} couldn't be normalized — shown as changed; verify manually",
@@ -172,7 +177,7 @@ pub(crate) fn backs_a_constraint(ix: &IndexDef, constraint_cols: &std::collectio
 ///
 /// Callers must apply this to a COPY. Both do: `normalize_for_diff` works on the
 /// throwaway snapshots it diffs, and `reconcile::index_shape` clones first.
-pub(crate) fn normalize_index(ix: &mut IndexDef) {
+pub(crate) fn normalize_index(ix: &mut IndexDef, cols: &crate::sql_expr::CoercibleColumns) {
     use crate::entity::{IndexType, SortOrder};
     if ix.index_type == Some(IndexType::Btree) {
         ix.index_type = None;
@@ -185,13 +190,13 @@ pub(crate) fn normalize_index(ix: &mut IndexDef) {
         // and `(context ->> 'module'::text)` from Postgres — the same normalization
         // the predicate needs, and for the same reason.
         if col.is_expression
-            && let Some(canon) = crate::sql_expr::canonicalize_expression(&col.name)
+            && let Some(canon) = crate::sql_expr::canonicalize_expression_for_columns(&col.name, cols)
         {
             col.name = canon;
         }
     }
     if let Some(pred) = ix.predicate.as_ref()
-        && let Some(canon) = crate::sql_expr::canonicalize_predicate(pred)
+        && let Some(canon) = crate::sql_expr::canonicalize_predicate_for_columns(pred, cols)
     {
         ix.predicate = Some(canon);
     }
@@ -203,8 +208,8 @@ pub(crate) fn normalize_index(ix: &mut IndexDef) {
 ///
 /// Returns `None` if the expression can't be parsed or re-deparsed; the caller
 /// records an advisory and keeps the raw text, so a real diff is never hidden.
-fn canonicalize_check_expr(expr: &str) -> Option<String> {
-    crate::sql_expr::canonicalize_predicate(expr)
+fn canonicalize_check_expr(expr: &str, cols: &crate::sql_expr::CoercibleColumns) -> Option<String> {
+    crate::sql_expr::canonicalize_predicate_for_columns(expr, cols)
 }
 
 /// Normalize a foreign key so a parsed (design) and an introspected (live) form
@@ -248,6 +253,7 @@ mod tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: None,
         }

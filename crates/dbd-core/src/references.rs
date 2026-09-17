@@ -330,6 +330,7 @@ mod tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: Some(bare_fk("ns_inline")),
         };

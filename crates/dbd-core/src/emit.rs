@@ -136,6 +136,13 @@ fn emit_column_line(c: &crate::entity::ColumnDef) -> String {
     if !c.nullable {
         col.push_str(" NOT NULL");
     }
+    // A computed column takes its value from the expression, never a DEFAULT —
+    // Postgres rejects a column carrying both. Emitting the clause is what keeps
+    // `reset`/`diff` from silently recreating the column as a plain one (#16).
+    if let Some(expr) = &c.generated {
+        col.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"));
+        return col;
+    }
     if let Some(d) = &c.default_value {
         col.push_str(&format!(" DEFAULT {d}"));
     }
@@ -425,6 +432,7 @@ mod tests {
                     is_pk: true,
                     is_unique: false,
                     identity: None,
+                    generated: None,
                     comment: Some("Order PK".into()),
                     inline_fk: None,
                 },
@@ -436,6 +444,7 @@ mod tests {
                     is_pk: false,
                     is_unique: false,
                     identity: None,
+                    generated: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -447,6 +456,7 @@ mod tests {
                     is_pk: false,
                     is_unique: false,
                     identity: None,
+                    generated: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -688,6 +698,57 @@ mod tests {
         assert_eq!(emit_sequence(&e), "CREATE SEQUENCE \"app\".\"counter\";");
     }
 
+    /// A computed column must carry its `GENERATED … STORED` clause into the
+    /// emitted DDL and never a `DEFAULT` — otherwise `reset`/`diff` recreate it
+    /// as a plain column and the generation is silently lost (issue #16).
+    #[test]
+    fn emit_table_generated_column_renders_the_clause_not_a_default() {
+        use crate::entity::{ColumnDef, TableDef};
+
+        let mut e = Entity::new(EntityType::Table, "app.docs");
+        e.schema = Some("app".into());
+        e.table_def = Some(TableDef {
+            columns: vec![
+                ColumnDef {
+                    name: "content".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    generated: None,
+                    comment: None,
+                    inline_fk: None,
+                },
+                ColumnDef {
+                    name: "tsv".into(),
+                    data_type: "tsvector".into(),
+                    nullable: true,
+                    default_value: None,
+                    is_pk: false,
+                    is_unique: false,
+                    identity: None,
+                    generated: Some("to_tsvector('english', coalesce(content, ''))".into()),
+                    comment: None,
+                    inline_fk: None,
+                },
+            ],
+            constraints: vec![],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        let sql = emit_table(&e);
+        assert!(
+            sql.contains("\"tsv\" tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(content, ''))) STORED"),
+            "got: {sql}"
+        );
+        assert!(
+            !sql.contains("DEFAULT"),
+            "a generated column takes no DEFAULT; got: {sql}"
+        );
+    }
+
     #[test]
     fn emit_table_serial_and_identity_columns() {
         use crate::entity::{ColumnDef, IdentityKind, TableConstraint, TableDef};
@@ -705,6 +766,7 @@ mod tests {
                     is_pk: false,
                     is_unique: false,
                     identity: None,
+                    generated: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -717,6 +779,7 @@ mod tests {
                     is_pk: false,
                     is_unique: false,
                     identity: Some(IdentityKind::Always),
+                    generated: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -729,6 +792,7 @@ mod tests {
                     is_pk: false,
                     is_unique: false,
                     identity: None,
+                    generated: None,
                     comment: None,
                     inline_fk: None,
                 },
@@ -779,6 +843,7 @@ mod tests {
                 is_pk: false,
                 is_unique: false,
                 identity: Some(IdentityKind::ByDefault),
+                generated: None,
                 comment: None,
                 inline_fk: None,
             }],
@@ -805,6 +870,7 @@ mod tests {
             is_pk: false,
             is_unique: false,
             identity: None,
+            generated: None,
             comment: None,
             inline_fk: None,
         };
