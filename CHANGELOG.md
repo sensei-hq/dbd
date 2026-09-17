@@ -9,10 +9,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-Two reconcile convergence fixes in `dbd-core` (#16, #17) land here alongside the
-earlier docs-site, CI and repo-metadata work. The Rust tree is **no longer**
-byte-identical to 0.13.0, so this section now warrants a patch release rather
-than merging unversioned as originally planned.
+## [0.13.1] — 2026-09-17
+
+Two reconcile convergence fixes in `dbd-core` (#16, #17), released alongside the
+docs-site, CI and repo-metadata work that had been accumulating unversioned. That
+work alone left the Rust tree byte-identical to 0.13.0 and so carried no bump;
+these two fixes change `dbd-core`, which is what makes this a patch release.
 
 ### Security
 
@@ -198,5 +200,6 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0
