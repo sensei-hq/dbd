@@ -33,6 +33,32 @@ export CARGO_INCREMENTAL := 0
 
 .PHONY: help bump patch minor major install clean sweep _check-clean _check-ci
 
+# Install from the working tree, then reclaim target/, leaving the install's own
+# status in `ok` for the caller to act on. Shared verbatim by `install` and the
+# post-push step of `bump`, which must end in the same state.
+#
+# The clean is deliberately in the SAME shell statement as the install: if it
+# were a separate recipe line, a failed install would abort the recipe and skip
+# it — and in `bump` that strands the tree *after* the tag is already public.
+# The clean's own exit status is inspected rather than assumed, so "target/
+# cleaned" is never printed over a clean that did not happen.
+#
+# Shared as a plain variable and NOT as a recursive `$(MAKE) install` on purpose:
+# make executes any recipe line containing `$(MAKE)` even under `-n`, so a
+# recursive call here would make `make -n bump` really wipe target/. Both
+# `a_dry_run_bump_does_not_touch_the_build_dir` and
+# `a_dry_run_install_does_not_touch_the_build_dir` pin that by side effect.
+define INSTALL_AND_RECLAIM
+cargo install --path . --locked --force; ok=$$?; \
+	 echo "Reclaiming disk: removing debug + stale build artifacts..."; \
+	 if cargo clean; then \
+	   echo "target/ cleaned; next build recompiles against the current lockfile."; \
+	 else \
+	   echo "WARNING: cargo clean failed — target/ is still on disk."; \
+	   if [ $$ok -eq 0 ]; then ok=1; fi; \
+	 fi
+endef
+
 ## Show this help.
 help:
 	@echo "Targets:"
@@ -40,7 +66,7 @@ help:
 	@echo "  make bump patch    Same as 'make bump'"
 	@echo "  make bump minor    Bump minor, commit, tag, push"
 	@echo "  make bump major    Bump major, commit, tag, push"
-	@echo "  make install       Install dbd into ~/.cargo/bin from working tree"
+	@echo "  make install       Install dbd into ~/.cargo/bin, then reclaim target/"
 	@echo "  make clean         Remove the target/ build directory (cargo clean)"
 	@echo "  make sweep         Prune stale/old-version artifacts (needs cargo-sweep)"
 	@echo ""
@@ -56,9 +82,14 @@ help:
 patch minor major:
 	@true
 
-## Install the dbd binary into ~/.cargo/bin from the current working tree.
+## Install the dbd binary into ~/.cargo/bin from the current working tree,
+## then reclaim target/ — `cargo install --path .` builds there, so leaving it
+## behind is ~1 GB the command itself created.
 install:
-	@cargo install --path . --locked --force
+	@trap 'echo ""; echo "Interrupted. Re-run: make install"; exit 130' INT; \
+	 $(INSTALL_AND_RECLAIM); \
+	 if [ $$ok -ne 0 ]; then exit $$ok; fi; \
+	 echo "dbd is on your PATH."
 
 ## Remove the target/ build directory to reclaim disk space.
 clean:
@@ -132,14 +163,7 @@ bump: _check-clean _check-ci
 	@echo "    gh workflow run release.yml -f tag=v$(NEW)"
 	@echo "Installing v$(NEW) into ~/.cargo/bin..."
 	@trap 'echo ""; echo "Interrupted. v$(NEW) is tagged and pushed, so the release itself is"; echo "complete. Run: make install   (do NOT run make bump)"; exit 130' INT; \
-	 cargo install --path . --locked --force; ok=$$?; \
-	 echo "Reclaiming disk: removing debug + stale build artifacts..."; \
-	 if cargo clean; then \
-	   echo "target/ cleaned; next build recompiles against the current lockfile."; \
-	 else \
-	   echo "WARNING: cargo clean failed — target/ is still on disk."; \
-	   if [ $$ok -eq 0 ]; then ok=1; fi; \
-	 fi; \
+	 $(INSTALL_AND_RECLAIM); \
 	 if [ $$ok -ne 0 ]; then \
 	   echo ""; \
 	   echo "v$(NEW) is tagged and pushed — the release itself is complete."; \
