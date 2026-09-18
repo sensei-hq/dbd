@@ -9,6 +9,20 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Changed
+
+- **`make install` now reclaims `target/`, matching `make bump`.** `cargo install
+  --path .` builds into `target/`, so the bare install left behind roughly a
+  gigabyte it had just created — and running it after a release silently undid
+  the reclaim the release had performed. Both entry points now share one
+  `INSTALL_AND_RECLAIM` block and end in the same state.
+
+  Shared as a plain make variable rather than a recursive `$(MAKE) install`,
+  deliberately: make executes any recipe line containing `$(MAKE)` even under
+  `-n`, so a recursive call would turn `make -n bump` into a real wipe. Two
+  tests pin that by side effect, because the printed recipe looks identical
+  either way.
+
 ### Security
 
 - **`rustls` 0.23.44 → 0.23.45** — RUSTSEC-2026-0285, "TLS 1.3 handshake messages

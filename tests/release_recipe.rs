@@ -318,3 +318,81 @@ fn a_failed_install_still_reclaims_the_build_dir() {
         cleans[0]
     );
 }
+
+// ── `make install` reclaims the build directory too ──────────────────────────
+
+fn install_recipe() -> String {
+    make(&["-n", "install"])
+}
+
+/// `make install` must reclaim `target/` the way `make bump` does.
+///
+/// `bump` ends by installing and then cleaning, so a release leaves no build
+/// directory behind. `install` used to be the bare `cargo install` alone, so the
+/// far more frequent command silently undid the reclaim — running it right after
+/// a release put ~1 GB straight back. Both entry points now end in the same
+/// state.
+#[test]
+fn install_reclaims_the_build_dir() {
+    let recipe = install_recipe();
+    let commands = logical_commands(&recipe);
+
+    let cleans: Vec<&String> = commands.iter().filter(|c| c.contains("cargo clean")).collect();
+    assert_eq!(cleans.len(), 1, "expected exactly one clean step:\n{recipe}");
+    assert!(
+        cleans[0].contains("cargo install"),
+        "`cargo clean` must share a shell statement with the install so a failed \
+         install cannot skip it; found it standing alone: {}",
+        cleans[0]
+    );
+}
+
+/// `install` must survive its own failures the way the post-push statement does.
+///
+/// Same three properties, and for the same reason: the clean runs whether or not
+/// the install succeeded, its own status is inspected rather than assumed, and
+/// the captured install status is re-raised so a failure is not merely printed.
+#[test]
+fn install_reports_every_way_it_can_fail() {
+    let statement = logical_commands(&install_recipe())
+        .into_iter()
+        .find(|c| c.contains("cargo clean"))
+        .expect("install must reclaim the build directory");
+
+    assert!(
+        statement.contains("exit $ok"),
+        "a failed install must fail the recipe after the clean, not just print: {statement}"
+    );
+    assert!(
+        statement.contains("if cargo clean"),
+        "the clean's exit status must be inspected before claiming target/ is gone: {statement}"
+    );
+    assert!(
+        statement.contains("trap ") && statement.contains("INT"),
+        "Ctrl-C during a multi-minute install must still explain the state: {statement}"
+    );
+}
+
+/// `make -n install` must stay a dry run.
+///
+/// The same trap `a_dry_run_bump_does_not_touch_the_build_dir` guards: make runs
+/// any recipe line containing `$(MAKE)` even under `-n`, so sharing the
+/// install+clean logic through a recursive call — rather than through a plain
+/// variable expansion — would turn every dry run into a real wipe. Asserted by
+/// side effect, because the printed recipe looks identical either way.
+#[test]
+fn a_dry_run_install_does_not_touch_the_build_dir() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sentinel = root.join("target/.dry-run-install-sentinel");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(&sentinel, "must survive a dry run").unwrap();
+
+    let _ = install_recipe();
+
+    let survived = sentinel.exists();
+    let _ = fs::remove_file(&sentinel);
+    assert!(
+        survived,
+        "`make -n install` deleted target/ — a dry run executed a real command"
+    );
+}
