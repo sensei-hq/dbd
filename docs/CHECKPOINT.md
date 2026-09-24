@@ -25,15 +25,24 @@ external embedders (issue #19, sensei's code indexer).
   correction comment on #19 (the six functions it names were the sqlparser
   layer and are now deleted; the real seam is a new `parse_sql`).
 
+- **`parse_sql` landed** (`c0cc392` red, `a20156b` green) — identity off the
+  statements. New `pg/declarations.rs` classifies declare-vs-attach and slices
+  statements by `stmt_location`/`stmt_len`; `parse_sql` reassembles each
+  entity's fragment and runs the existing per-type parser. 18 integration + 8
+  unit tests. Grouping was initially tested vacuously (index named the *first*
+  table, so match-by-name and match-first agree); mutating `owns()` to `true`
+  left everything green. Fixtures now name the second table and the mutation
+  fails four tests.
+
 ## Next
 
-Issue #19 — `parse_sql(sql, dialect) -> ParsedFile`, deriving entity
-type/schema/name from the statement rather than the path. Decided: keep dbd's
-rich `Entity` + `Reference` (sensei derives its nodes/edges from them);
-explicit dialect argument defaulting to PostgreSQL, not sniffed. Each `pg/*.rs`
-parser already walks the node holding the `RangeVar`/`funcname` and discards it.
+Fold `ALTER TABLE … ADD CONSTRAINT` into its table. `declarations::attaches_to`
+already has the shape for it (`AlterTableStmt.relation` is a `RangeVar`), but
+`pg::tables::extract` only reads `CreateStmt`/`IndexStmt`/`CommentStmt`, so the
+statement would be grouped and then ignored. Matters for migration-script
+corpora, which is most of what sensei will scan.
 
-    cargo test -p dbd-core --lib parser::
+    cargo test -p dbd-core --test parse_sql
 
 ## Open questions
 
