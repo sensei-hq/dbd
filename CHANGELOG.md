@@ -32,6 +32,21 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `sqlparser-rs` is still a dependency: `dbd format` and enum-candidate
   detection use it. It no longer reads DDL.
 
+### Fixed
+
+- **The pre-commit hook gated only the CLI.** `.githooks/pre-commit` ran
+  `cargo test` and `cargo clippy` without `--workspace`. The root package is
+  `dbd-cli`, deliberately not a workspace member, so both compiled the CLI and
+  stopped — `dbd-core` (parser, differ, adapters, 977 tests) was never built.
+  The hook printed "All checks passed." over a tree `cargo test --workspace`
+  failed with exit 101.
+
+  It now delegates to `make _check-ci`, the same pre-flight `make bump` runs,
+  which has had `--workspace` all along. The two were hand-maintained copies of
+  one list and drifted; there is one definition of green now, pinned by
+  `tests/pre_commit_hook.rs`. Contributor-facing only — CI and `make bump` both
+  pass `--workspace`, so no release shipped behind it.
+
 ### Changed
 
 - **BREAKING — `source.parser: sqlparser` is rejected.** A project still naming
