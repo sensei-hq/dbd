@@ -1,49 +1,54 @@
 # Checkpoint
 
-**Slice:** v0.13.1 shipped — reconcile convergence fixes for #16 and #17.
-Complete: tagged, published, merged to `main`, CI + CodeQL green, issues closed.
+**Slice:** Retire the sqlparser DDL path, then expose a per-file parser API for
+external embedders (issue #19, sensei's code indexer).
 
 ## Done
 
-- **#16 — STORED generated columns.** Postgres keeps the `GENERATED ALWAYS AS
-  (…) STORED` expression in `pg_attrdef`, where a plain DEFAULT lives, so
-  introspection read it as one and planned `DROP DEFAULT` — which Postgres
-  refuses, aborting every run. Now reads `attgenerated`; both parsers keep it on
-  the new `ColumnDef::generated`. Changed → `SET EXPRESSION AS` (PG17+); removed
-  → `DROP EXPRESSION`; the emitter renders the clause, so `reset`/`diff` stop
-  recreating a computed column as a plain one.
-- **#17 — varchar's implicit `::text` cast.** Canonicalization erases a `::text`
-  cast only on a **binary-coercible** column — `varchar` alone (`pg_cast
-  castmethod = 'b'`). `char(n)` excluded deliberately: its cast runs `rtrim1`
-  and strips trailing spaces, so erasing it would change meaning. Partial-index
-  predicates and `IN` lists fixed alongside CHECKs — same root cause.
-- **rustls 0.23.44 → 0.23.45** (RUSTSEC-2026-0285). Advisory published
-  2026-09-14; the pin predates v0.13.0, so `cargo audit` went red on the first
-  push to `main` after it landed, not on our change. Lockfile only.
-
-**Registry artifact verified:** `cargo install dbd-cli 0.13.1` from crates.io,
-run against both repros — `diff --exit-code` = 0 and two consecutive reconciles
-both `0 altered`, where 0.13.0 returns 2 and plans the DROP DEFAULT plus a
-drop/re-add of three CHECKs.
+- **Red tests first** (`8365b9a`) — `ParserChoice` contract: `sqlparser`
+  rejected by name as *removed*, non-Postgres dialect → `PgQuery`, same
+  rejection through `Design::from_config`. Verified red (exit 101) before
+  implementing.
+- **The retirement** (`3bffa7f`) — deleted `extractors.rs`, `tables.rs`,
+  `preprocess_sql`, `parse_with_sqlparser`, `SqlparserDdl`, `is_valid_postgres`
+  and the parity gate. 2,062 lines. Workspace tests exit 0, clippy `-D warnings`
+  clean, fmt clean, doctests pass, rustdoc errors back to the 22-error baseline.
+  54 deleted lib tests all accounted for (36 + 18 in the two deleted modules;
+  lib 1031 → 977 exactly). Docs synced: guide, llms.txt, architecture.md (ADR
+  marked superseded, not rewritten). CHANGELOG has the breaking entries.
 
 ## Next
 
-Nothing in flight. Remaining open issues, both untouched and unscheduled:
-**#11** (cover dbd-cli handlers needing a live connection — the crate-structure
-question is decided: add a `[lib]` target) and **#7** (multi-tenant schema
-isolation — still a design conversation, five candidate shapes).
+Issue #19 — `parse_sql(sql) -> ParsedFile`, deriving entity type/schema/name
+from the statement rather than the path. Agreed shape: keep dbd's rich `Entity`
++ `Reference`; sensei derives its nodes/edges from them. Each `pg/*.rs` parser
+already walks the node holding the `RangeVar`/`funcname` and discards it.
+
+    cargo test -p dbd-core --lib parser::
 
 ## Open questions
 
-None for this slice.
+- **Dialect parameter.** Agreed it should exist and auto-derive when absent.
+  `ParserChoice::for_dialect` is the seam (currently `_dialect`, all → PgQuery).
+  Open: does `parse_sql` take a dialect argument, or infer from the SQL?
+- **Filing two issues** — drafted, not yet created, awaiting the go-ahead.
 
 ## Known-broken / carried forward
 
+- **SQLite source DDL does not round-trip.** `init --from-db sqlite://` writes
+  `AUTOINCREMENT`/`WITHOUT ROWID`/`STRICT` verbatim; `reverse::design_yaml`
+  writes no `source:` block, so it loads under the `postgresql` default and
+  libpg_query rejects all three. `ensure_fully_parsed` then refuses the apply.
+  Measured: SQLiteDialect 13/13, sqlparser-Pg 9/13, libpg_query 5/13. Needs a
+  real SQLite grammar; pre-existing, not from this slice.
+- **The commit gate runs `cargo test` without `--workspace`.** The root package
+  is `dbd-cli`, so it tests 224 CLI tests and never touches `dbd-core`'s 977.
+  It reported "All checks passed" over three genuinely red tests. CI and
+  `make bump` both use `--workspace`, so releases are safe; the local loop is
+  not.
 - `ARRAY[col]::t[]` where the column is already type `t` still reads as drift.
 - `generate_data_sql` warns "may truncate data" on a *widening* cast.
 - `docs/design/architecture.md:360` still lists `is_identity: bool` on
-  `ColumnDef`; that field is now `identity: Option<IdentityKind>` and the
-  listing also predates `generated`. Pre-existing drift, not from this slice.
-- `site/package.json` `overrides`: `dompurify` and `sharp` are now redundant.
-- `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`, never
-  compiled). Re-check on sqlx bumps.
+  `ColumnDef`; now `identity: Option<IdentityKind>`, and predates `generated`.
+- 22 pre-existing rustdoc intra-doc-link errors (not gated by CI).
+- `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`).
