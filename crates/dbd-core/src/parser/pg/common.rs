@@ -1,24 +1,13 @@
 //! The libpg_query island: every helper that parses SQL through libpg_query
 //! (Postgres's own grammar) lives here, plus two small generic utilities
-//! (`push_unique`, `SYSTEM_SCHEMAS`) that sqlparser-side code in `extractors`
-//! also happens to need.
+//! (`push_unique`, `SYSTEM_SCHEMAS`) the per-type parsers share.
 //!
-//! Nothing here depends on `extractors`: the dependency runs one way,
-//! `extractors` (sqlparser) may call into `pg`, never the reverse. The
-//! previous arrangement had `pg::enums` importing `extractors` while
-//! `extractors` imported `pg::enums`, a cycle that each new native parser
-//! would deepen. That includes helpers reached only by fully-qualified path —
-//! that is exactly as much of a dependency as a `use` import, Rust doesn't
-//! distinguish the two. `qualify_name_str` and `collect_plpgsql_queries` are
-//! libpg_query helpers by their own doc comments, and their only other caller
-//! (`extract_proc_refs_via_pg_query`, the PL/pgSQL tier of
-//! [`extractors::extract_proc_refs`]) is libpg_query too, so they live here
-//! alongside it. `push_unique` and `SYSTEM_SCHEMAS` are genuinely generic —
-//! used by sqlparser-side code as well — but they live here too so that
-//! `extractors`'s two remaining call sites depend on `pg` (the allowed
-//! direction) instead of the reverse.
-//!
-//! [`extractors::extract_proc_refs`]: crate::parser::extractors::extract_proc_refs
+//! This module was carved out to break a cycle: `pg::enums` imported the
+//! sqlparser-side `extractors` while `extractors` imported `pg::enums`, and
+//! every new native parser deepened it. Moving the libpg_query helpers here
+//! made the dependency run one way. `extractors` is gone now, but the
+//! arrangement is worth keeping — the per-type parsers share these helpers,
+//! and a future non-Postgres grammar would sit beside `pg`, not inside it.
 
 use crate::entity::{EnumValue, Reference};
 
@@ -29,16 +18,13 @@ use super::enums;
 ///
 /// Postgres has no `CREATE TYPE IF NOT EXISTS`, so wrapping the CREATE in a DO
 /// block that swallows `duplicate_object` is the only idiom available for a
-/// conditional enum — and sqlparser rejects `DO` outright. This is the same
-/// second tier [`extractors::extract_proc_refs`] already uses for PL/pgSQL
-/// bodies: parse the block, take the SQL it embeds, and re-parse that into a
-/// real statement tree.
+/// conditional enum. A DO block is opaque to a plain statement parse, so this
+/// takes the same route the PL/pgSQL body walk does: parse the block, take the
+/// SQL it embeds, and re-parse that into a real statement tree.
 ///
 /// Returns an empty vec when the input is not a PL/pgSQL block libpg_query
 /// accepts, or when it declares no enum — the caller keeps its parse error, so a
 /// genuinely broken file is never quietly waved through.
-///
-/// [`extractors::extract_proc_refs`]: crate::parser::extractors::extract_proc_refs
 pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<EnumValue> {
     let Ok(tree) = pg_query::parse_plpgsql(raw_sql) else {
         return Vec::new();
@@ -60,31 +46,18 @@ pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<
     Vec::new()
 }
 
-/// Whether libpg_query — Postgres's own grammar — accepts this file.
+/// `search_path` schemas from libpg_query's AST.
 ///
-/// The authority on "is this valid SQL". sqlparser is a convenience parser that
-/// reimplements the grammar and lags the server, so its rejection alone says
-/// nothing about the file; this says whether Postgres itself would take it.
-pub(in crate::parser) fn is_valid_postgres(raw_sql: &str) -> bool {
-    pg_query::parse(raw_sql).is_ok()
-}
-
-/// `search_path` schemas from libpg_query's AST, for the fallback path where
-/// sqlparser produced no statements for [`extractors::extract_search_paths`] to
-/// read.
-///
-/// Mirrors that function's contract, including its `["public"]` default when the
-/// file sets no search path. Recovering this is not optional: reads and view
-/// references are qualified against it, so an empty list silently re-qualifies
-/// `t` to `public.t` — a plausibly-wrong edge pointing at a different table,
-/// which is worse than no edge at all.
+/// Defaults to `["public"]` when the file sets no search path. That default is
+/// not optional: reads and view references are qualified against it, so an
+/// empty list silently re-qualifies `t` to `public.t` — a plausibly-wrong edge
+/// pointing at a different table, which is worse than no edge at all.
 ///
 /// `pub(crate)`, wider than this file's other libpg_query helpers, because
 /// [`design::hooks`] — outside `crate::parser` entirely — resolves an
 /// after-script's `search_path` the same way a view or routine body does, to
 /// qualify the table names a hook script depends on.
 ///
-/// [`extractors::extract_search_paths`]: crate::parser::extractors::extract_search_paths
 /// [`design::hooks`]: crate::design::hooks
 pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
@@ -105,10 +78,8 @@ pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
     vec![DEFAULT_SEARCH_PATH.to_string()]
 }
 
-/// The default schema when a file sets no `search_path` — matches
-/// [`extractors::extract_search_paths`].
-///
-/// [`extractors::extract_search_paths`]: crate::parser::extractors::extract_search_paths
+/// The default schema when a file sets no `search_path`. Matches what Postgres
+/// itself falls back to, and what every reference-qualifying caller assumes.
 const DEFAULT_SEARCH_PATH: &str = "public";
 
 /// The string behind a `SET` argument node: a bare identifier arrives as a
@@ -125,13 +96,10 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
-/// The tables a view's body reads, from libpg_query's AST — the fallback for a
-/// view [`extractors::extract_view_info`] could not read because sqlparser
-/// rejected the file.
+/// The tables a view's body reads, from libpg_query's AST.
 ///
-/// Without this a recovered view carries no dependency edge at all, so it could
-/// be applied before the table it selects from: a loud skip traded for a silent
-/// misordering.
+/// A view that carries no dependency edge could be applied before the table it
+/// selects from — a silent misordering — so this is not optional detail.
 ///
 /// Sorted before returning: `ParseResult::select_tables()` is built from a
 /// `HashSet` internally, so its iteration order is not source order — it's
@@ -141,7 +109,6 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
 /// view would vary from run to run, which is a nondeterminism bug regardless of
 /// how the result is later compared.
 ///
-/// [`extractors::extract_view_info`]: crate::parser::extractors::extract_view_info
 pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Reference> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return Vec::new();
@@ -264,10 +231,8 @@ pub(crate) fn qualify_name_str(name: &str, default_schema: &str) -> Option<Strin
 
 /// Push a value only if not already present (preserves insertion order).
 ///
-/// Generic — not libpg_query-specific — but lives here rather than in
-/// `extractors.rs` so that module's two remaining call sites
-/// (`extract_proc_refs_via_ast`'s helpers) depend on `pg` instead of `pg`
-/// depending on `extractors`. See the module doc comment.
+/// Generic — not libpg_query-specific — but shared by the per-type parsers, so
+/// it lives beside them. See the module doc comment.
 pub(in crate::parser) fn push_unique(v: &mut Vec<String>, item: String) {
     if !v.contains(&item) {
         v.push(item);
@@ -277,9 +242,7 @@ pub(in crate::parser) fn push_unique(v: &mut Vec<String>, item: String) {
 /// System schemas to exclude from references.
 ///
 /// Generic — not libpg_query-specific — but lives here for the same reason as
-/// [`push_unique`]: `extractors.rs`'s sqlparser-side `qualify_relation` and
-/// `regex_table_after` also read it, and this keeps that a dependency on `pg`
-/// rather than the reverse.
+/// [`push_unique`].
 pub(in crate::parser) const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
 
 #[cfg(test)]

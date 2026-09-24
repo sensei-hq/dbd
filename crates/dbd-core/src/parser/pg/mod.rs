@@ -1,8 +1,9 @@
 //! The Postgres-native DDL parser, built on libpg_query.
 //!
-//! Covers entity types incrementally. Anything not yet native delegates to
-//! [`SqlparserDdl`], so the tree is releasable at every step of the migration
-//! rather than only at the end.
+//! Covers every entity type `Entity::from_file` can produce. It was built
+//! incrementally, delegating what it did not yet handle to a second sqlparser
+//! implementation so the tree stayed releasable at each step; that second
+//! implementation retired once the last type landed here.
 
 pub(crate) mod common;
 pub(crate) mod enums;
@@ -17,7 +18,7 @@ use std::path::Path;
 
 use crate::entity::{Entity, EntityType};
 use crate::error::Result;
-use crate::parser::{DdlParser, SqlparserDdl};
+use crate::parser::DdlParser;
 
 /// libpg_query — PostgreSQL's own grammar.
 pub(crate) struct PgQueryDdl;
@@ -66,7 +67,15 @@ impl DdlParser for PgQueryDdl {
         let entity = Entity::from_file(file);
         match Self::native(entity.entity_type) {
             Some(parse) => parse(entity, sql),
-            None => SqlparserDdl.parse(file, sql),
+            // Unreachable by construction, and left as a passthrough rather
+            // than an error for that reason. `native` returns `None` only for
+            // Schema, Extension, External and Import — none of which
+            // `Entity::from_file` can produce: `EntityType::from_folder_name`
+            // has no arm for them, and an unrecognised folder falls back to
+            // Table (which is native). They are synthesized from design.yaml
+            // and have no DDL body to read, so returning the entity as parsed
+            // from its path is the correct answer if one ever arrives here.
+            None => Ok(entity),
         }
     }
 }
@@ -74,23 +83,6 @@ impl DdlParser for PgQueryDdl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn json(entity: &Entity) -> serde_json::Value {
-        serde_json::to_value(entity).expect("Entity serializes")
-    }
-
-    /// Until a type is in COVERED, PgQueryDdl must be byte-identical to the
-    /// incumbent — that is what makes every step of the migration releasable.
-    #[test]
-    fn uncovered_types_delegate_identically() {
-        let path = Path::new("ddl/sequence/app/s.ddl");
-        let sql = "set search_path to app;\ncreate sequence s start with 5;";
-
-        let old = SqlparserDdl.parse(path, sql).unwrap();
-        let new = PgQueryDdl.parse(path, sql).unwrap();
-
-        assert_eq!(json(&old), json(&new));
-    }
 
     /// Every file-backed entity type is now native. `Schema` and `Extension`
     /// are synthesized from `design.yaml` rather than parsed from files — their

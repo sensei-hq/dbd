@@ -109,7 +109,7 @@ Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report
 
 ## Architecture
 
-- Parser: sqlparser-rs (pure Rust, multi-dialect)
+- Parser: libpg_query (PostgreSQL's own grammar, via the `pg_query` crate) — every DDL entity type. sqlparser-rs remains for `dbd format` and enum-candidate detection, not for reading DDL.
 - Adapters (all working):
     - PostgreSQL + Supabase (sqlx, `postgres://`) — COPY streaming import, namespace-aware catalog
     - SQLite (sqlx-sqlite, `sqlite://`/`sqlite::memory:`/`file:`) — batched multi-row INSERT (≤500 rows or 32k binds per batch), trigger-aware DDL splitter, ~150 builtins + `sqlite_*` prefix recognised offline

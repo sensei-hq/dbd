@@ -136,10 +136,10 @@ impl Design {
     /// source of truth if every file in it was understood, so callers check this
     /// *before* any write — a partial apply is what makes the failure expensive.
     ///
-    /// This fires only on SQL Postgres itself rejects. Valid SQL that merely
-    /// outruns sqlparser is recovered via libpg_query inside
-    /// `parser::parse_with_sqlparser`, reached from the scan path through
-    /// `parser::parse_entity_with` → `SqlparserDdl`, and never reaches here.
+    /// This fires only on SQL Postgres itself rejects, because the scan path
+    /// parses with libpg_query — Postgres's own grammar — via
+    /// `parser::parse_entity_with` → `pg::PgQueryDdl`. There is no second,
+    /// weaker parser whose shortfall could land a valid file here.
     pub(in crate::design) fn ensure_fully_parsed(
         &self,
         scope: Option<&ResolvedScope>,
