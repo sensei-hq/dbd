@@ -34,15 +34,23 @@ external embedders (issue #19, sensei's code indexer).
   left everything green. Fixtures now name the second table and the mutation
   fails four tests.
 
+- **`ALTER TABLE … ADD CONSTRAINT` fixed** (`2a8c635` red, `1c73fd1` green) —
+  it was silently dropped by `parse_entity`, the live apply path, not just by
+  `parse_sql`. An FK added that way produced no `refers` edge (wrong apply
+  order), no `table_def` constraint (`apply` omitted it), and reconcile planned
+  `DROP CONSTRAINT` against a DB that had it. Now routed through the same
+  `extract_table_constraint` as inline constraints, so the two spellings are
+  indistinguishable downstream. Other `ALTER` subcommands warn instead of
+  vanishing. Mutation-checked: forcing the table-name guard to `true` fails
+  `an_alter_on_another_table_is_not_absorbed`.
+
 ## Next
 
-Fold `ALTER TABLE … ADD CONSTRAINT` into its table. `declarations::attaches_to`
-already has the shape for it (`AlterTableStmt.relation` is a `RangeVar`), but
-`pg::tables::extract` only reads `CreateStmt`/`IndexStmt`/`CommentStmt`, so the
-statement would be grouped and then ignored. Matters for migration-script
-corpora, which is most of what sensei will scan.
+Nothing queued. Issue #19's ask is delivered; #20 (SQLite grammar) is the next
+substantive piece if you want it, and the release must be **0.14.0** — three
+breaking changes sit in `[Unreleased]`.
 
-    cargo test -p dbd-core --test parse_sql
+    cargo test --workspace --all-features
 
 ## Open questions
 
