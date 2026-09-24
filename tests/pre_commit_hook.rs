@@ -112,10 +112,7 @@ fn pre_commit_does_not_restate_the_release_preflight() {
          restating its commands — that duplication is what let the two drift"
     );
 
-    let own_cargo: Vec<&str> = hook
-        .lines()
-        .filter(|l| scope_sensitive_cargo(l).is_some())
-        .collect();
+    let own_cargo: Vec<&str> = hook.lines().filter(|l| scope_sensitive_cargo(l).is_some()).collect();
     assert!(
         own_cargo.is_empty(),
         "the hook still names cargo commands of its own, which can drift from \
