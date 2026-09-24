@@ -296,3 +296,37 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 `Entity` / `EntityType`, `SchemaModel`, `ResolvedScope`, `ApplyComplete` /
 `DeployComplete` / `ImportComplete`, `DbdError` / `Result`. The free fn
 `dbd_core::design::apply_policies` remains available to apply policies alone.
+
+### Parsing SQL without a dbd project
+
+An embedder with its own scanner — a code indexer, say — wants entities and
+their relationships, not a deploy. Use `parse_sql`, not `parse_entity`:
+
+```rust
+let parsed = dbd_core::parser::parse_sql(sql)?;   // ParsedFile
+for e in &parsed.entities {
+    // e.entity_type / e.schema / e.name  — read off the CREATE statement
+    // e.refers, e.references             — typed edges (FK, view dep, function call)
+    // e.reads, e.writes                  — separated, for functions and procedures
+}
+```
+
+`parse_entity` takes identity from the path (`ddl/<type>/<schema>/<name>.ddl`),
+which is right inside a dbd project and silently wrong outside one: it falls
+back to `EntityType::Table` and names the entity after a directory, so a stored
+procedure reads as a table with only `entity.errors` to hint at it. `parse_sql`
+asks the SQL what it declares. Several declarations in one file become several
+entities; `CREATE INDEX`, `COMMENT ON` and `ALTER TABLE … ADD CONSTRAINT` fold
+into the entity they *name*.
+
+Reference resolution is a separate phase: each entity carries its references as
+written, provisionally qualified against `search_paths[0]`, and
+`references::resolve_references(&mut entities, &externals, &ignore)` re-resolves
+them once every file is read, warning on what it cannot place. That split is
+what makes a scan parallelisable — the per-file parse touches no shared state,
+so a bare `t` that could be `a.t` or `b.t` stays undecided until the whole set
+is known.
+
+PostgreSQL only. `parse_sql_with(ParserChoice, sql)` selects the parser
+explicitly, and `ParserChoice::resolve(dialect, explicit)` derives it from a
+dialect string.

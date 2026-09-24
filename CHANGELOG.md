@@ -9,6 +9,22 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-24
+
+One parser. The sqlparser DDL path retires — it was a second *PostgreSQL*
+parser, not a dialect, kept as an escape hatch during the libpg_query migration
+and unreachable since every entity type went native in 0.13.0. Removing it takes
+the last regex out of the DDL parse path with it.
+
+In its place, two things the migration made possible. `parse_sql` gives an
+external embedder the statement-level identity the path-derived `parse_entity`
+could not (issue #19), and `ALTER TABLE … ADD CONSTRAINT` is finally read —
+until now a constraint written that way was silently dropped from the model, on
+the live apply path.
+
+Breaking for embedders and for any project that names `source.parser:
+sqlparser`; see **Changed** below.
+
 ### Added
 
 - **`parser::parse_sql` — statement-level parsing for external embedders**
@@ -347,5 +363,6 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
 [Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
 [0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0
