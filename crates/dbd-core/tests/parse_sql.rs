@@ -215,6 +215,39 @@ fn a_foreign_key_becomes_a_reference() {
     );
 }
 
+/// A constraint added by `ALTER TABLE` has to reach the entity through this
+/// entry point too, or `parse_sql` reports a weaker graph than `parse_entity`
+/// on the same bytes. It needs both halves: the statement grouped onto its
+/// table here, and the subcommand read by the table parser.
+#[test]
+fn a_constraint_added_by_alter_table_reaches_the_entity() {
+    let parsed = parse_sql(
+        "create table app.users (id int primary key);\n\
+         create table app.orders (id int primary key, uid int not null);\n\
+         alter table app.orders add constraint orders_uid_fk foreign key (uid) references app.users(id);",
+    )
+    .unwrap();
+
+    let orders = parsed.entities.iter().find(|e| e.name == "app.orders").unwrap();
+    assert!(
+        orders.refers.contains(&"app.users".to_string()),
+        "an ALTER-added FK must be an edge here too, got {:?}",
+        orders.refers
+    );
+    assert_eq!(
+        orders.table_def.as_ref().unwrap().constraints.len(),
+        1,
+        "the constraint must reach table_def"
+    );
+
+    // And it must land on the table it names, not the first one declared.
+    let users = parsed.entities.iter().find(|e| e.name == "app.users").unwrap();
+    assert!(
+        users.table_def.as_ref().unwrap().constraints.is_empty(),
+        "app.users must not absorb app.orders' constraint"
+    );
+}
+
 /// The read/write split is the thing an embedder cannot get from any other
 /// language's indexer, so it has to survive this entry point.
 #[test]

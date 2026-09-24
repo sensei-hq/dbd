@@ -41,9 +41,6 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parse_sql_with(ParserChoice, sql)` takes an explicit parser; pair it with
   `ParserChoice::resolve` to derive one from a dialect string.
 
-  Known gap: `ALTER TABLE … ADD CONSTRAINT` is not folded into its table, so an
-  FK declared that way is not yet an edge.
-
 ### Removed
 
 - **The sqlparser DDL path is gone** — `extractors.rs`, `tables.rs`, the
@@ -68,6 +65,38 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   detection use it. It no longer reads DDL.
 
 ### Fixed
+
+- **`ALTER TABLE … ADD CONSTRAINT` was silently dropped from table DDL.** A
+  constraint is legitimately written inline *or* as a trailing `ALTER TABLE …
+  ADD CONSTRAINT`, and the second form was read by nothing — no parser matched
+  `AlterTableStmt`. On a file adding an FK, a UNIQUE and a CHECK that way:
+
+  ```
+  errors      : []      ← no error, so `ensure_fully_parsed` did not refuse
+  refers      : []      ← the FK was not a dependency edge
+  constraints : 0       ← all three gone
+  ```
+
+  Three consequences, worst first. The missing `refers` edge let
+  `sort_by_dependencies` order a child before its parent, so a fresh `apply`
+  could fail. `apply` created the table without the constraints. And
+  `reconcile` saw an FK live-but-not-desired and planned
+  `DROP CONSTRAINT <live-name>` — gated behind `--allow-destructive`, but a
+  project that passes that flag would have lost it.
+
+  dbd never emits this form itself, which is why it survived: it only affected
+  a hand-authored file.
+
+  Constraints added this way now go through the same `extract_table_constraint`
+  as inline ones — same `TableDef`, same `PRIMARY KEY` column marking, same FK
+  edge — so the two spellings are indistinguishable downstream. An `ALTER`
+  naming a table the file does not declare is not absorbed.
+
+  Other `ALTER` subcommands remain out of scope: a dbd table file is the full
+  and final definition, and `ADD COLUMN` / `ALTER COLUMN` belong to generated
+  migrations, which `scanner::scan_ddl` never reads. They now raise a **warning**
+  on the entity rather than vanishing — silence is what kept the missing
+  constraints invisible.
 
 - **The pre-commit hook gated only the CLI.** `.githooks/pre-commit` ran
   `cargo test` and `cargo clippy` without `--workspace`. The root package is
