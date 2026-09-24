@@ -238,10 +238,33 @@ let sorted = dependency::sort_by_dependencies(&entities);
 let pending = snapshot::pending_migrations(db_version, Path::new("."));   // -> Vec<PendingMigration>
 
 // Low-level: parser, adapter trait, entity types
-use dbd_core::parser::parse_entity;   // parse one DDL file's SQL → Entity
+use dbd_core::parser::parse_entity;   // parse one DDL file's SQL → Entity (identity from the PATH)
+use dbd_core::parser::parse_sql;      // parse any SQL → ParsedFile (identity from the STATEMENTS)
 use dbd_core::adapter::DatabaseAdapter;
 use dbd_core::entity::{Entity, EntityType};
 ```
+
+**Which parser entry point?** `parse_entity` takes identity from
+`ddl/<type>/<schema>/<name>.ddl`, so it is right for a project laid out dbd's
+way and wrong for anything else — outside that layout it does not fail, it
+falls back to `EntityType::Table` and names the entity after a directory.
+`parse_sql` reads the declarations instead, and is the entry point for a caller
+with its own scanner:
+
+```rust
+let parsed = dbd_core::parser::parse_sql(sql)?;   // ParsedFile
+for e in &parsed.entities {
+    // e.entity_type / e.schema / e.name  — from the CREATE, not a path
+    // e.refers, e.references             — typed edges (FK, view dep, function call)
+    // e.reads, e.writes                  — separated, for routines
+}
+```
+
+Resolution is deliberately a second phase: each entity carries its references as
+written, provisionally qualified against `search_paths[0]`, and
+`references::resolve_references` re-resolves them once every file is read. The
+per-file parse touches no shared state, so the scan parallelises and a bare `t`
+that could be `a.t` or `b.t` stays undecided until the whole set is known.
 
 ### Embedding example — auto-migration in a Rust web app
 

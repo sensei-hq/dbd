@@ -153,19 +153,48 @@ fn indexes_and_comments_attach_to_their_table() {
 
 /// Statements are attributed to the table they name, not to whichever
 /// declaration happens to precede them.
+///
+/// The index and the comment both name the **second** table. Pointing them at
+/// the first would let an implementation that ignores the name entirely pass —
+/// confirmed by mutation: replacing the name match with `true` leaves the
+/// naive fixture green and fails this one.
 #[test]
-fn an_index_lands_on_the_table_it_names_not_the_nearest_one() {
+fn an_index_lands_on_the_table_it_names_not_the_first_one() {
     let parsed = parse_sql(
         "create table app.a (id int primary key, x text);\n\
          create table app.b (id int primary key, y text);\n\
-         create index a_x_idx on app.a (x);",
+         create index b_y_idx on app.b (y);\n\
+         comment on table app.b is 'second';",
     )
     .unwrap();
 
     let a = parsed.entities.iter().find(|e| e.name == "app.a").expect("app.a");
     let b = parsed.entities.iter().find(|e| e.name == "app.b").expect("app.b");
-    assert_eq!(a.table_def.as_ref().unwrap().indexes.len(), 1, "index belongs to app.a");
-    assert_eq!(b.table_def.as_ref().unwrap().indexes.len(), 0, "app.b has no index");
+
+    let a_td = a.table_def.as_ref().unwrap();
+    let b_td = b.table_def.as_ref().unwrap();
+    assert_eq!(b_td.indexes.len(), 1, "the index names app.b");
+    assert_eq!(a_td.indexes.len(), 0, "app.a must not collect app.b's index");
+    assert_eq!(b_td.comments.table.as_deref(), Some("second"));
+    assert_eq!(a_td.comments.table, None, "app.a must not collect app.b's comment");
+}
+
+/// An attachment naming a table this file does not declare must be dropped,
+/// not reassigned to whatever entity happens to be available.
+#[test]
+fn an_orphan_index_is_not_reassigned_to_a_declared_table() {
+    let parsed = parse_sql(
+        "create table app.t (id int primary key);\n\
+         create index i on other.elsewhere (x);",
+    )
+    .unwrap();
+
+    assert_eq!(parsed.entities.len(), 1);
+    assert_eq!(
+        parsed.entities[0].table_def.as_ref().unwrap().indexes.len(),
+        0,
+        "app.t must not adopt an index on other.elsewhere"
+    );
 }
 
 // ── Relations ───────────────────────────────────────────────────────────────
@@ -214,6 +243,104 @@ fn sql_that_declares_nothing_is_empty_not_an_error() {
     let parsed = parse_sql("insert into app.t (id) values (1);").unwrap();
     assert!(parsed.entities.is_empty());
     assert!(parsed.errors.is_empty(), "got: {:?}", parsed.errors);
+}
+
+// ── Corroboration against the path-derived parser ───────────────────────────
+
+/// The **type** is `parse_sql`'s core claim, and inside dbd's layout the path
+/// is an independent second opinion on it. They must agree on every fixture,
+/// with no exceptions — run against real DDL rather than a constructed case.
+#[test]
+fn parse_sql_agrees_with_parse_entity_on_type_across_the_fixture_corpus() {
+    let mut checked = 0;
+    for (path, from_path, from_sql) in fixture_pairs() {
+        assert!(
+            from_sql.errors.is_empty(),
+            "{}: parse_sql errors {:?}",
+            path.display(),
+            from_sql.errors
+        );
+        let types: Vec<EntityType> = from_sql.entities.iter().map(|e| e.entity_type).collect();
+        assert!(
+            types.contains(&from_path.entity_type),
+            "{}: path says {:?}, statements say {:?}",
+            path.display(),
+            from_path.entity_type,
+            types
+        );
+        checked += 1;
+    }
+    assert!(checked >= 7, "the fixture corpus should not have shrunk: {checked}");
+}
+
+/// Where the path and the statement disagree on the **name**, the divergence is
+/// the point, not a defect — and it must be exactly the one dbd already knows
+/// about.
+///
+/// `schema_model::build` records the limitation: it matches a column's type
+/// against the enum entity's *file-stem* name, "not necessarily the `CREATE
+/// TYPE` identifier … Works when they coincide; a stricter match is future
+/// work." `enum/config/status.sql` is the fixture where they do not coincide —
+/// the file declares `status_type`, the path says `status`, and `emit_enum`
+/// silently emits the path's answer.
+///
+/// `parse_sql` is what supplies the missing half. Pinned as a set so a *new*
+/// divergence fails here rather than passing under a relaxed assertion.
+#[test]
+fn parse_sql_recovers_the_declared_name_where_the_path_disagrees() {
+    let mut divergent: Vec<(String, String, String)> = Vec::new();
+
+    for (path, from_path, from_sql) in fixture_pairs() {
+        let declared: Vec<&str> = from_sql.entities.iter().map(|e| e.name.as_str()).collect();
+        if !declared.contains(&from_path.name.as_str()) {
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            divergent.push((file, from_path.name.clone(), declared.join(", ")));
+        }
+    }
+
+    assert_eq!(
+        divergent,
+        vec![(
+            "status.sql".to_string(),
+            "config.status".to_string(),
+            "config.status_type".to_string(),
+        )],
+        "the set of path-vs-statement name divergences changed"
+    );
+}
+
+/// `(path, parse_entity result, parse_sql result)` for every DDL fixture.
+fn fixture_pairs() -> Vec<(std::path::PathBuf, dbd_core::Entity, dbd_core::parser::ParsedFile)> {
+    use dbd_core::parser::parse_entity;
+    use std::path::Path;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ddl");
+    walk(&root)
+        .into_iter()
+        .map(|path| {
+            let sql = std::fs::read_to_string(&path).expect("fixture readable");
+            let from_path = parse_entity(&path, &sql).expect("parse_entity");
+            let from_sql = parse_sql(&sql).expect("parse_sql");
+            (path, from_path, from_sql)
+        })
+        .collect()
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
 }
 
 #[test]

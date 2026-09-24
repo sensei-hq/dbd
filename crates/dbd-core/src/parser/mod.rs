@@ -92,6 +92,60 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
     parse_entity_with(ParserChoice::PgQuery, file, sql)
 }
 
+/// Everything one SQL file declares.
+///
+/// The return of [`parse_sql`]. Holds dbd's own [`Entity`] rather than a
+/// reduced, indexer-shaped type: the read/write split on routines and the
+/// soft/hard distinction on references are the parts an embedder cannot get
+/// from any other language's parser, and flattening them here would throw away
+/// the reason to call this at all.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedFile {
+    /// One per declaration, in source order. Empty when the file declares
+    /// nothing — a migration that only `INSERT`s is not an error.
+    pub entities: Vec<Entity>,
+    /// The file's `SET search_path`, or `["public"]`. Unqualified names in
+    /// `entities` were resolved against its first element, and the full list is
+    /// the candidate set for resolving the rest (see
+    /// [`crate::references::resolve_references`]).
+    pub search_paths: Vec<String>,
+    /// File-level failures — SQL Postgres itself rejects. Per-entity problems
+    /// stay on `Entity::errors`.
+    pub errors: Vec<String>,
+}
+
+/// Read every entity a SQL file declares, taking identity from the statements.
+///
+/// The counterpart to [`parse_entity`], for callers that are not inside dbd's
+/// `ddl/<type>/<schema>/<name>.ddl` layout. `parse_entity` derives type, schema
+/// and name from the path, and outside that layout it does not fail — it falls
+/// back to [`EntityType::Table`] and names the entity after a directory, so a
+/// stored procedure reads as a table and only `entity.errors` hints otherwise.
+/// This asks the SQL instead.
+///
+/// Resolution is deliberately *not* done here. Each entity carries its
+/// references as written, provisionally qualified against `search_paths[0]`,
+/// and [`crate::references::resolve_references`] re-resolves them once every
+/// file has been read. That split is what makes a scan parallelisable: this
+/// function touches no shared state, so a bare `t` that could be `a.t` or `b.t`
+/// stays undecided until the whole set is known, rather than forcing the
+/// scanner to be sequential.
+///
+/// Defaults to PostgreSQL; use [`parse_sql_with`] to choose.
+pub fn parse_sql(sql: &str) -> Result<ParsedFile> {
+    parse_sql_with(ParserChoice::PgQuery, sql)
+}
+
+/// [`parse_sql`] with an explicit parser choice.
+///
+/// Pair with [`ParserChoice::resolve`] to derive the choice from a dialect
+/// string, which is what the project scan does for `source.dialect`.
+pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
+    match choice {
+        ParserChoice::PgQuery => pg::parse_sql(sql),
+    }
+}
+
 /// Entity types the Postgres-native parser handles itself.
 ///
 /// Every file-backed type, which is what let the sqlparser implementation
