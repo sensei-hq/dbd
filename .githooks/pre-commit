@@ -1,24 +1,23 @@
 #!/bin/sh
-# Pre-commit hook: run tests before allowing commit
+# Pre-commit hook: run the same pre-flight the release runs.
 # Install: git config core.hooksPath .githooks
+#
+# Delegates to `make _check-ci` rather than restating its commands. The two used
+# to be hand-maintained copies of the same list, and they drifted: `_check-ci`
+# passes `--workspace` to cargo, this hook did not. The root package is
+# `dbd-cli`, deliberately *not* a workspace member (see the note in Cargo.toml),
+# so an unscoped `cargo test` builds the CLI and nothing else — `dbd-core` was
+# never compiled, and its tests never ran. The hook reported "All checks
+# passed." over a tree that `cargo test --workspace` failed.
+#
+# One definition of green, so the next flag added to the release gate reaches
+# the commit gate for free. Guarded by tests/pre_commit_hook.rs.
 
 set -e
 
-echo "Running cargo test..."
-cargo test --quiet 2>&1
-
-echo "Running cargo clippy..."
-cargo clippy --all-targets --quiet -- -D warnings 2>&1 || {
+if ! make _check-ci; then
     echo ""
-    echo "Clippy warnings found. Fix them before committing."
+    echo "Pre-commit checks failed. Re-run them directly with: make _check-ci"
+    echo "Formatting only? Run 'cargo fmt --all' and re-commit."
     exit 1
-}
-
-echo "Running cargo fmt --check..."
-cargo fmt --all --check || {
-    echo ""
-    echo "Formatting differs from rustfmt.toml. Run 'cargo fmt --all' and re-commit."
-    exit 1
-}
-
-echo "All checks passed."
+fi
