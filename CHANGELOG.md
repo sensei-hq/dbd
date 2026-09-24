@@ -9,6 +9,41 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **`parser::parse_sql` — statement-level parsing for external embedders**
+  (issue #19). Reads every entity a SQL file declares, taking type, schema and
+  name from the **statements** rather than from the path.
+
+  `parse_entity` derives identity from `ddl/<type>/<schema>/<name>.ddl`, which
+  is correct inside dbd's layout and silently wrong outside it: it falls back to
+  `EntityType::Table` and names the entity after a directory, so a stored
+  procedure reads as `Table Users.sp_NewMCRIssue` with only `entity.errors` to
+  hint otherwise. `parse_sql` asks the SQL instead.
+
+  ```rust
+  let parsed = dbd_core::parser::parse_sql(sql)?;
+  for entity in &parsed.entities {
+      // entity.entity_type, entity.schema, entity.name (qualified),
+      // entity.refers / references (typed edges),
+      // entity.reads / writes (separated, for routines)
+  }
+  ```
+
+  Returns `ParsedFile { entities, search_paths, errors }`, holding dbd's own
+  `Entity` — the read/write split and the soft/hard reference distinction are
+  the parts an embedder cannot get elsewhere, so nothing is flattened. Several
+  declarations in one file become several entities; `CREATE INDEX` and
+  `COMMENT ON` fold into the entity they *name*, not the nearest preceding one.
+  Reference resolution stays in `references::resolve_references`, so the scan
+  itself touches no shared state and parallelises.
+
+  `parse_sql_with(ParserChoice, sql)` takes an explicit parser; pair it with
+  `ParserChoice::resolve` to derive one from a dialect string.
+
+  Known gap: `ALTER TABLE … ADD CONSTRAINT` is not folded into its table, so an
+  FK declared that way is not yet an edge.
+
 ### Removed
 
 - **The sqlparser DDL path is gone** — `extractors.rs`, `tables.rs`, the
