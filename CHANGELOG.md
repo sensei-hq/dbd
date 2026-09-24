@@ -9,7 +9,51 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Removed
+
+- **The sqlparser DDL path is gone** — `extractors.rs`, `tables.rs`, the
+  `preprocess_sql` workarounds, the parser parity gate, and the
+  `ParserChoice::Sqlparser` variant. 1,861 lines.
+
+  It was a second *PostgreSQL* parser, not a dialect: `parse_with_sqlparser`
+  hardcoded `PostgreSqlDialect` for its entire life. It existed as an escape
+  hatch during the libpg_query migration, and the migration's own design note
+  named its retirement condition — "once Table is native, `SqlparserDdl` has no
+  production callers". Every file-backed entity type has been native since
+  0.13.0, so nothing reached it: `PgQueryDdl::native` returns `Some` for all
+  eight types, and `EntityType::from_folder_name` cannot produce the four it
+  doesn't cover.
+
+  This also removes the last regex in the DDL parse path —
+  `extract_proc_reads_writes`, whose own doc comment recorded that it "can
+  over-match … and is blind to read/write classification". The libpg_query
+  parsers have none.
+
+  `sqlparser-rs` is still a dependency: `dbd format` and enum-candidate
+  detection use it. It no longer reads DDL.
+
 ### Changed
+
+- **BREAKING — `source.parser: sqlparser` is rejected.** A project still naming
+  it fails to load with a message saying it was removed and naming `pg_query`.
+  Silently switching a project to a parser its author did not choose is the
+  failure mode `ParserChoice::resolve` already refused for a typo; a retired
+  value is held to the same bar.
+
+- **BREAKING — `parser::extract_search_paths` is no longer exported.** It was
+  the one public item that leaked `sqlparser::ast::Statement` into `dbd-core`'s
+  API. Embedders wanting search paths get them from `Entity::search_paths`.
+
+- **A non-PostgreSQL `source.dialect` now resolves to the PostgreSQL parser**
+  rather than to sqlparser. For every project dbd generates this is a no-op —
+  `reverse::design_yaml` writes no `source:` block at all, so a project built by
+  `dbd init --from-db sqlite://` has always loaded under the `postgresql`
+  default. A **hand-written** `dialect: sqlite` previously got sqlparser, which
+  reads some SQLite DDL; it now gets libpg_query, which rejects `AUTOINCREMENT`,
+  `WITHOUT ROWID` and `STRICT`, so such a project will be refused by
+  `ensure_fully_parsed` instead of partially applied. SQLite DDL is not a
+  Postgres subset and never parsed correctly here; giving it a real grammar is
+  tracked separately.
 
 - **`make install` now reclaims `target/`, matching `make bump`.** `cargo install
   --path .` builds into `target/`, so the bare install left behind roughly a
