@@ -66,10 +66,11 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
         .unwrap_or_else(|| "public".to_string());
 
     match extract(&parsed, &default_schema) {
-        Ok((table_def, references)) => {
+        Ok((table_def, references, warnings)) => {
             entity.refers = references.iter().map(|r| r.name.clone()).collect();
             entity.references = references;
             entity.table_def = Some(table_def);
+            entity.warnings.extend(warnings);
         }
         // No `table_def` on this path — see the module note on `--prune`.
         Err(why) => entity.errors.push(why),
@@ -78,22 +79,34 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
     Ok(entity)
 }
 
-/// The whole file: its `CREATE TABLE`s, plus the `CREATE INDEX` and `COMMENT ON`
-/// statements that ship alongside them (Postgres has no way to nest either one
-/// inside `CREATE TABLE`, so they arrive as siblings).
-fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>)> {
+/// The whole file: its `CREATE TABLE`s, plus the `CREATE INDEX`, `COMMENT ON`
+/// and `ALTER TABLE … ADD CONSTRAINT` statements that ship alongside them
+/// (Postgres has no way to nest any of them inside `CREATE TABLE`, so they
+/// arrive as siblings).
+///
+/// Returns the warnings alongside the table, rather than swallowing them: an
+/// `ALTER` subcommand this does not read is the shape that hid the missing
+/// constraints for so long.
+fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>, Vec<String>)> {
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
     let mut comments = TableComments::default();
     let mut references: Vec<Reference> = Vec::new();
     let mut functions: Vec<String> = Vec::new();
-    let mut declares_a_table = false;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
+    // Deferred to a second pass: an `ALTER` is only this table's once every
+    // `CREATE TABLE` in the file has been seen, and its constraints must sort
+    // after the inline ones regardless of where the statement sits.
+    let mut alters: Vec<&protobuf::AlterTableStmt> = Vec::new();
 
     for stmt in &parsed.protobuf.stmts {
         match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
             Some(NodeEnum::CreateStmt(create)) => {
-                declares_a_table = true;
+                if let Some(rel) = create.relation.as_ref() {
+                    declared.push(qualified(rel, default_schema));
+                }
                 process_create_table(
                     create,
                     default_schema,
@@ -107,12 +120,34 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
                 indexes.push(extract_index(ix, default_schema, &mut functions)?);
             }
             Some(NodeEnum::CommentStmt(c)) => record_comment(c, &mut comments),
+            Some(NodeEnum::AlterTableStmt(alter)) => alters.push(alter),
             _ => {}
         }
     }
 
-    if !declares_a_table {
+    if declared.is_empty() {
         return Err("this table file declares no `CREATE TABLE`".to_string());
+    }
+
+    for alter in alters {
+        // An `ALTER` naming a table this file does not declare belongs to some
+        // other entity; absorbing it would invent a constraint on this one.
+        let names_this_file = alter
+            .relation
+            .as_ref()
+            .is_some_and(|rel| declared.contains(&qualified(rel, default_schema)));
+        if !names_this_file {
+            continue;
+        }
+        process_alter_table(
+            alter,
+            default_schema,
+            &mut columns,
+            &mut constraints,
+            &mut references,
+            &mut functions,
+            &mut warnings,
+        )?;
     }
 
     // Column comments are addressed by name, so they can only be attached once
@@ -136,7 +171,71 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
             comments,
         },
         references,
+        warnings,
     ))
+}
+
+/// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
+fn qualified(rel: &protobuf::RangeVar, default_schema: &str) -> String {
+    let schema = if rel.schemaname.is_empty() {
+        default_schema
+    } else {
+        &rel.schemaname
+    };
+    format!("{schema}.{}", rel.relname)
+}
+
+/// One `ALTER TABLE`'s `ADD CONSTRAINT` subcommands.
+///
+/// A constraint is legitimately written inline or added here, and the two must
+/// produce the same `TableDef` — otherwise the same table reads differently
+/// depending only on which spelling its author chose, and reconcile sees drift
+/// that never converges. The constraint node is the very same
+/// `protobuf::Constraint` an inline one carries, so it goes through
+/// [`extract_table_constraint`] unchanged, including the `PRIMARY KEY` column
+/// marking.
+///
+/// Every other subcommand is **reported, not read**. dbd generates `ADD COLUMN`
+/// / `ALTER COLUMN` into migrations and never into a table file — which
+/// `scanner::scan_ddl` does not scan — so one appearing here means the file is
+/// not the full-and-final definition this parser assumes. Reading it is out of
+/// scope; staying silent about it is what let the missing constraints go
+/// unnoticed, so it surfaces as a warning instead.
+#[allow(clippy::too_many_arguments)]
+fn process_alter_table(
+    alter: &protobuf::AlterTableStmt,
+    default_schema: &str,
+    columns: &mut [ColumnDef],
+    constraints: &mut Vec<TableConstraint>,
+    references: &mut Vec<Reference>,
+    functions: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Extract<()> {
+    for cmd in &alter.cmds {
+        let Some(NodeEnum::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+            continue;
+        };
+
+        if cmd.subtype != protobuf::AlterTableType::AtAddConstraint as i32 {
+            warnings.push(format!(
+                "ALTER TABLE {} is not read by dbd — a table file is the full and final \
+                 definition, so only ADD CONSTRAINT is honoured here; put column changes \
+                 in a migration",
+                cmd.subtype().as_str_name()
+            ));
+            continue;
+        }
+
+        let Some(NodeEnum::Constraint(c)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+            continue;
+        };
+        let tc = extract_table_constraint(c, default_schema, references, functions)?;
+        if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = &tc {
+            mark_pk_columns(columns, pk_cols);
+        }
+        constraints.push(tc);
+    }
+    Ok(())
 }
 
 /// One `CREATE TABLE`'s columns, then its table-level constraints.

@@ -176,10 +176,16 @@ fn declared(node: &NodeEnum, default_schema: &str) -> Option<(EntityType, Option
 }
 
 /// The qualified name a subordinate statement belongs to.
+///
+/// `ALTER TABLE` is here for `ADD CONSTRAINT`, which is one of the two spellings
+/// a constraint legitimately takes. Grouping it is only half the job — the table
+/// parser has to read the subcommand as well — and it warns about the
+/// subcommands it does not read rather than dropping them silently.
 fn attaches_to(node: &NodeEnum, default_schema: &str) -> Option<String> {
     match node {
         NodeEnum::IndexStmt(ix) => Some(from_range_var(ix.relation.as_ref()?, default_schema).1),
         NodeEnum::CommentStmt(c) => comment_target(c, default_schema),
+        NodeEnum::AlterTableStmt(a) => Some(from_range_var(a.relation.as_ref()?, default_schema).1),
         _ => None,
     }
 }
