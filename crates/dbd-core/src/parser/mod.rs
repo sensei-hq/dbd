@@ -757,6 +757,40 @@ mod tests {
         );
     }
 
+    // ── ParserChoice after the sqlparser retirement ─────────────────────────
+    //
+    // `sqlparser` was never a dialect — `parse_with_sqlparser` hardcoded
+    // `PostgreSqlDialect`, so it was a second *Postgres* parser kept alive as
+    // an escape hatch during the libpg_query migration. Every file-backed type
+    // is now native (`pg::PgQueryDdl::COVERED`), which is the precondition the
+    // migration spec named for retiring it.
+
+    /// A project still naming the retired parser must be told it is gone, not
+    /// silently switched to a different one — the same reasoning that already
+    /// makes an unrecognised value an error rather than a fallback.
+    #[test]
+    fn sqlparser_is_rejected_by_name_and_says_it_was_removed() {
+        let err = ParserChoice::resolve("postgresql", Some("sqlparser"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sqlparser"), "must name the value it rejects: {err}");
+        assert!(
+            err.contains("removed"),
+            "must say it was removed, not merely that it is invalid: {err}"
+        );
+        assert!(err.contains("pg_query"), "must name the remaining valid value: {err}");
+    }
+
+    /// No non-Postgres grammar is wired, and none ever was: `init --from-db
+    /// sqlite://` writes no `source:` block (`reverse::design_yaml`), so every
+    /// generated SQLite project has always loaded under the `postgresql`
+    /// default and reached `PgQuery`. This arm keeps that true instead of
+    /// naming a parser that no longer exists.
+    #[test]
+    fn a_non_postgres_dialect_gets_the_postgres_parser() {
+        assert_eq!(ParserChoice::resolve("sqlite", None).unwrap(), ParserChoice::PgQuery);
+    }
+
     /// `source.parser` is public API, so a typo must not silently leave the
     /// project on a parser the author did not ask for.
     #[test]

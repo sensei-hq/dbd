@@ -38,6 +38,24 @@ fn an_unknown_source_parser_fails_to_load() {
     assert!(err.contains("sqlparser"), "must name the valid values, got: {err}");
 }
 
+/// `sqlparser` was the escape hatch during the libpg_query migration, and it
+/// was a second *Postgres* parser rather than a dialect. It is gone; a project
+/// that still names it must fail at load with a message that says so, rather
+/// than being quietly moved onto a parser its author did not choose.
+#[test]
+fn a_project_still_naming_sqlparser_fails_to_load() {
+    let config = project_with_source_block("parser_choice_retired", "  dialect: postgresql\n  parser: sqlparser\n");
+    let err = match Design::from_config(&config, "dev") {
+        Ok(_) => panic!("source.parser: sqlparser was removed and must not load"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("removed"), "must say it was removed, got: {err}");
+    assert!(
+        err.contains("pg_query"),
+        "must name the remaining valid value, got: {err}"
+    );
+}
+
 #[test]
 fn an_explicit_valid_parser_loads() {
     let config = project_with_source_block("parser_choice_ok", "  dialect: postgresql\n  parser: sqlparser\n");
