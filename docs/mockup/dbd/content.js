@@ -94,7 +94,7 @@
           kicker: "Embeddable",
           title: "Use it as a library",
           body: "Everything the CLI does lives in the dbd-core crate. Embed schema parsing, diffing and deployment in your own Rust tooling — the guide covers the full API.",
-          code: { lang: "rust", label: "main.rs", source: "use dbd_core::Design;\n\nlet design = Design::from_config(path, \"prod\")?;\ndesign.apply(&adapter, None, false).await?;" },
+          code: { lang: "rust", label: "main.rs", source: "use dbd_core::{Design, design::Progress};\n\nlet design = Design::from_config(path, \"prod\")?;\ndesign.apply(&adapter, None, false, None, Progress::none()).await?;" },
         },
       ],
     },

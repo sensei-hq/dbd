@@ -175,7 +175,7 @@ export const concepts = {
 				lang: 'rust',
 				label: 'main.rs',
 				source:
-					'use dbd_core::Design;\n\nlet design = Design::from_config(path, "prod")?;\ndesign.apply(&adapter, None, false).await?;'
+					'use dbd_core::{Design, design::Progress};\n\nlet design = Design::from_config(path, "prod")?;\ndesign.apply(&adapter, None, false, None, Progress::none()).await?;'
 			}
 		}
 	]

@@ -42,6 +42,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   "In sync" is the one answer that must never be wrong. `apply`, `deploy`,
   `import` and `export` are unaffected.
 
+- **Every documented `Design::apply` / `import_data` example was uncompilable.**
+  They showed the three progress callbacks as three separate arguments; both
+  methods take five, with the callbacks travelling together in one `Progress`.
+  A 7-argument call does not compile.
+
+  The root cause was `apply`'s own doc comment — *"Use `|_| {}` / `|_, _| {}` /
+  `|_| {}` when progress reporting is not needed"* — and six downstream surfaces
+  had copied the misreading: `README.md`, both `SKILL.md` copies,
+  `docs/design/architecture.md` (twice), `docs/llms/llms-full.txt`, the live
+  site, and the design mockups.
+
+  All corrected, and `Design::apply` now carries a **doctest**, so `cargo test
+  --doc` compiles the canonical example on every run. There were no doctests on
+  `Design` at all, which is why CI never caught this. Verified by mutation:
+  changing the doctest back to the 7-argument form fails with *"this method
+  takes 5 arguments but 7 arguments were supplied"*.
+
 ### Added
 
 - **`source.parser: verbatim`** — selects the verbatim reader explicitly.

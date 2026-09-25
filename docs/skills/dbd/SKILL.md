@@ -267,13 +267,16 @@ let report = design.report(None, None);
 // 3. Connect an adapter — Postgres/SQLite/Convex chosen from the URL scheme.
 let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;
 
-// 4. Apply schema + entities + pending migrations. Callbacks are (on_start, on_done, on_complete).
+// 4. Apply schema + entities + pending migrations.
+//    The three callbacks travel together in ONE `Progress` value — they are not
+//    three arguments. `Progress::none()` for a silent run.
 let scope = design.resolve_scope(None, None)?; // None,None ⇒ full design, default deps policy
 design
-    .apply(&*adapter, None, /*dry_run*/ false, Some(&scope),
-        |desc| println!("→ {desc}"),
-        |desc, err| if let Some(e) = err { eprintln!("✗ {desc}: {e}") },
-        |summary| println!("applied {} entities", summary.applied))
+    .apply(&*adapter, None, /*dry_run*/ false, Some(&scope), Progress {
+        on_start: |desc: &str| println!("→ {desc}"),
+        on_done: |desc: &str, err: Option<&str>| if let Some(e) = err { eprintln!("✗ {desc}: {e}") },
+        on_complete: |s: ApplyComplete| println!("applied {} entities", s.applied),
+    })
     .await?;
 
 // Or apply + import + policies in one call — the same pipeline `dbd deploy` runs:
