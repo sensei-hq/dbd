@@ -82,7 +82,13 @@ ignore:
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
 | `dialect` | string | `postgresql` | SQL dialect of the DDL files |
-| `parser`  | string | (from `dialect`) | Override the DDL parser: `pg_query` or `sqlparser` |
+| `parser`  | string | (from `dialect`) | Override the DDL parser. `pg_query` is the only value. |
+
+DDL is read by `pg_query` (libpg_query — PostgreSQL's own grammar), so `parser`
+never needs setting; it exists so a future non-PostgreSQL grammar has somewhere
+to be selected. `parser: sqlparser` was a second PostgreSQL parser kept during
+the libpg_query migration and **was removed in 0.14.0** — a project still naming
+it fails to load with a message saying so.
 
 ### `target`
 
