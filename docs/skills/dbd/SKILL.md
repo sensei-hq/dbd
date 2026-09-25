@@ -252,11 +252,12 @@ dbd-core = { git = "https://github.com/sensei-hq/dbd" }
 ```
 
 ```rust
-use dbd_core::{connect, Design};
+use dbd_core::{connect, ApplyComplete, Design};
+use dbd_core::design::Progress;
 use std::path::Path;
 
 // 1. Load the declarative design for an environment (sync; scans ddl/ next to the config).
-let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // 2. Validate offline — no DB needed.
 let report = design.report(None, None);
