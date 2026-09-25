@@ -1529,281 +1529,289 @@ End-to-end tests against a real database. These verify the full lifecycle — no
 
 Each scenario uses a fresh database (CREATE DATABASE per test, DROP after).
 
+> Written as Gherkin rather than as code. These are *requirements* — what must
+> be true after an operation — and a requirement written as Rust is a
+> requirement that rots when the API moves, which is what happened to the type
+> listings above. Given/When/Then says what, not how, so it stays true across a
+> refactor and is readable by someone who does not write Rust.
+>
+> Step wording is the original author's and is deliberately terse.
+
 #### Scenario 1: Initial deploy (fresh database)
 
 Empty database, no tables, no `_dbd_migrations`.
 
-```
-Given: empty database
-When:  design.apply()
-Then:
-  - schemas created (config, staging)
-  - extensions installed (uuid-ossp)
-  - roles created in dependency order
-  - tables created in dependency order (FKs resolve)
-  - views, functions, procedures created
-  - _dbd_migrations has one row at latest snapshot version (or no row if no snapshots)
-  - design.report() shows zero errors
+```gherkin
+Scenario: Initial deploy (fresh database)
+  Given empty database
+  When design.apply()
+  Then schemas created (config, staging)
+  And extensions installed (uuid-ossp)
+  And roles created in dependency order
+  And tables created in dependency order (FKs resolve)
+  And views, functions, procedures created
+  And _dbd_migrations has one row at latest snapshot version (or no row if no snapshots)
+  And design.report() shows zero errors
 ```
 
 #### Scenario 2: Initial deploy with data seeding
 
 Fresh database, apply + import.
 
-```
-Given: empty database, import/ folder with CSV files
-When:  design.apply() then design.import_data()
-Then:
-  - all entities created (same as Scenario 1)
-  - staging tables truncated before load (truncate: true default)
-  - CSV data loaded into staging tables via COPY FROM STDIN
-  - import procedures called automatically (staging.import_<name>())
-  - import.after SQL files executed
-  - config tables populated (via procedures moving data from staging → config)
+```gherkin
+Scenario: Initial deploy with data seeding
+  Given empty database, import/ folder with CSV files
+  When design.apply() then design.import_data()
+  Then all entities created (same as Scenario 1)
+  And staging tables truncated before load (truncate: true default)
+  And CSV data loaded into staging tables via COPY FROM STDIN
+  And import procedures called automatically (staging.import_<name>())
+  And import.after SQL files executed
+  And config tables populated (via procedures moving data from staging → config)
 ```
 
 #### Scenario 3: Incremental update (schema migration)
 
 Database at v1, DDL files changed, snapshot v2 exists with migrations.
 
-```
-Given: database at v1 (tables exist, _dbd_migrations.version = 1)
-       snapshots/002.json exists with column additions
-       migrations/002/ has ALTER SQL files
-When:  design.apply()
-Then:
-  - pending migration v1→v2 detected
-  - ALTER TABLE runs before each affected table's CREATE OR REPLACE
-  - unaffected tables re-applied via CREATE OR REPLACE (idempotent)
-  - views/functions/procedures re-applied (pick up column changes)
-  - _dbd_migrations records version 2
-  - no data loss in existing tables
+```gherkin
+Scenario: Incremental update (schema migration)
+  Given database at v1 (tables exist, _dbd_migrations.version = 1)
+  And snapshots/002.json exists with column additions
+  And migrations/002/ has ALTER SQL files
+  When design.apply()
+  Then pending migration v1→v2 detected
+  And ALTER TABLE runs before each affected table's CREATE OR REPLACE
+  And unaffected tables re-applied via CREATE OR REPLACE (idempotent)
+  And views/functions/procedures re-applied (pick up column changes)
+  And _dbd_migrations records version 2
+  And no data loss in existing tables
 ```
 
 #### Scenario 4: Incremental update with data re-seeding
 
 Database has existing data, apply migrations + reload staging.
 
-```
-Given: database at v1 with data in config tables
-       new snapshot v2, import/ has updated CSV files
-When:  design.apply() then design.import_data()
-Then:
-  - migrations applied (same as Scenario 3)
-  - staging tables TRUNCATED before re-import (truncate: true)
-  - fresh CSV data loaded
-  - import procedures re-run (moves staging → config)
-  - existing config data updated/replaced by procedure logic
-  - import.after SQL files re-executed
+```gherkin
+Scenario: Incremental update with data re-seeding
+  Given database at v1 with data in config tables
+  And new snapshot v2, import/ has updated CSV files
+  When design.apply() then design.import_data()
+  Then migrations applied (same as Scenario 3)
+  And staging tables TRUNCATED before re-import (truncate: true)
+  And fresh CSV data loaded
+  And import procedures re-run (moves staging → config)
+  And existing config data updated/replaced by procedure logic
+  And import.after SQL files re-executed
 ```
 
 #### Scenario 5: Incremental seeding only (no schema change)
 
 Database schema is current, just reload staging data.
 
-```
-Given: database at latest version, config tables have stale data
-When:  design.import_data()
-Then:
-  - no schema changes (apply not called)
-  - staging tables truncated
-  - CSV data loaded
-  - import procedures called
-  - config tables refreshed
+```gherkin
+Scenario: Incremental seeding only (no schema change)
+  Given database at latest version, config tables have stale data
+  When design.import_data()
+  Then no schema changes (apply not called)
+  And staging tables truncated
+  And CSV data loaded
+  And import procedures called
+  And config tables refreshed
 ```
 
 #### Scenario 6: Append-only import (truncate: false)
 
 Import with truncate disabled — data accumulates.
 
-```
-Given: database with existing staging data
-       design.yaml has import.options.truncate: false
-When:  design.import_data()
-Then:
-  - staging tables NOT truncated
-  - new rows appended via COPY FROM STDIN
-  - import procedures called (procedure decides how to merge)
-  - pre-existing rows preserved
+```gherkin
+Scenario: Append-only import (truncate: false)
+  Given database with existing staging data
+  And design.yaml has import.options.truncate: false
+  When design.import_data()
+  Then staging tables NOT truncated
+  And new rows appended via COPY FROM STDIN
+  And import procedures called (procedure decides how to merge)
+  And pre-existing rows preserved
 ```
 
 #### Scenario 7: Staging table dropped and recreated during apply
 
 Staging tables may have stale columns from a prior version. Apply drops and recreates them via CREATE OR REPLACE.
 
-```
-Given: database at v1, staging.lookups has columns (id, name)
-       DDL changed: staging.lookups now has (id, name, category)
-       snapshot v2 has migration for staging.lookups
-When:  design.apply()
-Then:
-  - migration ALTER adds "category" column to staging.lookups
-  - CREATE OR REPLACE re-applies DDL (idempotent, column already exists)
-  - staging.lookups now has 3 columns
-  - import files with "category" column can now be loaded
+```gherkin
+Scenario: Staging table dropped and recreated during apply
+  Given database at v1, staging.lookups has columns (id, name)
+  And DDL changed: staging.lookups now has (id, name, category)
+  And snapshot v2 has migration for staging.lookups
+  When design.apply()
+  Then migration ALTER adds "category" column to staging.lookups
+  And CREATE OR REPLACE re-applies DDL (idempotent, column already exists)
+  And staging.lookups now has 3 columns
+  And import files with "category" column can now be loaded
 ```
 
 #### Scenario 8: Reset and rebuild
 
 Full teardown and fresh start. Requires `--force` once the database has graduated past v0 or is marked prod.
 
-```
-Given: database at v3 with data, _dbd_meta.env = "dev", version = 3
-When:  design.reset(force=true) then design.apply()
-Then:
-  - all schemas dropped (CASCADE)
-  - _dbd_meta and _dbd_migrations cleared for this project
-  - full rebuild from DDL (no ALTER scripts)
-  - _dbd_meta re-created with version at latest snapshot
-  - tables exist but are empty (no data — import not called)
+```gherkin
+Scenario: Reset and rebuild
+  Given database at v3 with data, _dbd_meta.env = "dev", version = 3
+  When design.reset(force=true) then design.apply()
+  Then all schemas dropped (CASCADE)
+  And _dbd_meta and _dbd_migrations cleared for this project
+  And full rebuild from DDL (no ALTER scripts)
+  And _dbd_meta re-created with version at latest snapshot
+  And tables exist but are empty (no data — import not called)
 ```
 
 #### Scenario 9: Multi-version catch-up
 
 Database is several versions behind.
 
-```
-Given: database at v1, snapshots up to v4
-       migrations/002/, 003/, 004/ all exist
-When:  design.apply()
-Then:
-  - migrations applied in order: v1→v2, v2→v3, v3→v4
-  - each migration's ALTER runs before its table's CREATE OR REPLACE
-  - dropped tables (if any) removed after all entities applied
-  - _dbd_migrations has entries for v2, v3, v4
+```gherkin
+Scenario: Multi-version catch-up
+  Given database at v1, snapshots up to v4
+  And migrations/002/, 003/, 004/ all exist
+  When design.apply()
+  Then migrations applied in order: v1→v2, v2→v3, v3→v4
+  And each migration's ALTER runs before its table's CREATE OR REPLACE
+  And dropped tables (if any) removed after all entities applied
+  And _dbd_migrations has entries for v2, v3, v4
 ```
 
 #### Scenario 10: Deploy from GitHub source
 
 End-to-end deploy from a remote source.
 
-```
-Given: empty database, GitHub repo with design.yaml + ddl/ + import/
-When:  deploy(source="owner/repo/database", database_url=url)
-Then:
-  - source downloaded to temp directory
-  - apply runs (same as Scenario 1)
-  - import runs (same as Scenario 2)
-  - temp directory cleaned up
-  - database fully populated
+```gherkin
+Scenario: Deploy from GitHub source
+  Given empty database, GitHub repo with design.yaml + ddl/ + import/
+  When deploy(source="owner/repo/database", database_url=url)
+  Then source downloaded to temp directory
+  And apply runs (same as Scenario 1)
+  And import runs (same as Scenario 2)
+  And temp directory cleaned up
+  And database fully populated
 ```
 
 #### Scenario 11: Environment-specific import
 
 Dev vs prod data loading.
 
-```
-Given: database with schema applied
-       import/dev/staging/fixtures.csv exists
-       import/prod/staging/seeds.csv exists
-       import/staging/lookups.csv exists (shared)
-When:  design.import_data() with env="dev"
-Then:
-  - shared files loaded (import/staging/lookups.csv)
-  - dev files loaded (import/dev/staging/fixtures.csv)
-  - prod files NOT loaded
-  - import procedures called for loaded tables only
+```gherkin
+Scenario: Environment-specific import
+  Given database with schema applied
+  And import/dev/staging/fixtures.csv exists
+  And import/prod/staging/seeds.csv exists
+  And import/staging/lookups.csv exists (shared)
+  When design.import_data() with env="dev"
+  Then shared files loaded (import/staging/lookups.csv)
+  And dev files loaded (import/dev/staging/fixtures.csv)
+  And prod files NOT loaded
+  And import procedures called for loaded tables only
 ```
 
 #### Scenario 12: Dry-run produces no side effects
 
 Verify preview mode.
 
-```
-Given: empty database
-When:  design.apply(dry_run=true) then design.import_data(dry_run=true)
-Then:
-  - no tables created
-  - no data loaded
-  - stdout lists entities that would be applied
-  - stdout lists tables that would be imported
-  - database still empty
+```gherkin
+Scenario: Dry-run produces no side effects
+  Given empty database
+  When design.apply(dry_run=true) then design.import_data(dry_run=true)
+  Then no tables created
+  And no data loaded
+  And stdout lists entities that would be applied
+  And stdout lists tables that would be imported
+  And database still empty
 ```
 
 #### Scenario 13: Dev free-reset before v1
 
 During initial development, reset is unrestricted.
 
-```
-Given: _dbd_meta has env = "dev", version = 0
-When:  design.reset()
-Then:
-  - reset proceeds (dev, pre-v1 — free reset mode)
-  - all schemas dropped
+```gherkin
+Scenario: Dev free-reset before v1
+  Given _dbd_meta has env = "dev", version = 0
+  When design.reset()
+  Then reset proceeds (dev, pre-v1 — free reset mode)
+  And all schemas dropped
 ```
 
 #### Scenario 14: Dev reset blocked after v1
 
 Once a snapshot is applied, dev databases graduate.
 
-```
-Given: _dbd_meta has env = "dev", version = 1
-When:  design.reset()
-Then:
-  - ERROR: "reset is blocked — database has applied migrations. Use --force to override."
-  - database unchanged
+```gherkin
+Scenario: Dev reset blocked after v1
+  Given _dbd_meta has env = "dev", version = 1
+  When design.reset()
+  Then ERROR: "reset is blocked — database has applied migrations. Use --force to override."
+  And database unchanged
 ```
 
-```
-Given: _dbd_meta has env = "dev", version = 1
-When:  design.reset(force=true)
-Then:
-  - reset proceeds (explicit override)
-  - all schemas dropped
+```gherkin
+Scenario: Dev reset after v1 with an explicit override
+  Given _dbd_meta has env = "dev", version = 1
+  When design.reset(force=true)
+  Then reset proceeds (explicit override)
+  And all schemas dropped
 ```
 
 #### Scenario 15: Prod always blocked
 
 Production databases are always protected, even at version 0.
 
-```
-Given: _dbd_meta has env = "prod", version = 0
-When:  design.reset()
-Then:
-  - ERROR: "reset is blocked — database is marked as prod. Use --force to override."
-  - database unchanged
+```gherkin
+Scenario: Prod always blocked
+  Given _dbd_meta has env = "prod", version = 0
+  When design.reset()
+  Then ERROR: "reset is blocked — database is marked as prod. Use --force to override."
+  And database unchanged
 ```
 
 #### Scenario 16: First apply records environment
 
-```
-Given: empty database, no _dbd_meta table
-When:  design.apply() with env = "dev"
-Then:
-  - _dbd_meta table created
-  - row inserted: { project: "MyProject", env: "dev", version: 0 }
-  - reset is now allowed (dev, pre-v1)
+```gherkin
+Scenario: First apply records environment
+  Given empty database, no _dbd_meta table
+  When design.apply() with env = "dev"
+  Then _dbd_meta table created
+  And row inserted: { project: "MyProject", env: "dev", version: 0 }
+  And reset is now allowed (dev, pre-v1)
 ```
 
-```
-Given: empty database, no _dbd_meta table
-When:  design.apply() with env = "prod"
-Then:
-  - _dbd_meta row: { project: "MyProject", env: "prod", version: 0 }
-  - reset is blocked from this point
+```gherkin
+Scenario: First apply in prod records the environment
+  Given empty database, no _dbd_meta table
+  When design.apply() with env = "prod"
+  Then _dbd_meta row: { project: "MyProject", env: "prod", version: 0 }
+  And reset is blocked from this point
 ```
 
 #### Scenario 17: Environment mismatch warning
 
-```
-Given: _dbd_meta has env = "prod"
-       caller passes --environment dev
-When:  design.apply()
-Then:
-  - WARNING: "database is marked as prod but command was called with env=dev"
-  - apply proceeds (not destructive, just a warning)
-  - _dbd_meta.env NOT overwritten (database's recorded env is authoritative)
+```gherkin
+Scenario: Environment mismatch warning
+  Given _dbd_meta has env = "prod"
+  And caller passes --environment dev
+  When design.apply()
+  Then WARNING: "database is marked as prod but command was called with env=dev"
+  And apply proceeds (not destructive, just a warning)
+  And _dbd_meta.env NOT overwritten (database's recorded env is authoritative)
 ```
 
 #### Scenario 18: Reset guard works for embedded consumers
 
-```
-Given: Rust web app calls design.reset() programmatically
-       _dbd_meta has env = "prod"
-When:  design.reset("supabase", false)
-Then:
-  - returns Err(DbdError::SafetyGuard(...))
-  - database unchanged
+```gherkin
+Scenario: Reset guard works for embedded consumers
+  Given Rust web app calls design.reset() programmatically
+  And _dbd_meta has env = "prod"
+  When design.reset("supabase", false)
+  Then returns Err(DbdError::SafetyGuard(...))
+  And database unchanged
 ```
 
 ### Reset safety model
