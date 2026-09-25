@@ -388,6 +388,32 @@ outside the declaration that made it.
 Worth having: over a 2,154-file T-SQL corpus this is 4,059 references, and **817
 of those files reported nothing at all before it existed**.
 
+### Whether a schema was written or guessed
+
+The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first entry
+on the entity's `search_path`, so it becomes `app.parent` — indistinguishable
+from a source that wrote `app.parent`. `Reference::schema_source` and
+`ForeignKey::ref_schema_source` say which it was:
+
+| `SchemaSource` | meaning |
+|---|---|
+| `Stated` | the source wrote the schema, or there is none to doubt |
+| `Inferred` | dbd supplied it from `search_path[0]`. **It can be wrong** |
+| `Resolved` | inferred, then confirmed against the full entity set |
+
+`is_guess()` is the usual question — true only for `Inferred`.
+
+This matters most to a per-file consumer. `references::resolve_references`
+corrects a bad guess, but it needs every entity in the scan, so a caller
+reading one file at a time cannot run it and would otherwise record a guessed
+schema as a confident edge. T-SQL and MySQL never infer: an unqualified name is
+reported unqualified rather than guessed at.
+
+Provenance is metadata, not schema. It is excluded from `ForeignKey`'s
+`PartialEq` and never serialized with one — otherwise an inferred FK would read
+as drift against an introspected one forever, and every snapshot would change
+on regeneration.
+
 Only a structured reader can be diffed: `diff` and `reconcile` refuse on `tsql`
 and `verbatim` projects, naming the reason.
 

@@ -396,6 +396,9 @@ impl<'a> Parser<'a> {
                 ref_columns: r.tgt_columns,
                 on_delete: r.on_delete,
                 on_update: r.on_update,
+                // A DBML `Ref` always names both sides' schemas, so nothing
+                // here was inferred.
+                ref_schema_source: crate::entity::SchemaSource::Stated,
             };
             if let Some(entity) = self.tables.iter_mut().find(|e| e.name == src_qualified)
                 && let Some(td) = entity.table_def.as_mut()
@@ -1567,6 +1570,7 @@ mod tests {
                     ref_columns: vec!["user_id".into(), "tenant_id".into()],
                     on_delete: Some(FkAction::Cascade),
                     on_update: None,
+                    ..Default::default()
                 }),
             ],
             indexes: vec![IndexDef {

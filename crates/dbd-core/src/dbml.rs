@@ -762,6 +762,7 @@ mod tests {
             ref_columns: vec!["id".to_string()],
             on_delete: Some(FkAction::Cascade),
             on_update: Some(FkAction::NoAction),
+            ..Default::default()
         };
 
         let ref_line = emit_ref("config", "orders", &fk);
@@ -849,6 +850,7 @@ mod tests {
             ref_columns: vec!["user_id".into(), "tenant_id".into()],
             on_delete: Some(FkAction::Cascade),
             on_update: None,
+            ..Default::default()
         };
         let line = emit_ref("shop", "orders", &fk);
         assert!(
@@ -884,6 +886,7 @@ mod tests {
                 ref_columns: vec!["user_id".into(), "tenant_id".into()],
                 on_delete: None,
                 on_update: None,
+                ..Default::default()
             }));
         let parent = make_table_entity(
             "auth.memberships",

@@ -739,6 +739,9 @@ impl PostgresAdapter {
                         ref_columns: ref_col_names,
                         on_delete,
                         on_update,
+                        // Read from the live catalog, which always states the
+                        // schema. Nothing was guessed.
+                        ref_schema_source: crate::entity::SchemaSource::Stated,
                     }));
                 }
                 "c" => {
