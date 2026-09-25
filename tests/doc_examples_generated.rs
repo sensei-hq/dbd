@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xe6ed7970427cb068
+// docs-digest: 0x138d6036f12b148c
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -16,6 +16,14 @@ async fn doc_readme_md_0() -> dbd_core::Result<()> {
     let sql: &str = "";
     #[allow(unused_variables)]
     let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::Design;
@@ -45,6 +53,14 @@ async fn doc_docs_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
     let sql: &str = "";
     #[allow(unused_variables)]
     let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::design::Progress;
@@ -107,6 +123,14 @@ async fn doc_docs_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let database_url: &str = "";
     #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     let parsed = dbd_core::parser::parse_sql(sql)?; // ParsedFile
     for e in &parsed.entities {
@@ -125,6 +149,14 @@ async fn doc_docs_skills_dbd_skill_md_2() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let database_url: &str = "";
     #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::parser::{Dialect, parse_sql_as};
 
@@ -140,6 +172,14 @@ async fn doc_src_assets_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
     let sql: &str = "";
     #[allow(unused_variables)]
     let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::design::Progress;
@@ -202,6 +242,14 @@ async fn doc_src_assets_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let database_url: &str = "";
     #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     let parsed = dbd_core::parser::parse_sql(sql)?; // ParsedFile
     for e in &parsed.entities {
@@ -220,6 +268,14 @@ async fn doc_src_assets_skills_dbd_skill_md_2() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let database_url: &str = "";
     #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::parser::{Dialect, parse_sql_as};
 
@@ -235,6 +291,14 @@ async fn doc_docs_llms_llms_full_txt_0() -> dbd_core::Result<()> {
     let sql: &str = "";
     #[allow(unused_variables)]
     let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::design::Progress;
@@ -301,5 +365,161 @@ async fn doc_docs_llms_llms_full_txt_0() -> dbd_core::Result<()> {
     // Dependency graph (for visualization) — returns Result.
     let graph = design.graph(None, None)?;
     // graph.nodes, graph.edges, graph.layers
+    Ok(())
+}
+
+// docs/design/architecture.md — block 0
+#[allow(unused, clippy::all)]
+async fn doc_docs_design_architecture_md_0() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    // High-level: one-call operations (deploy, apply, inspect)
+    use dbd_core::Design;
+    use dbd_core::design::Progress;
+    use std::path::Path;
+
+    let mut design = Design::from_config(Path::new("design.yaml"), "prod")?; // sync; scans ddl/
+    let adapter = dbd_core::connect(db_url, &design.config().project.name).await?;
+    let scope = design.resolve_scope(None, None)?;
+    // apply/import_data: (&*adapter, name, dry_run, scope, progress)
+    // The three callbacks travel together in one `Progress`; `Progress::none()` is silent.
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await?; // entities + migrations
+    design
+        .import_data(&*adapter, None, false, Some(&scope), Progress::none())
+        .await?; // staging data
+    let report = design.report(None, None); // inspect: errors/warnings
+
+    // Mid-level: individual subsystems
+    use dbd_core::config;
+    use dbd_core::dependency;
+    use dbd_core::snapshot;
+
+    let config = config::read(Path::new("design.yaml"))?;
+    let sorted = dependency::sort_by_dependencies(&entities);
+    let pending = snapshot::pending_migrations(db_version, Path::new(".")); // -> Vec<PendingMigration>
+
+    // Low-level: parser, adapter trait, entity types
+    use dbd_core::adapter::DatabaseAdapter;
+    use dbd_core::entity::{Entity, EntityType};
+    use dbd_core::parser::parse_entity; // parse one DDL file's SQL → Entity (identity from the PATH)
+    use dbd_core::parser::parse_sql; // parse any SQL → ParsedFile (identity from the STATEMENTS)
+    Ok(())
+}
+
+// docs/design/architecture.md — block 1
+#[allow(unused, clippy::all)]
+async fn doc_docs_design_architecture_md_1() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    let parsed = dbd_core::parser::parse_sql(sql)?; // ParsedFile
+    for e in &parsed.entities {
+        // e.entity_type / e.schema / e.name  — from the CREATE, not a path
+        // e.refers, e.references             — typed edges (FK, view dep, function call)
+        // e.reads, e.writes                  — separated, for routines
+    }
+    Ok(())
+}
+
+// docs/design/architecture.md — block 2
+#[allow(unused, clippy::all)]
+async fn doc_docs_design_architecture_md_2() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    // In a Rust web server's startup routine
+    use dbd_core::Design;
+    use dbd_core::design::Progress;
+    use std::path::Path;
+
+    async fn run_migrations(database_url: &str) -> dbd_core::Result<()> {
+        let design = Design::from_config(Path::new("database/design.yaml"), "prod")?;
+        let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+        let scope = design.resolve_scope(None, None)?;
+        design
+            .apply(&*adapter, None, false, Some(&scope), Progress::none())
+            .await?;
+        design
+            .import_data(&*adapter, None, false, Some(&scope), Progress::none())
+            .await?;
+        Ok(())
+    }
+    Ok(())
+}
+
+// docs/design/architecture.md — block 3
+#[allow(unused, clippy::all)]
+async fn doc_docs_design_architecture_md_3() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::Design;
+    use dbd_core::dependency::GraphResult;
+    use std::path::Path;
+
+    let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
+
+    // Get dependency graph for visualization
+    let graph: GraphResult = design.graph(None, None)?;
+    // graph.nodes: Vec<{name, type, schema}>
+    // graph.edges: Vec<{from, to}>
+    // graph.layers: Vec<Vec<String>>
+
+    // Get validation report for dashboard
+    let report = design.report(None, None);
+    // report.issues: Vec<Entity>   (entities with errors)
+    // report.warnings: Vec<Entity> (entities with warnings)
+
+    // Get snapshot diff for migration preview
+    use dbd_core::snapshot;
+    let pending = snapshot::pending_migrations(db_version, project_dir); // -> Vec<PendingMigration>
+    // Each migration: { from_version, to_version, altered, dropped }
     Ok(())
 }

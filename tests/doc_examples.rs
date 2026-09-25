@@ -46,6 +46,13 @@ const SURFACES: &[&str] = &[
     "docs/skills/dbd/SKILL.md",
     "src/assets/skills/dbd/SKILL.md",
     "docs/llms/llms-full.txt",
+    // The architecture document's copyable examples. Its other 22 blocks are
+    // illustrative — signatures, sketches, aspirational test files — and are
+    // fenced ```rust,ignore so they keep their highlighting while staying out
+    // of this gate. Compiling a sketch would mean rewriting a design document
+    // into working Rust for no reader's benefit; compiling a call somebody
+    // pastes is the whole point.
+    "docs/design/architecture.md",
 ];
 
 /// Names a doc example may use without declaring. The docs write `parse_sql(sql)`
@@ -54,6 +61,10 @@ const SURFACES: &[&str] = &[
 const PREAMBLE: &str = "\
     #[allow(unused_variables)] let sql: &str = \"\";\n    \
     #[allow(unused_variables)] let database_url: &str = \"\";\n    \
+    #[allow(unused_variables)] let db_url: &str = \"\";\n    \
+    #[allow(unused_variables)] let db_version: u32 = 0;\n    \
+    #[allow(unused_variables)] let entities: Vec<dbd_core::Entity> = Vec::new();\n    \
+    #[allow(unused_variables)] let project_dir = std::path::Path::new(\".\");\n    \
     #[allow(unused_variables)] let path = std::path::Path::new(\"design.yaml\");\n";
 
 fn root() -> PathBuf {

@@ -46,7 +46,7 @@ scan ddl/                          ← sequential (fast, single walkdir traversa
   → ready for all consumers
 ```
 
-```rust
+```rust,ignore
 use rayon::prelude::*;
 
 let entities: Vec<Entity> = ddl_files
@@ -219,6 +219,8 @@ The library exposes a layered API — consumers pick the level they need:
 ```rust
 // High-level: one-call operations (deploy, apply, inspect)
 use dbd_core::Design;
+use dbd_core::design::Progress;
+use std::path::Path;
 
 let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;   // sync; scans ddl/
 let adapter = dbd_core::connect(db_url, &design.config().project.name).await?;
@@ -272,8 +274,10 @@ that could be `a.t` or `b.t` stays undecided until the whole set is known.
 ```rust
 // In a Rust web server's startup routine
 use dbd_core::Design;
+use dbd_core::design::Progress;
+use std::path::Path;
 
-async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
+async fn run_migrations(database_url: &str) -> dbd_core::Result<()> {
     let design = Design::from_config(Path::new("database/design.yaml"), "prod")?;
     let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
     let scope = design.resolve_scope(None, None)?;
@@ -290,6 +294,9 @@ The library returns structured data that a UI can render:
 ```rust
 use dbd_core::Design;
 use dbd_core::dependency::GraphResult;
+use std::path::Path;
+
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // Get dependency graph for visualization
 let graph: GraphResult = design.graph(None, None)?;
@@ -562,7 +569,7 @@ prints the advisories, and must not treat either as the other.
 
 ### Adapter trait
 
-```rust
+```rust,ignore
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync {
     // Lifecycle
@@ -746,7 +753,7 @@ The Node.js version uses a standalone classifier with hardcoded lists of Postgre
 
 Each adapter knows what's native to its target. The classifier isn't a standalone module — it's part of the `DatabaseAdapter` trait.
 
-```rust
+```rust,ignore
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync {
     // ... existing methods ...
@@ -815,7 +822,7 @@ SELECT type_name FROM all_types WHERE owner = 'SYS';
 3. Static patterns (offline fallback)            ← works without DB connection
 ```
 
-```rust
+```rust,ignore
 pub enum ReferenceClass {
     Internal,          // Built-in function, type, or operator
     Extension(String), // From a specific extension (name included)
@@ -839,7 +846,7 @@ See `classify_reference` in `crates/dbd-core/src/adapter/postgres/`.
 
 Each adapter provides its own static patterns. These handle the common cases when no DB connection is available:
 
-```rust
+```rust,ignore
 impl PostgresAdapter {
     const INTERNAL_PATTERNS: &[&str] = &[
         r"^pg_", r"^information_schema\.", r"^array_", r"^json_",
@@ -904,7 +911,7 @@ Each adapter's catalog knows its own dialect's builtins. The classifier never ne
 
 Two-tier error strategy:
 
-```rust
+```rust,ignore
 // Typed errors for library-level code (adapter, parser, config)
 #[derive(Debug, thiserror::Error)]
 pub enum DbdError {
@@ -940,7 +947,7 @@ pub enum DbdError {
 
 `Design` is loaded synchronously from the config, then queried or driven against an adapter:
 
-```rust
+```rust,ignore
 impl Design {
     // Load + parse ddl/ (sync). `from_config_with_dir` overrides the project root.
     pub fn from_config(config_path: &Path, env: &str) -> Result<Self> { ... }
@@ -970,7 +977,7 @@ impl Design {
 
 Match the Node.js pattern: entities accumulate `errors` and `warnings` vectors. Functions return partial results. Only truly unrecoverable errors (IO, connection failure) use `Result::Err`. Validation errors are collected and reported.
 
-```rust
+```rust,ignore
 // Good: collect and continue
 entity.errors.push(format!("File not found: {}", path.display()));
 
@@ -982,7 +989,7 @@ Err(DbdError::Database(e))
 
 Port the existing algorithm directly:
 
-```rust
+```rust,ignore
 pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     // 1. Build adjacency: name → Set<dependency names>
     // 2. Iteratively extract entities with no in-group dependencies
@@ -1060,7 +1067,7 @@ first, and only the write set says so.
 
 **No regex fallback needed.** The Node.js version falls back to regex because `pgsql-parser` (WASM) fails on some function/procedure/enum DDL. `sqlparser-rs` handles all of these natively:
 
-```rust
+```rust,ignore
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::ast::Statement;
@@ -1102,7 +1109,7 @@ for stmt in statements {
 
 Replace `execFileSync('curl', ...)` and `execFileSync('tar', ...)` with `reqwest` + `flate2` + `tar`:
 
-```rust
+```rust,ignore
 pub fn download_github_source(source: &str) -> Result<GitHubDownload> {
     let parsed = parse_github_source(source)?;
     let tmp_dir = tempfile::tempdir()?;
@@ -1127,7 +1134,7 @@ pub fn download_github_source(source: &str) -> Result<GitHubDownload> {
 
 ## CLI Structure (clap)
 
-```rust
+```rust,ignore
 #[derive(Parser)]
 #[command(name = "dbd", version, about = "Database design tool")]
 struct Cli {
@@ -1304,7 +1311,7 @@ Each `dbd-core` module has inline tests for pure functions. No database or exter
 
 Test the full parse pipeline using real DDL fixture files. Verifies that the parser produces the correct `Entity` + `TableDef` from actual DDL.
 
-```rust
+```rust,ignore
 // tests/parser/tables_test.rs
 #[test]
 fn parses_table_with_fk_and_actions() {
@@ -1353,7 +1360,7 @@ fn parses_procedure_reads_and_writes() {
 
 Test `classify_reference()` for each adapter — both static fallback and catalog-based.
 
-```rust
+```rust,ignore
 // tests/adapter/classify_test.rs
 
 #[test]
@@ -1432,7 +1439,7 @@ fn convex_classifies_everything_as_internal() {
 
 Test the full pipeline: parsed entities → DBML text. Use insta snapshots for complex output.
 
-```rust
+```rust,ignore
 #[test]
 fn generates_dbml_for_table_with_fks() {
     let entities = parse_fixture_entities("tests/fixtures");
@@ -1469,7 +1476,7 @@ fn dbml_includes_enums() {
 
 ### Snapshot / migration tests (insta)
 
-```rust
+```rust,ignore
 #[test]
 fn generates_migration_sql_for_added_column() {
     let diff = SchemaDiff { /* ... */ };
@@ -1488,7 +1495,7 @@ fn generates_reset_script() {
 
 Test the binary end-to-end. Lives in `tests/`.
 
-```rust
+```rust,ignore
 #[test]
 fn inspect_example_project() {
     Command::cargo_bin("dbd").unwrap()
@@ -1876,7 +1883,7 @@ reset called
 
 **Library API:**
 
-```rust
+```rust,ignore
 impl Design {
     pub async fn reset(&self, target: &str, force: bool) -> Result<()> {
         if !force {
@@ -1914,7 +1921,7 @@ a divergent schema.
 
 **CLI integration:**
 
-```rust
+```rust,ignore
 /// Drop all schemas (bare state)
 Reset {
     #[arg(long, default_value = "supabase")]
@@ -2168,7 +2175,7 @@ Referenced in column type: `status schema.enum_name`
 
 #### Generator module structure (`dbml.rs`)
 
-```rust
+```rust,ignore
 pub fn generate_dbml(params: &DbmlParams) -> Vec<DbmlDocument> { ... }
 
 struct DbmlParams {
@@ -2185,7 +2192,7 @@ struct DbmlDocument {
 
 Internal functions:
 
-```rust
+```rust,ignore
 fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String;
 fn emit_enum(name: &str, schema: &str, values: &[EnumValue]) -> String;
 fn emit_table(table: &TableSnapshot, comments: &TableComments) -> String;
