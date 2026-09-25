@@ -1,33 +1,37 @@
 # Checkpoint
 
-**Slice:** v0.15.0 shipped (T-SQL reader, `project::survey`). Eight commits on
-`develop` since, all unreleased.
+**Slice:** v0.16.0 shipped and verified. `develop` and `main` are level;
+nothing unreleased.
 
-## Done — unreleased
+## Done
 
-- **MySQL reader** (`91034b9`) — the T-SQL walk under different `WalkRules`:
-  `ALTER` never declares, `a.b` is `database.object`, backticks quote, `#`
-  comments. **Fixture-verified only** — the `DBD_SQL_CORPUS` gate awaits one.
-- **Doc facts made executable** (`a2bebd8`) — doc `rust` blocks compile as a
-  test target; parser table, dialect mapping and skill copies checked in code.
-- **Every doc link resolved** (`fc541dc`) — 24 fixed, plus a `deny` guard.
-- **`architecture.md` de-rotted** (`6d64760`…`e1f69c4`) — dead types dropped;
-  13 drifted listings replaced with prose (16 of 40 declarations were wrong);
-  examples gated or marked illustrative; 18 scenarios rewritten as Gherkin;
-  three copied manifests replaced with links plus their rationale.
+- **v0.16.0 released** — tagged, both crates on crates.io, merged to `main`,
+  CI + CodeQL green on the merge.
+  - **MySQL reader** (`91034b9`) — the T-SQL walk under different `WalkRules`:
+    `ALTER` never declares, `a.b` is `database.object`, backticks quote, `#`
+    comments. **Fixture-verified only**; `DBD_SQL_CORPUS` awaits a corpus.
+  - **Doc gates** (`a2bebd8`, `fc541dc`) — doc `rust` blocks compile as a test
+    target, guide facts checked against code, 24 broken links fixed and
+    `deny`-ed. All three found real defects on their first run.
+  - **`architecture.md` de-rotted** (`6d64760`…`e1f69c4`) — 693 lines out, 405
+    in; 16 of 40 field declarations had been wrong.
+- **Verified from the registry**, not the working tree: 0.16.0 and 0.15.0
+  installed side by side, same MySQL project through `dbd graph`. 0.15.0 lost
+  the FK edge and emitted one alphabetical layer — exit 0, no warning, and
+  `orders` ahead of `users`. 0.16.0 emits the edge and orders correctly.
 
 ## Next
 
     cargo test --workspace --all-features   # 1528 pass, clippy + fmt clean
 
-1. **Cut 0.16.0** — `[Unreleased]` has the MySQL reader plus tooling. Minor.
-2. **Sensei switchover** — pin `dbd-core` v0.15.0, replace
-   `adapters/manifest/dbd.rs`'s `design.yaml` reader with `project::survey`,
-   route reading through `parse_sql_as`, delete `indexer/lang/sql/`.
+**Sensei switchover** — pin `dbd-core` v0.16.0, replace
+`adapters/manifest/dbd.rs`'s `design.yaml` reader with `project::survey`, route
+reading through `parse_sql_as`, delete `indexer/lang/sql/`. Agreed direction:
+one path in sensei, all SQL parsing in dbd.
 
 ## Open questions
 
-None blocking. Order: (1) before (2), or sensei pins an unreleased dbd.
+None blocking.
 
 ## Known-broken / carried forward
 
