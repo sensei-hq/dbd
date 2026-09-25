@@ -218,3 +218,75 @@ async fn a_postgres_only_entity_still_fails_on_sqlite() {
         "the enum should still be modelled; it is the apply that must refuse"
     );
 }
+
+// ── reconcile and diff must not claim "in sync" on a verbatim project ───────
+//
+// A verbatim entity has `raw_ddl` and no `table_def`, and both snapshot
+// builders keep only entities where `table_def.is_some()`. So desired and live
+// both reduce to nothing, `plan_reconcile` compares empty against empty, and
+// the plan comes back clean — against a database that may share not one table
+// with the design. Observed: reconcile on an EMPTY target returned
+// `added=0 altered=0 dropped=0`.
+//
+// "In sync" is the one answer that must never be wrong. Refusing is the honest
+// reply, and there is precedent: reconcile already refuses a batch adapter with
+// "no live SQL schema to diff".
+
+#[tokio::test]
+async fn reconcile_refuses_a_verbatim_project_instead_of_reporting_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = seeded_db("sqlite::memory:").await;
+    let config = write_project(tmp.path(), &*source).await;
+    let design = Design::from_config(&config, "dev").expect("load");
+
+    // Deliberately empty: every table in the design is missing here, so any
+    // answer other than "refused" or "massive drift" is false.
+    let target = dbd_core::connect("sqlite::memory:", "roundtrip")
+        .await
+        .expect("connect");
+    let scope = design.resolve_scope(None, None).expect("scope");
+
+    let result = design
+        .reconcile(
+            &*target,
+            true,
+            false,
+            false,
+            Some(&scope),
+            dbd_core::design::Progress::none(),
+        )
+        .await;
+
+    let err = match result {
+        Ok(plan) => panic!(
+            "reconcile reported a clean plan against an empty database: \
+             added={} altered={} dropped={}",
+            plan.added.len(),
+            plan.altered.len(),
+            plan.dropped.len()
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("verbatim") || err.contains("structured"),
+        "the refusal must say why — no structured model to diff: {err}"
+    );
+}
+
+#[tokio::test]
+async fn diff_refuses_a_verbatim_project_instead_of_reporting_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = seeded_db("sqlite::memory:").await;
+    let config = write_project(tmp.path(), &*source).await;
+    let design = Design::from_config(&config, "dev").expect("load");
+
+    let target = dbd_core::connect("sqlite::memory:", "roundtrip")
+        .await
+        .expect("connect");
+    let scope = design.resolve_scope(None, None).expect("scope");
+
+    assert!(
+        design.diff_live(&*target, Some(&scope)).await.is_err(),
+        "diff must refuse a project it cannot structurally compare, not report no drift"
+    );
+}

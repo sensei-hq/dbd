@@ -9,6 +9,45 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A SQLite project exported by dbd could not be read back by dbd** (#20).
+  `dbd init --from-db sqlite://…` writes `sqlite_master.sql` into `ddl/`
+  verbatim — `AUTOINCREMENT`, `WITHOUT ROWID` and `STRICT` included — but
+  `reverse::design_yaml` emitted no `source:` block, so the project loaded under
+  the `postgresql` default and libpg_query rejected all three. `apply` then
+  refused with *"N file(s) could not be parsed"*. The round-trip dbd advertises
+  did not work at all.
+
+  `source.dialect: sqlite` is now written by `init --from-db`, and it selects a
+  **verbatim** reader: the DDL file is kept as-is in `Entity::raw_ddl` and
+  applied unchanged. That is not a weaker fallback — it is the shape SQLite
+  already has on the other side, where `SqliteAdapter::introspect` builds each
+  entity from `sqlite_master.sql` with no `table_def` because that text *is* the
+  schema. Reading the files any other way made the two sides disagree about what
+  a table is.
+
+  Verified end-to-end against a real in-memory database: export a schema,
+  re-apply it to an empty database, and compare the definitions both sides
+  report — not just the names, since an empty table matches on names alone.
+
+- **`reconcile` and `diff` reported "in sync" for a SQLite project** — against a
+  database sharing not one table with the design. A verbatim entity has no
+  `table_def`, and both snapshot builders keep only entities that have one, so
+  desired and live each reduced to nothing and the comparison succeeded
+  trivially. Observed: `added=0 altered=0 dropped=0` against a completely empty
+  database.
+
+  Both now refuse, naming the reason, as they already did for batch adapters.
+  "In sync" is the one answer that must never be wrong. `apply`, `deploy`,
+  `import` and `export` are unaffected.
+
+### Added
+
+- **`source.parser: verbatim`** — selects the verbatim reader explicitly.
+  `dialect: sqlite` implies it; the override exists for anything else whose DDL
+  should be applied as written.
+
 ## [0.14.0] — 2026-09-24
 
 One parser. The sqlparser DDL path retires — it was a second *PostgreSQL*

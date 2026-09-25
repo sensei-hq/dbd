@@ -7,19 +7,27 @@ use crate::error::{DbdError, Result};
 
 /// Which parser reads a project's DDL.
 ///
-/// One variant today. It was two during the libpg_query migration, when
-/// `Sqlparser` held a second implementation as an escape hatch — but that
-/// implementation hardcoded `PostgreSqlDialect`, so it was never a *dialect*
-/// selector, only a second Postgres parser. It retired once every file-backed
-/// type became native (see `pg::PgQueryDdl::COVERED`, or [`pg_native_types`]).
-///
-/// The type stays because [`Self::resolve`] is the seam a real dialect belongs
-/// in: dbd reads PostgreSQL DDL only, and wiring a non-Postgres grammar means
-/// adding a variant here rather than reviving the one that went away.
+/// Two variants, for the two shapes of model dbd has. It was two during the
+/// libpg_query migration as well, but for a different reason: `Sqlparser` held
+/// a second implementation as an escape hatch, and that implementation
+/// hardcoded `PostgreSqlDialect`, so it was never a *dialect* selector at all.
+/// It retired once every file-backed type became native (see
+/// `pg::PgQueryDdl::COVERED`, or [`pg_native_types`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserChoice {
     /// libpg_query — PostgreSQL's own grammar, vendored from the server.
+    /// Produces a fully structured [`Entity`]: columns, constraints, indexes.
     PgQuery,
+    /// The file is the model. Identity comes from the path; the SQL is kept
+    /// verbatim in [`Entity::raw_ddl`] and applied as written.
+    ///
+    /// This is not a weaker fallback, it is the shape SQLite already has on the
+    /// other side: `SqliteAdapter::introspect` builds each entity from
+    /// `sqlite_master.sql` with `raw_ddl` and no `table_def`, because that text
+    /// *is* the schema — losslessly, `AUTOINCREMENT` and `WITHOUT ROWID` and
+    /// `STRICT` included. Reading a SQLite project's files any other way would
+    /// make the two sides disagree about what a table even is.
+    Verbatim,
 }
 
 impl ParserChoice {
@@ -33,6 +41,7 @@ impl ParserChoice {
     pub fn resolve(dialect: &str, explicit: Option<&str>) -> Result<Self> {
         match explicit {
             Some("pg_query") => Ok(Self::PgQuery),
+            Some("verbatim") => Ok(Self::Verbatim),
             Some("sqlparser") => Err(DbdError::Config(
                 "source.parser \"sqlparser\" was removed — it was a second PostgreSQL parser, \
                  not a dialect, and every entity type is now read by libpg_query. \
@@ -40,7 +49,7 @@ impl ParserChoice {
                     .to_string(),
             )),
             Some(other) => Err(DbdError::Config(format!(
-                "unknown source.parser {other:?} — expected \"pg_query\""
+                "unknown source.parser {other:?} — expected \"pg_query\" or \"verbatim\""
             ))),
             None => Ok(Self::for_dialect(dialect)),
         }
@@ -48,28 +57,58 @@ impl ParserChoice {
 
     /// The parser a `source.dialect` selects when `source.parser` is unset.
     ///
-    /// Every dialect resolves to `PgQuery`, because PostgreSQL DDL is the only
-    /// grammar dbd parses. That is not a regression for non-Postgres projects:
-    /// `reverse::design_yaml` writes no `source:` block at all, so a project
-    /// built by `dbd init --from-db sqlite://` has always loaded under the
-    /// `postgresql` default and reached this parser anyway.
+    /// `sqlite` takes the verbatim path, matching how its own adapter models a
+    /// table. Everything else takes libpg_query: PostgreSQL is the only grammar
+    /// dbd parses structurally, and `postgresql` is the default for a project
+    /// that declares no dialect at all.
     ///
-    /// SQLite DDL is *not* a Postgres subset — `AUTOINCREMENT`, `WITHOUT ROWID`
-    /// and `STRICT` are rejected outright — so a SQLite project's own DDL does
-    /// not round-trip today. Fixing that means teaching this function a real
-    /// SQLite grammar; the parameter is unused until then, and kept so that
-    /// work is a change of body rather than a change of signature.
-    fn for_dialect(_dialect: &str) -> Self {
-        Self::PgQuery
+    /// An *unrecognised* dialect is deliberately not an error here. It would be
+    /// a breaking change for a value someone already has in a working project,
+    /// and the failure it would prevent surfaces anyway the moment libpg_query
+    /// rejects a file — with the offending SQL named, which is more use than a
+    /// complaint about a config string.
+    fn for_dialect(dialect: &str) -> Self {
+        match dialect {
+            "sqlite" => Self::Verbatim,
+            _ => Self::PgQuery,
+        }
     }
 }
 
 /// Reads a DDL file into an [`Entity`].
 ///
-/// One implementation. The trait is what a second one would be added against —
-/// a real non-Postgres grammar, not the sqlparser twin that used to sit here.
+/// Two implementations, and they differ in what an entity *is* rather than in
+/// which grammar reads it: [`pg::PgQueryDdl`] produces a structured model that
+/// reconcile can diff, [`VerbatimDdl`] produces the file's own text because for
+/// its targets that text is the schema. A third would be a real non-Postgres
+/// grammar — not the sqlparser twin that used to sit here, which was a second
+/// Postgres parser wearing a dialect's name.
 pub(crate) trait DdlParser {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity>;
+}
+
+/// Takes the file as the model: identity from the path, SQL kept verbatim.
+///
+/// No grammar is involved, so nothing about the SQL can make it fail. That is
+/// correct for a target whose own catalog hands back `CREATE` text — see
+/// [`ParserChoice::Verbatim`] — and would be wrong for one dbd diffs
+/// structurally, which is why the choice is made once from the dialect rather
+/// than per file.
+pub(crate) struct VerbatimDdl;
+
+impl DdlParser for VerbatimDdl {
+    fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
+        let mut entity = Entity::from_file(file);
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            // An empty file declares nothing. Erroring keeps it visible rather
+            // than contributing an entity that applies no SQL.
+            entity.errors.push("this file is empty".to_string());
+            return Ok(entity);
+        }
+        entity.raw_ddl = Some(trimmed.to_string());
+        Ok(entity)
+    }
 }
 
 /// Parse a DDL file with an explicit parser choice.
@@ -80,6 +119,7 @@ pub(crate) trait DdlParser {
 pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result<Entity> {
     match choice {
         ParserChoice::PgQuery => pg::PgQueryDdl.parse(file, sql),
+        ParserChoice::Verbatim => VerbatimDdl.parse(file, sql),
     }
 }
 
@@ -140,9 +180,20 @@ pub fn parse_sql(sql: &str) -> Result<ParsedFile> {
 ///
 /// Pair with [`ParserChoice::resolve`] to derive the choice from a dialect
 /// string, which is what the project scan does for `source.dialect`.
+///
+/// [`ParserChoice::Verbatim`] is an error here rather than an empty result.
+/// Statement-level identity is exactly what that path does not have — it never
+/// looks at the SQL — so answering "this file declares nothing" would be a
+/// claim about content, made without reading any.
 pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
     match choice {
         ParserChoice::PgQuery => pg::parse_sql(sql),
+        ParserChoice::Verbatim => Err(DbdError::Config(
+            "parse_sql needs a grammar, and the verbatim parser has none — it takes identity \
+             from the file path, not the statements. Use `parse_entity` for a verbatim project, \
+             or pass `ParserChoice::PgQuery` to read PostgreSQL DDL."
+                .to_string(),
+        )),
     }
 }
 
@@ -595,14 +646,70 @@ mod tests {
         assert!(err.contains("pg_query"), "must name the remaining valid value: {err}");
     }
 
-    /// No non-Postgres grammar is wired, and none ever was: `init --from-db
-    /// sqlite://` writes no `source:` block (`reverse::design_yaml`), so every
-    /// generated SQLite project has always loaded under the `postgresql`
-    /// default and reached `PgQuery`. This arm keeps that true instead of
-    /// naming a parser that no longer exists.
+    /// SQLite models a table as its `CREATE` text — `SqliteAdapter::introspect`
+    /// sets `raw_ddl` and no `table_def` — so reading a SQLite project's files
+    /// through libpg_query was never right: it rejects `AUTOINCREMENT`,
+    /// `WITHOUT ROWID` and `STRICT` outright, and a project `init --from-db`
+    /// had just written refused to load (issue #20).
     #[test]
-    fn a_non_postgres_dialect_gets_the_postgres_parser() {
-        assert_eq!(ParserChoice::resolve("sqlite", None).unwrap(), ParserChoice::PgQuery);
+    fn the_sqlite_dialect_selects_the_verbatim_parser() {
+        assert_eq!(ParserChoice::resolve("sqlite", None).unwrap(), ParserChoice::Verbatim);
+    }
+
+    /// An unrecognised dialect still gets libpg_query rather than an error.
+    /// Erroring would break a value someone already has in a working project,
+    /// and a file libpg_query cannot read reports the offending SQL — more use
+    /// than a complaint about a config string.
+    #[test]
+    fn an_unrecognised_dialect_falls_back_to_the_postgres_parser() {
+        assert_eq!(ParserChoice::resolve("mysql", None).unwrap(), ParserChoice::PgQuery);
+        assert_eq!(ParserChoice::resolve("", None).unwrap(), ParserChoice::PgQuery);
+    }
+
+    /// The verbatim parser takes the file as written and asks no grammar
+    /// anything — which is what makes it usable for SQLite DDL that libpg_query
+    /// rejects.
+    #[test]
+    fn the_verbatim_parser_keeps_sql_no_postgres_grammar_accepts() {
+        let sql = "CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;";
+        assert!(
+            pg_query::parse(sql).is_err(),
+            "precondition: libpg_query must reject this, or the test proves nothing"
+        );
+
+        let entity = parse_entity_with(ParserChoice::Verbatim, Path::new("ddl/table/settings.ddl"), sql).unwrap();
+        assert!(entity.errors.is_empty(), "unexpected errors: {:?}", entity.errors);
+        assert_eq!(entity.entity_type, EntityType::Table);
+        assert_eq!(entity.name, "settings", "SQLite is schema-less, so the name stays bare");
+        assert_eq!(entity.schema, None);
+        assert_eq!(entity.raw_ddl.as_deref(), Some(sql));
+        assert!(
+            entity.table_def.is_none(),
+            "the verbatim path models no structure — the text is the model"
+        );
+    }
+
+    /// An empty file declares nothing. Erroring keeps it visible rather than
+    /// contributing an entity that applies no SQL.
+    #[test]
+    fn the_verbatim_parser_rejects_an_empty_file() {
+        let entity = parse_entity_with(ParserChoice::Verbatim, Path::new("ddl/table/blank.ddl"), "  \n\t ").unwrap();
+        assert!(!entity.errors.is_empty(), "an empty file must not pass silently");
+        assert!(entity.raw_ddl.is_none());
+    }
+
+    /// `parse_sql` is statement-level, and the verbatim path never looks at a
+    /// statement. Answering "declares nothing" would be a claim about content
+    /// made without reading any, so it refuses instead.
+    #[test]
+    fn parse_sql_refuses_the_verbatim_parser_rather_than_returning_empty() {
+        let err = parse_sql_with(ParserChoice::Verbatim, "create table t (a int);")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parse_entity"),
+            "must point at the usable entry point: {err}"
+        );
     }
 
     /// `source.parser` is public API, so a typo must not silently leave the

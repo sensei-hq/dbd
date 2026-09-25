@@ -419,6 +419,12 @@ pub struct Design {
     project_dir: PathBuf,
     env: String,
     validated: bool,
+    /// How this project's DDL was read, resolved once from `source.dialect` /
+    /// `source.parser`. Kept because it decides what an entity *is*: a
+    /// `Verbatim` project has no structured model, so the operations that
+    /// compare structure must refuse rather than compare nothing and report a
+    /// match.
+    parser: crate::parser::ParserChoice,
 }
 
 impl Design {
@@ -570,6 +576,7 @@ impl Design {
             project_dir,
             env: env.to_string(),
             validated: false,
+            parser: parser_choice,
         })
     }
 

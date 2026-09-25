@@ -81,14 +81,28 @@ ignore:
 
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
-| `dialect` | string | `postgresql` | SQL dialect of the DDL files |
-| `parser`  | string | (from `dialect`) | Override the DDL parser. `pg_query` is the only value. |
+| `dialect` | string | `postgresql` | SQL dialect of the DDL files. `sqlite` selects the verbatim reader; anything else is read as PostgreSQL. |
+| `parser`  | string | (from `dialect`) | Override the reader: `pg_query` or `verbatim`. |
 
-DDL is read by `pg_query` (libpg_query — PostgreSQL's own grammar), so `parser`
-never needs setting; it exists so a future non-PostgreSQL grammar has somewhere
-to be selected. `parser: sqlparser` was a second PostgreSQL parser kept during
-the libpg_query migration and **was removed in 0.14.0** — a project still naming
-it fails to load with a message saying so.
+`dialect` picks the reader, and `parser` overrides that choice — you should not
+normally need it.
+
+- **`pg_query`** (libpg_query, PostgreSQL's own grammar) builds a structured
+  model: columns, constraints, indexes. That structure is what `diff` and
+  `reconcile` compare, so it is required for them to work.
+- **`verbatim`** takes the file as written and applies it unchanged. This is
+  what `dialect: sqlite` selects, and it is not a weaker fallback — it mirrors
+  how SQLite is read on the other side, where `sqlite_master.sql` *is* the
+  schema. A structured PostgreSQL parse would reject `AUTOINCREMENT`,
+  `WITHOUT ROWID` and `STRICT` outright.
+
+`dbd init --from-db sqlite://…` writes `dialect: sqlite` for you. A verbatim
+project has no structured model, so `diff` and `reconcile` have nothing to
+compare — `apply`, `deploy`, `import` and `export` work normally.
+
+`parser: sqlparser` was a second PostgreSQL parser kept during the libpg_query
+migration and **was removed in 0.14.0** — a project still naming it fails to
+load with a message saying so.
 
 ### `target`
 
