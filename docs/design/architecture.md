@@ -778,21 +778,12 @@ pub trait DatabaseAdapter: Send + Sync {
 
 ### Parser trait
 
-```rust
-pub trait SqlParser: Send + Sync {
-    /// Parse a SQL script and extract entity identity, references, and table structure
-    fn parse_entity(&self, path: &Path, sql: &str) -> Result<Entity>;
+A reader takes a file's path and SQL and returns an `Entity`. Which reader runs
+is chosen once per project from `source.dialect` — see `parser::ParserChoice`
+and the `DdlParser` trait in `crates/dbd-core/src/parser/`.
 
-    /// Parse a table DDL into a snapshot structure (reuses TableDef from Entity)
-    fn parse_table_snapshot(&self, entity: &Entity) -> Result<TableSnapshot>;
-
-    /// Parse a view DDL and extract column names
-    fn parse_view_columns(&self, entity: &Entity) -> Result<Vec<String>>;
-}
-
-// Note: classify_reference() is on DatabaseAdapter, not SqlParser.
-// The adapter knows what's native to its target environment.
-```
+`classify_reference` is on `DatabaseAdapter`, not on the parser: only the
+adapter knows what is native to its target environment.
 
 ---
 
@@ -1016,48 +1007,14 @@ pub enum ReferenceClass {
 
 #### Adapter implementation (PostgreSQL)
 
-```rust
-pub struct PostgresAdapter {
-    pool: PgPool,
-    catalog: Option<AdapterCatalog>,  // Loaded lazily on first classify
-    // ...
-}
+The Postgres adapter loads its catalog lazily, on the first classification
+that needs one: the built-in functions and types from `pg_proc` and `pg_type`,
+and the object→extension mapping from `pg_extension`. A name found there is
+`Internal` or `Extension`; anything else falls through to a static pattern
+match, so classification still works with no connection, and finally to
+`UserDefined`.
 
-pub struct AdapterCatalog {
-    builtin_functions: HashSet<String>,      // pg_catalog functions
-    builtin_types: HashSet<String>,          // pg_catalog types
-    extension_objects: HashMap<String, String>, // name → extension
-}
-
-impl DatabaseAdapter for PostgresAdapter {
-    async fn load_catalog(&mut self) -> Result<()> {
-        // Query pg_proc, pg_type, pg_extension
-        // Populate self.catalog
-    }
-
-    fn classify_reference(&self, name: &str, installed: &[String]) -> ReferenceClass {
-        let lower = name.to_lowercase();
-
-        // Catalog lookup (authoritative)
-        if let Some(catalog) = &self.catalog {
-            if catalog.builtin_functions.contains(&lower)
-                || catalog.builtin_types.contains(&lower) {
-                return ReferenceClass::Internal;
-            }
-            if let Some(ext) = catalog.extension_objects.get(&lower) {
-                return ReferenceClass::Extension(ext.clone());
-            }
-        }
-
-        // Static pattern fallback (no DB connection)
-        if Self::matches_static_pattern(&lower) {
-            return ReferenceClass::Internal;
-        }
-
-        ReferenceClass::UserDefined
-    }
-}
-```
+See `classify_reference` in `crates/dbd-core/src/adapter/postgres/`.
 
 #### Static patterns (offline fallback)
 
@@ -2236,23 +2193,9 @@ Extends Postgres — filters out DDL for managed infrastructure:
 - **Pre-installed extensions** (10): plpgsql, uuid-ossp, pgcrypto, pgjwt, pg_graphql, pgsodium, supabase_vault, pg_stat_statements, pgaudit, pg_tle
 - Overrides `apply_entity()` to skip CREATE SCHEMA and CREATE EXTENSION for these
 
-```rust
-pub struct SupabaseAdapter {
-    inner: PostgresAdapter,
-    managed_schemas: HashSet<String>,
-    managed_extensions: HashSet<String>,
-}
-
-impl DatabaseAdapter for SupabaseAdapter {
-    async fn apply_entity(&self, entity: &Entity) -> Result<()> {
-        match entity.entity_type {
-            EntityType::Schema if self.managed_schemas.contains(&entity.name) => Ok(()),
-            EntityType::Extension if self.managed_extensions.contains(&entity.name) => Ok(()),
-            _ => self.inner.apply_entity(entity).await,
-        }
-    }
-}
-```
+Built as a *mode* of the Postgres adapter rather than a separate type: the
+connection is the same, and the only difference is which schemas and extensions
+it declines to emit DDL for. Selected by `target: supabase` in `design.yaml`.
 
 ### Convex adapter
 
