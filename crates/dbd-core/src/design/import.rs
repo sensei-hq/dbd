@@ -62,8 +62,8 @@ impl Design {
     ///
     /// Public so `dbd import --dry-run` previews exactly what the real run does
     /// without opening a connection — the same reason
-    /// [`import_entry_in_scope`](crate::design::import_entry_in_scope) is
-    /// public. Both share [`plan_hooks`](super::hooks::plan_hooks), so the
+    /// [`import_entry_in_scope`] is
+    /// public. Both share `plan_hooks`, so the
     /// preview cannot drift from the run.
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
         let narrowed = match scope {

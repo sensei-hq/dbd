@@ -177,7 +177,7 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
 /// Reconcile does not diff check constraints on existing tables here — their
 /// introspected/parsed forms differ too much to compare reliably (create them
 /// via the initial `CREATE`, or use snapshots) — so after the shared
-/// [`normalize_common`] pass this drops them from the diff entirely, along with
+/// `normalize_common` pass this drops them from the diff entirely, along with
 /// column comments and inline FK. **Foreign keys and indexes are handled
 /// separately** by [`plan_fk_convergence`] and [`plan_index_convergence`] from
 /// the raw (un-canonicalized) snapshots, so they are stripped here too — keeping
@@ -708,7 +708,7 @@ fn table_fks(t: &TableSnapshot) -> Vec<ForeignKey> {
 ///   (`DROP CONSTRAINT <live-name>`, which sets `plan.destructive` so it is
 ///   gated behind `--allow-destructive`).
 ///
-/// FKs match by [`FkShape`] (name-agnostic), so a live auto-named FK and the
+/// FKs match by `FkShape` (name-agnostic), so a live auto-named FK and the
 /// design's inline unnamed FK of the same shape reconcile to no change — the
 /// same matching the read-only `dbd diff` uses. An FK whose shape changed
 /// (e.g. a different `ON DELETE`) is a drop of the old plus an add of the new.
@@ -1285,7 +1285,7 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
 ///   (`DROP INDEX IF EXISTS …`, which sets `plan.destructive` so it is gated
 ///   behind `--allow-destructive`).
 ///
-/// Indexes match by [`IndexShape`] (name-agnostic: unique flag, access method,
+/// Indexes match by `IndexShape` (name-agnostic: unique flag, access method,
 /// and ordered columns), so a live index and a design index of the same shape
 /// under different names reconcile to no change — mirroring FK convergence. An
 /// index whose shape changed (columns, uniqueness, or method) is a drop of the

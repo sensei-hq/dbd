@@ -58,6 +58,12 @@ jobs:
         run: cargo test --workspace --doc
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Documentation links. The lints are DENIED in the source (see the crate
+      # roots), so this needs no flags — it just has to run rustdoc, which
+      # `cargo test` does not. Once per push rather than in the inner loop:
+      # a doc build is slow and a broken link is not worth blocking a commit on.
+      - name: cargo doc (documentation links)
+        run: cargo doc --workspace --no-deps --all-features
       # Formatting is enforced from v0.12.0. The tree was hand-formatted and had
       # never been rustfmt-clean; rustfmt.toml pins max_width = 120 to match the
       # house style, and the whole tree was normalised in one commit.

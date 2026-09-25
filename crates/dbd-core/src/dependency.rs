@@ -63,7 +63,7 @@ pub fn build_dependency_graph(entities: &[Entity]) -> HashMap<String, HashSet<St
 /// either pair, so the graph has to decide.
 ///
 /// Run this across ALL entity types at once. Sorting per type bucket instead
-/// silently discards every cross-type edge, because [`build_dependency_map`]
+/// silently discards every cross-type edge, because `build_dependency_map`
 /// keeps only the dependencies naming an entity in the set it is given.
 ///
 /// Cyclic entities get an error added and are appended at the end.

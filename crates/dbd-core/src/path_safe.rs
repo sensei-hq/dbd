@@ -31,7 +31,7 @@ use std::path::{Component, Path, PathBuf};
 /// two relative-directory names, and the NUL that truncates a C path.
 ///
 /// This is therefore **not** the right rule for a value that also reaches a URL
-/// or a command line — see [`crate::github::is_safe_github_ident`], which
+/// or a command line — see `github::is_safe_github_ident`, which
 /// allow-lists instead, for that case.
 pub fn is_safe_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\') && !s.contains('\0')

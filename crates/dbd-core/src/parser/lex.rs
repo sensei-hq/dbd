@@ -38,7 +38,7 @@
 //! A word starts at an ASCII letter or `_`. A bare identifier beginning with a
 //! non-ASCII character is not read as a name (its bytes become punctuation the
 //! reader ignores). Quoted ones are unaffected — `[café]` reads correctly,
-//! because [`quoted`] slices from the source — and SSMS brackets identifiers
+//! because `quoted` slices from the source — and SSMS brackets identifiers
 //! as a matter of course, so this is a narrow gap rather than a common one.
 
 /// Which characters this dialect gives special meaning to.
