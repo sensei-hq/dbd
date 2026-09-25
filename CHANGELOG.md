@@ -110,6 +110,38 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
 
+- **T-SQL is read.** `ParserChoice::TSql`, selected by `source.dialect: tsql`
+  (or `mssql`/`sqlserver`) and by `Dialect::detect`. A statement-head walk over
+  the token stream: `CREATE PROCEDURE [dbo].[sp_X]` declares; `FROM
+  [dbo].[Issues]` refers.
+
+  Measured over 2,154 real T-SQL files, against libpg_query's 13 declarations
+  and 94.5% parse-error rate on the same input:
+
+  | | |
+  |---|---|
+  | entities declared | **2,737** (1,285 procedure, 613 table, 506 view, 220 function, 113 trigger) |
+  | edges | 8,558 reads, 1,828 writes, 1,216 calls |
+  | files classified | 100% — a lexer has nothing to reject |
+
+  Three dialect-specific rules do the work. **`ALTER PROCEDURE` declares** —
+  T-SQL requires it to carry the complete body, so it replaces rather than
+  edits (271 files ship procedures that way); `ALTER TABLE` never does.
+  **A qualified call is an edge and a bare one is a built-in**, because T-SQL
+  *requires* a scalar UDF to be schema-qualified — the distinction is read off
+  the grammar rather than a list of built-in names that would go stale. And a
+  `DROP x` naming something the same file declares is the **redeploy idiom**,
+  not a change: counting it as one put 54.5% of the corpus in `Mixed`, and
+  resolving it correctly moved 558 files to `Declaration`.
+
+  A T-SQL entity carries **no `table_def`** — this reads statement heads, not
+  column lists — so `diff` and `reconcile` cannot run on T-SQL, the same
+  position SQLite is in and for the same reason.
+
+- **`EntityType::Trigger`** — 107 trigger files in the measured corpus, so
+  reporting one as a `Function` would be a visible lie. `CREATE TYPE` and
+  `CREATE SYNONYM` are deliberately *not* modelled: 3 files each.
+
 - **`parser::lex` — a SQL tokeniser.** Batches, comments, quoting; nothing
   else. The first half of reading T-SQL, and a lexer rather than a grammar
   because dbd measured the alternatives on a 2,154-file corpus and none of them
