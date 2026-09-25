@@ -258,6 +258,7 @@ impl Design {
                 "reconcile is not supported for this target (no live SQL schema to diff)".to_string(),
             ));
         }
+        self.refuse_without_a_structured_model("reconcile")?;
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
@@ -380,6 +381,30 @@ impl Design {
 
     /// Read-only: introspect the live database and return the complete
     /// difference against the design. Never writes. Unlike `reconcile`, this is
+    /// Refuse an operation that compares structure when this project has none.
+    ///
+    /// A `Verbatim` project models each entity as its own DDL text with no
+    /// `table_def`, and both snapshot builders keep only entities where
+    /// `table_def.is_some()`. Desired and live therefore both reduce to
+    /// nothing, the comparison succeeds trivially, and the answer is "no
+    /// drift" — observed against a database sharing not one table with the
+    /// design.
+    ///
+    /// "In sync" is the one answer that must never be wrong, so this refuses
+    /// instead. Mirrors the batch-adapter guard directly above each call site:
+    /// same failure (nothing to compare), same response.
+    fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
+        if self.parser == crate::parser::ParserChoice::Verbatim {
+            return Err(DbdError::Config(format!(
+                "{op} needs a structured model, and this project is read verbatim \
+                 (source.dialect: sqlite) — its DDL files are applied as written rather than \
+                 parsed into columns and constraints, so there is nothing to compare. \
+                 `apply`, `deploy`, `import` and `export` work normally."
+            )));
+        }
+        Ok(())
+    }
+
     /// available even after the project is released.
     pub async fn diff_live(
         &self,
@@ -394,6 +419,7 @@ impl Design {
                 "diff is not supported for this target (no live SQL schema to diff)".to_string(),
             ));
         }
+        self.refuse_without_a_structured_model("diff")?;
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
