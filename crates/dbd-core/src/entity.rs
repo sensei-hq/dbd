@@ -120,15 +120,98 @@ impl EntityType {
 /// is dropped silently instead of warned about.
 pub const REF_TYPE_FUNCTION: &str = "function";
 
+/// Where the schema in a qualified name came from.
+///
+/// The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first
+/// entry on the entity's `search_path`, so the result reads exactly like a
+/// source that wrote `app.parent`. Without this, a guess and a statement are
+/// the same string.
+///
+/// That matters to two different callers:
+///
+/// - **A per-file consumer**, which cannot run
+///   [`resolve_references`](crate::references::resolve_references) — that needs
+///   the whole entity set — and so would otherwise record a guessed schema as a
+///   confident edge.
+/// - **The resolver itself**, which used to infer this from the value: "the
+///   schema equals `search_path[0]`, so the parser must have supplied it". A
+///   source that deliberately writes `app.parent` under `search_path = app`
+///   matches that test, and could have its explicit qualification re-pointed.
+///
+/// Deliberately **not** part of a foreign key's identity or its serialized
+/// form — see [`ForeignKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaSource {
+    /// The source wrote the schema, or there is no schema to doubt — a T-SQL
+    /// name left unqualified is reported unqualified rather than guessed at.
+    ///
+    /// The default, so a value built by hand or loaded from an older snapshot
+    /// does not claim to be a guess.
+    #[default]
+    Stated,
+    /// dbd supplied it from `search_path[0]` because the source wrote a bare
+    /// name. **It can be wrong**: the real target may live in another schema on
+    /// the path.
+    Inferred,
+    /// Inferred, then checked against the full entity set and found to name a
+    /// real target — either the guess held, or the resolver re-pointed it.
+    Resolved,
+}
+
+impl SchemaSource {
+    /// Whether the schema is dbd's guess rather than the source's word.
+    ///
+    /// The question a caller usually has. `Resolved` answers `false`: it began
+    /// as a guess but has been checked against every entity in the scan.
+    pub fn is_guess(self) -> bool {
+        self == Self::Inferred
+    }
+
+    fn is_stated(&self) -> bool {
+        *self == Self::Stated
+    }
+
+    /// How far a caller can trust the schema — lower is better.
+    ///
+    /// Used to pick a winner when the same name is reached twice in one body,
+    /// once written and once bare. An explicit ranking rather than a derived
+    /// `Ord`, because the declaration order of the variants is about reading
+    /// them, not about which one wins.
+    pub(crate) fn confidence_rank(self) -> u8 {
+        match self {
+            Self::Stated => 0,
+            Self::Resolved => 1,
+            Self::Inferred => 2,
+        }
+    }
+}
+
 /// A parsed reference to another entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
     pub name: String,
     pub ref_type: Option<String>,
+    /// Where the schema in [`Self::name`] came from. See [`SchemaSource`].
+    #[serde(default, skip_serializing_if = "SchemaSource::is_stated")]
+    pub schema_source: SchemaSource,
 }
 
 /// Foreign key constraint with full detail.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// [`Self::ref_schema_source`] is metadata about how dbd learned the schema,
+/// not part of what the constraint *is*. Two consequences are load-bearing and
+/// both are enforced by tests:
+///
+/// - It is **excluded from [`PartialEq`]** (hand-written below). A parsed FK
+///   whose schema was inferred and an introspected one that states it are the
+///   same constraint; if provenance counted, every such pair would read as
+///   drift on every run and `reconcile` would never converge.
+/// - It is **not serialized** when `Stated`, and never deserialized as
+///   anything else by default. A snapshot records the schema, not dbd's
+///   epistemics, and writing it would make existing snapshots differ the next
+///   time they were generated.
+#[derive(Debug, Clone, Default, Eq, Serialize, Deserialize)]
 pub struct ForeignKey {
     pub name: Option<String>,
     pub columns: Vec<String>,
@@ -137,6 +220,49 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: Option<FkAction>,
     pub on_update: Option<FkAction>,
+    /// Where [`Self::ref_schema`] came from. See [`SchemaSource`], and the note
+    /// on this struct for why it is outside `PartialEq`.
+    ///
+    /// `skip`, not `skip_serializing_if`: a foreign key reaches a **snapshot**
+    /// through [`ColumnDef::inline_fk`] and [`TableConstraint::ForeignKey`], and
+    /// a snapshot records what the schema is. Emitting provenance would rewrite
+    /// every existing snapshot the next time one was generated — and after
+    /// `resolve_references` has run, most previously-bare keys are `Resolved`,
+    /// so it would be nearly all of them. Reading one back gives `Stated`,
+    /// which is the honest reading: a snapshot states its schemas.
+    ///
+    /// [`Reference::schema_source`] is *not* skipped, because a `Reference` goes
+    /// to a consumer rather than into a durable artifact, and that consumer is
+    /// the whole reason this exists.
+    #[serde(skip)]
+    pub ref_schema_source: SchemaSource,
+}
+
+impl PartialEq for ForeignKey {
+    /// Every field except [`Self::ref_schema_source`].
+    ///
+    /// Written out by destructuring rather than compared field by field, so a
+    /// field added later is a compile error here and has to be decided about
+    /// instead of silently left out of equality.
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            name,
+            columns,
+            ref_schema,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+            ref_schema_source: _,
+        } = self;
+        *name == other.name
+            && *columns == other.columns
+            && *ref_schema == other.ref_schema
+            && *ref_table == other.ref_table
+            && *ref_columns == other.ref_columns
+            && *on_delete == other.on_delete
+            && *on_update == other.on_update
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

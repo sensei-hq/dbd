@@ -84,10 +84,8 @@ fn a_written_schema_that_matches_the_default_is_still_stated() {
 
 #[test]
 fn a_table_constraint_foreign_key_is_marked_too() {
-    let e = one(
-        "set search_path to app;\n\
-         create table t (pid uuid, constraint fk foreign key (pid) references parent (id));",
-    );
+    let e = one("set search_path to app;\n\
+         create table t (pid uuid, constraint fk foreign key (pid) references parent (id));");
     assert_eq!(only_fk(&e).ref_schema_source, SchemaSource::Inferred);
 }
 
@@ -210,22 +208,52 @@ fn provenance_does_not_affect_foreign_key_equality() {
     assert_eq!(stated, inferred);
 }
 
-/// And it must not enter a snapshot. A snapshot records what the schema IS;
-/// how dbd came to know a name is not part of that, and writing it would make
-/// every existing snapshot differ on regeneration.
+/// And it must not enter a snapshot. A foreign key reaches one through
+/// `inline_fk` and `TableConstraint::ForeignKey`; a snapshot records what the
+/// schema IS, and emitting provenance would rewrite every existing snapshot the
+/// next time one was generated.
 #[test]
-fn provenance_is_not_serialized() {
+fn a_foreign_keys_provenance_is_never_serialized() {
     use dbd_core::entity::ForeignKey;
-    let fk = ForeignKey {
-        ref_schema: Some("app".into()),
-        ref_table: "parent".into(),
-        ref_schema_source: SchemaSource::Inferred,
-        ..Default::default()
+    for source in [SchemaSource::Inferred, SchemaSource::Resolved, SchemaSource::Stated] {
+        let fk = ForeignKey {
+            ref_schema: Some("app".into()),
+            ref_table: "parent".into(),
+            ref_schema_source: source,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&fk).expect("serializes");
+        assert!(
+            !json.contains("schema_source"),
+            "provenance leaked into the snapshot form for {source:?}: {json}"
+        );
+    }
+}
+
+/// A `Reference`, by contrast, exists to be handed to a consumer and never
+/// lands in a snapshot — so it carries provenance across a JSON boundary too.
+/// Omitted when `Stated`, which is the overwhelming majority and the default.
+#[test]
+fn a_references_provenance_survives_json() {
+    use dbd_core::entity::Reference;
+    let inferred = Reference {
+        name: "app.parent".into(),
+        ref_type: None,
+        schema_source: SchemaSource::Inferred,
     };
-    let json = serde_json::to_string(&fk).expect("serializes");
+    let json = serde_json::to_string(&inferred).expect("serializes");
+    assert!(json.contains("\"schema_source\":\"inferred\""), "{json}");
+    let back: Reference = serde_json::from_str(&json).expect("round-trips");
+    assert_eq!(back.schema_source, SchemaSource::Inferred);
+
+    let stated = Reference {
+        schema_source: SchemaSource::Stated,
+        ..inferred
+    };
+    let json = serde_json::to_string(&stated).expect("serializes");
     assert!(
-        !json.contains("schema_source") && !json.contains("inferred"),
-        "provenance leaked into the snapshot form: {json}"
+        !json.contains("schema_source"),
+        "the default is not worth emitting: {json}"
     );
 }
 

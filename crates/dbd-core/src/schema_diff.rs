@@ -301,6 +301,7 @@ mod tests {
             ref_columns: vec![refc.into()],
             on_delete,
             on_update: None,
+            ..Default::default()
         }
     }
 

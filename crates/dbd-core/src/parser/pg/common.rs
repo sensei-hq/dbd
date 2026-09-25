@@ -1,6 +1,6 @@
 //! The libpg_query island: every helper that parses SQL through libpg_query
-//! (Postgres's own grammar) lives here, plus two small generic utilities
-//! (`push_unique`, `SYSTEM_SCHEMAS`) the per-type parsers share.
+//! (Postgres's own grammar) lives here, plus `SYSTEM_SCHEMAS`, which the
+//! per-type parsers share.
 //!
 //! This module was carved out to break a cycle: `pg::enums` imported the
 //! sqlparser-side `extractors` while `extractors` imported `pg::enums`, and
@@ -9,7 +9,7 @@
 //! arrangement is worth keeping — the per-type parsers share these helpers,
 //! and a future non-Postgres grammar would sit beside `pg`, not inside it.
 
-use crate::entity::{EnumValue, Reference};
+use crate::entity::{EnumValue, Reference, SchemaSource};
 
 use super::enums;
 
@@ -113,18 +113,12 @@ pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_s
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = Vec::new();
-    for table in parsed.select_tables() {
-        if let Some(name) = qualify_name_str(&table, default_schema) {
-            push_unique(&mut names, name);
-        }
-    }
-    names.sort();
-    names
+    qualify_all_sourced(parsed.select_tables(), default_schema)
         .into_iter()
-        .map(|name| Reference {
+        .map(|(name, schema_source)| Reference {
             name,
             ref_type: Some("table".to_string()),
+            schema_source,
         })
         .collect()
 }
@@ -147,10 +141,11 @@ pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_s
 /// covered: the sqlparser incumbent's PL/pgSQL tier calls this same function,
 /// so an unsorted result compared two independent hash orderings of the same
 /// set and failed nondeterministically.
+#[allow(clippy::type_complexity)]
 pub(in crate::parser) fn extract_proc_refs_via_pg_query(
     raw_sql: &str,
     default_schema: &str,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<(String, SchemaSource)>, Vec<(String, SchemaSource)>)> {
     let tree = pg_query::parse_plpgsql(raw_sql).ok()?;
 
     let mut queries = Vec::new();
@@ -165,20 +160,13 @@ pub(in crate::parser) fn extract_proc_refs_via_pg_query(
         let Ok(parsed) = pg_query::parse(query).or_else(|_| pg_query::parse(&format!("SELECT {query}"))) else {
             continue;
         };
-        for table in parsed.select_tables() {
-            if let Some(name) = qualify_name_str(&table, default_schema) {
-                push_unique(&mut reads, name);
-            }
-        }
-        for table in parsed.dml_tables() {
-            if let Some(name) = qualify_name_str(&table, default_schema) {
-                push_unique(&mut writes, name);
-            }
-        }
+        reads.extend(parsed.select_tables());
+        writes.extend(parsed.dml_tables());
     }
-    reads.sort();
-    writes.sort();
-    Some((reads, writes))
+    Some((
+        qualify_all_sourced(reads, default_schema),
+        qualify_all_sourced(writes, default_schema),
+    ))
 }
 
 /// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
@@ -216,33 +204,53 @@ fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
 ///
 /// [`design::hooks`]: crate::design::hooks
 pub(crate) fn qualify_name_str(name: &str, default_schema: &str) -> Option<String> {
+    qualify_name_source(name, default_schema).map(|(name, _)| name)
+}
+
+/// [`qualify_name_str`], also saying whether the schema was the source's or
+/// dbd's.
+///
+/// The one place a bare name acquires a schema it never had, so the one place
+/// that can tell a statement from a guess. See [`SchemaSource`].
+pub(crate) fn qualify_name_source(name: &str, default_schema: &str) -> Option<(String, SchemaSource)> {
     let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [.., schema, table] => {
             if SYSTEM_SCHEMAS.contains(schema) {
                 return None;
             }
-            Some(format!("{schema}.{table}"))
+            Some((format!("{schema}.{table}"), SchemaSource::Stated))
         }
-        [table] => Some(format!("{default_schema}.{table}")),
+        [table] => Some((format!("{default_schema}.{table}"), SchemaSource::Inferred)),
         _ => None,
     }
 }
 
-/// Push a value only if not already present (preserves insertion order).
+/// Qualify a batch of names, sorted and deduplicated, keeping each one's
+/// provenance.
 ///
-/// Generic — not libpg_query-specific — but shared by the per-type parsers, so
-/// it lives beside them. See the module doc comment.
-pub(in crate::parser) fn push_unique(v: &mut Vec<String>, item: String) {
-    if !v.contains(&item) {
-        v.push(item);
-    }
+/// Sorted for the reason [`extract_view_refs_via_pg_query`] gives: the
+/// libpg_query accessors are `HashSet`-backed, so their order varies per
+/// process.
+///
+/// Deduplicated **by name**, keeping the most trustworthy provenance. The same
+/// table can be reached twice in one body — once written `app.t` and once bare
+/// — and if dbd knows the schema from anywhere in the file it should not report
+/// a guess.
+pub(in crate::parser) fn qualify_all_sourced(names: Vec<String>, default_schema: &str) -> Vec<(String, SchemaSource)> {
+    let mut out: Vec<(String, SchemaSource)> = names
+        .iter()
+        .filter_map(|n| qualify_name_source(n, default_schema))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.confidence_rank().cmp(&b.1.confidence_rank())));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
 }
 
 /// System schemas to exclude from references.
 ///
-/// Generic — not libpg_query-specific — but lives here for the same reason as
-/// [`push_unique`].
+/// Generic — not libpg_query-specific — but lives here because the per-type
+/// parsers share it. See the module doc comment.
 pub(in crate::parser) const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
 
 #[cfg(test)]

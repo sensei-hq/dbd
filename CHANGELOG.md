@@ -43,6 +43,31 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   later `ALTER TABLE x` batch to an `x` declared earlier in the same file is
   worth 182 references of the 20,929.
 
+- **A reference says whether its schema was written or guessed** ([#22]).
+  `Reference::schema_source` and `ForeignKey::ref_schema_source`, carrying
+  `SchemaSource::{Stated, Inferred, Resolved}` (`is_guess()` for the usual
+  question).
+
+  The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first
+  entry on the entity's `search_path`. The result — `app.parent` — is the same
+  string a source that wrote `app.parent` produces, and nothing recorded which
+  it was. `resolve_references` corrects a bad guess, but it needs every entity
+  in the scan, so a consumer reading one file at a time cannot run it and had
+  no way to tell a confident edge from an invented one.
+
+  T-SQL and MySQL never infer — an unqualified name is reported unqualified —
+  so everything those readers produce is `Stated`.
+
+- **The resolver no longer re-points a schema the source wrote** ([#22]).
+  `recover_bare_target` used *"the schema equals `default_schema`"* as a proxy
+  for *"the parser guessed this"* — its own comment called it "the parser's
+  bare-qualification marker". A table that deliberately writes `app.parent`
+  while its own `search_path` is `app` satisfies that test, so its explicit
+  qualification could be silently re-pointed at another schema on the path that
+  happened to hold a table of the same name. It now asks the recorded fact.
+
+  Found while implementing the above, not reported.
+
 ### Changed
 
 - **`FileKind::Empty` documents what it does and does not mean.** It means
@@ -52,6 +77,7 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   is the serialized value callers match on.
 
 [#21]: https://github.com/sensei-hq/dbd/issues/21
+[#22]: https://github.com/sensei-hq/dbd/issues/22
 
 ## [0.16.0] — 2026-09-25
 

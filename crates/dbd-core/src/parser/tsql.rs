@@ -459,6 +459,10 @@ fn refer(
         entity.references.push(Reference {
             name: full.clone(),
             ref_type,
+            // This walk never invents a schema: an unqualified name is reported
+            // unqualified rather than guessed at, so whatever is here is the
+            // source's own.
+            schema_source: crate::entity::SchemaSource::Stated,
         });
     }
     push_unique(&mut entity.refers, &full);

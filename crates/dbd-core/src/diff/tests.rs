@@ -1122,7 +1122,8 @@
                 ref_columns: vec!["id".to_string()],
                 on_delete: None,
                 on_update: None,
-            }),
+                ..Default::default()
+}),
             ..col("org_id", "uuid")
         };
         let sql = generate_migration_sql(&[alter_col("public.users", "org_id", col("org_id", "uuid"), new)]);
@@ -1213,7 +1214,8 @@
                         ref_columns: vec!["id".to_string()],
                         on_delete: None,
                         on_update: None,
-                    }),
+                        ..Default::default()
+}),
                 ))),
             }]),
         };
@@ -1266,7 +1268,8 @@
                         ref_columns: vec!["id".to_string()],
                         on_delete: Some(FkAction::Cascade),
                         on_update: None,
-                    }),
+                        ..Default::default()
+}),
                 ))),
             }]),
         };
@@ -1423,7 +1426,8 @@
                 ref_columns: vec!["id".to_string()],
                 on_delete: None,
                 on_update: None,
-            }),
+                ..Default::default()
+}),
             ..col("user_id", "int")
         };
         let new_col = ColumnDef {
@@ -1435,7 +1439,8 @@
                 ref_columns: vec!["id".to_string()],
                 on_delete: None,
                 on_update: None,
-            }),
+                ..Default::default()
+}),
             ..col("user_id", "int")
         };
         let a = snap(vec![table("public", "orders", vec![old_col])], vec![]);
@@ -1612,7 +1617,8 @@
                         ref_columns: vec!["id".to_string()],
                         on_delete: Some(FkAction::Cascade),
                         on_update: Some(FkAction::Restrict),
-                    }),
+                        ..Default::default()
+}),
                 ))),
             }]),
         };

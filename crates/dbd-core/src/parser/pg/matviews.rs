@@ -68,21 +68,22 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
     // matview's body is read the same way a view's is, only the write side
     // (the body text kept in `writes[0]`) differs.
     let mut references = common::extract_view_refs_via_pg_query(sql, &default_schema);
-    let mut function_names: Vec<String> = parsed
-        .call_functions()
-        .into_iter()
-        .filter_map(|name| common::qualify_name_str(&name, &default_schema))
-        .chain(index_functions)
-        .collect();
-    function_names.sort();
-    function_names.dedup();
-    for qualified in function_names {
+    // The body's calls need qualifying; the index expressions' were qualified
+    // when the indexes were read, so they arrive already sourced.
+    let mut function_names = common::qualify_all_sourced(parsed.call_functions(), &default_schema);
+    for pair in index_functions {
+        if !function_names.iter().any(|(n, _)| n == &pair.0) {
+            function_names.push(pair);
+        }
+    }
+    for (qualified, schema_source) in function_names {
         if references.iter().any(|r| r.name == qualified) {
             continue;
         }
         references.push(Reference {
             name: qualified,
             ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            schema_source,
         });
     }
     entity.refers = references.iter().map(|r| r.name.clone()).collect();
@@ -164,7 +165,7 @@ fn extract_body(sql: &str, raw_stmt: &pg_query::protobuf::RawStmt) -> Option<Str
 fn extract_indexes(
     parsed: &pg_query::ParseResult,
     default_schema: &str,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, crate::entity::SchemaSource)>,
 ) -> std::result::Result<Vec<IndexDef>, String> {
     let mut indexes = Vec::new();
     for stmt in &parsed.protobuf.stmts {

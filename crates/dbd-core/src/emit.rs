@@ -474,6 +474,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: None,
                     on_update: None,
+                    ..Default::default()
                 }),
             ],
             indexes: vec![IndexDef {
