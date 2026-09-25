@@ -52,6 +52,7 @@
 //! Ported from sensei's `indexer::lang::sql::tsql`.
 
 use crate::entity::{Entity, EntityType, REF_TYPE_FUNCTION, Reference};
+use crate::parser::FileReferences;
 use crate::parser::lex::{self, Tok};
 
 /// What a `CREATE` or `ALTER` head names.
@@ -222,8 +223,9 @@ impl WalkRules {
 }
 
 /// Read one file into the entities it declares and the references they make.
-pub(crate) fn read(rules: WalkRules, sql: &str) -> (Vec<Entity>, Signals) {
+pub(crate) fn read(rules: WalkRules, sql: &str) -> (Vec<Entity>, FileReferences, Signals) {
     let mut entities: Vec<Entity> = Vec::new();
+    let mut file_refs = FileReferences::default();
     let mut signals = Signals::default();
     // What the file DROPped or ALTERed, resolved against what it declares only
     // once every batch has been read. `DROP PROCEDURE x` followed by `CREATE
@@ -235,11 +237,11 @@ pub(crate) fn read(rules: WalkRules, sql: &str) -> (Vec<Entity>, Signals) {
 
     for (_line, batch) in lex::batches(sql) {
         let toks = lex::tokens_with(rules.lex, batch);
-        walk(&rules, &toks, &mut entities, &mut signals, &mut changed);
+        walk(&rules, &toks, &mut entities, &mut file_refs, &mut signals, &mut changed);
     }
 
     signals.changes = changed.iter().any(|name| !entities.iter().any(|e| &e.name == name));
-    (entities, signals)
+    (entities, file_refs, signals)
 }
 
 /// What the statements amounted to, for classifying the file itself.
@@ -255,6 +257,7 @@ fn walk(
     rules: &WalkRules,
     toks: &[Tok<'_>],
     entities: &mut Vec<Entity>,
+    file_refs: &mut FileReferences,
     signals: &mut Signals,
     changed: &mut Vec<String>,
 ) {
@@ -319,7 +322,7 @@ fn walk(
                         // Recorded, not decided: whether this is a change
                         // depends on what the whole file declares.
                         changed.push(name.name());
-                        refer(entities, owner, &name, RefKind::Writes);
+                        refer(entities, file_refs, owner, &name, RefKind::Writes);
                     }
                     i = name.next;
                     continue;
@@ -349,7 +352,7 @@ fn walk(
             // keyword, so `FROM`/`INTO` alone carries them. A SUBQUERY opens
             // with `FROM (`, which names no object.
             if let Some(name) = qualified(toks, i + 1, rules) {
-                refer(entities, owner, &name, kind);
+                refer(entities, file_refs, owner, &name, kind);
                 i = name.next;
                 continue;
             }
@@ -369,7 +372,7 @@ fn walk(
             && matches!(toks.get(name.next), Some(Tok::Punct('(')))
         {
             let next = name.next;
-            refer(entities, owner, &name, RefKind::Calls);
+            refer(entities, file_refs, owner, &name, RefKind::Calls);
             i = next;
             continue;
         }
@@ -403,17 +406,38 @@ fn declare(entities: &mut Vec<Entity>, name: &Qualified, entity_type: EntityType
     entities.len() - 1
 }
 
-/// Attribute a reference to the declaration that made it.
+/// Attribute a reference to the declaration that made it, or to the file.
 ///
-/// A reference made before any declaration in the batch belongs to no entity —
-/// it is the file's, and the file is not an entity. Dropping it is correct: the
-/// alternative is attaching it to whatever happens to be declared next, which
-/// would be a fabricated edge.
-fn refer(entities: &mut [Entity], owner: Option<usize>, name: &Qualified, kind: RefKind) {
-    let Some(owner) = owner else { return };
+/// A reference made before any declaration in the batch belongs to no entity.
+/// Attaching it to whatever happens to be declared next would fabricate an
+/// edge, so it is not attached to an entity at all — it goes to
+/// [`FileReferences`], because the file is what made it.
+///
+/// This used to drop such a reference. Over a 2,154-file T-SQL corpus that was
+/// 20,929 of 43,754 references (47.8%), and two-thirds of the loss was pure
+/// data scripts whose references are the whole point of the file (#21).
+fn refer(
+    entities: &mut [Entity],
+    file_refs: &mut FileReferences,
+    owner: Option<usize>,
+    name: &Qualified,
+    kind: RefKind,
+) {
     let full = match &name.catalog {
         Some(catalog) => format!("{catalog}.{}", name.name()),
         None => name.name(),
+    };
+    let Some(owner) = owner else {
+        // No declaration to own it: the file made this reference.
+        push_unique(
+            match kind {
+                RefKind::Reads => &mut file_refs.reads,
+                RefKind::Writes => &mut file_refs.writes,
+                RefKind::Calls => &mut file_refs.calls,
+            },
+            &full,
+        );
+        return;
     };
     let entity = &mut entities[owner];
     if entity.name == full {

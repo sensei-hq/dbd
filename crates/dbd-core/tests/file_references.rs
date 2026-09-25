@@ -19,6 +19,15 @@
 //! 0.04% of what dbd's walk already saw. Nothing was being missed; it was being
 //! thrown away at the last step.
 //!
+//! # What it recovered
+//!
+//! 20,929 is an *occurrence* count; these are deduplicated per file, as
+//! entity-level references already were. Over the same corpus that is **4,059
+//! file-level references**, taking the total from 10,695 to 14,754 (+38%) — and
+//! **817 of 2,154 files (38%) went from reporting nothing at all to reporting
+//! something**. That last number is the one worth caring about: those files were
+//! invisible.
+//!
 //! # What this does NOT do
 //!
 //! It does not attach anything to an entity. A file-level reference is reported
@@ -35,10 +44,7 @@ fn read(dialect: Dialect, sql: &str) -> dbd_core::parser::ParsedFile {
 /// The headline case: two-thirds of the measured loss.
 #[test]
 fn a_pure_data_script_reports_what_it_touched() {
-    let p = read(
-        Dialect::TSql,
-        "INSERT INTO dbo.Target (id) SELECT id FROM dbo.Source;",
-    );
+    let p = read(Dialect::TSql, "INSERT INTO dbo.Target (id) SELECT id FROM dbo.Source;");
     assert!(p.entities.is_empty(), "a data script declares nothing");
     assert_eq!(p.references.writes, vec!["dbo.Target"]);
     assert_eq!(p.references.reads, vec!["dbo.Source"]);
@@ -127,11 +133,25 @@ fn a_file_level_reference_is_recorded_once() {
     assert_eq!(p.references.reads, vec!["dbo.Issues"]);
 }
 
+/// A declaration that *does* refer to something — so this fails if owned
+/// references leak into the file set, rather than passing because there was
+/// nothing to leak.
 #[test]
 fn a_declaration_only_file_has_no_file_level_references() {
-    let p = read(Dialect::TSql, "CREATE TABLE dbo.T (id int NOT NULL);");
+    let p = read(
+        Dialect::TSql,
+        "CREATE TABLE dbo.Orders (\n\
+           id int NOT NULL,\n\
+           UserId int NOT NULL REFERENCES dbo.Users(id)\n\
+         );",
+    );
     assert_eq!(p.entities.len(), 1);
-    assert!(p.references.is_empty());
+    assert_eq!(
+        p.entities[0].reads,
+        vec!["dbo.Users"],
+        "precondition: the declaration makes a reference that could leak"
+    );
+    assert!(p.references.is_empty(), "but it is the table's, not the file's");
 }
 
 #[test]
@@ -144,10 +164,7 @@ fn an_empty_file_refers_to_nothing() {
 
 #[test]
 fn mysql_reports_file_level_references_too() {
-    let p = read(
-        Dialect::MySql,
-        "INSERT INTO `target` SELECT * FROM `source`;",
-    );
+    let p = read(Dialect::MySql, "INSERT INTO `target` SELECT * FROM `source`;");
     assert!(p.entities.is_empty());
     assert_eq!(p.references.writes, vec!["target"]);
     assert_eq!(p.references.reads, vec!["source"]);
