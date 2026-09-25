@@ -183,8 +183,9 @@ fn read_hook(canon_root: &Path, script: &str, kind: HookKind) -> Result<String> 
     // `path` is the project root joined with a path rebuilt from `Normal`
     // components only, then canonicalized and re-checked against that root — the
     // two checks above. The taint rule cannot see either, so it reports the read.
+    // A hook script is user-authored SQL and may be UTF-16 — see `source_text`.
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::read_to_string(&path).map_err(|e| denied(e.to_string()))
+    crate::source_text::read_to_string(&path).map_err(|e| denied(e.to_string()))
 }
 
 /// Run one phase's hook scripts, honouring scope and `dry_run`.

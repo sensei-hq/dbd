@@ -250,7 +250,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.14.0
+  rev: v0.15.0
   hooks:
     - id: dbd-format
 ```
@@ -282,9 +282,9 @@ async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
 
     let adapter = PostgresAdapter::new(database_url, &design.config().project.name).await?;
 
-    // apply(adapter, name, dry_run, scope, on_start, on_done, on_complete)
+    // apply(adapter, name, dry_run, scope, progress)
     let scope = design.resolve_scope(None, None)?;
-    design.apply(&adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
+    design.apply(&adapter, None, false, Some(&scope), Progress::none()).await?;
     Ok(())
 }
 ```

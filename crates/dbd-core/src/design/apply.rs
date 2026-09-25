@@ -6,10 +6,50 @@ impl Design {
     /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
     /// and executes the plan steps in order.
     ///
-    /// `on_start(desc)` is called just before each visible step.
-    /// `on_done(desc, err)` is called after — `err` is `None` on success.
-    /// `on_complete(summary)` is called once after all steps succeed.
-    /// Use `|_| {}` / `|_, _| {}` / `|_| {}` when progress reporting is not needed.
+    /// The three callbacks travel together in one [`Progress`] value — they are
+    /// **not** three arguments. Saying otherwise is what this doc comment used
+    /// to do, and every downstream example copied the misreading; the snippet
+    /// below is a doctest so the next one cannot.
+    ///
+    /// - `on_start(desc)` — just before each visible step
+    /// - `on_done(desc, err)` — after each; `err` is `None` on success
+    /// - `on_complete(summary)` — once, after all steps succeed
+    ///
+    /// Use [`Progress::none`] for a silent run.
+    ///
+    /// ```no_run
+    /// use dbd_core::{Design, design::Progress};
+    /// use std::path::Path;
+    ///
+    /// # async fn example() -> dbd_core::Result<()> {
+    /// let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+    /// let adapter = dbd_core::connect("postgres://localhost/mydb", "myproject").await?;
+    ///
+    /// // Silent.
+    /// design.apply(&*adapter, None, false, None, Progress::none()).await?;
+    ///
+    /// // Reporting. `scope` is `None` for the whole design.
+    /// let scope = design.resolve_scope(None, None)?;
+    /// design
+    ///     .apply(
+    ///         &*adapter,
+    ///         None,
+    ///         false,
+    ///         Some(&scope),
+    ///         Progress {
+    ///             on_start: |desc: &str| println!("→ {desc}"),
+    ///             on_done: |desc: &str, err: Option<&str>| {
+    ///                 if let Some(e) = err {
+    ///                     eprintln!("✗ {desc}: {e}")
+    ///                 }
+    ///             },
+    ///             on_complete: |s: dbd_core::ApplyComplete| println!("applied {} entities", s.applied),
+    ///         },
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub async fn apply<S, D, C>(
         &self,
@@ -326,12 +366,14 @@ impl Design {
                 on_start(&desc);
                 let result: Result<()> = async {
                     if migration_sql_path.exists() {
-                        let sql = std::fs::read_to_string(migration_sql_path)?;
+                        // dbd writes migrations as UTF-8, but a hand-edit in
+                        // SSMS does not stay that way — see `source_text`.
+                        let sql = crate::source_text::read_to_string(migration_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     let data_path = migration_sql_path.with_extension("data.sql");
                     if data_path.exists() {
-                        let sql = std::fs::read_to_string(&data_path)?;
+                        let sql = crate::source_text::read_to_string(&data_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     Ok(())

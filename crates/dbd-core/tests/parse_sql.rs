@@ -381,3 +381,123 @@ fn the_files_search_path_is_reported() {
     let parsed = parse_sql("set search_path to app, shared;\ncreate table t (id int);").unwrap();
     assert_eq!(parsed.search_paths, vec!["app".to_string(), "shared".to_string()]);
 }
+
+// ── What KIND of file is this? ──────────────────────────────────────────────
+//
+// A corpus is mostly not declarations. Measured over 2,154 real T-SQL files,
+// and measured independently by sensei over its own corpus, `ALTER TABLE`
+// outnumbers `CREATE TABLE` 159 to 101 — so the commonest statement in a SQL
+// codebase declares nothing at all.
+//
+// That matters to a caller building a graph. A change script that MINTED an
+// identity for the table it alters would produce two nodes for one table, and
+// a data script that minted one would produce a node for a table that lives
+// somewhere else entirely. The kind is what lets a caller tell "this file owns
+// this entity" from "this file touches it".
+
+use dbd_core::parser::{Dialect, FileKind};
+
+#[test]
+fn a_file_of_creates_is_a_declaration() {
+    let parsed = parse_sql("create table app.users (id int primary key);").unwrap();
+    assert_eq!(parsed.kind, FileKind::Declaration);
+}
+
+/// The commonest shape in a real corpus, and the one that must not mint an
+/// identity: it edits a table defined somewhere else.
+#[test]
+fn a_file_that_only_alters_is_a_migration() {
+    let parsed = parse_sql(
+        "alter table app.users add constraint users_email_uq unique (email);\n\
+         drop index if exists app.users_old_idx;",
+    )
+    .unwrap();
+
+    assert_eq!(parsed.kind, FileKind::Migration);
+    assert!(
+        parsed.entities.is_empty(),
+        "a change script declares nothing — minting a node here doubles the table: {:?}",
+        parsed.entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_file_that_only_moves_data_is_data() {
+    let parsed = parse_sql(
+        "insert into app.lookups (id, label) values (1, 'a');\n\
+         update app.settings set v = '2' where k = 'version';",
+    )
+    .unwrap();
+    assert_eq!(parsed.kind, FileKind::Data);
+    assert!(parsed.entities.is_empty());
+}
+
+/// A table file's own index and comment belong to the table it declares, so
+/// they are not a change to something else. Classing this as `Mixed` would put
+/// every ordinary dbd table file in the ambiguous bucket.
+#[test]
+fn a_declaration_with_its_own_index_and_comment_is_still_a_declaration() {
+    let parsed = parse_sql(
+        "create table app.users (id int primary key, email text);\n\
+         create unique index users_email_uidx on app.users (email);\n\
+         comment on table app.users is 'people';",
+    )
+    .unwrap();
+    assert_eq!(parsed.kind, FileKind::Declaration);
+}
+
+/// But an ALTER naming a table this file does NOT declare is a change to
+/// something else, and that makes the file mixed.
+#[test]
+fn a_declaration_plus_a_change_to_another_table_is_mixed() {
+    let parsed = parse_sql(
+        "create table app.new_thing (id int primary key);\n\
+         alter table app.existing add column note text;",
+    )
+    .unwrap();
+    assert_eq!(parsed.kind, FileKind::Mixed);
+    assert_eq!(parsed.entities.len(), 1, "only the declared table is an entity");
+    assert_eq!(parsed.entities[0].name, "app.new_thing");
+}
+
+#[test]
+fn a_file_with_nothing_dbd_recognises_is_empty() {
+    assert_eq!(parse_sql("select 1;").unwrap().kind, FileKind::Empty);
+    assert_eq!(parse_sql("-- just a comment\n").unwrap().kind, FileKind::Empty);
+}
+
+/// A `SET search_path` is ambient — it applies to whatever else is in the file
+/// and is not itself a statement of any kind.
+#[test]
+fn an_ambient_set_does_not_change_the_kind() {
+    let parsed = parse_sql("set search_path to app;\ncreate table t (id int);").unwrap();
+    assert_eq!(parsed.kind, FileKind::Declaration);
+}
+
+// ── Which dialect was it read as? ───────────────────────────────────────────
+
+/// Reported so a caller never has to remember what it asked for, and so a
+/// detected-but-unstated file says so rather than claiming PostgreSQL.
+#[test]
+fn the_dialect_the_file_was_read_as_is_reported() {
+    assert_eq!(
+        parse_sql("create table t (id int);").unwrap().dialect,
+        Dialect::PostgreSql,
+        "the default entry point states PostgreSQL"
+    );
+}
+
+/// The honest answer for a file nothing identified. It was read with the
+/// PostgreSQL reader because that is the fallback — but saying `PostgreSql`
+/// would claim the file stated something it did not.
+#[test]
+fn an_unstated_file_is_reported_as_unstated_not_as_postgres() {
+    use dbd_core::parser::parse_sql_as;
+
+    let sql = "CREATE TABLE t (id int);";
+    assert_eq!(Dialect::detect(sql), Dialect::Unstated, "precondition");
+
+    let parsed = parse_sql_as(Dialect::Unstated, sql).unwrap();
+    assert_eq!(parsed.dialect, Dialect::Unstated);
+    assert_eq!(parsed.entities.len(), 1, "and it is still read, by the fallback reader");
+}

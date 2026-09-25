@@ -623,7 +623,7 @@ pub fn cmd_release(
         anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
     }
 
-    let version = design.config().project.version.unwrap_or(1);
+    let version = design.config().project.version();
     let desc = name.unwrap_or("baseline release");
     dbd_core::snapshot::create_baseline_snapshot(design.entities(), project_dir, config, desc, version)
         .context("Failed to create baseline snapshot")?;

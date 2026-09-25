@@ -21,19 +21,33 @@ use crate::entity::{Entity, ForeignKey, REF_TYPE_FUNCTION, TableConstraint};
 ///
 /// Also filters out references that match the ignore list (patterns from design.yaml).
 pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ignore: &[String]) {
+    // Keyed on `Entity::qualified_key`, not `name`: two databases can hold the
+    // same `schema.name`, and keying on the bare name would merge them into one
+    // node. For a catalog-less entity — every entity in every PostgreSQL
+    // project — the key IS the name, so this set is byte-identical to what it
+    // was.
     let known_names: HashSet<String> = entities
         .iter()
-        .map(|e| e.name.clone())
+        .map(|e| e.qualified_key())
         .chain(external_names.iter().cloned())
         .collect();
 
+    // The catalogs present in the scan, so a reference naming one can be told
+    // apart from a schema that happens to share its name.
+    let known_catalogs: HashSet<String> = entities.iter().filter_map(|e| e.catalog.clone()).collect();
+
     for entity in entities.iter_mut() {
-        resolve_entity_references(entity, &known_names, ignore);
+        resolve_entity_references(entity, &known_names, &known_catalogs, ignore);
     }
 }
 
 /// Resolve one entity's references against the known entity names.
-fn resolve_entity_references(entity: &mut Entity, known: &HashSet<String>, ignore: &[String]) {
+fn resolve_entity_references(
+    entity: &mut Entity,
+    known: &HashSet<String>,
+    known_catalogs: &HashSet<String>,
+    ignore: &[String],
+) {
     // The parser qualifies bare references with the first search_path entry.
     // dbd appends `public` to every applied search_path (see
     // `ensure_public_in_search_path`), so a bare name can resolve there too.
@@ -50,7 +64,16 @@ fn resolve_entity_references(entity: &mut Entity, known: &HashSet<String>, ignor
         sp
     };
 
-    resolve_entity_refers(entity, &default_schema, &search_path, known, ignore);
+    let catalog = entity.catalog.clone();
+    resolve_entity_refers(
+        entity,
+        &default_schema,
+        &search_path,
+        catalog.as_deref(),
+        known,
+        known_catalogs,
+        ignore,
+    );
     resolve_entity_fks(entity, &default_schema, &search_path, known);
 }
 
@@ -62,11 +85,14 @@ fn resolve_entity_references(entity: &mut Entity, known: &HashSet<String>, ignor
 /// calls are collected the same way a call to a project-managed function is,
 /// and only this resolution step can tell them apart — so an unresolved one is
 /// a built-in, not a mistake worth reporting.
+#[allow(clippy::too_many_arguments)]
 fn resolve_entity_refers(
     entity: &mut Entity,
     default_schema: &str,
     search_path: &[String],
+    catalog: Option<&str>,
     known: &HashSet<String>,
+    known_catalogs: &HashSet<String>,
     ignore: &[String],
 ) {
     let soft: HashSet<&str> = entity
@@ -81,6 +107,28 @@ fn resolve_entity_refers(
     for ref_name in &entity.refers {
         if is_ignored(ref_name, ignore) {
             continue;
+        }
+        // A reference that NAMES a catalog is taken at its word — that is the
+        // whole point of writing one. It must not fall through to the bare
+        // forms below, or a cross-database edge would quietly resolve to the
+        // local table of the same name.
+        if let Some(named) = names_a_catalog(ref_name, known_catalogs) {
+            if known.contains(named) {
+                resolved_refers.push(named.to_string());
+            } else {
+                unresolved.push(ref_name.clone());
+            }
+            continue;
+        }
+        // A reference naming no catalog means the one it was written in. Try
+        // that first, then a catalog-less entity — a scan can hold a
+        // catalogued T-SQL tree beside a catalog-less PostgreSQL project.
+        if let Some(catalog) = catalog {
+            let local = format!("{catalog}.{ref_name}");
+            if known.contains(&local) {
+                resolved_refers.push(local);
+                continue;
+            }
         }
         if known.contains(ref_name) {
             resolved_refers.push(ref_name.clone());
@@ -118,6 +166,17 @@ fn resolve_entity_fks(entity: &mut Entity, default_schema: &str, search_path: &[
             fix_fk_schema(fk, default_schema, search_path, known);
         }
     }
+}
+
+/// The reference as written, when its leading segment is a catalog the scan
+/// knows about.
+///
+/// Checked against the catalogs actually present rather than by counting dots:
+/// `a.b.c` is a three-part name in T-SQL and could be a schema called `a` with
+/// a dotted object name elsewhere, and only the scan can say which.
+fn names_a_catalog<'a>(ref_name: &'a str, known_catalogs: &HashSet<String>) -> Option<&'a str> {
+    let (head, _) = ref_name.split_once('.')?;
+    known_catalogs.contains(head).then_some(ref_name)
 }
 
 /// If `schema.table` is unknown but `schema` is the table's default schema (the
