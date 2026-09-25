@@ -50,20 +50,15 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
     // SQL, same binary, different orderings across separate runs). Left
     // unsorted, `entity.refers` would vary from run to run for any view
     // calling more than one function.
-    let mut function_names: Vec<String> = parsed
-        .call_functions()
-        .into_iter()
-        .filter_map(|name| common::qualify_name_str(&name, &default_schema))
-        .collect();
-    function_names.sort();
-    function_names.dedup();
-    for qualified in function_names {
+    let function_names = common::qualify_all_sourced(parsed.call_functions(), &default_schema);
+    for (qualified, schema_source) in function_names {
         if references.iter().any(|r| r.name == qualified) {
             continue;
         }
         references.push(Reference {
             name: qualified,
             ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            schema_source,
         });
     }
 

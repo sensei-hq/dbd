@@ -105,6 +105,7 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
                 entities: Vec::new(),
                 search_paths,
                 errors: vec![format!("Parse error: {e}")],
+                references: Default::default(),
             });
         }
     };
@@ -141,6 +142,12 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
         entities,
         search_paths,
         errors: Vec::new(),
+        // Always empty here, and that is not an omission. libpg_query hands
+        // back a statement list where a `CREATE FUNCTION` carries its body as
+        // one node, so a reference cannot float outside the declaration that
+        // made it the way it can in a token walk. The statement-head readers
+        // fill this in; see `FileReferences`.
+        references: Default::default(),
     })
 }
 

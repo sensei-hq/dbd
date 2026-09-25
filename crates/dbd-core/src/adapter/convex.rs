@@ -981,6 +981,7 @@ mod tests {
             ref_columns: vec!["id".into()],
             on_delete: None,
             on_update: None,
+            ..Default::default()
         });
         let child_inline = table("auth.sessions_inline", vec![col("id", "int8", false), fk_col], vec![]);
         let mut child_constraint = table(
@@ -997,6 +998,7 @@ mod tests {
                 ref_columns: vec!["id".into()],
                 on_delete: None,
                 on_update: None,
+                ..Default::default()
             }));
         }
         let out = generate_schema_ts(&[&parent, &child_inline, &child_constraint]);

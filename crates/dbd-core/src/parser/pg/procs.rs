@@ -81,44 +81,46 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
 /// Mirrors `parser::apply_proc_refs`: reads and writes become hard references,
 /// called functions become soft ones tagged [`REF_TYPE_FUNCTION`], which
 /// `references::resolve_references` keeps only when they name a known entity.
-fn finish(mut entity: Entity, reads: Vec<String>, writes: Vec<String>, functions: Vec<String>) -> Entity {
+fn finish(mut entity: Entity, reads: Sourced, writes: Sourced, functions: Sourced) -> Entity {
     let mut references: Vec<Reference> = reads
         .iter()
         .chain(writes.iter())
-        .map(|name| Reference {
+        .map(|(name, schema_source)| Reference {
             name: name.clone(),
             ref_type: None,
+            schema_source: *schema_source,
         })
         .collect();
-    for name in functions {
+    for (name, schema_source) in functions {
         if references.iter().any(|r| r.name == name) {
             continue;
         }
         references.push(Reference {
             name,
             ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            schema_source,
         });
     }
     entity.refers = references.iter().map(|r| r.name.clone()).collect();
     entity.references = references;
-    entity.reads = reads;
-    entity.writes = writes;
+    // `reads`/`writes` stay bare strings. A caller that needs to know whether a
+    // schema was guessed reads `references`, which carries it per name; see
+    // `SchemaSource`.
+    entity.reads = reads.into_iter().map(|(n, _)| n).collect();
+    entity.writes = writes.into_iter().map(|(n, _)| n).collect();
     entity
 }
+
+/// Qualified names paired with where each one's schema came from.
+type Sourced = Vec<(String, crate::entity::SchemaSource)>;
 
 /// Qualify libpg_query's bare names and sort them.
 ///
 /// Sorted because `select_tables`/`dml_tables`/`call_functions` are built from a
 /// `HashSet`, so their order differs on every process run — see the determinism
 /// fix in `common::extract_view_refs_via_pg_query`.
-fn qualify_all(names: Vec<String>, default_schema: &str) -> Vec<String> {
-    let mut out: Vec<String> = names
-        .iter()
-        .filter_map(|n| common::qualify_name_str(n, default_schema))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+fn qualify_all(names: Vec<String>, default_schema: &str) -> Sourced {
+    common::qualify_all_sourced(names, default_schema)
 }
 
 /// The `LANGUAGE` and body text of the first routine in the file.

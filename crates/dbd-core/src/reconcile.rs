@@ -2018,6 +2018,7 @@ mod tests {
             ref_columns: vec!["id".to_string()],
             on_delete,
             on_update: None,
+            ..Default::default()
         }
     }
 
@@ -3379,6 +3380,7 @@ mod tests {
                     ref_columns: vec!["id".to_string()],
                     on_delete: None,
                     on_update: None,
+                    ..Default::default()
                 }),
                 TableConstraint::Check {
                     name: Some("ck".to_string()),

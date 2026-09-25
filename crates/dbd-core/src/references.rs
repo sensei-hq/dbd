@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::entity::{Entity, ForeignKey, REF_TYPE_FUNCTION, TableConstraint};
+use crate::entity::{Entity, ForeignKey, REF_TYPE_FUNCTION, SchemaSource, TableConstraint};
 
 /// Match parsed references against known entities and external entities.
 ///
@@ -135,7 +135,7 @@ fn resolve_entity_refers(
             continue;
         }
         if let Some((schema, table)) = ref_name.split_once('.')
-            && let Some(sch) = recover_bare_target(schema, table, default_schema, search_path, known)
+            && let Some(sch) = recover_bare_target_by_proxy(schema, table, default_schema, search_path, known)
         {
             resolved_refers.push(format!("{sch}.{table}"));
             continue;
@@ -179,18 +179,26 @@ fn names_a_catalog<'a>(ref_name: &'a str, known_catalogs: &HashSet<String>) -> O
     known_catalogs.contains(head).then_some(ref_name)
 }
 
-/// If `schema.table` is unknown but `schema` is the table's default schema (the
-/// parser's bare-qualification marker), return the first schema on `search_path`
-/// that has `<s>.table` among `known`. `None` = leave the reference as written
-/// (either it resolves already, or it was deliberately qualified elsewhere).
+/// If `schema.table` is unknown and dbd — not the source — supplied `schema`,
+/// return the first schema on `search_path` that has `<s>.table` among `known`.
+/// `None` = leave the reference as written.
+///
+/// `source` replaces what used to be a proxy for it: "the schema equals
+/// `default_schema`, so the parser must have put it there". A source that
+/// deliberately writes `app.parent` while its own `search_path` is `app`
+/// satisfies that test, and its explicit qualification could be re-pointed at
+/// another schema holding the same table name. The provenance is now recorded
+/// at the one site that invents a schema, so this asks the fact instead.
+///
+/// `default_schema` is still taken, for the caller that has no provenance to
+/// offer — see [`recover_bare_target_by_proxy`].
 fn recover_bare_target(
-    schema: &str,
+    source: SchemaSource,
     table: &str,
-    default_schema: &str,
     search_path: &[String],
     known: &HashSet<String>,
 ) -> Option<String> {
-    if schema != default_schema {
+    if !source.is_guess() {
         return None;
     }
     search_path
@@ -199,16 +207,40 @@ fn recover_bare_target(
         .cloned()
 }
 
+/// [`recover_bare_target`] for a caller working from a bare `refers` string,
+/// which carries no provenance — the old value-based test, kept for that path
+/// alone and named so it is not mistaken for the real question.
+fn recover_bare_target_by_proxy(
+    schema: &str,
+    table: &str,
+    default_schema: &str,
+    search_path: &[String],
+    known: &HashSet<String>,
+) -> Option<String> {
+    let looks_inferred = if schema == default_schema {
+        SchemaSource::Inferred
+    } else {
+        SchemaSource::Stated
+    };
+    recover_bare_target(looks_inferred, table, search_path, known)
+}
+
 /// Re-point a bare-qualified FK at the schema that actually holds its target,
 /// resolved along the referencing table's search_path. No-op when the FK already
 /// resolves as written or was explicitly qualified to a non-default schema.
 fn fix_fk_schema(fk: &mut ForeignKey, default_schema: &str, search_path: &[String], known: &HashSet<String>) {
-    let cur_schema = fk.ref_schema.as_deref().unwrap_or(default_schema);
+    let cur_schema = fk.ref_schema.as_deref().unwrap_or(default_schema).to_string();
     if known.contains(&format!("{cur_schema}.{}", fk.ref_table)) {
-        return; // resolves as written
+        // Resolves as written. If dbd had guessed the schema, the guess has now
+        // been checked against every entity in the scan and held.
+        if fk.ref_schema_source.is_guess() {
+            fk.ref_schema_source = SchemaSource::Resolved;
+        }
+        return;
     }
-    if let Some(sch) = recover_bare_target(cur_schema, &fk.ref_table, default_schema, search_path, known) {
+    if let Some(sch) = recover_bare_target(fk.ref_schema_source, &fk.ref_table, search_path, known) {
         fk.ref_schema = Some(sch);
+        fk.ref_schema_source = SchemaSource::Resolved;
     }
 }
 
@@ -374,11 +406,19 @@ mod tests {
 
         // A bare `REFERENCES namespaces` the parser qualified to the table's own
         // schema (`dojo`); the real target is `sensei.namespaces`.
+        //
+        // `Inferred` is what makes this the scenario the comment describes. It
+        // used to be implied by `ref_schema == default_schema`, which is also
+        // what a source that wrote `dojo.namespaces` looks like — the proxy
+        // `SchemaSource` replaced. A fixture that leaves this `Stated` is
+        // asserting the opposite case, and `the_resolver_does_not_repoint_a_
+        // schema_the_source_wrote` covers that one.
         let bare_fk = |col: &str| ForeignKey {
             columns: vec![col.to_string()],
             ref_schema: Some("dojo".to_string()),
             ref_table: "namespaces".to_string(),
             ref_columns: vec!["id".to_string()],
+            ref_schema_source: crate::entity::SchemaSource::Inferred,
             ..Default::default()
         };
         let col = ColumnDef {
