@@ -13,7 +13,11 @@ use crate::error::{DbdError, Result};
 /// hardcoded `PostgreSqlDialect`, so it was never a *dialect* selector at all.
 /// It retired once every file-backed type became native (see
 /// `pg::PgQueryDdl::COVERED`, or [`pg_native_types`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serializes as the value `source.parser` accepts (`pg_query`, `verbatim`), so
+/// a reported choice round-trips back into a config rather than needing a
+/// second mapping to be invented at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParserChoice {
     /// libpg_query — PostgreSQL's own grammar, vendored from the server.
     /// Produces a fully structured [`Entity`]: columns, constraints, indexes.

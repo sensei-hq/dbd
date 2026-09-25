@@ -79,7 +79,7 @@ fn a_project_is_identified_with_its_config_and_identity() {
     let s = project::survey(tmp.path()).unwrap().expect("this is a dbd project");
 
     assert_eq!(s.project, "shop");
-    assert_eq!(s.version, 3);
+    assert_eq!(s.version, Some(3), "the version is reported as written, not defaulted");
     assert_eq!(s.config_path, tmp.path().join("design.yaml"));
     assert_eq!(s.schemas, vec!["app".to_string(), "config".to_string()]);
 }
@@ -258,4 +258,136 @@ fn the_reported_parser_reads_the_reported_files() {
             entity.errors
         );
     }
+}
+
+/// `survey` and `Design::from_config` must not disagree about which files are
+/// the project's. They read the same layout by different routes, so a drift
+/// between them means one of the two is lying to its callers — and `survey` is
+/// the one an external scanner trusts without a second opinion.
+///
+/// Run against dbd's own fixture project, so it is checked on a real layout
+/// rather than a constructed one.
+#[test]
+fn survey_and_design_agree_on_the_projects_ddl_files() {
+    use dbd_core::Design;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let surveyed = project::survey(&root)
+        .expect("the fixture project must survey")
+        .expect("tests/fixtures is a dbd project");
+
+    let design = Design::from_config(&surveyed.config_path, "dev").expect("and must load");
+
+    let mut from_survey: Vec<String> = surveyed
+        .ddl_files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let mut from_design: Vec<String> = design
+        .entities()
+        .iter()
+        .filter_map(|e| e.file.as_ref())
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    from_survey.sort();
+    from_design.sort();
+    from_design.dedup();
+
+    assert_eq!(
+        from_survey, from_design,
+        "survey and Design disagree about the project's files"
+    );
+    assert!(!from_survey.is_empty(), "the fixture project should have DDL");
+}
+
+// ── Accepts a design.yaml path, not just a directory ────────────────────────
+
+/// A caller that already holds the config path should not have to strip the
+/// filename back off to ask about it.
+#[test]
+fn a_design_yaml_path_surveys_the_project_around_it() {
+    let tmp = project_fixture();
+
+    let from_dir = project::survey(tmp.path()).unwrap().unwrap();
+    let from_file = project::survey(&tmp.path().join("design.yaml")).unwrap().unwrap();
+
+    assert_eq!(from_file.project, from_dir.project);
+    assert_eq!(from_file.root, from_dir.root, "the root is the config's directory");
+    assert_eq!(from_file.ddl_files, from_dir.ddl_files);
+}
+
+/// A config under a different name still identifies the project it configures —
+/// `dbd -c` accepts any path, so a survey that only recognised `design.yaml`
+/// would disagree with the CLI about what a project is.
+#[test]
+fn a_config_under_another_name_is_still_a_project() {
+    let tmp = project_fixture();
+    std::fs::rename(tmp.path().join("design.yaml"), tmp.path().join("prod.yaml")).unwrap();
+
+    assert!(
+        project::survey(tmp.path()).unwrap().is_none(),
+        "the directory alone no longer looks like a project"
+    );
+    let s = project::survey(&tmp.path().join("prod.yaml"))
+        .unwrap()
+        .expect("but the config names one");
+    assert_eq!(s.project, "shop");
+}
+
+#[test]
+fn a_missing_config_path_is_not_a_project_rather_than_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        project::survey(&tmp.path().join("nope.yaml"))
+            .expect("absence is not an error")
+            .is_none()
+    );
+}
+
+// ── JSON ────────────────────────────────────────────────────────────────────
+
+/// The shape an external caller consumes. `managed` is an explicit field rather
+/// than "object vs null", so a consumer never has to infer the answer from the
+/// absence of data.
+#[test]
+fn survey_json_is_self_describing_both_ways() {
+    let tmp = project_fixture();
+
+    let yes = project::survey_json(tmp.path()).unwrap();
+    assert_eq!(yes["managed"], serde_json::json!(true));
+    assert_eq!(yes["project"], serde_json::json!("shop"));
+    assert_eq!(yes["dialect"], serde_json::json!("postgresql"));
+    assert_eq!(yes["parser"], serde_json::json!("pg_query"));
+    assert_eq!(yes["schemas"], serde_json::json!(["app", "config"]));
+    assert_eq!(yes["ddl_files"].as_array().unwrap().len(), 2);
+    assert_eq!(yes["policy_files"].as_array().unwrap().len(), 1);
+
+    let excluded = yes["excluded"].as_array().unwrap();
+    assert!(
+        excluded
+            .iter()
+            .any(|e| e["reason"] == serde_json::json!("generated")
+                && e["path"].as_str().unwrap().ends_with("migrations")),
+        "exclusions must be self-describing in JSON too: {excluded:?}"
+    );
+
+    let no = project::survey_json(tempfile::tempdir().unwrap().path()).unwrap();
+    assert_eq!(no["managed"], serde_json::json!(false));
+    assert!(no["reason"].is_string(), "a non-project says why: {no}");
+    assert!(no["project"].is_null(), "and carries no project data");
+}
+
+/// A verbatim project must report its parser by the same name `source.parser`
+/// accepts, so a consumer can round-trip the value back into a config.
+#[test]
+fn the_json_parser_name_matches_the_config_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: local\n  version: 1\n\nsource:\n  dialect: sqlite\n\n\
+         target:\n  sqlite:\n    url: $DATABASE_URL\n\nschemas: []\n",
+    );
+    let j = project::survey_json(tmp.path()).unwrap();
+    assert_eq!(j["parser"], serde_json::json!("verbatim"));
 }
