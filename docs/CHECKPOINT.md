@@ -26,12 +26,20 @@ SQLite round-trip fixed on top, unreleased.
     dropped=0` against a **completely empty** database. `Design` now carries its
     `ParserChoice` and both refuse a verbatim project.
 
+- **Uncompilable doc examples fixed** (`c66dba9`) — every documented
+  `Design::apply` / `import_data` call showed the three progress callbacks as
+  three arguments; both take five, callbacks in one `Progress`. Root cause was
+  `apply`'s own doc comment; six surfaces had copied it, including the live
+  site. `Design::apply` now carries a doctest, so `cargo test --doc` compiles
+  the canonical example — there were no doctests on `Design` at all, which is
+  why CI never caught it.
+
 ## Next
 
 Nothing queued. Candidates:
 
-- Cut **0.14.1** for the SQLite fix (`[Unreleased]` has it; no breaking changes,
-  so patch).
+- Cut **0.14.1** for the SQLite fix + doc fix (`[Unreleased]` has both; no
+  breaking changes, so patch).
 - `parse_sql` on external files still ignores non-constraint `ALTER`s. Correct
   inside dbd's full-and-final table contract; a real gap for a foreign corpus.
   Needs a scope decision, not a patch.
@@ -53,8 +61,5 @@ None blocking.
 - `generate_data_sql` warns "may truncate data" on a *widening* cast.
 - `docs/design/architecture.md:360` still lists `is_identity: bool` on
   `ColumnDef`; now `identity: Option<IdentityKind>`, and predates `generated`.
-- The dbd skill's `apply` example shows a 7-argument call; the real signature
-  takes 5 (`adapter, name, dry_run, scope, Progress`). Pre-existing doc drift,
-  hit while writing the SQLite test.
 - 31 pre-existing rustdoc intra-doc-link errors (not gated by CI).
 - `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`).
