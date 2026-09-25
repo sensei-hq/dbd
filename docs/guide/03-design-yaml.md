@@ -81,24 +81,38 @@ ignore:
 
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
-| `dialect` | string | `postgresql` | SQL dialect of the DDL files. `sqlite` selects the verbatim reader; anything else is read as PostgreSQL. |
-| `parser`  | string | (from `dialect`) | Override the reader: `pg_query` or `verbatim`. |
+| `dialect` | string | `postgresql` | SQL dialect of the DDL files — see below |
+| `parser`  | string | (from `dialect`) | Override the reader: `pg_query`, `tsql` or `verbatim` |
 
-`dialect` picks the reader, and `parser` overrides that choice — you should not
+`dialect` picks the reader; `parser` overrides that choice and you should not
 normally need it.
 
+| `dialect` | reader | structured? |
+|---|---|---|
+| `postgresql` / `postgres` / `supabase` | `pg_query` | yes |
+| `tsql` / `mssql` / `sqlserver` | `tsql` | no |
+| `sqlite` | `verbatim` | no |
+| anything else | `pg_query` | yes |
+
 - **`pg_query`** (libpg_query, PostgreSQL's own grammar) builds a structured
-  model: columns, constraints, indexes. That structure is what `diff` and
-  `reconcile` compare, so it is required for them to work.
+  model: columns, constraints, indexes.
+- **`tsql`** reads SQL Server statement *heads* — what each file declares and
+  what it references — with a lexer rather than a grammar. Measured over 2,154
+  real T-SQL files, `sqlparser`'s `MsSqlDialect` loses 99% of `CREATE
+  PROCEDURE` and 95% of `CREATE TABLE`; Microsoft's own complete parser is
+  .NET. It reads no column lists.
 - **`verbatim`** takes the file as written and applies it unchanged. This is
   what `dialect: sqlite` selects, and it is not a weaker fallback — it mirrors
   how SQLite is read on the other side, where `sqlite_master.sql` *is* the
   schema. A structured PostgreSQL parse would reject `AUTOINCREMENT`,
   `WITHOUT ROWID` and `STRICT` outright.
 
-`dbd init --from-db sqlite://…` writes `dialect: sqlite` for you. A verbatim
-project has no structured model, so `diff` and `reconcile` have nothing to
-compare — `apply`, `deploy`, `import` and `export` work normally.
+**Only a structured reader can diff.** `diff` and `reconcile` compare columns
+and constraints, so they work on `pg_query` projects and refuse on `tsql` and
+`verbatim` ones, naming the reason. `apply`, `deploy`, `import` and `export`
+work everywhere.
+
+`dbd init --from-db sqlite://…` writes `dialect: sqlite` for you.
 
 `parser: sqlparser` was a second PostgreSQL parser kept during the libpg_query
 migration and **was removed in 0.14.0** — a project still naming it fails to

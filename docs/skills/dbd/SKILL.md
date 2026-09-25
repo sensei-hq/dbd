@@ -330,6 +330,41 @@ what makes a scan parallelisable — the per-file parse touches no shared state,
 so a bare `t` that could be `a.t` or `b.t` stays undecided until the whole set
 is known.
 
-PostgreSQL only. `parse_sql_with(ParserChoice, sql)` selects the parser
-explicitly, and `ParserChoice::resolve(dialect, explicit)` derives it from a
-dialect string.
+### Multiple dialects
+
+`parse_sql_as(dialect, sql)` reads a file in a stated dialect; `Dialect::detect`
+reads it out of the SQL when nothing states one.
+
+```rust
+use dbd_core::parser::{Dialect, parse_sql_as};
+
+let parsed = parse_sql_as(Dialect::detect(sql), sql)?;
+println!("{:?} file, read as {:?}", parsed.kind, parsed.dialect);
+```
+
+| dialect | reader | structured? |
+|---|---|---|
+| `PostgreSql` | libpg_query | yes — columns, constraints, indexes |
+| `TSql` | statement-head lexer | no — identity and edges only |
+| `Sqlite` | verbatim | no — the file is the model |
+| `MySql`, `Unstated` | libpg_query (fallback) | — |
+
+Detection **fails closed**: `CREATE TABLE t (id int)` is valid in every dialect
+and says nothing, so it is `Unstated` rather than a guess. `ParsedFile::dialect`
+reports `Unstated` honestly in that case rather than claiming the fallback
+reader's dialect.
+
+`ParsedFile::kind` says what the file is *for* — `Declaration`, `Migration`,
+`Data`, `Mixed`, `Empty`. A corpus is mostly not declarations, and a change
+script that minted an identity for the table it alters would give you two nodes
+for one table.
+
+Only a structured reader can be diffed: `diff` and `reconcile` refuse on `tsql`
+and `verbatim` projects, naming the reason.
+
+### Encoding
+
+`source_text::read_to_string` decodes before parsing — SSMS writes UTF-16LE by
+default, and 16.2% of one measured SQL Server corpus was invisible to
+`std::fs::read_to_string`. Use it, not the stdlib, for any file that might hold
+SQL somebody else's tooling wrote.
