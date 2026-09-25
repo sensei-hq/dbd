@@ -29,7 +29,7 @@ pub enum EntityType {
     Import,
 }
 
-/// Entity types that live under a schema (file path: ddl/<type>/<schema>/<name>.ddl)
+/// Entity types that live under a schema (file path: `ddl/<type>/<schema>/<name>.ddl`)
 pub const TYPES_WITH_SCHEMA: &[EntityType] = &[
     EntityType::Sequence,
     EntityType::Enum,
@@ -40,7 +40,7 @@ pub const TYPES_WITH_SCHEMA: &[EntityType] = &[
     EntityType::Procedure,
 ];
 
-/// Entity types without schema qualification (file path: ddl/<type>/<name>.ddl)
+/// Entity types without schema qualification (file path: `ddl/<type>/<name>.ddl`)
 pub const TYPES_WITHOUT_SCHEMA: &[EntityType] = &[EntityType::Role, EntityType::Schema, EntityType::Extension];
 
 impl EntityType {

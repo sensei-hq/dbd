@@ -9,6 +9,133 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-25
+
+**MySQL** joins PostgreSQL, T-SQL and SQLite: `source.dialect: mysql` selects
+the same statement-head walk T-SQL uses, under rules that differ where the two
+dialects genuinely disagree. It is fixture-verified rather than
+corpus-measured, and says so.
+
+The rest of this release is about the documentation, which had been drifting
+for want of anything that reads it. `Design::apply`'s example was wrong on six
+surfaces at once — every one of them showing seven arguments to a method that
+takes five — and nothing noticed, because nothing compiled them. Now three
+gates do: every Rust example in the embedder-facing docs is compiled as a test
+target, the facts the guides state are checked against the code that decides
+them, and broken doc links are `deny`-ed at the crate root. All three found
+real defects on their first run.
+
+The design document got the same treatment by hand. It had become a second,
+wrong copy of the source — 16 of 40 field declarations inaccurate, three types
+gone, and a dependency listing with no `pg_query` in it.
+
+### Fixed
+
+- **Doc examples that did not compile.** Found by the gate below on its first
+  run, which is the point of it:
+  - `Progress` and `ApplyComplete` were used without being imported, on four
+    surfaces. A reader copying any of them got an unresolved-name error.
+  - `design.report()` takes `&mut self`, and both `SKILL.md` copies wrote
+    `let design` — while `llms-full.txt` correctly wrote `let mut design`. Two
+    surfaces documenting the same call, disagreeing.
+
+### Added
+
+- **Every Rust example in the embedder-facing docs is now compiled**
+  (`tests/doc_examples.rs`). Extracted from README, both `SKILL.md` copies and
+  `llms-full.txt` into a committed file that cargo builds as a test target, so
+  an example that does not typecheck is a build failure. A digest of the
+  extracted blocks is embedded, and a second test fails if a doc changed
+  without regenerating — compiling a stale copy would prove nothing about what
+  users read.
+
+  This exists because `Design::apply`'s examples were wrong on **six** surfaces
+  at once and nothing noticed for want of anything compiling them. Verified by
+  reverting one example to the old 7-argument form: the build fails with the
+  original error, `this method takes 5 arguments but 7 arguments were supplied`.
+
+  Scope is deliberate — `architecture.md`'s 34 blocks are design prose, not
+  code to copy. A block opts out with ` ```rust,ignore `.
+
+- **Broken documentation links are now an error.** Twenty-four had accumulated
+  — links to items since made private, links to items that no longer exist,
+  `<type>` read as an HTML tag, bare URLs. Each reads correctly in the source;
+  only rustdoc knows it does not resolve.
+
+  All twenty-four fixed, and the lints (`broken_intra_doc_links`,
+  `private_intra_doc_links`, `invalid_html_tags`, `bare_urls`) are now
+  `deny`-ed at both crate roots. A `deny` in the source rather than a flag in
+  CI, so it travels with the crate: a contributor running `cargo doc` locally
+  gets the same failure the pipeline does.
+
+  `cargo doc` runs once per push in CI, and before publish in the release
+  workflow — docs.rs builds after publish, and a publish cannot be undone.
+  Deliberately **not** in the inner loop: a doc build is slow, and a broken
+  link is not worth blocking a commit on.
+
+  One scoped exemption, in `src/cli.rs`, with the reason on it: every doc
+  comment there is a clap help string, so `dbd --help` is its first reader.
+  `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` is how Postgres writes an optional
+  keyword and `<dir>/<name>.<fmt>` is how a CLI shows a path template —
+  satisfying rustdoc would put backticks in what users see.
+
+- **Facts the docs state are checked against the code**
+  (`tests/docs_match_code.rs`): the two `SKILL.md` copies are byte-identical,
+  every `source.parser` value the guide lists is one the resolver accepts, the
+  guide's dialect→reader table matches `for_dialect_typed`, the readers the
+  guide says cannot be diffed are the ones that produce no `table_def`, and
+  every scaffolded `ddl/` folder is named somewhere a reader will look.
+
+  Not wording — facts with one right answer. A test that pins a sentence breaks
+  on a harmless rewrite and teaches people to delete tests.
+
+- **MySQL is read.** `ParserChoice::MySql`, selected by `source.dialect: mysql`
+  (or `mariadb`) and by `Dialect::detect`. The same statement-head walk as
+  T-SQL under different rules — the walk is what every SQL dialect has in
+  common; what differs is small, specific, and wrong the other way round:
+
+  | | MySQL | T-SQL |
+  |---|---|---|
+  | `ALTER PROCEDURE` | refers — changes characteristics only | declares — carries the body |
+  | `a.b` | `database.object` (no schemas) | `schema.object` |
+  | quoting | `` `name` `` | `[name]` |
+  | `#` | line comment | starts a temp-table name |
+
+  `a.b` landing in `Entity::catalog` rather than `schema` is what keeps two
+  databases' `users` tables from merging into one entity.
+
+  **Fixture-verified only.** The T-SQL reader was measured against 2,154 real
+  files; no MySQL corpus was available, so this is tested against cases its
+  author thought of rather than against a codebase. The `#[ignore]`d corpus
+  gate will measure it when one turns up.
+
+- **`lex::LexRules`** — the lexer is no longer dialect-blind, because two
+  dialects disagree about the same character. `#` starts a line comment in
+  MySQL and a temp-table name in T-SQL: read one way in the other's file and
+  either every comment becomes a phantom table, or every temp table swallows
+  the rest of its line.
+
+### Changed
+
+- **`docs/design/architecture.md` no longer describes types that do not
+  exist.** It had drifted into a second, wrong copy of the source: of 40 field
+  declarations it listed, 16 were inaccurate, three types were gone entirely,
+  and the dependency section reproduced all three manifests — claiming
+  workspace version `0.1.0` against a released 0.15.0, a `dbd-core`
+  requirement of `0.12.2`, features (`supabase`, `convex`) that were never
+  built and a `rusqlite` dependency never taken, with **no `pg_query` in the
+  listing at all** — the crate that reads every line of DDL dbd parses.
+
+  Every type listing is now prose about what the type is *for*, every manifest
+  is a link, and what remains is rationale a manifest cannot carry. Four
+  copyable examples joined the compile gate above; the 21 illustrative ones are
+  fenced ` ```rust,ignore `. The 18 end-to-end scenarios are now Gherkin — they
+  are requirements, and a requirement written as Rust rots when the API moves,
+  which is exactly what happened to everything else on this list.
+
+  Net 693 lines deleted against 405 added. No behaviour changed; this is the
+  document catching up with eleven releases of code.
+
 ## [0.15.0] — 2026-09-25
 
 dbd reads more than PostgreSQL. **T-SQL** is read by a statement-head lexer —
@@ -636,7 +763,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.16.0...main
+[0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
 [0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1

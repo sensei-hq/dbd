@@ -33,6 +33,18 @@ pub enum ParserChoice {
     /// libpg_query — PostgreSQL's own grammar, vendored from the server.
     /// Produces a fully structured [`Entity`]: columns, constraints, indexes.
     PgQuery,
+    /// A lexer and statement-head reader for MySQL.
+    ///
+    /// The same walk as [`Self::TSql`] under different rules: `ALTER` never
+    /// carries a body, `a.b` is `database.object` because MySQL has no
+    /// schemas, backticks quote and `#` comments. No `table_def`, for the same
+    /// reason.
+    ///
+    /// **Fixture-verified only.** The T-SQL reader was measured against 2,154
+    /// real files; no MySQL corpus was available, so this is tested against
+    /// cases its author thought of rather than against a codebase. Treat its
+    /// coverage as unproven until it meets one.
+    MySql,
     /// A lexer and statement-head reader for T-SQL.
     ///
     /// Produces identity and references but **no `table_def`** — it reads
@@ -68,6 +80,7 @@ impl ParserChoice {
             Some("pg_query") => Ok(Self::PgQuery),
             Some("verbatim") => Ok(Self::Verbatim),
             Some("tsql") => Ok(Self::TSql),
+            Some("mysql") => Ok(Self::MySql),
             Some("sqlparser") => Err(DbdError::Config(
                 "source.parser \"sqlparser\" was removed — it was a second PostgreSQL parser, \
                  not a dialect, and every entity type is now read by libpg_query. \
@@ -75,7 +88,7 @@ impl ParserChoice {
                     .to_string(),
             )),
             Some(other) => Err(DbdError::Config(format!(
-                "unknown source.parser {other:?} — expected \"pg_query\", \"tsql\" or \"verbatim\""
+                "unknown source.parser {other:?} — expected \"pg_query\", \"tsql\", \"mysql\" or \"verbatim\""
             ))),
             None => Ok(Self::for_dialect(dialect)),
         }
@@ -112,7 +125,8 @@ impl ParserChoice {
         match dialect {
             Dialect::Sqlite => Self::Verbatim,
             Dialect::TSql => Self::TSql,
-            Dialect::PostgreSql | Dialect::MySql | Dialect::Unstated => Self::PgQuery,
+            Dialect::MySql => Self::MySql,
+            Dialect::PostgreSql | Dialect::Unstated => Self::PgQuery,
         }
     }
 }
@@ -165,9 +179,14 @@ pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result
         // Identity from the path, as every `parse_entity` caller expects, with
         // the references read out of the SQL. A T-SQL DDL file laid out dbd's
         // way is named by its path like any other.
-        ParserChoice::TSql => {
+        ParserChoice::TSql | ParserChoice::MySql => {
+            let rules = if choice == ParserChoice::MySql {
+                tsql::WalkRules::MYSQL
+            } else {
+                tsql::WalkRules::TSQL
+            };
             let mut entity = Entity::from_file(file);
-            let (declared, _) = tsql::read(sql);
+            let (declared, _) = tsql::read(rules, sql);
             if let Some(found) = declared.into_iter().next() {
                 entity.entity_type = found.entity_type;
                 entity.refers = found.refers;
@@ -305,8 +324,13 @@ pub fn parse_sql_as(dialect: Dialect, sql: &str) -> Result<ParsedFile> {
 pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
     match choice {
         ParserChoice::PgQuery => pg::parse_sql(sql),
-        ParserChoice::TSql => {
-            let (entities, signals) = tsql::read(sql);
+        ParserChoice::TSql | ParserChoice::MySql => {
+            let (rules, dialect) = if choice == ParserChoice::MySql {
+                (tsql::WalkRules::MYSQL, Dialect::MySql)
+            } else {
+                (tsql::WalkRules::TSQL, Dialect::TSql)
+            };
+            let (entities, signals) = tsql::read(rules, sql);
             Ok(ParsedFile {
                 kind: match (signals.declares, signals.changes, signals.data) {
                     (false, false, false) => FileKind::Empty,
@@ -315,9 +339,9 @@ pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
                     (false, false, true) => FileKind::Data,
                     _ => FileKind::Mixed,
                 },
-                dialect: Dialect::TSql,
+                dialect,
                 entities,
-                // T-SQL has no `search_path`; a name is qualified or it is
+                // Neither dialect has a `search_path`; a name is qualified or it is
                 // resolved by the connection's default schema, which no file
                 // states.
                 search_paths: Vec::new(),
@@ -798,8 +822,27 @@ mod tests {
     /// than a complaint about a config string.
     #[test]
     fn an_unrecognised_dialect_falls_back_to_the_postgres_parser() {
-        assert_eq!(ParserChoice::resolve("mysql", None).unwrap(), ParserChoice::PgQuery);
+        // A dialect dbd has no reader for. `mysql` used to sit here and no
+        // longer can, which is the point of keeping the example unrecognised
+        // rather than merely unimplemented.
+        assert_eq!(ParserChoice::resolve("oracle", None).unwrap(), ParserChoice::PgQuery);
         assert_eq!(ParserChoice::resolve("", None).unwrap(), ParserChoice::PgQuery);
+    }
+
+    /// Every dialect with a reader selects it, and none of them collide.
+    #[test]
+    fn each_dialect_with_a_reader_selects_its_own() {
+        for (label, expected) in [
+            ("postgresql", ParserChoice::PgQuery),
+            ("supabase", ParserChoice::PgQuery),
+            ("tsql", ParserChoice::TSql),
+            ("mssql", ParserChoice::TSql),
+            ("mysql", ParserChoice::MySql),
+            ("mariadb", ParserChoice::MySql),
+            ("sqlite", ParserChoice::Verbatim),
+        ] {
+            assert_eq!(ParserChoice::resolve(label, None).unwrap(), expected, "{label}");
+        }
     }
 
     /// The verbatim parser takes the file as written and asks no grammar

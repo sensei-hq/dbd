@@ -881,7 +881,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.15.0
+  rev: v0.16.0
   hooks:
     - id: dbd-format
 ```
@@ -969,7 +969,8 @@ Set `GITHUB_TOKEN` for private repositories.
 ## Library usage
 
 ```rust
-use dbd_core::{connect, Design};
+use dbd_core::{connect, ApplyComplete, Design};
+use dbd_core::design::Progress;
 use std::path::Path;
 
 // Load the declarative design for an environment (sync; scans ddl/ next to the config).

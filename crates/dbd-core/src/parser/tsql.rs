@@ -63,13 +63,46 @@ struct Object {
     alter_defines: bool,
 }
 
+/// How one dialect differs from another inside the same walk.
+///
+/// The walk itself — find a head, read the name after it — is the same for
+/// every SQL dialect. What differs is small and specific, and putting it in a
+/// struct keeps a second dialect from being a second copy of the walk.
+#[derive(Clone, Copy)]
+pub(crate) struct WalkRules {
+    /// How to tokenise. See [`lex::LexRules`].
+    pub lex: lex::LexRules,
+    /// Whether `ALTER <object>` can carry the object's whole definition.
+    ///
+    /// T-SQL's `ALTER PROCEDURE` does and MySQL's does not — MySQL's changes
+    /// characteristics only (`COMMENT`, `SQL SECURITY`), and a body change
+    /// needs `DROP` then `CREATE`. So the same statement declares in one
+    /// dialect and refers in the other.
+    pub alter_can_define: bool,
+    /// Whether a two-part name's first segment is the DATABASE rather than a
+    /// schema.
+    ///
+    /// MySQL has no schemas: `shop.users` is the `users` table in the `shop`
+    /// database. Reading that first part as a schema would put two databases'
+    /// tables in one namespace, which is the merge `Entity::catalog` exists to
+    /// prevent.
+    pub two_part_is_catalog: bool,
+    /// Whether a bare function call can be told from a built-in by its
+    /// qualification alone.
+    ///
+    /// T-SQL REQUIRES a scalar UDF to be schema-qualified, so the grammar
+    /// answers it. MySQL does not, so a qualified call is still an edge but a
+    /// bare one cannot be distinguished from `NOW()` and is left alone.
+    pub qualified_call_is_an_edge: bool,
+}
+
 /// The object kinds this reader knows, and what each is in dbd's vocabulary.
 ///
 /// `TYPE` and `SYNONYM` are deliberately absent: 3 files each in a 2,421-file
 /// corpus, and neither maps to an `EntityType` without inventing one. A reader
 /// that declared them as something else would be reporting a kind the source
 /// did not write.
-fn object_kind(word: &Tok<'_>) -> Option<Object> {
+fn object_kind(word: &Tok<'_>, rules: &WalkRules) -> Option<Object> {
     let table = [
         ("procedure", EntityType::Procedure, true),
         ("proc", EntityType::Procedure, true),
@@ -78,10 +111,10 @@ fn object_kind(word: &Tok<'_>) -> Option<Object> {
         ("view", EntityType::View, true),
         ("table", EntityType::Table, false),
     ];
-    table.iter().find_map(|&(kw, entity_type, alter_defines)| {
+    table.iter().find_map(|&(kw, entity_type, body_carrying)| {
         word.is(kw).then_some(Object {
             entity_type,
-            alter_defines,
+            alter_defines: body_carrying && rules.alter_can_define,
         })
     })
 }
@@ -122,7 +155,7 @@ impl Qualified {
 /// three-part name: `OtherDb.dbo.Users` and `dbo.Users` are different objects
 /// when a scan spans databases, and dropping the first part would merge them.
 /// See [`Entity::catalog`].
-fn qualified(toks: &[Tok<'_>], i: usize) -> Option<Qualified> {
+fn qualified(toks: &[Tok<'_>], i: usize, rules: &WalkRules) -> Option<Qualified> {
     let mut parts: Vec<String> = Vec::new();
     let mut at = i;
     loop {
@@ -145,8 +178,19 @@ fn qualified(toks: &[Tok<'_>], i: usize) -> Option<Qualified> {
         }
     }
     let object = parts.pop()?;
-    let schema = parts.pop();
-    let catalog = parts.pop();
+    // `a.b` is `schema.object` in T-SQL and `database.object` in MySQL, which
+    // has no schemas. Reading MySQL's first part as a schema would put two
+    // databases' tables in one namespace.
+    let (catalog, schema) = if rules.two_part_is_catalog {
+        let catalog = parts.pop();
+        // A three-part MySQL name does not exist; if one appears, the leading
+        // segment is dropped rather than invented into a level MySQL has not
+        // got.
+        (catalog, None)
+    } else {
+        let schema = parts.pop();
+        (parts.pop(), schema)
+    };
     Some(Qualified {
         catalog,
         schema,
@@ -155,9 +199,30 @@ fn qualified(toks: &[Tok<'_>], i: usize) -> Option<Qualified> {
     })
 }
 
-/// Read one T-SQL file into the entities it declares and the references they
-/// make.
-pub(crate) fn read(sql: &str) -> (Vec<Entity>, Signals) {
+impl WalkRules {
+    /// T-SQL: `ALTER PROCEDURE` carries the body, `a.b` is `schema.object`, and
+    /// a qualified call is a user-defined function because the language
+    /// requires the qualification.
+    pub(crate) const TSQL: Self = Self {
+        lex: lex::LexRules::TSQL,
+        alter_can_define: true,
+        two_part_is_catalog: false,
+        qualified_call_is_an_edge: true,
+    };
+
+    /// MySQL: `ALTER` never carries a body, `a.b` is `database.object` because
+    /// MySQL has no schemas, and a bare call cannot be told from `NOW()`
+    /// because MySQL does not require a UDF to be qualified.
+    pub(crate) const MYSQL: Self = Self {
+        lex: lex::LexRules::MYSQL,
+        alter_can_define: false,
+        two_part_is_catalog: true,
+        qualified_call_is_an_edge: true,
+    };
+}
+
+/// Read one file into the entities it declares and the references they make.
+pub(crate) fn read(rules: WalkRules, sql: &str) -> (Vec<Entity>, Signals) {
     let mut entities: Vec<Entity> = Vec::new();
     let mut signals = Signals::default();
     // What the file DROPped or ALTERed, resolved against what it declares only
@@ -169,8 +234,8 @@ pub(crate) fn read(sql: &str) -> (Vec<Entity>, Signals) {
     let mut changed: Vec<String> = Vec::new();
 
     for (_line, batch) in lex::batches(sql) {
-        let toks = lex::tokens(batch);
-        walk(&toks, &mut entities, &mut signals, &mut changed);
+        let toks = lex::tokens_with(rules.lex, batch);
+        walk(&rules, &toks, &mut entities, &mut signals, &mut changed);
     }
 
     signals.changes = changed.iter().any(|name| !entities.iter().any(|e| &e.name == name));
@@ -186,7 +251,13 @@ pub(crate) struct Signals {
 }
 
 /// Walk one batch.
-fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, changed: &mut Vec<String>) {
+fn walk(
+    rules: &WalkRules,
+    toks: &[Tok<'_>],
+    entities: &mut Vec<Entity>,
+    signals: &mut Signals,
+    changed: &mut Vec<String>,
+) {
     // References belong to the most recent declaration in this batch, and to
     // NOTHING before there is one — which is the whole of a migration script.
     // A T-SQL procedure body runs to the end of its batch, so "most recent"
@@ -213,8 +284,8 @@ fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, cha
                 head += 1;
             }
             if let Some(word) = toks.get(head)
-                && let Some(obj) = object_kind(word)
-                && let Some(name) = qualified(toks, head + 1)
+                && let Some(obj) = object_kind(word, rules)
+                && let Some(name) = qualified(toks, head + 1, rules)
             {
                 owner = Some(declare(entities, &name, obj.entity_type));
                 signals.declares = true;
@@ -230,7 +301,7 @@ fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, cha
             let dropping = t.is("drop");
             let mut head = i + 1;
             if let Some(word) = toks.get(head)
-                && let Some(obj) = object_kind(word)
+                && let Some(obj) = object_kind(word, rules)
             {
                 head += 1;
                 // `DROP TABLE IF EXISTS x`
@@ -240,7 +311,7 @@ fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, cha
                         head += 1;
                     }
                 }
-                if let Some(name) = qualified(toks, head) {
+                if let Some(name) = qualified(toks, head, rules) {
                     if !dropping && obj.alter_defines {
                         owner = Some(declare(entities, &name, obj.entity_type));
                         signals.declares = true;
@@ -277,7 +348,7 @@ fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, cha
             // `DELETE FROM x` and `INSERT INTO x` are reached through their own
             // keyword, so `FROM`/`INTO` alone carries them. A SUBQUERY opens
             // with `FROM (`, which names no object.
-            if let Some(name) = qualified(toks, i + 1) {
+            if let Some(name) = qualified(toks, i + 1, rules) {
                 refer(entities, owner, &name, kind);
                 i = name.next;
                 continue;
@@ -290,9 +361,10 @@ fn walk(toks: &[Tok<'_>], entities: &mut Vec<Entity>, signals: &mut Signals, cha
         // A QUALIFIED CALL IN AN EXPRESSION — `SELECT dbo.fnIssues(@x)`. See
         // the module note: the qualification is what distinguishes a
         // user-defined function from a built-in, because T-SQL requires it.
-        if t.name().is_some()
+        if rules.qualified_call_is_an_edge
+            && t.name().is_some()
             && matches!(toks.get(i + 1), Some(Tok::Punct('.')))
-            && let Some(name) = qualified(toks, i)
+            && let Some(name) = qualified(toks, i, rules)
             && name.schema.is_some()
             && matches!(toks.get(name.next), Some(Tok::Punct('(')))
         {

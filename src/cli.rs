@@ -1,3 +1,23 @@
+//! The command-line surface.
+//!
+//! # Why rustdoc's link and HTML lints are off here
+//!
+//! Every doc comment in this file is a **clap help string** — it is what
+//! `dbd --help` prints, verbatim. Its first reader is somebody at a terminal,
+//! not somebody browsing rustdoc, and the two want different things from the
+//! same text:
+//!
+//! - `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` is how Postgres writes an
+//!   optional keyword. rustdoc reads `[…]` as a link.
+//! - `<dir>/<name>.<fmt>` is how a CLI shows a path template. rustdoc reads
+//!   `<dir>` as an HTML tag.
+//!
+//! Satisfying rustdoc would mean backticks or escapes in the help output, so
+//! the lints are allowed HERE and nowhere else. The crate root denies them, and
+//! this is the only exemption — scoped to the one module where the text has a
+//! different primary audience.
+#![allow(rustdoc::broken_intra_doc_links, rustdoc::invalid_html_tags, rustdoc::bare_urls)]
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
