@@ -1775,10 +1775,10 @@ impl DatabaseAdapter for PostgresAdapter {
 
     /// Live matview drift state: every materialized view (`pg_class.relkind =
     /// 'm'`) in a managed schema mapped to its raw object comment. Distinct from
-    /// [`Self::introspect_matviews`] (which reconstructs the full entity for
+    /// `introspect_matviews` (which reconstructs the full entity for
     /// merge/init) — this reads only what reconcile's create/skip/restamp/
     /// recreate decision needs. Returns the comment unparsed (see the trait
-    /// doc); [`crate::reconcile::parse_dbd_hash`] extracts the sentinel.
+    /// doc); `reconcile::parse_dbd_hash` extracts the sentinel.
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
         let sql = format!(

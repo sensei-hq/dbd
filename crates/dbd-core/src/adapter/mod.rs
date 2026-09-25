@@ -119,9 +119,9 @@ pub trait DatabaseAdapter: Send + Sync {
     /// Live materialized-view drift state: `"schema.name"` → the object's raw
     /// comment text (`None` when it carries no comment at all). An ABSENT key
     /// means the matview does not exist. Deliberately unparsed here — this
-    /// trait is public crate API, while [`crate::reconcile::Sentinel`] (the
+    /// trait is public crate API, while `reconcile::Sentinel` (the
     /// parsed `dbd:hash` stamp) is an internal reconcile detail; callers run it
-    /// through [`crate::reconcile::parse_dbd_hash`] to decide create / skip /
+    /// through `reconcile::parse_dbd_hash` to decide create / skip /
     /// restamp / recreate per matview. Default: an empty map (targets that
     /// don't expose materialized views).
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {

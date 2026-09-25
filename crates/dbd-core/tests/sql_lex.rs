@@ -219,3 +219,101 @@ fn the_parenless_procedure_form_lexes_without_complaint() {
         "no parameter leaked in as a name: {names:?}"
     );
 }
+
+// ── Dialect rules ───────────────────────────────────────────────────────────
+//
+// Two dialects disagree about the same character, so the lexer cannot be
+// dialect-blind. `#` starts a line comment in MySQL and a temp-table name in
+// T-SQL — read one way in the other's file and either every comment becomes a
+// phantom table, or every temp table swallows the rest of its line.
+
+use dbd_core::parser::lex::LexRules;
+
+fn words_with(rules: LexRules, sql: &str) -> Vec<String> {
+    lex::tokens_with(rules, sql)
+        .iter()
+        .filter_map(|t| t.name().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn a_hash_is_a_temp_table_in_tsql_and_a_comment_in_mysql() {
+    let sql = "insert into #staging select 1\nselect * from Real";
+
+    // T-SQL: `#staging` is a name (consumed as a Var, so not reported), and
+    // the rest of the line is still code.
+    assert_eq!(
+        words_with(LexRules::TSQL, sql),
+        vec!["insert", "into", "select", "select", "from", "Real"]
+    );
+
+    // MySQL: everything after `#` is a comment, so the first line's tail is
+    // gone and only the second line survives.
+    assert_eq!(
+        words_with(LexRules::MYSQL, sql),
+        vec!["insert", "into", "select", "from", "Real"],
+        "the `#` comment must swallow the rest of its line, and nothing more"
+    );
+}
+
+/// The distinction is the token KIND, not whether a name appears. Under T-SQL
+/// rules a backtick is junk punctuation and `order` still lexes — as a `Word`,
+/// which matches the keyword `order`. Under MySQL rules it is a `Quoted`, which
+/// never matches a keyword however it is spelled. A reader that confused the
+/// two would treat a column called `order` as an ORDER BY clause.
+#[test]
+fn a_backtick_quotes_an_identifier_in_mysql_only() {
+    let sql = "select * from `order`";
+
+    let mysql = lex::tokens_with(LexRules::MYSQL, sql);
+    let quoted = mysql
+        .iter()
+        .find(|t| matches!(t, Tok::Quoted(_)))
+        .expect("MySQL quotes it");
+    assert_eq!(quoted.name(), Some("order"));
+    assert!(!quoted.is("order"), "a quoted identifier is never a keyword");
+
+    let tsql = lex::tokens_with(LexRules::TSQL, sql);
+    assert!(
+        !tsql.iter().any(|t| matches!(t, Tok::Quoted(_))),
+        "a backtick is not T-SQL's quote — nothing here is a quoted identifier"
+    );
+    assert!(
+        tsql.iter().any(|t| t.is("order")),
+        "and the bare word still matches the keyword, as T-SQL would read it"
+    );
+}
+
+/// The doubled-backtick escape, matching how the other quotes behave.
+#[test]
+fn a_doubled_backtick_is_an_escaped_backtick() {
+    assert_eq!(words_with(LexRules::MYSQL, "from `we``ird`"), vec!["from", "we`ird"]);
+}
+
+/// A bracket is T-SQL's quote and means nothing in MySQL — reading it as one
+/// would invent a name from an array subscript or an index hint.
+#[test]
+fn a_bracket_quotes_an_identifier_in_tsql_only() {
+    let sql = "from [Order Details]";
+    assert_eq!(words_with(LexRules::TSQL, sql), vec!["from", "Order Details"]);
+    assert!(
+        !words_with(LexRules::MYSQL, sql).contains(&"Order Details".to_string()),
+        "MySQL has no bracket quoting"
+    );
+}
+
+/// Double quotes are ANSI and both dialects accept them, though MySQL only
+/// under `ANSI_QUOTES`. Reading them costs nothing when they are absent.
+#[test]
+fn double_quotes_are_read_in_both() {
+    for rules in [LexRules::TSQL, LexRules::MYSQL] {
+        assert_eq!(words_with(rules, r#"from "Order""#), vec!["from", "Order"]);
+    }
+}
+
+/// `tokens` keeps the T-SQL rules it has always had, so no existing caller
+/// changes behaviour.
+#[test]
+fn the_default_rules_are_the_tsql_ones() {
+    assert_eq!(lex::tokens("from #t"), lex::tokens_with(LexRules::TSQL, "from #t"));
+}

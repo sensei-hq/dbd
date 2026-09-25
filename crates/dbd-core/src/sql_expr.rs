@@ -92,7 +92,7 @@ pub fn canonicalize_predicate(expr: &str) -> Option<String> {
 /// is the rule [`canonicalize_predicate`] already enforced for every column.
 ///
 /// `cols` holds the bare, lower-cased names of the qualifying columns — see
-/// [`crate::reconcile::coercible_columns`], which derives it from a table's
+/// `reconcile::coercible_columns`, which derives it from a table's
 /// declared types.
 pub fn canonicalize_predicate_for_columns(expr: &str, cols: &CoercibleColumns) -> Option<String> {
     // `SELECT 1 WHERE (<expr>)` — the wrapper makes a bare predicate parseable

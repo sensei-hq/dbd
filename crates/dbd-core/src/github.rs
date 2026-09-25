@@ -53,12 +53,15 @@ fn is_safe_github_subpath(s: &str) -> bool {
 /// Parse a GitHub source string.
 ///
 /// Formats:
-///   owner/repo
-///   owner/repo/subpath
-///   owner/repo@ref
-///   owner/repo/subpath@ref
-///   https://github.com/owner/repo
-///   https://github.com/owner/repo/tree/branch/subpath
+///
+/// ```text
+/// owner/repo
+/// owner/repo/subpath
+/// owner/repo@ref
+/// owner/repo/subpath@ref
+/// https://github.com/owner/repo
+/// https://github.com/owner/repo/tree/branch/subpath
+/// ```
 pub fn parse_github_source(source: &str) -> Result<GitHubSource> {
     // Full URL format
     if let Some(rest) = source

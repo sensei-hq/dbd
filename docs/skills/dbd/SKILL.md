@@ -252,11 +252,12 @@ dbd-core = { git = "https://github.com/sensei-hq/dbd" }
 ```
 
 ```rust
-use dbd_core::{connect, Design};
+use dbd_core::{connect, ApplyComplete, Design};
+use dbd_core::design::Progress;
 use std::path::Path;
 
 // 1. Load the declarative design for an environment (sync; scans ddl/ next to the config).
-let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // 2. Validate offline — no DB needed.
 let report = design.report(None, None);
@@ -346,8 +347,9 @@ println!("{:?} file, read as {:?}", parsed.kind, parsed.dialect);
 |---|---|---|
 | `PostgreSql` | libpg_query | yes — columns, constraints, indexes |
 | `TSql` | statement-head lexer | no — identity and edges only |
+| `MySql` | statement-head lexer | no — identity and edges only |
 | `Sqlite` | verbatim | no — the file is the model |
-| `MySql`, `Unstated` | libpg_query (fallback) | — |
+| `Unstated` | libpg_query (fallback) | — |
 
 Detection **fails closed**: `CREATE TABLE t (id int)` is valid in every dialect
 and says nothing, so it is `Unstated` rather than a guess. `ParsedFile::dialect`

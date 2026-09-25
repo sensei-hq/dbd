@@ -250,7 +250,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.15.0
+  rev: v0.16.0
   hooks:
     - id: dbd-format
 ```
@@ -272,6 +272,7 @@ dbd-core = { git = "https://github.com/sensei-hq/dbd" }
 ```rust
 use dbd_core::Design;
 use dbd_core::adapter::postgres::PostgresAdapter;
+use dbd_core::design::Progress;
 use std::path::Path;
 
 async fn run_migrations(database_url: &str) -> anyhow::Result<()> {

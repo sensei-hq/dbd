@@ -46,7 +46,7 @@ scan ddl/                          ← sequential (fast, single walkdir traversa
   → ready for all consumers
 ```
 
-```rust
+```rust,ignore
 use rayon::prelude::*;
 
 let entities: Vec<Entity> = ddl_files
@@ -219,6 +219,8 @@ The library exposes a layered API — consumers pick the level they need:
 ```rust
 // High-level: one-call operations (deploy, apply, inspect)
 use dbd_core::Design;
+use dbd_core::design::Progress;
+use std::path::Path;
 
 let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;   // sync; scans ddl/
 let adapter = dbd_core::connect(db_url, &design.config().project.name).await?;
@@ -272,8 +274,10 @@ that could be `a.t` or `b.t` stays undecided until the whole set is known.
 ```rust
 // In a Rust web server's startup routine
 use dbd_core::Design;
+use dbd_core::design::Progress;
+use std::path::Path;
 
-async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
+async fn run_migrations(database_url: &str) -> dbd_core::Result<()> {
     let design = Design::from_config(Path::new("database/design.yaml"), "prod")?;
     let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
     let scope = design.resolve_scope(None, None)?;
@@ -290,6 +294,9 @@ The library returns structured data that a UI can render:
 ```rust
 use dbd_core::Design;
 use dbd_core::dependency::GraphResult;
+use std::path::Path;
+
+let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;
 
 // Get dependency graph for visualization
 let graph: GraphResult = design.graph(None, None)?;
@@ -314,168 +321,63 @@ let pending = snapshot::pending_migrations(db_version, project_dir);   // -> Vec
 
 ### Entity
 
-The central data structure. All DDL objects flow through this type.
+The central data structure. Every DDL object flows through it, whatever
+declared it — a file on disk, a live database's catalog, or a DBML import.
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entity {
-    pub entity_type: EntityType,
-    pub name: String,           // Fully qualified: "schema.name"
-    pub schema: Option<String>,
-    pub file: Option<PathBuf>,
-    pub format: Option<String>, // "ddl" or "sql"
-    pub refers: Vec<String>,    // Declared dependencies (from design.yaml)
-    pub references: Vec<Reference>,  // Parsed from SQL
-    pub search_paths: Vec<String>,
-    pub errors: Vec<String>,
-    pub warnings: Vec<String>,
-    pub reads: Vec<String>,     // Tables read (procedures only)
-    pub writes: Vec<String>,    // Tables written (procedures only)
-    pub table_def: Option<TableDef>,  // Parsed table structure (tables only)
-    pub enum_values: Vec<EnumValue>,  // Enum variants (enums only)
-}
+> Defined in `crates/dbd-core/src/entity.rs`. This section describes what the
+> type is *for*; the fields themselves are not listed here, because a field
+> list in prose is wrong within a release and says nothing a reader could not
+> get from the source.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntityType {
-    Schema,
-    Extension,
-    Role,
-    Enum,
-    Table,
-    View,
-    MaterializedView,
-    Function,
-    Procedure,
-    External,
-    Import,
-    Export,
-}
+An entity carries four kinds of thing:
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reference {
-    pub name: String,
-    pub ref_type: Option<String>,
-}
-```
+- **Identity** — what it is and what it is called. A type, a name, and the
+  levels that qualify it: the schema, and for the dialects that need one, the
+  database. Two objects with the same name in different databases are two
+  entities.
+- **Provenance** — the file it came from, if any. An entity introspected from a
+  live database has none.
+- **Edges** — what it references. Kept apart rather than merged, because the
+  kinds answer different questions: what a routine *reads* versus what it
+  *writes* drives import ordering, and a *soft* reference (a function call that
+  may be a built-in) is dropped silently on failure to resolve while a hard one
+  warns.
+- **Structure** — the parsed shape, for the readers that produce one. Only a
+  structured reader fills this in, and only an entity that has it can be
+  diffed; see *SQL parsing* below.
+
+Anything unreadable is recorded on the entity rather than thrown: errors and
+warnings travel with it, so one bad file does not fail a scan and a caller can
+report every problem at once.
 
 ### Parsed table structure (TableDef)
 
-The parser populates `TableDef` with the full column/constraint/index detail needed for both DBML generation and snapshot diffing. The Node.js version stores this information spread across extractors and loses FK actions — the Rust version captures everything in one structure.
+What a structured reader recovers from a `CREATE TABLE`: its columns, its
+constraints, its indexes, and the comments on any of them.
 
-```rust
-/// Full parsed table definition — populated by the parser, consumed by
-/// DBML generator, snapshot builder, and migration diff.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableDef {
-    pub columns: Vec<ColumnDef>,
-    pub constraints: Vec<TableConstraint>,
-    pub indexes: Vec<IndexDef>,
-    pub comments: TableComments,
-}
+> Defined in `crates/dbd-core/src/entity.rs`.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub default_value: Option<String>,
-    pub is_pk: bool,
-    pub is_unique: bool,
-    pub is_identity: bool,         // SERIAL / GENERATED ALWAYS AS IDENTITY
-    pub comment: Option<String>,   // COMMENT ON COLUMN
-    pub inline_fk: Option<ForeignKey>,  // Inline REFERENCES (single-column FK)
-}
+The rule that shapes this type is that **anything it cannot hold is invisible
+to reconcile**, and invisible means permanent drift. `reconcile` compares an
+authored table against an introspected one; a property the model drops looks
+identical on both sides and is silently never converged. That is why the model
+keeps things a simpler one would discard:
 
-/// Foreign key — captures the full detail the Node.js version drops.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignKey {
-    pub name: Option<String>,          // Constraint name (if named)
-    pub columns: Vec<String>,          // FK columns on this table
-    pub ref_schema: Option<String>,    // Referenced table schema
-    pub ref_table: String,             // Referenced table name
-    pub ref_columns: Vec<String>,      // Referenced columns
-    pub on_delete: Option<FkAction>,   // ON DELETE action
-    pub on_update: Option<FkAction>,   // ON UPDATE action
-}
+- how a column *generates* its value, kept apart from its default — Postgres
+  exposes a `GENERATED ALWAYS AS (…) STORED` expression through the same
+  catalog as an ordinary `DEFAULT`, and reading one as the other made reconcile
+  plan a `DROP DEFAULT` Postgres refuses, aborting every run (issue #16)
+- whether an index's entries are columns or *expressions*, because an emitter
+  that quotes an expression as an identifier produces
+  `column "(context ->> 'module')" does not exist`
+- operator classes, `INCLUDE` payloads, `NULLS NOT DISTINCT`, partial-index
+  predicates and access-method storage parameters — each of which distinguishes
+  two indexes that would otherwise compare equal
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum FkAction {
-    Cascade,
-    Restrict,
-    SetNull,
-    SetDefault,
-    NoAction,
-}
-
-/// Table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TableConstraint {
-    PrimaryKey {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
-    Unique {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
-    ForeignKey(ForeignKey),
-    Check {
-        name: Option<String>,
-        expression: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexDef {
-    pub name: Option<String>,
-    pub columns: Vec<IndexColumn>,
-    pub unique: bool,
-    pub index_type: Option<IndexType>,   // btree (default) or hash
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexColumn {
-    pub name: String,
-    pub order: Option<SortOrder>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum IndexType { Btree, Hash }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum SortOrder { Asc, Desc }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TableComments {
-    pub table: Option<String>,           // COMMENT ON TABLE
-    pub columns: HashMap<String, String>, // COMMENT ON COLUMN
-}
-
-/// Enum variant with optional note
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnumValue {
-    pub name: String,
-    pub note: Option<String>,
-}
-```
-
-#### What this fixes vs Node.js
-
-| Data point | Node.js parser | Rust parser |
-|---|---|---|
-| FK on_delete / on_update | **not captured** | `FkAction` enum on every FK |
-| FK constraint name | captured on table-level, lost on inline | always captured |
-| Column comments | extracted separately in comment pass | inline on `ColumnDef.comment` |
-| Table comments | extracted separately | inline on `TableComments.table` |
-| CHECK constraints | not captured | `TableConstraint::Check` |
-| SERIAL / identity | not detected | `ColumnDef.is_identity` |
-| Enum values | not on Entity | `Entity.enum_values` |
-| Index type (hash/btree) | captured in snapshot only | on `IndexDef` from parse |
-
-This structure serves three consumers:
-1. **DBML generator** — `table_def` has everything needed to emit Tables, Columns, Refs, Indexes, Enums
-2. **Snapshot builder** — `table_def` maps directly to `TableSnapshot` (no second parse pass)
-3. **Migration diff** — column/constraint/index comparison uses the same types
+A table dbd cannot read structurally is an **error**, not a partial result.
+Every other entity type may degrade; this one may not, because a table with no
+structure is absent from the desired snapshot, which makes the live table read
+as an orphan that `reconcile --prune` would DROP.
 
 ### Config (design.yaml) — restructured
 
@@ -628,122 +530,46 @@ ignore:
 
 #### Rust types
 
-```rust
-#[derive(Debug, Deserialize)]
-pub struct DesignConfig {
-    pub project: ProjectConfig,
-    pub source: SourceConfig,
-    pub target: IndexMap<String, TargetConfig>,  // Ordered — first is default
-    pub schemas: Vec<SchemaEntry>,
-    pub external: Vec<ExternalEntry>,
-    pub import: ImportConfig,
-    pub export: Vec<ExportEntry>,
-    pub dbml: Option<HashMap<String, DbmlDocConfig>>,
-    pub ignore: Vec<String>,
-    // Note: extensions, roles, grants live under target — not here
-}
+> Defined in `crates/dbd-core/src/config.rs`.
 
-#[derive(Debug, Deserialize)]
-pub struct ProjectConfig {
-    pub name: String,
-    pub note: Option<String>,
-}
+`design.yaml` deserializes into a tree mirroring the sections above. Two
+decisions shape it:
 
-#[derive(Debug, Deserialize)]
-pub struct SourceConfig {
-    #[serde(default = "default_dialect")]
-    pub dialect: String,  // "postgresql", "sqlite", etc.
-}
+- **Every section but `project` is optional.** A config that declares only a
+  name and a target is valid, and one written before a section existed still
+  loads — the format has grown, and a missing key is a fact about a project's
+  vintage rather than a parse failure.
+- **Order is preserved** where it carries meaning. The first `target` listed is
+  the one used, so the map is insertion-ordered rather than hashed.
 
-#[derive(Debug, Deserialize)]
-pub struct TargetConfig {
-    // Connection
-    pub url: Option<String>,               // Postgres/Supabase (env var refs expanded)
-    pub path: Option<PathBuf>,             // SQLite
-
-    // Postgres / Supabase
-    pub extensions: Vec<ExtensionEntry>,
-    pub roles: Vec<RoleEntry>,
-
-    // Supabase-specific
-    pub schemas: Option<Vec<String>>,      // PostgREST-exposed schemas
-    pub grants: Option<HashMap<String, GrantConfig>>,  // schema → role → perms
-
-    pub skip_schemas: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ImportConfig {
-    pub staging: Vec<String>,          // Schemas allowed for import
-    pub options: ImportOptions,
-    pub tables: Vec<ImportTableEntry>,
-    pub after: Vec<String>,
-}
-
-/// Schema entry: plain string or object with grants
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum SchemaEntry {
-    Name(String),
-    WithGrants {
-        // First key is schema name, value has grants
-    },
-}
-
-/// Extension: string or object with schema
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ExtensionEntry {
-    Name(String),
-    WithSchema { name: String, schema: String },
-}
-```
+Defaults that decide behaviour are named rather than inlined at the point of
+use, so two call sites cannot disagree about them — see
+`DEFAULT_PROJECT_VERSION` for the one case where they did.
 
 ### Snapshot & Migration
 
-```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub version: u32,
-    pub description: String,
-    pub timestamp: String,
-    pub tables: Vec<TableSnapshot>,
-}
+> Defined in `crates/dbd-core/src/snapshot.rs` and `schema_diff.rs`.
 
-/// TableSnapshot is built from TableDef — same column/constraint/index types,
-/// plus the table identity (name, schema). No duplicate type hierarchies.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TableSnapshot {
-    pub name: String,
-    pub schema: String,
-    pub columns: Vec<ColumnDef>,          // Reuses ColumnDef from parser
-    pub indexes: Vec<IndexDef>,           // Reuses IndexDef from parser
-    pub table_constraints: Vec<TableConstraint>, // Reuses TableConstraint from parser
-}
+A **snapshot** is the whole schema at one version, written to `snapshots/` when
+a release is cut. A **migration** is the SQL that moves a database from one
+version to the next, generated by diffing two snapshots.
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SchemaDiff {
-    pub from_version: u32,
-    pub to_version: u32,
-    pub added_tables: Vec<TableSnapshot>,
-    pub dropped_tables: Vec<TableSnapshot>,
-    pub altered_tables: Vec<AlteredTable>,
-}
+The diff is not a list of added and dropped tables. It carries:
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MigrationGraph {
-    pub from_version: u32,
-    pub to_version: u32,
-    pub altered: Vec<String>,
-    pub dropped: Vec<String>,
-}
-```
+- the **changes** themselves, at column and constraint granularity
+- **advisories** — changes that are valid but risky, such as a narrowing type
+  cast that may truncate
+- **warnings** — things the diff could not decide
+- **materialized-view drift**, which is tracked separately because dbd never
+  auto-recreates a matview: doing so means `DROP … CASCADE`, which loses data
+  and dependents, so drift is reported for a human instead
 
-Note: `TableSnapshot` reuses `ColumnDef`, `IndexDef`, and `TableConstraint` — no parallel type hierarchies. The parser populates `Entity.table_def`, the snapshot builder copies it into `TableSnapshot`, and the diff compares using the same types.
+Keeping those apart matters at the call site: a caller gates on the changes,
+prints the advisories, and must not treat either as the other.
 
 ### Adapter trait
 
-```rust
+```rust,ignore
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync {
     // Lifecycle
@@ -778,150 +604,70 @@ pub trait DatabaseAdapter: Send + Sync {
 
 ### Parser trait
 
-```rust
-pub trait SqlParser: Send + Sync {
-    /// Parse a SQL script and extract entity identity, references, and table structure
-    fn parse_entity(&self, path: &Path, sql: &str) -> Result<Entity>;
+A reader takes a file's path and SQL and returns an `Entity`. Which reader runs
+is resolved once per project from `source.dialect`, with `source.parser` as an
+explicit override — see `parser::ParserChoice` and the `DdlParser` trait in
+`crates/dbd-core/src/parser/`.
 
-    /// Parse a table DDL into a snapshot structure (reuses TableDef from Entity)
-    fn parse_table_snapshot(&self, entity: &Entity) -> Result<TableSnapshot>;
+An embedder reading files that belong to no project names the dialect per call
+instead (`parse_sql_as`), or lets `Dialect::detect` decide from the text. That
+is the same set of readers reached a different way, not a second path.
 
-    /// Parse a view DDL and extract column names
-    fn parse_view_columns(&self, entity: &Entity) -> Result<Vec<String>>;
-}
-
-// Note: classify_reference() is on DatabaseAdapter, not SqlParser.
-// The adapter knows what's native to its target environment.
-```
+`classify_reference` is on `DatabaseAdapter`, not on the parser: only the
+adapter knows what is native to its target environment.
 
 ---
 
-## Dependencies (Cargo.toml)
+## Dependencies
 
-### Workspace root
+> This section used to reproduce all three manifests. Every copy had rotted —
+> the workspace version said `0.1.0` against a released `0.15.0`, the
+> `dbd-core` requirement said `0.12.2`, the repository was still under the
+> author's personal account, and the listing had no `pg_query` in it at all,
+> which is the crate that reads every line of DDL dbd parses. A manifest copied
+> into prose is a second source of truth that nothing checks.
+>
+> The manifests are the record: [`Cargo.toml`](../../Cargo.toml) (the workspace
+> *and* the `dbd-cli` package) and
+> [`crates/dbd-core/Cargo.toml`](../../crates/dbd-core/Cargo.toml). Both carry
+> comments for the packaging decisions that only make sense next to the lines
+> they govern. What follows is the part a manifest cannot state: why each
+> dependency is the one chosen.
 
-```toml
-[workspace]
-resolver = "2"
-members = ["crates/*"]
+### The root manifest is both the workspace and the CLI
 
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-repository = "https://github.com/jerrythomas/dbd"
+`dbd-cli` is not a workspace member. The repo root is its package root, so
+`cargo install --path .` resolves to the CLI — which is the only thing
+pre-commit's `language: rust` can install, since it has no way to name a
+member. It also keeps exactly one target producing the `dbd` binary; a root
+shim alongside a `crates/dbd-cli` binary would collide on `target/debug/dbd`.
 
-[workspace.dependencies]
-# Shared across crates
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["full"] }
-thiserror = "2"
-anyhow = "1"
-```
-
-### `dbd-core` (library)
-
-```toml
-[package]
-name = "dbd-core"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-
-# PostgreSQL
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
-
-# SQL Parsing
-sqlparser = { version = "0.61", features = ["visitor"] }  # Pure Rust, multi-dialect
-
-# File system & parallelism
-walkdir = "2"
-rayon = "1"              # Parallel file parsing (work-stealing thread pool)
-
-# HTTP (GitHub source)
-reqwest = { version = "0.12", features = ["json", "stream"] }
-flate2 = "1"
-tar = "0.4"
-
-# Utilities
-async-trait = "0.1"
-sha2 = "0.10"            # SHA-256 for migration checksums
-tempfile = "3"
-dirs = "5"               # XDG cache directory
-chrono = "0.4"
-
-[dev-dependencies]
-insta = "1"              # Snapshot testing
-tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
-```
-
-### `dbd-cli` (binary)
-
-This is the **root** manifest — `Cargo.toml` at the repo root is both the
-workspace and the `dbd-cli` package, so `cargo install --path .` resolves there.
-(pre-commit's `language: rust` can only install from the repo root, and a second
-package producing a `dbd` binary would collide with this one on
-`target/debug/dbd`.)
-
-```toml
-[workspace]
-members = ["crates/*"]
-
-[workspace.dependencies]
-# The version requirement lives here, once. `cargo publish` strips the `path`
-# and resolves the `version`, so a path-only dep cannot be published.
-dbd-core = { path = "crates/dbd-core", version = "0.12.2" }
-
-[package]
-name = "dbd-cli"
-version.workspace = true
-edition.workspace = true
-# The package root is the repo root, so name what ships. These are
-# gitignore-style patterns: unanchored, `README.md` matches at ANY depth.
-include = ["/src/**/*", "/README.md", "/LICENSE"]
-
-[[bin]]
-name = "dbd"
-path = "src/main.rs"
-
-[dependencies]
-dbd-core = { workspace = true, features = ["postgres", "sqlite"] }
-clap = { version = "4", features = ["derive", "env"] }
-tokio.workspace = true
-anyhow.workspace = true
-
-[dev-dependencies]
-assert_cmd = "2"         # CLI integration tests
-predicates = "3"
-tempfile = "3"
-serde_json.workspace = true
-```
-
-Note: `clap`, `anyhow`, and CLI-specific deps live only in `dbd-cli`. Library consumers don't pull them in.
+The cost is that the package root is the whole repository, so `include` has to
+name what ships rather than exclude what does not — with every pattern
+anchored, because an unanchored `README.md` matches at any depth. A crates.io
+publish is public and cannot be deleted, only yanked.
 
 ### Key dependency choices
 
-| Need                | Node.js             | Rust                 | Rationale                                     |
-| ------------------- | ------------------- | -------------------- | --------------------------------------------- |
-| CLI parsing         | sade                | clap (derive)        | Industry standard, derive macros              |
-| YAML parsing        | js-yaml             | serde_yaml           | Serde ecosystem, zero-copy                    |
-| SQL parsing         | pgsql-parser (WASM) | sqlparser-rs         | Pure Rust, typed AST, multi-dialect, no C dep |
-| PostgreSQL          | postgres (npm)      | sqlx                 | Compile-time safety, async, connection pool   |
-| FP utilities        | ramda               | Iterator chains      | Rust iterators are the idiomatic equivalent   |
-| Parallel parsing    | —  (single-threaded) | rayon                | Work-stealing thread pool for CPU-bound parse |
-| HTTP                | curl (child proc)   | reqwest              | Pure Rust, async, no external dependency      |
-| Tarball extraction  | tar (child proc)    | flate2 + tar         | Pure Rust, no curl/tar binaries needed        |
-| Hashing             | crypto.createHash   | sha2                 | Pure Rust SHA-256                             |
-| Error handling      | throw/catch         | thiserror + anyhow   | Typed errors + ergonomic propagation          |
+| Need                | Node.js               | Rust                 | Rationale                                             |
+| ------------------- | --------------------- | -------------------- | ----------------------------------------------------- |
+| CLI parsing         | sade                  | clap (derive)        | Industry standard, derive macros                      |
+| YAML parsing        | js-yaml               | serde_yaml           | Serde ecosystem                                        |
+| PostgreSQL DDL      | pgsql-parser (WASM)   | pg_query             | PostgreSQL's own grammar — see the superseded ADR above |
+| Formatting, enums   | —                     | sqlparser-rs         | A typed AST is easier to walk than a protobuf one, and neither job has to be exhaustive |
+| T-SQL / MySQL DDL   | —                     | in-tree lexer        | A statement-head walk, not a grammar — `parser::tsql`   |
+| Non-UTF-8 sources   | —                     | encoding_rs          | SSMS writes UTF-16LE; 16.2% of a measured corpus needed it |
+| Database driver     | postgres (npm)        | sqlx                 | Async, pooled, one driver for Postgres and SQLite      |
+| FP utilities        | ramda                 | Iterator chains      | Rust iterators are the idiomatic equivalent            |
+| Parallel parsing    | — (single-threaded)   | rayon                | Work-stealing thread pool for CPU-bound parse          |
+| HTTP                | curl (child proc)     | reqwest (rustls)     | Pure Rust, async, no external binary and no OpenSSL    |
+| Tarball extraction  | tar (child proc)      | flate2 + tar         | Pure Rust, no external binary                          |
+| Hashing             | crypto.createHash     | sha2                 | Pure Rust SHA-256                                      |
+| Ordered maps        | JS object insertion   | indexmap             | Emitted DDL must be deterministic, so map order is load-bearing |
+| Error handling      | throw/catch           | thiserror + anyhow   | Typed errors in the library, ergonomic propagation in the CLI |
+
+`clap` and `anyhow` live only in `dbd-cli`. A library consumer does not pull
+them in.
 
 ---
 
@@ -936,7 +682,7 @@ The Node.js version uses a standalone classifier with hardcoded lists of Postgre
 
 Each adapter knows what's native to its target. The classifier isn't a standalone module — it's part of the `DatabaseAdapter` trait.
 
-```rust
+```rust,ignore
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync {
     // ... existing methods ...
@@ -1005,7 +751,7 @@ SELECT type_name FROM all_types WHERE owner = 'SYS';
 3. Static patterns (offline fallback)            ← works without DB connection
 ```
 
-```rust
+```rust,ignore
 pub enum ReferenceClass {
     Internal,          // Built-in function, type, or operator
     Extension(String), // From a specific extension (name included)
@@ -1016,54 +762,20 @@ pub enum ReferenceClass {
 
 #### Adapter implementation (PostgreSQL)
 
-```rust
-pub struct PostgresAdapter {
-    pool: PgPool,
-    catalog: Option<AdapterCatalog>,  // Loaded lazily on first classify
-    // ...
-}
+The Postgres adapter loads its catalog lazily, on the first classification
+that needs one: the built-in functions and types from `pg_proc` and `pg_type`,
+and the object→extension mapping from `pg_extension`. A name found there is
+`Internal` or `Extension`; anything else falls through to a static pattern
+match, so classification still works with no connection, and finally to
+`UserDefined`.
 
-pub struct AdapterCatalog {
-    builtin_functions: HashSet<String>,      // pg_catalog functions
-    builtin_types: HashSet<String>,          // pg_catalog types
-    extension_objects: HashMap<String, String>, // name → extension
-}
-
-impl DatabaseAdapter for PostgresAdapter {
-    async fn load_catalog(&mut self) -> Result<()> {
-        // Query pg_proc, pg_type, pg_extension
-        // Populate self.catalog
-    }
-
-    fn classify_reference(&self, name: &str, installed: &[String]) -> ReferenceClass {
-        let lower = name.to_lowercase();
-
-        // Catalog lookup (authoritative)
-        if let Some(catalog) = &self.catalog {
-            if catalog.builtin_functions.contains(&lower)
-                || catalog.builtin_types.contains(&lower) {
-                return ReferenceClass::Internal;
-            }
-            if let Some(ext) = catalog.extension_objects.get(&lower) {
-                return ReferenceClass::Extension(ext.clone());
-            }
-        }
-
-        // Static pattern fallback (no DB connection)
-        if Self::matches_static_pattern(&lower) {
-            return ReferenceClass::Internal;
-        }
-
-        ReferenceClass::UserDefined
-    }
-}
-```
+See `classify_reference` in `crates/dbd-core/src/adapter/postgres/`.
 
 #### Static patterns (offline fallback)
 
 Each adapter provides its own static patterns. These handle the common cases when no DB connection is available:
 
-```rust
+```rust,ignore
 impl PostgresAdapter {
     const INTERNAL_PATTERNS: &[&str] = &[
         r"^pg_", r"^information_schema\.", r"^array_", r"^json_",
@@ -1128,7 +840,7 @@ Each adapter's catalog knows its own dialect's builtins. The classifier never ne
 
 Two-tier error strategy:
 
-```rust
+```rust,ignore
 // Typed errors for library-level code (adapter, parser, config)
 #[derive(Debug, thiserror::Error)]
 pub enum DbdError {
@@ -1164,7 +876,7 @@ pub enum DbdError {
 
 `Design` is loaded synchronously from the config, then queried or driven against an adapter:
 
-```rust
+```rust,ignore
 impl Design {
     // Load + parse ddl/ (sync). `from_config_with_dir` overrides the project root.
     pub fn from_config(config_path: &Path, env: &str) -> Result<Self> { ... }
@@ -1194,7 +906,7 @@ impl Design {
 
 Match the Node.js pattern: entities accumulate `errors` and `warnings` vectors. Functions return partial results. Only truly unrecoverable errors (IO, connection failure) use `Result::Err`. Validation errors are collected and reported.
 
-```rust
+```rust,ignore
 // Good: collect and continue
 entity.errors.push(format!("File not found: {}", path.display()));
 
@@ -1206,7 +918,7 @@ Err(DbdError::Database(e))
 
 Port the existing algorithm directly:
 
-```rust
+```rust,ignore
 pub fn sort_by_dependencies(entities: &[Entity]) -> Vec<Entity> {
     // 1. Build adjacency: name → Set<dependency names>
     // 2. Iteratively extract entities with no in-group dependencies
@@ -1234,20 +946,12 @@ Import ordering is more complex than entity ordering. It combines two dependency
    - Cycles: append remaining sorted by DDL order (with warning)
 ```
 
-```rust
-pub struct ImportPlanEntry {
-    pub table: Entity,               // Staging table being imported
-    pub target: Option<Entity>,      // Config table it maps to
-    pub procedure: Option<Entity>,   // Import procedure that processes it
-    pub targets: Vec<String>,        // Config tables written by procedure
-    pub warnings: Vec<String>,
-}
+Each entry pairs a staging table with the procedure that processes it and the
+tables that procedure **writes** — which is what the ordering turns on. A
+staging table whose procedure writes a table another procedure reads must load
+first, and only the write set says so.
 
-pub fn build_import_plan(
-    import_tables: &[Entity],
-    entities: &[Entity],
-) -> Vec<ImportPlanEntry> { ... }
-```
+> `build_import_plan` in `crates/dbd-core/src/design/import.rs`.
 
 ### SQL parsing — `sqlparser-rs` (pure Rust, no regex fallback)
 
@@ -1260,11 +964,16 @@ pub fn build_import_plan(
 > the regex fallback this section claims to have removed.
 >
 > DDL is now read by **`pg_query`** (libpg_query — PostgreSQL's own grammar), the
-> option rejected below. The cross-compilation cost was real and was paid. The
-> "multi-dialect future" argument did not materialise either: the sqlparser path
-> hardcoded `PostgreSqlDialect` for its whole life, so it was never a dialect
-> selector — and SQLite DDL is not a Postgres subset, so a real SQLite grammar
-> would have been new work regardless.
+> option rejected below. The cross-compilation cost was real and was paid.
+>
+> The "multi-dialect future" argument did not survive either, though the future
+> itself arrived. The sqlparser path hardcoded `PostgreSqlDialect` for its whole
+> life, so it was never a dialect selector; dbd reads T-SQL and MySQL as of
+> 0.15.0, and neither goes through sqlparser. Both use an in-tree statement-head
+> walk, because what those files need is an inventory of what they declare, not
+> a grammar. SQLite went the other way again and is read verbatim — its DDL is
+> not a Postgres subset, so a real SQLite grammar would have been new work
+> regardless of which crate was chosen here.
 >
 > `sqlparser-rs` remains a dependency, for `dbd format` and enum-candidate
 > detection. It no longer reads DDL. The rest of this section is kept as the
@@ -1292,7 +1001,7 @@ pub fn build_import_plan(
 
 **No regex fallback needed.** The Node.js version falls back to regex because `pgsql-parser` (WASM) fails on some function/procedure/enum DDL. `sqlparser-rs` handles all of these natively:
 
-```rust
+```rust,ignore
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::ast::Statement;
@@ -1334,7 +1043,7 @@ for stmt in statements {
 
 Replace `execFileSync('curl', ...)` and `execFileSync('tar', ...)` with `reqwest` + `flate2` + `tar`:
 
-```rust
+```rust,ignore
 pub fn download_github_source(source: &str) -> Result<GitHubDownload> {
     let parsed = parse_github_source(source)?;
     let tmp_dir = tempfile::tempdir()?;
@@ -1359,7 +1068,7 @@ pub fn download_github_source(source: &str) -> Result<GitHubDownload> {
 
 ## CLI Structure (clap)
 
-```rust
+```rust,ignore
 #[derive(Parser)]
 #[command(name = "dbd", version, about = "Database design tool")]
 struct Cli {
@@ -1536,7 +1245,7 @@ Each `dbd-core` module has inline tests for pure functions. No database or exter
 
 Test the full parse pipeline using real DDL fixture files. Verifies that the parser produces the correct `Entity` + `TableDef` from actual DDL.
 
-```rust
+```rust,ignore
 // tests/parser/tables_test.rs
 #[test]
 fn parses_table_with_fk_and_actions() {
@@ -1585,7 +1294,7 @@ fn parses_procedure_reads_and_writes() {
 
 Test `classify_reference()` for each adapter — both static fallback and catalog-based.
 
-```rust
+```rust,ignore
 // tests/adapter/classify_test.rs
 
 #[test]
@@ -1664,7 +1373,7 @@ fn convex_classifies_everything_as_internal() {
 
 Test the full pipeline: parsed entities → DBML text. Use insta snapshots for complex output.
 
-```rust
+```rust,ignore
 #[test]
 fn generates_dbml_for_table_with_fks() {
     let entities = parse_fixture_entities("tests/fixtures");
@@ -1701,7 +1410,7 @@ fn dbml_includes_enums() {
 
 ### Snapshot / migration tests (insta)
 
-```rust
+```rust,ignore
 #[test]
 fn generates_migration_sql_for_added_column() {
     let diff = SchemaDiff { /* ... */ };
@@ -1720,7 +1429,7 @@ fn generates_reset_script() {
 
 Test the binary end-to-end. Lives in `tests/`.
 
-```rust
+```rust,ignore
 #[test]
 fn inspect_example_project() {
     Command::cargo_bin("dbd").unwrap()
@@ -1754,281 +1463,289 @@ End-to-end tests against a real database. These verify the full lifecycle — no
 
 Each scenario uses a fresh database (CREATE DATABASE per test, DROP after).
 
+> Written as Gherkin rather than as code. These are *requirements* — what must
+> be true after an operation — and a requirement written as Rust is a
+> requirement that rots when the API moves, which is what happened to the type
+> listings above. Given/When/Then says what, not how, so it stays true across a
+> refactor and is readable by someone who does not write Rust.
+>
+> Step wording is the original author's and is deliberately terse.
+
 #### Scenario 1: Initial deploy (fresh database)
 
 Empty database, no tables, no `_dbd_migrations`.
 
-```
-Given: empty database
-When:  design.apply()
-Then:
-  - schemas created (config, staging)
-  - extensions installed (uuid-ossp)
-  - roles created in dependency order
-  - tables created in dependency order (FKs resolve)
-  - views, functions, procedures created
-  - _dbd_migrations has one row at latest snapshot version (or no row if no snapshots)
-  - design.report() shows zero errors
+```gherkin
+Scenario: Initial deploy (fresh database)
+  Given empty database
+  When design.apply()
+  Then schemas created (config, staging)
+  And extensions installed (uuid-ossp)
+  And roles created in dependency order
+  And tables created in dependency order (FKs resolve)
+  And views, functions, procedures created
+  And _dbd_migrations has one row at latest snapshot version (or no row if no snapshots)
+  And design.report() shows zero errors
 ```
 
 #### Scenario 2: Initial deploy with data seeding
 
 Fresh database, apply + import.
 
-```
-Given: empty database, import/ folder with CSV files
-When:  design.apply() then design.import_data()
-Then:
-  - all entities created (same as Scenario 1)
-  - staging tables truncated before load (truncate: true default)
-  - CSV data loaded into staging tables via COPY FROM STDIN
-  - import procedures called automatically (staging.import_<name>())
-  - import.after SQL files executed
-  - config tables populated (via procedures moving data from staging → config)
+```gherkin
+Scenario: Initial deploy with data seeding
+  Given empty database, import/ folder with CSV files
+  When design.apply() then design.import_data()
+  Then all entities created (same as Scenario 1)
+  And staging tables truncated before load (truncate: true default)
+  And CSV data loaded into staging tables via COPY FROM STDIN
+  And import procedures called automatically (staging.import_<name>())
+  And import.after SQL files executed
+  And config tables populated (via procedures moving data from staging → config)
 ```
 
 #### Scenario 3: Incremental update (schema migration)
 
 Database at v1, DDL files changed, snapshot v2 exists with migrations.
 
-```
-Given: database at v1 (tables exist, _dbd_migrations.version = 1)
-       snapshots/002.json exists with column additions
-       migrations/002/ has ALTER SQL files
-When:  design.apply()
-Then:
-  - pending migration v1→v2 detected
-  - ALTER TABLE runs before each affected table's CREATE OR REPLACE
-  - unaffected tables re-applied via CREATE OR REPLACE (idempotent)
-  - views/functions/procedures re-applied (pick up column changes)
-  - _dbd_migrations records version 2
-  - no data loss in existing tables
+```gherkin
+Scenario: Incremental update (schema migration)
+  Given database at v1 (tables exist, _dbd_migrations.version = 1)
+  And snapshots/002.json exists with column additions
+  And migrations/002/ has ALTER SQL files
+  When design.apply()
+  Then pending migration v1→v2 detected
+  And ALTER TABLE runs before each affected table's CREATE OR REPLACE
+  And unaffected tables re-applied via CREATE OR REPLACE (idempotent)
+  And views/functions/procedures re-applied (pick up column changes)
+  And _dbd_migrations records version 2
+  And no data loss in existing tables
 ```
 
 #### Scenario 4: Incremental update with data re-seeding
 
 Database has existing data, apply migrations + reload staging.
 
-```
-Given: database at v1 with data in config tables
-       new snapshot v2, import/ has updated CSV files
-When:  design.apply() then design.import_data()
-Then:
-  - migrations applied (same as Scenario 3)
-  - staging tables TRUNCATED before re-import (truncate: true)
-  - fresh CSV data loaded
-  - import procedures re-run (moves staging → config)
-  - existing config data updated/replaced by procedure logic
-  - import.after SQL files re-executed
+```gherkin
+Scenario: Incremental update with data re-seeding
+  Given database at v1 with data in config tables
+  And new snapshot v2, import/ has updated CSV files
+  When design.apply() then design.import_data()
+  Then migrations applied (same as Scenario 3)
+  And staging tables TRUNCATED before re-import (truncate: true)
+  And fresh CSV data loaded
+  And import procedures re-run (moves staging → config)
+  And existing config data updated/replaced by procedure logic
+  And import.after SQL files re-executed
 ```
 
 #### Scenario 5: Incremental seeding only (no schema change)
 
 Database schema is current, just reload staging data.
 
-```
-Given: database at latest version, config tables have stale data
-When:  design.import_data()
-Then:
-  - no schema changes (apply not called)
-  - staging tables truncated
-  - CSV data loaded
-  - import procedures called
-  - config tables refreshed
+```gherkin
+Scenario: Incremental seeding only (no schema change)
+  Given database at latest version, config tables have stale data
+  When design.import_data()
+  Then no schema changes (apply not called)
+  And staging tables truncated
+  And CSV data loaded
+  And import procedures called
+  And config tables refreshed
 ```
 
 #### Scenario 6: Append-only import (truncate: false)
 
 Import with truncate disabled — data accumulates.
 
-```
-Given: database with existing staging data
-       design.yaml has import.options.truncate: false
-When:  design.import_data()
-Then:
-  - staging tables NOT truncated
-  - new rows appended via COPY FROM STDIN
-  - import procedures called (procedure decides how to merge)
-  - pre-existing rows preserved
+```gherkin
+Scenario: Append-only import (truncate: false)
+  Given database with existing staging data
+  And design.yaml has import.options.truncate: false
+  When design.import_data()
+  Then staging tables NOT truncated
+  And new rows appended via COPY FROM STDIN
+  And import procedures called (procedure decides how to merge)
+  And pre-existing rows preserved
 ```
 
 #### Scenario 7: Staging table dropped and recreated during apply
 
 Staging tables may have stale columns from a prior version. Apply drops and recreates them via CREATE OR REPLACE.
 
-```
-Given: database at v1, staging.lookups has columns (id, name)
-       DDL changed: staging.lookups now has (id, name, category)
-       snapshot v2 has migration for staging.lookups
-When:  design.apply()
-Then:
-  - migration ALTER adds "category" column to staging.lookups
-  - CREATE OR REPLACE re-applies DDL (idempotent, column already exists)
-  - staging.lookups now has 3 columns
-  - import files with "category" column can now be loaded
+```gherkin
+Scenario: Staging table dropped and recreated during apply
+  Given database at v1, staging.lookups has columns (id, name)
+  And DDL changed: staging.lookups now has (id, name, category)
+  And snapshot v2 has migration for staging.lookups
+  When design.apply()
+  Then migration ALTER adds "category" column to staging.lookups
+  And CREATE OR REPLACE re-applies DDL (idempotent, column already exists)
+  And staging.lookups now has 3 columns
+  And import files with "category" column can now be loaded
 ```
 
 #### Scenario 8: Reset and rebuild
 
 Full teardown and fresh start. Requires `--force` once the database has graduated past v0 or is marked prod.
 
-```
-Given: database at v3 with data, _dbd_meta.env = "dev", version = 3
-When:  design.reset(force=true) then design.apply()
-Then:
-  - all schemas dropped (CASCADE)
-  - _dbd_meta and _dbd_migrations cleared for this project
-  - full rebuild from DDL (no ALTER scripts)
-  - _dbd_meta re-created with version at latest snapshot
-  - tables exist but are empty (no data — import not called)
+```gherkin
+Scenario: Reset and rebuild
+  Given database at v3 with data, _dbd_meta.env = "dev", version = 3
+  When design.reset(force=true) then design.apply()
+  Then all schemas dropped (CASCADE)
+  And _dbd_meta and _dbd_migrations cleared for this project
+  And full rebuild from DDL (no ALTER scripts)
+  And _dbd_meta re-created with version at latest snapshot
+  And tables exist but are empty (no data — import not called)
 ```
 
 #### Scenario 9: Multi-version catch-up
 
 Database is several versions behind.
 
-```
-Given: database at v1, snapshots up to v4
-       migrations/002/, 003/, 004/ all exist
-When:  design.apply()
-Then:
-  - migrations applied in order: v1→v2, v2→v3, v3→v4
-  - each migration's ALTER runs before its table's CREATE OR REPLACE
-  - dropped tables (if any) removed after all entities applied
-  - _dbd_migrations has entries for v2, v3, v4
+```gherkin
+Scenario: Multi-version catch-up
+  Given database at v1, snapshots up to v4
+  And migrations/002/, 003/, 004/ all exist
+  When design.apply()
+  Then migrations applied in order: v1→v2, v2→v3, v3→v4
+  And each migration's ALTER runs before its table's CREATE OR REPLACE
+  And dropped tables (if any) removed after all entities applied
+  And _dbd_migrations has entries for v2, v3, v4
 ```
 
 #### Scenario 10: Deploy from GitHub source
 
 End-to-end deploy from a remote source.
 
-```
-Given: empty database, GitHub repo with design.yaml + ddl/ + import/
-When:  deploy(source="owner/repo/database", database_url=url)
-Then:
-  - source downloaded to temp directory
-  - apply runs (same as Scenario 1)
-  - import runs (same as Scenario 2)
-  - temp directory cleaned up
-  - database fully populated
+```gherkin
+Scenario: Deploy from GitHub source
+  Given empty database, GitHub repo with design.yaml + ddl/ + import/
+  When deploy(source="owner/repo/database", database_url=url)
+  Then source downloaded to temp directory
+  And apply runs (same as Scenario 1)
+  And import runs (same as Scenario 2)
+  And temp directory cleaned up
+  And database fully populated
 ```
 
 #### Scenario 11: Environment-specific import
 
 Dev vs prod data loading.
 
-```
-Given: database with schema applied
-       import/dev/staging/fixtures.csv exists
-       import/prod/staging/seeds.csv exists
-       import/staging/lookups.csv exists (shared)
-When:  design.import_data() with env="dev"
-Then:
-  - shared files loaded (import/staging/lookups.csv)
-  - dev files loaded (import/dev/staging/fixtures.csv)
-  - prod files NOT loaded
-  - import procedures called for loaded tables only
+```gherkin
+Scenario: Environment-specific import
+  Given database with schema applied
+  And import/dev/staging/fixtures.csv exists
+  And import/prod/staging/seeds.csv exists
+  And import/staging/lookups.csv exists (shared)
+  When design.import_data() with env="dev"
+  Then shared files loaded (import/staging/lookups.csv)
+  And dev files loaded (import/dev/staging/fixtures.csv)
+  And prod files NOT loaded
+  And import procedures called for loaded tables only
 ```
 
 #### Scenario 12: Dry-run produces no side effects
 
 Verify preview mode.
 
-```
-Given: empty database
-When:  design.apply(dry_run=true) then design.import_data(dry_run=true)
-Then:
-  - no tables created
-  - no data loaded
-  - stdout lists entities that would be applied
-  - stdout lists tables that would be imported
-  - database still empty
+```gherkin
+Scenario: Dry-run produces no side effects
+  Given empty database
+  When design.apply(dry_run=true) then design.import_data(dry_run=true)
+  Then no tables created
+  And no data loaded
+  And stdout lists entities that would be applied
+  And stdout lists tables that would be imported
+  And database still empty
 ```
 
 #### Scenario 13: Dev free-reset before v1
 
 During initial development, reset is unrestricted.
 
-```
-Given: _dbd_meta has env = "dev", version = 0
-When:  design.reset()
-Then:
-  - reset proceeds (dev, pre-v1 — free reset mode)
-  - all schemas dropped
+```gherkin
+Scenario: Dev free-reset before v1
+  Given _dbd_meta has env = "dev", version = 0
+  When design.reset()
+  Then reset proceeds (dev, pre-v1 — free reset mode)
+  And all schemas dropped
 ```
 
 #### Scenario 14: Dev reset blocked after v1
 
 Once a snapshot is applied, dev databases graduate.
 
-```
-Given: _dbd_meta has env = "dev", version = 1
-When:  design.reset()
-Then:
-  - ERROR: "reset is blocked — database has applied migrations. Use --force to override."
-  - database unchanged
+```gherkin
+Scenario: Dev reset blocked after v1
+  Given _dbd_meta has env = "dev", version = 1
+  When design.reset()
+  Then ERROR: "reset is blocked — database has applied migrations. Use --force to override."
+  And database unchanged
 ```
 
-```
-Given: _dbd_meta has env = "dev", version = 1
-When:  design.reset(force=true)
-Then:
-  - reset proceeds (explicit override)
-  - all schemas dropped
+```gherkin
+Scenario: Dev reset after v1 with an explicit override
+  Given _dbd_meta has env = "dev", version = 1
+  When design.reset(force=true)
+  Then reset proceeds (explicit override)
+  And all schemas dropped
 ```
 
 #### Scenario 15: Prod always blocked
 
 Production databases are always protected, even at version 0.
 
-```
-Given: _dbd_meta has env = "prod", version = 0
-When:  design.reset()
-Then:
-  - ERROR: "reset is blocked — database is marked as prod. Use --force to override."
-  - database unchanged
+```gherkin
+Scenario: Prod always blocked
+  Given _dbd_meta has env = "prod", version = 0
+  When design.reset()
+  Then ERROR: "reset is blocked — database is marked as prod. Use --force to override."
+  And database unchanged
 ```
 
 #### Scenario 16: First apply records environment
 
-```
-Given: empty database, no _dbd_meta table
-When:  design.apply() with env = "dev"
-Then:
-  - _dbd_meta table created
-  - row inserted: { project: "MyProject", env: "dev", version: 0 }
-  - reset is now allowed (dev, pre-v1)
+```gherkin
+Scenario: First apply records environment
+  Given empty database, no _dbd_meta table
+  When design.apply() with env = "dev"
+  Then _dbd_meta table created
+  And row inserted: { project: "MyProject", env: "dev", version: 0 }
+  And reset is now allowed (dev, pre-v1)
 ```
 
-```
-Given: empty database, no _dbd_meta table
-When:  design.apply() with env = "prod"
-Then:
-  - _dbd_meta row: { project: "MyProject", env: "prod", version: 0 }
-  - reset is blocked from this point
+```gherkin
+Scenario: First apply in prod records the environment
+  Given empty database, no _dbd_meta table
+  When design.apply() with env = "prod"
+  Then _dbd_meta row: { project: "MyProject", env: "prod", version: 0 }
+  And reset is blocked from this point
 ```
 
 #### Scenario 17: Environment mismatch warning
 
-```
-Given: _dbd_meta has env = "prod"
-       caller passes --environment dev
-When:  design.apply()
-Then:
-  - WARNING: "database is marked as prod but command was called with env=dev"
-  - apply proceeds (not destructive, just a warning)
-  - _dbd_meta.env NOT overwritten (database's recorded env is authoritative)
+```gherkin
+Scenario: Environment mismatch warning
+  Given _dbd_meta has env = "prod"
+  And caller passes --environment dev
+  When design.apply()
+  Then WARNING: "database is marked as prod but command was called with env=dev"
+  And apply proceeds (not destructive, just a warning)
+  And _dbd_meta.env NOT overwritten (database's recorded env is authoritative)
 ```
 
 #### Scenario 18: Reset guard works for embedded consumers
 
-```
-Given: Rust web app calls design.reset() programmatically
-       _dbd_meta has env = "prod"
-When:  design.reset("supabase", false)
-Then:
-  - returns Err(DbdError::SafetyGuard(...))
-  - database unchanged
+```gherkin
+Scenario: Reset guard works for embedded consumers
+  Given Rust web app calls design.reset() programmatically
+  And _dbd_meta has env = "prod"
+  When design.reset("supabase", false)
+  Then returns Err(DbdError::SafetyGuard(...))
+  And database unchanged
 ```
 
 ### Reset safety model
@@ -2108,7 +1825,7 @@ reset called
 
 **Library API:**
 
-```rust
+```rust,ignore
 impl Design {
     pub async fn reset(&self, target: &str, force: bool) -> Result<()> {
         if !force {
@@ -2133,29 +1850,20 @@ impl Design {
 }
 ```
 
-**Adapter trait additions:**
+**Adapter trait additions.** The adapter gains methods to create the
+bookkeeping table, read a project's recorded state, and write it back.
 
-```rust
-#[async_trait]
-pub trait DatabaseAdapter: Send + Sync {
-    // ... existing methods ...
+What is recorded is the project, the environment, the version it reached, when
+it was applied, and **the scope it was applied with**. That last one is the
+guard: a later run requesting a different scope than the one a database is
+pinned to is refused, so a mistyped or forgotten `--scope` cannot quietly build
+a divergent schema.
 
-    // Meta tracking
-    async fn ensure_meta_table(&self) -> Result<()>;
-    async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()>;
-}
-
-pub struct ProjectMeta {
-    pub project: String,
-    pub env: String,
-    pub version: u32,
-}
-```
+> `ProjectMeta` and the trait methods in `crates/dbd-core/src/adapter/`.
 
 **CLI integration:**
 
-```rust
+```rust,ignore
 /// Drop all schemas (bare state)
 Reset {
     #[arg(long, default_value = "supabase")]
@@ -2226,7 +1934,8 @@ The Node.js version supports 5 adapters. The Rust version must support them as f
 | COPY import | yes | yes | no | npx |
 | Migrations table | yes | yes | yes | no |
 | Catalog queries | yes | yes | no | no |
-| Snapshots | yes | yes | tbd | no |
+| Snapshots | yes | yes | no | no |
+| Diff / reconcile | yes | yes | no | no |
 
 ### Supabase adapter
 
@@ -2236,23 +1945,9 @@ Extends Postgres — filters out DDL for managed infrastructure:
 - **Pre-installed extensions** (10): plpgsql, uuid-ossp, pgcrypto, pgjwt, pg_graphql, pgsodium, supabase_vault, pg_stat_statements, pgaudit, pg_tle
 - Overrides `apply_entity()` to skip CREATE SCHEMA and CREATE EXTENSION for these
 
-```rust
-pub struct SupabaseAdapter {
-    inner: PostgresAdapter,
-    managed_schemas: HashSet<String>,
-    managed_extensions: HashSet<String>,
-}
-
-impl DatabaseAdapter for SupabaseAdapter {
-    async fn apply_entity(&self, entity: &Entity) -> Result<()> {
-        match entity.entity_type {
-            EntityType::Schema if self.managed_schemas.contains(&entity.name) => Ok(()),
-            EntityType::Extension if self.managed_extensions.contains(&entity.name) => Ok(()),
-            _ => self.inner.apply_entity(entity).await,
-        }
-    }
-}
-```
+Built as a *mode* of the Postgres adapter rather than a separate type: the
+connection is the same, and the only difference is which schemas and extensions
+it declines to emit DDL for. Selected by `target: supabase` in `design.yaml`.
 
 ### Convex adapter
 
@@ -2267,18 +1962,35 @@ Generates TypeScript schema — no SQL execution at all:
 
 Subset of features — no schemas, extensions, enums, roles, or stored procedures.
 
+Its DDL is also read **verbatim**: `source.dialect: sqlite` selects
+`ParserChoice::Verbatim`, so each file is kept as the text it is rather than
+parsed into columns and constraints. SQLite's dialect is not a Postgres subset
+(`AUTOINCREMENT`, `WITHOUT ROWID`, `STRICT`), and introspection already returns
+raw DDL for the same reason.
+
+That decides the two `no` cells above. `apply`, `deploy`, `import` and `export`
+work normally, because none of them needs to know what a column is. `diff`,
+`reconcile` and snapshotting compare structure, and against no structure they
+would compare nothing and report a match — which is what they did, reporting
+"in sync" against an empty database. They refuse instead: "in sync" is the one
+answer that must never be wrong.
+
 ### Feature gates (Cargo features)
 
-```toml
-[features]
-default = ["postgres"]
-postgres = ["sqlx"]
-supabase = ["postgres"]
-sqlite = ["dep:rusqlite"]
-convex = []               # No DB driver needed — generates files
-```
+`dbd-core` defaults to `postgres`, `sqlite` and `deploy`. The first two each
+pull in the matching `sqlx` driver — one driver crate serves both, which is why
+there is no separate `rusqlite`. `deploy` gates `reqwest` and `tar`, so a
+consumer that never fetches a GitHub source does not compile an HTTP stack.
 
-Consumers choose which adapters to compile in. The CLI binary enables all by default.
+There is no `supabase` or `convex` feature. Supabase is a *mode* of the
+Postgres adapter rather than a separate type, and Convex generates files with
+no driver to gate. `embedded-tests` is a test-only gate for the tests that
+start a real PostgreSQL.
+
+See `[features]` in
+[`crates/dbd-core/Cargo.toml`](../../crates/dbd-core/Cargo.toml) for the list
+itself. The CLI names `postgres` and `sqlite` without disabling defaults, so it
+compiles all three.
 
 ---
 
@@ -2423,7 +2135,7 @@ Referenced in column type: `status schema.enum_name`
 
 #### Generator module structure (`dbml.rs`)
 
-```rust
+```rust,ignore
 pub fn generate_dbml(params: &DbmlParams) -> Vec<DbmlDocument> { ... }
 
 struct DbmlParams {
@@ -2440,7 +2152,7 @@ struct DbmlDocument {
 
 Internal functions:
 
-```rust
+```rust,ignore
 fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String;
 fn emit_enum(name: &str, schema: &str, values: &[EnumValue]) -> String;
 fn emit_table(table: &TableSnapshot, comments: &TableComments) -> String;

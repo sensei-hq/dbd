@@ -82,7 +82,7 @@ ignore:
 | Field     | Type   | Default      | Description |
 |-----------|--------|--------------|-------------|
 | `dialect` | string | `postgresql` | SQL dialect of the DDL files — see below |
-| `parser`  | string | (from `dialect`) | Override the reader: `pg_query`, `tsql` or `verbatim` |
+| `parser`  | string | (from `dialect`) | Override the reader: `pg_query`, `tsql`, `mysql` or `verbatim` |
 
 `dialect` picks the reader; `parser` overrides that choice and you should not
 normally need it.
@@ -91,6 +91,7 @@ normally need it.
 |---|---|---|
 | `postgresql` / `postgres` / `supabase` | `pg_query` | yes |
 | `tsql` / `mssql` / `sqlserver` | `tsql` | no |
+| `mysql` / `mariadb` | `mysql` | no |
 | `sqlite` | `verbatim` | no |
 | anything else | `pg_query` | yes |
 
@@ -101,6 +102,12 @@ normally need it.
   real T-SQL files, `sqlparser`'s `MsSqlDialect` loses 99% of `CREATE
   PROCEDURE` and 95% of `CREATE TABLE`; Microsoft's own complete parser is
   .NET. It reads no column lists.
+- **`mysql`** reads MySQL statement heads, the same way. It differs from
+  `tsql` in three places that would be wrong the other way round: `ALTER` never
+  carries a body (MySQL needs `DROP` + `CREATE` for that), `db.table` names a
+  **database** rather than a schema because MySQL has none, and backticks quote
+  while `#` comments. **Fixture-verified only** — no MySQL corpus was available,
+  unlike the 2,154 files behind `tsql`.
 - **`verbatim`** takes the file as written and applies it unchanged. This is
   what `dialect: sqlite` selects, and it is not a weaker fallback — it mirrors
   how SQLite is read on the other side, where `sqlite_master.sql` *is* the
