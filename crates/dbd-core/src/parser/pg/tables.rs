@@ -66,10 +66,11 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
         .unwrap_or_else(|| "public".to_string());
 
     match extract(&parsed, &default_schema) {
-        Ok((table_def, references)) => {
+        Ok((table_def, references, warnings)) => {
             entity.refers = references.iter().map(|r| r.name.clone()).collect();
             entity.references = references;
             entity.table_def = Some(table_def);
+            entity.warnings.extend(warnings);
         }
         // No `table_def` on this path — see the module note on `--prune`.
         Err(why) => entity.errors.push(why),
@@ -78,22 +79,34 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
     Ok(entity)
 }
 
-/// The whole file: its `CREATE TABLE`s, plus the `CREATE INDEX` and `COMMENT ON`
-/// statements that ship alongside them (Postgres has no way to nest either one
-/// inside `CREATE TABLE`, so they arrive as siblings).
-fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>)> {
+/// The whole file: its `CREATE TABLE`s, plus the `CREATE INDEX`, `COMMENT ON`
+/// and `ALTER TABLE … ADD CONSTRAINT` statements that ship alongside them
+/// (Postgres has no way to nest any of them inside `CREATE TABLE`, so they
+/// arrive as siblings).
+///
+/// Returns the warnings alongside the table, rather than swallowing them: an
+/// `ALTER` subcommand this does not read is the shape that hid the missing
+/// constraints for so long.
+fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>, Vec<String>)> {
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
     let mut comments = TableComments::default();
     let mut references: Vec<Reference> = Vec::new();
     let mut functions: Vec<String> = Vec::new();
-    let mut declares_a_table = false;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
+    // Deferred to a second pass: an `ALTER` is only this table's once every
+    // `CREATE TABLE` in the file has been seen, and its constraints must sort
+    // after the inline ones regardless of where the statement sits.
+    let mut alters: Vec<&protobuf::AlterTableStmt> = Vec::new();
 
     for stmt in &parsed.protobuf.stmts {
         match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
             Some(NodeEnum::CreateStmt(create)) => {
-                declares_a_table = true;
+                if let Some(rel) = create.relation.as_ref() {
+                    declared.push(qualified(rel, default_schema));
+                }
                 process_create_table(
                     create,
                     default_schema,
@@ -107,12 +120,34 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
                 indexes.push(extract_index(ix, default_schema, &mut functions)?);
             }
             Some(NodeEnum::CommentStmt(c)) => record_comment(c, &mut comments),
+            Some(NodeEnum::AlterTableStmt(alter)) => alters.push(alter),
             _ => {}
         }
     }
 
-    if !declares_a_table {
+    if declared.is_empty() {
         return Err("this table file declares no `CREATE TABLE`".to_string());
+    }
+
+    for alter in alters {
+        // An `ALTER` naming a table this file does not declare belongs to some
+        // other entity; absorbing it would invent a constraint on this one.
+        let names_this_file = alter
+            .relation
+            .as_ref()
+            .is_some_and(|rel| declared.contains(&qualified(rel, default_schema)));
+        if !names_this_file {
+            continue;
+        }
+        process_alter_table(
+            alter,
+            default_schema,
+            &mut columns,
+            &mut constraints,
+            &mut references,
+            &mut functions,
+            &mut warnings,
+        )?;
     }
 
     // Column comments are addressed by name, so they can only be attached once
@@ -136,7 +171,71 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
             comments,
         },
         references,
+        warnings,
     ))
+}
+
+/// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
+fn qualified(rel: &protobuf::RangeVar, default_schema: &str) -> String {
+    let schema = if rel.schemaname.is_empty() {
+        default_schema
+    } else {
+        &rel.schemaname
+    };
+    format!("{schema}.{}", rel.relname)
+}
+
+/// One `ALTER TABLE`'s `ADD CONSTRAINT` subcommands.
+///
+/// A constraint is legitimately written inline or added here, and the two must
+/// produce the same `TableDef` — otherwise the same table reads differently
+/// depending only on which spelling its author chose, and reconcile sees drift
+/// that never converges. The constraint node is the very same
+/// `protobuf::Constraint` an inline one carries, so it goes through
+/// [`extract_table_constraint`] unchanged, including the `PRIMARY KEY` column
+/// marking.
+///
+/// Every other subcommand is **reported, not read**. dbd generates `ADD COLUMN`
+/// / `ALTER COLUMN` into migrations and never into a table file — which
+/// `scanner::scan_ddl` does not scan — so one appearing here means the file is
+/// not the full-and-final definition this parser assumes. Reading it is out of
+/// scope; staying silent about it is what let the missing constraints go
+/// unnoticed, so it surfaces as a warning instead.
+#[allow(clippy::too_many_arguments)]
+fn process_alter_table(
+    alter: &protobuf::AlterTableStmt,
+    default_schema: &str,
+    columns: &mut [ColumnDef],
+    constraints: &mut Vec<TableConstraint>,
+    references: &mut Vec<Reference>,
+    functions: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Extract<()> {
+    for cmd in &alter.cmds {
+        let Some(NodeEnum::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+            continue;
+        };
+
+        if cmd.subtype != protobuf::AlterTableType::AtAddConstraint as i32 {
+            warnings.push(format!(
+                "ALTER TABLE {} is not read by dbd — a table file is the full and final \
+                 definition, so only ADD CONSTRAINT is honoured here; put column changes \
+                 in a migration",
+                cmd.subtype().as_str_name()
+            ));
+            continue;
+        }
+
+        let Some(NodeEnum::Constraint(c)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+            continue;
+        };
+        let tc = extract_table_constraint(c, default_schema, references, functions)?;
+        if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = &tc {
+            mark_pk_columns(columns, pk_cols);
+        }
+        constraints.push(tc);
+    }
+    Ok(())
 }
 
 /// One `CREATE TABLE`'s columns, then its table-level constraints.
@@ -1273,5 +1372,152 @@ mod tests {
             vec!["app".to_string()]
         );
         assert_eq!(parse("create table t (").search_paths, vec!["public".to_string()]);
+    }
+
+    // ── ALTER TABLE … ADD CONSTRAINT ────────────────────────────────────────
+    //
+    // A dbd table file is full and final — `ADD COLUMN` / `ALTER COLUMN` belong
+    // to generated migrations, which this parser never sees (`scanner::scan_ddl`
+    // reads `ddl/` only). But a constraint is legitimately written either
+    // inline or as a trailing `ALTER TABLE … ADD CONSTRAINT`, and the second
+    // form was read by nothing: no `AlterTableStmt` arm existed, so the
+    // constraint vanished with no error.
+    //
+    // Not cosmetic. The constraint is absent from the desired model, so
+    // `apply` creates the table without it and `plan_fk_convergence` plans
+    // `DROP CONSTRAINT <live-name>` against a database that has it. Worse, an
+    // FK added this way produced no `refers` edge at all, so
+    // `sort_by_dependencies` could order the child before its parent and a
+    // fresh apply would fail.
+
+    #[test]
+    fn a_foreign_key_added_by_alter_table_is_a_constraint_and_an_edge() {
+        let e = parse(
+            "set search_path to app;\n\
+             create table orders (id int primary key, uid int not null);\n\
+             alter table orders add constraint orders_uid_fk foreign key (uid) references users(id);",
+        );
+        assert!(e.errors.is_empty(), "unexpected errors: {:?}", e.errors);
+
+        let td = e.table_def.as_ref().expect("table_def");
+        let fk = td
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                TableConstraint::ForeignKey(fk) => Some(fk),
+                _ => None,
+            })
+            .expect("the FK must reach table_def.constraints");
+        assert_eq!(fk.name.as_deref(), Some("orders_uid_fk"));
+        assert_eq!(fk.columns, vec!["uid".to_string()]);
+        assert_eq!(fk.ref_table, "users");
+
+        // The edge is what orders the apply. Without it `orders` can be created
+        // before `users` and the FK fails on a fresh database.
+        assert!(
+            e.refers.contains(&"app.users".to_string()),
+            "an ALTER-added FK must still be a dependency edge, got {:?}",
+            e.refers
+        );
+    }
+
+    #[test]
+    fn unique_check_and_primary_key_added_by_alter_table_are_read() {
+        let td = def("set search_path to app;\n\
+             create table t (id int, code text, n int);\n\
+             alter table t add constraint t_pk primary key (id);\n\
+             alter table t add constraint t_code_uq unique (code);\n\
+             alter table t add constraint t_n_ck check (n > 0);");
+
+        assert!(
+            td.constraints.iter().any(|c| matches!(
+                c,
+                TableConstraint::PrimaryKey { name, columns }
+                    if name.as_deref() == Some("t_pk") && columns == &["id".to_string()]
+            )),
+            "PK missing: {:?}",
+            td.constraints
+        );
+        assert!(
+            td.constraints.iter().any(|c| matches!(
+                c,
+                TableConstraint::Unique { name, columns, .. }
+                    if name.as_deref() == Some("t_code_uq") && columns == &["code".to_string()]
+            )),
+            "UNIQUE missing: {:?}",
+            td.constraints
+        );
+        assert!(
+            td.constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Check { name, .. } if name.as_deref() == Some("t_n_ck"))),
+            "CHECK missing: {:?}",
+            td.constraints
+        );
+    }
+
+    /// A PK added by `ALTER TABLE` marks its columns exactly as an inline one
+    /// does. Otherwise the same table reads as having no primary key depending
+    /// only on which spelling its author chose, and reconcile sees drift
+    /// forever.
+    #[test]
+    fn an_alter_added_primary_key_marks_its_columns() {
+        let td = def("create table t (id int not null, other int);\n\
+             alter table t add constraint t_pk primary key (id);");
+        let id = td.columns.iter().find(|c| c.name == "id").expect("id column");
+        assert!(id.is_pk, "the PK column must be marked, as an inline PK marks it");
+        let other = td.columns.iter().find(|c| c.name == "other").expect("other column");
+        assert!(!other.is_pk);
+    }
+
+    /// An `ALTER TABLE` naming a *different* table is not this table's.
+    #[test]
+    fn an_alter_on_another_table_is_not_absorbed() {
+        let td = def("set search_path to app;\n\
+             create table t (id int, code text);\n\
+             alter table other add constraint other_uq unique (code);");
+        assert!(
+            td.constraints.is_empty(),
+            "a constraint on `other` must not land on `t`: {:?}",
+            td.constraints
+        );
+    }
+
+    /// dbd generates `ADD COLUMN` / `ALTER COLUMN` into migrations and never
+    /// into a table file, so finding one here means the file is not the full
+    /// and final definition this parser assumes. Reading it is out of scope;
+    /// *silently dropping* it is what made the missing-constraint bug invisible
+    /// for so long, so it surfaces as a warning instead.
+    #[test]
+    fn an_unsupported_alter_subcommand_warns_rather_than_vanishing() {
+        let e = parse(
+            "create table t (id int);\n\
+             alter table t add column extra text;",
+        );
+        assert!(e.errors.is_empty(), "it is valid SQL, not an error: {:?}", e.errors);
+        assert!(
+            e.warnings.iter().any(|w| w.to_lowercase().contains("alter table")),
+            "an unread ALTER subcommand must be reported, got {:?}",
+            e.warnings
+        );
+        // Still out of scope to apply: the column does not appear.
+        let td = e.table_def.expect("table_def");
+        assert!(
+            !td.columns.iter().any(|c| c.name == "extra"),
+            "ADD COLUMN is deliberately not read"
+        );
+    }
+
+    #[test]
+    fn add_constraint_does_not_warn() {
+        let e = parse(
+            "create table t (id int, code text);\n\
+             alter table t add constraint t_uq unique (code);",
+        );
+        assert!(
+            e.warnings.is_empty(),
+            "a supported ALTER must not warn: {:?}",
+            e.warnings
+        );
     }
 }

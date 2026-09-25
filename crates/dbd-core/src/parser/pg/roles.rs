@@ -13,11 +13,6 @@ use crate::entity::{Entity, Reference};
 use crate::error::Result;
 
 /// Parse a role DDL file, recording its memberships as references.
-///
-/// Visible to `parser::mod` (not just `pg::mod`, unlike a purely native type):
-/// `SqlparserDdl` calls this directly for `EntityType::Role` too, because
-/// there has never been a sqlparser implementation of role DDL to fall back
-/// to — see the call site's doc comment.
 pub(in crate::parser) fn parse_role(mut entity: Entity, sql: &str) -> Result<Entity> {
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,

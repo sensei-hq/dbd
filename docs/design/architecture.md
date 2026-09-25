@@ -11,7 +11,7 @@ Build a standalone Rust binary (`dbd`) that replicates the Node.js `dbd` CLI. Si
 ```mermaid
 flowchart LR
     files["Files\n(DDL, YAML, CSV)"]
-    parser["Parser\n(sqlparser-rs)"]
+    parser["Parser\n(libpg_query)"]
     ir["Internal Representation\n(Entity + TableDef)"]
 
     dbml["DBML Generator"] --> dbml_out[".dbml files"]
@@ -39,7 +39,7 @@ The parse phase is embarrassingly parallel — each DDL file is independent unti
 ```
 scan ddl/                          ← sequential (fast, single walkdir traversal)
   → Vec<PathBuf>
-  → rayon::par_iter()              ← parallel: read file + sqlparser::parse per file
+  → rayon::par_iter()              ← parallel: read file + parse per file
     → Vec<Entity>                     (CPU-bound, scales with core count)
   → resolve references             ← sequential (needs all entities)
   → sort by dependencies           ← sequential
@@ -53,7 +53,7 @@ let entities: Vec<Entity> = ddl_files
     .par_iter()                           // parallel iterator
     .map(|path| {
         let sql = std::fs::read_to_string(path)?;
-        parser.parse_entity(path, &sql)   // sqlparser is pure Rust, thread-safe
+        parser.parse_entity(path, &sql)   // parse is pure, no shared state
     })
     .collect::<Result<Vec<_>>>()?;
 ```
@@ -181,7 +181,7 @@ parser/                          adapter/
   Pure, stateless                  Stateful (connection, catalog)
 ```
 
-**The parser understands the source dialect.** DDL files are written in a specific SQL dialect (currently PostgreSQL). The parser uses `sqlparser-rs` configured for that dialect to produce `Entity` + `TableDef`.
+**The parser understands the source dialect.** DDL files are written in a specific SQL dialect (currently PostgreSQL, the only one supported). The parser uses `libpg_query` — PostgreSQL's own grammar — to produce `Entity` + `TableDef`. `ParserChoice` is the seam a second grammar would be selected through.
 
 **The adapter understands the target.** It takes the internal representation and applies it to the target system. The adapter also owns catalog knowledge (classify_reference, resolve_entity).
 
@@ -238,10 +238,33 @@ let sorted = dependency::sort_by_dependencies(&entities);
 let pending = snapshot::pending_migrations(db_version, Path::new("."));   // -> Vec<PendingMigration>
 
 // Low-level: parser, adapter trait, entity types
-use dbd_core::parser::parse_entity;   // parse one DDL file's SQL → Entity
+use dbd_core::parser::parse_entity;   // parse one DDL file's SQL → Entity (identity from the PATH)
+use dbd_core::parser::parse_sql;      // parse any SQL → ParsedFile (identity from the STATEMENTS)
 use dbd_core::adapter::DatabaseAdapter;
 use dbd_core::entity::{Entity, EntityType};
 ```
+
+**Which parser entry point?** `parse_entity` takes identity from
+`ddl/<type>/<schema>/<name>.ddl`, so it is right for a project laid out dbd's
+way and wrong for anything else — outside that layout it does not fail, it
+falls back to `EntityType::Table` and names the entity after a directory.
+`parse_sql` reads the declarations instead, and is the entry point for a caller
+with its own scanner:
+
+```rust
+let parsed = dbd_core::parser::parse_sql(sql)?;   // ParsedFile
+for e in &parsed.entities {
+    // e.entity_type / e.schema / e.name  — from the CREATE, not a path
+    // e.refers, e.references             — typed edges (FK, view dep, function call)
+    // e.reads, e.writes                  — separated, for routines
+}
+```
+
+Resolution is deliberately a second phase: each entity carries its references as
+written, provisionally qualified against `search_paths[0]`, and
+`references::resolve_references` re-resolves them once every file is read. The
+per-file parse touches no shared state, so the scan parallelises and a bare `t`
+that could be `a.t` or `b.t` stays undecided until the whole set is known.
 
 ### Embedding example — auto-migration in a Rust web app
 
@@ -1227,6 +1250,25 @@ pub fn build_import_plan(
 
 ### SQL parsing — `sqlparser-rs` (pure Rust, no regex fallback)
 
+> **Superseded (0.14.0).** This decision was reversed. `sqlparser-rs` reimplements
+> the SQL grammar and lags the server, and the gap was not cosmetic: a file it
+> rejected carried a parse error, which drops the entity from apply/reconcile's
+> desired set — so `dbd apply` reported success while never creating the object
+> (`INCREMENT BY` on a sequence, `RETURNS SETOF`, `DO $$ … $$`-guarded enums,
+> `COMMENT ON VIEW`). Each gap was patched with a text-level workaround, which is
+> the regex fallback this section claims to have removed.
+>
+> DDL is now read by **`pg_query`** (libpg_query — PostgreSQL's own grammar), the
+> option rejected below. The cross-compilation cost was real and was paid. The
+> "multi-dialect future" argument did not materialise either: the sqlparser path
+> hardcoded `PostgreSqlDialect` for its whole life, so it was never a dialect
+> selector — and SQLite DDL is not a Postgres subset, so a real SQLite grammar
+> would have been new work regardless.
+>
+> `sqlparser-rs` remains a dependency, for `dbd format` and enum-candidate
+> detection. It no longer reads DDL. The rest of this section is kept as the
+> original record.
+
 **`sqlparser-rs`** (Apache DataFusion) is the parser. It replaces both `pg_query` (C FFI) and the regex fallbacks from the Node.js version.
 
 | Concern | `pg_query` (C FFI) | `sqlparser-rs` (chosen) |
@@ -1491,7 +1533,7 @@ Each `dbd-core` module has inline tests for pure functions. No database or exter
 
 ### Parser integration tests (`tests/parser/`)
 
-Test the full parse pipeline using real DDL fixture files. Verifies that `sqlparser-rs` produces the correct `Entity` + `TableDef` from actual DDL.
+Test the full parse pipeline using real DDL fixture files. Verifies that the parser produces the correct `Entity` + `TableDef` from actual DDL.
 
 ```rust
 // tests/parser/tables_test.rs
