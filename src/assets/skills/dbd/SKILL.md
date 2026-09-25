@@ -346,8 +346,9 @@ println!("{:?} file, read as {:?}", parsed.kind, parsed.dialect);
 |---|---|---|
 | `PostgreSql` | libpg_query | yes — columns, constraints, indexes |
 | `TSql` | statement-head lexer | no — identity and edges only |
+| `MySql` | statement-head lexer | no — identity and edges only |
 | `Sqlite` | verbatim | no — the file is the model |
-| `MySql`, `Unstated` | libpg_query (fallback) | — |
+| `Unstated` | libpg_query (fallback) | — |
 
 Detection **fails closed**: `CREATE TABLE t (id int)` is valid in every dialect
 and says nothing, so it is `Unstated` rather than a guess. `ParsedFile::dialect`

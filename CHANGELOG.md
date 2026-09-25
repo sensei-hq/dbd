@@ -9,6 +9,34 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL is read.** `ParserChoice::MySql`, selected by `source.dialect: mysql`
+  (or `mariadb`) and by `Dialect::detect`. The same statement-head walk as
+  T-SQL under different rules — the walk is what every SQL dialect has in
+  common; what differs is small, specific, and wrong the other way round:
+
+  | | MySQL | T-SQL |
+  |---|---|---|
+  | `ALTER PROCEDURE` | refers — changes characteristics only | declares — carries the body |
+  | `a.b` | `database.object` (no schemas) | `schema.object` |
+  | quoting | `` `name` `` | `[name]` |
+  | `#` | line comment | starts a temp-table name |
+
+  `a.b` landing in `Entity::catalog` rather than `schema` is what keeps two
+  databases' `users` tables from merging into one entity.
+
+  **Fixture-verified only.** The T-SQL reader was measured against 2,154 real
+  files; no MySQL corpus was available, so this is tested against cases its
+  author thought of rather than against a codebase. The `#[ignore]`d corpus
+  gate will measure it when one turns up.
+
+- **`lex::LexRules`** — the lexer is no longer dialect-blind, because two
+  dialects disagree about the same character. `#` starts a line comment in
+  MySQL and a temp-table name in T-SQL: read one way in the other's file and
+  either every comment becomes a phantom table, or every temp table swallows
+  the rest of its line.
+
 ## [0.15.0] — 2026-09-25
 
 dbd reads more than PostgreSQL. **T-SQL** is read by a statement-head lexer —
