@@ -16,6 +16,15 @@ pub enum EntityType {
     MaterializedView,
     Function,
     Procedure,
+    /// A T-SQL trigger. Measured at 107 files in one SQL Server corpus (80
+    /// `CREATE`, 27 `ALTER`), so reporting one as a `Function` would be a
+    /// visible lie rather than a rounding error.
+    ///
+    /// dbd does not apply triggers — no emitter produces one and no folder
+    /// name maps to it — so this exists to let a *reader* say what it found.
+    /// `CREATE TYPE` and `CREATE SYNONYM` are deliberately absent for the
+    /// opposite reason: 3 files each in the same corpus.
+    Trigger,
     External,
     Import,
 }
@@ -90,7 +99,11 @@ impl EntityType {
             EntityType::View => 6,
             EntityType::MaterializedView => 7,
             EntityType::Function | EntityType::Procedure => 8,
-            EntityType::External => 9,
+            // A trigger fires on a table and calls a routine, so it is applied
+            // after both. dbd does not apply one today — this rank exists so
+            // the sort is total rather than because anything sorts by it.
+            EntityType::Trigger => 9,
+            EntityType::External => 10,
             // Anything else sorts with tables, matching the historical
             // catch-all bucket.
             EntityType::Import => 5,

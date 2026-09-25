@@ -591,3 +591,83 @@ fn the_lexer_gets_through_the_whole_tsql_corpus() {
          the lexer is swallowing content, not reading it"
     );
 }
+
+/// **What the T-SQL reader finds in a real corpus.**
+///
+/// The number this whole increment exists to move. The same corpus read by
+/// libpg_query produced a 94.5% parse-error rate and 13 declarations; an
+/// off-the-shelf T-SQL grammar loses 99% of `CREATE PROCEDURE`. This asks what
+/// dbd's own reader gets.
+#[test]
+#[ignore]
+fn what_the_tsql_reader_finds_in_a_real_corpus() {
+    use dbd_core::entity::EntityType;
+    use dbd_core::parser::{FileKind, parse_sql_as};
+    use std::collections::BTreeMap;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut kinds: BTreeMap<String, usize> = Default::default();
+    let mut types: BTreeMap<String, usize> = Default::default();
+    let mut entities = 0usize;
+    let mut reads = 0usize;
+    let mut writes = 0usize;
+    let mut calls = 0usize;
+    let mut with_catalog = 0usize;
+
+    for sql in &tsql {
+        let Ok(p) = parse_sql_as(Dialect::TSql, sql) else {
+            continue;
+        };
+        *kinds.entry(format!("{:?}", p.kind)).or_default() += 1;
+        for e in &p.entities {
+            entities += 1;
+            *types.entry(format!("{:?}", e.entity_type)).or_default() += 1;
+            reads += e.reads.len();
+            writes += e.writes.len();
+            calls += e
+                .references
+                .iter()
+                .filter(|r| r.ref_type.as_deref() == Some(dbd_core::entity::REF_TYPE_FUNCTION))
+                .count();
+            if e.catalog.is_some() {
+                with_catalog += 1;
+            }
+        }
+    }
+
+    let n = tsql.len();
+    println!("\n── the T-SQL reader over {n} files ──");
+    println!("  files by kind:");
+    for (k, v) in &kinds {
+        println!("    {k:<14} {v:>6}  ({:.1}%)", pct(*v, n));
+    }
+    println!("  entities declared  {entities:>6}");
+    for (t, v) in &types {
+        println!("    {t:<14} {v:>6}");
+    }
+    println!("  edges: reads {reads}, writes {writes}, calls {calls}");
+    println!("  entities with a catalog (3-part name)  {with_catalog}");
+    println!("\n  Before this reader: 13 declarations, 94.5% parse errors.\n");
+
+    // The one thing worth asserting: a reader that declared nothing would be
+    // useless, and one that declared something for nearly every file would be
+    // minting identities from change scripts.
+    let declared_files = kinds.get("Declaration").copied().unwrap_or(0);
+    assert!(entities > 500, "only {entities} entities from {n} T-SQL files");
+    assert!(
+        declared_files < n,
+        "every file declared something — change scripts are being read as declarations"
+    );
+    let _ = EntityType::Table;
+    let _ = FileKind::Declaration;
+}
