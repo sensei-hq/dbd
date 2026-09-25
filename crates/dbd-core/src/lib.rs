@@ -27,6 +27,7 @@ pub mod schema_model;
 pub mod scope;
 pub mod script;
 pub mod snapshot;
+pub mod source_text;
 pub mod sql_expr;
 pub mod sql_quote;
 

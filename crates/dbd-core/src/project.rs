@@ -135,7 +135,7 @@ pub struct ProjectSurvey {
 ///
 /// if let Some(survey) = dbd_core::project::survey(Path::new("."))? {
 ///     for file in &survey.ddl_files {
-///         let sql = std::fs::read_to_string(file)?;
+///         let sql = dbd_core::source_text::read_to_string(file)?;
 ///         let entity = dbd_core::parser::parse_entity_with(survey.parser, file, &sql)?;
 ///         println!("{:?} {}", entity.entity_type, entity.name);
 ///     }
