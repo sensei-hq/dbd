@@ -1,3 +1,24 @@
+//! # Documentation links are checked
+//!
+//! `rustdoc`'s link and HTML lints are denied crate-wide, because they catch a
+//! class of rot nothing else does: a doc comment that points at an item which
+//! has been renamed, made private, or deleted still *reads* correctly. Only
+//! rustdoc knows it no longer resolves.
+//!
+//! This is a `deny` in the source rather than a flag in CI so it travels with
+//! the crate — a contributor running `cargo doc` locally sees the same failure
+//! the pipeline would, and the rule is discoverable from the code that obeys
+//! it. `cargo doc` is not run on every `cargo test`, so this costs nothing in
+//! the inner loop; `.github/workflows/ci.yml` runs it once per push.
+//!
+//! Twenty-four of these had accumulated before the lint was turned on.
+#![deny(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::private_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls
+)]
+
 pub mod adapter;
 pub mod config;
 pub mod dbml;

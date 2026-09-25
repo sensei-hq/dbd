@@ -37,6 +37,28 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   Scope is deliberate — `architecture.md`'s 34 blocks are design prose, not
   code to copy. A block opts out with ` ```rust,ignore `.
 
+- **Broken documentation links are now an error.** Twenty-four had accumulated
+  — links to items since made private, links to items that no longer exist,
+  `<type>` read as an HTML tag, bare URLs. Each reads correctly in the source;
+  only rustdoc knows it does not resolve.
+
+  All twenty-four fixed, and the lints (`broken_intra_doc_links`,
+  `private_intra_doc_links`, `invalid_html_tags`, `bare_urls`) are now
+  `deny`-ed at both crate roots. A `deny` in the source rather than a flag in
+  CI, so it travels with the crate: a contributor running `cargo doc` locally
+  gets the same failure the pipeline does.
+
+  `cargo doc` runs once per push in CI, and before publish in the release
+  workflow — docs.rs builds after publish, and a publish cannot be undone.
+  Deliberately **not** in the inner loop: a doc build is slow, and a broken
+  link is not worth blocking a commit on.
+
+  One scoped exemption, in `src/cli.rs`, with the reason on it: every doc
+  comment there is a clap help string, so `dbd --help` is its first reader.
+  `REFRESH MATERIALIZED VIEW [CONCURRENTLY]` is how Postgres writes an optional
+  keyword and `<dir>/<name>.<fmt>` is how a CLI shows a path template —
+  satisfying rustdoc would put backticks in what users see.
+
 - **Facts the docs state are checked against the code**
   (`tests/docs_match_code.rs`): the two `SKILL.md` copies are byte-identical,
   every `source.parser` value the guide lists is one the resolver accepts, the

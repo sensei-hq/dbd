@@ -78,6 +78,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo fmt
         run: cargo fmt --all --check
+      # docs.rs builds the documentation AFTER publish, and a publish cannot be
+      # undone — so a broken doc link found there is permanent for that version.
+      # The lints are denied in the source; this just runs rustdoc.
+      - name: cargo doc (documentation links)
+        run: cargo doc --workspace --no-deps --all-features --locked
 
       # Published one crate at a time, in dependency order, skipping any version
       # already on the registry. `cargo publish --workspace` would refuse the

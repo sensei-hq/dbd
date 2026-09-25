@@ -245,7 +245,7 @@ pub fn import_entry_in_scope(
 pub struct Report {
     pub entity: Option<Entity>,
     /// Errored entities the active scope actually builds. These are exactly
-    /// what [`Design::ensure_fully_parsed`] refuses on, so `inspect` and
+    /// what `Design::ensure_fully_parsed` refuses on, so `inspect` and
     /// `apply` agree about what is broken.
     pub issues: Vec<Entity>,
     /// Errored entities the active scope excludes. A scoped run never touches
@@ -664,7 +664,7 @@ impl Design {
     /// `<project_dir>/.dbd/refcache.json`.
     ///
     /// Subsequent offline `inspect` runs can use this snapshot to silence
-    /// "Unresolved reference" warnings via [`resolve_unknown_refs_via_cache`].
+    /// "Unresolved reference" warnings via `resolve_unknown_refs_via_cache`.
     ///
     /// Returns the number of entities written to the cache.
     pub async fn write_ref_cache(&self, adapter: &dyn DatabaseAdapter, source: &str) -> Result<usize> {

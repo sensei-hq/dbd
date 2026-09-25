@@ -18,7 +18,7 @@ const MANAGED_INTERNALLY: &[(&str, &str)] = &[(
 
 /// Whether `path` (under `project_dir`) is a file dbd manages itself.
 ///
-/// Shares [`MANAGED_INTERNALLY`] with [`detect_stale_files`] so the two cannot
+/// Shares `MANAGED_INTERNALLY` with [`detect_stale_files`] so the two cannot
 /// disagree: adding an entry there both makes `doctor` report the file and
 /// keeps it out of [`crate::project::survey`]'s DDL list, which is what stops
 /// a caller indexing dbd's own plumbing as the project's schema.
