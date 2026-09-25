@@ -314,168 +314,63 @@ let pending = snapshot::pending_migrations(db_version, project_dir);   // -> Vec
 
 ### Entity
 
-The central data structure. All DDL objects flow through this type.
+The central data structure. Every DDL object flows through it, whatever
+declared it — a file on disk, a live database's catalog, or a DBML import.
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entity {
-    pub entity_type: EntityType,
-    pub name: String,           // Fully qualified: "schema.name"
-    pub schema: Option<String>,
-    pub file: Option<PathBuf>,
-    pub format: Option<String>, // "ddl" or "sql"
-    pub refers: Vec<String>,    // Declared dependencies (from design.yaml)
-    pub references: Vec<Reference>,  // Parsed from SQL
-    pub search_paths: Vec<String>,
-    pub errors: Vec<String>,
-    pub warnings: Vec<String>,
-    pub reads: Vec<String>,     // Tables read (procedures only)
-    pub writes: Vec<String>,    // Tables written (procedures only)
-    pub table_def: Option<TableDef>,  // Parsed table structure (tables only)
-    pub enum_values: Vec<EnumValue>,  // Enum variants (enums only)
-}
+> Defined in `crates/dbd-core/src/entity.rs`. This section describes what the
+> type is *for*; the fields themselves are not listed here, because a field
+> list in prose is wrong within a release and says nothing a reader could not
+> get from the source.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntityType {
-    Schema,
-    Extension,
-    Role,
-    Enum,
-    Table,
-    View,
-    MaterializedView,
-    Function,
-    Procedure,
-    External,
-    Import,
-    Export,
-}
+An entity carries four kinds of thing:
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reference {
-    pub name: String,
-    pub ref_type: Option<String>,
-}
-```
+- **Identity** — what it is and what it is called. A type, a name, and the
+  levels that qualify it: the schema, and for the dialects that need one, the
+  database. Two objects with the same name in different databases are two
+  entities.
+- **Provenance** — the file it came from, if any. An entity introspected from a
+  live database has none.
+- **Edges** — what it references. Kept apart rather than merged, because the
+  kinds answer different questions: what a routine *reads* versus what it
+  *writes* drives import ordering, and a *soft* reference (a function call that
+  may be a built-in) is dropped silently on failure to resolve while a hard one
+  warns.
+- **Structure** — the parsed shape, for the readers that produce one. Only a
+  structured reader fills this in, and only an entity that has it can be
+  diffed; see *SQL parsing* below.
+
+Anything unreadable is recorded on the entity rather than thrown: errors and
+warnings travel with it, so one bad file does not fail a scan and a caller can
+report every problem at once.
 
 ### Parsed table structure (TableDef)
 
-The parser populates `TableDef` with the full column/constraint/index detail needed for both DBML generation and snapshot diffing. The Node.js version stores this information spread across extractors and loses FK actions — the Rust version captures everything in one structure.
+What a structured reader recovers from a `CREATE TABLE`: its columns, its
+constraints, its indexes, and the comments on any of them.
 
-```rust
-/// Full parsed table definition — populated by the parser, consumed by
-/// DBML generator, snapshot builder, and migration diff.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableDef {
-    pub columns: Vec<ColumnDef>,
-    pub constraints: Vec<TableConstraint>,
-    pub indexes: Vec<IndexDef>,
-    pub comments: TableComments,
-}
+> Defined in `crates/dbd-core/src/entity.rs`.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub default_value: Option<String>,
-    pub is_pk: bool,
-    pub is_unique: bool,
-    pub is_identity: bool,         // SERIAL / GENERATED ALWAYS AS IDENTITY
-    pub comment: Option<String>,   // COMMENT ON COLUMN
-    pub inline_fk: Option<ForeignKey>,  // Inline REFERENCES (single-column FK)
-}
+The rule that shapes this type is that **anything it cannot hold is invisible
+to reconcile**, and invisible means permanent drift. `reconcile` compares an
+authored table against an introspected one; a property the model drops looks
+identical on both sides and is silently never converged. That is why the model
+keeps things a simpler one would discard:
 
-/// Foreign key — captures the full detail the Node.js version drops.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignKey {
-    pub name: Option<String>,          // Constraint name (if named)
-    pub columns: Vec<String>,          // FK columns on this table
-    pub ref_schema: Option<String>,    // Referenced table schema
-    pub ref_table: String,             // Referenced table name
-    pub ref_columns: Vec<String>,      // Referenced columns
-    pub on_delete: Option<FkAction>,   // ON DELETE action
-    pub on_update: Option<FkAction>,   // ON UPDATE action
-}
+- how a column *generates* its value, kept apart from its default — Postgres
+  exposes a `GENERATED ALWAYS AS (…) STORED` expression through the same
+  catalog as an ordinary `DEFAULT`, and reading one as the other made reconcile
+  plan a `DROP DEFAULT` Postgres refuses, aborting every run (issue #16)
+- whether an index's entries are columns or *expressions*, because an emitter
+  that quotes an expression as an identifier produces
+  `column "(context ->> 'module')" does not exist`
+- operator classes, `INCLUDE` payloads, `NULLS NOT DISTINCT`, partial-index
+  predicates and access-method storage parameters — each of which distinguishes
+  two indexes that would otherwise compare equal
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum FkAction {
-    Cascade,
-    Restrict,
-    SetNull,
-    SetDefault,
-    NoAction,
-}
-
-/// Table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TableConstraint {
-    PrimaryKey {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
-    Unique {
-        name: Option<String>,
-        columns: Vec<String>,
-    },
-    ForeignKey(ForeignKey),
-    Check {
-        name: Option<String>,
-        expression: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexDef {
-    pub name: Option<String>,
-    pub columns: Vec<IndexColumn>,
-    pub unique: bool,
-    pub index_type: Option<IndexType>,   // btree (default) or hash
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexColumn {
-    pub name: String,
-    pub order: Option<SortOrder>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum IndexType { Btree, Hash }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum SortOrder { Asc, Desc }
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TableComments {
-    pub table: Option<String>,           // COMMENT ON TABLE
-    pub columns: HashMap<String, String>, // COMMENT ON COLUMN
-}
-
-/// Enum variant with optional note
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnumValue {
-    pub name: String,
-    pub note: Option<String>,
-}
-```
-
-#### What this fixes vs Node.js
-
-| Data point | Node.js parser | Rust parser |
-|---|---|---|
-| FK on_delete / on_update | **not captured** | `FkAction` enum on every FK |
-| FK constraint name | captured on table-level, lost on inline | always captured |
-| Column comments | extracted separately in comment pass | inline on `ColumnDef.comment` |
-| Table comments | extracted separately | inline on `TableComments.table` |
-| CHECK constraints | not captured | `TableConstraint::Check` |
-| SERIAL / identity | not detected | `ColumnDef.is_identity` |
-| Enum values | not on Entity | `Entity.enum_values` |
-| Index type (hash/btree) | captured in snapshot only | on `IndexDef` from parse |
-
-This structure serves three consumers:
-1. **DBML generator** — `table_def` has everything needed to emit Tables, Columns, Refs, Indexes, Enums
-2. **Snapshot builder** — `table_def` maps directly to `TableSnapshot` (no second parse pass)
-3. **Migration diff** — column/constraint/index comparison uses the same types
+A table dbd cannot read structurally is an **error**, not a partial result.
+Every other entity type may degrade; this one may not, because a table with no
+structure is absent from the desired snapshot, which makes the live table read
+as an orphan that `reconcile --prune` would DROP.
 
 ### Config (design.yaml) — restructured
 
@@ -628,118 +523,42 @@ ignore:
 
 #### Rust types
 
-```rust
-#[derive(Debug, Deserialize)]
-pub struct DesignConfig {
-    pub project: ProjectConfig,
-    pub source: SourceConfig,
-    pub target: IndexMap<String, TargetConfig>,  // Ordered — first is default
-    pub schemas: Vec<SchemaEntry>,
-    pub external: Vec<ExternalEntry>,
-    pub import: ImportConfig,
-    pub export: Vec<ExportEntry>,
-    pub dbml: Option<HashMap<String, DbmlDocConfig>>,
-    pub ignore: Vec<String>,
-    // Note: extensions, roles, grants live under target — not here
-}
+> Defined in `crates/dbd-core/src/config.rs`.
 
-#[derive(Debug, Deserialize)]
-pub struct ProjectConfig {
-    pub name: String,
-    pub note: Option<String>,
-}
+`design.yaml` deserializes into a tree mirroring the sections above. Two
+decisions shape it:
 
-#[derive(Debug, Deserialize)]
-pub struct SourceConfig {
-    #[serde(default = "default_dialect")]
-    pub dialect: String,  // "postgresql", "sqlite", etc.
-}
+- **Every section but `project` is optional.** A config that declares only a
+  name and a target is valid, and one written before a section existed still
+  loads — the format has grown, and a missing key is a fact about a project's
+  vintage rather than a parse failure.
+- **Order is preserved** where it carries meaning. The first `target` listed is
+  the one used, so the map is insertion-ordered rather than hashed.
 
-#[derive(Debug, Deserialize)]
-pub struct TargetConfig {
-    // Connection
-    pub url: Option<String>,               // Postgres/Supabase (env var refs expanded)
-    pub path: Option<PathBuf>,             // SQLite
-
-    // Postgres / Supabase
-    pub extensions: Vec<ExtensionEntry>,
-    pub roles: Vec<RoleEntry>,
-
-    // Supabase-specific
-    pub schemas: Option<Vec<String>>,      // PostgREST-exposed schemas
-    pub grants: Option<HashMap<String, GrantConfig>>,  // schema → role → perms
-
-    pub skip_schemas: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ImportConfig {
-    pub staging: Vec<String>,          // Schemas allowed for import
-    pub options: ImportOptions,
-    pub tables: Vec<ImportTableEntry>,
-    pub after: Vec<String>,
-}
-
-/// Schema entry: plain string or object with grants
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum SchemaEntry {
-    Name(String),
-    WithGrants {
-        // First key is schema name, value has grants
-    },
-}
-
-/// Extension: string or object with schema
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ExtensionEntry {
-    Name(String),
-    WithSchema { name: String, schema: String },
-}
-```
+Defaults that decide behaviour are named rather than inlined at the point of
+use, so two call sites cannot disagree about them — see
+`DEFAULT_PROJECT_VERSION` for the one case where they did.
 
 ### Snapshot & Migration
 
-```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub version: u32,
-    pub description: String,
-    pub timestamp: String,
-    pub tables: Vec<TableSnapshot>,
-}
+> Defined in `crates/dbd-core/src/snapshot.rs` and `schema_diff.rs`.
 
-/// TableSnapshot is built from TableDef — same column/constraint/index types,
-/// plus the table identity (name, schema). No duplicate type hierarchies.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TableSnapshot {
-    pub name: String,
-    pub schema: String,
-    pub columns: Vec<ColumnDef>,          // Reuses ColumnDef from parser
-    pub indexes: Vec<IndexDef>,           // Reuses IndexDef from parser
-    pub table_constraints: Vec<TableConstraint>, // Reuses TableConstraint from parser
-}
+A **snapshot** is the whole schema at one version, written to `snapshots/` when
+a release is cut. A **migration** is the SQL that moves a database from one
+version to the next, generated by diffing two snapshots.
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SchemaDiff {
-    pub from_version: u32,
-    pub to_version: u32,
-    pub added_tables: Vec<TableSnapshot>,
-    pub dropped_tables: Vec<TableSnapshot>,
-    pub altered_tables: Vec<AlteredTable>,
-}
+The diff is not a list of added and dropped tables. It carries:
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MigrationGraph {
-    pub from_version: u32,
-    pub to_version: u32,
-    pub altered: Vec<String>,
-    pub dropped: Vec<String>,
-}
-```
+- the **changes** themselves, at column and constraint granularity
+- **advisories** — changes that are valid but risky, such as a narrowing type
+  cast that may truncate
+- **warnings** — things the diff could not decide
+- **materialized-view drift**, which is tracked separately because dbd never
+  auto-recreates a matview: doing so means `DROP … CASCADE`, which loses data
+  and dependents, so drift is reported for a human instead
 
-Note: `TableSnapshot` reuses `ColumnDef`, `IndexDef`, and `TableConstraint` — no parallel type hierarchies. The parser populates `Entity.table_def`, the snapshot builder copies it into `TableSnapshot`, and the diff compares using the same types.
+Keeping those apart matters at the call site: a caller gates on the changes,
+prints the advisories, and must not treat either as the other.
 
 ### Adapter trait
 
@@ -1191,20 +1010,12 @@ Import ordering is more complex than entity ordering. It combines two dependency
    - Cycles: append remaining sorted by DDL order (with warning)
 ```
 
-```rust
-pub struct ImportPlanEntry {
-    pub table: Entity,               // Staging table being imported
-    pub target: Option<Entity>,      // Config table it maps to
-    pub procedure: Option<Entity>,   // Import procedure that processes it
-    pub targets: Vec<String>,        // Config tables written by procedure
-    pub warnings: Vec<String>,
-}
+Each entry pairs a staging table with the procedure that processes it and the
+tables that procedure **writes** — which is what the ordering turns on. A
+staging table whose procedure writes a table another procedure reads must load
+first, and only the write set says so.
 
-pub fn build_import_plan(
-    import_tables: &[Entity],
-    entities: &[Entity],
-) -> Vec<ImportPlanEntry> { ... }
-```
+> `build_import_plan` in `crates/dbd-core/src/design/import.rs`.
 
 ### SQL parsing — `sqlparser-rs` (pure Rust, no regex fallback)
 
@@ -2090,25 +1901,16 @@ impl Design {
 }
 ```
 
-**Adapter trait additions:**
+**Adapter trait additions.** The adapter gains methods to create the
+bookkeeping table, read a project's recorded state, and write it back.
 
-```rust
-#[async_trait]
-pub trait DatabaseAdapter: Send + Sync {
-    // ... existing methods ...
+What is recorded is the project, the environment, the version it reached, when
+it was applied, and **the scope it was applied with**. That last one is the
+guard: a later run requesting a different scope than the one a database is
+pinned to is refused, so a mistyped or forgotten `--scope` cannot quietly build
+a divergent schema.
 
-    // Meta tracking
-    async fn ensure_meta_table(&self) -> Result<()>;
-    async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
-    async fn set_project_meta(&self, env: &str, version: u32) -> Result<()>;
-}
-
-pub struct ProjectMeta {
-    pub project: String,
-    pub env: String,
-    pub version: u32,
-}
-```
+> `ProjectMeta` and the trait methods in `crates/dbd-core/src/adapter/`.
 
 **CLI integration:**
 
