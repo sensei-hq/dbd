@@ -83,7 +83,10 @@ fn the_detector_classifies_a_real_corpus() {
     let mut unreadable = 0usize;
 
     for file in &files {
-        let Ok(sql) = std::fs::read_to_string(file) else {
+        // `source_text`, not `read_to_string` — 16.2% of this corpus is not
+        // UTF-8, and measuring the detector through a reader that cannot see
+        // those files would measure the reader instead.
+        let Ok(sql) = dbd_core::source_text::read_to_string(file) else {
             unreadable += 1;
             continue;
         };
@@ -198,7 +201,7 @@ fn the_tsql_share_of_the_corpus_is_recorded() {
     let tsql: Vec<&PathBuf> = files
         .iter()
         .filter(|f| {
-            std::fs::read_to_string(f)
+            dbd_core::source_text::read_to_string(f)
                 .map(|s| Dialect::detect(&s) == Dialect::TSql)
                 .unwrap_or(false)
         })

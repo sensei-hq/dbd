@@ -366,12 +366,14 @@ impl Design {
                 on_start(&desc);
                 let result: Result<()> = async {
                     if migration_sql_path.exists() {
-                        let sql = std::fs::read_to_string(migration_sql_path)?;
+                        // dbd writes migrations as UTF-8, but a hand-edit in
+                        // SSMS does not stay that way — see `source_text`.
+                        let sql = crate::source_text::read_to_string(migration_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     let data_path = migration_sql_path.with_extension("data.sql");
                     if data_path.exists() {
-                        let sql = std::fs::read_to_string(&data_path)?;
+                        let sql = crate::source_text::read_to_string(&data_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     Ok(())

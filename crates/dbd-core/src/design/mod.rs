@@ -356,7 +356,11 @@ pub async fn apply_policies(
             continue;
         }
 
-        match std::fs::read_to_string(&canon_file) {
+        // A policy file is user-authored SQL and may be UTF-16 — see
+        // `source_text`. The failure stays per-file here (it lands in
+        // `report.failed`), but an undecodable one must say so rather than
+        // report a bare I/O error.
+        match crate::source_text::read_to_string(&canon_file) {
             Ok(sql) => match adapter.execute_script(&sql).await {
                 Ok(()) => report.applied.push(file.clone()),
                 Err(e) => report.failed.push((file.clone(), e.to_string())),
@@ -460,8 +464,12 @@ impl Design {
         let ddl_files = scanner::scan_ddl(&project_dir)?;
         let mut entities: Vec<Entity> = Vec::new();
         for file in &ddl_files {
-            let sql = std::fs::read_to_string(file)
-                .map_err(|e| DbdError::Config(format!("read DDL {}: {e}", file.display())))?;
+            // `source_text`, not `std::fs::read_to_string`: SSMS writes
+            // UTF-16LE by default, and the stdlib rejects it outright. Since
+            // this error PROPAGATES, one such file used to fail the whole load
+            // rather than itself — a project authored in SQL Server could not
+            // be opened at all.
+            let sql = crate::source_text::read_to_string(file)?;
             // Use relative path for entity type/name derivation, but
             // store the absolute path so the file is readable regardless of CWD.
             let relative = file.strip_prefix(&project_dir).unwrap_or(file);

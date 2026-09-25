@@ -11,6 +11,16 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ### Fixed
 
+- **One UTF-16 DDL file failed the whole project load.** `Design::from_config`
+  read DDL with `std::fs::read_to_string` and *propagated* the error, so a
+  single UTF-16 file under `ddl/` aborted the load — not that file, the load. A
+  project authored in SQL Server Management Studio could not be opened at all.
+
+  Every path that reads user-authored SQL now decodes through `source_text`:
+  the project scan, RLS policy files, lifecycle hook scripts, migration SQL and
+  data SQL. Measured against the corpus, the files dbd cannot read fell from
+  **391 to 14**, and the share it can classify rose from 76.2% to 91.8%.
+
 - **A SQLite project exported by dbd could not be read back by dbd** (#20).
   `dbd init --from-db sqlite://…` writes `sqlite_master.sql` into `ddl/`
   verbatim — `AUTOINCREMENT`, `WITHOUT ROWID` and `STRICT` included — but
@@ -99,6 +109,26 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   field rather than "object vs null", and a `reason` when the answer is no.
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
+
+- **`source_text` — decoding a file before any parser sees it.** `std::fs::
+  read_to_string` rejects anything that is not UTF-8, and SSMS writes UTF-16LE
+  by default. Measured over a real SQL Server corpus of 2,421 `.sql`/`.ddl`
+  files: **377 UTF-16 with a BOM (15.6%) and 14 other non-UTF-8 (0.6%)** —
+  16.2% invisible before any grammar was involved.
+
+  A BOM is a positive statement of encoding and is read **first**, because
+  UTF-16LE ASCII is `X 00 X 00` and any null-byte test would otherwise call
+  every UTF-16 file binary. The BOM is then *consumed*: a parser handed
+  `\u{feff}CREATE` reports a syntax error on line 1 of a valid file.
+
+  No BOM means UTF-8 is required. Charset detection — guessing latin-1 from
+  byte frequencies — is deliberately not done: `NotUtf8` is already the
+  actionable answer, and guessing invents characters the source never carried.
+  A lossy decode is refused for the same reason, since U+FFFD in an identifier
+  is a name no use site could mint.
+
+  Ported from sensei's `classifiers::decode_source`, which reads the same trees
+  and had measured the same split.
 
 - **`parser::Dialect` — which SQL a file is, stated or detected.** Distinct
   from `ParserChoice`, which is which reader dbd *runs*: several dialects share
