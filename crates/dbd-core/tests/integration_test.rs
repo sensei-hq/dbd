@@ -262,7 +262,7 @@ fn search_paths_extracted() {
     let d = design();
     let lookups = d.entities().iter().find(|e| e.name == "config.lookups").unwrap();
     assert!(
-        !lookups.search_paths.is_empty(),
+        !lookups.schema_path.entries.is_empty(),
         "Should have search_paths from SET search_path"
     );
 }

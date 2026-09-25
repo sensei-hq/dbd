@@ -25,7 +25,7 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before the parse-error early return, same as every other native
     // parser here: an errored entity must still carry the sqlparser path's
     // `["public"]` default, since references are qualified against it.
-    entity.search_paths = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
@@ -46,11 +46,7 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         entity.writes = vec![body];
     }
 
-    let default_schema = entity
-        .search_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "public".to_string());
+    let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     // Trailing CREATE INDEX statements land in table_def.indexes, exactly like
     // a table's indexes — through the same extractor, so a matview's index
@@ -274,13 +270,13 @@ mod tests {
     #[test]
     fn search_path_is_captured() {
         let e = parse("set search_path to app;\ncreate materialized view m as select a from t with data;");
-        assert_eq!(e.search_paths, vec!["app".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
     }
 
     #[test]
     fn missing_search_path_defaults_to_public() {
         let e = parse("create materialized view m as select a from t with data;");
-        assert_eq!(e.search_paths, vec!["public".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["public"]);
     }
 
     #[test]

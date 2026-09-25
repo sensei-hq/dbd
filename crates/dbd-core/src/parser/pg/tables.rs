@@ -49,7 +49,7 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before any early return, like every other native parser here: an
     // errored entity must still carry the sqlparser path's `["public"]`
     // default, since references are qualified against it.
-    entity.search_paths = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
@@ -59,11 +59,7 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
         }
     };
 
-    let default_schema = entity
-        .search_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "public".to_string());
+    let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     match extract(&parsed, &default_schema) {
         Ok((table_def, references, warnings)) => {
@@ -1366,14 +1362,16 @@ mod tests {
     }
 
     /// Mirrors every other native parser: an errored entity still carries the
-    /// `["public"]` default, because references are qualified against it.
+    /// default path, because references are qualified against it.
     #[test]
     fn search_paths_survive_both_the_happy_and_the_error_path() {
-        assert_eq!(
-            parse("set search_path to app;\ncreate table t (a int);").search_paths,
-            vec!["app".to_string()]
-        );
-        assert_eq!(parse("create table t (").search_paths, vec!["public".to_string()]);
+        let stated = parse("set search_path to app;\ncreate table t (a int);").schema_path;
+        assert_eq!(stated.schemas().collect::<Vec<_>>(), vec!["app"]);
+        assert!(stated.stated);
+
+        let errored = parse("create table t (").schema_path;
+        assert_eq!(errored.default_schema(), Some("public"));
+        assert!(!errored.stated, "nothing in the file said so");
     }
 
     // ── ALTER TABLE … ADD CONSTRAINT ────────────────────────────────────────

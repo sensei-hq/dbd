@@ -66,7 +66,10 @@ fn every_entity_type_carries_the_path() {
         ("table", "create table t (id int);"),
         ("view", "create view v as select 1;"),
         ("matview", "create materialized view m as select 1;"),
-        ("function", "create function f() returns int language sql as $$select 1$$;"),
+        (
+            "function",
+            "create function f() returns int language sql as $$select 1$$;",
+        ),
         ("procedure", "create procedure p() language sql as $$select 1$$;"),
         ("enum", "create type e as enum ('a','b');"),
     ] {
@@ -192,7 +195,10 @@ fn mysql_use_sets_the_catalog_too() {
 #[test]
 fn no_use_statement_means_no_catalog() {
     let p = parse_sql_as(Dialect::MySql, "CREATE TABLE users (id INT);").unwrap();
-    assert_eq!(p.entities[0].catalog, None, "the connection decides, and no file states it");
+    assert_eq!(
+        p.entities[0].catalog, None,
+        "the connection decides, and no file states it"
+    );
 }
 
 /// Neither dialect has a search_path, and inventing one would be a claim the

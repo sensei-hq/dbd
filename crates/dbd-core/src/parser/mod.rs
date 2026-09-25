@@ -271,7 +271,9 @@ pub struct ParsedFile {
     /// `entities` were resolved against its first element, and the full list is
     /// the candidate set for resolving the rest (see
     /// [`crate::references::resolve_references`]).
-    pub search_paths: Vec<String>,
+    ///
+    /// The same value every entity in the file carries.
+    pub schema_path: crate::entity::SchemaPath,
     /// File-level failures — SQL Postgres itself rejects. Per-entity problems
     /// stay on `Entity::errors`.
     pub errors: Vec<String>,
@@ -406,10 +408,13 @@ pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
                 },
                 dialect,
                 entities,
-                // Neither dialect has a `search_path`; a name is qualified or it is
-                // resolved by the connection's default schema, which no file
-                // states.
-                search_paths: Vec::new(),
+                // Neither dialect has a `search_path`. T-SQL resolves an
+                // unqualified name against the connecting user's default
+                // schema and MySQL has no schemas at all — neither is stated
+                // by a file, so an empty, unstated path is the honest answer.
+                // What these files DO state is the database, via `USE`, and
+                // that lands on `Entity::catalog`.
+                schema_path: crate::entity::SchemaPath::default(),
                 errors: Vec::new(),
                 references,
             })
@@ -460,7 +465,10 @@ mod tests {
     #[test]
     fn extracts_search_paths() {
         let entity = parse_fixture("table/config/lookups.ddl");
-        assert_eq!(entity.search_paths, vec!["config", "extensions"]);
+        assert_eq!(
+            entity.schema_path.schemas().collect::<Vec<_>>(),
+            vec!["config", "extensions"]
+        );
     }
 
     #[test]
@@ -616,7 +624,7 @@ mod tests {
              create function wf2() returns int language plpgsql as $$ begin perform 1 from t; end $$ window;",
         )
         .unwrap();
-        assert_eq!(entity.search_paths, vec!["app".to_string()]);
+        assert_eq!(entity.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
         assert!(
             entity.reads.contains(&"app.t".to_string()),
             "read must qualify against the file's search_path, not `public`: {:?}",
@@ -678,7 +686,7 @@ mod tests {
         // The guarded form must record its search path like the plain
         // `create type` form does — this arm returns before the extraction
         // further down, so it has to set it itself.
-        assert_eq!(entity.search_paths, vec!["app".to_string()]);
+        assert_eq!(entity.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
     }
 
     // The fallback must not turn every unparseable enum file into a silent pass.

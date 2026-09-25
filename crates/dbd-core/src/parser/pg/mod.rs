@@ -91,7 +91,7 @@ impl DdlParser for PgQueryDdl {
 /// schema and type came from.
 pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
     let search_paths = common::extract_search_paths_via_pg_query(sql);
-    let default_schema = search_paths.first().cloned().unwrap_or_else(|| "public".to_string());
+    let default_schema = search_paths.default_schema().unwrap_or("public").to_string();
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
@@ -103,7 +103,7 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
                 kind: FileKind::Empty,
                 dialect: crate::parser::Dialect::PostgreSql,
                 entities: Vec::new(),
-                search_paths,
+                schema_path: search_paths,
                 errors: vec![format!("Parse error: {e}")],
                 references: Default::default(),
             });
@@ -140,7 +140,7 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
         // for; this reader only ever runs for PostgreSQL-shaped SQL.
         dialect: crate::parser::Dialect::PostgreSql,
         entities,
-        search_paths,
+        schema_path: search_paths,
         errors: Vec::new(),
         // Always empty here, and that is not an omission. libpg_query hands
         // back a statement list where a `CREATE FUNCTION` carries its body as

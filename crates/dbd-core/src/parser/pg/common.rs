@@ -9,7 +9,7 @@
 //! arrangement is worth keeping — the per-type parsers share these helpers,
 //! and a future non-Postgres grammar would sit beside `pg`, not inside it.
 
-use crate::entity::{EnumValue, Reference, SchemaSource};
+use crate::entity::{EnumValue, PathEntry, Reference, SchemaPath, SchemaSource};
 
 use super::enums;
 
@@ -59,9 +59,9 @@ pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<
 /// qualify the table names a hook script depends on.
 ///
 /// [`design::hooks`]: crate::design::hooks
-pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
+pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> SchemaPath {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
-        return vec![DEFAULT_SEARCH_PATH.to_string()];
+        return SchemaPath::postgres_default();
     };
     for stmt in &parsed.protobuf.stmts {
         let Some(pg_query::NodeEnum::VariableSetStmt(set)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
@@ -70,17 +70,23 @@ pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> Vec<String> {
         if !set.name.eq_ignore_ascii_case("search_path") {
             continue;
         }
-        let paths: Vec<String> = set.args.iter().filter_map(const_str).collect();
-        if !paths.is_empty() {
-            return paths;
+        let entries: Vec<PathEntry> = set.args.iter().filter_map(const_str).map(path_entry).collect();
+        if !entries.is_empty() {
+            return SchemaPath::stated(entries);
         }
     }
-    vec![DEFAULT_SEARCH_PATH.to_string()]
+    SchemaPath::postgres_default()
 }
 
-/// The default schema when a file sets no `search_path`. Matches what Postgres
-/// itself falls back to, and what every reference-qualifying caller assumes.
-const DEFAULT_SEARCH_PATH: &str = "public";
+/// `"$user"` is a placeholder, not a schema. Reading it as one produced
+/// references to a schema called `$user`, which cannot exist.
+fn path_entry(name: String) -> PathEntry {
+    if name == "$user" {
+        PathEntry::CurrentUser
+    } else {
+        PathEntry::Schema(name)
+    }
+}
 
 /// The string behind a `SET` argument node: a bare identifier arrives as a
 /// `ColumnRef` (`to app`), a quoted one as an `A_Const` string (`to 'app'`).

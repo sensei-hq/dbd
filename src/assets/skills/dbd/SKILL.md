@@ -388,6 +388,36 @@ outside the declaration that made it.
 Worth having: over a 2,154-file T-SQL corpus this is 4,059 references, and **817
 of those files reported nothing at all before it existed**.
 
+### The namespace context a file established
+
+Every entity carries `schema_path` — where unqualified names in its file
+resolve. PostgreSQL states it with `SET search_path TO a, b`; T-SQL and MySQL
+state the *database* with `USE db`, which lands on `Entity::catalog`.
+
+```rust
+use dbd_core::parser::parse_sql;
+
+let parsed = parse_sql(sql)?;
+for e in &parsed.entities {
+    for schema in e.schema_path.schemas() {
+        println!("{} resolves bare names against {schema}", e.name);
+    }
+    if !e.schema_path.stated {
+        println!("  ...but the file never said so — the session decides");
+    }
+}
+```
+
+`stated` is the part worth checking. A file that says nothing is not a file
+that says `public`: Postgres's real default is `"$user", public`, so with a
+schema named after the connecting role a bare `lookup` resolves to
+`<role>.lookup`. `ALTER ROLE … SET search_path` and `ALTER DATABASE … SET
+search_path` move it too, so it is not knowable from the file.
+
+`schemas()` yields only entries that name a schema — `"$user"` is a
+placeholder, kept in `entries` for a caller that has a connection, and never
+used to qualify a name.
+
 ### Whether a schema was written or guessed
 
 The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first entry
