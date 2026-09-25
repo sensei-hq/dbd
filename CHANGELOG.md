@@ -9,6 +9,26 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-25
+
+**MySQL** joins PostgreSQL, T-SQL and SQLite: `source.dialect: mysql` selects
+the same statement-head walk T-SQL uses, under rules that differ where the two
+dialects genuinely disagree. It is fixture-verified rather than
+corpus-measured, and says so.
+
+The rest of this release is about the documentation, which had been drifting
+for want of anything that reads it. `Design::apply`'s example was wrong on six
+surfaces at once — every one of them showing seven arguments to a method that
+takes five — and nothing noticed, because nothing compiled them. Now three
+gates do: every Rust example in the embedder-facing docs is compiled as a test
+target, the facts the guides state are checked against the code that decides
+them, and broken doc links are `deny`-ed at the crate root. All three found
+real defects on their first run.
+
+The design document got the same treatment by hand. It had become a second,
+wrong copy of the source — 16 of 40 field declarations inaccurate, three types
+gone, and a dependency listing with no `pg_query` in it.
+
 ### Fixed
 
 - **Doc examples that did not compile.** Found by the gate below on its first
@@ -94,6 +114,27 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   MySQL and a temp-table name in T-SQL: read one way in the other's file and
   either every comment becomes a phantom table, or every temp table swallows
   the rest of its line.
+
+### Changed
+
+- **`docs/design/architecture.md` no longer describes types that do not
+  exist.** It had drifted into a second, wrong copy of the source: of 40 field
+  declarations it listed, 16 were inaccurate, three types were gone entirely,
+  and the dependency section reproduced all three manifests — claiming
+  workspace version `0.1.0` against a released 0.15.0, a `dbd-core`
+  requirement of `0.12.2`, features (`supabase`, `convex`) that were never
+  built and a `rusqlite` dependency never taken, with **no `pg_query` in the
+  listing at all** — the crate that reads every line of DDL dbd parses.
+
+  Every type listing is now prose about what the type is *for*, every manifest
+  is a link, and what remains is rationale a manifest cannot carry. Four
+  copyable examples joined the compile gate above; the 21 illustrative ones are
+  fenced ` ```rust,ignore `. The 18 end-to-end scenarios are now Gherkin — they
+  are requirements, and a requirement written as Rust rots when the API moves,
+  which is exactly what happened to everything else on this list.
+
+  Net 693 lines deleted against 405 added. No behaviour changed; this is the
+  document catching up with eleven releases of code.
 
 ## [0.15.0] — 2026-09-25
 
@@ -722,7 +763,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.16.0...main
+[0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
 [0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
