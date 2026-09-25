@@ -31,7 +31,7 @@ use pg_query::protobuf;
 
 use crate::entity::{
     ColumnDef, Entity, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, REF_TYPE_FUNCTION,
-    Reference, SortOrder, TableComments, TableConstraint, TableDef,
+    Reference, SchemaSource, SortOrder, TableComments, TableConstraint, TableDef,
 };
 use crate::error::Result;
 
@@ -93,7 +93,7 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
     let mut indexes: Vec<IndexDef> = Vec::new();
     let mut comments = TableComments::default();
     let mut references: Vec<Reference> = Vec::new();
-    let mut functions: Vec<String> = Vec::new();
+    let mut functions: Vec<(String, SchemaSource)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut declared: Vec<String> = Vec::new();
     // Deferred to a second pass: an `ALTER` is only this table's once every
@@ -158,9 +158,10 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
         }
     }
 
-    references.extend(functions.into_iter().map(|name| Reference {
+    references.extend(functions.into_iter().map(|(name, schema_source)| Reference {
         name,
         ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+        schema_source,
     }));
 
     Ok((
@@ -208,7 +209,7 @@ fn process_alter_table(
     columns: &mut [ColumnDef],
     constraints: &mut Vec<TableConstraint>,
     references: &mut Vec<Reference>,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, SchemaSource)>,
     warnings: &mut Vec<String>,
 ) -> Extract<()> {
     for cmd in &alter.cmds {
@@ -250,7 +251,7 @@ fn process_create_table(
     columns: &mut Vec<ColumnDef>,
     constraints: &mut Vec<TableConstraint>,
     references: &mut Vec<Reference>,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<()> {
     // `PARTITION OF p`, `INHERITS (p)` and `OF a_type` all declare a table whose
     // columns live somewhere else, so `table_elts` is empty and every column is
@@ -318,7 +319,7 @@ fn extract_column(
     col_def: &protobuf::ColumnDef,
     default_schema: &str,
     references: &mut Vec<Reference>,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<(ColumnDef, Vec<TableConstraint>)> {
     let name = col_def.colname.clone();
     let type_name = col_def
@@ -438,7 +439,7 @@ fn extract_table_constraint(
     c: &protobuf::Constraint,
     default_schema: &str,
     references: &mut Vec<Reference>,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<TableConstraint> {
     use protobuf::ConstrType::*;
     match c.contype() {
@@ -487,21 +488,26 @@ fn extract_foreign_key(
         .pktable
         .as_ref()
         .ok_or_else(|| "a foreign key names no target table".to_string())?;
-    let ref_schema = if target.schemaname.is_empty() {
-        default_schema.to_string()
+    // The one place a foreign key acquires a schema its source never wrote.
+    // Recorded, because downstream the guess is indistinguishable from a
+    // statement — see `SchemaSource`.
+    let (ref_schema, ref_schema_source) = if target.schemaname.is_empty() {
+        (default_schema.to_string(), SchemaSource::Inferred)
     } else {
-        target.schemaname.clone()
+        (target.schemaname.clone(), SchemaSource::Stated)
     };
 
     references.push(Reference {
         name: format!("{ref_schema}.{}", target.relname),
         ref_type: Some("table".to_string()),
+        schema_source: ref_schema_source,
     });
 
     Ok(ForeignKey {
         name: None,
         columns,
         ref_schema: Some(ref_schema),
+        ref_schema_source,
         ref_table: target.relname.clone(),
         ref_columns: string_list(&c.pk_attrs),
         on_delete: fk_action(&c.fk_del_action),
@@ -577,7 +583,7 @@ fn record_comment(stmt: &protobuf::CommentStmt, comments: &mut TableComments) {
 pub(super) fn extract_index(
     ix: &protobuf::IndexStmt,
     default_schema: &str,
-    functions: &mut Vec<String>,
+    functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<IndexDef> {
     let label = if ix.idxname.is_empty() {
         "<unnamed>"
@@ -745,18 +751,14 @@ fn scalar_text(node: &protobuf::Node) -> Option<String> {
 /// `call_functions()` is `HashSet`-derived, so its order is Rust's randomized
 /// per-process hash order rather than source order (the nondeterminism the
 /// parity gate already caught twice in `common`).
-fn collect_function_refs(rendered: &str, default_schema: &str, functions: &mut Vec<String>) {
+fn collect_function_refs(rendered: &str, default_schema: &str, functions: &mut Vec<(String, SchemaSource)>) {
     let Ok(parsed) = pg_query::parse(&format!("SELECT {rendered}")) else {
         return;
     };
-    let mut names: Vec<String> = parsed
-        .call_functions()
-        .into_iter()
-        .filter_map(|name| common::qualify_name_str(&name, default_schema))
-        .collect();
-    names.sort();
-    for name in names {
-        common::push_unique(functions, name);
+    for pair in common::qualify_all_sourced(parsed.call_functions(), default_schema) {
+        if !functions.iter().any(|(n, _): &(String, SchemaSource)| n == &pair.0) {
+            functions.push(pair);
+        }
     }
 }
 

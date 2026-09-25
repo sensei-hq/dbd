@@ -1,40 +1,39 @@
 # Checkpoint
 
-**Slice:** v0.15.0 shipped (T-SQL reader, `project::survey`). Eight commits on
-`develop` since, all unreleased.
+**Slice:** #21 file-level references, fixed on top of v0.16.0. Unreleased.
 
-## Done — unreleased
+## Done
 
-- **MySQL reader** (`91034b9`) — the T-SQL walk under different `WalkRules`:
-  `ALTER` never declares, `a.b` is `database.object`, backticks quote, `#`
-  comments. **Fixture-verified only** — the `DBD_SQL_CORPUS` gate awaits one.
-- **Doc facts made executable** (`a2bebd8`) — doc `rust` blocks compile as a
-  test target; parser table, dialect mapping and skill copies checked in code.
-- **Every doc link resolved** (`fc541dc`) — 24 fixed, plus a `deny` guard.
-- **`architecture.md` de-rotted** (`6d64760`…`e1f69c4`) — dead types dropped;
-  13 drifted listings replaced with prose (16 of 40 declarations were wrong);
-  examples gated or marked illustrative; 18 scenarios rewritten as Gherkin;
-  three copied manifests replaced with links plus their rationale.
+- **v0.16.0 shipped and verified** — both crates on crates.io, merged to
+  `main`, CI + CodeQL green; registry artifact re-ran the MySQL repro.
+- **#19 and #20 closed** — both shipped earlier, both resolved *differently*
+  than proposed; the issue comments say how.
+- **#21 fixed** (`3daef4a` red, `6d19303` green). `ParsedFile.references`
+  (`reads`/`writes`/`calls`) carries what a file refers to outside any
+  declaration. Instrumented first: `refer()` ran 43,754 times against an
+  independent reader's 43,737, so extraction was never the gap — 20,929 (47.8%)
+  were dropped for want of an owner. Deduplicated: +4,059 refs, and **817 of
+  2,154 files went from reporting nothing to reporting something**.
 
 ## Next
 
-    cargo test --workspace --all-features   # 1528 pass, clippy + fmt clean
+    cargo test --workspace --all-features   # 1540 pass, clippy + fmt + doc clean
 
-1. **Cut 0.16.0** — `[Unreleased]` has the MySQL reader plus tooling. Minor.
-2. **Sensei switchover** — pin `dbd-core` v0.15.0, replace
-   `adapters/manifest/dbd.rs`'s `design.yaml` reader with `project::survey`,
-   route reading through `parse_sql_as`, delete `indexer/lang/sql/`.
+1. **#22** — record whether a `Reference`'s schema was written or inferred from
+   `search_path`, so a per-file consumer can decline to trust a guess.
+2. **Cut 0.17.0** — `ParsedFile` gained a field, so minor.
+3. Older: #18 (reconcile non-convergence), #11 (CLI coverage), #7 (tenancy).
 
-## Open questions
+## Open question
 
-None blocking. Order: (1) before (2), or sensei pins an unreleased dbd.
+Does sensei's 43,737 count occurrences or unique pairs? Until settled, a
+residual difference is not a defect.
 
 ## Known-broken / carried forward
 
 - `diff`/`reconcile`/snapshots refused on SQLite (verbatim, no structure);
   `apply`, `deploy`, `import`, `export` work.
-- `parse_sql` ignores non-constraint `ALTER`s — fine inside dbd's contract, a
-  gap on a foreign corpus.
-- `ARRAY[col]::t[]` where the column is already `t` reads as drift, and
-  `generate_data_sql` warns "may truncate" on a *widening* cast.
-- `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`).
+- `parse_sql` ignores non-constraint `ALTER`s — fine inside dbd's contract.
+- `ARRAY[col]::t[]` where the column is already `t` reads as drift;
+  `generate_data_sql` warns "may truncate" on a *widening* cast;
+  `.cargo/audit.toml` ignores RUSTSEC-2023-0071 (`rsa` via `sqlx-mysql`).

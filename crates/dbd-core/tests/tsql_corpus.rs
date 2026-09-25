@@ -671,3 +671,63 @@ fn what_the_tsql_reader_finds_in_a_real_corpus() {
     let _ = EntityType::Table;
     let _ = FileKind::Declaration;
 }
+
+/// What the file-level reference set recovers, over the same corpus.
+///
+/// Issue #21: 20,929 of 43,754 references (47.8%) were dropped for want of an
+/// owning declaration. They are now reported as the file's. This measures how
+/// many come back and where they land.
+#[test]
+#[ignore]
+fn what_file_level_references_recover_from_a_real_corpus() {
+    use dbd_core::parser::{Dialect, parse_sql_as};
+    use std::collections::BTreeMap;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut owned = 0usize;
+    let mut file_level = 0usize;
+    let mut files_that_said_nothing_before = 0usize;
+    let mut by_kind: BTreeMap<String, usize> = Default::default();
+
+    for sql in &tsql {
+        let Ok(p) = parse_sql_as(Dialect::TSql, sql) else {
+            continue;
+        };
+        let o: usize = p.entities.iter().map(|e| e.refers.len()).sum();
+        let f = p.references.all().count();
+        owned += o;
+        file_level += f;
+        *by_kind.entry(format!("{:?}", p.kind)).or_default() += f;
+        if o == 0 && f > 0 {
+            files_that_said_nothing_before += 1;
+        }
+    }
+
+    let n = tsql.len();
+    println!("\n── file-level references over {n} files ──");
+    println!("  owned by a declaration  {owned:>7}");
+    println!("  owned by the file       {file_level:>7}");
+    println!("  TOTAL                   {:>7}", owned + file_level);
+    println!("  files that reported NOTHING before, and say something now: {files_that_said_nothing_before}");
+    println!("  file-level refs by kind:");
+    for (k, v) in &by_kind {
+        println!("    {k:<14} {v:>7}");
+    }
+
+    // The property, not the number: a corpus this size must have references
+    // outside declarations, and a reader that found none would have regressed
+    // to the behaviour this replaced.
+    assert!(
+        file_level > 1000,
+        "only {file_level} file-level references — the ownerless path is not being reached"
+    );
+}

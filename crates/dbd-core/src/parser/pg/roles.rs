@@ -9,7 +9,7 @@
 //! identifier immediately. Postgres parses them as different statement types, so
 //! that exclusion is structural here: only `GrantRoleStmt` is a membership.
 
-use crate::entity::{Entity, Reference};
+use crate::entity::{Entity, Reference, SchemaSource};
 use crate::error::Result;
 
 /// Parse a role DDL file, recording its memberships as references.
@@ -47,6 +47,8 @@ pub(in crate::parser) fn parse_role(mut entity: Entity, sql: &str) -> Result<Ent
             name: name.clone(),
             // A membership is a hard dependency, unlike a body's function calls.
             ref_type: None,
+            // A role name is not schema-qualified, so there is no guess in it.
+            schema_source: SchemaSource::Stated,
         })
         .collect();
     entity.refers = names;

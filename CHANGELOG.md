@@ -9,6 +9,100 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-25
+
+Two reports from an embedder reading SQL through `parse_sql_as`, both about
+references dbd was quietly getting wrong rather than failing to find.
+
+The first ([#21]) measured dbd extracting **half** the references a reader it
+had replaced found on the same corpus. Instrumenting the walk showed dbd
+calling `refer()` 43,754 times against the other reader's 43,737 — within
+0.04%. Nothing was being missed; 47.8% was being **discarded** one line later,
+for want of a declaration to hang it on. A data script that is nothing but
+`INSERT INTO a SELECT FROM b` reported nothing at all. It now reports what it
+touched: **817 of 2,154 files went from silent to saying something.**
+
+The second ([#22]) is about honesty rather than volume. A bare `REFERENCES
+parent` is qualified with `search_path[0]`, and the result was the same string
+as a source that wrote it — so a consumer could not tell a fact from a guess.
+Now it can. Implementing it exposed a defect nobody had reported: the resolver
+used the *value* as a proxy for "dbd guessed this", and could therefore
+re-point a schema the source had explicitly written.
+
+**Breaking:** `ParsedFile`, `Reference` and `ForeignKey` each gained a field.
+Code that constructs them with a struct literal needs `..Default::default()` or
+the new field. Nothing changes for code that only reads them.
+
+### Added
+
+- **A file's references are no longer thrown away** ([#21]). `ParsedFile` grows
+  a `references` field — `reads`, `writes`, `calls` — carrying what the file
+  referred to outside any declaration it makes.
+
+  The statement-head walk attributed every reference to the most recent
+  declaration in its batch and **dropped** anything made before there was one.
+  The reasoning was half right: attaching a reference to whatever happens to be
+  declared next *would* fabricate an edge. But "it belongs to the file" is a
+  third answer, and dbd had nowhere to put it.
+
+  Measured over a 2,154-file T-SQL corpus: the walk calls `refer()` **43,754**
+  times and was discarding **20,929 of them (47.8%)**. An independent reader
+  over the same corpus found 43,737 references — within 0.04% — so nothing was
+  being missed in extraction; it was being dropped at the last step. Two-thirds
+  of the loss was 278 pure data scripts, where the references are the whole
+  content of the file.
+
+  Deduplicated per file, as entity references already were, that is **4,059
+  file-level references**, total 10,695 → 14,754 (+38%). The number that
+  matters: **817 of 2,154 files (38%) went from reporting nothing at all to
+  reporting something.**
+
+  Nothing is attached to an entity that did not make it. Filled in by the
+  `TSql` and `MySql` readers; the PostgreSQL reader leaves it empty, and that is
+  not an omission — libpg_query hands back a statement list where a function
+  carries its body as one node, so a reference cannot float outside its
+  declaration there.
+
+  One hypothesis was measured and rejected rather than built: re-attaching a
+  later `ALTER TABLE x` batch to an `x` declared earlier in the same file is
+  worth 182 references of the 20,929.
+
+- **A reference says whether its schema was written or guessed** ([#22]).
+  `Reference::schema_source` and `ForeignKey::ref_schema_source`, carrying
+  `SchemaSource::{Stated, Inferred, Resolved}` (`is_guess()` for the usual
+  question).
+
+  The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first
+  entry on the entity's `search_path`. The result — `app.parent` — is the same
+  string a source that wrote `app.parent` produces, and nothing recorded which
+  it was. `resolve_references` corrects a bad guess, but it needs every entity
+  in the scan, so a consumer reading one file at a time cannot run it and had
+  no way to tell a confident edge from an invented one.
+
+  T-SQL and MySQL never infer — an unqualified name is reported unqualified —
+  so everything those readers produce is `Stated`.
+
+- **The resolver no longer re-points a schema the source wrote** ([#22]).
+  `recover_bare_target` used *"the schema equals `default_schema`"* as a proxy
+  for *"the parser guessed this"* — its own comment called it "the parser's
+  bare-qualification marker". A table that deliberately writes `app.parent`
+  while its own `search_path` is `app` satisfies that test, so its explicit
+  qualification could be silently re-pointed at another schema on the path that
+  happened to hold a table of the same name. It now asks the recorded fact.
+
+  Found while implementing the above, not reported.
+
+### Changed
+
+- **`FileKind::Empty` documents what it does and does not mean.** It means
+  "declares nothing, changes nothing, moves no rows" — not "says nothing". A
+  read-only script lands there and now reports what it reads (140 references
+  across 109 such files in the corpus). The variant is not renamed: `"empty"`
+  is the serialized value callers match on.
+
+[#21]: https://github.com/sensei-hq/dbd/issues/21
+[#22]: https://github.com/sensei-hq/dbd/issues/22
+
 ## [0.16.0] — 2026-09-25
 
 **MySQL** joins PostgreSQL, T-SQL and SQLite: `source.dialect: mysql` selects
@@ -763,7 +857,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.16.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.17.0...main
+[0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
 [0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
