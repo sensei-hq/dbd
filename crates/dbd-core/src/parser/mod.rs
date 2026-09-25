@@ -1,4 +1,5 @@
 mod dialect;
+pub mod lex;
 pub(crate) mod pg;
 
 pub use dialect::Dialect;

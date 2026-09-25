@@ -526,3 +526,68 @@ fn which_batches_an_off_the_shelf_parser_fails_on() {
     }
     println!("\n  A head that is mostly lost is a fact dbd would not have.\n");
 }
+
+/// **Can the lexer get through the corpus at all?**
+///
+/// The claim behind choosing a lexer over a grammar is that it has no opinion
+/// about T-SQL it does not understand — where `MsSqlDialect` loses 99% of
+/// `CREATE PROCEDURE` batches, a tokeniser should lose none, because there is
+/// nothing for it to reject.
+///
+/// This checks that directly: every batch of every T-SQL file is tokenised, and
+/// what comes out is counted. It also pins the two ways a hand-written lexer
+/// can fail silently — producing nothing from a non-empty batch, or hanging on
+/// an unterminated construct (the test simply has to finish).
+#[test]
+#[ignore]
+fn the_lexer_gets_through_the_whole_tsql_corpus() {
+    use dbd_core::parser::lex;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut batches = 0usize;
+    let mut empty_batches = 0usize;
+    let mut toks = 0usize;
+    let mut names = 0usize;
+
+    for sql in &tsql {
+        for (_line, batch) in lex::batches(sql) {
+            batches += 1;
+            let t = lex::tokens(batch);
+            if t.is_empty() {
+                // A non-empty batch that yields no tokens means the lexer
+                // consumed everything as comment or literal — possible, but
+                // worth counting rather than assuming.
+                empty_batches += 1;
+            }
+            names += t.iter().filter(|t| t.name().is_some()).count();
+            toks += t.len();
+        }
+    }
+
+    println!("\n── the lexer over {} T-SQL files ──", tsql.len());
+    println!("  batches            {batches:>8}");
+    println!(
+        "  yielding no tokens {empty_batches:>8}  ({:.2}%)",
+        pct(empty_batches, batches)
+    );
+    println!("  tokens             {toks:>8}");
+    println!("  of which names     {names:>8}  ({:.1}%)", pct(names, toks));
+    println!("\n  Compare: MsSqlDialect fails 18.1% of these batches outright,");
+    println!("  and 99% of the CREATE PROCEDURE ones.\n");
+
+    assert!(
+        pct(empty_batches, batches) < 5.0,
+        "{empty_batches} of {batches} batches produced no tokens at all — \
+         the lexer is swallowing content, not reading it"
+    );
+}

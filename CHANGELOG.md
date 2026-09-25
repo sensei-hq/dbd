@@ -110,6 +110,27 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
 
+- **`parser::lex` — a SQL tokeniser.** Batches, comments, quoting; nothing
+  else. The first half of reading T-SQL, and a lexer rather than a grammar
+  because dbd measured the alternatives on a 2,154-file corpus and none of them
+  can read the statements it wants. After splitting `GO` batches — the most
+  generous way to ask — `sqlparser`'s `MsSqlDialect` loses **99% of
+  `CREATE PROCEDURE`, 100% of `ALTER PROCEDURE`, 95% of `CREATE TABLE`**. It
+  passes `SET`, `IF EXISTS` and `INSERT`, so an 81.9% batch-level pass rate
+  hides a near-total loss of exactly the facts a reader is reading for.
+  Microsoft's ScriptDom is complete and is .NET, a runtime dependency dbd does
+  not have.
+
+  Over the same corpus the lexer reaches **99.57% of batches** (83 of 19,299
+  yield no tokens), producing 2.5M tokens of which 1.16M are names.
+
+  `GO` is separated before anything reads a batch: it is a client directive,
+  not SQL, so no grammar accepts it. Comments and literals are *consumed* —
+  a table named in a comment is not a reference, and a real corpus is full of
+  commented-out SQL. Nested block comments, `[bracket]]escapes]`, `''` in
+  literals, and `@p`/`@@ROWCOUNT`/`#temp` consumed whole so their tails never
+  lex as phantom tables.
+
 - **`ParsedFile::kind` and `ParsedFile::dialect`, plus `parse_sql_as`.** A SQL
   codebase is mostly not declarations — sensei measured `ALTER TABLE`
   outnumbering `CREATE TABLE` 159 to 101 — and a change script that minted an
