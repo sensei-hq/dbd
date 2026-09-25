@@ -110,6 +110,28 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
 
+- **`ParsedFile::kind` and `ParsedFile::dialect`, plus `parse_sql_as`.** A SQL
+  codebase is mostly not declarations — sensei measured `ALTER TABLE`
+  outnumbering `CREATE TABLE` 159 to 101 — and a change script that minted an
+  identity for the table it alters would give a caller two nodes for one table.
+  `FileKind` tells "owns this entity" from "touches it":
+
+  | | |
+  |---|---|
+  | `Declaration` | declares entities, changes nothing it does not declare |
+  | `Migration` | `ALTER`/`DROP` on objects defined elsewhere — edges, not nodes |
+  | `Data` | `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`COPY` |
+  | `Mixed` | declares *and* changes something else |
+  | `Empty` | nothing dbd recognises |
+
+  A declaration's **own** index and comment are part of it, not changes to
+  something else — otherwise every ordinary dbd table file would land in
+  `Mixed`.
+
+  `parse_sql_as(dialect, sql)` is the multi-dialect entry point; pair it with
+  `Dialect::detect`. The result records `Unstated` when nothing identified the
+  file, rather than claiming the fallback reader's dialect as the file's own.
+
 - **`source_text` — decoding a file before any parser sees it.** `std::fs::
   read_to_string` rejects anything that is not UTF-8, and SSMS writes UTF-16LE
   by default. Measured over a real SQL Server corpus of 2,421 `.sql`/`.ddl`
