@@ -16,6 +16,16 @@ const MANAGED_INTERNALLY: &[(&str, &str)] = &[(
     "now managed internally by dbd — apply via ensure_import_procedure(), remove from project DDL",
 )];
 
+/// Whether `path` (under `project_dir`) is a file dbd manages itself.
+///
+/// Shares [`MANAGED_INTERNALLY`] with [`detect_stale_files`] so the two cannot
+/// disagree: adding an entry there both makes `doctor` report the file and
+/// keeps it out of [`crate::project::survey`]'s DDL list, which is what stops
+/// a caller indexing dbd's own plumbing as the project's schema.
+pub fn is_internally_managed(project_dir: &Path, path: &Path) -> bool {
+    MANAGED_INTERNALLY.iter().any(|(rel, _)| path == project_dir.join(rel))
+}
+
 /// Scan the project directory for files that were once user-scaffolded but are
 /// now managed internally by dbd. Returns one entry per stale file found.
 pub fn detect_stale_files(project_dir: &Path) -> Vec<StaleFile> {

@@ -61,6 +61,45 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ### Added
 
+- **`project::survey` — is this a dbd project, and what is in it?** The cheap
+  counterpart to `Design::from_config`: reads the config and walks the layout,
+  parses no SQL. For a caller walking a repository, that ordering matters —
+  decide *whether* to parse a directory, and with which parser, before paying
+  to parse anything.
+
+  ```rust
+  if let Some(s) = dbd_core::project::survey(Path::new("."))? {
+      for file in &s.ddl_files {
+          let sql = std::fs::read_to_string(file)?;
+          let entity = dbd_core::parser::parse_entity_with(s.parser, file, &sql)?;
+      }
+  }
+  ```
+
+  Takes a project directory **or** a config path (`dbd -c` accepts a config
+  under any name, so recognising only `design.yaml` would disagree with the
+  CLI). Reports the project name, version, dialect, the `ParserChoice` that
+  dialect resolves to, schemas, and three separate file lists — `ddl_files`,
+  `policy_files`, `import_files`. Policies are SQL but not entity definitions,
+  so folding them into the DDL list would invent entities.
+
+  "Not a dbd project" is `Ok(None)`, not an error — a scanner meets far more
+  non-projects than projects. A `design.yaml` that cannot be read is `Err`, and
+  the distinction is deliberate: collapsing them means a malformed project is
+  silently skipped as "not dbd".
+
+  **What was excluded is reported, with a reason.** `migrations/` and
+  `snapshots/` hold generated SQL — a scanner that indexed them would report
+  every historical version of a table as a live entity — and
+  `ddl/procedure/staging/import_jsonb_to_table.ddl` is dbd's own plumbing.
+  Nothing absent is reported: a project with no generated output has an empty
+  exclusion list.
+
+- **`project::survey_json`** — the same as JSON, with `managed` as an explicit
+  field rather than "object vs null", and a `reason` when the answer is no.
+  `parser` is spelled as `source.parser` accepts it, so the value round-trips
+  back into a config.
+
 - **`source.parser: verbatim`** — selects the verbatim reader explicitly.
   `dialect: sqlite` implies it; the override exists for anything else whose DDL
   should be applied as written.
