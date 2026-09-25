@@ -374,6 +374,29 @@ pub struct Entity {
     pub entity_type: EntityType,
     pub name: String,
     pub schema: Option<String>,
+    /// The database this entity lives in, when that is part of its identity.
+    ///
+    /// `None` for PostgreSQL, always: cross-database references are not
+    /// possible on one connection, so every entity a scan sees belongs to the
+    /// same database and naming it would add a level that distinguishes
+    /// nothing.
+    ///
+    /// `Some` for the dialects where it does distinguish something.
+    /// `OtherDb.dbo.Users` is an ordinary reference in a SQL Server codebase,
+    /// and MySQL's `db.users` puts the *database* where this model expects a
+    /// schema. Without this level, `dbo.Users` in two databases is one entity
+    /// and a scan across a multi-database repository merges them silently.
+    ///
+    /// Deliberately **not** folded into [`Self::name`], which stays
+    /// `schema.name` — every existing caller reads it that way.
+    /// [`Self::qualified_key`] is the composite, and resolution uses that.
+    ///
+    /// `#[serde(default, skip_serializing_if)]` so snapshots written before
+    /// this field existed still load, and a catalog-less entity does not start
+    /// writing it — otherwise every snapshot in every project churns on the
+    /// next write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     pub file: Option<PathBuf>,
     pub format: Option<String>,
     pub refers: Vec<String>,
@@ -400,6 +423,7 @@ impl Entity {
             entity_type,
             name: name.to_string(),
             schema,
+            catalog: None,
             file: None,
             format: None,
             refers: Vec::new(),
@@ -510,6 +534,19 @@ impl Entity {
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         entity
+    }
+
+    /// The key resolution matches on: `catalog.schema.name`, or `schema.name`
+    /// when there is no catalog.
+    ///
+    /// Byte-identical to [`Self::name`] for every catalog-less entity, which is
+    /// every entity in every PostgreSQL project — so introducing the level is
+    /// invisible to them.
+    pub fn qualified_key(&self) -> String {
+        match &self.catalog {
+            Some(catalog) => format!("{catalog}.{}", self.name),
+            None => self.name.clone(),
+        }
     }
 
     /// Whether this entity has validation errors.
