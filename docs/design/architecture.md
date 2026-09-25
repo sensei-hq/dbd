@@ -605,140 +605,69 @@ pub trait DatabaseAdapter: Send + Sync {
 ### Parser trait
 
 A reader takes a file's path and SQL and returns an `Entity`. Which reader runs
-is chosen once per project from `source.dialect` — see `parser::ParserChoice`
-and the `DdlParser` trait in `crates/dbd-core/src/parser/`.
+is resolved once per project from `source.dialect`, with `source.parser` as an
+explicit override — see `parser::ParserChoice` and the `DdlParser` trait in
+`crates/dbd-core/src/parser/`.
+
+An embedder reading files that belong to no project names the dialect per call
+instead (`parse_sql_as`), or lets `Dialect::detect` decide from the text. That
+is the same set of readers reached a different way, not a second path.
 
 `classify_reference` is on `DatabaseAdapter`, not on the parser: only the
 adapter knows what is native to its target environment.
 
 ---
 
-## Dependencies (Cargo.toml)
+## Dependencies
 
-### Workspace root
+> This section used to reproduce all three manifests. Every copy had rotted —
+> the workspace version said `0.1.0` against a released `0.15.0`, the
+> `dbd-core` requirement said `0.12.2`, the repository was still under the
+> author's personal account, and the listing had no `pg_query` in it at all,
+> which is the crate that reads every line of DDL dbd parses. A manifest copied
+> into prose is a second source of truth that nothing checks.
+>
+> The manifests are the record: [`Cargo.toml`](../../Cargo.toml) (the workspace
+> *and* the `dbd-cli` package) and
+> [`crates/dbd-core/Cargo.toml`](../../crates/dbd-core/Cargo.toml). Both carry
+> comments for the packaging decisions that only make sense next to the lines
+> they govern. What follows is the part a manifest cannot state: why each
+> dependency is the one chosen.
 
-```toml
-[workspace]
-resolver = "2"
-members = ["crates/*"]
+### The root manifest is both the workspace and the CLI
 
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-repository = "https://github.com/jerrythomas/dbd"
+`dbd-cli` is not a workspace member. The repo root is its package root, so
+`cargo install --path .` resolves to the CLI — which is the only thing
+pre-commit's `language: rust` can install, since it has no way to name a
+member. It also keeps exactly one target producing the `dbd` binary; a root
+shim alongside a `crates/dbd-cli` binary would collide on `target/debug/dbd`.
 
-[workspace.dependencies]
-# Shared across crates
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["full"] }
-thiserror = "2"
-anyhow = "1"
-```
-
-### `dbd-core` (library)
-
-```toml
-[package]
-name = "dbd-core"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-
-# PostgreSQL
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
-
-# SQL Parsing
-sqlparser = { version = "0.61", features = ["visitor"] }  # Pure Rust, multi-dialect
-
-# File system & parallelism
-walkdir = "2"
-rayon = "1"              # Parallel file parsing (work-stealing thread pool)
-
-# HTTP (GitHub source)
-reqwest = { version = "0.12", features = ["json", "stream"] }
-flate2 = "1"
-tar = "0.4"
-
-# Utilities
-async-trait = "0.1"
-sha2 = "0.10"            # SHA-256 for migration checksums
-tempfile = "3"
-dirs = "5"               # XDG cache directory
-chrono = "0.4"
-
-[dev-dependencies]
-insta = "1"              # Snapshot testing
-tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
-```
-
-### `dbd-cli` (binary)
-
-This is the **root** manifest — `Cargo.toml` at the repo root is both the
-workspace and the `dbd-cli` package, so `cargo install --path .` resolves there.
-(pre-commit's `language: rust` can only install from the repo root, and a second
-package producing a `dbd` binary would collide with this one on
-`target/debug/dbd`.)
-
-```toml
-[workspace]
-members = ["crates/*"]
-
-[workspace.dependencies]
-# The version requirement lives here, once. `cargo publish` strips the `path`
-# and resolves the `version`, so a path-only dep cannot be published.
-dbd-core = { path = "crates/dbd-core", version = "0.12.2" }
-
-[package]
-name = "dbd-cli"
-version.workspace = true
-edition.workspace = true
-# The package root is the repo root, so name what ships. These are
-# gitignore-style patterns: unanchored, `README.md` matches at ANY depth.
-include = ["/src/**/*", "/README.md", "/LICENSE"]
-
-[[bin]]
-name = "dbd"
-path = "src/main.rs"
-
-[dependencies]
-dbd-core = { workspace = true, features = ["postgres", "sqlite"] }
-clap = { version = "4", features = ["derive", "env"] }
-tokio.workspace = true
-anyhow.workspace = true
-
-[dev-dependencies]
-assert_cmd = "2"         # CLI integration tests
-predicates = "3"
-tempfile = "3"
-serde_json.workspace = true
-```
-
-Note: `clap`, `anyhow`, and CLI-specific deps live only in `dbd-cli`. Library consumers don't pull them in.
+The cost is that the package root is the whole repository, so `include` has to
+name what ships rather than exclude what does not — with every pattern
+anchored, because an unanchored `README.md` matches at any depth. A crates.io
+publish is public and cannot be deleted, only yanked.
 
 ### Key dependency choices
 
-| Need                | Node.js             | Rust                 | Rationale                                     |
-| ------------------- | ------------------- | -------------------- | --------------------------------------------- |
-| CLI parsing         | sade                | clap (derive)        | Industry standard, derive macros              |
-| YAML parsing        | js-yaml             | serde_yaml           | Serde ecosystem, zero-copy                    |
-| SQL parsing         | pgsql-parser (WASM) | sqlparser-rs         | Pure Rust, typed AST, multi-dialect, no C dep |
-| PostgreSQL          | postgres (npm)      | sqlx                 | Compile-time safety, async, connection pool   |
-| FP utilities        | ramda               | Iterator chains      | Rust iterators are the idiomatic equivalent   |
-| Parallel parsing    | —  (single-threaded) | rayon                | Work-stealing thread pool for CPU-bound parse |
-| HTTP                | curl (child proc)   | reqwest              | Pure Rust, async, no external dependency      |
-| Tarball extraction  | tar (child proc)    | flate2 + tar         | Pure Rust, no curl/tar binaries needed        |
-| Hashing             | crypto.createHash   | sha2                 | Pure Rust SHA-256                             |
-| Error handling      | throw/catch         | thiserror + anyhow   | Typed errors + ergonomic propagation          |
+| Need                | Node.js               | Rust                 | Rationale                                             |
+| ------------------- | --------------------- | -------------------- | ----------------------------------------------------- |
+| CLI parsing         | sade                  | clap (derive)        | Industry standard, derive macros                      |
+| YAML parsing        | js-yaml               | serde_yaml           | Serde ecosystem                                        |
+| PostgreSQL DDL      | pgsql-parser (WASM)   | pg_query             | PostgreSQL's own grammar — see the superseded ADR above |
+| Formatting, enums   | —                     | sqlparser-rs         | A typed AST is easier to walk than a protobuf one, and neither job has to be exhaustive |
+| T-SQL / MySQL DDL   | —                     | in-tree lexer        | A statement-head walk, not a grammar — `parser::tsql`   |
+| Non-UTF-8 sources   | —                     | encoding_rs          | SSMS writes UTF-16LE; 16.2% of a measured corpus needed it |
+| Database driver     | postgres (npm)        | sqlx                 | Async, pooled, one driver for Postgres and SQLite      |
+| FP utilities        | ramda                 | Iterator chains      | Rust iterators are the idiomatic equivalent            |
+| Parallel parsing    | — (single-threaded)   | rayon                | Work-stealing thread pool for CPU-bound parse          |
+| HTTP                | curl (child proc)     | reqwest (rustls)     | Pure Rust, async, no external binary and no OpenSSL    |
+| Tarball extraction  | tar (child proc)      | flate2 + tar         | Pure Rust, no external binary                          |
+| Hashing             | crypto.createHash     | sha2                 | Pure Rust SHA-256                                      |
+| Ordered maps        | JS object insertion   | indexmap             | Emitted DDL must be deterministic, so map order is load-bearing |
+| Error handling      | throw/catch           | thiserror + anyhow   | Typed errors in the library, ergonomic propagation in the CLI |
+
+`clap` and `anyhow` live only in `dbd-cli`. A library consumer does not pull
+them in.
 
 ---
 
@@ -1035,11 +964,16 @@ first, and only the write set says so.
 > the regex fallback this section claims to have removed.
 >
 > DDL is now read by **`pg_query`** (libpg_query — PostgreSQL's own grammar), the
-> option rejected below. The cross-compilation cost was real and was paid. The
-> "multi-dialect future" argument did not materialise either: the sqlparser path
-> hardcoded `PostgreSqlDialect` for its whole life, so it was never a dialect
-> selector — and SQLite DDL is not a Postgres subset, so a real SQLite grammar
-> would have been new work regardless.
+> option rejected below. The cross-compilation cost was real and was paid.
+>
+> The "multi-dialect future" argument did not survive either, though the future
+> itself arrived. The sqlparser path hardcoded `PostgreSqlDialect` for its whole
+> life, so it was never a dialect selector; dbd reads T-SQL and MySQL as of
+> 0.15.0, and neither goes through sqlparser. Both use an in-tree statement-head
+> walk, because what those files need is an inventory of what they declare, not
+> a grammar. SQLite went the other way again and is read verbatim — its DDL is
+> not a Postgres subset, so a real SQLite grammar would have been new work
+> regardless of which crate was chosen here.
 >
 > `sqlparser-rs` remains a dependency, for `dbd format` and enum-candidate
 > detection. It no longer reads DDL. The rest of this section is kept as the
@@ -2000,7 +1934,8 @@ The Node.js version supports 5 adapters. The Rust version must support them as f
 | COPY import | yes | yes | no | npx |
 | Migrations table | yes | yes | yes | no |
 | Catalog queries | yes | yes | no | no |
-| Snapshots | yes | yes | tbd | no |
+| Snapshots | yes | yes | no | no |
+| Diff / reconcile | yes | yes | no | no |
 
 ### Supabase adapter
 
@@ -2027,18 +1962,35 @@ Generates TypeScript schema — no SQL execution at all:
 
 Subset of features — no schemas, extensions, enums, roles, or stored procedures.
 
+Its DDL is also read **verbatim**: `source.dialect: sqlite` selects
+`ParserChoice::Verbatim`, so each file is kept as the text it is rather than
+parsed into columns and constraints. SQLite's dialect is not a Postgres subset
+(`AUTOINCREMENT`, `WITHOUT ROWID`, `STRICT`), and introspection already returns
+raw DDL for the same reason.
+
+That decides the two `no` cells above. `apply`, `deploy`, `import` and `export`
+work normally, because none of them needs to know what a column is. `diff`,
+`reconcile` and snapshotting compare structure, and against no structure they
+would compare nothing and report a match — which is what they did, reporting
+"in sync" against an empty database. They refuse instead: "in sync" is the one
+answer that must never be wrong.
+
 ### Feature gates (Cargo features)
 
-```toml
-[features]
-default = ["postgres"]
-postgres = ["sqlx"]
-supabase = ["postgres"]
-sqlite = ["dep:rusqlite"]
-convex = []               # No DB driver needed — generates files
-```
+`dbd-core` defaults to `postgres`, `sqlite` and `deploy`. The first two each
+pull in the matching `sqlx` driver — one driver crate serves both, which is why
+there is no separate `rusqlite`. `deploy` gates `reqwest` and `tar`, so a
+consumer that never fetches a GitHub source does not compile an HTTP stack.
 
-Consumers choose which adapters to compile in. The CLI binary enables all by default.
+There is no `supabase` or `convex` feature. Supabase is a *mode* of the
+Postgres adapter rather than a separate type, and Convex generates files with
+no driver to gate. `embedded-tests` is a test-only gate for the tests that
+start a real PostgreSQL.
+
+See `[features]` in
+[`crates/dbd-core/Cargo.toml`](../../crates/dbd-core/Cargo.toml) for the list
+itself. The CLI names `postgres` and `sqlite` without disabling defaults, so it
+compiles all three.
 
 ---
 
