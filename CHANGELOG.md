@@ -9,6 +9,44 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **Every entity carries the namespace context its file established.**
+  `Entity::schema_path` and `ParsedFile::schema_path` replace
+  `search_paths: Vec<String>` with a `SchemaPath` that says *where*
+  unqualified names resolve **and whether the file actually said so**.
+
+  An unqualified name means nothing without that context, and each dialect
+  states it differently: PostgreSQL `SET search_path TO a, b`, T-SQL and MySQL
+  `USE db`.
+
+- **`USE db` is read, and sets the catalog.** Previously ignored outright. Over
+  a 2,154-file T-SQL corpus, 77 files carry one; the reader now recognises 63
+  of them, taking entities with a catalog from **2 to 123**. Without it,
+  `dbo.Issues` in two databases was a single entity — the collision
+  `Entity::catalog` exists to prevent. A three-part name states its own
+  database and still wins.
+
+### Fixed
+
+- **`"$user"` is no longer treated as a schema name.** A file writing
+  Postgres's own default (`SET search_path TO "$user", public`) produced
+  references to `"$user".lookup` — a schema that cannot exist, so an edge that
+  could never resolve. It is now `PathEntry::CurrentUser`: kept on the path,
+  in position, for a caller that has a connection, and never used to qualify.
+
+- **A file that states no search_path is distinguishable from one stating
+  `public`.** Both used to produce `["public"]`. Verified against a live
+  server, Postgres's actual default is `"$user", public` — with a schema named
+  after the connecting role, a bare `lookup` resolves to `<role>.lookup`, and
+  `ALTER ROLE`/`ALTER DATABASE … SET search_path` move it further. dbd cannot
+  know at parse time and said `public` as though it could; `SchemaPath::stated`
+  now says whose answer it is.
+
+  **Not changed:** what a bare reference is pre-qualified *to*. Every existing
+  project's apply path depends on the `public` fallback, so this makes the
+  guess visible rather than moving it.
+
 ## [0.17.0] — 2026-09-25
 
 Two reports from an embedder reading SQL through `parse_sql_as`, both about

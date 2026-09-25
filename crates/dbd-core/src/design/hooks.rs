@@ -29,9 +29,9 @@ pub(crate) fn derive_dependencies(sql: &str) -> Vec<String> {
         return Vec::new();
     };
     let default_schema = crate::parser::pg::common::extract_search_paths_via_pg_query(sql)
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "public".to_string());
+        .default_schema()
+        .unwrap_or("public")
+        .to_string();
 
     let mut out: Vec<String> = Vec::new();
     for name in parsed.tables() {
