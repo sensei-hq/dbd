@@ -9,6 +9,29 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-25
+
+dbd reads more than PostgreSQL. **T-SQL** is read by a statement-head lexer —
+2,737 entities and 11,602 edges from a corpus where libpg_query managed 13
+declarations and a 94.5% parse-error rate. **SQLite** round-trips: a project
+`init --from-db` exported could not be read back at all, because dbd wrote no
+`source:` block and then rejected its own `AUTOINCREMENT`. And **16.2% of a
+real SQL Server corpus was invisible** to `std::fs::read_to_string`, which
+failed a whole project load rather than one file.
+
+For callers outside dbd: `project::survey` answers "is this a dbd project, and
+what is in it" without parsing anything, and `parse_sql` reads entities out of
+SQL that is not in dbd's layout at all.
+
+Two things the measurements changed. `reconcile` and `diff` reported **"in
+sync" against an empty database** on any project without a structured model —
+they now refuse and say why. And every documented `Design::apply` example was
+uncompilable; there were no doctests on `Design` at all, which is why nothing
+caught it.
+
+Breaking for embedders: new `EntityType` and `ParserChoice` variants, and new
+fields on `Entity` and `ParsedFile`.
+
 ### Fixed
 
 - **One UTF-16 DDL file failed the whole project load.** `Design::from_config`
@@ -614,6 +637,7 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
 [Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
 [0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0
