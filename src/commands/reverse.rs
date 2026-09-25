@@ -282,6 +282,13 @@ pub async fn cmd_merge(
     // and managed databases take the same overwrite+snapshot path; only a managed DB
     // strictly behind the project is refused.
     let managed = adapter.reverse_managed_version().await?;
+    // Deliberately NOT `config.project.version()`, which defaults to 1. This is
+    // not asking "what version is this project" — it is choosing the floor for a
+    // safety gate, and the permissive floor is the safe one here. A project that
+    // declares no version has made no claim to be ahead of anything, so treating
+    // it as 0 lets the merge proceed; treating it as 1 would refuse against a
+    // managed database that reports 0 (its `_dbd_meta` exists but has no row for
+    // this project), which is a normal first-merge situation.
     let project_version = config.project.version.unwrap_or(0);
     match merge_decision(managed, project_version) {
         MergeDecision::Refuse { db, project } => {
@@ -652,6 +659,32 @@ mod tests {
     }
 
     /// Both at zero (unset project version) → snapshot.
+    /// This gate's floor for an undeclared version is 0, and deliberately not
+    /// `ProjectConfig::version`'s 1. The two answer different questions:
+    /// "what version is this project" (1 — a project that exists is at v1) and
+    /// "what floor makes this safety gate permissive" (0).
+    ///
+    /// Collapsing them would make a first merge refuse. A managed database with
+    /// no row for this project reports `Some(0)`, so a v1 project reads as ahead
+    /// of it and `merge_decision` refuses — blocking the ordinary case of
+    /// merging into a database this project has not applied to yet.
+    #[test]
+    fn the_merge_gate_floors_an_undeclared_version_at_zero_not_one() {
+        let cfg: dbd_core::config::ProjectConfig = serde_yaml::from_str("name: p").unwrap();
+        assert_eq!(cfg.version(), 1, "the project's own answer is 1");
+
+        // What this gate uses instead, and why it must.
+        assert_eq!(
+            merge_decision(Some(0), cfg.version.unwrap_or(0)),
+            MergeDecision::Snapshot
+        );
+        assert_eq!(
+            merge_decision(Some(0), cfg.version()),
+            MergeDecision::Refuse { db: 0, project: 1 },
+            "using the project-level default here would refuse an ordinary first merge"
+        );
+    }
+
     #[test]
     fn merge_decision_snapshots_at_zero() {
         assert_eq!(merge_decision(Some(0), 0), MergeDecision::Snapshot);

@@ -79,13 +79,14 @@ pub struct ProjectSurvey {
     pub config_path: PathBuf,
     /// `project.name`.
     pub project: String,
-    /// `project.version`, as written — `None` when the file omits it.
+    /// `project.version`, defaulting to [`crate::config::DEFAULT_PROJECT_VERSION`]
+    /// when the file omits it.
     ///
-    /// Not defaulted here on purpose. The CLI itself disagrees about what a
-    /// missing version means (`unwrap_or(1)` when reporting status,
-    /// `unwrap_or(0)` when reverse-engineering), so a survey that picked one
-    /// would be inventing a convention rather than describing the file.
-    pub version: Option<u32>,
+    /// A plain `u32`: "what version is this project" has one answer, and
+    /// [`crate::config::ProjectConfig::version`] is it. The raw field behind it
+    /// still records whether the file said so, for tooling that reports on the
+    /// file itself.
+    pub version: u32,
     /// `source.dialect`, verbatim — `postgresql` when unset.
     pub dialect: String,
     /// The parser [`dialect`](Self::dialect) and `source.parser` resolve to.
@@ -206,7 +207,7 @@ pub fn survey(path: &Path) -> Result<Option<ProjectSurvey>> {
         root: dir.to_path_buf(),
         config_path,
         project: cfg.project.name.clone(),
-        version: cfg.project.version,
+        version: cfg.project.version(),
         dialect: cfg.source.dialect.clone(),
         parser,
         schemas: cfg.schema_names(),

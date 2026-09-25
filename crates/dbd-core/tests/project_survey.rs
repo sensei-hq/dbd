@@ -79,7 +79,7 @@ fn a_project_is_identified_with_its_config_and_identity() {
     let s = project::survey(tmp.path()).unwrap().expect("this is a dbd project");
 
     assert_eq!(s.project, "shop");
-    assert_eq!(s.version, Some(3), "the version is reported as written, not defaulted");
+    assert_eq!(s.version, 3);
     assert_eq!(s.config_path, tmp.path().join("design.yaml"));
     assert_eq!(s.schemas, vec!["app".to_string(), "config".to_string()]);
 }
