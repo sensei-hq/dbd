@@ -46,9 +46,10 @@ pub(in crate::parser) fn declarations(
     parsed: &pg_query::ParseResult,
     sql: &str,
     default_schema: &str,
-) -> Vec<Declaration> {
+) -> (Vec<Declaration>, Signals) {
     let mut declared_here: Vec<Declaration> = Vec::new();
     let mut attachments: Vec<(String, Range<usize>)> = Vec::new();
+    let mut signals = Signals::default();
 
     for raw in &parsed.protobuf.stmts {
         let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
@@ -56,7 +57,12 @@ pub(in crate::parser) fn declarations(
         };
         let range = stmt_range(raw, sql.len());
 
+        if moves_data(node) {
+            signals.data = true;
+            continue;
+        }
         if let Some((entity_type, schema, name)) = declared(node, default_schema) {
+            signals.declares = true;
             declared_here.push(Declaration {
                 entity_type,
                 name,
@@ -69,11 +75,40 @@ pub(in crate::parser) fn declarations(
     }
 
     for (target, range) in attachments {
-        if let Some(owner) = declared_here.iter_mut().find(|d| owns(d, &target)) {
-            owner.ranges.push(range);
+        match declared_here.iter_mut().find(|d| owns(d, &target)) {
+            // Belongs to something this file declares — part of that
+            // declaration, not a change to anything else.
+            Some(owner) => owner.ranges.push(range),
+            // Names something defined elsewhere. THAT is what makes a file a
+            // change script: it edits a table it does not own.
+            None => signals.changes = true,
         }
     }
-    declared_here
+    (declared_here, signals)
+}
+
+/// What the statements in a file amounted to, for classifying the file itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::parser) struct Signals {
+    /// A `CREATE` of something.
+    pub declares: bool,
+    /// A statement naming an object this file does not declare — an `ALTER`,
+    /// a `DROP`, an index on somebody else's table.
+    pub changes: bool,
+    /// `INSERT` / `UPDATE` / `DELETE` / `MERGE` / `COPY`.
+    pub data: bool,
+}
+
+/// Whether a statement moves rows rather than shapes.
+fn moves_data(node: &NodeEnum) -> bool {
+    matches!(
+        node,
+        NodeEnum::InsertStmt(_)
+            | NodeEnum::UpdateStmt(_)
+            | NodeEnum::DeleteStmt(_)
+            | NodeEnum::MergeStmt(_)
+            | NodeEnum::CopyStmt(_)
+    )
 }
 
 /// Source ranges of statements that apply to every entity in the file rather
@@ -186,6 +221,11 @@ fn attaches_to(node: &NodeEnum, default_schema: &str) -> Option<String> {
         NodeEnum::IndexStmt(ix) => Some(from_range_var(ix.relation.as_ref()?, default_schema).1),
         NodeEnum::CommentStmt(c) => comment_target(c, default_schema),
         NodeEnum::AlterTableStmt(a) => Some(from_range_var(a.relation.as_ref()?, default_schema).1),
+        // A `DROP` or `RENAME` names its target the way a comment does. It
+        // never belongs to something this file declares — you do not create and
+        // drop the same object in one file — so in practice it always lands as
+        // a change signal, which is what a migration script is made of.
+        NodeEnum::DropStmt(_) | NodeEnum::RenameStmt(_) => Some(String::new()),
         _ => None,
     }
 }
@@ -263,6 +303,7 @@ mod tests {
     fn decls(sql: &str) -> Vec<(EntityType, String, usize)> {
         let parsed = pg_query::parse(sql).expect("valid SQL");
         declarations(&parsed, sql, "public")
+            .0
             .into_iter()
             .map(|d| (d.entity_type, d.name, d.ranges.len()))
             .collect()
@@ -351,7 +392,7 @@ mod tests {
     fn a_final_statement_without_a_semicolon_is_not_truncated() {
         let sql = "create table app.t (id int)";
         let parsed = pg_query::parse(sql).unwrap();
-        let d = declarations(&parsed, sql, "public");
+        let (d, _) = declarations(&parsed, sql, "public");
         let assembled = assemble(sql, &[], &d[0].ranges);
         assert!(assembled.contains("(id int)"), "got: {assembled}");
     }
@@ -361,7 +402,7 @@ mod tests {
         let sql = "set search_path to app;\ncreate table t (id int);";
         let parsed = pg_query::parse(sql).unwrap();
         let ambient = ambient_ranges(&parsed, sql);
-        let d = declarations(&parsed, sql, "app");
+        let (d, _) = declarations(&parsed, sql, "app");
         let assembled = assemble(sql, &ambient, &d[0].ranges);
         assert!(assembled.starts_with("set search_path to app;"), "got: {assembled}");
     }

@@ -167,8 +167,47 @@ pub fn parse_entity(file: &Path, sql: &str) -> Result<Entity> {
 /// soft/hard distinction on references are the parts an embedder cannot get
 /// from any other language's parser, and flattening them here would throw away
 /// the reason to call this at all.
+/// What a SQL file is *for*.
+///
+/// A corpus is mostly not declarations. Measured over 2,154 real T-SQL files,
+/// and independently by sensei over its own corpus, `ALTER TABLE` outnumbers
+/// `CREATE TABLE` 159 to 101 — the commonest statement in a SQL codebase
+/// declares nothing at all.
+///
+/// That matters to a caller building a graph. A change script that minted an
+/// identity for the table it alters produces two nodes for one table; a data
+/// script that minted one produces a node for a table defined elsewhere. This
+/// is what tells "owns the entity" from "touches it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    /// Declares entities and changes nothing it does not declare. A dbd DDL
+    /// file, and the shape `Entity` was built for. Its own indexes and
+    /// comments count as part of the declaration.
+    Declaration,
+    /// Changes objects defined elsewhere — `ALTER`, `DROP`, an index on
+    /// somebody else's table. Declares nothing, so it contributes edges rather
+    /// than nodes.
+    Migration,
+    /// Moves rows, not shapes.
+    Data,
+    /// Declares something *and* changes something else, or mixes data in.
+    Mixed,
+    /// Nothing dbd recognises — a bare `SELECT`, a file of comments.
+    #[default]
+    Empty,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFile {
+    /// What the file is for — see [`FileKind`].
+    pub kind: FileKind,
+    /// The dialect the file was read as.
+    ///
+    /// [`Dialect::Unstated`] when nothing identified it: it was still read, by
+    /// the fallback reader, but saying `PostgreSql` would claim the file stated
+    /// something it did not.
+    pub dialect: Dialect,
     /// One per declaration, in source order. Empty when the file declares
     /// nothing — a migration that only `INSERT`s is not an error.
     pub entities: Vec<Entity>,
@@ -201,7 +240,28 @@ pub struct ParsedFile {
 ///
 /// Defaults to PostgreSQL; use [`parse_sql_with`] to choose.
 pub fn parse_sql(sql: &str) -> Result<ParsedFile> {
-    parse_sql_with(ParserChoice::PgQuery, sql)
+    parse_sql_as(Dialect::PostgreSql, sql)
+}
+
+/// [`parse_sql`] for a known — or deliberately unknown — dialect.
+///
+/// The entry point for a multi-dialect scan: pair it with [`Dialect::detect`]
+/// for a file nothing states, and the result records `Unstated` rather than
+/// claiming the fallback reader's dialect as the file's own.
+///
+/// ```no_run
+/// # fn example(sql: &str) -> dbd_core::Result<()> {
+/// use dbd_core::parser::{Dialect, parse_sql_as};
+///
+/// let parsed = parse_sql_as(Dialect::detect(sql), sql)?;
+/// println!("{:?} file, read as {:?}", parsed.kind, parsed.dialect);
+/// # Ok(())
+/// # }
+/// ```
+pub fn parse_sql_as(dialect: Dialect, sql: &str) -> Result<ParsedFile> {
+    let mut parsed = parse_sql_with(ParserChoice::for_dialect_typed(dialect), sql)?;
+    parsed.dialect = dialect;
+    Ok(parsed)
 }
 
 /// [`parse_sql`] with an explicit parser choice.

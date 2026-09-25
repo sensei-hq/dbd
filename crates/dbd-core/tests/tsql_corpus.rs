@@ -218,3 +218,69 @@ fn the_tsql_share_of_the_corpus_is_recorded() {
     println!("  bytes  {:>6.1} MB", bytes as f64 / 1_048_576.0);
     println!("  (the set the T-SQL reader must handle)\n");
 }
+
+/// What a real SQL codebase is actually made OF.
+///
+/// The number that shapes the whole design: if a corpus were mostly
+/// declarations, a reader could treat every file as one and be roughly right.
+/// It is not. Sensei measured `ALTER TABLE` outnumbering `CREATE TABLE` 159 to
+/// 101 on its corpus; this asks the same question of every file here, through
+/// dbd's own classifier.
+///
+/// Reported rather than pinned to a threshold — the ratio is a fact about this
+/// corpus, and asserting one would be asserting something about somebody's
+/// codebase rather than about dbd.
+#[test]
+#[ignore]
+fn the_file_kinds_of_a_real_corpus_are_recorded() {
+    use dbd_core::parser::{FileKind, parse_sql_as};
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    let mut declaration = 0usize;
+    let mut migration = 0usize;
+    let mut data = 0usize;
+    let mut mixed = 0usize;
+    let mut empty = 0usize;
+    let mut unreadable = 0usize;
+    let mut errored = 0usize;
+
+    let files = sql_files(&root);
+    for file in &files {
+        let Ok(sql) = dbd_core::source_text::read_to_string(file) else {
+            unreadable += 1;
+            continue;
+        };
+        let Ok(parsed) = parse_sql_as(Dialect::detect(&sql), &sql) else {
+            errored += 1;
+            continue;
+        };
+        if !parsed.errors.is_empty() {
+            errored += 1;
+            continue;
+        }
+        match parsed.kind {
+            FileKind::Declaration => declaration += 1,
+            FileKind::Migration => migration += 1,
+            FileKind::Data => data += 1,
+            FileKind::Mixed => mixed += 1,
+            FileKind::Empty => empty += 1,
+        }
+    }
+
+    let total = files.len();
+    println!("\n── FileKind over {total} SQL files ──");
+    println!("  declaration {declaration:>6}  ({:.1}%)", pct(declaration, total));
+    println!("  migration   {migration:>6}  ({:.1}%)", pct(migration, total));
+    println!("  data        {data:>6}  ({:.1}%)", pct(data, total));
+    println!("  mixed       {mixed:>6}  ({:.1}%)", pct(mixed, total));
+    println!("  empty       {empty:>6}  ({:.1}%)", pct(empty, total));
+    println!("  ── not classified ──");
+    println!("  parse error {errored:>6}  ({:.1}%)", pct(errored, total));
+    println!("  unreadable  {unreadable:>6}\n");
+    println!("  NOTE: these are T-SQL files read by the PostgreSQL reader —");
+    println!("  the parse-error share is the gap the T-SQL reader closes.\n");
+}

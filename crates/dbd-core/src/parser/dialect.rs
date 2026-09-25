@@ -35,7 +35,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A SQL dialect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dialect {
     /// PostgreSQL — `$$` bodies, `::` casts, `plpgsql`. Supabase is this.
@@ -45,7 +45,10 @@ pub enum Dialect {
     MySql,
     Sqlite,
     /// No marker of any dialect, or markers for more than one in equal
-    /// measure. NOT a default — see the module note on failing closed.
+    /// measure. Not a default *answer* — see the module note on failing closed
+    /// — but it is the `Default` value, because "nothing has said" is the
+    /// honest starting point for a field nobody has filled in yet.
+    #[default]
     Unstated,
 }
 
