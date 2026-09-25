@@ -24,6 +24,10 @@ pg_query = "6"
 walkdir = "2"
 rayon = "1"
 regex = "1"
+# Decoding source files that are not UTF-8. SSMS writes UTF-16LE by default and
+# 16.2% of a measured SQL Server corpus was unreadable without this. Pure Rust,
+# no C toolchain — see `source_text`.
+encoding_rs = "0.8"
 
 # Async
 tokio.workspace = true

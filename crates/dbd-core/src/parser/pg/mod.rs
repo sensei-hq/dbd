@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::entity::{Entity, EntityType};
 use crate::error::Result;
-use crate::parser::{DdlParser, ParsedFile};
+use crate::parser::{DdlParser, FileKind, ParsedFile};
 
 /// libpg_query — PostgreSQL's own grammar.
 pub(crate) struct PgQueryDdl;
@@ -97,6 +97,11 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
         Ok(p) => p,
         Err(e) => {
             return Ok(ParsedFile {
+                // Nothing was read, so nothing is known about what the file is
+                // for. `Empty` would claim it holds no statements; it may hold
+                // plenty that this reader could not get through.
+                kind: FileKind::Empty,
+                dialect: crate::parser::Dialect::PostgreSql,
                 entities: Vec::new(),
                 search_paths,
                 errors: vec![format!("Parse error: {e}")],
@@ -105,9 +110,10 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
     };
 
     let ambient = declarations::ambient_ranges(&parsed, sql);
+    let (decls, signals) = declarations::declarations(&parsed, sql, &default_schema);
     let mut entities = Vec::new();
 
-    for decl in declarations::declarations(&parsed, sql, &default_schema) {
+    for decl in decls {
         let mut entity = Entity::new(decl.entity_type, &decl.name);
         entity.schema = decl.schema;
 
@@ -128,10 +134,29 @@ pub(in crate::parser) fn parse_sql(sql: &str) -> Result<ParsedFile> {
     }
 
     Ok(ParsedFile {
+        kind: classify(signals),
+        // Overwritten by `parse_sql_as` with what the caller actually asked
+        // for; this reader only ever runs for PostgreSQL-shaped SQL.
+        dialect: crate::parser::Dialect::PostgreSql,
         entities,
         search_paths,
         errors: Vec::new(),
     })
+}
+
+/// Which [`FileKind`] a file's statements amount to.
+///
+/// A declaration's OWN indexes and comments are not changes — they were folded
+/// into it by `declarations`, so they never reach `signals.changes`. Without
+/// that, every ordinary dbd table file would land in `Mixed`.
+fn classify(signals: declarations::Signals) -> FileKind {
+    match (signals.declares, signals.changes, signals.data) {
+        (false, false, false) => FileKind::Empty,
+        (true, false, false) => FileKind::Declaration,
+        (false, true, false) => FileKind::Migration,
+        (false, false, true) => FileKind::Data,
+        _ => FileKind::Mixed,
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,280 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-25
+
+dbd reads more than PostgreSQL. **T-SQL** is read by a statement-head lexer —
+2,737 entities and 11,602 edges from a corpus where libpg_query managed 13
+declarations and a 94.5% parse-error rate. **SQLite** round-trips: a project
+`init --from-db` exported could not be read back at all, because dbd wrote no
+`source:` block and then rejected its own `AUTOINCREMENT`. And **16.2% of a
+real SQL Server corpus was invisible** to `std::fs::read_to_string`, which
+failed a whole project load rather than one file.
+
+For callers outside dbd: `project::survey` answers "is this a dbd project, and
+what is in it" without parsing anything, and `parse_sql` reads entities out of
+SQL that is not in dbd's layout at all.
+
+Two things the measurements changed. `reconcile` and `diff` reported **"in
+sync" against an empty database** on any project without a structured model —
+they now refuse and say why. And every documented `Design::apply` example was
+uncompilable; there were no doctests on `Design` at all, which is why nothing
+caught it.
+
+Breaking for embedders: new `EntityType` and `ParserChoice` variants, and new
+fields on `Entity` and `ParsedFile`.
+
+### Fixed
+
+- **One UTF-16 DDL file failed the whole project load.** `Design::from_config`
+  read DDL with `std::fs::read_to_string` and *propagated* the error, so a
+  single UTF-16 file under `ddl/` aborted the load — not that file, the load. A
+  project authored in SQL Server Management Studio could not be opened at all.
+
+  Every path that reads user-authored SQL now decodes through `source_text`:
+  the project scan, RLS policy files, lifecycle hook scripts, migration SQL and
+  data SQL. Measured against the corpus, the files dbd cannot read fell from
+  **391 to 14**, and the share it can classify rose from 76.2% to 91.8%.
+
+- **A SQLite project exported by dbd could not be read back by dbd** (#20).
+  `dbd init --from-db sqlite://…` writes `sqlite_master.sql` into `ddl/`
+  verbatim — `AUTOINCREMENT`, `WITHOUT ROWID` and `STRICT` included — but
+  `reverse::design_yaml` emitted no `source:` block, so the project loaded under
+  the `postgresql` default and libpg_query rejected all three. `apply` then
+  refused with *"N file(s) could not be parsed"*. The round-trip dbd advertises
+  did not work at all.
+
+  `source.dialect: sqlite` is now written by `init --from-db`, and it selects a
+  **verbatim** reader: the DDL file is kept as-is in `Entity::raw_ddl` and
+  applied unchanged. That is not a weaker fallback — it is the shape SQLite
+  already has on the other side, where `SqliteAdapter::introspect` builds each
+  entity from `sqlite_master.sql` with no `table_def` because that text *is* the
+  schema. Reading the files any other way made the two sides disagree about what
+  a table is.
+
+  Verified end-to-end against a real in-memory database: export a schema,
+  re-apply it to an empty database, and compare the definitions both sides
+  report — not just the names, since an empty table matches on names alone.
+
+- **`reconcile` and `diff` reported "in sync" for a SQLite project** — against a
+  database sharing not one table with the design. A verbatim entity has no
+  `table_def`, and both snapshot builders keep only entities that have one, so
+  desired and live each reduced to nothing and the comparison succeeded
+  trivially. Observed: `added=0 altered=0 dropped=0` against a completely empty
+  database.
+
+  Both now refuse, naming the reason, as they already did for batch adapters.
+  "In sync" is the one answer that must never be wrong. `apply`, `deploy`,
+  `import` and `export` are unaffected.
+
+- **Every documented `Design::apply` / `import_data` example was uncompilable.**
+  They showed the three progress callbacks as three separate arguments; both
+  methods take five, with the callbacks travelling together in one `Progress`.
+  A 7-argument call does not compile.
+
+  The root cause was `apply`'s own doc comment — *"Use `|_| {}` / `|_, _| {}` /
+  `|_| {}` when progress reporting is not needed"* — and six downstream surfaces
+  had copied the misreading: `README.md`, both `SKILL.md` copies,
+  `docs/design/architecture.md` (twice), `docs/llms/llms-full.txt`, the live
+  site, and the design mockups.
+
+  All corrected, and `Design::apply` now carries a **doctest**, so `cargo test
+  --doc` compiles the canonical example on every run. There were no doctests on
+  `Design` at all, which is why CI never caught this. Verified by mutation:
+  changing the doctest back to the 7-argument form fails with *"this method
+  takes 5 arguments but 7 arguments were supplied"*.
+
+### Added
+
+- **`project::survey` — is this a dbd project, and what is in it?** The cheap
+  counterpart to `Design::from_config`: reads the config and walks the layout,
+  parses no SQL. For a caller walking a repository, that ordering matters —
+  decide *whether* to parse a directory, and with which parser, before paying
+  to parse anything.
+
+  ```rust
+  if let Some(s) = dbd_core::project::survey(Path::new("."))? {
+      for file in &s.ddl_files {
+          let sql = std::fs::read_to_string(file)?;
+          let entity = dbd_core::parser::parse_entity_with(s.parser, file, &sql)?;
+      }
+  }
+  ```
+
+  Takes a project directory **or** a config path (`dbd -c` accepts a config
+  under any name, so recognising only `design.yaml` would disagree with the
+  CLI). Reports the project name, version, dialect, the `ParserChoice` that
+  dialect resolves to, schemas, and three separate file lists — `ddl_files`,
+  `policy_files`, `import_files`. Policies are SQL but not entity definitions,
+  so folding them into the DDL list would invent entities.
+
+  "Not a dbd project" is `Ok(None)`, not an error — a scanner meets far more
+  non-projects than projects. A `design.yaml` that cannot be read is `Err`, and
+  the distinction is deliberate: collapsing them means a malformed project is
+  silently skipped as "not dbd".
+
+  **What was excluded is reported, with a reason.** `migrations/` and
+  `snapshots/` hold generated SQL — a scanner that indexed them would report
+  every historical version of a table as a live entity — and
+  `ddl/procedure/staging/import_jsonb_to_table.ddl` is dbd's own plumbing.
+  Nothing absent is reported: a project with no generated output has an empty
+  exclusion list.
+
+- **`project::survey_json`** — the same as JSON, with `managed` as an explicit
+  field rather than "object vs null", and a `reason` when the answer is no.
+  `parser` is spelled as `source.parser` accepts it, so the value round-trips
+  back into a config.
+
+- **T-SQL is read.** `ParserChoice::TSql`, selected by `source.dialect: tsql`
+  (or `mssql`/`sqlserver`) and by `Dialect::detect`. A statement-head walk over
+  the token stream: `CREATE PROCEDURE [dbo].[sp_X]` declares; `FROM
+  [dbo].[Issues]` refers.
+
+  Measured over 2,154 real T-SQL files, against libpg_query's 13 declarations
+  and 94.5% parse-error rate on the same input:
+
+  | | |
+  |---|---|
+  | entities declared | **2,737** (1,285 procedure, 613 table, 506 view, 220 function, 113 trigger) |
+  | edges | 8,558 reads, 1,828 writes, 1,216 calls |
+  | files classified | 100% — a lexer has nothing to reject |
+
+  Three dialect-specific rules do the work. **`ALTER PROCEDURE` declares** —
+  T-SQL requires it to carry the complete body, so it replaces rather than
+  edits (271 files ship procedures that way); `ALTER TABLE` never does.
+  **A qualified call is an edge and a bare one is a built-in**, because T-SQL
+  *requires* a scalar UDF to be schema-qualified — the distinction is read off
+  the grammar rather than a list of built-in names that would go stale. And a
+  `DROP x` naming something the same file declares is the **redeploy idiom**,
+  not a change: counting it as one put 54.5% of the corpus in `Mixed`, and
+  resolving it correctly moved 558 files to `Declaration`.
+
+  A T-SQL entity carries **no `table_def`** — this reads statement heads, not
+  column lists — so `diff` and `reconcile` cannot run on T-SQL, the same
+  position SQLite is in and for the same reason.
+
+- **`EntityType::Trigger`** — 107 trigger files in the measured corpus, so
+  reporting one as a `Function` would be a visible lie. `CREATE TYPE` and
+  `CREATE SYNONYM` are deliberately *not* modelled: 3 files each.
+
+- **`parser::lex` — a SQL tokeniser.** Batches, comments, quoting; nothing
+  else. The first half of reading T-SQL, and a lexer rather than a grammar
+  because dbd measured the alternatives on a 2,154-file corpus and none of them
+  can read the statements it wants. After splitting `GO` batches — the most
+  generous way to ask — `sqlparser`'s `MsSqlDialect` loses **99% of
+  `CREATE PROCEDURE`, 100% of `ALTER PROCEDURE`, 95% of `CREATE TABLE`**. It
+  passes `SET`, `IF EXISTS` and `INSERT`, so an 81.9% batch-level pass rate
+  hides a near-total loss of exactly the facts a reader is reading for.
+  Microsoft's ScriptDom is complete and is .NET, a runtime dependency dbd does
+  not have.
+
+  Over the same corpus the lexer reaches **99.57% of batches** (83 of 19,299
+  yield no tokens), producing 2.5M tokens of which 1.16M are names.
+
+  `GO` is separated before anything reads a batch: it is a client directive,
+  not SQL, so no grammar accepts it. Comments and literals are *consumed* —
+  a table named in a comment is not a reference, and a real corpus is full of
+  commented-out SQL. Nested block comments, `[bracket]]escapes]`, `''` in
+  literals, and `@p`/`@@ROWCOUNT`/`#temp` consumed whole so their tails never
+  lex as phantom tables.
+
+- **`ParsedFile::kind` and `ParsedFile::dialect`, plus `parse_sql_as`.** A SQL
+  codebase is mostly not declarations — sensei measured `ALTER TABLE`
+  outnumbering `CREATE TABLE` 159 to 101 — and a change script that minted an
+  identity for the table it alters would give a caller two nodes for one table.
+  `FileKind` tells "owns this entity" from "touches it":
+
+  | | |
+  |---|---|
+  | `Declaration` | declares entities, changes nothing it does not declare |
+  | `Migration` | `ALTER`/`DROP` on objects defined elsewhere — edges, not nodes |
+  | `Data` | `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`COPY` |
+  | `Mixed` | declares *and* changes something else |
+  | `Empty` | nothing dbd recognises |
+
+  A declaration's **own** index and comment are part of it, not changes to
+  something else — otherwise every ordinary dbd table file would land in
+  `Mixed`.
+
+  `parse_sql_as(dialect, sql)` is the multi-dialect entry point; pair it with
+  `Dialect::detect`. The result records `Unstated` when nothing identified the
+  file, rather than claiming the fallback reader's dialect as the file's own.
+
+- **`source_text` — decoding a file before any parser sees it.** `std::fs::
+  read_to_string` rejects anything that is not UTF-8, and SSMS writes UTF-16LE
+  by default. Measured over a real SQL Server corpus of 2,421 `.sql`/`.ddl`
+  files: **377 UTF-16 with a BOM (15.6%) and 14 other non-UTF-8 (0.6%)** —
+  16.2% invisible before any grammar was involved.
+
+  A BOM is a positive statement of encoding and is read **first**, because
+  UTF-16LE ASCII is `X 00 X 00` and any null-byte test would otherwise call
+  every UTF-16 file binary. The BOM is then *consumed*: a parser handed
+  `\u{feff}CREATE` reports a syntax error on line 1 of a valid file.
+
+  No BOM means UTF-8 is required. Charset detection — guessing latin-1 from
+  byte frequencies — is deliberately not done: `NotUtf8` is already the
+  actionable answer, and guessing invents characters the source never carried.
+  A lossy decode is refused for the same reason, since U+FFFD in an identifier
+  is a name no use site could mint.
+
+  Ported from sensei's `classifiers::decode_source`, which reads the same trees
+  and had measured the same split.
+
+- **`parser::Dialect` — which SQL a file is, stated or detected.** Distinct
+  from `ParserChoice`, which is which reader dbd *runs*: several dialects share
+  a reader, and a dialect dbd has no reader for still has a name.
+  `ParserChoice::for_dialect_typed` is the single place one becomes the other,
+  so a config label and a detected dialect can never select different readers
+  for the same SQL.
+
+  `Dialect::detect` **fails closed**. `CREATE TABLE t (id int)` is valid in
+  every dialect and says nothing about which one it is in, so it is `Unstated`
+  — not a default, and not a guess. A tie between two dialects is `Unstated`
+  too. Markers are ported from sensei's SQL indexer, where they were scored
+  against a real multi-dialect corpus.
+
+  Nothing changes for existing projects: an unrecognised `source.dialect` still
+  falls back to libpg_query rather than erroring.
+
+- **`Entity::catalog` and `Entity::qualified_key()`** — the database level,
+  for telling two same-named tables in different databases apart.
+
+  `None` for PostgreSQL, always: cross-database references are impossible on
+  one connection, so the name would distinguish nothing. `Some` for T-SQL and
+  MySQL, where `OtherDb.dbo.Users` is an ordinary reference and MySQL's
+  `db.users` puts the *database* where dbd's model expects a schema. Without
+  the level, `dbo.Users` in two databases is one entity and a multi-database
+  scan merges them silently.
+
+  `resolve_references` now keys on `qualified_key()` (`catalog.schema.name`, or
+  `schema.name` without one). A reference naming no catalog resolves within the
+  **referring entity's** catalog first, then against a catalog-less entity —
+  mirroring how a bare schema already resolves along `search_path`. One naming
+  a catalog is taken at its word, and stays unresolved if that catalog is not
+  in the scan rather than falling back to a local table of the same name.
+
+  Invisible to every existing project: with no catalog anywhere the key *is*
+  the name, so the resolution set is byte-identical. `catalog` is
+  `skip_serializing_if = "Option::is_none"`, so snapshots neither churn nor
+  need migrating.
+
+- **`config::ProjectConfig::version()` and `DEFAULT_PROJECT_VERSION`** — one
+  answer to "what version is this project" when `design.yaml` omits it: **1**.
+  `dbd release` used `unwrap_or(1)`, so that behaviour is unchanged; the value
+  now has a name and a home.
+
+  `dbd merge`'s version-safety gate deliberately keeps its own floor of **0**
+  and is unchanged. It is not asking what version the project is — it is
+  choosing how permissive to be, and a project declaring no version has made no
+  claim to be ahead of any database. Flooring it at 1 would refuse an ordinary
+  first merge, since a managed database with no row for this project reports 0.
+  The difference is now documented on both sides and pinned by a test, so it
+  cannot be "tidied up" into a bug.
+
+- **`source.parser: verbatim`** — selects the verbatim reader explicitly.
+  `dialect: sqlite` implies it; the override exists for anything else whose DDL
+  should be applied as written.
+
 ## [0.14.0] — 2026-09-24
 
 One parser. The sqlparser DDL path retires — it was a second *PostgreSQL*
@@ -363,6 +637,7 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
 [Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.13.1...main
+[0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
 [0.13.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.1
 [0.13.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.13.0

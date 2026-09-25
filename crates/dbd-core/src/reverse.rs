@@ -355,8 +355,21 @@ pub fn plan_from_entities(
 ///
 /// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`;
 /// `"sqlite"` maps to the `sqlite` target key, everything else maps to `"postgres"`.
+///
+/// A SQLite source also gets an explicit `source.dialect: sqlite`. Everything
+/// else is left to the `postgresql` default, so a Postgres project's generated
+/// file is unchanged. That asymmetry is the point: the `source` block says how
+/// the DDL files are *read*, and until this was written a SQLite export loaded
+/// under the Postgres default — which rejects `AUTOINCREMENT`, `WITHOUT ROWID`
+/// and `STRICT`, so a project dbd had just written refused to load (issue #20).
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
-    let target_key = if dialect == "sqlite" { "sqlite" } else { "postgres" };
+    let is_sqlite = dialect == "sqlite";
+    let target_key = if is_sqlite { "sqlite" } else { "postgres" };
+    let source_block = if is_sqlite {
+        "source:\n  dialect: sqlite\n\n"
+    } else {
+        ""
+    };
     // A schema-less source (SQLite) yields no schemas — emit an explicit empty
     // sequence rather than a bare `schemas:` (which parses as null, not a list).
     let schemas_block = if schemas.is_empty() {
@@ -371,6 +384,7 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
     };
     format!(
         "project:\n  name: {project}\n  version: {version}\n\n\
+         {source_block}\
          target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
          {schemas_block}"
     )

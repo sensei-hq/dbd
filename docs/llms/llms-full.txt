@@ -881,7 +881,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.14.0
+  rev: v0.15.0
   hooks:
     - id: dbd-format
 ```
@@ -988,17 +988,20 @@ let adapter = connect("postgres://localhost/mydb", &design.config().project.name
 // Resolve the scope once (None, None ⇒ full design, the scope's default deps policy).
 let scope = design.resolve_scope(None, None)?;
 
-// apply / import_data take: (&*adapter, name, dry_run, scope,
-// on_start(&str), on_done(&str, Option<&str>), on_complete(summary)).
-// deploy drops the name and takes only on_complete: (&*adapter, dry_run,
+// apply / import_data take FIVE arguments: (&*adapter, name, dry_run, scope,
+// progress). The three callbacks travel together in one `Progress` value —
+// on_start(&str), on_done(&str, Option<&str>), on_complete(summary) — they are
+// NOT three separate arguments. `Progress::none()` for a silent run.
+// deploy drops the name and takes on_complete directly: (&*adapter, dry_run,
 // scope, on_complete(DeployComplete)).
 design
-    .apply(&*adapter, None, /*dry_run*/ false, Some(&scope),
-        |desc| println!("→ {desc}"),
-        |desc, err| if let Some(e) = err { eprintln!("✗ {desc}: {e}") },
-        |s| println!("applied {} entities", s.applied))
+    .apply(&*adapter, None, /*dry_run*/ false, Some(&scope), Progress {
+        on_start: |desc: &str| println!("→ {desc}"),
+        on_done: |desc: &str, err: Option<&str>| if let Some(e) = err { eprintln!("✗ {desc}: {e}") },
+        on_complete: |s: ApplyComplete| println!("applied {} entities", s.applied),
+    })
     .await?;
-design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
+design.import_data(&*adapter, None, false, Some(&scope), Progress::none()).await?;
 
 // Or apply + import + policies in one call — the same pipeline `dbd deploy`
 // runs, so an embedder and the CLI cannot drift. A failed policy file does not

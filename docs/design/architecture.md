@@ -223,9 +223,10 @@ use dbd_core::Design;
 let mut design = Design::from_config(Path::new("design.yaml"), "prod")?;   // sync; scans ddl/
 let adapter = dbd_core::connect(db_url, &design.config().project.name).await?;
 let scope = design.resolve_scope(None, None)?;
-// apply/import_data: (&*adapter, name, dry_run, scope, on_start, on_done, on_complete)
-design.apply(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;        // entities + migrations
-design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;  // staging data
+// apply/import_data: (&*adapter, name, dry_run, scope, progress)
+// The three callbacks travel together in one `Progress`; `Progress::none()` is silent.
+design.apply(&*adapter, None, false, Some(&scope), Progress::none()).await?;        // entities + migrations
+design.import_data(&*adapter, None, false, Some(&scope), Progress::none()).await?;  // staging data
 let report = design.report(None, None);    // inspect: errors/warnings
 
 // Mid-level: individual subsystems
@@ -276,8 +277,8 @@ async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
     let design = Design::from_config(Path::new("database/design.yaml"), "prod")?;
     let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
     let scope = design.resolve_scope(None, None)?;
-    design.apply(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
-    design.import_data(&*adapter, None, false, Some(&scope), |_| {}, |_, _| {}, |_| {}).await?;
+    design.apply(&*adapter, None, false, Some(&scope), Progress::none()).await?;
+    design.import_data(&*adapter, None, false, Some(&scope), Progress::none()).await?;
     Ok(())
 }
 ```

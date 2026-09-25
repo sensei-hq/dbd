@@ -119,16 +119,44 @@ pub struct ScopeSpec {
 
 // ── Project ─────────────────────────────────────────────
 
+/// The version a project is at when `design.yaml` does not say.
+///
+/// A project that exists is at version 1. Version 0 means "nothing has been
+/// applied", which is a fact about a *database*, not about a design file.
+///
+/// One caller deliberately does not use this: `dbd merge`'s version-safety gate
+/// floors an undeclared version at **0** instead. It is not asking what version
+/// the project is — it is choosing how permissive to be, and a project that
+/// declares no version has made no claim to be ahead of any database. Flooring
+/// at 1 there would refuse an ordinary first merge, because a managed database
+/// with no row for this project reports 0. That difference is intentional and
+/// pinned by a test at the call site.
+pub const DEFAULT_PROJECT_VERSION: u32 = 1;
+
 #[derive(Debug, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
     pub note: Option<String>,
+    /// As written. Prefer [`Self::version`] for "what version is this project"
+    /// — this field answers the narrower "did the file say so?", which only
+    /// tooling that reports on the file itself should need.
     pub version: Option<u32>,
     /// Whether the project has been released (baselined). Once released, the
     /// declarative `dbd reconcile` workflow is disabled and schema changes must
     /// go through snapshots + migrations. Set by `dbd release`.
     #[serde(default)]
     pub released: bool,
+}
+
+impl ProjectConfig {
+    /// What version this project is at, defaulting to
+    /// [`DEFAULT_PROJECT_VERSION`] when `design.yaml` omits it.
+    ///
+    /// The single answer to that question — see the constant for why it needs
+    /// to be single.
+    pub fn version(&self) -> u32 {
+        self.version.unwrap_or(DEFAULT_PROJECT_VERSION)
+    }
 }
 
 // ── Source ───────────────────────────────────────────────
@@ -645,6 +673,34 @@ pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::write(config_path, output)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod version_default_tests {
+    use super::*;
+
+    /// One answer to "what version is this project", so callers asking that
+    /// question cannot drift apart. (`dbd merge`'s safety gate floors at 0
+    /// instead — a different question, documented on the constant.)
+    #[test]
+    fn an_undeclared_version_is_one() {
+        let cfg: ProjectConfig = serde_yaml::from_str("name: p").unwrap();
+        assert_eq!(cfg.version, None, "the raw field still records that it was absent");
+        assert_eq!(cfg.version(), 1, "but the question 'what version' has one answer");
+    }
+
+    #[test]
+    fn a_declared_version_is_returned_as_written() {
+        let cfg: ProjectConfig = serde_yaml::from_str("name: p\nversion: 7").unwrap();
+        assert_eq!(cfg.version(), 7);
+    }
+
+    /// Zero is a legitimate declared value and must not be mistaken for absent.
+    #[test]
+    fn a_declared_zero_is_not_the_default() {
+        let cfg: ProjectConfig = serde_yaml::from_str("name: p\nversion: 0").unwrap();
+        assert_eq!(cfg.version(), 0);
+    }
 }
 
 #[cfg(test)]
