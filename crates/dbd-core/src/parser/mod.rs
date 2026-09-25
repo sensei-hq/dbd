@@ -1,18 +1,27 @@
+mod dialect;
 pub(crate) mod pg;
+
+pub use dialect::Dialect;
 
 use std::path::Path;
 
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 
-/// Which parser reads a project's DDL.
+/// Which reader dbd runs over a file.
 ///
-/// Two variants, for the two shapes of model dbd has. It was two during the
-/// libpg_query migration as well, but for a different reason: `Sqlparser` held
-/// a second implementation as an escape hatch, and that implementation
-/// hardcoded `PostgreSqlDialect`, so it was never a *dialect* selector at all.
-/// It retired once every file-backed type became native (see
-/// `pg::PgQueryDdl::COVERED`, or [`pg_native_types`]).
+/// Not the same question as [`Dialect`], which is what the SQL *is*. Several
+/// dialects can share a reader, and a dialect dbd has no reader for still has a
+/// name — [`Self::for_dialect_typed`] is the one place one becomes the other.
+///
+/// Two variants, for the two shapes of model dbd has: a structured one that
+/// `reconcile` can diff, and the file's own text for targets where that text is
+/// the schema. It was two during the libpg_query migration as well, but for a
+/// different reason — `Sqlparser` held a second implementation as an escape
+/// hatch, and that implementation hardcoded `PostgreSqlDialect`, so it was
+/// never a dialect selector at all. It retired once every file-backed type
+/// became native (see `pg::PgQueryDdl::COVERED`, or [`pg_native_types`]).
+///
 /// Serializes as the value `source.parser` accepts (`pg_query`, `verbatim`), so
 /// a reported choice round-trips back into a config rather than needing a
 /// second mapping to be invented at the boundary.
@@ -59,22 +68,37 @@ impl ParserChoice {
         }
     }
 
-    /// The parser a `source.dialect` selects when `source.parser` is unset.
+    /// The parser a `source.dialect` label selects when `source.parser` is
+    /// unset.
     ///
-    /// `sqlite` takes the verbatim path, matching how its own adapter models a
-    /// table. Everything else takes libpg_query: PostgreSQL is the only grammar
-    /// dbd parses structurally, and `postgresql` is the default for a project
-    /// that declares no dialect at all.
-    ///
-    /// An *unrecognised* dialect is deliberately not an error here. It would be
-    /// a breaking change for a value someone already has in a working project,
-    /// and the failure it would prevent surfaces anyway the moment libpg_query
+    /// An *unrecognised* label is deliberately not an error here. It would be a
+    /// breaking change for a value someone already has in a working project,
+    /// and the failure it would prevent surfaces anyway the moment the reader
     /// rejects a file — with the offending SQL named, which is more use than a
     /// complaint about a config string.
-    fn for_dialect(dialect: &str) -> Self {
+    fn for_dialect(label: &str) -> Self {
+        match Dialect::from_label(label) {
+            Some(d) => Self::for_dialect_typed(d),
+            None => Self::PgQuery,
+        }
+    }
+
+    /// The reader a dialect is read by.
+    ///
+    /// The single mapping from *what the SQL is* to *how dbd reads it*. Both
+    /// the stated path ([`Self::resolve`], from `source.dialect`) and the
+    /// detected path ([`Dialect::detect`]) go through here, so a config label
+    /// and a detected dialect can never select different readers for the same
+    /// SQL.
+    ///
+    /// `Sqlite` reads verbatim, matching how its own adapter models a table.
+    /// [`Dialect::Unstated`] falls back to libpg_query — it has no reader of
+    /// its own, and a file that reader cannot read reports why, which is the
+    /// one thing a caller can rely on.
+    pub fn for_dialect_typed(dialect: Dialect) -> Self {
         match dialect {
-            "sqlite" => Self::Verbatim,
-            _ => Self::PgQuery,
+            Dialect::Sqlite => Self::Verbatim,
+            Dialect::PostgreSql | Dialect::TSql | Dialect::MySql | Dialect::Unstated => Self::PgQuery,
         }
     }
 }
