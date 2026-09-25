@@ -100,6 +100,19 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
 
+- **`config::ProjectConfig::version()` and `DEFAULT_PROJECT_VERSION`** — one
+  answer to "what version is this project" when `design.yaml` omits it: **1**.
+  `dbd release` used `unwrap_or(1)`, so that behaviour is unchanged; the value
+  now has a name and a home.
+
+  `dbd merge`'s version-safety gate deliberately keeps its own floor of **0**
+  and is unchanged. It is not asking what version the project is — it is
+  choosing how permissive to be, and a project declaring no version has made no
+  claim to be ahead of any database. Flooring it at 1 would refuse an ordinary
+  first merge, since a managed database with no row for this project reports 0.
+  The difference is now documented on both sides and pinned by a test, so it
+  cannot be "tidied up" into a bug.
+
 - **`source.parser: verbatim`** — selects the verbatim reader explicitly.
   `dialect: sqlite` implies it; the override exists for anything else whose DDL
   should be applied as written.
