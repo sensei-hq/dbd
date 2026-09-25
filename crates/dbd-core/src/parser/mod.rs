@@ -186,7 +186,7 @@ pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result
                 tsql::WalkRules::TSQL
             };
             let mut entity = Entity::from_file(file);
-            let (declared, _) = tsql::read(rules, sql);
+            let (declared, _, _) = tsql::read(rules, sql);
             if let Some(found) = declared.into_iter().next() {
                 entity.entity_type = found.entity_type;
                 entity.refers = found.refers;
@@ -241,7 +241,15 @@ pub enum FileKind {
     Data,
     /// Declares something *and* changes something else, or mixes data in.
     Mixed,
-    /// Nothing dbd recognises — a bare `SELECT`, a file of comments.
+    /// Declares nothing, changes nothing, moves no rows — a bare `SELECT`, a
+    /// file of comments.
+    ///
+    /// **Not the same as "says nothing".** A read-only script still refers to
+    /// what it reads, and those references are on
+    /// [`ParsedFile::references`] — 140 of them across 109 such files in a
+    /// 2,154-file corpus. The name is kept because it is the serialized value
+    /// (`"empty"`) callers already match on, but read it as "none of the three
+    /// things a file is normally for", not as "no information here".
     #[default]
     Empty,
 }
@@ -267,6 +275,63 @@ pub struct ParsedFile {
     /// File-level failures — SQL Postgres itself rejects. Per-entity problems
     /// stay on `Entity::errors`.
     pub errors: Vec<String>,
+    /// What the file referred to outside any declaration it makes — see
+    /// [`FileReferences`].
+    pub references: FileReferences,
+}
+
+/// What a file referred to outside any declaration it makes.
+///
+/// # Why a file needs these at all
+///
+/// A reference is normally the property of the thing that makes it: a
+/// procedure that selects from `dbo.Issues` owns that edge. But most SQL in
+/// the world is not inside a declaration. A data script, a migration, an
+/// ad-hoc report — these declare nothing and are nothing *but* references, and
+/// attributing their references to whatever the file happens to declare next
+/// would fabricate an edge that the source does not contain.
+///
+/// So the reference is reported as the file's, which is what it is. Nothing is
+/// attached to an entity that did not make it.
+///
+/// Measured over a 2,154-file T-SQL corpus (issue #21): **20,929 of 43,754
+/// references (47.8%)** were made outside any declaration, two-thirds of them
+/// in pure data scripts where the references are the file's entire content.
+/// Before this existed they were dropped, and such a file read as nothing.
+///
+/// # Which reader fills this in
+///
+/// The statement-head readers — [`ParserChoice::TSql`] and
+/// [`ParserChoice::MySql`]. The PostgreSQL reader does not: it works from
+/// libpg_query's statement list, where a `CREATE FUNCTION` carries its body as
+/// one node, so it has no notion of a reference floating outside a
+/// declaration. A bare `SELECT` in a Postgres file contributes nothing today
+/// and this does not change that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileReferences {
+    /// Tables and views read — `FROM`, `JOIN`, and a foreign key's target.
+    pub reads: Vec<String>,
+    /// Tables written — `INSERT INTO`, `UPDATE`, `MERGE`, and the object an
+    /// `ALTER`/`DROP` names.
+    pub writes: Vec<String>,
+    /// Procedures and functions invoked — `EXEC`, and a schema-qualified call
+    /// in an expression.
+    pub calls: Vec<String>,
+}
+
+impl FileReferences {
+    /// Whether the file referred to nothing outside its declarations.
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty() && self.writes.is_empty() && self.calls.is_empty()
+    }
+
+    /// Every name referred to, in `reads`, `writes`, `calls` order.
+    ///
+    /// For a caller that wants the edges without caring which kind each is —
+    /// a dependency graph that only asks "does this file touch that object".
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        self.reads.iter().chain(&self.writes).chain(&self.calls)
+    }
 }
 
 /// Read every entity a SQL file declares, taking identity from the statements.
@@ -330,7 +395,7 @@ pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
             } else {
                 (tsql::WalkRules::TSQL, Dialect::TSql)
             };
-            let (entities, signals) = tsql::read(rules, sql);
+            let (entities, references, signals) = tsql::read(rules, sql);
             Ok(ParsedFile {
                 kind: match (signals.declares, signals.changes, signals.data) {
                     (false, false, false) => FileKind::Empty,
@@ -346,6 +411,7 @@ pub fn parse_sql_with(choice: ParserChoice, sql: &str) -> Result<ParsedFile> {
                 // states.
                 search_paths: Vec::new(),
                 errors: Vec::new(),
+                references,
             })
         }
         ParserChoice::Verbatim => Err(DbdError::Config(

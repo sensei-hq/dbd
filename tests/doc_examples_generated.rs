@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x138d6036f12b148c
+// docs-digest: 0xb38960ddb587f49f
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -165,6 +165,35 @@ async fn doc_docs_skills_dbd_skill_md_2() -> dbd_core::Result<()> {
     Ok(())
 }
 
+// docs/skills/dbd/SKILL.md — block 3
+#[allow(unused, clippy::all)]
+async fn doc_docs_skills_dbd_skill_md_3() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::parser::{Dialect, parse_sql_as};
+
+    let parsed = parse_sql_as(Dialect::TSql, sql)?;
+    for e in &parsed.entities {
+        println!("{} reads {:?}", e.name, e.reads); // owned by a declaration
+    }
+    println!("the file itself reads {:?}", parsed.references.reads);
+    println!("        writes {:?}", parsed.references.writes);
+    println!("        calls  {:?}", parsed.references.calls);
+    Ok(())
+}
+
 // src/assets/skills/dbd/SKILL.md — block 0
 #[allow(unused, clippy::all)]
 async fn doc_src_assets_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
@@ -281,6 +310,35 @@ async fn doc_src_assets_skills_dbd_skill_md_2() -> dbd_core::Result<()> {
 
     let parsed = parse_sql_as(Dialect::detect(sql), sql)?;
     println!("{:?} file, read as {:?}", parsed.kind, parsed.dialect);
+    Ok(())
+}
+
+// src/assets/skills/dbd/SKILL.md — block 3
+#[allow(unused, clippy::all)]
+async fn doc_src_assets_skills_dbd_skill_md_3() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::parser::{Dialect, parse_sql_as};
+
+    let parsed = parse_sql_as(Dialect::TSql, sql)?;
+    for e in &parsed.entities {
+        println!("{} reads {:?}", e.name, e.reads); // owned by a declaration
+    }
+    println!("the file itself reads {:?}", parsed.references.reads);
+    println!("        writes {:?}", parsed.references.writes);
+    println!("        calls  {:?}", parsed.references.calls);
     Ok(())
 }
 

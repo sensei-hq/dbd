@@ -9,6 +9,50 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **A file's references are no longer thrown away** ([#21]). `ParsedFile` grows
+  a `references` field — `reads`, `writes`, `calls` — carrying what the file
+  referred to outside any declaration it makes.
+
+  The statement-head walk attributed every reference to the most recent
+  declaration in its batch and **dropped** anything made before there was one.
+  The reasoning was half right: attaching a reference to whatever happens to be
+  declared next *would* fabricate an edge. But "it belongs to the file" is a
+  third answer, and dbd had nowhere to put it.
+
+  Measured over a 2,154-file T-SQL corpus: the walk calls `refer()` **43,754**
+  times and was discarding **20,929 of them (47.8%)**. An independent reader
+  over the same corpus found 43,737 references — within 0.04% — so nothing was
+  being missed in extraction; it was being dropped at the last step. Two-thirds
+  of the loss was 278 pure data scripts, where the references are the whole
+  content of the file.
+
+  Deduplicated per file, as entity references already were, that is **4,059
+  file-level references**, total 10,695 → 14,754 (+38%). The number that
+  matters: **817 of 2,154 files (38%) went from reporting nothing at all to
+  reporting something.**
+
+  Nothing is attached to an entity that did not make it. Filled in by the
+  `TSql` and `MySql` readers; the PostgreSQL reader leaves it empty, and that is
+  not an omission — libpg_query hands back a statement list where a function
+  carries its body as one node, so a reference cannot float outside its
+  declaration there.
+
+  One hypothesis was measured and rejected rather than built: re-attaching a
+  later `ALTER TABLE x` batch to an `x` declared earlier in the same file is
+  worth 182 references of the 20,929.
+
+### Changed
+
+- **`FileKind::Empty` documents what it does and does not mean.** It means
+  "declares nothing, changes nothing, moves no rows" — not "says nothing". A
+  read-only script lands there and now reports what it reads (140 references
+  across 109 such files in the corpus). The variant is not renamed: `"empty"`
+  is the serialized value callers match on.
+
+[#21]: https://github.com/sensei-hq/dbd/issues/21
+
 ## [0.16.0] — 2026-09-25
 
 **MySQL** joins PostgreSQL, T-SQL and SQLite: `source.dialect: mysql` selects
