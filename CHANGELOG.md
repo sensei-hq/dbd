@@ -9,6 +9,30 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-25
+
+Two reports from an embedder reading SQL through `parse_sql_as`, both about
+references dbd was quietly getting wrong rather than failing to find.
+
+The first ([#21]) measured dbd extracting **half** the references a reader it
+had replaced found on the same corpus. Instrumenting the walk showed dbd
+calling `refer()` 43,754 times against the other reader's 43,737 — within
+0.04%. Nothing was being missed; 47.8% was being **discarded** one line later,
+for want of a declaration to hang it on. A data script that is nothing but
+`INSERT INTO a SELECT FROM b` reported nothing at all. It now reports what it
+touched: **817 of 2,154 files went from silent to saying something.**
+
+The second ([#22]) is about honesty rather than volume. A bare `REFERENCES
+parent` is qualified with `search_path[0]`, and the result was the same string
+as a source that wrote it — so a consumer could not tell a fact from a guess.
+Now it can. Implementing it exposed a defect nobody had reported: the resolver
+used the *value* as a proxy for "dbd guessed this", and could therefore
+re-point a schema the source had explicitly written.
+
+**Breaking:** `ParsedFile`, `Reference` and `ForeignKey` each gained a field.
+Code that constructs them with a struct literal needs `..Default::default()` or
+the new field. Nothing changes for code that only reads them.
+
 ### Added
 
 - **A file's references are no longer thrown away** ([#21]). `ParsedFile` grows
@@ -833,7 +857,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.16.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.17.0...main
+[0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
 [0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
 [0.14.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.14.0
