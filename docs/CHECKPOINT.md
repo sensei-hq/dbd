@@ -34,6 +34,34 @@ SQLite round-trip fixed on top, unreleased.
   the canonical example — there were no doctests on `Design` at all, which is
   why CI never caught it.
 
+- **`project::survey` + `survey_json`** (`71a5da8` red, `c80295e` green) — is a
+  directory a dbd project, and what is in it? Config + layout, no SQL parsed.
+  Reports dialect, `ParserChoice`, three file lists, and exclusions with
+  reasons. `Ok(None)` for "not a project", `Err` for "broken project".
+- **Project-version default named** (`db912dd`) — `ProjectConfig::version()` →
+  `DEFAULT_PROJECT_VERSION` (1), used by `release` and `survey`. `dbd merge`
+  deliberately keeps its own floor of 0 (a permissive safety gate, not the same
+  question); documented both sides and pinned by a test asserting BOTH values.
+
+## Sensei integration — measured, not assumed
+
+`sensei/crates/senseid` **already depends on `dbd-core` at tag v0.14.0**.
+
+- Its **PostgreSQL** half reads through dbd (`the_postgres_corpus_reads_through_dbd`
+  — "the reading is dbd's").
+- Its **T-SQL** half is its own: `indexer/lang/sql/{lex,tsql,postgres}.rs`,
+  ~1,500 lines, with a corpus gate. **dbd should not build T-SQL** — that would
+  be a second weaker implementation of something that works, which is the
+  mistake this whole release undid.
+- `adapters/manifest/dbd.rs` re-implements a partial `design.yaml` reader
+  (`stated_dialect -> Option<String>`). `project::survey` replaces it and
+  upgrades the answer to a real `ParserChoice` + file list + exclusions.
+- **Their measured finding dbd should adopt:** a change script is not a
+  declaration. `CREATE` declares; `ALTER`/`DROP` *refer*. Over their corpus
+  `ALTER TABLE` outnumbers `CREATE TABLE` 159:101. dbd's `parse_sql` currently
+  **drops** an ALTER naming an undeclared table — correct inside a dbd project,
+  but on a foreign corpus it discards more edges than it keeps.
+
 ## Next
 
 Nothing queued. Candidates:
