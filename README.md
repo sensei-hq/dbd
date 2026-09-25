@@ -272,6 +272,7 @@ dbd-core = { git = "https://github.com/sensei-hq/dbd" }
 ```rust
 use dbd_core::Design;
 use dbd_core::adapter::postgres::PostgresAdapter;
+use dbd_core::design::Progress;
 use std::path::Path;
 
 async fn run_migrations(database_url: &str) -> anyhow::Result<()> {

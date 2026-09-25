@@ -9,7 +9,43 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **Doc examples that did not compile.** Found by the gate below on its first
+  run, which is the point of it:
+  - `Progress` and `ApplyComplete` were used without being imported, on four
+    surfaces. A reader copying any of them got an unresolved-name error.
+  - `design.report()` takes `&mut self`, and both `SKILL.md` copies wrote
+    `let design` — while `llms-full.txt` correctly wrote `let mut design`. Two
+    surfaces documenting the same call, disagreeing.
+
 ### Added
+
+- **Every Rust example in the embedder-facing docs is now compiled**
+  (`tests/doc_examples.rs`). Extracted from README, both `SKILL.md` copies and
+  `llms-full.txt` into a committed file that cargo builds as a test target, so
+  an example that does not typecheck is a build failure. A digest of the
+  extracted blocks is embedded, and a second test fails if a doc changed
+  without regenerating — compiling a stale copy would prove nothing about what
+  users read.
+
+  This exists because `Design::apply`'s examples were wrong on **six** surfaces
+  at once and nothing noticed for want of anything compiling them. Verified by
+  reverting one example to the old 7-argument form: the build fails with the
+  original error, `this method takes 5 arguments but 7 arguments were supplied`.
+
+  Scope is deliberate — `architecture.md`'s 34 blocks are design prose, not
+  code to copy. A block opts out with ` ```rust,ignore `.
+
+- **Facts the docs state are checked against the code**
+  (`tests/docs_match_code.rs`): the two `SKILL.md` copies are byte-identical,
+  every `source.parser` value the guide lists is one the resolver accepts, the
+  guide's dialect→reader table matches `for_dialect_typed`, the readers the
+  guide says cannot be diffed are the ones that produce no `table_def`, and
+  every scaffolded `ddl/` folder is named somewhere a reader will look.
+
+  Not wording — facts with one right answer. A test that pins a sentence breaks
+  on a harmless rewrite and teaches people to delete tests.
 
 - **MySQL is read.** `ParserChoice::MySql`, selected by `source.dialect: mysql`
   (or `mariadb`) and by `Dialect::detect`. The same statement-head walk as
