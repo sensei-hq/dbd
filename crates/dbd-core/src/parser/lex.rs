@@ -41,6 +41,39 @@
 //! because [`quoted`] slices from the source — and SSMS brackets identifiers
 //! as a matter of course, so this is a narrow gap rather than a common one.
 
+/// Which characters this dialect gives special meaning to.
+///
+/// The lexer cannot be dialect-blind, because two dialects disagree about the
+/// same character. `#` starts a line comment in MySQL and a temp-table name in
+/// T-SQL: read one way in the other's file and either every comment becomes a
+/// phantom table, or every temp table swallows the rest of its line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexRules {
+    /// `#` begins a line comment. MySQL. Mutually exclusive with reading
+    /// `#temp` as a name, which is why this is a rule rather than a guess.
+    pub hash_is_comment: bool,
+    /// `` `name` `` quotes an identifier, with ``` `` ``` as the escape. MySQL.
+    pub backtick_quotes: bool,
+    /// `[name]` quotes an identifier, with `]]` as the escape. T-SQL.
+    pub bracket_quotes: bool,
+}
+
+impl LexRules {
+    /// T-SQL: brackets quote, `#` starts a temp-table name.
+    pub const TSQL: Self = Self {
+        hash_is_comment: false,
+        backtick_quotes: false,
+        bracket_quotes: true,
+    };
+
+    /// MySQL: backticks quote, `#` starts a comment.
+    pub const MYSQL: Self = Self {
+        hash_is_comment: true,
+        backtick_quotes: true,
+        bracket_quotes: false,
+    };
+}
+
 /// One token. Deliberately small: a reader needs to know WHICH WORD is here
 /// and where a statement ends, and nothing about expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +191,13 @@ fn quoted(sql: &str, i: &mut usize, closer: u8) -> String {
 /// Comments and literals are CONSUMED rather than emitted: a table named in a
 /// comment is not a reference, and a real corpus is full of commented-out SQL.
 pub fn tokens(sql: &str) -> Vec<Tok<'_>> {
+    tokens_with(LexRules::TSQL, sql)
+}
+
+/// Tokenise one batch under a dialect's rules.
+///
+/// See [`LexRules`] for why the rules cannot be inferred from the text.
+pub fn tokens_with(rules: LexRules, sql: &str) -> Vec<Tok<'_>> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -206,9 +246,14 @@ pub fn tokens(sql: &str) -> Vec<Tok<'_>> {
                 out.push(Tok::Literal);
             }
             // `[Order Details]`, with `]]` as the escape.
-            b'[' => {
+            b'[' if rules.bracket_quotes => {
                 i += 1;
                 out.push(Tok::Quoted(quoted(sql, &mut i, b']')));
+            }
+            // `` `order` ``, with ``` `` ``` as the escape.
+            b'`' if rules.backtick_quotes => {
+                i += 1;
+                out.push(Tok::Quoted(quoted(sql, &mut i, b'`')));
             }
             // `"Order"` under QUOTED_IDENTIFIER ON, which is the default.
             b'"' => {
@@ -218,6 +263,12 @@ pub fn tokens(sql: &str) -> Vec<Tok<'_>> {
             // `@p`, `@@ROWCOUNT`, `#temp`, `##global` — none of them a name
             // this reader records, but all of them consumed WHOLE so their tail
             // is not read as a bare identifier and minted as a phantom table.
+            // `# line comment` in MySQL, where `#` is never part of a name.
+            b'#' if rules.hash_is_comment => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'@' | b'#' => {
                 let start = i;
                 i += 1;
