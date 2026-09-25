@@ -100,6 +100,44 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `parser` is spelled as `source.parser` accepts it, so the value round-trips
   back into a config.
 
+- **`parser::Dialect` — which SQL a file is, stated or detected.** Distinct
+  from `ParserChoice`, which is which reader dbd *runs*: several dialects share
+  a reader, and a dialect dbd has no reader for still has a name.
+  `ParserChoice::for_dialect_typed` is the single place one becomes the other,
+  so a config label and a detected dialect can never select different readers
+  for the same SQL.
+
+  `Dialect::detect` **fails closed**. `CREATE TABLE t (id int)` is valid in
+  every dialect and says nothing about which one it is in, so it is `Unstated`
+  — not a default, and not a guess. A tie between two dialects is `Unstated`
+  too. Markers are ported from sensei's SQL indexer, where they were scored
+  against a real multi-dialect corpus.
+
+  Nothing changes for existing projects: an unrecognised `source.dialect` still
+  falls back to libpg_query rather than erroring.
+
+- **`Entity::catalog` and `Entity::qualified_key()`** — the database level,
+  for telling two same-named tables in different databases apart.
+
+  `None` for PostgreSQL, always: cross-database references are impossible on
+  one connection, so the name would distinguish nothing. `Some` for T-SQL and
+  MySQL, where `OtherDb.dbo.Users` is an ordinary reference and MySQL's
+  `db.users` puts the *database* where dbd's model expects a schema. Without
+  the level, `dbo.Users` in two databases is one entity and a multi-database
+  scan merges them silently.
+
+  `resolve_references` now keys on `qualified_key()` (`catalog.schema.name`, or
+  `schema.name` without one). A reference naming no catalog resolves within the
+  **referring entity's** catalog first, then against a catalog-less entity —
+  mirroring how a bare schema already resolves along `search_path`. One naming
+  a catalog is taken at its word, and stays unresolved if that catalog is not
+  in the scan rather than falling back to a local table of the same name.
+
+  Invisible to every existing project: with no catalog anywhere the key *is*
+  the name, so the resolution set is byte-identical. `catalog` is
+  `skip_serializing_if = "Option::is_none"`, so snapshots neither churn nor
+  need migrating.
+
 - **`config::ProjectConfig::version()` and `DEFAULT_PROJECT_VERSION`** — one
   answer to "what version is this project" when `design.yaml` omits it: **1**.
   `dbd release` used `unwrap_or(1)`, so that behaviour is unchanged; the value
