@@ -284,3 +284,245 @@ fn the_file_kinds_of_a_real_corpus_are_recorded() {
     println!("  NOTE: these are T-SQL files read by the PostgreSQL reader —");
     println!("  the parse-error share is the gap the T-SQL reader closes.\n");
 }
+
+/// **Is an off-the-shelf parser good enough for T-SQL?**
+///
+/// The question dbd has to answer before writing a reader of its own, and the
+/// answer has to be measured rather than inherited. Sensei measured
+/// `sqlparser`'s `MsSqlDialect` at 28% of files parsed whole over 331 files;
+/// this asks the same of every T-SQL file here, which is a far larger sample
+/// and one that includes the UTF-16 files a UTF-8-only reader never saw.
+///
+/// `sqlparser` is already a dependency (the formatter uses it), so this costs
+/// nothing to ask. If the number were high, dbd should use it and not write a
+/// lexer. Reported, not asserted: a threshold here would be a claim about
+/// somebody's codebase.
+#[test]
+#[ignore]
+fn how_much_of_the_tsql_corpus_an_off_the_shelf_parser_reads() {
+    use sqlparser::dialect::{GenericDialect, MsSqlDialect, PostgreSqlDialect};
+    use sqlparser::parser::Parser;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut mssql_ok = 0usize;
+    let mut generic_ok = 0usize;
+    let mut pg_ok = 0usize;
+    let mut libpg_ok = 0usize;
+
+    for sql in &tsql {
+        if Parser::parse_sql(&MsSqlDialect {}, sql).is_ok() {
+            mssql_ok += 1;
+        }
+        if Parser::parse_sql(&GenericDialect {}, sql).is_ok() {
+            generic_ok += 1;
+        }
+        if Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok() {
+            pg_ok += 1;
+        }
+        if pg_query::parse(sql).is_ok() {
+            libpg_ok += 1;
+        }
+    }
+
+    let n = tsql.len();
+    println!("\n── whole-file parse rate over {n} detected T-SQL files ──");
+    println!(
+        "  sqlparser MsSqlDialect       {mssql_ok:>6}  ({:.1}%)",
+        pct(mssql_ok, n)
+    );
+    println!(
+        "  sqlparser GenericDialect     {generic_ok:>6}  ({:.1}%)",
+        pct(generic_ok, n)
+    );
+    println!("  sqlparser PostgreSqlDialect  {pg_ok:>6}  ({:.1}%)", pct(pg_ok, n));
+    println!(
+        "  libpg_query                  {libpg_ok:>6}  ({:.1}%)",
+        pct(libpg_ok, n)
+    );
+    println!("\n  A reader dbd would rely on has to clear these.\n");
+}
+
+/// **Does splitting `GO` batches rescue an off-the-shelf parser?**
+///
+/// The obvious confound in the measurement above. `GO` is not SQL — it is a
+/// client directive that sqlcmd and SSMS use to split a file into batches — so
+/// no grammar accepts it, and nearly every file in a SQL Server codebase has
+/// one. A whole-file parse rate therefore measures `GO` as much as it measures
+/// the grammar.
+///
+/// This splits first and asks again. It matters: if a batch splitter plus
+/// `sqlparser` reads most of a corpus, dbd should write the splitter and stop,
+/// rather than write a reader. That is roughly a thousand lines of difference,
+/// so it is worth the fifty this costs to ask.
+#[test]
+#[ignore]
+fn whether_splitting_go_batches_rescues_an_off_the_shelf_parser() {
+    use sqlparser::dialect::MsSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    /// Split on a line that is exactly `GO` — the same rule `Dialect::detect`
+    /// counts batches with.
+    fn batches(sql: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for line in sql.lines() {
+            let t = line.trim();
+            let mut c = t.chars();
+            let is_go = matches!(c.next(), Some('g' | 'G'))
+                && matches!(c.next(), Some('o' | 'O'))
+                && c.as_str().trim().is_empty();
+            if is_go {
+                out.push(String::new());
+            } else {
+                out.last_mut().unwrap().push_str(line);
+                out.last_mut().unwrap().push('\n');
+            }
+        }
+        out.retain(|b| !b.trim().is_empty());
+        out
+    }
+
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut whole_file = 0usize;
+    let mut total_batches = 0usize;
+    let mut ok_batches = 0usize;
+
+    for sql in &tsql {
+        let bs = batches(sql);
+        let mut all = true;
+        for b in &bs {
+            total_batches += 1;
+            if Parser::parse_sql(&MsSqlDialect {}, b).is_ok() {
+                ok_batches += 1;
+            } else {
+                all = false;
+            }
+        }
+        if all && !bs.is_empty() {
+            whole_file += 1;
+        }
+    }
+
+    let n = tsql.len();
+    println!("\n── MsSqlDialect AFTER splitting GO batches, {n} T-SQL files ──");
+    println!(
+        "  files where every batch parses  {whole_file:>6}  ({:.1}%)",
+        pct(whole_file, n)
+    );
+    println!(
+        "  batches that parse              {ok_batches:>6}  ({:.1}%)  of {total_batches}",
+        pct(ok_batches, total_batches)
+    );
+    println!("\n  If this were high, a splitter + sqlparser would beat writing a reader.\n");
+}
+
+/// **WHICH batches does an off-the-shelf parser fail on?**
+///
+/// 81.9% of batches parsing sounds like a usable reader. It only is if the
+/// 18.1% that fail are unimportant — and the suspicion is the opposite. A
+/// `CREATE PROCEDURE` body is where a T-SQL codebase keeps its table
+/// references, and `CREATE PROCEDURE dbo.x @p int AS` is the parenless
+/// parameter form `MsSqlDialect` is known to reject. If the failures are
+/// concentrated there, an 81.9% batch rate hides a near-total loss of exactly
+/// the facts dbd wants.
+#[test]
+#[ignore]
+fn which_batches_an_off_the_shelf_parser_fails_on() {
+    use sqlparser::dialect::MsSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let Some(root) = corpus() else {
+        println!("DBD_SQL_CORPUS unset or not a directory — nothing to measure.");
+        return;
+    };
+
+    fn batches(sql: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for line in sql.lines() {
+            let t = line.trim();
+            let mut c = t.chars();
+            let is_go = matches!(c.next(), Some('g' | 'G'))
+                && matches!(c.next(), Some('o' | 'O'))
+                && c.as_str().trim().is_empty();
+            if is_go {
+                out.push(String::new());
+            } else {
+                out.last_mut().unwrap().push_str(line);
+                out.last_mut().unwrap().push('\n');
+            }
+        }
+        out.retain(|b| !b.trim().is_empty());
+        out
+    }
+
+    /// The first two words, which is what a statement head amounts to.
+    fn head(batch: &str) -> String {
+        let cleaned: String = batch
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        cleaned
+            .split_whitespace()
+            .take(2)
+            .map(|w| w.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let tsql: Vec<String> = sql_files(&root)
+        .iter()
+        .filter_map(|f| dbd_core::source_text::read_to_string(f).ok())
+        .filter(|s| Dialect::detect(s) == Dialect::TSql)
+        .collect();
+
+    let mut failed: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut passed: std::collections::BTreeMap<String, usize> = Default::default();
+
+    for sql in &tsql {
+        for b in batches(sql) {
+            let h = head(&b);
+            if Parser::parse_sql(&MsSqlDialect {}, &b).is_ok() {
+                *passed.entry(h).or_default() += 1;
+            } else {
+                *failed.entry(h).or_default() += 1;
+            }
+        }
+    }
+
+    let mut top: Vec<(&String, &usize)> = failed.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1));
+
+    println!("\n── the batches MsSqlDialect FAILS on, by statement head ──");
+    for (h, n) in top.iter().take(12) {
+        let ok = passed.get(*h).copied().unwrap_or(0);
+        let total = *n + ok;
+        println!(
+            "  {:<28} failed {:>5} of {:>5}  ({:.0}% lost)",
+            h,
+            n,
+            total,
+            pct(**n, total)
+        );
+    }
+    println!("\n  A head that is mostly lost is a fact dbd would not have.\n");
+}
