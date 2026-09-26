@@ -131,7 +131,12 @@ bump: _check-clean _check-ci
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
 	@sed -i '' 's|dbd-core = { path = "crates/dbd-core", version = "$(VERSION)" }|dbd-core = { path = "crates/dbd-core", version = "$(NEW)" }|' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
-	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
+##  The website serves a COPY of every guide page and the llms files, so the
+##  rewrite has to reach both or the published site keeps the old pin. It did
+##  exactly that: the site said `rev: v0.13.0` six releases after docs/ moved
+##  on, because only the docs/ path was listed here.
+	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt \
+	  site/src/lib/content/guide/04-commands.md site/src/lib/content/llms/llms-full.txt
 ##  sensei.library.json carries two version-coupled fields that consumers rely on
 ##  to answer "are these docs for the release I depend on?": `documents` (the
 ##  concrete release the published docs describe) and `ref` (the tag to fetch the
@@ -143,7 +148,8 @@ bump: _check-clean _check-ci
 	@sed -i '' 's/"documents": "[^"]*"/"documents": "$(NEW)"/' sensei.library.json
 	@sed -i '' 's/"ref": "v[0-9]*\.[0-9]*\.[0-9]*"/"ref": "v$(NEW)"/' sensei.library.json
 	@cargo build -q
-	@git add Cargo.lock Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt sensei.library.json
+	@git add Cargo.lock Cargo.toml site/package.json README.md docs/guide/04-commands.md docs/llms/llms-full.txt \
+	  site/src/lib/content/guide/04-commands.md site/src/lib/content/llms/llms-full.txt sensei.library.json
 	@git commit -m "chore: bump version to v$(NEW)"
 	@git tag -a "v$(NEW)" -m "v$(NEW)"
 	@echo "Pushing $(BRANCH) and v$(NEW)..."
