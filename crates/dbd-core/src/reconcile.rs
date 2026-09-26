@@ -292,7 +292,8 @@ fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
 fn normalize_column_types(t: &mut snapshot::TableSnapshot, enum_types: &HashMap<String, String>) {
     for c in &mut t.columns {
         c.data_type = canonical_type(&c.data_type, enum_types);
-        c.default_value = c.default_value.as_deref().map(canonical_default);
+        let ty = c.data_type.clone();
+        c.default_value = c.default_value.as_deref().map(|d| canonical_default(d, &ty));
         c.generated = c.generated.as_deref().map(canonical_generated);
         c.is_pk = false;
         c.is_unique = false;
@@ -486,8 +487,131 @@ fn canonical_datetime(s: &str) -> Option<String> {
 /// comes back `now()`, `coalesce(…)` comes back `COALESCE(…)`. Comparing those
 /// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
 /// re-spelled, so the next diff reported the same change — forever.
-fn canonical_default(raw: &str) -> String {
-    fold_unquoted_case(strip_trailing_cast(raw.trim()).trim())
+fn canonical_default(raw: &str, data_type: &str) -> String {
+    let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
+    canonical_default_for_type(&base, data_type).unwrap_or(base)
+}
+
+/// Settle a literal the server rewrites when it stores it (#18).
+///
+/// Stripping the cast and folding case is not enough for the types where
+/// Postgres does not keep what you wrote. Measured on a live server:
+///
+/// | written | stored |
+/// |---|---|
+/// | `'{"b":1,"a":2}'` (jsonb) | `'{"a": 2, "b": 1}'` |
+/// | `'epoch'` (timestamptz) | `'1969-12-31 18:00:00-06'` |
+/// | `'t'` (boolean) | `true` |
+///
+/// Each of these read as permanent drift: reconcile emitted a `SET DEFAULT`,
+/// the server rewrote it again, and the next run saw the same change.
+///
+/// # The output has to be valid SQL
+///
+/// This value is *emitted* — `SET DEFAULT {default}` in both
+/// [`crate::diff::generate`] and the type-change path below — so it cannot be
+/// reduced to a comparison key. Every form produced here is a literal with the
+/// same meaning as the input, in the spelling Postgres itself uses.
+///
+/// `None` means "nothing to settle": the caller keeps the text, which may read
+/// as drift but can never read as falsely equal.
+fn canonical_default_for_type(base: &str, data_type: &str) -> Option<String> {
+    let ty = data_type.trim().to_ascii_lowercase();
+    let ty = ty.split(['(', '[']).next().unwrap_or(&ty).trim();
+    match ty {
+        "json" | "jsonb" => canonical_json_default(base),
+        "bool" | "boolean" => canonical_bool_default(base),
+        "timestamptz" | "timestamp with time zone" => canonical_instant_default(base),
+        _ => None,
+    }
+}
+
+/// Re-render a JSON **object** literal with its keys sorted, matching how
+/// `jsonb` stores and reports one.
+///
+/// Objects only: an array or scalar has no key order to settle, and
+/// re-rendering one would risk changing a value for no gain. A literal that is
+/// not valid JSON is left alone.
+fn canonical_json_default(base: &str) -> Option<String> {
+    let inner = base.strip_prefix('\'')?.strip_suffix('\'')?;
+    let value: serde_json::Value = serde_json::from_str(&inner.replace("''", "'")).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    // `to_string` on a `serde_json::Map` is insertion-ordered; dbd builds
+    // `serde_json` with `preserve_order` off, so parsing already sorted the
+    // keys. Rendered with Postgres's `", "` and `": "` spacing so the two
+    // sides are byte-identical rather than merely equivalent.
+    let rendered = render_json_pg(&value);
+    Some(format!("'{}'", rendered.replace('\'', "''")))
+}
+
+/// `serde_json` compact form, respaced the way `jsonb` prints it.
+fn render_json_pg(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, val)| format!("{}: {}", serde_json::Value::String(k.clone()), render_json_pg(val)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        serde_json::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(render_json_pg).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `'t'`, `'yes'`, `TRUE` and the rest all store as `true`.
+fn canonical_bool_default(base: &str) -> Option<String> {
+    let word = base.trim_matches('\'').trim();
+    match word {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Some("true".to_string()),
+        "f" | "false" | "n" | "no" | "off" | "0" => Some("false".to_string()),
+        _ => None,
+    }
+}
+
+/// Reduce a `timestamptz` literal to one instant, spelled in UTC.
+///
+/// Two reasons a text comparison cannot work here. `'epoch'` is a special
+/// input the server resolves on store, and the stored value is reported **in
+/// the session's timezone** — so the same database reports different text to
+/// different connections. Rendering both sides as the same instant settles
+/// both at once.
+///
+/// Deliberately NOT applied to `'now'`, `'today'` and friends. Those are
+/// resolved at DDL time and frozen, so the live value is a particular moment
+/// that will differ from the design on every later day — no normalisation can
+/// make them agree, and choosing one would be inventing a value. They stay as
+/// written and read as drift, which is the honest report; `now()` and
+/// `current_date` are the forms that converge.
+fn canonical_instant_default(base: &str) -> Option<String> {
+    let inner = base.strip_prefix('\'')?.strip_suffix('\'')?.trim();
+    let instant = if inner.eq_ignore_ascii_case("epoch") {
+        chrono::DateTime::UNIX_EPOCH
+    } else {
+        parse_timestamptz(inner)?
+    };
+    Some(format!("'{}'", instant.format("%Y-%m-%d %H:%M:%S%.f+00")))
+}
+
+/// Parse the shapes Postgres emits and authors write for a `timestamptz`.
+fn parse_timestamptz(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, Utc};
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+    ] {
+        if let Ok(dt) = DateTime::parse_from_str(text, fmt) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    None
 }
 
 /// Lowercase a default expression *outside* string literals and quoted
@@ -3329,7 +3453,6 @@ mod tests {
         assert!(plan.altered[0].sql.contains("SET DEFAULT 1"));
     }
 
-    #[test]
     // ── Defaults the server rewrites on store (#18) ─────────────────────
 
     /// `jsonb` does not preserve key order or spacing, so a text comparison of
@@ -3420,7 +3543,12 @@ mod tests {
     /// read as drift but never as falsely equal.
     #[test]
     fn an_unrecognised_default_is_passed_through() {
-        assert_eq!(canonical_default("nextval('s'::regclass)", "integer"), "nextval('s')");
+        // An inner cast stays — only a single TRAILING top-level one is
+        // stripped, which is what keeps `nextval('s'::regclass)` intact.
+        assert_eq!(
+            canonical_default("nextval('s'::regclass)", "integer"),
+            "nextval('s'::regclass)"
+        );
         assert_eq!(canonical_default("'{oops'", "jsonb"), "'{oops'");
         assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
     }
@@ -3429,15 +3557,15 @@ mod tests {
     /// every other type.
     #[test]
     fn canonical_default_strips_trailing_cast() {
-        assert_eq!(canonical_default("'{}'::text[]"), "'{}'");
-        assert_eq!(canonical_default("''::text"), "''");
-        assert_eq!(canonical_default("'active'::config.status"), "'active'");
+        assert_eq!(canonical_default("'{}'::text[]", "text"), "'{}'");
+        assert_eq!(canonical_default("''::text", "text"), "''");
+        assert_eq!(canonical_default("'active'::config.status", "text"), "'active'");
         assert_eq!(
-            canonical_default("'2020-01-01'::timestamp with time zone"),
+            canonical_default("'2020-01-01'::timestamp with time zone", "text"),
             "'2020-01-01'"
         );
-        assert_eq!(canonical_default("0::numeric(10,2)"), "0");
-        assert_eq!(canonical_default("  'x' :: text "), "'x'");
+        assert_eq!(canonical_default("0::numeric(10,2)", "text"), "0");
+        assert_eq!(canonical_default("  'x' :: text ", "text"), "'x'");
     }
 
     /// `normalize_common` does the representation normalization (types, defaults,
@@ -3503,16 +3631,16 @@ mod tests {
     #[test]
     fn canonical_default_leaves_non_casts_intact() {
         // No top-level cast → unchanged.
-        assert_eq!(canonical_default("now()"), "now()");
-        assert_eq!(canonical_default("0"), "0");
-        assert_eq!(canonical_default("false"), "false");
+        assert_eq!(canonical_default("now()", "text"), "now()");
+        assert_eq!(canonical_default("0", "text"), "0");
+        assert_eq!(canonical_default("false", "text"), "false");
         // Cast lives inside the function args, not on the whole expression.
         assert_eq!(
-            canonical_default("nextval('app.seq'::regclass)"),
+            canonical_default("nextval('app.seq'::regclass)", "text"),
             "nextval('app.seq'::regclass)"
         );
         // `::` embedded in a string literal must not be treated as a cast.
-        assert_eq!(canonical_default("'a::b'"), "'a::b'");
+        assert_eq!(canonical_default("'a::b'", "text"), "'a::b'");
     }
 
     /// The authored spelling of a keyword default and the spelling `pg_get_expr`
@@ -3538,18 +3666,18 @@ mod tests {
             ("CURRENT_TIMESTAMP(3)", "current_timestamp(3)"),
         ] {
             assert_eq!(
-                canonical_default(authored),
-                canonical_default(introspected),
+                canonical_default(authored, "text"),
+                canonical_default(introspected, "text"),
                 "{authored} and {introspected} are the same default"
             );
         }
         // Catalog functions: Postgres stores these lowercase whatever was authored.
-        assert_eq!(canonical_default("NOW()"), canonical_default("now()"));
-        assert_eq!(canonical_default("Gen_Random_Uuid()"), "gen_random_uuid()");
+        assert_eq!(canonical_default("NOW()", "text"), canonical_default("now()", "text"));
+        assert_eq!(canonical_default("Gen_Random_Uuid()", "text"), "gen_random_uuid()");
         // SQL constructs: stored uppercase, and the literal arguments keep their case.
         assert_eq!(
-            canonical_default("coalesce('X', 'y')"),
-            canonical_default("COALESCE('X', 'y')")
+            canonical_default("coalesce('X', 'y')", "text"),
+            canonical_default("COALESCE('X', 'y')", "text")
         );
     }
 
@@ -3558,32 +3686,35 @@ mod tests {
     /// actually written to the database.
     #[test]
     fn canonical_default_preserves_quoted_text_case() {
-        assert_eq!(canonical_default("'Mixed Case'"), "'Mixed Case'");
-        assert_eq!(canonical_default("'Mixed Case'::text"), "'Mixed Case'");
-        assert_eq!(canonical_default("upper('aB')"), "upper('aB')");
-        assert_eq!(canonical_default("UPPER('aB')"), "upper('aB')");
+        assert_eq!(canonical_default("'Mixed Case'", "text"), "'Mixed Case'");
+        assert_eq!(canonical_default("'Mixed Case'::text", "text"), "'Mixed Case'");
+        assert_eq!(canonical_default("upper('aB')", "text"), "upper('aB')");
+        assert_eq!(canonical_default("UPPER('aB')", "text"), "upper('aB')");
         // A quoted identifier is case-significant too.
-        assert_eq!(canonical_default("\"MyFunc\"()"), "\"MyFunc\"()");
+        assert_eq!(canonical_default("\"MyFunc\"()", "text"), "\"MyFunc\"()");
         // Doubled quotes escape: the run continues, so inner case survives.
-        assert_eq!(canonical_default("'It''s A Value'"), "'It''s A Value'");
+        assert_eq!(canonical_default("'It''s A Value'", "text"), "'It''s A Value'");
         // Two defaults differing only inside a literal must NOT converge.
-        assert_ne!(canonical_default("'Active'"), canonical_default("'active'"));
+        assert_ne!(
+            canonical_default("'Active'", "text"),
+            canonical_default("'active'", "text")
+        );
     }
 
     /// A dollar-quoted default is left exactly as authored rather than risking a
     /// fold inside its body — at worst it keeps reading as drift.
     #[test]
     fn canonical_default_leaves_dollar_quoted_alone() {
-        assert_eq!(canonical_default("$$Hello World$$"), "$$Hello World$$");
-        assert_eq!(canonical_default("$tag$Mixed$tag$"), "$tag$Mixed$tag$");
+        assert_eq!(canonical_default("$$Hello World$$", "text"), "$$Hello World$$");
+        assert_eq!(canonical_default("$tag$Mixed$tag$", "text"), "$tag$Mixed$tag$");
     }
 
     /// Non-ASCII text survives folding intact (byte-wise lowercasing would corrupt
     /// a multibyte sequence).
     #[test]
     fn canonical_default_handles_non_ascii() {
-        assert_eq!(canonical_default("'café'"), "'café'");
-        assert_eq!(canonical_default("'CAFÉ'"), "'CAFÉ'");
+        assert_eq!(canonical_default("'café'", "text"), "'café'");
+        assert_eq!(canonical_default("'CAFÉ'", "text"), "'CAFÉ'");
     }
 
     // ── Materialized-view convergence (Task 13) ──────────────

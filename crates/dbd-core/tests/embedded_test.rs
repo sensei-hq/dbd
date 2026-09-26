@@ -3548,3 +3548,105 @@ async fn reconcile_converges_generated_columns_and_varchar_checks() {
     let sql = altered_sql(&design, &*adapter).await;
     assert!(sql.is_empty(), "reconcile must be idempotent; second pass got {sql:?}");
 }
+
+/// Defaults PostgreSQL rewrites when it stores them (#18).
+///
+/// Reconcile compared defaults as text, so a literal the server re-spells read
+/// as drift on every run: it emitted a `SET DEFAULT`, the server rewrote it
+/// again, and the next run saw the same change. Non-destructive, but it meant
+/// reconcile never reached a clean state — so no CI drift-guard could be built
+/// on it, and real drift hid among the permanent noise.
+///
+/// The four rewrites, all measured on a live server before any code changed:
+///
+/// | written | stored |
+/// |---|---|
+/// | `'epoch'` (timestamptz) | `'1969-12-31 18:00:00-06'` — *in the session timezone* |
+/// | `'{"b":1,"a":2}'` (jsonb) | `'{"a": 2, "b": 1}'` |
+/// | `'t'` (boolean) | `true` |
+/// | `'infinity'` (timestamptz) | `'infinity'` — already converged |
+///
+/// `'now'` and `'today'` are deliberately absent: the server resolves them at
+/// DDL time and freezes the result, so no comparison can converge and
+/// normalising them would mean inventing a value. See
+/// `a_frozen_special_input_is_not_normalised`.
+#[tokio::test]
+async fn reconcile_converges_defaults_the_server_rewrites() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "reconcile_rewritten_defaults").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: reconcile_rewritten_defaults\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/cursors.ddl"),
+        "set search_path to app;\n\
+         create table if not exists cursors (\n\
+           id            uuid        primary key\n\
+         , last_seen     timestamptz not null default 'epoch'\n\
+         , never         timestamptz not null default 'infinity'\n\
+         , sync_policy   jsonb       not null default '{\"config_pull\":\"realtime\",\"pull_interval_s\":300,\"offline_grace_h\":72,\"buffer_flush\":\"on_reconnect\"}'\n\
+         , enabled       boolean     not null default 't'\n\
+         , explicit_ts   timestamptz not null default '2024-03-01 07:00:00-05'\n\
+         );\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    async fn plan_sql(design: &Design, adapter: &dyn dbd_core::DatabaseAdapter) -> Vec<String> {
+        design
+            .reconcile(adapter, true, true, false, None, Progress::none())
+            .await
+            .expect("dry-run reconcile failed")
+            .altered
+            .into_iter()
+            .map(|s| s.sql)
+            .collect()
+    }
+
+    // The assertion that used to fail: every one of these came back as a
+    // `SET DEFAULT`, forever.
+    let sql = plan_sql(&design, &*adapter).await;
+    assert!(
+        sql.is_empty(),
+        "a freshly applied design must reconcile to no change; got {sql:?}"
+    );
+
+    // And it must still SEE a real change — a normaliser that made everything
+    // equal would also pass the assertion above.
+    std::fs::write(
+        dir.join("ddl/table/app/cursors.ddl"),
+        "set search_path to app;\n\
+         create table if not exists cursors (\n\
+           id            uuid        primary key\n\
+         , last_seen     timestamptz not null default 'epoch'\n\
+         , never         timestamptz not null default 'infinity'\n\
+         , sync_policy   jsonb       not null default '{\"config_pull\":\"batched\"}'\n\
+         , enabled       boolean     not null default 'f'\n\
+         , explicit_ts   timestamptz not null default '2024-03-01 07:00:00-05'\n\
+         );\n",
+    )
+    .unwrap();
+    let changed = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("reload");
+    let sql = plan_sql(&changed, &*adapter).await;
+    let joined = sql.join("\n");
+    assert!(
+        joined.contains("sync_policy") && joined.contains("enabled"),
+        "a genuinely changed jsonb and boolean default must still be reported; got {sql:?}"
+    );
+    assert!(
+        !joined.contains("last_seen") && !joined.contains("never") && !joined.contains("explicit_ts"),
+        "and the unchanged ones must stay quiet; got {sql:?}"
+    );
+}
