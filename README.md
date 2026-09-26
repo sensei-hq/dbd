@@ -64,6 +64,7 @@ myproject/
 | `dbd refresh` | Refresh materialized views now (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`); `--name <entity>` or `<schema>.*` to target a subset. Scheduled refresh is managed via pg_cron |
 | `dbd deploy` | Fetch from GitHub or local path + apply + import + RLS policies |
 | `dbd combine` | Combine all DDL into a single SQL file |
+| `dbd emit` | Translate the schema into another engine's DDL (MySQL, T-SQL, SQLite) |
 | `dbd graph` | Output dependency graph as JSON |
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
@@ -78,7 +79,32 @@ myproject/
 | `dbd reset` | Drop project schemas (with safety guards) |
 | `dbd install` | Install dbd's Claude Code skill + agent into `~/.claude` (or `./.claude` with `--project`) |
 
+## Reading vs. connecting
+
+dbd does two separable things, and it supports a different set of databases for
+each. **Reading** a dialect means parsing its DDL into entities; **connecting**
+means having an adapter that can apply to a live server.
+
+| Dialect | Read its DDL | Connect and apply |
+|---|---|---|
+| PostgreSQL / Supabase | yes — full structure (columns, constraints, indexes) | yes |
+| SQLite | yes — verbatim, the file *is* the model | yes |
+| T-SQL (SQL Server) | yes — identity and references, **no columns** | **no adapter** |
+| MySQL / MariaDB | yes — identity and references, **no columns** | **no adapter** |
+| Convex | — (a codegen target, not a source) | yes, writes `schema.ts` |
+
+So a T-SQL or MySQL project works with `dbd inspect`, `parse_sql_as`,
+`project::survey` and the graph/DBML output, and `apply`/`deploy` have nothing
+to connect to — a `mysql://` or `sqlserver://` URL is refused by name rather
+than attempted.
+
+Only the PostgreSQL reader produces a structured model, so `diff`, `reconcile`
+and snapshots need it: the others are refused rather than allowed to compare
+nothing and report "in sync".
+
 ## Targets
+
+Where `apply` can write. See the table above for what dbd can *read*.
 
 | Target | Status | URL form |
 |--------|--------|----------|
@@ -250,7 +276,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.19.0
+  rev: v0.21.0
   hooks:
     - id: dbd-format
 ```

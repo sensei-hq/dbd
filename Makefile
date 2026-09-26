@@ -131,6 +131,9 @@ bump: _check-clean _check-ci
 	@sed -i '' 's/^version = "$(VERSION)"/version = "$(NEW)"/' Cargo.toml
 	@sed -i '' 's|dbd-core = { path = "crates/dbd-core", version = "$(VERSION)" }|dbd-core = { path = "crates/dbd-core", version = "$(NEW)" }|' Cargo.toml
 	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW)"/' site/package.json
+##  Only the docs/ originals: site/src/lib/content/ is GENERATED from them by
+##  site/scripts/copy-content.mjs on every build and is gitignored, so editing
+##  it here would rewrite a build artifact and then fail to `git add` it.
 	@sed -i '' 's/rev: v[0-9]*\.[0-9]*\.[0-9]*/rev: v$(NEW)/' README.md docs/guide/04-commands.md docs/llms/llms-full.txt
 ##  sensei.library.json carries two version-coupled fields that consumers rely on
 ##  to answer "are these docs for the release I depend on?": `documents` (the

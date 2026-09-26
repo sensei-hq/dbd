@@ -429,6 +429,13 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.dialect` as the project wrote it.
+    ///
+    /// Kept beside [`Self::parser`] because a refusal has to name what the
+    /// *user* set, not the reader it selected: `sqlite` picks `Verbatim`, and
+    /// telling someone their "verbatim project" cannot be diffed names nothing
+    /// they typed.
+    dialect: String,
 }
 
 /// Report a DDL file that states no `SET search_path` of its own.
@@ -450,6 +457,15 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
     if entity.schema_path.stated() || !entity.entity_type.has_schema() {
         return;
     }
+    // A dialect with no schema path at all has nothing to warn about. T-SQL
+    // resolves an unqualified name against the connecting user's default
+    // schema and MySQL has no schemas — neither has a `search_path`, and
+    // telling their authors about PostgreSQL's session default would be
+    // nonsense. The PostgreSQL reader always supplies entries (its own
+    // default, `"$user", public`), so an empty path means "not that dialect".
+    if entity.schema_path.entries.is_empty() {
+        return;
+    }
     let resolved_against = match entity.schema_path.source {
         PathSource::Project => "source.search_path".to_string(),
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
@@ -461,6 +477,21 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
 }
 
 impl Design {
+    /// Which reader this project's DDL was read by.
+    ///
+    /// Exposed because it decides what a caller may ask for: only a reader
+    /// that [`produces_structure`](crate::parser::ParserChoice::produces_structure)
+    /// can be diffed, reconciled or emitted as another dialect.
+    pub fn parser(&self) -> crate::parser::ParserChoice {
+        self.parser
+    }
+
+    /// `source.dialect` as the project wrote it, for a message that has to
+    /// name what the user set rather than the reader it selected.
+    pub fn dialect(&self) -> &str {
+        &self.dialect
+    }
+
     /// Create a Design from a config file path.
     ///
     /// Reads design.yaml, scans DDL files, parses entities, resolves references,
@@ -477,6 +508,10 @@ impl Design {
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         let design_config = config::read(config_path)?;
+        // Taken before the config is moved into the Design, and kept as the
+        // user wrote it — a refusal must name `sqlite`, not the `Verbatim`
+        // reader that label selects.
+        let dialect_label = design_config.source.dialect.clone();
 
         // Validate and resolve the parser before reading any file, so a bad
         // `source.parser` fails at load rather than partway through the scan.
@@ -652,6 +687,7 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            dialect: dialect_label,
         })
     }
 

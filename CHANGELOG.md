@@ -9,6 +9,124 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-09-26
+
+**`dbd emit`** translates a PostgreSQL schema into MySQL, T-SQL or SQLite DDL.
+Anything the target cannot express is downgraded to the nearest equivalent and
+reported — inline in the file, in the run summary, and as JSON for CI. A
+faithful mapping is reported nowhere, so the report stays worth reading.
+
+Two correctness fixes behind it. **`reconcile` finally converges** (#18): it
+compared defaults as text, and PostgreSQL rewrites some of them on store, so a
+freshly applied design reported drift forever. Measuring both sides on a live
+server found more than the report described — the timestamptz form is rendered
+in the *session's* timezone, and `'now'`/`'today'` are frozen at DDL time and
+can never converge, so they stay visible as drift rather than normalised to an
+invented value.
+
+And the **non-PostgreSQL dialects are honest about being read-only**. `diff`
+and `reconcile` reported "in sync" for T-SQL and MySQL projects — the guard
+added for SQLite asked `parser == Verbatim`, and both were added after it. A
+`mysql://` URL failed with a *PostgreSQL* pool timeout, because `connect` fell
+through to Postgres for any unrecognised scheme.
+
+**Breaking:** none to the library API. `dbd emit` is new.
+
+### Added
+
+- **`dbd emit --dialect mysql|tsql|sqlite`** — the schema as another engine's
+  DDL ([#23]). Distinct from `combine`, which consolidates *this* project's own
+  DDL into one script; `emit` translates it for a different engine.
+
+  ```sh
+  dbd emit --dialect mysql -f schema.mysql.sql --report downgrades.json
+  ```
+
+  **One direction, by construction.** Only the PostgreSQL reader produces
+  columns and constraints (`ParserChoice::produces_structure`), so emitting
+  *from* a T-SQL, MySQL or SQLite project is refused rather than quietly
+  producing an empty schema. Tables and views; routines are skipped and
+  reported, because their bodies do not translate.
+
+  **Downgrade, never drop, never refuse.** A construct the target cannot
+  express becomes the nearest thing it can, so the output is always a complete
+  schema. Every *lossy* downgrade is reported three ways — a comment at the
+  site in the emitted file, the run summary, and `--report` as JSON for CI to
+  assert on. A faithful mapping (`integer` → `INT`) is reported nowhere, or the
+  report becomes noise nobody reads.
+
+  ```sql
+  -- dbd: `tags` was `text[]` — emitted as JSON; no array type exists here, so
+  --      the `text` elements become a JSON document
+  `tags` JSON,
+  ```
+
+  The exit status stays 0 when downgrades happen: they are the documented
+  behaviour, which is why the count — not the exit code — is what a pipeline
+  should assert on.
+
+- **A view keeps its body.** `Entity::body` now carries a view's `SELECT`, as a
+  materialized view's always did. The view parser deliberately omitted it, with
+  a comment explaining that nothing rendered a view's body and the omission
+  kept it "parity-clean against the incumbent" — the incumbent being the
+  sqlparser path retired in 0.14.0. `emit` renders one, and without this a view
+  came out as `CREATE VIEW x AS SELECT 1`.
+
+- **`Design::parser()` and `Design::dialect()`** are public: which reader a
+  project used decides what may be asked of it, and a refusal has to name the
+  dialect the user configured rather than the reader it selected.
+
+[#23]: https://github.com/sensei-hq/dbd/issues/23
+
+### Fixed
+
+- **`diff` and `reconcile` no longer report "in sync" for T-SQL and MySQL
+  projects.** The guard added for SQLite (#20) asked `parser == Verbatim`, but
+  `Verbatim` was never the only reader without a structured model: the
+  statement-head readers produce identity and references and no `table_def`
+  either. Both were added *after* the guard and walked straight past it, so
+  desired and live reduced to nothing, the comparison succeeded trivially, and
+  the answer was "no drift" against a database sharing not one table with the
+  design.
+
+  The guard now asks `ParserChoice::produces_structure()` — a property of the
+  reader rather than a list to keep in sync, which is exactly what went stale.
+  The refusal also names `source.dialect` as written rather than the reader it
+  selected, so a SQLite project is told about `sqlite` and not about
+  "verbatim".
+
+- **A URL for a database dbd has no adapter for is refused by name.**
+  `connect` dispatched on `convex:` and `sqlite:` and fell through to
+  **PostgreSQL for everything else**, so `mysql://…` built a `PostgresAdapter`
+  and failed with `pool timed out while waiting for an open connection` — a
+  PostgreSQL error naming neither MySQL nor the missing adapter. It now says:
+
+  > no adapter for MySQL: dbd can READ MySQL DDL (source.dialect) but cannot
+  > connect to one, so `apply`, `deploy`, `diff` and `reconcile` are not
+  > available. `parse_sql_as`, `project::survey` and `dbd inspect` work offline.
+
+- **A dialect with no `search_path` is no longer warned about one.** The
+  missing-`SET search_path` report added in 0.18.0 fired on T-SQL and MySQL
+  projects, telling their authors that unqualified names "resolved against
+  PostgreSQL's session default". Neither dialect has a search path.
+
+### Added
+
+- **`dbd`'s connecting commands are covered against a real database**
+  (`tests/cli_live.rs`, #11). `dbd-core`'s embedded suite covers the library;
+  the CLI's own layer — the `run` arms that build an adapter, and the exit code
+  `main` turns a failure into — sat near zero.
+
+  Driven as the binary rather than by adding a `[lib]` to `dbd-cli`: that
+  would publish the command handlers as public API to be maintained for
+  testing's sake, and driving the binary also covers argument parsing and is
+  the only way to assert an **exit code**, which is what a pipeline keys on.
+  Coverage reaches it — `cargo llvm-cov` instruments the binary and the spawned
+  process writes its own profile, verified before the suite was written.
+
+  `commands/mod.rs` 4.5% → 30.1% regions, `commands/reverse.rs` → 43.0%,
+  `commands/migration.rs` → 14.8%.
+
 ## [0.19.0] — 2026-09-26
 
 `Entity` carried four fields for one idea. `refers` was every name in
@@ -1014,7 +1132,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.19.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.21.0...main
+[0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0

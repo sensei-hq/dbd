@@ -394,11 +394,12 @@ impl Design {
     /// instead. Mirrors the batch-adapter guard directly above each call site:
     /// same failure (nothing to compare), same response.
     fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
-        if self.parser == crate::parser::ParserChoice::Verbatim {
+        if !self.parser.produces_structure() {
+            let dialect = &self.dialect;
             return Err(DbdError::Config(format!(
-                "{op} needs a structured model, and this project is read verbatim \
-                 (source.dialect: sqlite) — its DDL files are applied as written rather than \
-                 parsed into columns and constraints, so there is nothing to compare. \
+                "{op} needs a structured model, and this project's DDL is not read into one \
+                 (source.dialect: {dialect}) — its files give identity and references but no \
+                 columns or constraints, so there is nothing to compare. \
                  `apply`, `deploy`, `import` and `export` work normally."
             )));
         }
