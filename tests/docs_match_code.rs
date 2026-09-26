@@ -72,7 +72,10 @@ fn the_website_copies_match_the_docs() {
 /// Every `docs/` file the website keeps a copy of, as (source, copy).
 fn mirrored_docs() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (dir, dest) in [("docs/guide", "site/src/lib/content/guide"), ("docs/llms", "site/src/lib/content/llms")] {
+    for (dir, dest) in [
+        ("docs/guide", "site/src/lib/content/guide"),
+        ("docs/llms", "site/src/lib/content/llms"),
+    ] {
         let entries = std::fs::read_dir(root().join(dir)).unwrap_or_else(|e| panic!("{dir}: {e}"));
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();

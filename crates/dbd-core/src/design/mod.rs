@@ -477,6 +477,21 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
 }
 
 impl Design {
+    /// Which reader this project's DDL was read by.
+    ///
+    /// Exposed because it decides what a caller may ask for: only a reader
+    /// that [`produces_structure`](crate::parser::ParserChoice::produces_structure)
+    /// can be diffed, reconciled or emitted as another dialect.
+    pub fn parser(&self) -> crate::parser::ParserChoice {
+        self.parser
+    }
+
+    /// `source.dialect` as the project wrote it, for a message that has to
+    /// name what the user set rather than the reader it selected.
+    pub fn dialect(&self) -> &str {
+        &self.dialect
+    }
+
     /// Create a Design from a config file path.
     ///
     /// Reads design.yaml, scans DDL files, parses entities, resolves references,

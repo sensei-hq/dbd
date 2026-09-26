@@ -30,6 +30,7 @@ pub mod diagram;
 pub mod diff;
 pub mod doctor;
 pub mod emit;
+pub mod emit_dialect;
 pub mod entity;
 pub mod error;
 pub mod formatter;

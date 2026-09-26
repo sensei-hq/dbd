@@ -108,6 +108,27 @@ pub enum Commands {
         #[arg(short, long, default_value = "init.sql")]
         file: PathBuf,
     },
+    /// Translate the schema into another engine's DDL
+    ///
+    /// Not `combine`, which consolidates this project's own DDL into one
+    /// script for its own target. `emit` rewrites the schema for a DIFFERENT
+    /// engine: types are mapped, and anything the target cannot express is
+    /// downgraded to the nearest thing it can and reported — inline in the
+    /// file and, with --report, as JSON.
+    ///
+    /// Only a PostgreSQL project can be emitted: it is the one dialect dbd
+    /// reads into columns and constraints.
+    Emit {
+        /// Target engine: mysql, tsql or sqlite
+        #[arg(long)]
+        dialect: String,
+        /// Destination SQL file
+        #[arg(short, long, default_value = "schema.sql")]
+        file: PathBuf,
+        /// Also write every downgrade as JSON, for CI to assert on
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Load data files into database
     Import {
         /// Import a specific table only

@@ -64,6 +64,7 @@ myproject/
 | `dbd refresh` | Refresh materialized views now (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`); `--name <entity>` or `<schema>.*` to target a subset. Scheduled refresh is managed via pg_cron |
 | `dbd deploy` | Fetch from GitHub or local path + apply + import + RLS policies |
 | `dbd combine` | Combine all DDL into a single SQL file |
+| `dbd emit` | Translate the schema into another engine's DDL (MySQL, T-SQL, SQLite) |
 | `dbd graph` | Output dependency graph as JSON |
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |

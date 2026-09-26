@@ -429,6 +429,35 @@ outside the declaration that made it.
 Worth having: over a 2,154-file T-SQL corpus this is 4,059 references, and **817
 of those files reported nothing at all before it existed**.
 
+### Translating to another engine
+
+`dbd emit --dialect mysql|tsql|sqlite` rewrites a **PostgreSQL** project's
+schema as another engine's DDL. Distinct from `combine`, which consolidates
+this project's own DDL into one script.
+
+Only PostgreSQL can be the source: it is the one dialect dbd reads into columns
+and constraints (`ParserChoice::produces_structure`). Tables and views only —
+routine bodies do not translate and are skipped and reported.
+
+Anything the target cannot express is **downgraded to the nearest equivalent
+and reported**, never silently dropped: as a comment at the site in the emitted
+file, in the run summary, and as JSON with `--report`. A faithful mapping
+(`integer` → `INT`) is not reported, so the report stays worth reading.
+
+```rust
+use dbd_core::Design;
+use dbd_core::emit_dialect::emit_schema;
+use dbd_core::parser::Dialect;
+use std::path::Path;
+
+let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+let (sql, downgrades) = emit_schema(&design, Dialect::MySql, None)?;
+std::fs::write("schema.mysql.sql", sql)?;
+for d in &downgrades {
+    println!("{} {:?}: {} -> {}", d.entity, d.column, d.from, d.to);
+}
+```
+
 ### The namespace context a file established
 
 Every entity carries `schema_path` — where unqualified names in its file
