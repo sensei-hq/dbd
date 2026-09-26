@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn a_sequence_has_no_references_or_table_def() {
         let e = parse("set search_path to app;\ncreate sequence s;");
-        assert!(e.refers.is_empty());
+        assert!(e.refers().next().is_none());
         assert!(e.table_def.is_none());
     }
 

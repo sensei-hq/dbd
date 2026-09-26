@@ -30,8 +30,8 @@ use pg_query::NodeEnum;
 use pg_query::protobuf;
 
 use crate::entity::{
-    ColumnDef, Entity, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, REF_TYPE_FUNCTION,
-    Reference, SchemaSource, SortOrder, TableComments, TableConstraint, TableDef,
+    ColumnDef, Entity, FkAction, ForeignKey, IdentityKind, IndexColumn, IndexDef, IndexType, Ref, RefKind,
+    SchemaSource, SortOrder, TableComments, TableConstraint, TableDef,
 };
 use crate::error::Result;
 
@@ -63,8 +63,7 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
 
     match extract(&parsed, &default_schema) {
         Ok((table_def, references, warnings)) => {
-            entity.refers = references.iter().map(|r| r.name.clone()).collect();
-            entity.references = references;
+            entity.refs = references;
             entity.table_def = Some(table_def);
             entity.warnings.extend(warnings);
         }
@@ -83,12 +82,12 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
 /// Returns the warnings alongside the table, rather than swallowing them: an
 /// `ALTER` subcommand this does not read is the shape that hid the missing
 /// constraints for so long.
-fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Reference>, Vec<String>)> {
+fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(TableDef, Vec<Ref>, Vec<String>)> {
     let mut columns: Vec<ColumnDef> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
     let mut comments = TableComments::default();
-    let mut references: Vec<Reference> = Vec::new();
+    let mut references: Vec<Ref> = Vec::new();
     let mut functions: Vec<(String, SchemaSource)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut declared: Vec<String> = Vec::new();
@@ -154,10 +153,11 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
         }
     }
 
-    references.extend(functions.into_iter().map(|(name, schema_source)| Reference {
+    references.extend(functions.into_iter().map(|(name, schema_source)| Ref {
         name,
-        ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+        kind: RefKind::Calls,
         schema_source,
+        unresolved: false,
     }));
 
     Ok((
@@ -204,7 +204,7 @@ fn process_alter_table(
     default_schema: &str,
     columns: &mut [ColumnDef],
     constraints: &mut Vec<TableConstraint>,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Ref>,
     functions: &mut Vec<(String, SchemaSource)>,
     warnings: &mut Vec<String>,
 ) -> Extract<()> {
@@ -246,7 +246,7 @@ fn process_create_table(
     default_schema: &str,
     columns: &mut Vec<ColumnDef>,
     constraints: &mut Vec<TableConstraint>,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Ref>,
     functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<()> {
     // `PARTITION OF p`, `INHERITS (p)` and `OF a_type` all declare a table whose
@@ -314,7 +314,7 @@ fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
 fn extract_column(
     col_def: &protobuf::ColumnDef,
     default_schema: &str,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Ref>,
     functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<(ColumnDef, Vec<TableConstraint>)> {
     let name = col_def.colname.clone();
@@ -434,7 +434,7 @@ fn extract_column(
 fn extract_table_constraint(
     c: &protobuf::Constraint,
     default_schema: &str,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Ref>,
     functions: &mut Vec<(String, SchemaSource)>,
 ) -> Extract<TableConstraint> {
     use protobuf::ConstrType::*;
@@ -478,7 +478,7 @@ fn extract_foreign_key(
     c: &protobuf::Constraint,
     columns: Vec<String>,
     default_schema: &str,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Ref>,
 ) -> Extract<ForeignKey> {
     let target = c
         .pktable
@@ -493,10 +493,11 @@ fn extract_foreign_key(
         (target.schemaname.clone(), SchemaSource::Stated)
     };
 
-    references.push(Reference {
+    references.push(Ref {
         name: format!("{ref_schema}.{}", target.relname),
-        ref_type: Some("table".to_string()),
+        kind: RefKind::Reads,
         schema_source: ref_schema_source,
+        unresolved: false,
     });
 
     Ok(ForeignKey {
@@ -737,7 +738,7 @@ fn scalar_text(node: &protobuf::Node) -> Option<String> {
 }
 
 /// The functions an expression calls, appended to `functions` as *soft*
-/// references (see [`REF_TYPE_FUNCTION`]): `default now()` is indistinguishable
+/// references (see [`RefKind::Calls`]): `default now()` is indistinguishable
 /// here from a call to a project-managed function, so the resolver keeps the
 /// ones naming a known entity and drops the rest without warning.
 ///
@@ -955,7 +956,7 @@ mod tests {
         );
         let d = e.table_def.as_ref().unwrap();
         assert_eq!(d.columns[1].identity, None);
-        assert!(e.refers.contains(&"app.doubled".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("app.doubled"), "got {:?}", e.refers().collect::<Vec<_>>());
         // The expression lands on `generated`, NOT `default_value` — the live
         // side reads the same one out of `pg_attrdef`, and they only converge if
         // both sides keep it in the same place (issue #16).
@@ -996,7 +997,7 @@ mod tests {
         assert_eq!(fk.ref_columns, vec!["id"]);
         assert_eq!(fk.on_delete, Some(FkAction::Cascade));
         assert_eq!(fk.on_update, Some(FkAction::SetNull));
-        assert!(e.refers.contains(&"app.parent".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("app.parent"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
     /// An explicit schema on the target wins over the file's search path.
@@ -1005,7 +1006,7 @@ mod tests {
         let e = parse("set search_path to app;\ncreate table t (pid uuid references other.parent (id));");
         let fk = e.table_def.as_ref().unwrap().columns[0].inline_fk.as_ref().unwrap();
         assert_eq!(fk.ref_schema.as_deref(), Some("other"));
-        assert!(e.refers.contains(&"other.parent".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("other.parent"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
     /// `references parent` with no column list targets the parent's primary key;
@@ -1044,11 +1045,11 @@ mod tests {
     fn a_default_calling_a_function_records_a_soft_reference() {
         let e = parse("set search_path to app;\ncreate table t (id uuid default app.new_id());");
         let r = e
-            .references
+            .refs
             .iter()
             .find(|r| r.name == "app.new_id")
             .expect("function reference");
-        assert_eq!(r.ref_type.as_deref(), Some(crate::entity::REF_TYPE_FUNCTION));
+        assert_eq!(r.kind, crate::entity::RefKind::Calls);
     }
 
     // ── 3. Table-level constraints ──────────────────────────────────────────
@@ -1244,7 +1245,7 @@ mod tests {
         assert!(cols[1].is_expression);
         assert_eq!(cols[1].name, "lower(name)");
         // The function an index key calls must exist before the table is built.
-        assert!(e.refers.contains(&"app.lower".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("app.lower"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
     #[test]
@@ -1415,9 +1416,9 @@ mod tests {
         // The edge is what orders the apply. Without it `orders` can be created
         // before `users` and the FK fails on a fresh database.
         assert!(
-            e.refers.contains(&"app.users".to_string()),
+            e.refers_to("app.users"),
             "an ALTER-added FK must still be a dependency edge, got {:?}",
-            e.refers
+            e.refers().collect::<Vec<_>>()
         );
     }
 

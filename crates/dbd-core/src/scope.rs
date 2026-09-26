@@ -154,7 +154,10 @@ fn traverse(
         .filter(|e| is_scopable(e))
         .map(|e| e.name.as_str())
         .collect();
-    let refers: HashMap<&str, &Vec<String>> = all_entities.iter().map(|e| (e.name.as_str(), &e.refers)).collect();
+    let refers: HashMap<&str, Vec<&str>> = all_entities
+        .iter()
+        .map(|e| (e.name.as_str(), e.refers().collect()))
+        .collect();
 
     let mut visited: HashSet<String> = resolved.entities.clone();
     let mut parent: HashMap<String, String> = HashMap::new();
@@ -167,13 +170,13 @@ fn traverse(
 
     while let Some(cur) = queue.pop_front() {
         if let Some(deps) = refers.get(cur.as_str()) {
-            for dep in deps.iter() {
-                if dep == &cur || externals.contains(dep) || !managed.contains(dep.as_str()) {
+            for dep in deps.iter().copied() {
+                if dep == cur || externals.contains(dep) || !managed.contains(dep) {
                     continue;
                 }
-                if visited.insert(dep.clone()) {
-                    parent.insert(dep.clone(), cur.clone());
-                    queue.push_back(dep.clone());
+                if visited.insert(dep.to_string()) {
+                    parent.insert(dep.to_string(), cur.clone());
+                    queue.push_back(dep.to_string());
                 }
             }
         }
@@ -342,7 +345,10 @@ mod tests {
 
     fn ent(t: EntityType, name: &str, refers: &[&str]) -> Entity {
         let mut e = Entity::new(t, name);
-        e.refers = refers.iter().map(|s| s.to_string()).collect();
+        e.refs = refers
+            .iter()
+            .map(|s| crate::entity::Ref::stated(*s, crate::entity::RefKind::Reads))
+            .collect();
         e
     }
 

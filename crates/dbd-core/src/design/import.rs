@@ -109,7 +109,7 @@ impl Design {
             .entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function)
-            .filter(|e| !e.reads.is_empty() || !e.writes.is_empty())
+            .filter(|e| e.reads().next().is_some() || e.writes().next().is_some())
             .collect();
 
         // Build entries: match each staging table to the procedure that reads from it
@@ -118,12 +118,14 @@ impl Design {
             .map(|table| {
                 let matched_proc = procedures
                     .iter()
-                    .find(|proc| proc.reads.iter().any(|r| r == &table.name));
+                    .find(|proc| proc.reads().any(|r| r.name == table.name));
 
                 ImportPlanEntry {
                     table: (*table).clone(),
                     procedure: matched_proc.map(|p| p.name.clone()),
-                    writes: matched_proc.map(|p| p.writes.clone()).unwrap_or_default(),
+                    writes: matched_proc
+                        .map(|p| p.writes().map(|r| r.name.clone()).collect())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -146,7 +148,7 @@ impl Design {
             .entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Table)
-            .map(|e| (e.name.clone(), e.refers.clone()))
+            .map(|e| (e.name.clone(), e.refers().map(str::to_string).collect::<Vec<_>>()))
             .collect();
 
         // Simple topological sort on entries

@@ -632,12 +632,12 @@ fn what_the_tsql_reader_finds_in_a_real_corpus() {
         for e in &p.entities {
             entities += 1;
             *types.entry(format!("{:?}", e.entity_type)).or_default() += 1;
-            reads += e.reads.len();
-            writes += e.writes.len();
+            reads += e.reads().count();
+            writes += e.writes().count();
             calls += e
-                .references
+                .refs
                 .iter()
-                .filter(|r| r.ref_type.as_deref() == Some(dbd_core::entity::REF_TYPE_FUNCTION))
+                .filter(|r| r.kind == dbd_core::entity::RefKind::Calls)
                 .count();
             if e.catalog.is_some() {
                 with_catalog += 1;
@@ -702,7 +702,7 @@ fn what_file_level_references_recover_from_a_real_corpus() {
         let Ok(p) = parse_sql_as(Dialect::TSql, sql) else {
             continue;
         };
-        let o: usize = p.entities.iter().map(|e| e.refers.len()).sum();
+        let o: usize = p.entities.iter().map(|e| e.refers().count()).sum();
         let f = p.references.all().count();
         owned += o;
         file_level += f;

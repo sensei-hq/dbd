@@ -373,12 +373,53 @@ use dbd_core::parser::{Dialect, parse_sql_as};
 
 let parsed = parse_sql_as(Dialect::TSql, sql)?;
 for e in &parsed.entities {
-    println!("{} reads {:?}", e.name, e.reads);   // owned by a declaration
+    // owned by a declaration
+    for r in e.reads() {
+        println!("{} reads {}", e.name, r.name);
+    }
 }
 println!("the file itself reads {:?}", parsed.references.reads);
 println!("        writes {:?}", parsed.references.writes);
 println!("        calls  {:?}", parsed.references.calls);
 ```
+
+### One list of references
+
+`Entity::refs` is every reference the entity makes, each carrying three facts:
+
+```rust
+use dbd_core::entity::RefKind;
+use dbd_core::parser::parse_sql;
+
+for r in &parse_sql(sql)?.entities[0].refs {
+    println!("{:?} {} (schema {:?}, unresolved {})",
+        r.kind, r.name, r.schema_source, r.unresolved);
+}
+```
+
+| | |
+|---|---|
+| `kind` | `Reads` / `Writes` / `Calls` / `Member`. `Calls` is **soft** — an unresolved one is a built-in, not a broken edge |
+| `schema_source` | whether the schema is the source's word or dbd's guess |
+| `unresolved` | set by `resolve_references` when nothing matched |
+
+`reads()`, `writes()`, `calls()` and `refs_of(kind)` filter it; `refers()`
+yields every name once. **`refers()` omits unresolved refs and the others do
+not** — a dependency graph must never wait on an entity that does not exist,
+while `reads()` is the file's own account, which is what the import plan
+matches a staging table against.
+
+This replaced four parallel fields (`refers`, `references`, `reads`, `writes`)
+that could not answer "which of my reads has a guessed schema?" without a join
+on a key that was not unique.
+
+### The body is not a reference
+
+`Entity::body` holds the verbatim DDL for the types whose `CREATE` is
+reconstructed from one — a view's or matview's `SELECT`, a sequence's whole
+`CREATE`, one string per routine overload. It used to share the `writes` field
+with table references, which meant two different things depending on whether a
+parser or the introspector filled it.
 
 Filled in by the statement-head readers (`TSql`, `MySql`). The PostgreSQL reader
 leaves it empty and that is not an omission — libpg_query hands back a statement
