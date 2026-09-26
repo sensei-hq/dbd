@@ -201,6 +201,46 @@ fn no_use_statement_means_no_catalog() {
     );
 }
 
+/// A `USE` inside a string literal is not a `USE`.
+///
+/// This is the one corpus file the reader does not take a catalog from, and
+/// **that is the correct answer** rather than a gap to close. Both of its
+/// occurrences are dynamic SQL:
+///
+/// - `USE [?]` — the `sp_MSforeachdb` idiom, where `?` stands for *every*
+///   database in turn. There is no single catalog to name.
+/// - `USE ' + @db + '` — the database is a runtime variable.
+///
+/// The lexer strips string literals, so no `use` token is produced and nothing
+/// is invented. Pinned because the temptation on seeing "1 file missed" is to
+/// go looking inside strings, which would mint a database called `?`.
+///
+/// Corpus accounting, which closes exactly: 77 files carry a `USE` line — 13
+/// declare nothing to attach a catalog to, 63 get one, and this is the 1.
+#[test]
+fn a_use_inside_dynamic_sql_mints_no_database() {
+    let foreachdb = parse_sql_as(
+        Dialect::TSql,
+        "EXEC sp_MSforeachdb N'\n  USE [?];\n  CREATE TABLE dbo.Audit (Id int);\n';",
+    )
+    .unwrap();
+    assert!(
+        foreachdb.entities.iter().all(|e| e.catalog.is_none()),
+        "`?` is a placeholder for every database, not the name of one: {:?}",
+        foreachdb.entities.iter().map(|e| &e.catalog).collect::<Vec<_>>()
+    );
+
+    let concatenated = parse_sql_as(
+        Dialect::TSql,
+        "DECLARE @sql nvarchar(max) = 'USE ' + @db + '; CREATE TABLE dbo.T (Id int);';\nEXEC(@sql);",
+    )
+    .unwrap();
+    assert!(
+        concatenated.entities.iter().all(|e| e.catalog.is_none()),
+        "the database is a runtime variable and cannot be known statically"
+    );
+}
+
 /// Neither dialect has a search_path, and inventing one would be a claim the
 /// source never made. The path is empty and unstated.
 #[test]
