@@ -30,11 +30,6 @@ added for SQLite asked `parser == Verbatim`, and both were added after it. A
 `mysql://` URL failed with a *PostgreSQL* pool timeout, because `connect` fell
 through to Postgres for any unrecognised scheme.
 
-**The website had been serving three stale documents**, including a `v0.13.0`
-version pin six releases out of date and the uncompilable `Design::apply`
-example that 0.16.0's doc gate exists to prevent — the gate read `docs/` and
-the site's copy was never checked. All three are now gated.
-
 **Breaking:** none to the library API. `dbd emit` is new.
 
 ### Added
