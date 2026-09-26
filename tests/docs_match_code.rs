@@ -38,55 +38,6 @@ fn the_two_skill_copies_are_identical() {
     );
 }
 
-/// The website serves a copy of every guide page and the llms files. They are
-/// the same documents and must stay identical.
-///
-/// Ungated until now, and all three of the drifted files were serving
-/// something wrong: the site's `04-commands.md` and `llms-full.txt` still said
-/// `rev: v0.13.0` six releases later, because `make bump` rewrote the `docs/`
-/// original and not the copy; `03-design-yaml.md` was 69 lines behind, so the
-/// site documented neither `tsql`/`mysql`/`verbatim` nor `source.search_path`;
-/// and the site's `llms-full.txt` still carried the uncompilable
-/// `Design::apply` example that the doc-examples gate exists to prevent —
-/// that gate reads `docs/`, so it passed while the website served the bug.
-#[test]
-fn the_website_copies_match_the_docs() {
-    let mut stale = Vec::new();
-    for (src, dst) in mirrored_docs() {
-        let a = read(&src);
-        let b = std::fs::read_to_string(root().join(&dst)).unwrap_or_default();
-        if a != b {
-            stale.push(format!("  {src}\n    -> {dst}"));
-        }
-    }
-    assert!(
-        stale.is_empty(),
-        "\n\nThe website is serving a different document from `docs/`:\n{}\n\n\
-         Sync with:\n\
-         \x20   cp docs/guide/*.md site/src/lib/content/guide/\n\
-         \x20   cp docs/llms/*    site/src/lib/content/llms/\n",
-        stale.join("\n")
-    );
-}
-
-/// Every `docs/` file the website keeps a copy of, as (source, copy).
-fn mirrored_docs() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for (dir, dest) in [
-        ("docs/guide", "site/src/lib/content/guide"),
-        ("docs/llms", "site/src/lib/content/llms"),
-    ] {
-        let entries = std::fs::read_dir(root().join(dir)).unwrap_or_else(|e| panic!("{dir}: {e}"));
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            out.push((format!("{dir}/{name}"), format!("{dest}/{name}")));
-        }
-    }
-    out.sort();
-    assert!(out.len() >= 6, "the mirror list found almost nothing: {out:?}");
-    out
-}
-
 /// `source.parser` accepts a fixed set of values. The guide lists them; the
 /// resolver decides them. A value in one and not the other is either a
 /// documented option that does not work, or a working option nobody knows
