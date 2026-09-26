@@ -231,18 +231,51 @@ pub struct SchemaPath {
     /// The entries, in resolution order. Empty for a dialect that has no such
     /// concept.
     pub entries: Vec<PathEntry>,
-    /// Whether the FILE established this, as opposed to dbd supplying a
-    /// default.
-    pub stated: bool,
+    /// Whose answer this is. See [`PathSource`].
+    pub source: PathSource,
+}
+
+/// Who established a [`SchemaPath`].
+///
+/// Three possible authors, and the difference is actionable: a caller can
+/// trust a file's own statement, should know when it is instead reading the
+/// project's blanket default, and must not treat the session default as a fact
+/// about anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathSource {
+    /// The file itself — `SET search_path TO …`, the convention every dbd DDL
+    /// file is expected to open with.
+    File,
+    /// `source.search_path` in design.yaml. The file said nothing, so the
+    /// project's blanket answer applies. **Never silent** — the load reports
+    /// every file it had to do this for.
+    Project,
+    /// Nobody. The file states none and the project configures none, so
+    /// whatever the connection happens to have applies: `"$user", public`,
+    /// unless a role or database setting moved it. dbd cannot know which.
+    #[default]
+    SessionDefault,
 }
 
 impl SchemaPath {
-    /// A path the file stated.
-    pub fn stated(entries: Vec<PathEntry>) -> Self {
-        Self { entries, stated: true }
+    /// A path the file itself stated.
+    pub fn from_file(entries: Vec<PathEntry>) -> Self {
+        Self {
+            entries,
+            source: PathSource::File,
+        }
     }
 
-    /// The default Postgres applies when a file states nothing: the connecting
+    /// A path `source.search_path` supplied, for a file that stated none.
+    pub fn from_project(entries: Vec<PathEntry>) -> Self {
+        Self {
+            entries,
+            source: PathSource::Project,
+        }
+    }
+
+    /// The default Postgres applies when nothing else does: the connecting
     /// role's own schema, then `public`.
     pub fn postgres_default() -> Self {
         Self {
@@ -250,8 +283,13 @@ impl SchemaPath {
                 PathEntry::CurrentUser,
                 PathEntry::Schema(crate::reconcile::DEFAULT_SCHEMA.to_string()),
             ],
-            stated: false,
+            source: PathSource::SessionDefault,
         }
+    }
+
+    /// Whether the file itself established this.
+    pub fn stated(&self) -> bool {
+        self.source == PathSource::File
     }
 
     /// The schemas on the path, in order, skipping any placeholder.

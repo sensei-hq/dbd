@@ -20,7 +20,7 @@ pub(in crate::parser) fn parse_sequence(mut entity: Entity, sql: &str) -> Result
     // Before any early return, matching the other native parsers: an errored
     // entity reporting `[]` instead of the `["public"]` default is an invariant
     // break the enum parser already hit once.
-    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,

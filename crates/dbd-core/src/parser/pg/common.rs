@@ -59,6 +59,21 @@ pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<
 /// qualify the table names a hook script depends on.
 ///
 /// [`design::hooks`]: crate::design::hooks
+/// The path an entity should carry: the file's own if it states one, else the
+/// fallback already seeded on the entity, else PostgreSQL's session default.
+///
+/// The seeded value is `source.search_path` — the project's answer for a file
+/// that forgets its `SET search_path`. Threaded in on the entity rather than as
+/// a parameter to every per-type parser, so the fallback reaches all of them
+/// through the one line each already had.
+pub(in crate::parser) fn resolve_schema_path(raw_sql: &str, seeded: &SchemaPath) -> SchemaPath {
+    let from_file = extract_search_paths_via_pg_query(raw_sql);
+    if from_file.stated() || seeded.source == crate::entity::PathSource::SessionDefault {
+        return from_file;
+    }
+    seeded.clone()
+}
+
 pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> SchemaPath {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return SchemaPath::postgres_default();
@@ -72,7 +87,7 @@ pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> SchemaPath {
         }
         let entries: Vec<PathEntry> = set.args.iter().filter_map(const_str).map(path_entry).collect();
         if !entries.is_empty() {
-            return SchemaPath::stated(entries);
+            return SchemaPath::from_file(entries);
         }
     }
     SchemaPath::postgres_default()

@@ -49,7 +49,7 @@ fn one(sql: &str) -> dbd_core::entity::Entity {
 #[test]
 fn a_stated_search_path_is_recorded_in_order() {
     let e = one("set search_path to app, shared;\ncreate table t (id int);");
-    assert!(e.schema_path.stated, "the file said this");
+    assert!(e.schema_path.stated(), "the file said this");
     assert_eq!(
         e.schema_path.schemas().collect::<Vec<_>>(),
         vec!["app", "shared"],
@@ -79,7 +79,7 @@ fn every_entity_type_carries_the_path() {
             vec!["app", "shared"],
             "{label} lost its schema path"
         );
-        assert!(e.schema_path.stated, "{label}");
+        assert!(e.schema_path.stated(), "{label}");
     }
 }
 
@@ -101,8 +101,11 @@ fn an_unstated_path_is_marked_as_dbds_own() {
     let stated = one("set search_path to public;\ncreate table t (id int);");
     let unstated = one("create table t (id int);");
 
-    assert!(stated.schema_path.stated, "the file wrote `SET search_path TO public`");
-    assert!(!unstated.schema_path.stated, "the file wrote nothing at all");
+    assert!(
+        stated.schema_path.stated(),
+        "the file wrote `SET search_path TO public`"
+    );
+    assert!(!unstated.schema_path.stated(), "the file wrote nothing at all");
 }
 
 /// And the unstated default is Postgres's real one, not a convenient half of
@@ -248,7 +251,7 @@ fn the_statement_head_dialects_state_no_schema_path() {
     for d in [Dialect::TSql, Dialect::MySql] {
         let p = parse_sql_as(d, "CREATE TABLE t (id int);").unwrap();
         assert!(p.entities[0].schema_path.entries.is_empty(), "{d:?}");
-        assert!(!p.entities[0].schema_path.stated, "{d:?}");
+        assert!(!p.entities[0].schema_path.stated(), "{d:?}");
     }
 }
 

@@ -275,7 +275,7 @@ mod tests {
     /// schema the parser uses to qualify bare references).
     fn entity_sp(name: &str, refers: &[&str], search_paths: &[&str]) -> Entity {
         let mut e = entity(name, refers);
-        e.schema_path = crate::entity::SchemaPath::stated(
+        e.schema_path = crate::entity::SchemaPath::from_file(
             search_paths
                 .iter()
                 .map(|s| crate::entity::PathEntry::Schema(s.to_string()))

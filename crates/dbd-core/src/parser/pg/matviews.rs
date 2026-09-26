@@ -25,7 +25,7 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before the parse-error early return, same as every other native
     // parser here: an errored entity must still carry the sqlparser path's
     // `["public"]` default, since references are qualified against it.
-    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
