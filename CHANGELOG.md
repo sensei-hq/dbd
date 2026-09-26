@@ -9,6 +9,29 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-25
+
+An unqualified name in a SQL file means nothing without knowing where it
+resolves, and dbd was answering that question with a constant. Every entity
+now carries the namespace context its file established — and says who
+established it.
+
+Three things were wrong, each verified against a live PostgreSQL rather than
+assumed. `"$user"` was read as a schema name, so a file writing Postgres's own
+default produced references into a schema that cannot exist. A file stating
+nothing was indistinguishable from one stating `public`, though the real
+session default is `"$user", public` and depends on the connecting role.
+And `USE db` — the T-SQL and MySQL equivalent — was ignored outright, so the
+same table in two databases collapsed into one entity.
+
+The fallback is now the project's to choose (`source.search_path`) instead of
+a `public` compiled into dbd, and **it is never silent**: every DDL file that
+states no path is named, with what its names were resolved against instead.
+
+**Breaking:** `Entity::search_paths` and `ParsedFile::search_paths` are gone,
+replaced by `schema_path: SchemaPath`. Code reading `entity.search_paths` as a
+`Vec<String>` becomes `entity.schema_path.schemas()`.
+
 ### Added
 
 - **Every entity carries the namespace context its file established.**
@@ -63,12 +86,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   server, Postgres's actual default is `"$user", public` — with a schema named
   after the connecting role, a bare `lookup` resolves to `<role>.lookup`, and
   `ALTER ROLE`/`ALTER DATABASE … SET search_path` move it further. dbd cannot
-  know at parse time and said `public` as though it could; `SchemaPath::stated`
+  know at parse time and said `public` as though it could; `SchemaPath::source`
   now says whose answer it is.
-
-  **Not changed:** what a bare reference is pre-qualified *to*. Every existing
-  project's apply path depends on the `public` fallback, so this makes the
-  guess visible rather than moving it.
 
 ## [0.17.0] — 2026-09-25
 
@@ -918,7 +937,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.17.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.18.0...main
+[0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
 [0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
