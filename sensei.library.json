@@ -1,10 +1,10 @@
 {
   "library": "dbd",
   "version": ">=0.10",
-  "documents": "0.20.0",
+  "documents": "0.21.0",
   "ecosystem": "cargo",
   "repo": "https://github.com/sensei-hq/dbd",
-  "ref": "v0.20.0",
+  "ref": "v0.21.0",
   "site": "https://dbd.sensei-hq.com",
   "packages": ["dbd-core", "dbd-cli"],
   "llms": {
