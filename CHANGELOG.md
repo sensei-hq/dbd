@@ -9,7 +9,7 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-## [0.20.0] — 2026-09-26
+## [0.21.0] — 2026-09-26
 
 **`dbd emit`** translates a PostgreSQL schema into MySQL, T-SQL or SQLite DDL.
 Anything the target cannot express is downgraded to the nearest equivalent and
@@ -1132,8 +1132,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.20.0...main
-[0.20.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.20.0
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.21.0...main
+[0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
