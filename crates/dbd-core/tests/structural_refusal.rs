@@ -60,10 +60,7 @@ async fn diff_refuses_every_dialect_without_a_structured_model() {
             Ok(d) => panic!("{dialect}: diff must refuse, not report {d:?}"),
             Err(e) => e.to_string(),
         };
-        assert!(
-            err.contains("structured"),
-            "{dialect}: the refusal must say why: {err}"
-        );
+        assert!(err.contains("structured"), "{dialect}: the refusal must say why: {err}");
         assert!(
             err.contains(dialect),
             "{dialect}: and name the dialect responsible: {err}"
@@ -122,4 +119,51 @@ fn only_the_postgres_reader_produces_a_structured_model() {
     for choice in [ParserChoice::TSql, ParserChoice::MySql, ParserChoice::Verbatim] {
         assert!(!choice.produces_structure(), "{choice:?}");
     }
+}
+
+// ── There is no adapter for these dialects, and the error should say so ─────
+
+/// A URL for a database dbd has no adapter for must be refused by name.
+///
+/// `connect` dispatched on `convex:` and `sqlite:` and fell through to
+/// **Postgres for everything else**, so `mysql://…` built a `PostgresAdapter`
+/// and failed with `pool timed out while waiting for an open connection` — a
+/// PostgreSQL error, mentioning neither MySQL nor the absence of an adapter.
+/// Reading those dialects arrived before any adapter did; the message now says
+/// which half exists.
+#[tokio::test]
+async fn a_url_for_an_unsupported_database_names_it() {
+    for (url, name) in [
+        ("mysql://root@localhost:3306/shop", "MySQL"),
+        ("mariadb://root@localhost:3306/shop", "MySQL"),
+        ("sqlserver://sa@localhost:1433/db", "SQL Server"),
+        ("mssql://sa@localhost:1433/db", "SQL Server"),
+    ] {
+        let err = match dbd_core::connect(url, "p").await {
+            Ok(_) => panic!("{url}: must not connect"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(name), "{url}: must name the database: {err}");
+        assert!(
+            !err.contains("pool timed out"),
+            "{url}: must not surface a PostgreSQL connection error: {err}"
+        );
+        assert!(
+            err.contains("read") || err.contains("parse"),
+            "{url}: and should say reading it IS supported: {err}"
+        );
+    }
+}
+
+/// A scheme dbd genuinely treats as PostgreSQL must keep working.
+#[tokio::test]
+async fn a_postgres_url_still_routes_to_postgres() {
+    let err = match dbd_core::connect("postgres://nobody@127.0.0.1:1/absent", "p").await {
+        Ok(_) => panic!("nothing is listening on that port"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !err.contains("no adapter"),
+        "a postgres:// URL must still reach the Postgres adapter: {err}"
+    );
 }
