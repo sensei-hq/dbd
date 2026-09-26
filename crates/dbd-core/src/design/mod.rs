@@ -431,6 +431,35 @@ pub struct Design {
     parser: crate::parser::ParserChoice,
 }
 
+/// Report a DDL file that states no `SET search_path` of its own.
+///
+/// Every dbd DDL file is expected to open with one — no emitter writes it, so
+/// it is a convention the author keeps, and a file that forgets is a real
+/// possibility. Measured across dbd's own fixtures, 43 of 44 schema-owning DDL
+/// files have it.
+///
+/// The report is the point as much as the fallback. Silently resolving a
+/// forgotten path — against `public`, or against the project default — is how a
+/// reference ends up aimed at a schema nobody chose. `inspect` counts these and
+/// `apply`/`deploy` print them.
+///
+/// Types without a schema (roles, extensions) are skipped: they have no
+/// unqualified names to resolve, so a missing path is not a defect there.
+fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
+    use crate::entity::PathSource;
+    if entity.schema_path.stated() || !entity.entity_type.has_schema() {
+        return;
+    }
+    let resolved_against = match entity.schema_path.source {
+        PathSource::Project => "source.search_path".to_string(),
+        _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
+    };
+    entity.warnings.push(format!(
+        "{} states no `SET search_path`; unqualified names resolved against {resolved_against}",
+        relative.display()
+    ));
+}
+
 impl Design {
     /// Create a Design from a config file path.
     ///
@@ -456,6 +485,33 @@ impl Design {
             design_config.source.parser.as_deref(),
         )?;
 
+        // The project's answer for a file that states no `SET search_path`.
+        // Validated here rather than at use, so a mistake fails the load
+        // instead of quietly resolving nothing.
+        let project_search_path = match design_config.source.search_path.as_deref() {
+            None => None,
+            Some([]) => {
+                return Err(DbdError::Config(
+                    "source.search_path is an empty list. Remove the key to use PostgreSQL's \
+                     own default (\"$user\", public), or name the schemas a file that states no \
+                     `SET search_path` should resolve against."
+                        .to_string(),
+                ));
+            }
+            Some(names) => Some(
+                names
+                    .iter()
+                    .map(|n| {
+                        if n == "$user" {
+                            crate::entity::PathEntry::CurrentUser
+                        } else {
+                            crate::entity::PathEntry::Schema(n.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        };
+
         // Scan and parse DDL entities. A file that fails to read must not
         // silently vanish from the desired set — a live table could be
         // dropped by `reconcile --prune` — so propagate the read error.
@@ -473,8 +529,13 @@ impl Design {
             // Use relative path for entity type/name derivation, but
             // store the absolute path so the file is readable regardless of CWD.
             let relative = file.strip_prefix(&project_dir).unwrap_or(file);
-            if let Ok(mut entity) = parser::parse_entity_with(parser_choice, relative, &sql) {
+            let fallback = project_search_path
+                .clone()
+                .map(crate::entity::SchemaPath::from_project)
+                .unwrap_or_default();
+            if let Ok(mut entity) = parser::parse_entity_with_search_path(parser_choice, relative, &sql, &fallback) {
                 entity.file = Some(file.clone());
+                warn_if_no_search_path(&mut entity, relative);
                 entities.push(entity);
             }
         }

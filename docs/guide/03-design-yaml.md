@@ -83,6 +83,32 @@ ignore:
 |-----------|--------|--------------|-------------|
 | `dialect` | string | `postgresql` | SQL dialect of the DDL files — see below |
 | `parser`  | string | (from `dialect`) | Override the reader: `pg_query`, `tsql`, `mysql` or `verbatim` |
+| `search_path` | list | (session default) | Where unqualified names resolve in a file that states no `SET search_path` |
+
+#### `search_path`
+
+Every dbd DDL file is expected to open with `SET search_path TO <schema>;`.
+Nothing generates that line — it is a convention you keep — so a file can
+forget it, and then its unqualified names resolve against whatever the
+connection happens to have.
+
+`search_path` is the project's answer for that case:
+
+```yaml
+source:
+  dialect: postgresql
+  search_path: [app, shared]
+```
+
+A file that states its own path still wins; this only fills the gap. Omit the
+key and PostgreSQL's own default applies (`"$user", public`), which depends on
+the connecting role and can be moved by `ALTER ROLE`/`ALTER DATABASE … SET
+search_path` — so dbd cannot know it from your files.
+
+**Either way it is reported, not silent.** Every DDL file that states no path
+is named in a warning saying what its names were resolved against instead.
+`dbd inspect` counts them; `apply` and `deploy` print them. An empty list is
+refused rather than treated as "no schemas".
 
 `dialect` picks the reader; `parser` overrides that choice and you should not
 normally need it.

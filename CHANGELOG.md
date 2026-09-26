@@ -9,6 +9,86 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-25
+
+An unqualified name in a SQL file means nothing without knowing where it
+resolves, and dbd was answering that question with a constant. Every entity
+now carries the namespace context its file established — and says who
+established it.
+
+Three things were wrong, each verified against a live PostgreSQL rather than
+assumed. `"$user"` was read as a schema name, so a file writing Postgres's own
+default produced references into a schema that cannot exist. A file stating
+nothing was indistinguishable from one stating `public`, though the real
+session default is `"$user", public` and depends on the connecting role.
+And `USE db` — the T-SQL and MySQL equivalent — was ignored outright, so the
+same table in two databases collapsed into one entity.
+
+The fallback is now the project's to choose (`source.search_path`) instead of
+a `public` compiled into dbd, and **it is never silent**: every DDL file that
+states no path is named, with what its names were resolved against instead.
+
+**Breaking:** `Entity::search_paths` and `ParsedFile::search_paths` are gone,
+replaced by `schema_path: SchemaPath`. Code reading `entity.search_paths` as a
+`Vec<String>` becomes `entity.schema_path.schemas()`.
+
+### Added
+
+- **Every entity carries the namespace context its file established.**
+  `Entity::schema_path` and `ParsedFile::schema_path` replace
+  `search_paths: Vec<String>` with a `SchemaPath` that says *where*
+  unqualified names resolve **and whether the file actually said so**.
+
+  An unqualified name means nothing without that context, and each dialect
+  states it differently: PostgreSQL `SET search_path TO a, b`, T-SQL and MySQL
+  `USE db`.
+
+- **`USE db` is read, and sets the catalog.** Previously ignored outright. Over
+  a 2,154-file T-SQL corpus, 77 files carry one; the reader now recognises 63
+  of them, taking entities with a catalog from **2 to 123**. Without it,
+  `dbo.Issues` in two databases was a single entity — the collision
+  `Entity::catalog` exists to prevent. A three-part name states its own
+  database and still wins.
+
+- **`source.search_path` — the fallback path is the project's to choose**, not
+  a constant compiled into dbd. Every dbd DDL file is expected to open with
+  `SET search_path TO <schema>;`; nothing generates that line, so a file can
+  forget it, and then its unqualified names resolved against `public` — for a
+  project whose schemas are `app` and `shared`, simply the wrong answer.
+
+  ```yaml
+  source:
+    search_path: [app, shared]
+  ```
+
+  A file stating its own path still wins; this only fills the gap. Omitted,
+  PostgreSQL's session default stands. An empty list is refused rather than
+  read as "no schemas".
+
+  **And it is never silent.** Loading a project names every DDL file that
+  stated no path, and what its names were resolved against instead: `inspect`
+  counts them, `apply` and `deploy` print them. Schemaless types (roles,
+  extensions) are exempt — they have no unqualified names to resolve.
+
+  `PathSource::{File, Project, SessionDefault}` replaces `SchemaPath::stated`
+  as a bool, since there are now three possible authors of the answer.
+
+### Fixed
+
+- **`"$user"` is no longer treated as a schema name.** A file writing
+  Postgres's own default (`SET search_path TO "$user", public`) produced
+  references to `"$user".lookup` — a schema that cannot exist, so an edge that
+  could never resolve. It is now `PathEntry::CurrentUser`: kept on the path,
+  in position, for a caller that has a connection, and never used to qualify.
+
+- **A file that states no search_path is distinguishable from one stating
+  `public`.** Both used to produce `["public"]`. Verified against a live
+  server, Postgres's actual default is `"$user", public` — with a schema named
+  after the connecting role, a bare `lookup` resolves to `<role>.lookup`, and
+  `ALTER ROLE`/`ALTER DATABASE … SET search_path` move it further. dbd cannot
+  know at parse time and said `public` as though it could; `SchemaPath::source`
+  now says whose answer it is.
+
 ## [0.17.0] — 2026-09-25
 
 Two reports from an embedder reading SQL through `parse_sql_as`, both about
@@ -857,7 +937,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.17.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.18.0...main
+[0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
 [0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
 [0.15.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.15.0
