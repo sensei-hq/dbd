@@ -121,6 +121,22 @@ impl ParserChoice {
     /// [`Dialect::Unstated`] falls back to libpg_query — it has no reader of
     /// its own, and a file that reader cannot read reports why, which is the
     /// one thing a caller can rely on.
+    /// Whether this reader produces a structured model — columns, constraints,
+    /// indexes — that `diff` and `reconcile` can compare.
+    ///
+    /// Only libpg_query does. The statement-head readers give identity and
+    /// references but no `TableDef`, and [`Self::Verbatim`] keeps the file's
+    /// text. Asked as a property of the reader rather than kept as a list,
+    /// because the list is what went stale: the guard was written for
+    /// `Verbatim` and T-SQL and MySQL were added after it, so both walked past
+    /// and reported a clean diff against anything.
+    pub fn produces_structure(self) -> bool {
+        match self {
+            Self::PgQuery => true,
+            Self::TSql | Self::MySql | Self::Verbatim => false,
+        }
+    }
+
     pub fn for_dialect_typed(dialect: Dialect) -> Self {
         match dialect {
             Dialect::Sqlite => Self::Verbatim,

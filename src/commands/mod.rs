@@ -29,6 +29,7 @@ fn command_honors_scope(command: &Commands) -> bool {
         Commands::Inspect { .. }
         | Commands::Apply { .. }
         | Commands::Combine { .. }
+        | Commands::Emit { .. }
         | Commands::Import { .. }
         | Commands::Graph { .. }
         | Commands::Dbml { .. }
@@ -99,6 +100,18 @@ pub async fn run(
         }
 
         Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity),
+
+        Commands::Emit { dialect, file, report } => schema::cmd_emit(
+            config,
+            env,
+            project_dir,
+            dialect,
+            file,
+            report.as_deref(),
+            scope,
+            deps,
+            verbosity,
+        ),
 
         Commands::Refresh { name } => {
             schema::cmd_refresh(

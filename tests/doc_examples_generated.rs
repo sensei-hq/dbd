@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x55e96d386561122a
+// docs-digest: 0x46d8eaf7271a6a2b
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -243,6 +243,37 @@ async fn doc_docs_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
     let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
+    use dbd_core::Design;
+    use dbd_core::emit_dialect::emit_schema;
+    use dbd_core::parser::Dialect;
+    use std::path::Path;
+
+    let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+    let (sql, downgrades) = emit_schema(&design, Dialect::MySql, None)?;
+    std::fs::write("schema.mysql.sql", sql)?;
+    for d in &downgrades {
+        println!("{} {:?}: {} -> {}", d.entity, d.column, d.from, d.to);
+    }
+    Ok(())
+}
+
+// docs/skills/dbd/SKILL.md — block 6
+#[allow(unused, clippy::all)]
+async fn doc_docs_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
     use dbd_core::parser::parse_sql;
 
     let parsed = parse_sql(sql)?;
@@ -440,6 +471,37 @@ async fn doc_src_assets_skills_dbd_skill_md_4() -> dbd_core::Result<()> {
 // src/assets/skills/dbd/SKILL.md — block 5
 #[allow(unused, clippy::all)]
 async fn doc_src_assets_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::Design;
+    use dbd_core::emit_dialect::emit_schema;
+    use dbd_core::parser::Dialect;
+    use std::path::Path;
+
+    let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+    let (sql, downgrades) = emit_schema(&design, Dialect::MySql, None)?;
+    std::fs::write("schema.mysql.sql", sql)?;
+    for d in &downgrades {
+        println!("{} {:?}: {} -> {}", d.entity, d.column, d.from, d.to);
+    }
+    Ok(())
+}
+
+// src/assets/skills/dbd/SKILL.md — block 6
+#[allow(unused, clippy::all)]
+async fn doc_src_assets_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]

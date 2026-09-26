@@ -650,6 +650,62 @@ fn print_enum_hints(hints: &[dbd_core::design::EnumHint]) {
     }
 }
 
+/// `dbd emit --dialect <target>` — the schema as another engine's DDL.
+///
+/// Distinct from [`cmd_combine`], which consolidates this project's own DDL
+/// into one applyable script. This one translates: types are mapped, and
+/// anything the target cannot express is downgraded and reported.
+///
+/// The exit status stays 0 when downgrades happen — they are the documented
+/// behaviour, not a failure — which is exactly why `--report` exists: a
+/// pipeline asserts on the count rather than on the exit code.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_emit(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    dialect: &str,
+    file: &Path,
+    report: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let target = dbd_core::parser::Dialect::from_label(dialect)
+        .ok_or_else(|| anyhow::anyhow!("unknown dialect {dialect:?} — expected mysql, tsql or sqlite"))?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps)?;
+
+    let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
+    std::fs::write(file, sql).with_context(|| format!("Failed to write {}", file.display()))?;
+    output::info(verbosity, &format!("Generated {}", file.display()));
+
+    // Counted, not just listed: a summary someone can act on without reading
+    // every line, and the number a reviewer compares against last time.
+    if downgrades.is_empty() {
+        output::info(verbosity, "No downgrades — every construct mapped faithfully.");
+    } else {
+        output::warn(&format!(
+            "{} downgrade(s) — the target could not express these exactly:",
+            downgrades.len()
+        ));
+        for d in &downgrades {
+            let where_ = match &d.column {
+                Some(c) => format!("{}.{c}", d.entity),
+                None => d.entity.clone(),
+            };
+            output::warn(&format!("  {where_}: {} -> {} ({})", d.from, d.to, d.reason));
+        }
+    }
+
+    if let Some(path) = report {
+        let json = serde_json::to_string_pretty(&downgrades).context("Failed to serialize the report")?;
+        std::fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        output::info(verbosity, &format!("Wrote {}", path.display()));
+    }
+    Ok(())
+}
+
 pub fn cmd_combine(
     config: &Path,
     env: &str,

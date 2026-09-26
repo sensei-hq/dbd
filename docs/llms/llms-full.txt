@@ -775,6 +775,44 @@ dbd combine --scope hub --deps include  # self-contained closure
 
 `--scope`/`--deps` filter the combined SQL to the working set (filter-only, no gap gate). Roles are kept in every scope; extensions too, unless the scope sets an `extensions` allowlist (`[]` ⇒ none).
 
+### dbd emit
+
+```sh
+dbd emit --dialect mysql -f schema.mysql.sql
+dbd emit --dialect tsql  -f schema.tsql.sql --report downgrades.json
+dbd emit --dialect sqlite --scope hub -f hub.sqlite.sql
+```
+
+Translates the schema into **another engine's** DDL. Not `combine`, which
+consolidates this project's own DDL into one script for its own target.
+
+Targets: `mysql`, `tsql`, `sqlite`. The **source must be PostgreSQL** — it is
+the only dialect dbd reads into columns and constraints, so emitting from a
+T-SQL, MySQL or SQLite project is refused rather than producing an empty
+schema.
+
+Tables and views only. Functions, procedures and triggers are skipped and
+reported: their bodies are PL/pgSQL or SQL that does not translate.
+
+Anything the target cannot express is **downgraded to the nearest thing it
+can, and reported** — never silently dropped, and never a reason to refuse the
+whole schema. Each loss appears twice: as a comment at the site in the emitted
+file, and in the run's summary. `--report <file>` writes the same set as JSON
+so CI can assert on the count.
+
+```sql
+-- dbd: `tags` was `text[]` — emitted as JSON; no array type exists here, so
+--      the `text` elements become a JSON document
+`tags` JSON,
+```
+
+A *faithful* mapping is not reported. `integer` → `INT` loses nothing, and a
+report padded with those is one nobody reads.
+
+The exit status stays 0 when downgrades happen — they are the documented
+behaviour, not a failure — which is why the count is what a pipeline should
+assert on.
+
 ### dbd graph
 
 ```sh
@@ -881,7 +919,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.19.0
+  rev: v0.21.0
   hooks:
     - id: dbd-format
 ```

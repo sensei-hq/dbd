@@ -7,9 +7,13 @@ use super::common;
 
 /// Parse a view DDL file.
 ///
-/// A view entity carries only its references — nothing renders its body — so
-/// unlike a materialized view it needs no verbatim SQL, which is what makes it
-/// parity-clean against the incumbent.
+/// Carries the body verbatim in [`Entity::body`], like a materialized view.
+///
+/// It did not, and the comment here said it "needs no verbatim SQL, which is
+/// what makes it parity-clean against the incumbent" — the incumbent being the
+/// sqlparser path retired in 0.14.0. Nothing rendered a view's body at the
+/// time, so the omission cost nothing. `dbd emit` renders one (#23), and
+/// without this a view came out as `CREATE VIEW x AS SELECT 1`.
 pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set the search path before any early return: references are qualified
     // against it, and an errored entity reporting `[]` instead of the
@@ -29,6 +33,10 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
             .errors
             .push("this view file declares no `CREATE VIEW`".to_string());
         return Ok(entity);
+    }
+
+    if let Some(body) = view_body(sql, &parsed) {
+        entity.body = vec![body];
     }
 
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
@@ -71,6 +79,39 @@ fn declares_a_view(parsed: &pg_query::ParseResult) -> bool {
         .iter()
         .filter_map(|s| s.stmt.as_ref()?.node.as_ref())
         .any(|n| matches!(n, pg_query::NodeEnum::ViewStmt(_)))
+}
+
+/// The verbatim `SELECT` after the view's `AS`.
+///
+/// Simpler than the materialized-view version, which also has to stop before a
+/// trailing `WITH [NO] DATA`; a plain view has no such clause, so the body runs
+/// to the end of the statement.
+fn view_body(sql: &str, parsed: &pg_query::ParseResult) -> Option<String> {
+    let raw = parsed.protobuf.stmts.iter().find(|s| {
+        matches!(
+            s.stmt.as_ref().and_then(|n| n.node.as_ref()),
+            Some(pg_query::NodeEnum::ViewStmt(_))
+        )
+    })?;
+    let start = raw.stmt_location as usize;
+    // `stmt_len == 0` means "runs to the end of input" — a final statement
+    // with no trailing `;`.
+    let end = if raw.stmt_len == 0 {
+        sql.len()
+    } else {
+        start + raw.stmt_len as usize
+    };
+
+    let scan = pg_query::scan(sql).ok()?;
+    let in_range = |t: &&pg_query::protobuf::ScanToken| (t.start as usize) >= start && (t.end as usize) <= end;
+    let as_token = scan
+        .tokens
+        .iter()
+        .filter(in_range)
+        .find(|t| sql[t.start as usize..t.end as usize].eq_ignore_ascii_case("as"))?;
+
+    let body = sql[as_token.end as usize..end].trim().trim_end_matches(';').trim();
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 #[cfg(test)]
