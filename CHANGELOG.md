@@ -27,6 +27,29 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `Entity::catalog` exists to prevent. A three-part name states its own
   database and still wins.
 
+- **`source.search_path` — the fallback path is the project's to choose**, not
+  a constant compiled into dbd. Every dbd DDL file is expected to open with
+  `SET search_path TO <schema>;`; nothing generates that line, so a file can
+  forget it, and then its unqualified names resolved against `public` — for a
+  project whose schemas are `app` and `shared`, simply the wrong answer.
+
+  ```yaml
+  source:
+    search_path: [app, shared]
+  ```
+
+  A file stating its own path still wins; this only fills the gap. Omitted,
+  PostgreSQL's session default stands. An empty list is refused rather than
+  read as "no schemas".
+
+  **And it is never silent.** Loading a project names every DDL file that
+  stated no path, and what its names were resolved against instead: `inspect`
+  counts them, `apply` and `deploy` print them. Schemaless types (roles,
+  extensions) are exempt — they have no unqualified names to resolve.
+
+  `PathSource::{File, Project, SessionDefault}` replaces `SchemaPath::stated`
+  as a bool, since there are now three possible authors of the answer.
+
 ### Fixed
 
 - **`"$user"` is no longer treated as a schema name.** A file writing
