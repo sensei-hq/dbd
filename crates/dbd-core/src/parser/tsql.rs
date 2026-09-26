@@ -51,7 +51,7 @@
 //!
 //! Ported from sensei's `indexer::lang::sql::tsql`.
 
-use crate::entity::{Entity, EntityType, REF_TYPE_FUNCTION, Reference};
+use crate::entity::{Entity, EntityType, Ref};
 use crate::parser::FileReferences;
 use crate::parser::lex::{self, Tok};
 
@@ -415,11 +415,28 @@ fn walk(
     }
 }
 
+/// What the walk saw, before it becomes an [`entity::RefKind`].
+///
+/// A separate enum because the walk has no `Member`: role membership is a
+/// PostgreSQL `GRANT`, which these dialects express differently and this
+/// reader does not read.
+///
+/// [`entity::RefKind`]: crate::entity::RefKind
 #[derive(Clone, Copy, PartialEq)]
 enum RefKind {
     Reads,
     Writes,
     Calls,
+}
+
+impl From<RefKind> for crate::entity::RefKind {
+    fn from(k: RefKind) -> Self {
+        match k {
+            RefKind::Reads => Self::Reads,
+            RefKind::Writes => Self::Writes,
+            RefKind::Calls => Self::Calls,
+        }
+    }
 }
 
 /// Record a declaration, returning its index in `entities`.
@@ -489,27 +506,10 @@ fn refer(
         return;
     }
 
-    match kind {
-        RefKind::Reads => push_unique(&mut entity.reads, &full),
-        RefKind::Writes => push_unique(&mut entity.writes, &full),
-        RefKind::Calls => {}
-    }
-    let ref_type = (kind == RefKind::Calls).then(|| REF_TYPE_FUNCTION.to_string());
-    if !entity
-        .references
-        .iter()
-        .any(|r| r.name == full && r.ref_type == ref_type)
-    {
-        entity.references.push(Reference {
-            name: full.clone(),
-            ref_type,
-            // This walk never invents a schema: an unqualified name is reported
-            // unqualified rather than guessed at, so whatever is here is the
-            // source's own.
-            schema_source: crate::entity::SchemaSource::Stated,
-        });
-    }
-    push_unique(&mut entity.refers, &full);
+    // This walk never invents a schema: an unqualified name is reported
+    // unqualified rather than guessed at, so whatever is here is the source's
+    // own.
+    entity.push_ref(Ref::stated(full, kind.into()));
 }
 
 fn push_unique(v: &mut Vec<String>, item: &str) {

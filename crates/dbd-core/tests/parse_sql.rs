@@ -209,9 +209,9 @@ fn a_foreign_key_becomes_a_reference() {
 
     let orders = parsed.entities.iter().find(|e| e.name == "app.orders").unwrap();
     assert!(
-        orders.refers.contains(&"app.users".to_string()),
+        orders.refers_to("app.users"),
         "FK must become an edge, got {:?}",
-        orders.refers
+        orders.refers().collect::<Vec<_>>()
     );
 }
 
@@ -230,9 +230,9 @@ fn a_constraint_added_by_alter_table_reaches_the_entity() {
 
     let orders = parsed.entities.iter().find(|e| e.name == "app.orders").unwrap();
     assert!(
-        orders.refers.contains(&"app.users".to_string()),
+        orders.refers_to("app.users"),
         "an ALTER-added FK must be an edge here too, got {:?}",
-        orders.refers
+        orders.refers().collect::<Vec<_>>()
     );
     assert_eq!(
         orders.table_def.as_ref().unwrap().constraints.len(),
@@ -255,8 +255,16 @@ fn a_routine_keeps_its_reads_and_writes_separated() {
     let e = one("set search_path to app;\n\
          create procedure sync() language plpgsql as $$ begin \
          insert into target select * from source; end $$;");
-    assert!(e.reads.iter().any(|r| r == "app.source"), "reads: {:?}", e.reads);
-    assert!(e.writes.iter().any(|w| w == "app.target"), "writes: {:?}", e.writes);
+    assert!(
+        e.reads().any(|r| r.name == "app.source"),
+        "reads: {:?}",
+        e.reads().collect::<Vec<_>>()
+    );
+    assert!(
+        e.writes().any(|r| r.name == "app.target"),
+        "writes: {:?}",
+        e.writes().collect::<Vec<_>>()
+    );
 }
 
 // ── Failure is reported, not fabricated ─────────────────────────────────────

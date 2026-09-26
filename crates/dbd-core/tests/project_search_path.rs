@@ -118,9 +118,9 @@ fn a_bare_reference_resolves_against_the_projects_path() {
     );
     let child = entity(&d, "app.child");
     assert!(
-        child.refers.iter().any(|r| r == "app.parent"),
+        child.refers_to("app.parent"),
         "the bare `parent` should resolve in the project's own schema, got {:?}",
-        child.refers
+        child.refers().collect::<Vec<_>>()
     );
 }
 

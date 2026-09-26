@@ -570,7 +570,13 @@ impl Design {
             }
             for role in &target.roles {
                 let mut entity = Entity::new(EntityType::Role, &role.name);
-                entity.refers = role.refers.clone();
+                // A role listed under `target.roles` is granted the roles it
+                // names — a membership, not a read.
+                entity.refs = role
+                    .refers
+                    .iter()
+                    .map(|r| crate::entity::Ref::stated(r, crate::entity::RefKind::Member))
+                    .collect();
                 entities.push(entity);
             }
         }
@@ -3587,7 +3593,10 @@ import:
     fn dependency_overrides_type_order_for_view_on_function() {
         use crate::entity::EntityType;
         let mut view = Entity::new(EntityType::View, "app.v");
-        view.refers = vec!["app.f".to_string()];
+        view.refs = (vec!["app.f".to_string()])
+            .into_iter()
+            .map(|n| crate::entity::Ref::stated(n, crate::entity::RefKind::Reads))
+            .collect();
         let ents = vec![view, Entity::new(EntityType::Function, "app.f")];
 
         let ordered = order_entities_for_test(ents);
@@ -3606,7 +3615,10 @@ import:
     fn dependency_overrides_type_order_for_function_on_view() {
         use crate::entity::EntityType;
         let mut func = Entity::new(EntityType::Function, "app.f");
-        func.refers = vec!["app.v".to_string()];
+        func.refs = (vec!["app.v".to_string()])
+            .into_iter()
+            .map(|n| crate::entity::Ref::stated(n, crate::entity::RefKind::Reads))
+            .collect();
         let ents = vec![func, Entity::new(EntityType::View, "app.v")];
 
         let ordered = order_entities_for_test(ents);

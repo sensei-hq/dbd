@@ -28,7 +28,7 @@ pub fn build_dependency_graph(entities: &[Entity]) -> HashMap<String, HashSet<St
     entities
         .iter()
         .map(|e| {
-            let deps: HashSet<String> = e.refers.iter().cloned().collect();
+            let deps: HashSet<String> = e.refers().map(str::to_string).collect();
             (e.name.clone(), deps)
         })
         .collect()
@@ -193,10 +193,9 @@ fn build_dependency_map(entities: &[Entity]) -> HashMap<String, HashSet<String>>
         .iter()
         .map(|e| {
             let deps: HashSet<String> = e
-                .refers
-                .iter()
-                .filter(|dep| entity_names.contains(*dep) && **dep != e.name)
-                .cloned()
+                .refers()
+                .filter(|dep| entity_names.contains(*dep) && *dep != e.name)
+                .map(str::to_string)
                 .collect();
             (e.name.clone(), deps)
         })
@@ -288,12 +287,11 @@ pub fn graph_from_entities(entities: &[Entity], scope: Option<&str>) -> GraphRes
     let edges: Vec<GraphEdge> = filtered
         .iter()
         .flat_map(|e| {
-            e.refers
-                .iter()
+            e.refers()
                 .filter(|dep| entity_names.contains(*dep))
                 .map(|dep| GraphEdge {
                     from: e.name.clone(),
-                    to: dep.clone(),
+                    to: dep.to_string(),
                 })
         })
         .collect();
@@ -315,9 +313,9 @@ fn reachable_subgraph(entities: &[Entity], start: &str) -> Vec<Entity> {
             continue;
         }
         if let Some(entity) = entity_map.get(name.as_str()) {
-            for dep in &entity.refers {
+            for dep in entity.refers() {
                 if !visited.contains(dep) {
-                    stack.push(dep.clone());
+                    stack.push(dep.to_string());
                 }
             }
         }
@@ -333,7 +331,10 @@ mod tests {
 
     fn entity(name: &str, refers: &[&str]) -> Entity {
         let mut e = Entity::new(EntityType::Table, name);
-        e.refers = refers.iter().map(|s| s.to_string()).collect();
+        e.refs = refers
+            .iter()
+            .map(|n| crate::entity::Ref::stated(*n, crate::entity::RefKind::Reads))
+            .collect();
         e
     }
 

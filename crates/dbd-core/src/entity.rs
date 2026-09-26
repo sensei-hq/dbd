@@ -111,15 +111,6 @@ impl EntityType {
     }
 }
 
-/// `Reference::ref_type` for a call to a function or procedure.
-///
-/// Function references are *soft*: a view body is full of built-in and
-/// aggregate calls (`now()`, `sum()`, `coalesce()`) that look exactly like a
-/// call to a project-managed function, and only the resolver knows which is
-/// which. Unlike a table reference, one that does not resolve to a known entity
-/// is dropped silently instead of warned about.
-pub const REF_TYPE_FUNCTION: &str = "function";
-
 /// Where the schema in a qualified name came from.
 ///
 /// The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first
@@ -318,14 +309,85 @@ impl SchemaPath {
     }
 }
 
-/// A parsed reference to another entity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reference {
+/// What an entity does to something it refers to.
+///
+/// Replaces `Reference::ref_type`, an `Option<String>` that carried `None` for
+/// reads and writes alike, `Some("function")` for calls, and `Some("table")`
+/// at two sites nothing ever read — so it distinguished only "is this a call",
+/// and the read/write split lived in two other fields entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefKind {
+    /// `FROM`, `JOIN`, or a foreign key's target. A **hard** dependency: the
+    /// target must exist before this entity is applied.
+    Reads,
+    /// `INSERT`/`UPDATE`/`MERGE`, or the object an `ALTER`/`DROP` names. Also
+    /// hard.
+    Writes,
+    /// `EXEC`, or a schema-qualified call in an expression.
+    ///
+    /// **Soft**: a body is full of built-in and aggregate calls (`now()`,
+    /// `coalesce()`) that look exactly like a call to a project-managed
+    /// function, and only the resolver knows which is which. One that does not
+    /// resolve is dropped silently rather than warned about.
+    Calls,
+    /// A role granted to another role.
+    ///
+    /// Hard, like a read, but deliberately not one: a caller walking data flow
+    /// through `reads()` must not find role memberships in it.
+    Member,
+}
+
+impl RefKind {
+    /// Whether an unresolved reference of this kind is dropped rather than
+    /// warned about. See [`Self::Calls`].
+    pub fn is_soft(self) -> bool {
+        self == Self::Calls
+    }
+}
+
+/// One reference an entity makes.
+///
+/// Three facts on one row — *what*, *how*, and *how far the schema can be
+/// trusted*. They used to be spread across four parallel fields, joinable only
+/// by name, and the name is not a key: a routine that both reads and writes
+/// one table produced two indistinguishable entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ref {
+    /// The target, schema-qualified where a schema is known. See
+    /// [`Self::schema_source`] for whether that schema is the source's word.
     pub name: String,
-    pub ref_type: Option<String>,
-    /// Where the schema in [`Self::name`] came from. See [`SchemaSource`].
+    /// What this entity does to it.
+    pub kind: RefKind,
+    /// Where the schema in [`Self::name`] came from.
     #[serde(default, skip_serializing_if = "SchemaSource::is_stated")]
     pub schema_source: SchemaSource,
+    /// Set by [`resolve_references`] when it could not match this to any known
+    /// entity.
+    ///
+    /// **Marked, not deleted.** The two fields this replaced disagreed on
+    /// purpose: `refers` held only what resolved, so a dependency graph never
+    /// waited on something that does not exist, while `reads`/`writes` kept
+    /// the file's own account, which is what the import plan matches a staging
+    /// table against. Dropping the row would lose the second; keeping it
+    /// unmarked would break the first. So [`Entity::refers`] skips these and
+    /// [`Entity::reads`]/[`Entity::writes`] do not.
+    ///
+    /// [`resolve_references`]: crate::references::resolve_references
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresolved: bool,
+}
+
+impl Ref {
+    /// A reference whose schema the source wrote (or that has none).
+    pub fn stated(name: impl Into<String>, kind: RefKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            schema_source: SchemaSource::Stated,
+            unresolved: false,
+        }
+    }
 }
 
 /// Foreign key constraint with full detail.
@@ -362,9 +424,9 @@ pub struct ForeignKey {
     /// so it would be nearly all of them. Reading one back gives `Stated`,
     /// which is the honest reading: a snapshot states its schemas.
     ///
-    /// [`Reference::schema_source`] is *not* skipped, because a `Reference` goes
-    /// to a consumer rather than into a durable artifact, and that consumer is
-    /// the whole reason this exists.
+    /// [`Ref::schema_source`] is *not* skipped, because a [`Ref`] goes to a
+    /// consumer rather than into a durable artifact, and that consumer is the
+    /// whole reason this exists.
     #[serde(skip)]
     pub ref_schema_source: SchemaSource,
 }
@@ -669,8 +731,14 @@ pub struct Entity {
     pub catalog: Option<String>,
     pub file: Option<PathBuf>,
     pub format: Option<String>,
-    pub refers: Vec<String>,
-    pub references: Vec<Reference>,
+    /// Every reference this entity makes — see [`Ref`].
+    ///
+    /// One list rather than the four parallel ones it replaces, because the
+    /// three facts a caller needs (name, direction, schema provenance) belong
+    /// on the same row. [`Self::reads`], [`Self::writes`], [`Self::calls`] and
+    /// [`Self::refers`] are views over it.
+    #[serde(default)]
+    pub refs: Vec<Ref>,
     /// Where unqualified names in this entity's file resolve — see
     /// [`SchemaPath`]. Every entity carries it, for every dialect that has the
     /// concept; a consumer resolving a bare reference needs it and cannot
@@ -686,8 +754,23 @@ pub struct Entity {
     pub schema_path: SchemaPath,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
-    pub reads: Vec<String>,
-    pub writes: Vec<String>,
+    /// The entity's own DDL text, verbatim, for the types whose `CREATE` is
+    /// reconstructed from a body rather than composed from a structured model:
+    /// a view's or matview's `SELECT`, a sequence's whole `CREATE`, and one
+    /// string per routine overload.
+    ///
+    /// Separate from [`Self::refs`] because it used to share a field with
+    /// them. `writes` held table names when a parser filled it and body SQL
+    /// when the introspector did, and `emit_view`/`emit_sequence`/
+    /// `emit_routine` read `writes[0]` back out as the body. Nothing mixed the
+    /// two in practice — `emit_entity` only ever sees introspected entities,
+    /// plus parsed matviews whose parser followed the same convention — but
+    /// one field meaning two things is a trap regardless.
+    ///
+    /// Distinct from [`Self::raw_ddl`], which bypasses the emitter entirely:
+    /// this is a *fragment* the emitter wraps in the right `CREATE`.
+    #[serde(default)]
+    pub body: Vec<String>,
     pub table_def: Option<TableDef>,
     pub enum_values: Vec<EnumValue>,
     /// Verbatim DDL to emit as-is, bypassing the structured emitter. Used by sources
@@ -698,6 +781,69 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// The references of one kind.
+    pub fn refs_of(&self, kind: RefKind) -> impl Iterator<Item = &Ref> {
+        self.refs.iter().filter(move |r| r.kind == kind)
+    }
+
+    /// Tables and views this entity reads.
+    pub fn reads(&self) -> impl Iterator<Item = &Ref> {
+        self.refs_of(RefKind::Reads)
+    }
+
+    /// Tables this entity writes.
+    pub fn writes(&self) -> impl Iterator<Item = &Ref> {
+        self.refs_of(RefKind::Writes)
+    }
+
+    /// Routines this entity calls. Soft — see [`RefKind::Calls`].
+    pub fn calls(&self) -> impl Iterator<Item = &Ref> {
+        self.refs_of(RefKind::Calls)
+    }
+
+    /// Every name this entity refers to, deduplicated, in first-seen order.
+    ///
+    /// What a dependency graph wants, so it **omits** anything
+    /// [`Ref::unresolved`] — waiting on an entity that does not exist would
+    /// deadlock the topological sort. [`Self::reads`] and [`Self::writes`] do
+    /// include them, because they are the file's own account.
+    ///
+    /// Deduplicated because one table can be both read and written, which is
+    /// two [`Ref`]s but one edge — the old `refers: Vec<String>` listed such a
+    /// name twice.
+    pub fn refers(&self) -> impl Iterator<Item = &str> {
+        let mut seen = std::collections::HashSet::new();
+        self.refs
+            .iter()
+            .filter(|r| !r.unresolved)
+            .map(|r| r.name.as_str())
+            .filter(move |n| seen.insert(*n))
+    }
+
+    /// Whether this entity refers to `name`, in any way.
+    pub fn refers_to(&self, name: &str) -> bool {
+        self.refs.iter().any(|r| r.name == name)
+    }
+
+    /// Record a reference, ignoring one already recorded with the same name
+    /// and kind.
+    pub fn push_ref(&mut self, r: Ref) {
+        if !self.refs.iter().any(|x| x.name == r.name && x.kind == r.kind) {
+            self.refs.push(r);
+        }
+    }
+
+    /// Replace every reference of the given kinds with `refs`.
+    ///
+    /// For a producer that recomputes one direction at a time; the kinds it
+    /// does not name are left alone.
+    pub fn set_refs_of(&mut self, kinds: &[RefKind], refs: Vec<Ref>) {
+        self.refs.retain(|r| !kinds.contains(&r.kind));
+        for r in refs {
+            self.push_ref(r);
+        }
+    }
+
     /// Create a new empty entity with the given type and name.
     pub fn new(entity_type: EntityType, name: &str) -> Self {
         let (schema, _) = split_qualified_name(name);
@@ -708,13 +854,11 @@ impl Entity {
             catalog: None,
             file: None,
             format: None,
-            refers: Vec::new(),
-            references: Vec::new(),
+            refs: Vec::new(),
             schema_path: SchemaPath::default(),
             errors: Vec::new(),
             warnings: Vec::new(),
-            reads: Vec::new(),
-            writes: Vec::new(),
+            body: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),
             raw_ddl: None,
