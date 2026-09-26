@@ -14,7 +14,7 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before the parse-error early return: an errored entity must still
     // carry the sqlparser path's `["public"]` default, since View qualifies
     // its refs against `search_paths`.
-    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     // libpg_query is Postgres's own grammar, so its rejection is the definition
     // of invalid SQL. Recording an error only here keeps the invariant

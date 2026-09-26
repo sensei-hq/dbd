@@ -49,7 +49,7 @@ pub(crate) fn parse_table(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before any early return, like every other native parser here: an
     // errored entity must still carry the sqlparser path's `["public"]`
     // default, since references are qualified against it.
-    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
@@ -1367,11 +1367,11 @@ mod tests {
     fn search_paths_survive_both_the_happy_and_the_error_path() {
         let stated = parse("set search_path to app;\ncreate table t (a int);").schema_path;
         assert_eq!(stated.schemas().collect::<Vec<_>>(), vec!["app"]);
-        assert!(stated.stated);
+        assert!(stated.stated());
 
         let errored = parse("create table t (").schema_path;
         assert_eq!(errored.default_schema(), Some("public"));
-        assert!(!errored.stated, "nothing in the file said so");
+        assert!(!errored.stated(), "nothing in the file said so");
     }
 
     // ── ALTER TABLE … ADD CONSTRAINT ────────────────────────────────────────

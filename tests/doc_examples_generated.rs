@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x0cf4d859e7bd6afc
+// docs-digest: 0x0a10b3b9ed53a353
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -218,8 +218,8 @@ async fn doc_docs_skills_dbd_skill_md_4() -> dbd_core::Result<()> {
         for schema in e.schema_path.schemas() {
             println!("{} resolves bare names against {schema}", e.name);
         }
-        if !e.schema_path.stated {
-            println!("  ...but the file never said so — the session decides");
+        if !e.schema_path.stated() {
+            println!("  ...supplied by {:?}, not by the file", e.schema_path.source);
         }
     }
     Ok(())
@@ -397,8 +397,8 @@ async fn doc_src_assets_skills_dbd_skill_md_4() -> dbd_core::Result<()> {
         for schema in e.schema_path.schemas() {
             println!("{} resolves bare names against {schema}", e.name);
         }
-        if !e.schema_path.stated {
-            println!("  ...but the file never said so — the session decides");
+        if !e.schema_path.stated() {
+            println!("  ...supplied by {:?}, not by the file", e.schema_path.source);
         }
     }
     Ok(())

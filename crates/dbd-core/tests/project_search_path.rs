@@ -68,7 +68,10 @@ fn a_file_that_states_a_path_keeps_it() {
     let d = project(
         tmp.path(),
         "source:\n  dialect: postgresql\n  search_path: [app, shared]\n",
-        &[("table/app/t.ddl", "set search_path to shared;\ncreate table app.t (id int);")],
+        &[(
+            "table/app/t.ddl",
+            "set search_path to shared;\ncreate table app.t (id int);",
+        )],
     );
     let e = entity(&d, "app.t");
     assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["shared"]);
@@ -107,7 +110,10 @@ fn a_bare_reference_resolves_against_the_projects_path() {
         &[
             ("table/app/parent.ddl", "create table app.parent (id uuid primary key);"),
             // No `SET search_path`, and a bare FK target.
-            ("table/app/child.ddl", "create table app.child (pid uuid references parent (id));"),
+            (
+                "table/app/child.ddl",
+                "create table app.child (pid uuid references parent (id));",
+            ),
         ],
     );
     let child = entity(&d, "app.child");
@@ -156,4 +162,77 @@ fn the_configured_path_may_name_the_current_user() {
         vec![PathEntry::CurrentUser, PathEntry::Schema("app".into())]
     );
     assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
+}
+
+// ── And it is never silent ──────────────────────────────────────────────────
+
+/// The fallback must be reported, not applied quietly. A forgotten
+/// `SET search_path` is a real authoring mistake, and resolving it against
+/// *anything* without saying so is how a reference ends up aimed at a schema
+/// nobody chose.
+#[test]
+fn a_file_with_no_search_path_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = project(
+        tmp.path(),
+        "source:\n  dialect: postgresql\n  search_path: [app]\n",
+        &[
+            (
+                "table/app/quiet.ddl",
+                "set search_path to app;\ncreate table app.quiet (id int);",
+            ),
+            ("table/app/loud.ddl", "create table app.loud (id int);"),
+        ],
+    );
+    let warned: Vec<&String> = d.entities().iter().flat_map(|e| &e.warnings).collect();
+    assert!(
+        warned
+            .iter()
+            .any(|w| w.contains("loud.ddl") && w.contains("search_path")),
+        "the file that forgot must be named: {warned:?}"
+    );
+    assert!(
+        !warned.iter().any(|w| w.contains("quiet.ddl")),
+        "the file that stated one must not be: {warned:?}"
+    );
+    assert!(
+        warned.iter().any(|w| w.contains("source.search_path")),
+        "and the report must say what it was resolved against: {warned:?}"
+    );
+}
+
+/// Unconfigured, the report says so and points at the setting.
+#[test]
+fn without_the_setting_the_report_names_it_as_the_remedy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = project(
+        tmp.path(),
+        "source:\n  dialect: postgresql\n",
+        &[("table/app/t.ddl", "create table app.t (id int);")],
+    );
+    let w = d
+        .entities()
+        .iter()
+        .flat_map(|e| &e.warnings)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        w.iter()
+            .any(|w| w.contains("session default") && w.contains("source.search_path")),
+        "{w:?}"
+    );
+}
+
+/// A role has no unqualified names to resolve, so a missing path is not a
+/// defect there and must not be reported as one.
+#[test]
+fn a_schemaless_entity_is_not_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = project(
+        tmp.path(),
+        "source:\n  dialect: postgresql\n",
+        &[("role/basic.ddl", "create role basic;")],
+    );
+    let w: Vec<&String> = d.entities().iter().flat_map(|e| &e.warnings).collect();
+    assert!(!w.iter().any(|x| x.contains("basic.ddl")), "{w:?}");
 }

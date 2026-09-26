@@ -63,6 +63,19 @@ impl PgQueryDdl {
     }
 }
 
+/// [`PgQueryDdl::parse`] with the project's fallback schema path.
+///
+/// Seeded onto the entity before dispatch; `common::resolve_schema_path` keeps
+/// it only when the file states none of its own.
+pub(crate) fn parse_with_fallback(file: &Path, sql: &str, fallback: &crate::entity::SchemaPath) -> Result<Entity> {
+    let mut entity = Entity::from_file(file);
+    entity.schema_path = fallback.clone();
+    match PgQueryDdl::native(entity.entity_type) {
+        Some(parse) => parse(entity, sql),
+        None => Ok(entity),
+    }
+}
+
 impl DdlParser for PgQueryDdl {
     fn parse(&self, file: &Path, sql: &str) -> Result<Entity> {
         let entity = Entity::from_file(file);

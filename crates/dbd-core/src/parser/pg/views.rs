@@ -14,7 +14,7 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set the search path before any early return: references are qualified
     // against it, and an errored entity reporting `[]` instead of the
     // `["public"]` default is an invariant break the enum parser already hit.
-    entity.schema_path = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,

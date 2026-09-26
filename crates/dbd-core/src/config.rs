@@ -169,6 +169,19 @@ pub struct SourceConfig {
     /// decide; set it only to override that choice.
     #[serde(default)]
     pub parser: Option<String>,
+    /// Where unqualified names resolve in a file that states no
+    /// `SET search_path` of its own.
+    ///
+    /// Every dbd DDL file is expected to open with one — no emitter writes it,
+    /// it is a convention the author keeps. This is the project's answer for
+    /// the file that forgets, replacing a hardcoded `public` that had nothing
+    /// to do with any particular project.
+    ///
+    /// `None` leaves Postgres's own session default (`"$user", public`) in
+    /// place. Either way the load *reports* each file it applied this to; the
+    /// fallback is never silent.
+    #[serde(default)]
+    pub search_path: Option<Vec<String>>,
 }
 
 impl Default for SourceConfig {
@@ -176,6 +189,7 @@ impl Default for SourceConfig {
         Self {
             dialect: default_dialect(),
             parser: None,
+            search_path: None,
         }
     }
 }

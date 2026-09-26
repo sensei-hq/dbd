@@ -173,8 +173,22 @@ impl DdlParser for VerbatimDdl {
 /// once, before reading any file, and calls this directly so a bad config
 /// value fails at load rather than partway through the scan.
 pub fn parse_entity_with(choice: ParserChoice, file: &Path, sql: &str) -> Result<Entity> {
+    parse_entity_with_search_path(choice, file, sql, &crate::entity::SchemaPath::default())
+}
+
+/// [`parse_entity_with`], supplying the path a file that states no
+/// `SET search_path` should resolve against.
+///
+/// `source.search_path` from design.yaml. A file that states its own wins; this
+/// only fills the gap, and the project scan reports every file it filled.
+pub fn parse_entity_with_search_path(
+    choice: ParserChoice,
+    file: &Path,
+    sql: &str,
+    fallback: &crate::entity::SchemaPath,
+) -> Result<Entity> {
     match choice {
-        ParserChoice::PgQuery => pg::PgQueryDdl.parse(file, sql),
+        ParserChoice::PgQuery => pg::parse_with_fallback(file, sql, fallback),
         ParserChoice::Verbatim => VerbatimDdl.parse(file, sql),
         // Identity from the path, as every `parse_entity` caller expects, with
         // the references read out of the SQL. A T-SQL DDL file laid out dbd's
