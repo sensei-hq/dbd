@@ -86,6 +86,19 @@ pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter
         let adapter = adapter::sqlite::SqliteAdapter::new(url, project).await?;
         return Ok(Box::new(adapter));
     }
+    // A database dbd can READ but not connect to. Named explicitly, because
+    // the fallthrough below is PostgreSQL: without this, `mysql://…` built a
+    // `PostgresAdapter` and failed with `pool timed out while waiting for an
+    // open connection` — a PostgreSQL error mentioning neither MySQL nor the
+    // absence of an adapter. Reading T-SQL and MySQL arrived before any
+    // adapter for them did, and the message should say which half exists.
+    if let Some(name) = unsupported_database(url) {
+        return Err(DbdError::Config(format!(
+            "no adapter for {name}: dbd can READ {name} DDL (source.dialect) but cannot \
+             connect to one, so `apply`, `deploy`, `diff` and `reconcile` are not available. \
+             `parse_sql_as`, `project::survey` and `dbd inspect` work offline."
+        )));
+    }
     #[cfg(feature = "postgres")]
     {
         let adapter = adapter::postgres::PostgresAdapter::new(url, project).await?;
@@ -93,6 +106,21 @@ pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter
     }
     #[cfg(not(feature = "postgres"))]
     Err(DbdError::Config(format!("No adapter compiled in for URL: {url}")))
+}
+
+/// The database a URL scheme names, when dbd has a reader for it but no
+/// adapter.
+///
+/// Matched on the scheme alone: anything else still falls through to
+/// PostgreSQL, which is what every `postgres://`, `postgresql://` and bare
+/// host URL relies on.
+fn unsupported_database(url: &str) -> Option<&'static str> {
+    let scheme = url.split_once("://").map(|(s, _)| s)?.to_ascii_lowercase();
+    match scheme.as_str() {
+        "mysql" | "mariadb" => Some("MySQL"),
+        "sqlserver" | "mssql" | "jdbc:sqlserver" => Some("SQL Server"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

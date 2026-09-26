@@ -9,6 +9,55 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **`diff` and `reconcile` no longer report "in sync" for T-SQL and MySQL
+  projects.** The guard added for SQLite (#20) asked `parser == Verbatim`, but
+  `Verbatim` was never the only reader without a structured model: the
+  statement-head readers produce identity and references and no `table_def`
+  either. Both were added *after* the guard and walked straight past it, so
+  desired and live reduced to nothing, the comparison succeeded trivially, and
+  the answer was "no drift" against a database sharing not one table with the
+  design.
+
+  The guard now asks `ParserChoice::produces_structure()` — a property of the
+  reader rather than a list to keep in sync, which is exactly what went stale.
+  The refusal also names `source.dialect` as written rather than the reader it
+  selected, so a SQLite project is told about `sqlite` and not about
+  "verbatim".
+
+- **A URL for a database dbd has no adapter for is refused by name.**
+  `connect` dispatched on `convex:` and `sqlite:` and fell through to
+  **PostgreSQL for everything else**, so `mysql://…` built a `PostgresAdapter`
+  and failed with `pool timed out while waiting for an open connection` — a
+  PostgreSQL error naming neither MySQL nor the missing adapter. It now says:
+
+  > no adapter for MySQL: dbd can READ MySQL DDL (source.dialect) but cannot
+  > connect to one, so `apply`, `deploy`, `diff` and `reconcile` are not
+  > available. `parse_sql_as`, `project::survey` and `dbd inspect` work offline.
+
+- **A dialect with no `search_path` is no longer warned about one.** The
+  missing-`SET search_path` report added in 0.18.0 fired on T-SQL and MySQL
+  projects, telling their authors that unqualified names "resolved against
+  PostgreSQL's session default". Neither dialect has a search path.
+
+### Added
+
+- **`dbd`'s connecting commands are covered against a real database**
+  (`tests/cli_live.rs`, #11). `dbd-core`'s embedded suite covers the library;
+  the CLI's own layer — the `run` arms that build an adapter, and the exit code
+  `main` turns a failure into — sat near zero.
+
+  Driven as the binary rather than by adding a `[lib]` to `dbd-cli`: that
+  would publish the command handlers as public API to be maintained for
+  testing's sake, and driving the binary also covers argument parsing and is
+  the only way to assert an **exit code**, which is what a pipeline keys on.
+  Coverage reaches it — `cargo llvm-cov` instruments the binary and the spawned
+  process writes its own profile, verified before the suite was written.
+
+  `commands/mod.rs` 4.5% → 30.1% regions, `commands/reverse.rs` → 43.0%,
+  `commands/migration.rs` → 14.8%.
+
 ## [0.19.0] — 2026-09-26
 
 `Entity` carried four fields for one idea. `refers` was every name in

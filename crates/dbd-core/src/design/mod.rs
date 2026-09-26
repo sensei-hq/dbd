@@ -429,6 +429,13 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.dialect` as the project wrote it.
+    ///
+    /// Kept beside [`Self::parser`] because a refusal has to name what the
+    /// *user* set, not the reader it selected: `sqlite` picks `Verbatim`, and
+    /// telling someone their "verbatim project" cannot be diffed names nothing
+    /// they typed.
+    dialect: String,
 }
 
 /// Report a DDL file that states no `SET search_path` of its own.
@@ -486,6 +493,10 @@ impl Design {
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         let design_config = config::read(config_path)?;
+        // Taken before the config is moved into the Design, and kept as the
+        // user wrote it — a refusal must name `sqlite`, not the `Verbatim`
+        // reader that label selects.
+        let dialect_label = design_config.source.dialect.clone();
 
         // Validate and resolve the parser before reading any file, so a bad
         // `source.parser` fails at load rather than partway through the scan.
@@ -661,6 +672,7 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            dialect: dialect_label,
         })
     }
 
