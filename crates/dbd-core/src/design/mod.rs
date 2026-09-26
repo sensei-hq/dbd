@@ -450,6 +450,15 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
     if entity.schema_path.stated() || !entity.entity_type.has_schema() {
         return;
     }
+    // A dialect with no schema path at all has nothing to warn about. T-SQL
+    // resolves an unqualified name against the connecting user's default
+    // schema and MySQL has no schemas — neither has a `search_path`, and
+    // telling their authors about PostgreSQL's session default would be
+    // nonsense. The PostgreSQL reader always supplies entries (its own
+    // default, `"$user", public`), so an empty path means "not that dialect".
+    if entity.schema_path.entries.is_empty() {
+        return;
+    }
     let resolved_against = match entity.schema_path.source {
         PathSource::Project => "source.search_path".to_string(),
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),

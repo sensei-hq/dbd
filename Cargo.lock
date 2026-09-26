@@ -527,6 +527,7 @@ dependencies = [
  "dbd-core",
  "indicatif",
  "open",
+ "postgresql_embedded",
  "predicates",
  "serde_json",
  "serde_yaml",
