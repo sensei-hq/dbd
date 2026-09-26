@@ -3330,6 +3330,104 @@ mod tests {
     }
 
     #[test]
+    // ── Defaults the server rewrites on store (#18) ─────────────────────
+
+    /// `jsonb` does not preserve key order or spacing, so a text comparison of
+    /// an object default never converges. Measured on a live server:
+    /// `'{"b":1,"a":2}'` is stored as `'{"a": 2, "b": 1}'::jsonb`.
+    ///
+    /// Both sides canonicalise to sorted keys with Postgres's own spacing,
+    /// which is still a valid literal — it has to be, because this value is
+    /// what `SET DEFAULT` emits.
+    #[test]
+    fn a_jsonb_object_default_converges_regardless_of_key_order() {
+        let design = canonical_default(r#"'{"b":1,"a":2}'"#, "jsonb");
+        let live = canonical_default(r#"'{"a": 2, "b": 1}'::jsonb"#, "jsonb");
+        assert_eq!(design, live);
+        assert_eq!(design, r#"'{"a": 2, "b": 1}'"#, "and it is Postgres's own spelling");
+    }
+
+    #[test]
+    fn nested_jsonb_keys_are_ordered_too() {
+        let design = canonical_default(r#"'{"z":{"b":1,"a":2}}'"#, "jsonb");
+        let live = canonical_default(r#"'{"z": {"a": 2, "b": 1}}'::jsonb"#, "jsonb");
+        assert_eq!(design, live);
+    }
+
+    /// A `jsonb` default that is not an object is left alone — there is no key
+    /// order to settle, and re-rendering risks changing it.
+    #[test]
+    fn a_non_object_jsonb_default_is_untouched() {
+        assert_eq!(canonical_default("'[]'", "jsonb"), "'[]'");
+        assert_eq!(canonical_default("'null'", "jsonb"), "'null'");
+    }
+
+    /// `'epoch'` is a special input Postgres resolves on store — and renders
+    /// back **in the session timezone**, so the live text differs by
+    /// connection as well as by spelling. Measured: `'1969-12-31 18:00:00-06'`
+    /// for a `-06` session. Both sides reduce to the same instant.
+    #[test]
+    fn a_timestamptz_special_input_converges_to_its_instant() {
+        let design = canonical_default("'epoch'", "timestamptz");
+        let live = canonical_default("'1969-12-31 18:00:00-06'::timestamp with time zone", "timestamptz");
+        assert_eq!(design, live, "same instant, different spelling and timezone");
+    }
+
+    #[test]
+    fn two_spellings_of_one_instant_converge() {
+        let a = canonical_default("'2024-03-01 12:00:00+00'", "timestamptz");
+        let b = canonical_default("'2024-03-01 07:00:00-05'::timestamp with time zone", "timestamptz");
+        assert_eq!(a, b);
+    }
+
+    /// `'infinity'` already round-trips unchanged and must stay that way — it
+    /// is not an instant and must not be coerced into one.
+    #[test]
+    fn infinity_is_left_as_written() {
+        assert_eq!(canonical_default("'infinity'", "timestamptz"), "'infinity'");
+        assert_eq!(canonical_default("'-infinity'", "timestamptz"), "'-infinity'");
+    }
+
+    /// **Cannot converge, by construction.** `'now'` and `'today'` are
+    /// resolved at DDL time and frozen, so the live value is a fixed timestamp
+    /// that differs from the design text on every later day. Normalising them
+    /// would mean inventing a value. They are left alone and read as drift,
+    /// which is the honest answer — the fix is to write `now()` or
+    /// `current_date`, which are re-evaluated and do converge.
+    #[test]
+    fn a_frozen_special_input_is_not_normalised() {
+        assert_eq!(canonical_default("'today'", "date"), "'today'");
+        assert_eq!(canonical_default("'now'", "timestamptz"), "'now'");
+        assert_ne!(
+            canonical_default("'today'", "date"),
+            canonical_default("'2026-09-26'::date", "date"),
+            "and it must NOT be made to match some particular day"
+        );
+    }
+
+    /// Postgres stores `'t'`, `'true'` and `TRUE` alike as `true`.
+    #[test]
+    fn boolean_default_spellings_converge() {
+        for written in ["'t'", "'true'", "true", "'y'", "'yes'", "'1'"] {
+            assert_eq!(canonical_default(written, "boolean"), "true", "{written}");
+        }
+        for written in ["'f'", "'false'", "false", "'n'", "'no'", "'0'"] {
+            assert_eq!(canonical_default(written, "boolean"), "false", "{written}");
+        }
+    }
+
+    /// A default the normaliser does not understand keeps its text, so it can
+    /// read as drift but never as falsely equal.
+    #[test]
+    fn an_unrecognised_default_is_passed_through() {
+        assert_eq!(canonical_default("nextval('s'::regclass)", "integer"), "nextval('s')");
+        assert_eq!(canonical_default("'{oops'", "jsonb"), "'{oops'");
+        assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
+    }
+
+    /// Type-awareness must not change what the old text-only rules did for
+    /// every other type.
+    #[test]
     fn canonical_default_strips_trailing_cast() {
         assert_eq!(canonical_default("'{}'::text[]"), "'{}'");
         assert_eq!(canonical_default("''::text"), "''");
