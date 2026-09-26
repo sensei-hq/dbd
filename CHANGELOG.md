@@ -9,6 +9,32 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-26
+
+`Entity` carried four fields for one idea. `refers` was every name in
+`references`, rebuilt by hand at each producer. `references` knew where a
+schema came from but not whether the entity read or wrote it. `reads` and
+`writes` knew the opposite. Asking "which of my reads has a guessed schema?"
+meant joining two lists on a key that is not unique — a routine that both
+reads and writes one table produced two identical rows and a duplicated name.
+
+They are now one list. `Ref { name, kind, schema_source, unresolved }` puts
+the three facts on the same row, and `RefKind` retires a `ref_type` that
+distinguished only "is this a call".
+
+Getting there meant untangling an overload first: `writes` held table names
+when a parser filled it and the entity's own DDL body when the introspector
+did. Nothing mixed the two in practice, but one field meaning two things is a
+trap, so the body moved to `Entity::body`.
+
+Measured against the same 2,154-file T-SQL corpus before and after:
+**identical** — 2,737 entities, 8,558 reads, 1,828 writes, 1,216 calls, 123
+catalogs, 14,754 total references. The shape changed; the meaning did not.
+
+**Breaking:** any code reading `entity.refers`, `entity.references`,
+`entity.reads` or `entity.writes`, and `REF_TYPE_FUNCTION` is gone. See the
+migration note at the end of this entry.
+
 ### Changed
 
 - **One list of references, replacing four parallel fields** ([#22] follow-up).
@@ -988,7 +1014,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.18.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.19.0...main
+[0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
 [0.16.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.16.0
