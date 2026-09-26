@@ -9,6 +9,34 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-26
+
+**`dbd emit`** translates a PostgreSQL schema into MySQL, T-SQL or SQLite DDL.
+Anything the target cannot express is downgraded to the nearest equivalent and
+reported — inline in the file, in the run summary, and as JSON for CI. A
+faithful mapping is reported nowhere, so the report stays worth reading.
+
+Two correctness fixes behind it. **`reconcile` finally converges** (#18): it
+compared defaults as text, and PostgreSQL rewrites some of them on store, so a
+freshly applied design reported drift forever. Measuring both sides on a live
+server found more than the report described — the timestamptz form is rendered
+in the *session's* timezone, and `'now'`/`'today'` are frozen at DDL time and
+can never converge, so they stay visible as drift rather than normalised to an
+invented value.
+
+And the **non-PostgreSQL dialects are honest about being read-only**. `diff`
+and `reconcile` reported "in sync" for T-SQL and MySQL projects — the guard
+added for SQLite asked `parser == Verbatim`, and both were added after it. A
+`mysql://` URL failed with a *PostgreSQL* pool timeout, because `connect` fell
+through to Postgres for any unrecognised scheme.
+
+**The website had been serving three stale documents**, including a `v0.13.0`
+version pin six releases out of date and the uncompilable `Design::apply`
+example that 0.16.0's doc gate exists to prevent — the gate read `docs/` and
+the site's copy was never checked. All three are now gated.
+
+**Breaking:** none to the library API. `dbd emit` is new.
+
 ### Added
 
 - **`dbd emit --dialect mysql|tsql|sqlite`** — the schema as another engine's
@@ -1109,7 +1137,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.19.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.20.0...main
+[0.20.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.20.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
 [0.17.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.17.0
