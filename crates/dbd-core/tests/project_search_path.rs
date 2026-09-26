@@ -236,3 +236,31 @@ fn a_schemaless_entity_is_not_reported() {
     let w: Vec<&String> = d.entities().iter().flat_map(|e| &e.warnings).collect();
     assert!(!w.iter().any(|x| x.contains("basic.ddl")), "{w:?}");
 }
+
+/// A dialect with no `search_path` concept must not be warned about one.
+///
+/// T-SQL resolves an unqualified name against the connecting user's default
+/// schema and MySQL has no schemas at all. Telling either author that their
+/// names "resolved against PostgreSQL's session default" is nonsense — and it
+/// is what this did when the warning first shipped.
+#[test]
+fn a_dialect_without_a_search_path_is_not_warned_about_one() {
+    for dialect in ["tsql", "mysql"] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            format!("project:\n  name: T\n\nsource:\n  dialect: {dialect}\n\nschemas:\n  - dbo\n"),
+        )
+        .unwrap();
+        let t = tmp.path().join("ddl/table/dbo");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("issues.ddl"), "CREATE TABLE dbo.Issues (Id int NOT NULL);").unwrap();
+
+        let d = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).expect("loads");
+        let w: Vec<&String> = d.entities().iter().flat_map(|e| &e.warnings).collect();
+        assert!(
+            !w.iter().any(|x| x.contains("search_path")),
+            "{dialect} has no search_path to miss: {w:?}"
+        );
+    }
+}
