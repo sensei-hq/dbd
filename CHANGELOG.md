@@ -9,6 +9,52 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **`dbd emit --dialect mysql|tsql|sqlite`** — the schema as another engine's
+  DDL ([#23]). Distinct from `combine`, which consolidates *this* project's own
+  DDL into one script; `emit` translates it for a different engine.
+
+  ```sh
+  dbd emit --dialect mysql -f schema.mysql.sql --report downgrades.json
+  ```
+
+  **One direction, by construction.** Only the PostgreSQL reader produces
+  columns and constraints (`ParserChoice::produces_structure`), so emitting
+  *from* a T-SQL, MySQL or SQLite project is refused rather than quietly
+  producing an empty schema. Tables and views; routines are skipped and
+  reported, because their bodies do not translate.
+
+  **Downgrade, never drop, never refuse.** A construct the target cannot
+  express becomes the nearest thing it can, so the output is always a complete
+  schema. Every *lossy* downgrade is reported three ways — a comment at the
+  site in the emitted file, the run summary, and `--report` as JSON for CI to
+  assert on. A faithful mapping (`integer` → `INT`) is reported nowhere, or the
+  report becomes noise nobody reads.
+
+  ```sql
+  -- dbd: `tags` was `text[]` — emitted as JSON; no array type exists here, so
+  --      the `text` elements become a JSON document
+  `tags` JSON,
+  ```
+
+  The exit status stays 0 when downgrades happen: they are the documented
+  behaviour, which is why the count — not the exit code — is what a pipeline
+  should assert on.
+
+- **A view keeps its body.** `Entity::body` now carries a view's `SELECT`, as a
+  materialized view's always did. The view parser deliberately omitted it, with
+  a comment explaining that nothing rendered a view's body and the omission
+  kept it "parity-clean against the incumbent" — the incumbent being the
+  sqlparser path retired in 0.14.0. `emit` renders one, and without this a view
+  came out as `CREATE VIEW x AS SELECT 1`.
+
+- **`Design::parser()` and `Design::dialect()`** are public: which reader a
+  project used decides what may be asked of it, and a refusal has to name the
+  dialect the user configured rather than the reader it selected.
+
+[#23]: https://github.com/sensei-hq/dbd/issues/23
+
 ### Fixed
 
 - **`diff` and `reconcile` no longer report "in sync" for T-SQL and MySQL

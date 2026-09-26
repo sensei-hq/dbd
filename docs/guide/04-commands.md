@@ -208,6 +208,49 @@ This is what makes the wrong-`-e` trap visible: a run that seeds no rows now say
 
 ---
 
+## `dbd emit`
+
+Translate the schema into another engine's DDL.
+
+```sh
+dbd emit --dialect mysql -f schema.mysql.sql
+dbd emit --dialect tsql -f schema.tsql.sql --report downgrades.json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--dialect` | Target engine: `mysql`, `tsql` or `sqlite` |
+| `-f`, `--file` | Destination (default `schema.sql`) |
+| `--report` | Also write every downgrade as JSON |
+
+**`emit` is not `combine`.** `combine` consolidates this project's own DDL into
+one script for its own target; `emit` rewrites the schema for a *different*
+engine.
+
+The source must be a **PostgreSQL** project — it is the only dialect dbd reads
+into columns and constraints. Tables and views are emitted; functions,
+procedures and triggers are skipped and reported, because their bodies do not
+translate.
+
+### Downgrades
+
+A construct the target cannot express is emitted as the nearest thing it can,
+so the output is always a complete schema. Every such loss is reported — inline
+as a comment at the site, in the run summary, and as JSON with `--report`:
+
+| PostgreSQL | MySQL | T-SQL | SQLite |
+|---|---|---|---|
+| `text[]` | `JSON` ⚠ | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
+| `jsonb` | `JSON` | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
+| `uuid` | `CHAR(36)` ⚠ | `uniqueidentifier` | `TEXT` ⚠ |
+| `timestamptz` | `DATETIME` | `datetimeoffset` | `TEXT` |
+| schemas | folded into the name ⚠ | native | folded into the name ⚠ |
+
+⚠ = a real loss of meaning, and therefore reported. A faithful mapping is not
+reported — a report padded with `integer → INT` is one nobody reads.
+
+Downgrades do not fail the run; assert on the `--report` count instead.
+
 ## `dbd combine`
 
 Combine all DDL into a single SQL file.

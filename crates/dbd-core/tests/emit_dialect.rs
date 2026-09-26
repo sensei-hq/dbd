@@ -145,9 +145,17 @@ fn a_faithful_mapping_is_not_reported() {
     let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
 
     let (_, report) = emit_schema(&design, Dialect::MySql, None).expect("emits");
+    let type_losses: Vec<_> = report.iter().filter(|d| d.column.is_some()).collect();
     assert!(
-        report.is_empty(),
-        "integer and varchar map faithfully to MySQL; nothing to report: {report:?}"
+        type_losses.is_empty(),
+        "integer and varchar map faithfully to MySQL; no column should be reported: {type_losses:?}"
+    );
+    // The schema fold IS a real loss and must still be reported — MySQL has no
+    // schemas, so `app.plain` becomes `app_plain` and every reference to it
+    // has to be updated by hand.
+    assert!(
+        report.iter().any(|d| d.column.is_none() && d.from.contains("schema")),
+        "the schema fold must be reported: {report:?}"
     );
 }
 
@@ -216,5 +224,46 @@ fn emitting_the_source_dialect_points_at_combine() {
         Ok(_) => panic!("must refuse"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("combine"), "it should name the command that does this: {err}");
+    assert!(
+        err.contains("combine"),
+        "it should name the command that does this: {err}"
+    );
+}
+
+// ── Keys are not silently dropped ───────────────────────────────────────────
+
+/// A column-level `PRIMARY KEY` must survive.
+///
+/// It did not on the first cut: a *parsed* table carries `ColumnDef::is_pk`,
+/// and only the reconcile path lifts that into a `TableConstraint`. Emitting
+/// constraints alone produced a table with no key at all — valid DDL, wrong
+/// schema, and exactly the silent loss the report cannot catch because nothing
+/// knew anything had been lost.
+#[test]
+fn a_column_level_primary_key_survives() {
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, _) = emit(dialect);
+        assert!(
+            sql.to_uppercase().contains("PRIMARY KEY"),
+            "{dialect:?}: the primary key vanished:\n{sql}"
+        );
+    }
+}
+
+/// And a column-level `UNIQUE` likewise — `code varchar(20) not null unique`.
+#[test]
+fn a_column_level_unique_survives() {
+    let (sql, _) = emit(Dialect::MySql);
+    assert!(sql.to_uppercase().contains("UNIQUE"), "the unique vanished:\n{sql}");
+}
+
+/// A key is a faithful mapping in all three targets, so it must not be
+/// reported — only things that actually changed meaning belong in the report.
+#[test]
+fn a_surviving_key_is_not_reported_as_a_downgrade() {
+    let (_, report) = emit(Dialect::MySql);
+    assert!(
+        !report.iter().any(|d| d.to.to_uppercase().contains("PRIMARY KEY")),
+        "a key that survived is not a downgrade: {report:?}"
+    );
 }
