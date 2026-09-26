@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn search_paths_stay_empty() {
         let e = parse("grant a to c;");
-        assert!(e.search_paths.is_empty(), "got {:?}", e.search_paths);
+        assert!(e.schema_path.entries.is_empty(), "got {:?}", e.schema_path);
     }
 
     /// Role names are not schema-qualified.

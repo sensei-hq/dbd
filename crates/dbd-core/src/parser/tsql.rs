@@ -234,10 +234,21 @@ pub(crate) fn read(rules: WalkRules, sql: &str) -> (Vec<Entity>, FileReferences,
     // as a change would put nearly every declaration file in `Mixed`.
     // Measured: it did, 54.5% of the corpus.
     let mut changed: Vec<String> = Vec::new();
+    // `USE <db>` holds until the next one, across batch boundaries — the
+    // statement is almost always alone in its own batch before a `GO`.
+    let mut current_db: Option<String> = None;
 
     for (_line, batch) in lex::batches(sql) {
         let toks = lex::tokens_with(rules.lex, batch);
-        walk(&rules, &toks, &mut entities, &mut file_refs, &mut signals, &mut changed);
+        walk(
+            &rules,
+            &toks,
+            &mut entities,
+            &mut file_refs,
+            &mut signals,
+            &mut changed,
+            &mut current_db,
+        );
     }
 
     signals.changes = changed.iter().any(|name| !entities.iter().any(|e| &e.name == name));
@@ -260,6 +271,7 @@ fn walk(
     file_refs: &mut FileReferences,
     signals: &mut Signals,
     changed: &mut Vec<String>,
+    current_db: &mut Option<String>,
 ) {
     // References belong to the most recent declaration in this batch, and to
     // NOTHING before there is one — which is the whole of a migration script.
@@ -270,6 +282,29 @@ fn walk(
 
     while i < toks.len() {
         let t = &toks[i];
+
+        // `USE <db>` — these dialects' answer to `SET search_path`. It names
+        // the DATABASE unqualified objects belong to, which is dbd's catalog.
+        //
+        // `use` is reserved in neither dialect, so a column or alias called
+        // `use` must not mint a database. Two guards, and the statement has to
+        // satisfy both: it starts a statement, and it *is* the whole statement
+        // — the name is followed by `;` or the end of the batch.
+        //
+        // Measured separately over the 77 corpus files carrying a `USE`: each
+        // guard alone recognises 63, and so does the pair. The combination is
+        // free, so it is taken.
+        if t.is("use")
+            && (i == 0 || matches!(toks.get(i - 1), Some(Tok::Punct(';'))))
+            && let Some(name) = qualified(toks, i + 1, rules)
+            && name.schema.is_none()
+            && name.catalog.is_none()
+            && matches!(toks.get(name.next), None | Some(Tok::Punct(';')))
+        {
+            *current_db = Some(name.object.clone());
+            i = name.next;
+            continue;
+        }
 
         // `CREATE [OR ALTER] <object> <name>` — a DECLARATION.
         if t.is("create") {
@@ -290,7 +325,7 @@ fn walk(
                 && let Some(obj) = object_kind(word, rules)
                 && let Some(name) = qualified(toks, head + 1, rules)
             {
-                owner = Some(declare(entities, &name, obj.entity_type));
+                owner = Some(declare(entities, &name, obj.entity_type, current_db));
                 signals.declares = true;
                 i = name.next;
                 continue;
@@ -316,7 +351,7 @@ fn walk(
                 }
                 if let Some(name) = qualified(toks, head, rules) {
                     if !dropping && obj.alter_defines {
-                        owner = Some(declare(entities, &name, obj.entity_type));
+                        owner = Some(declare(entities, &name, obj.entity_type, current_db));
                         signals.declares = true;
                     } else {
                         // Recorded, not decided: whether this is a change
@@ -392,16 +427,25 @@ enum RefKind {
 /// A redeploy script's `DROP … CREATE` names the object twice, and a release
 /// folder ships the same procedure repeatedly. Declaring it once keeps a caller
 /// from seeing two nodes for one object.
-fn declare(entities: &mut Vec<Entity>, name: &Qualified, entity_type: EntityType) -> usize {
+fn declare(
+    entities: &mut Vec<Entity>,
+    name: &Qualified,
+    entity_type: EntityType,
+    current_db: &Option<String>,
+) -> usize {
     let full = name.name();
+    // A three-part name states its own database and wins; otherwise the most
+    // recent `USE` supplies it. Without this the same object in two databases
+    // collapses into one entity.
+    let catalog = name.catalog.clone().or_else(|| current_db.clone());
     if let Some(existing) = entities
         .iter()
-        .position(|e| e.name == full && e.catalog == name.catalog && e.entity_type == entity_type)
+        .position(|e| e.name == full && e.catalog == catalog && e.entity_type == entity_type)
     {
         return existing;
     }
     let mut entity = Entity::new(entity_type, &full);
-    entity.catalog = name.catalog.clone();
+    entity.catalog = catalog;
     entities.push(entity);
     entities.len() - 1
 }

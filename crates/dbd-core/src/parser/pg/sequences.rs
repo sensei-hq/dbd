@@ -20,7 +20,7 @@ pub(in crate::parser) fn parse_sequence(mut entity: Entity, sql: &str) -> Result
     // Before any early return, matching the other native parsers: an errored
     // entity reporting `[]` instead of the `["public"]` default is an invariant
     // break the enum parser already hit once.
-    entity.search_paths = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
@@ -96,13 +96,13 @@ mod tests {
     #[test]
     fn search_path_is_captured() {
         let e = parse("set search_path to app;\ncreate sequence s;");
-        assert_eq!(e.search_paths, vec!["app".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
     }
 
     #[test]
     fn missing_search_path_defaults_to_public() {
         let e = parse("create sequence s;");
-        assert_eq!(e.search_paths, vec!["public".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["public"]);
     }
 
     #[test]
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn an_errored_sequence_still_has_a_search_path() {
         let e = parse("create sequence s start with ;;;");
-        assert_eq!(e.search_paths, vec!["public".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["public"]);
     }
 
     #[test]

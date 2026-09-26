@@ -51,13 +51,12 @@ fn resolve_entity_references(
     // The parser qualifies bare references with the first search_path entry.
     // dbd appends `public` to every applied search_path (see
     // `ensure_public_in_search_path`), so a bare name can resolve there too.
-    let default_schema = entity
-        .search_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "public".to_string());
+    let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
     let search_path: Vec<String> = {
-        let mut sp = entity.search_paths.clone();
+        // Only the NAMED entries: `"$user"` is the connecting role's schema and
+        // no scan knows what that is, so it cannot be a resolution candidate
+        // here. It stays on the path for a caller that has a connection.
+        let mut sp: Vec<String> = entity.schema_path.schemas().map(str::to_string).collect();
         if !sp.iter().any(|s| s == "public") {
             sp.push("public".to_string());
         }
@@ -276,7 +275,12 @@ mod tests {
     /// schema the parser uses to qualify bare references).
     fn entity_sp(name: &str, refers: &[&str], search_paths: &[&str]) -> Entity {
         let mut e = entity(name, refers);
-        e.search_paths = search_paths.iter().map(|s| s.to_string()).collect();
+        e.schema_path = crate::entity::SchemaPath::from_file(
+            search_paths
+                .iter()
+                .map(|s| crate::entity::PathEntry::Schema(s.to_string()))
+                .collect(),
+        );
         e
     }
 

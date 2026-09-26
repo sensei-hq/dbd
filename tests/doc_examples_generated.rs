@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xb38960ddb587f49f
+// docs-digest: 0x0a10b3b9ed53a353
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -194,6 +194,37 @@ async fn doc_docs_skills_dbd_skill_md_3() -> dbd_core::Result<()> {
     Ok(())
 }
 
+// docs/skills/dbd/SKILL.md — block 4
+#[allow(unused, clippy::all)]
+async fn doc_docs_skills_dbd_skill_md_4() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::parser::parse_sql;
+
+    let parsed = parse_sql(sql)?;
+    for e in &parsed.entities {
+        for schema in e.schema_path.schemas() {
+            println!("{} resolves bare names against {schema}", e.name);
+        }
+        if !e.schema_path.stated() {
+            println!("  ...supplied by {:?}, not by the file", e.schema_path.source);
+        }
+    }
+    Ok(())
+}
+
 // src/assets/skills/dbd/SKILL.md — block 0
 #[allow(unused, clippy::all)]
 async fn doc_src_assets_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
@@ -339,6 +370,37 @@ async fn doc_src_assets_skills_dbd_skill_md_3() -> dbd_core::Result<()> {
     println!("the file itself reads {:?}", parsed.references.reads);
     println!("        writes {:?}", parsed.references.writes);
     println!("        calls  {:?}", parsed.references.calls);
+    Ok(())
+}
+
+// src/assets/skills/dbd/SKILL.md — block 4
+#[allow(unused, clippy::all)]
+async fn doc_src_assets_skills_dbd_skill_md_4() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::parser::parse_sql;
+
+    let parsed = parse_sql(sql)?;
+    for e in &parsed.entities {
+        for schema in e.schema_path.schemas() {
+            println!("{} resolves bare names against {schema}", e.name);
+        }
+        if !e.schema_path.stated() {
+            println!("  ...supplied by {:?}, not by the file", e.schema_path.source);
+        }
+    }
     Ok(())
 }
 

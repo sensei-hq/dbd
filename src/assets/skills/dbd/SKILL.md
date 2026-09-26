@@ -388,6 +388,57 @@ outside the declaration that made it.
 Worth having: over a 2,154-file T-SQL corpus this is 4,059 references, and **817
 of those files reported nothing at all before it existed**.
 
+### The namespace context a file established
+
+Every entity carries `schema_path` — where unqualified names in its file
+resolve. PostgreSQL states it with `SET search_path TO a, b`; T-SQL and MySQL
+state the *database* with `USE db`, which lands on `Entity::catalog`.
+
+```rust
+use dbd_core::parser::parse_sql;
+
+let parsed = parse_sql(sql)?;
+for e in &parsed.entities {
+    for schema in e.schema_path.schemas() {
+        println!("{} resolves bare names against {schema}", e.name);
+    }
+    if !e.schema_path.stated() {
+        println!("  ...supplied by {:?}, not by the file", e.schema_path.source);
+    }
+}
+```
+
+`stated` is the part worth checking. A file that says nothing is not a file
+that says `public`: Postgres's real default is `"$user", public`, so with a
+schema named after the connecting role a bare `lookup` resolves to
+`<role>.lookup`. `ALTER ROLE … SET search_path` and `ALTER DATABASE … SET
+search_path` move it too, so it is not knowable from the file.
+
+`schemas()` yields only entries that name a schema — `"$user"` is a
+placeholder, kept in `entries` for a caller that has a connection, and never
+used to qualify a name.
+
+`source` names the author: `File` (the DDL said `SET search_path`), `Project`
+(design.yaml's `source.search_path` filled the gap), or `SessionDefault`
+(nobody did, so the connection decides).
+
+```yaml
+source:
+  dialect: postgresql
+  search_path: [app, shared]   # for a file that states none of its own
+```
+
+Every dbd DDL file is expected to open with `SET search_path TO <schema>;` —
+no emitter writes it, so it is a convention the author keeps. `search_path`
+is the project's answer for the file that forgets, replacing a `public` that
+was compiled into dbd and had nothing to do with any project.
+
+**It is never silent.** Loading a project records a warning naming every DDL
+file that stated no path and what its names were resolved against instead;
+`dbd inspect` counts them and `apply`/`deploy` print them. A forgotten
+`SET search_path` is an authoring mistake, and resolving it quietly is how a
+reference ends up aimed at a schema nobody chose.
+
 ### Whether a schema was written or guessed
 
 The PostgreSQL reader qualifies a bare `REFERENCES parent` with the first entry

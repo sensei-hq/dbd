@@ -379,7 +379,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn the_files_search_path_is_reported() {
     let parsed = parse_sql("set search_path to app, shared;\ncreate table t (id int);").unwrap();
-    assert_eq!(parsed.search_paths, vec!["app".to_string(), "shared".to_string()]);
+    assert_eq!(parsed.schema_path.schemas().collect::<Vec<_>>(), vec!["app", "shared"]);
 }
 
 // ── What KIND of file is this? ──────────────────────────────────────────────

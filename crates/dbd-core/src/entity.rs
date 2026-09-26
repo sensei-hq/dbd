@@ -187,6 +187,137 @@ impl SchemaSource {
     }
 }
 
+/// One entry on a schema path.
+///
+/// Almost always a named schema. The exception is Postgres's `"$user"`, which
+/// is not a schema name but a placeholder for the connecting role's own schema
+/// — so it resolves differently per connection and cannot be known while
+/// parsing a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathEntry {
+    /// A schema, named.
+    Schema(String),
+    /// Postgres `"$user"` — the connecting role's own schema.
+    ///
+    /// Recorded rather than dropped, because a caller that *has* a connection
+    /// can resolve it, and its **position** matters even to one that cannot:
+    /// `"$user", public` means a role-owned table shadows the `public` one.
+    /// Never used to qualify a name — doing so produced references to a schema
+    /// called `$user`, which cannot exist.
+    CurrentUser,
+}
+
+/// Where unqualified names in a file resolve, in order.
+///
+/// Each dialect states this differently: PostgreSQL with `SET search_path TO
+/// a, b`, T-SQL and MySQL with `USE db` (which names a database — dbd's
+/// [`Entity::catalog`] — and leaves the schema to the connection).
+///
+/// # `stated` is the load-bearing part
+///
+/// A file that says nothing is not the same as one that says `public`, and
+/// dbd used to report both as `["public"]`. Postgres's actual default is
+/// `"$user", public`: given a schema named after the connecting role, a bare
+/// `lookup` resolves to `<role>.lookup`. Which applies depends on the role and
+/// the database — `ALTER ROLE … SET search_path` and `ALTER DATABASE … SET
+/// search_path` both move it — so it is not knowable from the file.
+///
+/// `stated: false` says "dbd supplied this, the session decides". A consumer
+/// that wants to be careful can check it; dbd's own resolver still falls back
+/// to `public`, because every existing project's apply path depends on that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaPath {
+    /// The entries, in resolution order. Empty for a dialect that has no such
+    /// concept.
+    pub entries: Vec<PathEntry>,
+    /// Whose answer this is. See [`PathSource`].
+    pub source: PathSource,
+}
+
+/// Who established a [`SchemaPath`].
+///
+/// Three possible authors, and the difference is actionable: a caller can
+/// trust a file's own statement, should know when it is instead reading the
+/// project's blanket default, and must not treat the session default as a fact
+/// about anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathSource {
+    /// The file itself — `SET search_path TO …`, the convention every dbd DDL
+    /// file is expected to open with.
+    File,
+    /// `source.search_path` in design.yaml. The file said nothing, so the
+    /// project's blanket answer applies. **Never silent** — the load reports
+    /// every file it had to do this for.
+    Project,
+    /// Nobody. The file states none and the project configures none, so
+    /// whatever the connection happens to have applies: `"$user", public`,
+    /// unless a role or database setting moved it. dbd cannot know which.
+    #[default]
+    SessionDefault,
+}
+
+impl SchemaPath {
+    /// A path the file itself stated.
+    pub fn from_file(entries: Vec<PathEntry>) -> Self {
+        Self {
+            entries,
+            source: PathSource::File,
+        }
+    }
+
+    /// A path `source.search_path` supplied, for a file that stated none.
+    pub fn from_project(entries: Vec<PathEntry>) -> Self {
+        Self {
+            entries,
+            source: PathSource::Project,
+        }
+    }
+
+    /// The default Postgres applies when nothing else does: the connecting
+    /// role's own schema, then `public`.
+    pub fn postgres_default() -> Self {
+        Self {
+            entries: vec![
+                PathEntry::CurrentUser,
+                PathEntry::Schema(crate::reconcile::DEFAULT_SCHEMA.to_string()),
+            ],
+            source: PathSource::SessionDefault,
+        }
+    }
+
+    /// Whether the file itself established this.
+    pub fn stated(&self) -> bool {
+        self.source == PathSource::File
+    }
+
+    /// The schemas on the path, in order, skipping any placeholder.
+    ///
+    /// What a caller resolving a bare name walks. [`PathEntry::CurrentUser`] is
+    /// omitted rather than rendered, so nobody qualifies a name with `$user` by
+    /// accident.
+    pub fn schemas(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|e| match e {
+            PathEntry::Schema(s) => Some(s.as_str()),
+            PathEntry::CurrentUser => None,
+        })
+    }
+
+    /// The first named schema — what dbd qualifies a bare name against.
+    pub fn default_schema(&self) -> Option<&str> {
+        self.schemas().next()
+    }
+
+    /// Whether any entry cannot be resolved without a connection.
+    ///
+    /// True when the path contains `"$user"`. A caller resolving names offline
+    /// should treat a miss as "cannot say" rather than "does not exist".
+    pub fn needs_a_connection(&self) -> bool {
+        self.entries.contains(&PathEntry::CurrentUser)
+    }
+}
+
 /// A parsed reference to another entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
@@ -540,7 +671,19 @@ pub struct Entity {
     pub format: Option<String>,
     pub refers: Vec<String>,
     pub references: Vec<Reference>,
-    pub search_paths: Vec<String>,
+    /// Where unqualified names in this entity's file resolve — see
+    /// [`SchemaPath`]. Every entity carries it, for every dialect that has the
+    /// concept; a consumer resolving a bare reference needs it and cannot
+    /// recover it from the name.
+    ///
+    /// `#[serde(default)]` because this replaced a `search_paths: Vec<String>`
+    /// that was required. Anything serialized before now carries the old key,
+    /// which serde ignores — without the default, every such document would
+    /// fail to load with `missing field`. An absent path deserializes as
+    /// unstated and empty, which is the truth: that document never recorded
+    /// one.
+    #[serde(default)]
+    pub schema_path: SchemaPath,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub reads: Vec<String>,
@@ -567,7 +710,7 @@ impl Entity {
             format: None,
             refers: Vec::new(),
             references: Vec::new(),
-            search_paths: Vec::new(),
+            schema_path: SchemaPath::default(),
             errors: Vec::new(),
             warnings: Vec::new(),
             reads: Vec::new(),

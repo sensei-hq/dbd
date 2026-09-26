@@ -14,7 +14,7 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
     // Set before the parse-error early return: an errored entity must still
     // carry the sqlparser path's `["public"]` default, since View qualifies
     // its refs against `search_paths`.
-    entity.search_paths = common::extract_search_paths_via_pg_query(sql);
+    entity.schema_path = common::resolve_schema_path(sql, &entity.schema_path);
 
     // libpg_query is Postgres's own grammar, so its rejection is the definition
     // of invalid SQL. Recording an error only here keeps the invariant
@@ -118,14 +118,14 @@ mod tests {
     #[test]
     fn search_path_is_captured() {
         let e = parse("set search_path to app;\ncreate type status as enum ('a');");
-        assert_eq!(e.search_paths, vec!["app".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
     }
 
     /// Matches the sqlparser path's default so the two agree under parity.
     #[test]
     fn missing_search_path_defaults_to_public() {
         let e = parse("create type status as enum ('a');");
-        assert_eq!(e.search_paths, vec!["public".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["public"]);
     }
 
     /// libpg_query names the offending token but reports no line/column — its
@@ -162,6 +162,6 @@ mod tests {
     fn errored_entity_still_defaults_search_paths_to_public() {
         let e = parse("create type status as enum (;;;");
         assert!(!e.errors.is_empty(), "sanity: this SQL must still error");
-        assert_eq!(e.search_paths, vec!["public".to_string()]);
+        assert_eq!(e.schema_path.schemas().collect::<Vec<_>>(), vec!["public"]);
     }
 }
