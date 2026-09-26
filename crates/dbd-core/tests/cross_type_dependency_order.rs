@@ -99,9 +99,9 @@ fn view_calling_function_in_target_list_is_applied_after_it() {
         .find(|e| e.name == "app.v_target_list")
         .unwrap();
     assert!(
-        view.refers.contains(&"app.scalar_fn".to_string()),
+        view.refers_to("app.scalar_fn"),
         "target-list function call should be a dependency: {:?}",
-        view.refers
+        view.refers().collect::<Vec<_>>()
     );
     assert!(
         position(&design, "app.scalar_fn") < position(&design, "app.v_target_list"),
@@ -237,7 +237,7 @@ fn builtin_function_calls_are_not_dependencies_and_do_not_warn() {
 
     let view = design.entities().iter().find(|e| e.name == "app.v_rollup").unwrap();
     assert_eq!(
-        view.refers,
+        view.refers().collect::<Vec<_>>(),
         vec!["app.events".to_string()],
         "only the real table should be a dependency"
     );
@@ -269,9 +269,9 @@ fn builtin_set_returning_function_in_from_clause_does_not_warn() {
         view.warnings
     );
     assert!(
-        view.refers.is_empty(),
+        view.refers().next().is_none(),
         "built-in SRF must not be a dependency: {:?}",
-        view.refers
+        view.refers().collect::<Vec<_>>()
     );
 }
 
@@ -429,7 +429,7 @@ fn function_body_from_clause_builtin_does_not_warn() {
         func.warnings
     );
     assert_eq!(
-        func.refers,
+        func.refers().collect::<Vec<_>>(),
         vec!["app.docs".to_string()],
         "only the real table should remain a dependency"
     );
@@ -529,9 +529,9 @@ fn table_with_default_calling_function_is_applied_after_it() {
 
     let table = design.entities().iter().find(|e| e.name == "app.things").unwrap();
     assert!(
-        table.refers.contains(&"app.make_slug".to_string()),
+        table.refers_to("app.make_slug"),
         "DEFAULT function call should be a dependency: {:?}",
-        table.refers
+        table.refers().collect::<Vec<_>>()
     );
     assert!(
         position(&design, "app.make_slug") < position(&design, "app.things"),
@@ -655,9 +655,9 @@ fn builtin_calls_in_table_defaults_do_not_warn() {
         table.warnings
     );
     assert!(
-        table.refers.is_empty(),
+        table.refers().next().is_none(),
         "built-in DEFAULT calls must not be dependencies: {:?}",
-        table.refers
+        table.refers().collect::<Vec<_>>()
     );
 }
 

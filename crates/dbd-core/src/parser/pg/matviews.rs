@@ -1,7 +1,7 @@
 //! Materialized view DDL, parsed with libpg_query.
 //!
 //! Unlike a plain view, a matview's body is re-executed only on `REFRESH`, and
-//! `emit_matview` reconstructs the `CREATE` from `entity.writes[0]` — so what
+//! `emit_matview` reconstructs the `CREATE` from `entity.writes().collect::<Vec<_>>()[0]` — so what
 //! that field holds is user-visible, not just an internal detail. The
 //! sqlparser incumbent stored sqlparser's own re-rendering of the body; this
 //! parser stores the author's SQL verbatim instead.
@@ -15,7 +15,7 @@
 //! the last `WITH` (if any) — tokenized, so an `as` inside a string, comment,
 //! or dollar-quoted body is never mistaken for the boundary.
 
-use crate::entity::{Entity, IndexDef, REF_TYPE_FUNCTION, Reference, TableComments, TableDef};
+use crate::entity::{Entity, IndexDef, Ref, RefKind, TableComments, TableDef};
 use crate::error::Result;
 
 use super::{common, tables};
@@ -43,7 +43,7 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
     };
 
     if let Some(body) = extract_body(sql, raw_stmt) {
-        entity.writes = vec![body];
+        entity.body = vec![body];
     }
 
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
@@ -76,14 +76,14 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         if references.iter().any(|r| r.name == qualified) {
             continue;
         }
-        references.push(Reference {
+        references.push(Ref {
             name: qualified,
-            ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            kind: RefKind::Calls,
             schema_source,
+            unresolved: false,
         });
     }
-    entity.refers = references.iter().map(|r| r.name.clone()).collect();
-    entity.references = references;
+    entity.refs = references;
 
     // There is no CREATE TABLE here, so only indexes are populated
     // (columns/constraints/comments stay empty).
@@ -183,7 +183,7 @@ mod tests {
     }
 
     fn body(sql: &str) -> String {
-        parse(sql).writes.first().cloned().unwrap_or_default()
+        parse(sql).body.first().cloned().unwrap_or_default()
     }
 
     /// The whole point of this change: the author's SQL survives, rather than a
@@ -263,8 +263,8 @@ mod tests {
     #[test]
     fn relations_and_function_calls_become_references() {
         let e = parse("set search_path to app;\ncreate materialized view m as select app.myfn(a) from t with data;");
-        assert!(e.refers.contains(&"app.t".to_string()), "got {:?}", e.refers);
-        assert!(e.refers.contains(&"app.myfn".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("app.t"), "got {:?}", e.refers().collect::<Vec<_>>());
+        assert!(e.refers_to("app.myfn"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
     #[test]

@@ -961,7 +961,7 @@ impl PostgresAdapter {
                 let viewname: String = row.get("viewname");
                 let definition: String = row.get("definition");
                 let mut e = Entity::new(EntityType::View, &format!("{schema}.{viewname}"));
-                e.writes = vec![definition];
+                e.body = vec![definition];
                 e
             })
             .collect();
@@ -1004,7 +1004,7 @@ impl PostgresAdapter {
                 .await?;
 
             let mut e = Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
-            e.writes = vec![definition];
+            e.body = vec![definition];
             if !indexes.is_empty() {
                 e.table_def = Some(TableDef {
                     columns: Vec::new(),
@@ -1084,7 +1084,7 @@ impl PostgresAdapter {
 
             let mut e = Entity::new(EntityType::Sequence, &format!("{schema}.{name}"));
             e.schema = Some(schema);
-            e.writes = vec![ddl];
+            e.body = vec![ddl];
             entities.push(e);
         }
         Ok(entities)
@@ -1136,7 +1136,7 @@ impl PostgresAdapter {
             if current_key.as_ref() == Some(&key) {
                 // Same routine (overload) — append its body to the current entity.
                 if let Some(last) = entities.last_mut() {
-                    last.writes.push(definition);
+                    last.body.push(definition);
                 }
                 continue;
             }
@@ -1148,7 +1148,7 @@ impl PostgresAdapter {
             };
             let mut e = Entity::new(entity_type, &format!("{schema}.{name}"));
             e.schema = Some(schema);
-            e.writes = vec![definition];
+            e.body = vec![definition];
             entities.push(e);
             current_key = Some(key);
         }
@@ -1680,7 +1680,10 @@ impl DatabaseAdapter for PostgresAdapter {
             .map(|name| {
                 let mut e = Entity::new(EntityType::Role, &name);
                 if let Some(refers) = refers_by_member.remove(&name) {
-                    e.refers = refers;
+                    e.refs = refers
+                        .into_iter()
+                        .map(|r| crate::entity::Ref::stated(r, crate::entity::RefKind::Member))
+                        .collect();
                 }
                 e
             })

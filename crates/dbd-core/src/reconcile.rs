@@ -1240,14 +1240,9 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
             let qname = qualified_entity_name(e);
             let schema = e.schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
             let deepest = e
-                .refers
-                .iter()
-                .filter(|r| **r != qname && **r != e.name)
-                .filter_map(|r| {
-                    depth
-                        .get(r.as_str())
-                        .or_else(|| depth.get(format!("{schema}.{r}").as_str()))
-                })
+                .refers()
+                .filter(|r| *r != qname && *r != e.name)
+                .filter_map(|r| depth.get(r).or_else(|| depth.get(format!("{schema}.{r}").as_str())))
                 .max()
                 .copied();
             let Some(d) = deepest else { continue };
@@ -1658,11 +1653,11 @@ fn qualified_matview_name(entity: &Entity) -> String {
     format!("{schema}.{name}")
 }
 
-/// Normalize a matview's `SELECT` body for a stable hash input: first `writes`
+/// Normalize a matview's `SELECT` body for a stable hash input: first `body`
 /// entry, trimmed, a single trailing `;` removed, internal whitespace collapsed
 /// to single spaces, lowercased.
 fn normalize_matview_body(e: &Entity) -> String {
-    let raw = e.writes.first().map(String::as_str).unwrap_or_default();
+    let raw = e.body.first().map(String::as_str).unwrap_or_default();
     raw.trim()
         .trim_end_matches(';')
         .split_whitespace()
@@ -3497,7 +3492,7 @@ mod tests {
 
     fn mv(name: &str, body: &str) -> Entity {
         let mut e = Entity::new(EntityType::MaterializedView, name);
-        e.writes = vec![body.into()];
+        e.body = vec![body.into()];
         e
     }
 
@@ -3725,7 +3720,10 @@ mod enum_recreation_tests {
 
     fn entity(entity_type: EntityType, name: &str, refers: &[&str]) -> Entity {
         let mut e = Entity::new(entity_type, name);
-        e.refers = refers.iter().map(|r| r.to_string()).collect();
+        e.refs = refers
+            .iter()
+            .map(|r| crate::entity::Ref::stated(*r, crate::entity::RefKind::Reads))
+            .collect();
         e
     }
 

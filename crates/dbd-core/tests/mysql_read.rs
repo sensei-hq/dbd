@@ -132,18 +132,30 @@ fn reads_and_writes_are_kept_apart() {
          END",
     );
     let e = &p.entities[0];
-    assert!(e.reads.contains(&"source".to_string()), "reads: {:?}", e.reads);
-    assert!(e.writes.contains(&"target".to_string()), "writes: {:?}", e.writes);
-    assert!(e.writes.contains(&"audit".to_string()), "writes: {:?}", e.writes);
+    assert!(
+        e.reads().any(|r| r.name == "source"),
+        "reads: {:?}",
+        e.reads().collect::<Vec<_>>()
+    );
+    assert!(
+        e.writes().any(|r| r.name == "target"),
+        "writes: {:?}",
+        e.writes().collect::<Vec<_>>()
+    );
+    assert!(
+        e.writes().any(|r| r.name == "audit"),
+        "writes: {:?}",
+        e.writes().collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn a_foreign_key_names_the_table_it_points_at() {
     let p = read("CREATE TABLE orders (user_id INT, FOREIGN KEY (user_id) REFERENCES users(id));");
     assert!(
-        p.entities[0].refers.contains(&"users".to_string()),
+        p.entities[0].refers_to("users"),
         "{:?}",
-        p.entities[0].refers
+        p.entities[0].refers().collect::<Vec<_>>()
     );
 }
 
@@ -151,7 +163,10 @@ fn a_foreign_key_names_the_table_it_points_at() {
 #[test]
 fn a_cross_database_reference_keeps_its_database() {
     let p = read("CREATE VIEW v AS SELECT * FROM crm.contacts;");
-    assert_eq!(p.entities[0].reads, vec!["crm.contacts"]);
+    assert_eq!(
+        p.entities[0].reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["crm.contacts"]
+    );
 }
 
 // ── `#` is a comment here ───────────────────────────────────────────────────
@@ -201,8 +216,8 @@ fn a_delimiter_directive_does_not_break_the_read() {
     );
     assert_eq!(names(&p), vec!["p"]);
     assert!(
-        p.entities[0].reads.contains(&"t".to_string()),
+        p.entities[0].reads().any(|r| r.name == "t"),
         "{:?}",
-        p.entities[0].reads
+        p.entities[0].reads().collect::<Vec<_>>()
     );
 }

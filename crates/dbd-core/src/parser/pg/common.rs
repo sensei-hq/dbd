@@ -9,7 +9,7 @@
 //! arrangement is worth keeping — the per-type parsers share these helpers,
 //! and a future non-Postgres grammar would sit beside `pg`, not inside it.
 
-use crate::entity::{EnumValue, PathEntry, Reference, SchemaPath, SchemaSource};
+use crate::entity::{EnumValue, PathEntry, Ref, RefKind, SchemaPath, SchemaSource};
 
 use super::enums;
 
@@ -126,20 +126,21 @@ fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
 /// `HashSet` internally, so its iteration order is not source order — it's
 /// Rust's randomized per-process hash order, confirmed by parsing the same SQL
 /// in the same binary across separate runs and observing different orderings.
-/// Left unsorted, `entity.refers`/`entity.references` for any multi-relation
+/// Left unsorted, `entity.refers().collect::<Vec<_>>()`/`entity.refs` for any multi-relation
 /// view would vary from run to run, which is a nondeterminism bug regardless of
 /// how the result is later compared.
 ///
-pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Reference> {
+pub(in crate::parser) fn extract_view_refs_via_pg_query(raw_sql: &str, default_schema: &str) -> Vec<Ref> {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return Vec::new();
     };
     qualify_all_sourced(parsed.select_tables(), default_schema)
         .into_iter()
-        .map(|(name, schema_source)| Reference {
+        .map(|(name, schema_source)| Ref {
             name,
-            ref_type: Some("table".to_string()),
+            kind: RefKind::Reads,
             schema_source,
+            unresolved: false,
         })
         .collect()
 }

@@ -26,7 +26,10 @@ use dbd_core::references::resolve_references;
 fn table(catalog: Option<&str>, name: &str, refers: &[&str]) -> Entity {
     let mut e = Entity::new(EntityType::Table, name);
     e.catalog = catalog.map(str::to_string);
-    e.refers = refers.iter().map(|s| s.to_string()).collect();
+    e.refs = refers
+        .iter()
+        .map(|s| dbd_core::entity::Ref::stated(*s, dbd_core::entity::RefKind::Reads))
+        .collect();
     e
 }
 
@@ -44,13 +47,16 @@ fn resolution_is_unchanged_when_nothing_has_a_catalog() {
     resolve_references(&mut entities, &[], &[]);
 
     assert_eq!(
-        entities[1].refers,
+        entities[1].refers().collect::<Vec<_>>(),
         vec!["app.users"],
         "a resolvable edge still resolves"
     );
     assert!(entities[1].warnings.is_empty());
 
-    assert!(entities[2].refers.is_empty(), "an unresolvable edge is still dropped");
+    assert!(
+        entities[2].refers().next().is_none(),
+        "an unresolvable edge is still dropped"
+    );
     assert_eq!(entities[2].warnings.len(), 1, "and still warns");
     assert!(entities[2].warnings[0].contains("app.missing"));
 }
@@ -93,7 +99,7 @@ fn a_bare_reference_resolves_within_the_referring_entitys_catalog() {
     resolve_references(&mut entities, &[], &[]);
 
     assert_eq!(
-        entities[2].refers,
+        entities[2].refers().collect::<Vec<_>>(),
         vec!["MainDb.dbo.Users"],
         "MainDb.dbo.Orders must reach MainDb's Users, not OtherDb's"
     );
@@ -111,7 +117,7 @@ fn a_reference_naming_a_catalog_crosses_to_it() {
     ];
     resolve_references(&mut entities, &[], &[]);
 
-    assert_eq!(entities[2].refers, vec!["OtherDb.dbo.Users"]);
+    assert_eq!(entities[2].refers().collect::<Vec<_>>(), vec!["OtherDb.dbo.Users"]);
     assert!(entities[2].warnings.is_empty());
 }
 
@@ -126,7 +132,7 @@ fn a_bare_reference_falls_back_to_a_catalog_less_entity() {
     ];
     resolve_references(&mut entities, &[], &[]);
 
-    assert_eq!(entities[1].refers, vec!["app.shared"]);
+    assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["app.shared"]);
     assert!(entities[1].warnings.is_empty());
 }
 
@@ -141,9 +147,9 @@ fn a_reference_to_an_absent_catalog_stays_unresolved() {
     resolve_references(&mut entities, &[], &[]);
 
     assert!(
-        entities[1].refers.is_empty(),
+        entities[1].refers().next().is_none(),
         "got {:?} — a cross-database edge must not fall back to the local one",
-        entities[1].refers
+        entities[1].refers().collect::<Vec<_>>()
     );
     assert_eq!(entities[1].warnings.len(), 1);
     assert!(entities[1].warnings[0].contains("Nowhere.dbo.Users"));

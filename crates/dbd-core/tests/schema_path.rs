@@ -132,9 +132,9 @@ fn the_current_user_placeholder_is_never_used_as_a_schema() {
         vec![PathEntry::CurrentUser, PathEntry::Schema("public".into())]
     );
     assert!(
-        !e.references.iter().any(|r| r.name.contains("$user")),
+        !e.refs.iter().any(|r| r.name.contains("$user")),
         "a reference was qualified with `$user`: {:?}",
-        e.references.iter().map(|r| &r.name).collect::<Vec<_>>()
+        e.refs.iter().map(|r| &r.name).collect::<Vec<_>>()
     );
 }
 

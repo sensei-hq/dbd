@@ -91,8 +91,14 @@ fn a_declarations_own_references_do_not_leak_to_the_file() {
          END",
     );
     assert_eq!(p.entities.len(), 1);
-    assert_eq!(p.entities[0].reads, vec!["dbo.Source"]);
-    assert_eq!(p.entities[0].writes, vec!["dbo.Target"]);
+    assert_eq!(
+        p.entities[0].reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["dbo.Source"]
+    );
+    assert_eq!(
+        p.entities[0].writes().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["dbo.Target"]
+    );
     assert!(
         p.references.reads.is_empty() && p.references.writes.is_empty(),
         "the procedure's references are its own, not the file's: {:?}",
@@ -113,7 +119,10 @@ fn a_mixed_file_splits_by_batch() {
          GO",
     );
     assert_eq!(p.entities.len(), 1);
-    assert_eq!(p.entities[0].reads, vec!["dbo.Source"]);
+    assert_eq!(
+        p.entities[0].reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["dbo.Source"]
+    );
     assert_eq!(
         p.references.writes,
         vec!["dbo.Audit"],
@@ -147,7 +156,7 @@ fn a_declaration_only_file_has_no_file_level_references() {
     );
     assert_eq!(p.entities.len(), 1);
     assert_eq!(
-        p.entities[0].reads,
+        p.entities[0].reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
         vec!["dbo.Users"],
         "precondition: the declaration makes a reference that could leak"
     );

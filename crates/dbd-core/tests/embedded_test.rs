@@ -562,7 +562,7 @@ async fn introspect_returns_fixture_entities() {
         .iter()
         .find(|e| e.entity_type == dbd_core::EntityType::View && e.name == "revtest.active");
     let view = view.expect("view 'revtest.active' not found in introspect output");
-    let body = view.writes.first().expect("view should have a body in writes[0]");
+    let body = view.body.first().expect("view should have a body in body[0]");
     assert!(
         body.to_uppercase().contains("SELECT"),
         "view body should contain SELECT, got: {body}"
@@ -574,7 +574,7 @@ async fn introspect_returns_fixture_entities() {
 /// Reverse-engineer a materialized view from `pg_matviews`. Creates a schema, a
 /// `CREATE MATERIALIZED VIEW … WITH DATA`, and a UNIQUE INDEX on it, then asserts
 /// `introspect` captures it as `EntityType::MaterializedView` with its SELECT body
-/// in `writes[0]` and its index attached via `table_def` (matviews carry indexes
+/// in `body[0]` and its index attached via `table_def` (matviews carry indexes
 /// in `pg_index` exactly like tables). Drops the schema (CASCADE) at the end.
 #[tokio::test]
 async fn introspect_captures_materialized_views() {
@@ -603,8 +603,8 @@ async fn introspect_captures_materialized_views() {
         "mvtest.mv should be a MaterializedView"
     );
 
-    // Body carried in writes[0] (same contract as views); contains the SELECT.
-    let body = mv.writes.first().expect("matview should carry its body in writes[0]");
+    // Body carried in body[0] (same contract as views); contains the SELECT.
+    let body = mv.body.first().expect("matview should carry its body in body[0]");
     assert!(
         body.to_lowercase().contains("select"),
         "matview body should contain SELECT (case-insensitive), got: {body}"
@@ -929,11 +929,11 @@ async fn introspect_captures_functions_and_procedures() {
         dbd_core::EntityType::Function,
         "add_one should be a Function"
     );
-    assert_eq!(add_one.writes.len(), 1, "add_one has one body");
+    assert_eq!(add_one.body.len(), 1, "add_one has one body");
     assert!(
-        add_one.writes[0].to_uppercase().contains("FUNCTION"),
+        add_one.body[0].to_uppercase().contains("FUNCTION"),
         "add_one body should be a CREATE FUNCTION, got: {}",
-        add_one.writes[0]
+        add_one.body[0]
     );
 
     // ── procedure captured as EntityType::Procedure ──────────────────────────
@@ -947,9 +947,9 @@ async fn introspect_captures_functions_and_procedures() {
         "noop should be a Procedure"
     );
     assert!(
-        noop.writes[0].to_uppercase().contains("PROCEDURE"),
+        noop.body[0].to_uppercase().contains("PROCEDURE"),
         "noop body should be a CREATE PROCEDURE, got: {}",
-        noop.writes[0]
+        noop.body[0]
     );
 
     // ── overloaded function: ONE entity with TWO writes ──────────────────────
@@ -967,13 +967,13 @@ async fn introspect_captures_functions_and_procedures() {
         "greet should be a Function"
     );
     assert_eq!(
-        greet.writes.len(),
+        greet.body.len(),
         2,
         "overloaded greet must hold TWO definitions in writes, got {}",
-        greet.writes.len()
+        greet.body.len()
     );
     // Both signatures present across the two bodies.
-    let joined = greet.writes.join("\n");
+    let joined = greet.body.join("\n");
     assert!(joined.contains("name text"), "first overload signature missing");
     assert!(joined.contains("loud boolean"), "second overload signature missing");
 
@@ -1061,9 +1061,9 @@ async fn introspect_roles_captures_project_roles_and_memberships() {
         .expect("role 'app_admin' not found");
     assert_eq!(app_admin.entity_type, dbd_core::EntityType::Role);
     assert!(
-        app_admin.refers.is_empty(),
+        app_admin.refers().next().is_none(),
         "app_admin should have no memberships, got {:?}",
-        app_admin.refers
+        app_admin.refers().collect::<Vec<_>>()
     );
 
     let app_ro = roles
@@ -1072,7 +1072,7 @@ async fn introspect_roles_captures_project_roles_and_memberships() {
         .expect("role 'app_ro' not found");
     assert_eq!(app_ro.entity_type, dbd_core::EntityType::Role);
     assert_eq!(
-        app_ro.refers,
+        app_ro.refers().collect::<Vec<_>>(),
         vec!["app_admin".to_string()],
         "app_ro should be a member of app_admin"
     );
@@ -1169,7 +1169,10 @@ async fn role_membership_grant_survives_apply() {
 
     // Create the child role with the parent as a member.
     let mut child = Entity::new(EntityType::Role, "app_ro");
-    child.refers = vec!["app_admin".to_string()];
+    child.refs = vec![dbd_core::entity::Ref::stated(
+        "app_admin",
+        dbd_core::entity::RefKind::Member,
+    )];
     let child_ddl = ddl_from_entity(&child).expect("ddl_from_entity(app_ro) must return Some");
 
     // Verify the emitted DDL contains the GRANT.
@@ -1235,9 +1238,9 @@ async fn introspect_captures_sequences_and_serial_identity() {
         .expect("standalone sequence 'app.counter' not captured");
     assert_eq!(counter.entity_type, EntityType::Sequence);
     assert!(
-        counter.writes.first().is_some_and(|w| w.contains("CREATE SEQUENCE")),
-        "sequence entity should carry rendered CREATE SEQUENCE in writes[0], got {:?}",
-        counter.writes
+        counter.body.first().is_some_and(|w| w.contains("CREATE SEQUENCE")),
+        "sequence entity should carry rendered CREATE SEQUENCE in body[0], got {:?}",
+        counter.body
     );
 
     // The bigserial- and identity-owned sequences must NOT appear as standalone
@@ -1360,8 +1363,8 @@ async fn emitted_sequences_and_serial_identity_apply_to_postgres() {
         let mut c = e.clone();
         c.name = c.name.replacen("src.", "dst.", 1);
         c.schema = Some("dst".into());
-        // The sequence body in writes[0] is fully-qualified to src — retarget it too.
-        c.writes = c.writes.iter().map(|w| w.replace("src", "dst")).collect();
+        // The sequence body in body[0] is fully-qualified to src — retarget it too.
+        c.body = c.body.iter().map(|w| w.replace("src", "dst")).collect();
         c
     };
 
