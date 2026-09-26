@@ -41,13 +41,13 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
 /// Generate an idempotent role creation script.
 ///
 /// Uses a DO block to check pg_catalog.pg_roles before creating.
-/// Grants referenced roles (from entity.refers).
+/// Grants the roles this one is a member of.
 fn generate_role_script(entity: &Entity) -> String {
     let name = &entity.name;
     let mut script = format!(
         "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{name}') THEN\n    CREATE ROLE \"{name}\";\n  END IF;\nEND $$;\n"
     );
-    for granted_role in &entity.refers {
+    for granted_role in entity.refs_of(crate::entity::RefKind::Member).map(|r| &r.name) {
         script.push_str(&format!("GRANT \"{granted_role}\" TO \"{name}\";\n"));
     }
     script
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn ddl_for_role_with_grants() {
         let mut entity = Entity::new(EntityType::Role, "advanced");
-        entity.refers = vec!["basic".to_string()];
+        entity.refs = vec![crate::entity::Ref::stated("basic", crate::entity::RefKind::Member)];
         let ddl = ddl_from_entity(&entity).unwrap();
         assert!(ddl.contains("CREATE ROLE"));
         assert!(ddl.contains("GRANT \"basic\" TO \"advanced\""));

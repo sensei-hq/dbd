@@ -1,6 +1,6 @@
 //! View DDL, parsed with libpg_query.
 
-use crate::entity::{Entity, REF_TYPE_FUNCTION, Reference};
+use crate::entity::{Entity, Ref, RefKind};
 use crate::error::Result;
 
 use super::common;
@@ -44,22 +44,22 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
     // built from a `HashSet` internally, so its order is Rust's randomized
     // per-process hash order, not source order — confirmed empirically (same
     // SQL, same binary, different orderings across separate runs). Left
-    // unsorted, `entity.refers` would vary from run to run for any view
+    // unsorted, `entity.refers().collect::<Vec<_>>()` would vary from run to run for any view
     // calling more than one function.
     let function_names = common::qualify_all_sourced(parsed.call_functions(), &default_schema);
     for (qualified, schema_source) in function_names {
         if references.iter().any(|r| r.name == qualified) {
             continue;
         }
-        references.push(Reference {
+        references.push(Ref {
             name: qualified,
-            ref_type: Some(REF_TYPE_FUNCTION.to_string()),
+            kind: RefKind::Calls,
             schema_source,
+            unresolved: false,
         });
     }
 
-    entity.refers = references.iter().map(|r| r.name.clone()).collect();
-    entity.references = references;
+    entity.refs = references;
     Ok(entity)
 }
 
@@ -76,7 +76,7 @@ fn declares_a_view(parsed: &pg_query::ParseResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{EntityType, REF_TYPE_FUNCTION};
+    use crate::entity::EntityType;
 
     fn parse(sql: &str) -> Entity {
         parse_view(Entity::new(EntityType::View, "app.v"), sql).unwrap()
@@ -85,14 +85,14 @@ mod tests {
     #[test]
     fn relation_references_are_captured_and_qualified() {
         let e = parse("set search_path to app;\ncreate view v as select a from t;");
-        assert!(e.refers.contains(&"app.t".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("app.t"), "got {:?}", e.refers().collect::<Vec<_>>());
         assert!(e.errors.is_empty(), "got {:?}", e.errors);
     }
 
     #[test]
     fn an_explicit_schema_is_not_overridden_by_the_search_path() {
         let e = parse("set search_path to app;\ncreate view v as select a from shop.orders;");
-        assert!(e.refers.contains(&"shop.orders".to_string()), "got {:?}", e.refers);
+        assert!(e.refers_to("shop.orders"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
     /// Function calls are soft references: the resolver keeps the ones naming a
@@ -101,18 +101,22 @@ mod tests {
     fn function_calls_are_captured_as_soft_references() {
         let e = parse("set search_path to app;\ncreate view v as select app.myfn(a) from t;");
         let myfn = e
-            .references
+            .refs
             .iter()
             .find(|r| r.name == "app.myfn")
             .expect("function reference missing");
-        assert_eq!(myfn.ref_type.as_deref(), Some(REF_TYPE_FUNCTION));
+        assert_eq!(myfn.kind, crate::entity::RefKind::Calls);
     }
 
     /// A CTE name is query-local, not a real relation.
     #[test]
     fn cte_names_are_not_references() {
         let e = parse("set search_path to app;\ncreate view v as with r as (select 1 n) select n from r;");
-        assert!(!e.refers.contains(&"app.r".to_string()), "CTE leaked: {:?}", e.refers);
+        assert!(
+            !e.refers_to("app.r"),
+            "CTE leaked: {:?}",
+            e.refers().collect::<Vec<_>>()
+        );
     }
 
     #[test]

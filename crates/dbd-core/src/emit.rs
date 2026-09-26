@@ -295,13 +295,13 @@ fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
 
 /// `CREATE SEQUENCE "schema"."name" …;`
 ///
-/// The fully-rendered statement is carried verbatim in `entity.writes[0]` (set by
+/// The fully-rendered statement is carried verbatim in `entity.body[0]` (set by
 /// the introspector, which reconstructs it from `pg_sequences`/`pg_sequence`). We
 /// emit that text, trimmed of any trailing whitespace/`;` and re-terminated with a
 /// single `;`. Falls back to a bare `CREATE SEQUENCE "s"."n";` when no body was
 /// captured.
 pub fn emit_sequence(entity: &Entity) -> String {
-    if let Some(body) = entity.writes.first() {
+    if let Some(body) = entity.body.first() {
         let body = body.trim().trim_end_matches(';').trim_end();
         if !body.is_empty() {
             return format!("{body};");
@@ -313,17 +313,17 @@ pub fn emit_sequence(entity: &Entity) -> String {
 }
 
 /// `CREATE VIEW "schema"."name" AS <definition>;`
-/// The view body is carried in `entity.writes[0]` (set by the introspector).
+/// The view body is carried in `entity.body[0]` (set by the introspector).
 pub fn emit_view(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
-    let body = entity.writes.first().map(String::as_str).unwrap_or("SELECT 1");
+    let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
     format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
 }
 
 /// `CREATE MATERIALIZED VIEW IF NOT EXISTS "schema"."name" AS <definition> WITH DATA;`
-/// Body is carried in `entity.writes[0]` (same contract as `emit_view`); the
+/// Body is carried in `entity.body[0]` (same contract as `emit_view`); the
 /// parser stores it without a `WITH DATA` clause, which we re-add here.
 /// Trailing index statements (if any) are appended from `entity.table_def`,
 /// rendered via the same `emit_index_sql` helper `emit_table` uses.
@@ -337,7 +337,7 @@ pub fn emit_matview(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
     let qname = format!("{}.{}", q(schema), q(name));
-    let body = entity.writes.first().map(String::as_str).unwrap_or("SELECT 1");
+    let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
     let mut out = format!("CREATE MATERIALIZED VIEW IF NOT EXISTS {qname} AS {body} WITH DATA;");
 
@@ -353,13 +353,13 @@ pub fn emit_matview(entity: &Entity) -> String {
 /// `CREATE OR REPLACE FUNCTION|PROCEDURE …;` for each overload, joined by a
 /// blank line.
 ///
-/// The bodies are carried verbatim in `entity.writes` (one per overload, set by
+/// The bodies are carried verbatim in `entity.body` (one per overload, set by
 /// the introspector via `pg_get_functiondef`, whose output omits the trailing
 /// semicolon). Each piece is trimmed of trailing whitespace and any trailing
 /// `;`, then terminated with exactly one `;`, so the result is a valid script.
 pub fn emit_routine(entity: &Entity) -> String {
     entity
-        .writes
+        .body
         .iter()
         .map(|w| {
             let body = w.trim_end();
@@ -551,9 +551,8 @@ mod tests {
     #[test]
     fn emits_view() {
         let mut e = Entity::new(EntityType::View, "shop.active_orders");
-        e.references = vec![];
-        // We store the view body in entity.writes[0] per the introspector contract:
-        e.writes = vec!["SELECT * FROM shop.orders WHERE status = 'paid'".into()];
+        // We store the view body in entity.body[0] per the introspector contract:
+        e.body = vec!["SELECT * FROM shop.orders WHERE status = 'paid'".into()];
         let sql = emit_view(&e);
         assert_eq!(
             sql,
@@ -564,7 +563,7 @@ mod tests {
     #[test]
     fn emits_materialized_view() {
         let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
-        e.writes = vec!["SELECT 1 AS x".to_string()];
+        e.body = vec!["SELECT 1 AS x".to_string()];
         let sql = emit_matview(&e);
         assert_eq!(
             sql,
@@ -575,7 +574,7 @@ mod tests {
     #[test]
     fn emit_entity_dispatches_matview() {
         let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
-        e.writes = vec!["SELECT 1 AS x".to_string()];
+        e.body = vec!["SELECT 1 AS x".to_string()];
         let sql = emit_entity(&e).expect("matview should emit");
         assert!(sql.starts_with("CREATE MATERIALIZED VIEW"));
     }
@@ -585,7 +584,7 @@ mod tests {
         use crate::entity::{IndexColumn, IndexDef, TableDef};
 
         let mut e = Entity::new(EntityType::MaterializedView, "analytics.daily_sales");
-        e.writes = vec!["SELECT 1 AS x".to_string()];
+        e.body = vec!["SELECT 1 AS x".to_string()];
         e.table_def = Some(TableDef {
             columns: vec![],
             constraints: vec![],
@@ -625,7 +624,7 @@ mod tests {
         // no trailing semicolon — emit_routine must add exactly one per piece.
         let mut e = Entity::new(EntityType::Function, "app.f");
         e.schema = Some("app".into());
-        e.writes = vec![
+        e.body = vec![
             "CREATE OR REPLACE FUNCTION app.f(a int) RETURNS int LANGUAGE sql AS $$ select 1 $$".into(),
             "CREATE OR REPLACE FUNCTION app.f(a text) RETURNS int LANGUAGE sql AS $$ select 2 $$".into(),
         ];
@@ -647,7 +646,7 @@ mod tests {
         // Dispatch wiring: emit_entity routes Function/Procedure to emit_routine.
         assert_eq!(emit_entity(&e).as_deref(), Some(sql.as_str()));
         let mut p = Entity::new(EntityType::Procedure, "app.p");
-        p.writes = vec!["CREATE OR REPLACE PROCEDURE app.p() LANGUAGE sql AS $$ select 1 $$".into()];
+        p.body = vec!["CREATE OR REPLACE PROCEDURE app.p() LANGUAGE sql AS $$ select 1 $$".into()];
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
     }
 
@@ -677,7 +676,7 @@ mod tests {
         // The introspector stashes the fully-rendered statement in writes[0].
         let mut e = Entity::new(EntityType::Sequence, "app.counter");
         e.schema = Some("app".into());
-        e.writes = vec![
+        e.body = vec![
             "CREATE SEQUENCE \"app\".\"counter\" AS bigint INCREMENT BY 1 \
              MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 1"
                 .into(),

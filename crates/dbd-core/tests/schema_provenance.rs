@@ -95,25 +95,25 @@ fn a_table_constraint_foreign_key_is_marked_too() {
 fn a_bare_view_reference_is_inferred_and_a_written_one_is_not() {
     let bare = one("set search_path to app;\ncreate view v as select * from parent;");
     assert_eq!(
-        bare.references
+        bare.refs
             .iter()
             .find(|r| r.name == "app.parent")
             .map(|r| r.schema_source),
         Some(SchemaSource::Inferred),
         "refs: {:?}",
-        bare.references
+        bare.refs
     );
 
     let written = one("set search_path to app;\ncreate view v as select * from other.parent;");
     assert_eq!(
         written
-            .references
+            .refs
             .iter()
             .find(|r| r.name == "other.parent")
             .map(|r| r.schema_source),
         Some(SchemaSource::Stated),
         "refs: {:?}",
-        written.references
+        written.refs
     );
 }
 
@@ -123,7 +123,7 @@ fn a_bare_view_reference_is_inferred_and_a_written_one_is_not() {
 fn the_tsql_reader_never_infers() {
     use dbd_core::parser::{Dialect, parse_sql_as};
     let p = parse_sql_as(Dialect::TSql, "CREATE VIEW dbo.v AS SELECT * FROM Issues;").expect("reads");
-    for r in &p.entities[0].references {
+    for r in &p.entities[0].refs {
         assert_eq!(r.schema_source, SchemaSource::Stated, "{r:?}");
     }
 }
@@ -230,23 +230,24 @@ fn a_foreign_keys_provenance_is_never_serialized() {
     }
 }
 
-/// A `Reference`, by contrast, exists to be handed to a consumer and never
+/// A `Ref`, by contrast, exists to be handed to a consumer and never
 /// lands in a snapshot — so it carries provenance across a JSON boundary too.
 /// Omitted when `Stated`, which is the overwhelming majority and the default.
 #[test]
 fn a_references_provenance_survives_json() {
-    use dbd_core::entity::Reference;
-    let inferred = Reference {
+    use dbd_core::entity::Ref;
+    let inferred = Ref {
         name: "app.parent".into(),
-        ref_type: None,
+        kind: dbd_core::entity::RefKind::Reads,
         schema_source: SchemaSource::Inferred,
+        unresolved: false,
     };
     let json = serde_json::to_string(&inferred).expect("serializes");
     assert!(json.contains("\"schema_source\":\"inferred\""), "{json}");
-    let back: Reference = serde_json::from_str(&json).expect("round-trips");
+    let back: Ref = serde_json::from_str(&json).expect("round-trips");
     assert_eq!(back.schema_source, SchemaSource::Inferred);
 
-    let stated = Reference {
+    let stated = Ref {
         schema_source: SchemaSource::Stated,
         ..inferred
     };

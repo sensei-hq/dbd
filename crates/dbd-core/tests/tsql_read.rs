@@ -39,9 +39,9 @@ fn a_procedure_with_parenless_parameters_is_declared() {
     assert_eq!(p.entities[0].entity_type, EntityType::Procedure);
     assert_eq!(p.kind, FileKind::Declaration);
     assert!(
-        p.entities[0].reads.contains(&"dbo.Issues".to_string()),
+        p.entities[0].reads().any(|r| r.name == "dbo.Issues"),
         "the body's table must be an edge, got {:?}",
-        p.entities[0].reads
+        p.entities[0].reads().collect::<Vec<_>>()
     );
 }
 
@@ -76,7 +76,7 @@ fn alter_procedure_declares_because_it_carries_the_whole_body() {
     let p = read("ALTER PROCEDURE dbo.sp_X AS BEGIN SELECT * FROM dbo.Issues END");
     assert_eq!(names(&p), vec!["dbo.sp_X"]);
     assert_eq!(p.kind, FileKind::Declaration);
-    assert!(p.entities[0].reads.contains(&"dbo.Issues".to_string()));
+    assert!(p.entities[0].reads().any(|r| r.name == "dbo.Issues"));
 }
 
 /// `ALTER TABLE` never carries a definition — it is an edit to a table defined
@@ -145,24 +145,36 @@ fn reads_and_writes_are_kept_apart() {
          END",
     );
     let e = &p.entities[0];
-    assert!(e.reads.contains(&"dbo.Source".to_string()), "reads: {:?}", e.reads);
-    assert!(e.writes.contains(&"dbo.Target".to_string()), "writes: {:?}", e.writes);
-    assert!(e.writes.contains(&"dbo.Audit".to_string()), "writes: {:?}", e.writes);
-    assert!(!e.reads.contains(&"dbo.Target".to_string()), "a write is not a read");
+    assert!(
+        e.reads().any(|r| r.name == "dbo.Source"),
+        "reads: {:?}",
+        e.reads().collect::<Vec<_>>()
+    );
+    assert!(
+        e.writes().any(|r| r.name == "dbo.Target"),
+        "writes: {:?}",
+        e.writes().collect::<Vec<_>>()
+    );
+    assert!(
+        e.writes().any(|r| r.name == "dbo.Audit"),
+        "writes: {:?}",
+        e.writes().collect::<Vec<_>>()
+    );
+    assert!(!e.reads().any(|r| r.name == "dbo.Target"), "a write is not a read");
 }
 
 #[test]
 fn a_join_is_a_read_and_a_foreign_key_names_its_target() {
     let p = read("CREATE VIEW dbo.V AS SELECT * FROM dbo.A JOIN dbo.B ON A.id = B.id");
-    let reads = &p.entities[0].reads;
-    assert!(reads.contains(&"dbo.A".to_string()), "{reads:?}");
-    assert!(reads.contains(&"dbo.B".to_string()), "{reads:?}");
+    let reads: Vec<&str> = p.entities[0].reads().map(|r| r.name.as_str()).collect();
+    assert!(reads.contains(&"dbo.A"), "{reads:?}");
+    assert!(reads.contains(&"dbo.B"), "{reads:?}");
 
     let p = read("CREATE TABLE dbo.Orders (UserId int REFERENCES dbo.Users(Id))");
     assert!(
-        p.entities[0].refers.contains(&"dbo.Users".to_string()),
+        p.entities[0].refers_to("dbo.Users"),
         "an FK must be an edge: {:?}",
-        p.entities[0].refers
+        p.entities[0].refers().collect::<Vec<_>>()
     );
 }
 
@@ -177,15 +189,15 @@ fn a_qualified_call_is_an_edge_and_a_bare_one_is_a_builtin() {
     );
     let e = &p.entities[0];
     assert!(
-        e.refers.contains(&"dbo.fnCalc".to_string()),
+        e.refers_to("dbo.fnCalc"),
         "the qualified call is an edge: {:?}",
-        e.refers
+        e.refers().collect::<Vec<_>>()
     );
     for builtin in ["GETDATE", "ISNULL"] {
         assert!(
-            !e.refers.iter().any(|r| r.contains(builtin)),
+            !e.refers().collect::<Vec<_>>().iter().any(|r| r.contains(builtin)),
             "a bare call is a built-in, not an edge: {:?}",
-            e.refers
+            e.refers().collect::<Vec<_>>()
         );
     }
 }
@@ -203,8 +215,15 @@ fn a_reference_belongs_to_the_procedure_it_is_inside() {
     );
     let first = p.entities.iter().find(|e| e.name == "dbo.First").unwrap();
     let second = p.entities.iter().find(|e| e.name == "dbo.Second").unwrap();
-    assert_eq!(first.reads, vec!["dbo.A"], "First must not see B's table");
-    assert_eq!(second.reads, vec!["dbo.B"]);
+    assert_eq!(
+        first.reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["dbo.A"],
+        "First must not see B's table"
+    );
+    assert_eq!(
+        second.reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["dbo.B"]
+    );
 }
 
 /// A temp table is not an object anything else can reference.
@@ -213,11 +232,11 @@ fn a_temp_table_is_not_a_reference() {
     let p = read("CREATE PROCEDURE dbo.sp_X AS INSERT INTO #staging SELECT * FROM dbo.Real");
     let e = &p.entities[0];
     assert!(
-        !e.writes.iter().any(|w| w.contains("staging")),
+        !e.writes().any(|r| r.name.contains("staging")),
         "a #temp must not become a table: {:?}",
-        e.writes
+        e.writes().collect::<Vec<_>>()
     );
-    assert!(e.reads.contains(&"dbo.Real".to_string()));
+    assert!(e.reads().any(|r| r.name == "dbo.Real"));
 }
 
 // ── The catalog level ───────────────────────────────────────────────────────
@@ -229,7 +248,7 @@ fn a_temp_table_is_not_a_reference() {
 fn a_three_part_name_keeps_its_database() {
     let p = read("CREATE PROCEDURE dbo.sp_X AS SELECT * FROM OtherDb.dbo.Users");
     assert_eq!(
-        p.entities[0].reads,
+        p.entities[0].reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
         vec!["OtherDb.dbo.Users"],
         "the database must survive into the edge"
     );

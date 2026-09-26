@@ -124,9 +124,9 @@ fn discovers_and_emits_materialized_view_from_fixture() {
     // Its SELECT source is a real fixture entity, so dependency resolution is
     // realistic (the matview reads from the config.genders view).
     assert!(
-        mv.refers.iter().any(|r| r == "config.genders"),
+        mv.refers_to("config.genders"),
         "matview should depend on its source view, got: {:?}",
-        mv.refers
+        mv.refers().collect::<Vec<_>>()
     );
 
     // Emits a CREATE MATERIALIZED VIEW statement carrying its unique index.
@@ -243,7 +243,7 @@ fn fk_references_extracted() {
     let d = design();
     let lookup_values = d.entities().iter().find(|e| e.name == "config.lookup_values").unwrap();
     assert!(
-        !lookup_values.refers.is_empty(),
+        !lookup_values.refers().next().is_none(),
         "lookup_values should reference other tables via FK"
     );
 }
@@ -276,8 +276,8 @@ fn procedure_reads_writes_extracted() {
         .filter(|e| e.entity_type == EntityType::Procedure)
         .collect();
     if !procs.is_empty() {
-        let has_reads = procs.iter().any(|p| !p.reads.is_empty());
-        let has_writes = procs.iter().any(|p| !p.writes.is_empty());
+        let has_reads = procs.iter().any(|p| !p.reads().next().is_none());
+        let has_writes = procs.iter().any(|p| !p.writes().next().is_none());
         assert!(
             has_reads || has_writes,
             "At least one procedure should have reads or writes"

@@ -8,7 +8,7 @@
 //! Collecting calls from a PL/pgSQL body would put phantom edges in the apply
 //! graph; omitting them from a `LANGUAGE sql` body would drop real ones.
 
-use crate::entity::{Entity, REF_TYPE_FUNCTION, Reference};
+use crate::entity::{Entity, Ref, RefKind};
 use crate::error::Result;
 
 use super::common;
@@ -75,35 +75,29 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
 /// Fill the entity's reference fields.
 ///
 /// Mirrors `parser::apply_proc_refs`: reads and writes become hard references,
-/// called functions become soft ones tagged [`REF_TYPE_FUNCTION`], which
+/// called functions become soft ones ([`RefKind::Calls`]), which
 /// `references::resolve_references` keeps only when they name a known entity.
 fn finish(mut entity: Entity, reads: Sourced, writes: Sourced, functions: Sourced) -> Entity {
-    let mut references: Vec<Reference> = reads
-        .iter()
-        .chain(writes.iter())
-        .map(|(name, schema_source)| Reference {
-            name: name.clone(),
-            ref_type: None,
-            schema_source: *schema_source,
-        })
-        .collect();
-    for (name, schema_source) in functions {
-        if references.iter().any(|r| r.name == name) {
-            continue;
+    let rows = [
+        (reads, RefKind::Reads),
+        (writes, RefKind::Writes),
+        (functions, RefKind::Calls),
+    ];
+    for (names, kind) in rows {
+        for (name, schema_source) in names {
+            // A call to something already read or written is that relation, not
+            // a second soft edge to a routine of the same name.
+            if kind == RefKind::Calls && entity.refers_to(&name) {
+                continue;
+            }
+            entity.push_ref(Ref {
+                name,
+                kind,
+                schema_source,
+                unresolved: false,
+            });
         }
-        references.push(Reference {
-            name,
-            ref_type: Some(REF_TYPE_FUNCTION.to_string()),
-            schema_source,
-        });
     }
-    entity.refers = references.iter().map(|r| r.name.clone()).collect();
-    entity.references = references;
-    // `reads`/`writes` stay bare strings. A caller that needs to know whether a
-    // schema was guessed reads `references`, which carries it per name; see
-    // `SchemaSource`.
-    entity.reads = reads.into_iter().map(|(n, _)| n).collect();
-    entity.writes = writes.into_iter().map(|(n, _)| n).collect();
     entity
 }
 
@@ -163,7 +157,7 @@ fn routine_body(parsed: &pg_query::ParseResult) -> Option<Routine> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{EntityType, REF_TYPE_FUNCTION};
+    use crate::entity::EntityType;
 
     fn parse(sql: &str) -> Entity {
         parse_proc(Entity::new(EntityType::Function, "app.f"), sql).unwrap()
@@ -175,7 +169,12 @@ mod tests {
             "set search_path to app;\n\
              create function f() returns int language sql as $$ select count(*) from t $$;",
         );
-        assert_eq!(e.reads, vec!["app.t".to_string()], "got {:?}", e.reads);
+        assert_eq!(
+            e.reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["app.t"],
+            "got {:?}",
+            e.reads().collect::<Vec<_>>()
+        );
         assert!(e.errors.is_empty(), "got {:?}", e.errors);
     }
 
@@ -185,7 +184,12 @@ mod tests {
             "set search_path to app;\n\
              create function f() returns void language sql as $$ insert into t(a) values (1) $$;",
         );
-        assert_eq!(e.writes, vec!["app.t".to_string()], "got {:?}", e.writes);
+        assert_eq!(
+            e.writes().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["app.t"],
+            "got {:?}",
+            e.writes().collect::<Vec<_>>()
+        );
     }
 
     /// Postgres validates a `LANGUAGE sql` body at creation, so a function it
@@ -197,11 +201,11 @@ mod tests {
              create function f() returns int language sql as $$ select app.myfn(1) $$;",
         );
         let myfn = e
-            .references
+            .refs
             .iter()
             .find(|r| r.name == "app.myfn")
             .expect("called function missing");
-        assert_eq!(myfn.ref_type.as_deref(), Some(REF_TYPE_FUNCTION));
+        assert_eq!(myfn.kind, crate::entity::RefKind::Calls);
     }
 
     #[test]
@@ -210,7 +214,12 @@ mod tests {
             "set search_path to app;\n\
              create function f() returns void language plpgsql as $$ begin insert into t(a) values (1); end $$;",
         );
-        assert_eq!(e.writes, vec!["app.t".to_string()], "got {:?}", e.writes);
+        assert_eq!(
+            e.writes().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["app.t"],
+            "got {:?}",
+            e.writes().collect::<Vec<_>>()
+        );
     }
 
     /// A PL/pgSQL body resolves names at run time, so its calls are NOT
@@ -223,9 +232,9 @@ mod tests {
              create function f() returns int language plpgsql as $$ begin return app.myfn(1); end $$;",
         );
         assert!(
-            !e.refers.iter().any(|r| r == "app.myfn"),
+            !e.refers_to("app.myfn"),
             "plpgsql calls must not become dependencies, got {:?}",
-            e.refers
+            e.refers().collect::<Vec<_>>()
         );
     }
 
@@ -235,7 +244,12 @@ mod tests {
             "set search_path to app;\n\
              create function f() returns int as $$ select count(*) from t $$ language sql;",
         );
-        assert_eq!(e.reads, vec!["app.t".to_string()], "got {:?}", e.reads);
+        assert_eq!(
+            e.reads().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["app.t"],
+            "got {:?}",
+            e.reads().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -246,7 +260,12 @@ mod tests {
              create procedure p() language plpgsql as $$ begin insert into t(a) values (1); end $$;",
         )
         .unwrap();
-        assert_eq!(e.writes, vec!["app.t".to_string()], "got {:?}", e.writes);
+        assert_eq!(
+            e.writes().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["app.t"],
+            "got {:?}",
+            e.writes().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -299,7 +318,7 @@ mod tests {
              create function f() returns int language sql as $$ this is not valid sql at all $$;",
         );
         assert!(e.errors.is_empty(), "got {:?}", e.errors);
-        assert!(e.reads.is_empty(), "got {:?}", e.reads);
-        assert!(e.writes.is_empty(), "got {:?}", e.writes);
+        assert!(e.reads().next().is_none(), "got {:?}", e.reads().collect::<Vec<_>>());
+        assert!(e.writes().next().is_none(), "got {:?}", e.writes().collect::<Vec<_>>());
     }
 }

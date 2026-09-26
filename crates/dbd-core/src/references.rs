@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::entity::{Entity, ForeignKey, REF_TYPE_FUNCTION, SchemaSource, TableConstraint};
+use crate::entity::{Entity, ForeignKey, Ref, SchemaSource, TableConstraint};
 
 /// Match parsed references against known entities and external entities.
 ///
@@ -64,22 +64,14 @@ fn resolve_entity_references(
     };
 
     let catalog = entity.catalog.clone();
-    resolve_entity_refers(
-        entity,
-        &default_schema,
-        &search_path,
-        catalog.as_deref(),
-        known,
-        known_catalogs,
-        ignore,
-    );
+    resolve_entity_refers(entity, &search_path, catalog.as_deref(), known, known_catalogs, ignore);
     resolve_entity_fks(entity, &default_schema, &search_path, known);
 }
 
 /// (1) String references → `refers` (FK targets, view/proc deps). Recovers
 /// bare-qualified schemas along the search_path; warns on the unresolvable.
 ///
-/// Function references (tagged [`REF_TYPE_FUNCTION`]) are the exception: they
+/// Function references ([`RefKind::Calls`]) are the exception: they
 /// resolve or vanish, silently. A view body's `now()` / `sum()` / `coalesce()`
 /// calls are collected the same way a call to a project-managed function is,
 /// and only this resolution step can tell them apart — so an unresolved one is
@@ -87,63 +79,72 @@ fn resolve_entity_references(
 #[allow(clippy::too_many_arguments)]
 fn resolve_entity_refers(
     entity: &mut Entity,
-    default_schema: &str,
     search_path: &[String],
     catalog: Option<&str>,
     known: &HashSet<String>,
     known_catalogs: &HashSet<String>,
     ignore: &[String],
 ) {
-    let soft: HashSet<&str> = entity
-        .references
-        .iter()
-        .filter(|r| r.ref_type.as_deref() == Some(REF_TYPE_FUNCTION))
-        .map(|r| r.name.as_str())
-        .collect();
+    let mut resolved: Vec<Ref> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
 
-    let mut resolved_refers = Vec::new();
-    let mut unresolved = Vec::new();
-    for ref_name in &entity.refers {
-        if is_ignored(ref_name, ignore) {
+    for mut r in std::mem::take(&mut entity.refs) {
+        if is_ignored(&r.name, ignore) {
             continue;
         }
         // A reference that NAMES a catalog is taken at its word — that is the
         // whole point of writing one. It must not fall through to the bare
         // forms below, or a cross-database edge would quietly resolve to the
         // local table of the same name.
-        if let Some(named) = names_a_catalog(ref_name, known_catalogs) {
-            if known.contains(named) {
-                resolved_refers.push(named.to_string());
-            } else {
-                unresolved.push(ref_name.clone());
+        if let Some(named) = names_a_catalog(&r.name, known_catalogs) {
+            if !known.contains(named) {
+                unresolved.push(r.name.clone());
+                r.unresolved = true;
             }
+            resolved.push(r);
             continue;
         }
         // A reference naming no catalog means the one it was written in. Try
         // that first, then a catalog-less entity — a scan can hold a
         // catalogued T-SQL tree beside a catalog-less PostgreSQL project.
         if let Some(catalog) = catalog {
-            let local = format!("{catalog}.{ref_name}");
+            let local = format!("{catalog}.{}", r.name);
             if known.contains(&local) {
-                resolved_refers.push(local);
+                r.name = local;
+                resolved.push(r);
                 continue;
             }
         }
-        if known.contains(ref_name) {
-            resolved_refers.push(ref_name.clone());
+        if known.contains(&r.name) {
+            // Resolves as written. A schema dbd guessed has now been checked
+            // against every entity in the scan and held.
+            if r.schema_source.is_guess() {
+                r.schema_source = SchemaSource::Resolved;
+            }
+            resolved.push(r);
             continue;
         }
-        if let Some((schema, table)) = ref_name.split_once('.')
-            && let Some(sch) = recover_bare_target_by_proxy(schema, table, default_schema, search_path, known)
+        // Re-point a guessed schema along the search path. Asks the reference's
+        // own provenance rather than the value-based proxy the `refers` strings
+        // used to force, so a schema the SOURCE wrote is never moved.
+        if let Some((_, table)) = r.name.split_once('.')
+            && let Some(sch) = recover_bare_target(r.schema_source, table, search_path, known)
         {
-            resolved_refers.push(format!("{sch}.{table}"));
+            r.name = format!("{sch}.{table}");
+            r.schema_source = SchemaSource::Resolved;
+            resolved.push(r);
             continue;
         }
-        if !soft.contains(ref_name.as_str()) {
-            unresolved.push(ref_name.clone());
+        // A call that resolves to nothing is a built-in, not a broken edge —
+        // see `RefKind::Calls`.
+        if !r.kind.is_soft() {
+            unresolved.push(r.name.clone());
         }
+        r.unresolved = true;
+        resolved.push(r);
     }
-    entity.refers = resolved_refers;
+
+    entity.refs = resolved;
     for ref_name in unresolved {
         entity.warnings.push(format!("Unresolved reference: {ref_name}"));
     }
@@ -189,8 +190,6 @@ fn names_a_catalog<'a>(ref_name: &'a str, known_catalogs: &HashSet<String>) -> O
 /// another schema holding the same table name. The provenance is now recorded
 /// at the one site that invents a schema, so this asks the fact instead.
 ///
-/// `default_schema` is still taken, for the caller that has no provenance to
-/// offer — see [`recover_bare_target_by_proxy`].
 fn recover_bare_target(
     source: SchemaSource,
     table: &str,
@@ -204,24 +203,6 @@ fn recover_bare_target(
         .iter()
         .find(|s| known.contains(&format!("{s}.{table}")))
         .cloned()
-}
-
-/// [`recover_bare_target`] for a caller working from a bare `refers` string,
-/// which carries no provenance — the old value-based test, kept for that path
-/// alone and named so it is not mistaken for the real question.
-fn recover_bare_target_by_proxy(
-    schema: &str,
-    table: &str,
-    default_schema: &str,
-    search_path: &[String],
-    known: &HashSet<String>,
-) -> Option<String> {
-    let looks_inferred = if schema == default_schema {
-        SchemaSource::Inferred
-    } else {
-        SchemaSource::Stated
-    };
-    recover_bare_target(looks_inferred, table, search_path, known)
 }
 
 /// Re-point a bare-qualified FK at the schema that actually holds its target,
@@ -265,14 +246,32 @@ mod tests {
     use super::*;
     use crate::entity::EntityType;
 
+    /// Mark an entity's references as the parser's own guess.
+    ///
+    /// The distinction the resolver now acts on: it re-points a schema dbd
+    /// supplied and leaves one the source wrote. A fixture that wants the
+    /// re-pointing behaviour has to say so.
+    fn bare(mut e: Entity) -> Entity {
+        for r in &mut e.refs {
+            r.schema_source = SchemaSource::Inferred;
+        }
+        e
+    }
+
     fn entity(name: &str, refers: &[&str]) -> Entity {
         let mut e = Entity::new(EntityType::Table, name);
-        e.refers = refers.iter().map(|s| s.to_string()).collect();
+        e.refs = refers
+            .iter()
+            .map(|s| crate::entity::Ref::stated(*s, crate::entity::RefKind::Reads))
+            .collect();
         e
     }
 
     /// Like `entity`, but with an explicit `SET search_path` (first entry is the
     /// schema the parser uses to qualify bare references).
+    /// An entity whose file stated a `search_path`. Its references are
+    /// `Stated` — what a source that WROTE the qualification produces. Use
+    /// [`bare`] for the parser-qualified shape the resolver may re-point.
     fn entity_sp(name: &str, refers: &[&str], search_paths: &[&str]) -> Entity {
         let mut e = entity(name, refers);
         e.schema_path = crate::entity::SchemaPath::from_file(
@@ -292,7 +291,7 @@ mod tests {
         ];
         resolve_references(&mut entities, &[], &[]);
 
-        assert_eq!(entities[1].refers, vec!["config.lookups"]);
+        assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["config.lookups"]);
         assert!(entities[1].warnings.is_empty());
     }
 
@@ -301,7 +300,7 @@ mod tests {
         let mut entities = vec![entity("config.orders", &["config.nonexistent"])];
         resolve_references(&mut entities, &[], &[]);
 
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert_eq!(entities[0].warnings.len(), 1);
         assert!(entities[0].warnings[0].contains("Unresolved"));
     }
@@ -312,7 +311,7 @@ mod tests {
         let externals = vec!["auth.users".to_string()];
         resolve_references(&mut entities, &externals, &[]);
 
-        assert_eq!(entities[0].refers, vec!["auth.users"]);
+        assert_eq!(entities[0].refers().collect::<Vec<_>>(), vec!["auth.users"]);
         assert!(entities[0].warnings.is_empty());
     }
 
@@ -322,7 +321,7 @@ mod tests {
         let ignore = vec!["bfs".to_string()];
         resolve_references(&mut entities, &[], &ignore);
 
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert!(entities[0].warnings.is_empty()); // Ignored, not warned
     }
 
@@ -332,7 +331,7 @@ mod tests {
         let ignore = vec!["my_company.*".to_string()];
         resolve_references(&mut entities, &[], &ignore);
 
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert!(entities[0].warnings.is_empty());
     }
 
@@ -344,7 +343,7 @@ mod tests {
         resolve_references(&mut entities, &[], &ignore);
 
         // "my_company" is not in known entities and not matched by wildcard
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert_eq!(entities[0].warnings.len(), 1); // Unresolved, not ignored
     }
 
@@ -354,7 +353,7 @@ mod tests {
         let ignore = vec!["bfs".to_string()];
         resolve_references(&mut entities, &[], &ignore);
 
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert!(entities[0].warnings.is_empty());
     }
 
@@ -366,11 +365,15 @@ mod tests {
         // stay in `refers` so scope-gap analysis sees the cross-scope edge.
         let mut entities = vec![
             entity("sensei.namespaces", &[]),
-            entity_sp("dojo.shared_rules", &["dojo.namespaces"], &["dojo", "sensei"]),
+            bare(entity_sp(
+                "dojo.shared_rules",
+                &["dojo.namespaces"],
+                &["dojo", "sensei"],
+            )),
         ];
         resolve_references(&mut entities, &[], &[]);
 
-        assert_eq!(entities[1].refers, vec!["sensei.namespaces"]);
+        assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["sensei.namespaces"]);
         assert!(
             entities[1].warnings.is_empty(),
             "should not warn once resolved: {:?}",
@@ -384,11 +387,11 @@ mod tests {
         // `app`-scoped table resolves against `public` when nothing local matches.
         let mut entities = vec![
             entity("public.helper", &[]),
-            entity_sp("app.widget", &["app.helper"], &["app"]),
+            bare(entity_sp("app.widget", &["app.helper"], &["app"])),
         ];
         resolve_references(&mut entities, &[], &[]);
 
-        assert_eq!(entities[1].refers, vec!["public.helper"]);
+        assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["public.helper"]);
         assert!(entities[1].warnings.is_empty());
     }
 
@@ -399,7 +402,7 @@ mod tests {
         let mut entities = vec![entity_sp("dojo.rules", &["dojo.ghost"], &["dojo", "sensei"])];
         resolve_references(&mut entities, &[], &[]);
 
-        assert!(entities[0].refers.is_empty());
+        assert!(entities[0].refers().next().is_none());
         assert_eq!(entities[0].warnings.len(), 1);
         assert!(entities[0].warnings[0].contains("dojo.ghost"));
     }
@@ -437,7 +440,14 @@ mod tests {
             comment: None,
             inline_fk: Some(bare_fk("ns_inline")),
         };
-        let mut shared = entity_sp("dojo.shared_rules", &["dojo.namespaces"], &["dojo", "sensei"]);
+        // Bare in the source, so the parser supplied `dojo.` — the shape the
+        // resolver may re-point. The FK structs below say the same via
+        // `ref_schema_source`.
+        let mut shared = bare(entity_sp(
+            "dojo.shared_rules",
+            &["dojo.namespaces"],
+            &["dojo", "sensei"],
+        ));
         shared.table_def = Some(TableDef {
             columns: vec![col],
             constraints: vec![TableConstraint::ForeignKey(bare_fk("ns_constraint"))],
@@ -449,7 +459,7 @@ mod tests {
         resolve_references(&mut entities, &[], &[]);
 
         // refers AND both FK structs (inline + constraint) now point at sensei.
-        assert_eq!(entities[1].refers, vec!["sensei.namespaces"]);
+        assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["sensei.namespaces"]);
         let td = entities[1].table_def.as_ref().unwrap();
         assert_eq!(
             td.columns[0].inline_fk.as_ref().unwrap().ref_schema.as_deref(),
@@ -508,7 +518,7 @@ mod tests {
         ];
         resolve_references(&mut entities, &[], &[]);
 
-        assert!(entities[1].refers.is_empty());
+        assert!(entities[1].refers().next().is_none());
         assert_eq!(entities[1].warnings.len(), 1);
         assert!(entities[1].warnings[0].contains("other.namespaces"));
     }
@@ -522,7 +532,7 @@ mod tests {
         let ignore = vec!["bfs".to_string()];
         resolve_references(&mut entities, &[], &ignore);
 
-        assert_eq!(entities[1].refers, vec!["config.lookups"]);
+        assert_eq!(entities[1].refers().collect::<Vec<_>>(), vec!["config.lookups"]);
         assert_eq!(entities[1].warnings.len(), 1);
         assert!(entities[1].warnings[0].contains("config.missing"));
     }

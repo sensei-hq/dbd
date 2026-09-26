@@ -9,6 +9,57 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Changed
+
+- **One list of references, replacing four parallel fields** ([#22] follow-up).
+  `Entity::refs: Vec<Ref>` supersedes `refers`, `references`, `reads` and
+  `writes`, with `Ref { name, kind, schema_source, unresolved }`.
+
+  The four held overlapping views of the same facts and none held all of them.
+  `refers` was every name in `references`, rebuilt by hand at each producer.
+  `references` knew provenance but not direction — `ref_type` was `None` for
+  reads *and* writes, `Some("function")` for calls, and `Some("table")` at two
+  sites nothing ever read. `reads`/`writes` knew direction but not provenance.
+  So "which of my reads has a guessed schema?" needed a join on a key that was
+  not unique: a routine both reading and writing one table produced
+  `refers: ["app.audit", "app.audit"]` and two identical `references` rows.
+
+  `RefKind::{Reads, Writes, Calls, Member}` replaces the stringly `ref_type`,
+  and `REF_TYPE_FUNCTION` is gone with it. Role membership is its own kind
+  rather than a read, so a caller walking data flow does not find roles in it.
+
+  `reads()`, `writes()`, `calls()`, `refs_of(kind)` and `refers()` are views
+  over the list. **`refers()` omits unresolved references and the others do
+  not**, which reproduces exactly what the old pair did: `refers` held only
+  what resolved, so the topological sort never waited on something absent,
+  while `reads`/`writes` kept the file's own account, which is what the import
+  plan matches a staging table against. That disagreement used to be
+  accidental; it is now one field (`Ref::unresolved`) and documented.
+
+- **`Entity::body` — the DDL body is no longer a "write"**. `writes` meant two
+  unrelated things depending on who filled it: the parser put table names
+  there, the introspector put the entity's own DDL body there (a view's
+  `SELECT`, a sequence's `CREATE`, one string per routine overload), and
+  `emit_view`/`emit_sequence`/`emit_routine` read `writes[0]` back out as that
+  body.
+
+  No live path mixed them — `emit_entity` is reached only from `reverse`
+  (introspected entities) and `matview_create_sql` (matviews, whose parser
+  deliberately followed the introspector's convention) — so this was a trap
+  rather than a bug. The collapse above could not happen until it was
+  untangled.
+
+- **The resolver asks provenance, not a proxy, for `refers` too.**
+  `recover_bare_target_by_proxy` is gone. Every reference now carries its own
+  `schema_source`, so the value-based guess ("the schema equals
+  `default_schema`, so the parser must have supplied it") is no longer needed
+  anywhere — closing the last of the gap #22 opened.
+
+**Breaking:** any code reading `entity.refers`, `entity.references`,
+`entity.reads` or `entity.writes`. `entity.refers` → `entity.refers()`;
+`entity.reads` → `entity.reads().map(|r| &r.name)`; a view or routine body is
+`entity.body`.
+
 ## [0.18.0] — 2026-09-25
 
 An unqualified name in a SQL file means nothing without knowing where it

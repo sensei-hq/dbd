@@ -9,7 +9,7 @@
 //! identifier immediately. Postgres parses them as different statement types, so
 //! that exclusion is structural here: only `GrantRoleStmt` is a membership.
 
-use crate::entity::{Entity, Reference, SchemaSource};
+use crate::entity::{Entity, Ref, RefKind, SchemaSource};
 use crate::error::Result;
 
 /// Parse a role DDL file, recording its memberships as references.
@@ -41,17 +41,19 @@ pub(in crate::parser) fn parse_role(mut entity: Entity, sql: &str) -> Result<Ent
         }
     }
 
-    entity.references = names
-        .iter()
-        .map(|name| Reference {
-            name: name.clone(),
-            // A membership is a hard dependency, unlike a body's function calls.
-            ref_type: None,
-            // A role name is not schema-qualified, so there is no guess in it.
+    // A membership is a hard dependency, unlike a body's function calls — and
+    // its own kind, so a caller walking data flow through `reads()` does not
+    // find roles in it. A role name is not schema-qualified, so nothing is
+    // guessed.
+    entity.refs = names
+        .into_iter()
+        .map(|name| Ref {
+            name,
+            kind: RefKind::Member,
             schema_source: SchemaSource::Stated,
+            unresolved: false,
         })
         .collect();
-    entity.refers = names;
     Ok(entity)
 }
 
@@ -71,14 +73,14 @@ mod tests {
         let e = parse(
             "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'app_ro') THEN\n    CREATE ROLE \"app_ro\";\n  END IF;\nEND $$;\nGRANT \"app_admin\" TO \"app_ro\";\n",
         );
-        assert_eq!(e.refers, vec!["app_admin".to_string()]);
+        assert_eq!(e.refers().collect::<Vec<_>>(), vec!["app_admin".to_string()]);
         assert!(e.errors.is_empty(), "got {:?}", e.errors);
     }
 
     #[test]
     fn bare_identifiers_are_handled() {
         let e = parse("grant parent to child;");
-        assert_eq!(e.refers, vec!["parent".to_string()]);
+        assert_eq!(e.refers().collect::<Vec<_>>(), vec!["parent".to_string()]);
     }
 
     /// An object grant is a different statement type in Postgres's grammar, so
@@ -87,25 +89,29 @@ mod tests {
     fn object_grants_are_not_memberships() {
         let e =
             parse("GRANT SELECT ON TABLE t TO app_ro;\nGRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA app TO app_ro;");
-        assert!(e.refers.is_empty(), "object grants leaked: {:?}", e.refers);
+        assert!(
+            e.refers().next().is_none(),
+            "object grants leaked: {:?}",
+            e.refers().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn multiple_memberships_are_all_captured() {
         let e = parse("grant a to c;\ngrant b to c;");
-        assert_eq!(e.refers, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(e.refers().collect::<Vec<_>>(), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn duplicate_grants_are_deduplicated() {
         let e = parse("grant a to c;\ngrant a to c;");
-        assert_eq!(e.refers, vec!["a".to_string()]);
+        assert_eq!(e.refers().collect::<Vec<_>>(), vec!["a".to_string()]);
     }
 
     #[test]
     fn with_admin_option_is_still_a_membership() {
         let e = parse("grant a to c with admin option;");
-        assert_eq!(e.refers, vec!["a".to_string()]);
+        assert_eq!(e.refers().collect::<Vec<_>>(), vec!["a".to_string()]);
     }
 
     /// A membership is a hard reference — the resolver must not treat it as a
@@ -113,7 +119,7 @@ mod tests {
     #[test]
     fn memberships_are_hard_references() {
         let e = parse("grant a to c;");
-        assert_eq!(e.references[0].ref_type, None);
+        assert_eq!(e.refs[0].kind, crate::entity::RefKind::Member);
     }
 
     /// Role is the one native type whose search path stays empty: a role name
@@ -129,7 +135,11 @@ mod tests {
     #[test]
     fn role_names_are_not_schema_qualified() {
         let e = parse("grant a to c;");
-        assert_eq!(e.refers, vec!["a".to_string()], "must not become public.a");
+        assert_eq!(
+            e.refers().collect::<Vec<_>>(),
+            vec!["a".to_string()],
+            "must not become public.a"
+        );
     }
 
     #[test]
@@ -137,7 +147,7 @@ mod tests {
         let e = parse(
             "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'solo') THEN\n    CREATE ROLE \"solo\";\n  END IF;\nEND $$;\n",
         );
-        assert!(e.refers.is_empty());
+        assert!(e.refers().next().is_none());
         assert!(
             e.errors.is_empty(),
             "a role with no grants is valid, got {:?}",

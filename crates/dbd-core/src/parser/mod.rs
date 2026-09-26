@@ -203,10 +203,7 @@ pub fn parse_entity_with_search_path(
             let (declared, _, _) = tsql::read(rules, sql);
             if let Some(found) = declared.into_iter().next() {
                 entity.entity_type = found.entity_type;
-                entity.refers = found.refers;
-                entity.references = found.references;
-                entity.reads = found.reads;
-                entity.writes = found.writes;
+                entity.refs = found.refs;
             }
             Ok(entity)
         }
@@ -507,7 +504,7 @@ mod tests {
     #[test]
     fn extracts_table_with_fk_references() {
         let entity = parse_fixture("table/config/lookup_values.ddl");
-        let refers: Vec<&str> = entity.refers.iter().map(|s| s.as_str()).collect();
+        let refers: Vec<&str> = entity.refers().collect();
         // Should reference lookups and categories via FK
         assert!(refers.contains(&"config.lookups") || refers.contains(&"lookups"));
     }
@@ -518,7 +515,7 @@ mod tests {
         assert_eq!(entity.entity_type, EntityType::View);
         assert_eq!(entity.name, "config.genders");
         // View references tables it SELECTs from
-        assert!(!entity.references.is_empty());
+        assert!(!entity.refs.is_empty());
     }
 
     #[test]
@@ -534,11 +531,11 @@ mod tests {
     fn extracts_procedure_reads_writes() {
         let entity = parse_fixture("procedure/staging/import_lookups.ddl");
         assert_eq!(entity.entity_type, EntityType::Procedure);
-        assert!(!entity.reads.is_empty());
-        assert!(!entity.writes.is_empty());
+        assert!(!entity.reads().next().is_none());
+        assert!(!entity.writes().next().is_none());
         // Reads from staging.lookups, writes to config.lookups
-        assert!(entity.reads.iter().any(|r| r.contains("staging.lookups")));
-        assert!(entity.writes.iter().any(|w| w.contains("config.lookups")));
+        assert!(entity.reads().any(|r| r.name.contains("staging.lookups")));
+        assert!(entity.writes().any(|r| r.name.contains("config.lookups")));
     }
 
     #[test]
@@ -565,9 +562,9 @@ mod tests {
         .unwrap();
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
         assert!(
-            entity.reads.contains(&"app.t".to_string()),
+            entity.reads().any(|r| r.name == "app.t"),
             "a parsed function must resolve its read against the file's search_path, got {:?}",
-            entity.reads
+            entity.reads().collect::<Vec<_>>()
         );
     }
 
@@ -620,9 +617,9 @@ mod tests {
         .unwrap();
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
         assert!(
-            entity.refers.contains(&"app.t".to_string()),
+            entity.refers_to("app.t"),
             "a recovered view must keep its dependency edge, got {:?}",
-            entity.refers
+            entity.refers().collect::<Vec<_>>()
         );
     }
 
@@ -640,9 +637,9 @@ mod tests {
         .unwrap();
         assert_eq!(entity.schema_path.schemas().collect::<Vec<_>>(), vec!["app"]);
         assert!(
-            entity.reads.contains(&"app.t".to_string()),
+            entity.reads().any(|r| r.name == "app.t"),
             "read must qualify against the file's search_path, not `public`: {:?}",
-            entity.reads
+            entity.reads().collect::<Vec<_>>()
         );
     }
 
@@ -736,7 +733,10 @@ mod tests {
 
         // Build a role entity with two parent memberships.
         let mut role = crate::entity::Entity::new(EntityType::Role, "app_ro");
-        role.refers = vec!["app_admin".to_string(), "other_parent".to_string()];
+        role.refs = ["app_admin", "other_parent"]
+            .into_iter()
+            .map(|n| crate::entity::Ref::stated(n, crate::entity::RefKind::Member))
+            .collect();
 
         // Emit DDL via the existing Role arm of ddl_from_entity.
         let emitted = ddl_from_entity(&role).expect("ddl_from_entity must return Some for Role");
@@ -761,16 +761,21 @@ mod tests {
 
         // Both parent roles must survive the round-trip.
         assert!(
-            parsed.refers.contains(&"app_admin".to_string()),
+            parsed.refers_to("app_admin"),
             "app_admin missing from parsed refers: {:?}",
-            parsed.refers
+            parsed.refers().collect::<Vec<_>>()
         );
         assert!(
-            parsed.refers.contains(&"other_parent".to_string()),
+            parsed.refers_to("other_parent"),
             "other_parent missing from parsed refers: {:?}",
-            parsed.refers
+            parsed.refers().collect::<Vec<_>>()
         );
-        assert_eq!(parsed.refers.len(), 2, "unexpected extra refers: {:?}", parsed.refers);
+        assert_eq!(
+            parsed.refers().count(),
+            2,
+            "unexpected extra refers: {:?}",
+            parsed.refers().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -783,9 +788,9 @@ mod tests {
 
         let parsed = parse_entity(Path::new("ddl/role/basic.ddl"), &emitted).unwrap();
         assert!(
-            parsed.refers.is_empty(),
+            parsed.refers().next().is_none(),
             "role with no grants should have empty refers, got {:?}",
-            parsed.refers
+            parsed.refers().collect::<Vec<_>>()
         );
     }
 
@@ -795,9 +800,9 @@ mod tests {
         let sql = "DO $$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'child') THEN\n    CREATE ROLE \"child\";\n  END IF;\nEND $$;\nGRANT parent TO child;\n";
         let parsed = parse_entity(Path::new("ddl/role/child.ddl"), sql).unwrap();
         assert!(
-            parsed.refers.contains(&"parent".to_string()),
+            parsed.refers_to("parent"),
             "bare-identifier grant not parsed; refers: {:?}",
-            parsed.refers
+            parsed.refers().collect::<Vec<_>>()
         );
     }
 
@@ -812,8 +817,8 @@ mod tests {
         assert_eq!(entity.entity_type, EntityType::MaterializedView);
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
 
-        // Body captured the same way a view's body is (verbatim in writes[0]).
-        let body = entity.writes.first().expect("matview body should be captured");
+        // Body captured the same way a view's body is (verbatim in body[0]).
+        let body = entity.body.first().expect("matview body should be captured");
         assert!(
             body.to_lowercase().contains("from shop.orders"),
             "body missing source table: {body}"
@@ -842,9 +847,9 @@ mod tests {
 
         assert!(entity.errors.is_empty(), "unexpected parse errors: {:?}", entity.errors);
         assert!(
-            entity.refers.contains(&"shop.orders".to_string()),
+            entity.refers_to("shop.orders"),
             "the matview must keep its dependency edge, got {:?}",
-            entity.refers
+            entity.refers().collect::<Vec<_>>()
         );
     }
 
