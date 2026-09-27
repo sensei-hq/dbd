@@ -35,6 +35,8 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
         return Ok(entity);
     };
 
+    entity.comment = common::entity_comment(&parsed);
+
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     let (reads, writes, functions) = match routine.language.as_str() {

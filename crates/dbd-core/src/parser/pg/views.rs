@@ -38,6 +38,7 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
     if let Some(body) = view_body(sql, &parsed) {
         entity.body = vec![body];
     }
+    entity.comment = common::entity_comment(&parsed);
 
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
