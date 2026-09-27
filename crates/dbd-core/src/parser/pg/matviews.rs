@@ -46,6 +46,8 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         entity.body = vec![body];
     }
 
+    entity.comment = common::entity_comment(&parsed);
+
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     // Trailing CREATE INDEX statements land in table_def.indexes, exactly like
@@ -184,6 +186,27 @@ mod tests {
 
     fn body(sql: &str) -> String {
         parse(sql).body.first().cloned().unwrap_or_default()
+    }
+
+    /// A matview's own comment has nowhere to live but [`Entity::comment`] —
+    /// the entity description table is built from comments, and this one was
+    /// parsed and dropped.
+    #[test]
+    fn a_matview_carries_its_own_comment() {
+        let e = parse(
+            "create materialized view m as select a from t;\n\
+             comment on materialized view m is 'Rolled up daily';",
+        );
+        assert_eq!(e.comment.as_deref(), Some("Rolled up daily"));
+    }
+
+    #[test]
+    fn a_matview_without_a_comment_has_none() {
+        assert!(
+            parse("create materialized view m as select a from t;")
+                .comment
+                .is_none()
+        );
     }
 
     /// The whole point of this change: the author's SQL survives, rather than a

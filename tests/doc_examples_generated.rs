@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x46d8eaf7271a6a2b
+// docs-digest: 0x406085c41f9c0522
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -137,6 +137,7 @@ async fn doc_docs_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
         // e.refers, e.references             — typed edges (FK, view dep, function call)
         // e.reads, e.writes                  — separated, for functions and procedures
+        // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
 }
@@ -244,6 +245,33 @@ async fn doc_docs_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::Design;
+    use std::path::Path;
+
+    let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+    for t in design.unprotected_exposed_tables() {
+        println!("{t} is reachable from outside with no RLS policy");
+    }
+    Ok(())
+}
+
+// docs/skills/dbd/SKILL.md — block 6
+#[allow(unused, clippy::all)]
+async fn doc_docs_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::Design;
     use dbd_core::emit_dialect::emit_schema;
     use dbd_core::parser::Dialect;
     use std::path::Path;
@@ -257,9 +285,9 @@ async fn doc_docs_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/skills/dbd/SKILL.md — block 6
+// docs/skills/dbd/SKILL.md — block 7
 #[allow(unused, clippy::all)]
-async fn doc_docs_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
+async fn doc_docs_skills_dbd_skill_md_7() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -379,6 +407,7 @@ async fn doc_src_assets_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
         // e.refers, e.references             — typed edges (FK, view dep, function call)
         // e.reads, e.writes                  — separated, for functions and procedures
+        // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
 }
@@ -486,6 +515,33 @@ async fn doc_src_assets_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     use dbd_core::Design;
+    use std::path::Path;
+
+    let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+    for t in design.unprotected_exposed_tables() {
+        println!("{t} is reachable from outside with no RLS policy");
+    }
+    Ok(())
+}
+
+// src/assets/skills/dbd/SKILL.md — block 6
+#[allow(unused, clippy::all)]
+async fn doc_src_assets_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::Design;
     use dbd_core::emit_dialect::emit_schema;
     use dbd_core::parser::Dialect;
     use std::path::Path;
@@ -499,9 +555,9 @@ async fn doc_src_assets_skills_dbd_skill_md_5() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// src/assets/skills/dbd/SKILL.md — block 6
+// src/assets/skills/dbd/SKILL.md — block 7
 #[allow(unused, clippy::all)]
-async fn doc_src_assets_skills_dbd_skill_md_6() -> dbd_core::Result<()> {
+async fn doc_src_assets_skills_dbd_skill_md_7() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]

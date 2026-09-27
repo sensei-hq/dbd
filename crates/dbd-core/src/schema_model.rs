@@ -11,10 +11,81 @@ use crate::scope::ResolvedScope;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaModel {
+    /// Wire-format version. `2` added [`Self::entities`], [`Self::deps`], and
+    /// `fk`/`uq` on [`Column`].
+    ///
+    /// This type is read by dbd's own viewer, by a shared component package,
+    /// and by external consumers, so it is a cross-repo contract rather than
+    /// an internal shape. Without a version each extension is a guess for
+    /// everyone downstream.
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub project: ProjectInfo,
     pub schemas: Vec<SchemaInfo>,
+    /// Tables only — unchanged from v1, deliberately. Every other kind is in
+    /// [`Self::entities`], so a consumer reading this as "the tables" stays
+    /// correct.
     pub tables: Vec<TableNode>,
+    /// Foreign keys only — unchanged from v1. The dependency graph is
+    /// [`Self::deps`]; an ER renderer wants these and a call-graph renderer
+    /// wants those.
     pub refs: Vec<Ref>,
+    /// Views, materialized views, functions and procedures (v2).
+    ///
+    /// Separate from [`Self::tables`] rather than folded in under `kind`,
+    /// because folding would silently change what every existing consumer of
+    /// `tables` receives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EntityNode>,
+    /// What reads, writes or calls what (v2) — projected from
+    /// [`crate::entity::Entity::refs`], which is already resolved and
+    /// deduplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<DepEdge>,
+}
+
+fn default_version() -> u32 {
+    2
+}
+
+/// A non-table entity: a view, materialized view, function or procedure.
+///
+/// No columns. A parsed routine has none, and a view's are not read — what it
+/// has is a body and the things it depends on, which are in
+/// [`SchemaModel::deps`].
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct EntityNode {
+    pub schema: String,
+    pub name: String,
+    /// `view` | `materialized_view` | `function` | `procedure`
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
+    pub note_md: Option<String>,
+}
+
+/// One dependency edge: a view reading a table, a routine calling a routine.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct DepEdge {
+    pub from: NodeRef,
+    pub to: NodeRef,
+    /// `reads` | `writes` | `calls` | `member`
+    pub kind: String,
+    /// The target did not resolve to anything in the project — a built-in, or
+    /// a genuine dangling reference. A renderer should dim rather than drop
+    /// it: the edge is real, the endpoint is not placeable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresolved: bool,
+}
+
+/// One end of a [`DepEdge`]: schema and name, no column.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeRef {
+    /// Schema name
+    pub s: String,
+    /// Entity name
+    pub n: String,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +146,15 @@ pub struct Column {
     pub en: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub def: Option<String>,
+    /// column is a foreign key (v2)
+    ///
+    /// Carried so a renderer can pick a glyph without scanning
+    /// [`SchemaModel::refs`] for the column.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fk: bool,
+    /// column is unique (v2) — inline `UNIQUE` or a single-column constraint
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uq: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -149,7 +229,41 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
 
     tables.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
 
+    // v2: everything that is not a table, and what depends on what.
+    let mut entities_out: Vec<EntityNode> = entities
+        .iter()
+        .filter_map(|e| {
+            node_kind(e.entity_type).map(|kind| EntityNode {
+                schema: e.schema.clone().unwrap_or_default(),
+                name: e.name.rsplit('.').next().unwrap_or(&e.name).to_string(),
+                kind: kind.to_string(),
+                note: note_first_line(e.comment.as_deref()),
+                note_md: e.comment.clone(),
+            })
+        })
+        .collect();
+    entities_out.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
+
+    let known: std::collections::HashSet<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    let mut deps: Vec<DepEdge> = Vec::new();
+    for e in &entities {
+        for r in &e.refs {
+            deps.push(DepEdge {
+                from: node_ref(&e.name, e.schema.as_deref()),
+                to: node_ref(&r.name, None),
+                kind: dep_kind(r.kind).to_string(),
+                // A call that resolved to nothing is a built-in, and a read
+                // that did is a genuine dangle. Either way the endpoint is
+                // not placeable, so say so rather than drop the edge.
+                unresolved: r.unresolved || !known.contains(r.name.as_str()),
+            });
+        }
+    }
+
     SchemaModel {
+        version: default_version(),
+        entities: entities_out,
+        deps,
         project: ProjectInfo {
             name: design.config().project.name.clone(),
             db: design.config().source.dialect.clone(),
@@ -180,6 +294,35 @@ fn build_table_node(
         .flatten()
         .collect();
 
+    // Foreign-key and unique columns, so a renderer never has to re-derive
+    // them from `refs` and the index list to choose a glyph.
+    let fk_cols: std::collections::HashSet<&str> = def
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::ForeignKey(fk) => Some(fk.columns.iter().map(|s| s.as_str())),
+            _ => None,
+        })
+        .flatten()
+        .chain(
+            def.columns
+                .iter()
+                .filter(|c| c.inline_fk.is_some())
+                .map(|c| c.name.as_str()),
+        )
+        .collect();
+    // Single-column UNIQUE only: a composite constraint is a property of the
+    // combination, and marking each member would claim something untrue.
+    let uq_cols: std::collections::HashSet<&str> = def
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Unique { columns, .. } if columns.len() == 1 => Some(columns[0].as_str()),
+            _ => None,
+        })
+        .chain(def.columns.iter().filter(|c| c.is_unique).map(|c| c.name.as_str()))
+        .collect();
+
     let columns = def
         .columns
         .iter()
@@ -190,6 +333,8 @@ fn build_table_node(
             nn: !c.nullable,
             en: enum_names.contains(&c.data_type),
             def: c.default_value.clone(),
+            fk: fk_cols.contains(c.name.as_str()),
+            uq: uq_cols.contains(c.name.as_str()),
             note: c.comment.clone().or_else(|| def.comments.columns.get(&c.name).cloned()),
         })
         .collect();
@@ -198,7 +343,7 @@ fn build_table_node(
         schema,
         name,
         kind: "table".into(),
-        note: note_first_line(def),
+        note: note_first_line(def.comments.table.as_deref()),
         note_md: def.comments.table.clone(),
         columns,
         indexes: collect_indexes(def),
@@ -245,16 +390,16 @@ fn collect_table_refs(
     refs
 }
 
-/// First non-empty first line of a table comment → the short `note` (or None).
-fn note_first_line(def: &crate::entity::TableDef) -> Option<String> {
-    def.comments.table.as_ref().and_then(|t| {
-        let first = t.lines().next().unwrap_or("").trim();
-        if first.is_empty() {
-            None
-        } else {
-            Some(first.to_string())
-        }
-    })
+/// First non-empty first line of a comment → the short `note` (or None).
+///
+/// Takes the text rather than a `TableDef`, because a view or routine's comment
+/// lives on [`crate::entity::Entity::comment`] and must render the same way: the
+/// entity description table draws `note` as the one-line summary and `noteMd` as
+/// the full prose, and a view whose summary was the whole essay would wreck the
+/// column it sits in.
+fn note_first_line(text: Option<&str>) -> Option<String> {
+    let first = text?.lines().next().unwrap_or("").trim();
+    (!first.is_empty()).then(|| first.to_string())
 }
 
 /// Table-level UNIQUE constraints + explicit indexes, formatted for the viewer's
@@ -312,6 +457,45 @@ fn fk_action_str(a: FkAction) -> String {
         FkAction::NoAction => "no_action",
     }
     .to_string()
+}
+
+/// The `kind` string for a non-table entity, or `None` for one that belongs
+/// elsewhere in the model (tables) or nowhere in it (schemas, roles).
+fn node_kind(t: EntityType) -> Option<&'static str> {
+    match t {
+        EntityType::View => Some("view"),
+        EntityType::MaterializedView => Some("materialized_view"),
+        EntityType::Function => Some("function"),
+        EntityType::Procedure => Some("procedure"),
+        EntityType::Trigger => Some("trigger"),
+        _ => None,
+    }
+}
+
+/// [`crate::entity::RefKind`] as the wire string.
+fn dep_kind(k: crate::entity::RefKind) -> &'static str {
+    use crate::entity::RefKind;
+    match k {
+        RefKind::Reads => "reads",
+        RefKind::Writes => "writes",
+        RefKind::Calls => "calls",
+        RefKind::Member => "member",
+    }
+}
+
+/// Split a possibly-qualified name into a [`NodeRef`], falling back to the
+/// entity's own schema when the reference carries none.
+fn node_ref(name: &str, fallback_schema: Option<&str>) -> NodeRef {
+    match name.rsplit_once('.') {
+        Some((s, n)) => NodeRef {
+            s: s.to_string(),
+            n: n.to_string(),
+        },
+        None => NodeRef {
+            s: fallback_schema.unwrap_or_default().to_string(),
+            n: name.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +563,9 @@ mod tests {
     #[test]
     fn serializes_to_dbd_schema_shape() {
         let model = SchemaModel {
+            version: 2,
+            entities: vec![],
+            deps: vec![],
             project: ProjectInfo {
                 name: "p".into(),
                 db: "postgresql".into(),
@@ -403,6 +590,8 @@ mod tests {
                     en: false,
                     def: Some("gen_random_uuid()".into()),
                     note: None,
+                    fk: false,
+                    uq: false,
                 }],
                 indexes: vec![],
             }],

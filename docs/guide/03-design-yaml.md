@@ -230,6 +230,42 @@ schemas:
 
 This emits `GRANT USAGE ON SCHEMA`, `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, overriding perms for roles present in both). Targets without a SQL grant model (SQLite, Convex) skip grant emission with a note rather than failing.
 
+#### `exposed`
+
+Whether something **outside** the database serves this schema — PostgREST on
+Supabase. A table in an exposed schema is reachable by `anon` over HTTP; a
+table anywhere else is not.
+
+```yaml
+schemas:
+  - app:
+      exposed: true
+  - internal          # private: the default
+```
+
+Internal unless declared, with one exception: on a `supabase` target `public`
+is exposed by default, mirroring Supabase itself. An explicit `exposed: false`
+overrides that — a bare schema name does not, because saying nothing is not
+the same as saying no. Nothing is exposed on a plain `postgres` target, where
+nothing serves HTTP.
+
+**What it buys you.** `dbd inspect` reports every table in an exposed schema
+with no RLS policy declared:
+
+```
+⚠ No RLS policy on 1 table(s) in exposed schema(s) app:
+  app.orders
+```
+
+Advisory only — it never changes the exit code, because dbd cannot know the
+author did not mean it. A policy is a file at `policies/<schema>/<table>.sql`;
+dbd checks that one exists rather than parsing it.
+
+This is a **different axis** from whether Supabase owns a schema. `extensions`
+is Supabase's and not exposed; your own `app` schema can be exposed without
+being Supabase's. Platform ownership decides what `reconcile --prune` may
+touch; exposure decides what the internet can read.
+
 ### `external`
 
 FK stubs for tables managed outside the project (e.g., Supabase `auth.users`):

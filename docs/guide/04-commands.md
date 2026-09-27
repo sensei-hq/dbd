@@ -315,7 +315,25 @@ dbd diagram --json -f schema.json  # write the raw SchemaModel JSON (upload it a
 dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 ```
 
-`dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model (schemas, tables, columns, FK refs); upload it on the site's `/diagram` page, or feed it to other tooling. The model is JSON (not DBML), so it extends to views/functions/procedures later.
+`dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model; upload it on the site's `/diagram` page, or feed it to other tooling.
+
+### The model JSON
+
+The model carries a `version` (currently `2`), and being JSON rather than DBML it covers more than tables:
+
+| Field | What it holds |
+| --- | --- |
+| `tables` | Tables, with columns (`pk`/`nn`/`en`/`fk`/`uq`, type, default, comment) and indexes |
+| `refs` | Foreign keys — the ER edges, column-level, as `{s,t,c}` |
+| `entities` | Views, materialized views, functions and procedures |
+| `deps` | What reads, writes or calls what — the call/reference graph |
+| `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
+
+`entities` and `deps` are separate from `tables` and `refs` on purpose: an ER renderer wants foreign keys, a call-graph renderer wants dependencies, and folding them into one array would change what every existing consumer of `tables` receives.
+
+A dependency edge whose target is not a project entity — a Postgres built-in like `now()`, or a genuine dangling reference — is marked `"unresolved": true` rather than dropped. The edge is real; only its endpoint cannot be placed on the diagram.
+
+Comments reach the model for **every** kind, not just tables: `note` is the first line (the one-line summary an entity table shows) and `noteMd` the full text.
 
 ---
 
@@ -825,7 +843,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.21.0
+  rev: v0.22.0
   hooks:
     - id: dbd-format
 ```

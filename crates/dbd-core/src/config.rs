@@ -255,7 +255,7 @@ pub struct GrantConfig {
 #[serde(untagged)]
 pub enum SchemaEntry {
     Name(String),
-    WithGrants(HashMap<String, SchemaGrantConfig>),
+    WithGrants(HashMap<String, SchemaOptions>),
 }
 
 impl SchemaEntry {
@@ -265,11 +265,30 @@ impl SchemaEntry {
             Self::WithGrants(map) => map.keys().next().cloned().unwrap_or_default(),
         }
     }
+
+    /// Whether the schema declared itself exposed, and `None` when it said
+    /// nothing — which is not the same as `Some(false)`. A bare name leaves
+    /// the platform default in force (PostgREST serves `public` on Supabase);
+    /// an explicit `exposed: false` overrides it.
+    pub fn exposed(&self) -> Option<bool> {
+        match self {
+            Self::Name(_) => None,
+            Self::WithGrants(map) => map.values().next().and_then(|o| o.exposed),
+        }
+    }
 }
 
+/// Per-schema settings under `schemas:`.
+///
+/// Named for grants when that was all it carried; it now also says whether the
+/// schema is reachable from outside the database.
 #[derive(Debug, Deserialize)]
-pub struct SchemaGrantConfig {
+pub struct SchemaOptions {
     pub grants: Option<HashMap<String, Vec<String>>>,
+    /// Whether something outside the database serves this schema — PostgREST
+    /// on Supabase. Drives the check for tables reachable by `anon` with no
+    /// RLS policy. Absent means "use the platform default".
+    pub exposed: Option<bool>,
 }
 
 // ── External ────────────────────────────────────────────

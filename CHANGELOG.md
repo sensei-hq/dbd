@@ -9,6 +9,141 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-09-27
+
+**The schema model became a model of the schema.** `dbd diagram --json` emitted
+tables and foreign keys and nothing else — `build` filtered
+`entity_type == Table` behind a doc comment calling itself "an extension point
+for view/function/procedure later". v2 adds views, materialized views,
+functions and procedures, plus the dependency graph an ER diagram cannot show:
+what reads, writes and calls what. It states its own `version` now, because it
+is read by dbd's viewer, by the package being extracted for sensei and Rokkit,
+and by anything pointed at the JSON.
+
+Found while building it: **`COMMENT ON` was captured for tables and nothing
+else.** A comment lives on `TableDef::comments`, a view or routine has no
+`TableDef`, so its comment parsed cleanly and was dropped — blanking every
+non-table row of the entity description table the diagram generates.
+
+Also in this release, both carved out of #7: a schema can declare itself
+**exposed** (PostgREST-served) so `dbd inspect` can report exposed tables with
+no RLS policy, and **`reconcile --prune` no longer drops what the platform
+owns** — the one operation that could destroy an object the project never
+declared, previously unprotected.
+
+**Breaking:** `config::SchemaGrantConfig` is renamed `SchemaOptions`.
+`SchemaModel` and `Column` gained fields, so struct literals in embedding code
+need updating; deserialization is unaffected (the new fields carry serde
+defaults).
+
+### Added
+
+- **Schema model v2 — views, routines, the dependency graph, and comments
+  everywhere** (#24). `dbd diagram --json` was tables and foreign keys, and
+  nothing else: `build` filtered `entity_type == Table`, and `TableNode.kind`
+  was hardcoded `"table"` behind a doc comment calling itself "an extension
+  point for view/function/procedure later". Anything rendering from that JSON
+  could draw an ER diagram and stop.
+
+  The model now states a `version` (`2`) and carries:
+
+  - `entities` — views, materialized views, functions and procedures;
+  - `deps` — what reads, writes or calls what, the call/reference graph the ER
+    diagram could never show;
+  - `fk`/`uq` on each column, so a renderer picks a glyph without re-scanning
+    `refs` and the index list to work out what the column is.
+
+  `tables` and `refs` keep their exact v1 shape and contents. Folding every
+  kind into one array under a `kind` discriminator would read tidier and would
+  silently change what every existing consumer of `tables` receives — at the
+  moment the viewer is being extracted into a package dbd, sensei and Rokkit
+  share. `version` is there so the next extension is not a guess downstream.
+
+  `deps` is a projection of `Entity::refs`, already resolved and deduplicated:
+  no second parse. An edge whose target is not a project entity — a built-in
+  like `now()`, or a genuine dangling reference — carries `"unresolved": true`
+  rather than being dropped. The edge is real; only the endpoint cannot be
+  placed, and dimming it beats pretending the call does not happen.
+
+- **`COMMENT ON` is captured for views, materialized views, functions and
+  procedures** (#24). A table's comments live on `TableDef::comments`. Nothing
+  else has a `TableDef`, so `COMMENT ON VIEW recent IS '…'` parsed cleanly
+  through libpg_query and was dropped on the floor — confirmed by probing all
+  three parsers, every one reporting `comment=None` on a file that plainly has
+  one.
+
+  Not cosmetic: the diagram's entity description table is built from comments,
+  so every non-table row in it came out blank. New `Entity::comment`, captured
+  by one shared helper and projected to `note` (first line) / `noteMd` (full)
+  exactly as a table's comment already is. Tables deliberately keep
+  `TableDef::comments` as their single source of truth rather than gaining a
+  second home for the same string.
+
+- **Exposed vs internal schemas** (#7). A schema can declare whether something
+  outside the database serves it — PostgREST on Supabase:
+
+  ```yaml
+  schemas:
+    - app:
+        exposed: true
+    - internal          # private: the default
+  ```
+
+  Internal unless declared, except `public` on a `supabase` target, mirroring
+  Supabase itself. An explicit `exposed: false` overrides that default; a bare
+  schema name does not, because saying nothing is not the same as saying no.
+  Nothing is exposed on a plain `postgres` target.
+
+  **What it buys:** `dbd inspect` now reports every table in an exposed schema
+  with no RLS policy declared — on Supabase, tables readable by `anon` over
+  HTTP. Advisory only, never changing the exit code, because dbd cannot know
+  the author did not mean it. A policy is a file at
+  `policies/<schema>/<table>.sql`; dbd checks one exists rather than parsing
+  it.
+
+  This is a **different axis** from the Supabase protected set, which is about
+  who *owns* a schema. `extensions` is Supabase's and not exposed; a project's
+  own schema can be exposed without being Supabase's. Ownership decides what
+  `reconcile --prune` may drop; exposure decides what the internet can read.
+  Conflating the two in one list is what left both questions unanswerable.
+
+  `Design::exposed_schemas()` and `Design::unprotected_exposed_tables()` are
+  public. `config::SchemaGrantConfig` is renamed `SchemaOptions` — it carries
+  more than grants now.
+
+### Fixed
+
+- **`reconcile --prune` no longer drops what the platform owns** (#7). Prune
+  is the only dbd operation that drops an object the design does **not**
+  declare — `reset` emits a `DROP` per *declared* entity, and its protection
+  covers the schema object alone. So prune is the only one that can destroy
+  something the project never knew about, and it had no protection at all.
+
+  On a Supabase target that bites: one project table declared in `auth` puts
+  the whole schema into `managed_schemas`, every table Supabase keeps there
+  reads as an orphan, and prune drops the lot. Recreating them loses the
+  policies and grants the environment runs on.
+
+  `SUPABASE_PROTECTED` could not express the fix, because it conflated two
+  properties. It is now two lists:
+
+  - `SUPABASE_INFRASTRUCTURE` — `auth`, `storage`, `vault` and the rest.
+    Supabase owns them and the project owns nothing in them, so prune never
+    touches their contents.
+  - `SUPABASE_PROTECTED` — the above **plus `public`**, protected from
+    `DROP SCHEMA` because recreating it loses grants, while its *contents*
+    stay the project's. `public` is still prunable, and reset still drops
+    entities in it.
+
+  The filter applies to the **drops**, not to `managed_schemas`. Narrowing the
+  managed set would also narrow the live snapshot, so a table the project
+  legitimately keeps in `auth` could be created and then never checked for
+  drift again — a blind spot traded for the fix. Filtering drops keeps every
+  declared object fully reconciled and removes only the dangerous operation.
+
+- **`Design::target_name()`** is public — which schemas belong to the platform
+  rather than the project depends on it.
+
 ## [0.21.0] — 2026-09-26
 
 **`dbd emit`** translates a PostgreSQL schema into MySQL, T-SQL or SQLite DDL.
@@ -1132,7 +1267,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.21.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.22.0...main
+[0.22.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.22.0
 [0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0

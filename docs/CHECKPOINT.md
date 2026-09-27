@@ -1,39 +1,46 @@
 # Checkpoint
 
-**Slice:** v0.19.0 shipped and verified. `develop` and `main` level.
+**Slice:** #24 schema model v2 — complete on `develop`, unreleased.
 
 ## Done
 
-- **v0.19.0 released** — both crates on crates.io, merged to `main`, CI +
-  CodeQL green. Minor, because it breaks `Entity`'s reference API.
-- **One list of references.** `Entity::refs: Vec<Ref>` replaces `refers`,
-  `references`, `reads`, `writes`. `Ref { name, kind, schema_source,
-  unresolved }` puts on one row what four fields held between them and none
-  held alone. `RefKind` retires the stringly `ref_type`; `REF_TYPE_FUNCTION`
-  and `recover_bare_target_by_proxy` are gone.
-- **`Entity::body`** — `writes` held table names from a parser and DDL body
-  text from the introspector. A trap, not a live bug, but it had to split.
-- **No meaning changed** — the 2,154-file corpus reports identically before
-  and after: 2,737 entities, 8,558/1,828/1,216 edges, 14,754 references.
-- **Verified from the registry** — a crate on `dbd-core = "0.19.0"` ran 12
-  repros green and confirmed `entity.refers`/`.reads` no longer compile.
+- **#24 schema model v2** (`316b06c` red, `d55e2b5` green, `e38d28e` docs).
+  `version: 2`; `entities` (views, matviews, functions, procedures); `deps`
+  (reads/writes/calls/member, projected from `Entity::refs`, `unresolved`
+  rather than dropped); `fk`/`uq` on `Column`. `tables`/`refs` keep their v1
+  shape so the viewer extraction is not invalidated.
+- **`COMMENT ON` for non-tables** (`389f36c` red, `d55e2b5` green). New
+  `Entity::comment` — a view/matview/routine has no `TableDef`, so its comment
+  was parsed and dropped, blanking every non-table row of the diagram's
+  entity description table.
+- **Docs on all four surfaces** — guide, both llms files, both SKILL.md
+  copies. Website is generated from `docs/` by `copy-content.mjs`; no agent
+  describes the model shape.
+- Earlier in `[Unreleased]`: #7 carve-outs — exposed/internal schemas, and
+  `reconcile --prune` no longer dropping platform-owned objects.
 
 ## Next
 
-    cargo test --workspace --all-features   # 1592 pass, clippy + fmt + doc clean
+    make minor      # breaking: config::SchemaGrantConfig → SchemaOptions
 
-Nothing queued. Open: #18 (reconcile), #11 (CLI coverage), #7 (tenancy).
+Workspace green (1023 dbd-core + CLI suites), clippy + fmt + doc-examples
+clean. Release checklist item 5 — install the artifact and re-run the repro —
+still to do after the bump.
 
-## Open question
+## Open questions
 
-Does sensei's 43,737 count occurrences or unique pairs? Until settled, a
-residual difference is not a defect.
+- Does sensei's 43,737 count occurrences or unique pairs? Until settled, a
+  residual difference is not a defect.
+- #7 (multi-tenant) stays open but is largely superseded by scopes; prune and
+  exposed schemas were carved out of it.
 
 ## Known-broken / carried forward
 
+- The viewer does not yet render `entities`/`deps` — that is rokkit#159,
+  running in a separate session.
+- `emit` covers tables and views only; routines are skipped and reported.
 - `CREATE ROLE … IN ROLE …` is not read as a membership; `GRANT … TO …` is.
-- `schema_model::Ref` (a DBML graph edge) shares a name with `entity::Ref`.
-  Different modules, type-checked, so not the silent-confusion shape.
-- `diff`/`reconcile`/snapshots refused on SQLite (verbatim, no structure).
-- `ARRAY[col]::t[]` where the column is already `t` reads as drift;
-  `generate_data_sql` warns "may truncate" on a widening cast.
+- `cmd_format --check` still calls `std::process::exit(1)`, so that path
+  cannot be tested in-process.
+- The commit gate tests the **worktree**, not the index — a staged-only
+  change is not what it verifies.
