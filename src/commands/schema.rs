@@ -90,6 +90,13 @@ pub async fn cmd_inspect(
     let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
     print_enum_hints(&enum_hints);
 
+    // Advisory only, and the one with teeth: a table in a schema something
+    // outside the database serves, with no RLS policy declared. On Supabase
+    // that is readable by `anon` over HTTP. Report-only like the enum hints —
+    // dbd cannot know the author did not mean it.
+    let exposed = design.unprotected_exposed_tables();
+    print_exposed_tables(&exposed, &design.exposed_schemas());
+
     // Summary last, so the counts are the final thing on screen. Printed before
     // the advisory section it would scroll away behind it, which is backwards:
     // the tally is what a reader is looking for.
@@ -107,6 +114,12 @@ pub async fn cmd_inspect(
     // separately rather than folded into the error count.
     if let Some(line) = enum_advisory_tally(&enum_hints) {
         output::always(&line);
+    }
+    if !exposed.is_empty() {
+        output::always(&format!(
+            "{} table(s) in an exposed schema have no RLS policy (advisory)",
+            exposed.len()
+        ));
     }
 
     // Report first, then fail. The findings above are the useful output; an
@@ -567,6 +580,27 @@ fn resolve_name_collisions(proposals: &mut [EnumProposal]) {
 
 /// Render the advisory enum-candidate section: one rationale, then the
 /// instances (pure, so it's unit-testable).
+/// Advisory block for tables reachable from outside with no RLS policy.
+///
+/// Silent when nothing is exposed — which is every plain `postgres` project,
+/// where no PostgREST serves anything and the check has nothing to say.
+fn print_exposed_tables(tables: &[String], exposed_schemas: &[String]) {
+    if tables.is_empty() {
+        return;
+    }
+    output::always("");
+    output::warn(&format!(
+        "No RLS policy on {} table(s) in exposed schema(s) {}:",
+        tables.len(),
+        exposed_schemas.join(", ")
+    ));
+    for t in tables {
+        output::always(&format!("  {t}"));
+    }
+    output::always("  A policy lives at policies/<schema>/<table>.sql. Declare `exposed: false`");
+    output::always("  on the schema if nothing outside the database serves it.");
+}
+
 fn render_enum_hints(hints: &[dbd_core::design::EnumHint]) -> Vec<String> {
     let proposals = group_enum_hints(hints);
     if proposals.is_empty() {

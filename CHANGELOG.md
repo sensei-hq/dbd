@@ -9,6 +9,40 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **Exposed vs internal schemas** (#7). A schema can declare whether something
+  outside the database serves it — PostgREST on Supabase:
+
+  ```yaml
+  schemas:
+    - app:
+        exposed: true
+    - internal          # private: the default
+  ```
+
+  Internal unless declared, except `public` on a `supabase` target, mirroring
+  Supabase itself. An explicit `exposed: false` overrides that default; a bare
+  schema name does not, because saying nothing is not the same as saying no.
+  Nothing is exposed on a plain `postgres` target.
+
+  **What it buys:** `dbd inspect` now reports every table in an exposed schema
+  with no RLS policy declared — on Supabase, tables readable by `anon` over
+  HTTP. Advisory only, never changing the exit code, because dbd cannot know
+  the author did not mean it. A policy is a file at
+  `policies/<schema>/<table>.sql`; dbd checks one exists rather than parsing
+  it.
+
+  This is a **different axis** from the Supabase protected set, which is about
+  who *owns* a schema. `extensions` is Supabase's and not exposed; a project's
+  own schema can be exposed without being Supabase's. Ownership decides what
+  `reconcile --prune` may drop; exposure decides what the internet can read.
+  Conflating the two in one list is what left both questions unanswerable.
+
+  `Design::exposed_schemas()` and `Design::unprotected_exposed_tables()` are
+  public. `config::SchemaGrantConfig` is renamed `SchemaOptions` — it carries
+  more than grants now.
+
 ### Fixed
 
 - **`reconcile --prune` no longer drops what the platform owns** (#7). Prune
