@@ -283,6 +283,7 @@ impl Design {
         let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
 
         let mut plan = plan_reconcile(&live, &desired);
+        self.drop_platform_owned_drops(&mut plan);
 
         // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
         // above, so converge them from the RAW snapshots — adding declared FKs
@@ -393,6 +394,26 @@ impl Design {
     /// "In sync" is the one answer that must never be wrong, so this refuses
     /// instead. Mirrors the batch-adapter guard directly above each call site:
     /// same failure (nothing to compare), same response.
+    /// Remove from a plan any drop targeting a schema the platform owns.
+    ///
+    /// Filters the **drops**, not `managed_schemas`. Narrowing the managed set
+    /// would also narrow the *live* snapshot, so a table the project
+    /// legitimately keeps in `auth` could be created but never checked for
+    /// drift again — a blind spot traded for the fix. Dropping the drops keeps
+    /// every declared object fully reconciled and removes only the one
+    /// operation that can destroy something undeclared.
+    ///
+    /// `public` is never filtered: protected from `DROP SCHEMA` on Supabase,
+    /// but its contents are the project's. See
+    /// [`crate::script::prune_is_forbidden_in`].
+    fn drop_platform_owned_drops(&self, plan: &mut crate::reconcile::ReconcilePlan) {
+        let target = self.target_name();
+        plan.dropped.retain(|stmt| {
+            let schema = stmt.entity_name.split_once('.').map(|(s, _)| s).unwrap_or("public");
+            !crate::script::prune_is_forbidden_in(schema, target)
+        });
+    }
+
     fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
         if !self.parser.produces_structure() {
             let dialect = &self.dialect;

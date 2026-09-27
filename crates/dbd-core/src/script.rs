@@ -4,6 +4,37 @@ use crate::entity::{Entity, EntityType};
 /// Supabase-managed schemas that must never be dropped — includes `public`, which
 /// Supabase exposes via PostgREST (on a plain `postgres` target `public` is an
 /// ordinary project schema and is droppable with `--schemas`).
+/// Supabase schemas the project owns **nothing** in.
+///
+/// Supabase creates and maintains these, and everything inside them is its —
+/// so `reconcile --prune` must never drop their contents, however they came to
+/// be in `managed_schemas`.
+///
+/// Deliberately **excludes `public`**: see [`SUPABASE_PROTECTED`].
+pub const SUPABASE_INFRASTRUCTURE: &[&str] = &[
+    "auth",
+    "storage",
+    "realtime",
+    "graphql_public",
+    "supabase_functions",
+    "pgbouncer",
+    "pgsodium",
+    "vault",
+    "extensions",
+    "supabase_migrations",
+];
+
+/// Schemas protected from `DROP SCHEMA` on a `supabase` target: the
+/// infrastructure set **plus `public`**.
+///
+/// `public` is the reason this is a second list rather than the same one.
+/// Dropping and recreating it loses the grants and policies PostgREST needs,
+/// so the *schema object* is protected — but its **contents are the
+/// project's**, which is why `reset` still drops entities in it and
+/// [`prune_is_forbidden_in`] still allows pruning it.
+///
+/// On a plain `postgres` target `public` is an ordinary project schema and is
+/// droppable with `--schemas`.
 pub const SUPABASE_PROTECTED: &[&str] = &[
     "public",
     "auth",
@@ -56,6 +87,27 @@ fn generate_role_script(entity: &Entity) -> String {
 /// Schemas never dropped by reset on any target: Postgres internals plus
 /// dbd's own bookkeeping schema (`dbd`).
 const ALWAYS_PROTECTED: &[&str] = &["pg_catalog", "information_schema", "pg_toast", "dbd"];
+
+/// Whether `reconcile --prune` must refuse to drop anything in `schema`.
+///
+/// Prune is the only dbd operation that drops an object the design does not
+/// declare, so it is the only one that can destroy something the project never
+/// knew about. `reset`, by contrast, emits a `DROP` per *declared* entity and
+/// needs no such guard.
+///
+/// Forbidden: the true system schemas and dbd's own bookkeeping on every
+/// target, plus Supabase's [infrastructure][SUPABASE_INFRASTRUCTURE] on a
+/// `supabase` target.
+///
+/// **`public` is allowed**, on both targets. It is protected from `DROP
+/// SCHEMA` on Supabase because recreating it loses grants, but the tables in
+/// it are the project's and pruning them is the point.
+pub fn prune_is_forbidden_in(schema: &str, target: &str) -> bool {
+    if ALWAYS_PROTECTED.contains(&schema) {
+        return true;
+    }
+    target == "supabase" && SUPABASE_INFRASTRUCTURE.contains(&schema)
+}
 
 /// Schema of an entity, defaulting to `public` when unqualified.
 fn entity_schema(entity: &Entity) -> &str {

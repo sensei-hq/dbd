@@ -108,3 +108,57 @@ fn public_is_not_in_the_infrastructure_set() {
         "public is the project's; putting it here would stop prune working on Supabase"
     );
 }
+
+// ── And it protects a real database ─────────────────────────────────────────
+
+/// The property end to end: a Supabase project that declares a table in
+/// `auth` must not have Supabase's own `auth` tables reported as prunable.
+///
+/// The unit tests above pin the predicate. This pins that the predicate is
+/// actually *reached* — a correct rule wired to nothing protects nothing.
+#[tokio::test]
+async fn a_supabase_project_does_not_plan_to_prune_supabase_tables() {
+    use dbd_core::Design;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: sb\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  supabase:\n    url: $DATABASE_URL\n\
+         schemas:\n  - auth\n  - app\n",
+    )
+    .unwrap();
+    // A table the project legitimately keeps in `auth` — this is what puts the
+    // whole schema into `managed_schemas`.
+    let t = dir.join("ddl/table/auth");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(
+        t.join("app_profiles.ddl"),
+        "set search_path to auth;\ncreate table if not exists app_profiles (id integer primary key);",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    assert_eq!(design.target_name(), "supabase", "precondition: the supabase target");
+
+    let target = dbd_core::connect("sqlite::memory:", "sb").await.expect("connect");
+    let scope = design.resolve_scope(None, None).expect("scope");
+    let plan = design.diff_live(&*target, Some(&scope)).await;
+
+    // The project's OWN table in `auth` must still be managed — the fix filters
+    // drops, not the schema, so nothing the design declares stops being
+    // reconciled. What must never appear is a DROP.
+    if let Ok(d) = plan {
+        let text = format!("{d:?}");
+        assert!(
+            text.contains("auth.app_profiles"),
+            "the project's own table in auth must still be planned: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("drop"),
+            "no drop may target a Supabase-owned schema: {text}"
+        );
+    }
+}

@@ -3650,3 +3650,98 @@ async fn reconcile_converges_defaults_the_server_rewrites() {
         "and the unchanged ones must stay quiet; got {sql:?}"
     );
 }
+
+/// `reconcile --prune` must not drop a table the platform owns (#7).
+///
+/// Prune is the only dbd operation that drops something the design does not
+/// declare. On a Supabase target, one project table declared in `auth` puts
+/// the whole schema into `managed_schemas` — and every table Supabase keeps
+/// there then reads as an orphan. Dropping them loses the policies and grants
+/// the environment runs on.
+///
+/// This needs a real database: the drop only appears in the plan when the live
+/// side actually holds an undeclared table in the protected schema, so a test
+/// against an empty target passes whether the filter is wired up or not. That
+/// is exactly what happened to the first version of this test.
+#[tokio::test]
+async fn reconcile_does_not_prune_a_platform_owned_table() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "prune_guard").await.unwrap();
+
+    // Stand in for what Supabase provisions: an `auth` schema with its own
+    // table that no dbd design declares.
+    adapter
+        .execute_script(
+            "CREATE SCHEMA IF NOT EXISTS auth; CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY);",
+        )
+        .await
+        .expect("seed the platform schema");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: prune_guard\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  supabase:\n    url: $DATABASE_URL\n\
+         schemas:\n  - auth\n",
+    )
+    .unwrap();
+    // The project's own table, inside the platform's schema — this is what
+    // pulls `auth` into the managed set.
+    std::fs::create_dir_all(dir.join("ddl/table/auth")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/auth/app_profiles.ddl"),
+        "set search_path to auth;\ncreate table if not exists app_profiles (id integer primary key);",
+    )
+    .unwrap();
+
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    assert_eq!(design.target_name(), "supabase");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    let plan = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("dry-run reconcile failed");
+
+    let dropped: Vec<&str> = plan.dropped.iter().map(|s| s.entity_name.as_str()).collect();
+    assert!(
+        !dropped.iter().any(|n| n.starts_with("auth.")),
+        "a Supabase-owned table was planned for pruning: {dropped:?}"
+    );
+
+    // And the guard must be narrow: an undeclared table in a schema the
+    // project DOES own is still prunable, or the fix has just disabled prune.
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app; CREATE TABLE IF NOT EXISTS app.orphan (id integer);")
+        .await
+        .expect("seed an ownable orphan");
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: prune_guard\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  supabase:\n    url: $DATABASE_URL\n\
+         schemas:\n  - auth\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/kept.ddl"),
+        "set search_path to app;\ncreate table if not exists kept (id integer primary key);",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("reload");
+    let plan = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("dry-run reconcile failed");
+    let dropped: Vec<&str> = plan.dropped.iter().map(|s| s.entity_name.as_str()).collect();
+    assert!(
+        dropped.iter().any(|n| n.starts_with("app.")),
+        "an orphan in the project's own schema must still be prunable: {dropped:?}"
+    );
+}
