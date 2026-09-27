@@ -74,6 +74,39 @@ pub(in crate::parser) fn resolve_schema_path(raw_sql: &str, seeded: &SchemaPath)
     seeded.clone()
 }
 
+/// The entity's own `COMMENT ON …`, for the kinds that are not tables.
+///
+/// A table's comments land in `TableDef::comments`; a view, materialized view
+/// or routine has no `TableDef`, so `COMMENT ON VIEW recent IS '…'` parsed
+/// cleanly and was dropped on the floor. The diagram's entity description
+/// table is built from comments, so every one of those rows came out blank.
+///
+/// `COMMENT ON COLUMN` is not read here: a view's columns are not modelled,
+/// and reading a column comment as the entity's would be worse than nothing.
+///
+/// The first comment wins. A file with two `COMMENT ON VIEW` for the same view
+/// is a file where the last one wins in Postgres, but it is also a file that
+/// should not exist; taking the first keeps this total and order-stable rather
+/// than encoding a rule nobody relies on.
+pub(super) fn entity_comment(parsed: &pg_query::ParseResult) -> Option<String> {
+    use pg_query::protobuf::ObjectType;
+
+    parsed.protobuf.stmts.iter().find_map(|stmt| {
+        let Some(pg_query::NodeEnum::CommentStmt(c)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            return None;
+        };
+        matches!(
+            c.objtype(),
+            ObjectType::ObjectView
+                | ObjectType::ObjectMatview
+                | ObjectType::ObjectFunction
+                | ObjectType::ObjectProcedure
+                | ObjectType::ObjectRoutine
+        )
+        .then(|| c.comment.clone())
+    })
+}
+
 pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> SchemaPath {
     let Ok(parsed) = pg_query::parse(raw_sql) else {
         return SchemaPath::postgres_default();

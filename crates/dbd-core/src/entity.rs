@@ -754,6 +754,19 @@ pub struct Entity {
     pub schema_path: SchemaPath,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    /// The entity's own `COMMENT ON …`, for the kinds that have nowhere else
+    /// to put one.
+    ///
+    /// A table's comment lives in [`TableDef::comments`], which only exists
+    /// when there is a `TableDef` — so a view, function or procedure had no
+    /// home for one and `COMMENT ON VIEW` was parsed and dropped. The entity
+    /// description table is built from comments, so those rows came out blank.
+    ///
+    /// Deliberately **not** used for tables: they keep `TableDef::comments`,
+    /// and duplicating a table comment into two fields is the kind of overload
+    /// that made `writes` mean two things.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     /// The entity's own DDL text, verbatim, for the types whose `CREATE` is
     /// reconstructed from a body rather than composed from a structured model:
     /// a view's or matview's `SELECT`, a sequence's whole `CREATE`, and one
@@ -858,6 +871,7 @@ impl Entity {
             schema_path: SchemaPath::default(),
             errors: Vec::new(),
             warnings: Vec::new(),
+            comment: None,
             body: Vec::new(),
             table_def: None,
             enum_values: Vec::new(),

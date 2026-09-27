@@ -35,6 +35,8 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
         return Ok(entity);
     };
 
+    entity.comment = common::entity_comment(&parsed);
+
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     let (reads, writes, functions) = match routine.language.as_str() {
@@ -161,6 +163,39 @@ mod tests {
 
     fn parse(sql: &str) -> Entity {
         parse_proc(Entity::new(EntityType::Function, "app.f"), sql).unwrap()
+    }
+
+    /// A routine has no `TableDef`, so `COMMENT ON FUNCTION` had nowhere to go
+    /// and was parsed and dropped.
+    #[test]
+    fn a_function_carries_its_own_comment() {
+        let e = parse(
+            "create function f() returns int language sql as $$ select 1 $$;\n\
+             comment on function f() is 'Always one';",
+        );
+        assert_eq!(e.comment.as_deref(), Some("Always one"));
+    }
+
+    /// `COMMENT ON PROCEDURE` is a distinct object type in the parse tree, so
+    /// matching only on `FUNCTION` would silently drop every procedure's.
+    #[test]
+    fn a_procedure_carries_its_own_comment() {
+        let e = parse_proc(
+            Entity::new(EntityType::Procedure, "app.p"),
+            "create procedure p() language sql as $$ select 1 $$;\n\
+             comment on procedure p() is 'Does the thing';",
+        )
+        .unwrap();
+        assert_eq!(e.comment.as_deref(), Some("Does the thing"));
+    }
+
+    #[test]
+    fn a_routine_without_a_comment_has_none() {
+        assert!(
+            parse("create function f() returns int language sql as $$ select 1 $$;")
+                .comment
+                .is_none()
+        );
     }
 
     #[test]

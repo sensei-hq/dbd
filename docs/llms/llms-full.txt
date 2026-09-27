@@ -775,6 +775,27 @@ dbd combine --scope hub --deps include  # self-contained closure
 
 `--scope`/`--deps` filter the combined SQL to the working set (filter-only, no gap gate). Roles are kept in every scope; extensions too, unless the scope sets an `extensions` allowlist (`[]` ⇒ none).
 
+### Exposed vs internal schemas
+
+```yaml
+schemas:
+  - app:
+      exposed: true     # PostgREST serves this
+  - internal            # private (the default)
+```
+
+A table in an exposed schema is reachable by `anon` over HTTP. Internal unless
+declared, except `public` on a `supabase` target. `exposed: false` overrides
+that default; a bare name does not.
+
+`dbd inspect` reports tables in exposed schemas with no RLS policy
+(`policies/<schema>/<table>.sql`). Advisory — never changes the exit code.
+
+A different axis from platform ownership: `extensions` is Supabase's and not
+exposed; your own schema can be exposed without being Supabase's. Ownership
+decides what `reconcile --prune` may drop; exposure decides what is readable
+from outside.
+
 ### dbd emit
 
 ```sh
@@ -837,7 +858,7 @@ dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 dbd diagram --json -f schema.json  # write the raw SchemaModel JSON for upload/tooling
 ```
 
-Opens the hosted interactive viewer at `https://dbd.sensei-hq.com/diagram` (sidebar schema→table nav, pan/zoom ER diagram, per-table detail panel). The dbd-native schema model (schemas/tables/columns/FK refs) is gzip-compressed into the URL fragment — client-side only, never sent to a server, so the link is private and self-contained. `--print-url` prints the link without opening a browser (useful on headless machines). `--site`/`$DBD_DIAGRAM_URL` overrides the base URL. `--json -f schema.json` writes the raw SchemaModel JSON (`project`/`schemas`/`tables`/`refs`, column-level FK refs as `{s,t,c}`; not DBML, so it extends to views/functions/procedures); upload it on the site's `/diagram` page or feed it to other tooling.
+Opens the hosted interactive viewer at `https://dbd.sensei-hq.com/diagram` (sidebar schema→table nav, pan/zoom ER diagram, per-table detail panel). The dbd-native schema model (schemas/tables/columns/FK refs) is gzip-compressed into the URL fragment — client-side only, never sent to a server, so the link is private and self-contained. `--print-url` prints the link without opening a browser (useful on headless machines). `--site`/`$DBD_DIAGRAM_URL` overrides the base URL. `--json -f schema.json` writes the raw SchemaModel JSON; upload it on the site's `/diagram` page or feed it to other tooling. The model carries `version` (currently `2`) and, being JSON rather than DBML, covers more than tables: `tables` (columns with `pk`/`nn`/`en`/`fk`/`uq`, type, default, comment, plus indexes), `refs` (foreign keys — the ER edges, column-level as `{s,t,c}`), `entities` (views, materialized views, functions, procedures), `deps` (what reads/writes/calls what — the call graph), and `schemas`/`project`. `entities`/`deps` are deliberately separate from `tables`/`refs`: an ER renderer wants FKs, a call-graph renderer wants dependencies, and folding them would change what every existing consumer of `tables` receives. A dep edge whose target is not a project entity (a built-in like `now()`, or a dangling reference) is marked `"unresolved": true` rather than dropped — the edge is real, only the endpoint is unplaceable. Comments reach the model for every kind, not just tables: `note` is the first line, `noteMd` the full text.
 
 ### dbd dbml
 
@@ -919,7 +940,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.21.0
+  rev: v0.22.0
   hooks:
     - id: dbd-format
 ```
