@@ -208,3 +208,55 @@ fn a_column_says_whether_it_is_a_foreign_key_or_unique() {
     assert!(!col("owner_id").uq);
     assert!(col("id").pk, "and pk still works");
 }
+
+// ── Comments on non-table entities ──────────────────────────────────────────
+
+/// The entity description table is built from comments, so a view or routine
+/// without one is a blank row.
+///
+/// Nothing captured these before: only tables have a comment home
+/// (`TableDef::comments`), and a view or routine has no `TableDef` at all, so
+/// `COMMENT ON VIEW` was parsed and dropped. `Entity::comment` is where an
+/// entity's own comment lives now.
+#[test]
+fn a_view_or_routine_carries_its_own_comment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let d = project(dir);
+    drop(d);
+
+    std::fs::write(
+        dir.join("ddl/view/app/recent.ddl"),
+        "set search_path to app;\n\
+         create or replace view recent as select id, code from orders;\n\
+         comment on view recent is 'Orders from the last 30 days';",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/function/app/total.ddl"),
+        "set search_path to app;\n\
+         create or replace function total() returns bigint language sql as $$\n\
+           select count(*) from orders;\n\
+         $$;\n\
+         comment on function total() is 'How many orders there are';",
+    )
+    .unwrap();
+
+    let m = build(
+        &Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load"),
+        None,
+    );
+    let note_of = |n: &str| m.entities.iter().find(|e| e.name == n).and_then(|e| e.note.clone());
+    assert_eq!(note_of("recent").as_deref(), Some("Orders from the last 30 days"));
+    assert_eq!(note_of("total").as_deref(), Some("How many orders there are"));
+}
+
+/// An entity with no comment says so, rather than carrying an empty string a
+/// renderer would draw as a blank cell it cannot distinguish from a space.
+#[test]
+fn an_entity_without_a_comment_has_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = model(tmp.path());
+    let recent = m.entities.iter().find(|e| e.name == "recent").expect("recent");
+    assert!(recent.note.is_none());
+}
