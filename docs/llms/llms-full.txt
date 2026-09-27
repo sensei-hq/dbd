@@ -775,6 +775,27 @@ dbd combine --scope hub --deps include  # self-contained closure
 
 `--scope`/`--deps` filter the combined SQL to the working set (filter-only, no gap gate). Roles are kept in every scope; extensions too, unless the scope sets an `extensions` allowlist (`[]` ⇒ none).
 
+### Exposed vs internal schemas
+
+```yaml
+schemas:
+  - app:
+      exposed: true     # PostgREST serves this
+  - internal            # private (the default)
+```
+
+A table in an exposed schema is reachable by `anon` over HTTP. Internal unless
+declared, except `public` on a `supabase` target. `exposed: false` overrides
+that default; a bare name does not.
+
+`dbd inspect` reports tables in exposed schemas with no RLS policy
+(`policies/<schema>/<table>.sql`). Advisory — never changes the exit code.
+
+A different axis from platform ownership: `extensions` is Supabase's and not
+exposed; your own schema can be exposed without being Supabase's. Ownership
+decides what `reconcile --prune` may drop; exposure decides what is readable
+from outside.
+
 ### dbd emit
 
 ```sh

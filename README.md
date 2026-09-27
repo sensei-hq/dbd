@@ -123,6 +123,12 @@ Where `apply` can write. See the table above for what dbd can *read*.
   formatter knows about SQLite `CREATE TRIGGER … BEGIN … END;` blocks and
   keeps them whole. Offline `inspect` classifies ~150 built-in functions /
   types plus the `sqlite_*` prefix as Internal without touching the DB.
+- **Exposed schemas.** `schemas: [{ app: { exposed: true } }]` marks a schema
+  as served from outside the database (PostgREST on Supabase). `dbd inspect`
+  then reports tables in it with no RLS policy. Internal by default, except
+  `public` on a `supabase` target. A different axis from the protected set
+  above: ownership decides what `reconcile --prune` may drop, exposure decides
+  what the internet can read.
 - **Convex** is a codegen target — `apply` writes `convex/schema.ts` from
   parsed `TableDef`s and tracks migrations in a sidecar `.dbd_state.json`.
   Names are flattened (`config.users` → `config_users`). SQL types map to

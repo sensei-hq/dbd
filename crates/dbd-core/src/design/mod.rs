@@ -486,6 +486,67 @@ impl Design {
         self.parser
     }
 
+    /// The schemas something outside the database serves.
+    ///
+    /// A table in one of these is reachable by `anon` over HTTP on Supabase;
+    /// a table in any other schema is not. Distinct from
+    /// [`crate::script::SUPABASE_INFRASTRUCTURE`], which is about who *owns* a
+    /// schema — `extensions` is the platform's and not exposed, and a
+    /// project's own `app` schema can be exposed without being the platform's.
+    ///
+    /// Internal unless declared, except that `public` is exposed by default on
+    /// a `supabase` target, mirroring what Supabase itself does. An explicit
+    /// `exposed: false` overrides that; a bare schema name does not, because
+    /// saying nothing is not the same as saying no.
+    pub fn exposed_schemas(&self) -> Vec<String> {
+        let supabase = self.target_name() == "supabase";
+        self.config
+            .schemas
+            .iter()
+            .filter(|e| match e.exposed() {
+                Some(declared) => declared,
+                None => supabase && e.name() == crate::reconcile::DEFAULT_SCHEMA,
+            })
+            .map(|e| e.name())
+            .collect()
+    }
+
+    /// Tables reachable from outside the database with no RLS policy declared.
+    ///
+    /// The point of knowing which schemas are exposed. A policy lives at
+    /// `policies/<schema>/<table>.sql`, so "declared" is a file that exists —
+    /// dbd does not parse the policy, only note that the author wrote one.
+    ///
+    /// Reports nothing when no schema is exposed, which includes every plain
+    /// `postgres` project: with nothing serving HTTP there is no exposure to
+    /// report, and a check that fires anyway is noise.
+    pub fn unprotected_exposed_tables(&self) -> Vec<String> {
+        let exposed = self.exposed_schemas();
+        if exposed.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Table)
+            .filter(|e| e.schema.as_ref().is_some_and(|s| exposed.contains(s)))
+            .filter(|e| !self.has_policy_file(e))
+            .map(|e| e.name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether `policies/<schema>/<table>.*` exists for this entity.
+    fn has_policy_file(&self, entity: &Entity) -> bool {
+        let Some(schema) = &entity.schema else { return false };
+        let bare = entity.name.rsplit('.').next().unwrap_or(&entity.name);
+        let dir = self.project_dir.join("policies").join(schema);
+        ["sql", "ddl"]
+            .iter()
+            .any(|ext| dir.join(format!("{bare}.{ext}")).is_file())
+    }
+
     /// The active target's name — the first key under `target:` in
     /// design.yaml, or `postgres` when none is declared.
     ///

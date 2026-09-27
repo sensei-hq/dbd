@@ -429,6 +429,28 @@ outside the declaration that made it.
 Worth having: over a 2,154-file T-SQL corpus this is 4,059 references, and **817
 of those files reported nothing at all before it existed**.
 
+### Exposed schemas and unprotected tables
+
+```rust
+use dbd_core::Design;
+use std::path::Path;
+
+let design = Design::from_config(Path::new("design.yaml"), "prod")?;
+for t in design.unprotected_exposed_tables() {
+    println!("{t} is reachable from outside with no RLS policy");
+}
+```
+
+`exposed_schemas()` is what something outside the database serves — PostgREST
+on Supabase. Internal unless `exposed: true`, except `public` on a `supabase`
+target. `unprotected_exposed_tables()` crosses that with
+`policies/<schema>/<table>.sql` to find tables readable by `anon` with no
+policy declared.
+
+Distinct from `script::SUPABASE_INFRASTRUCTURE`, which is about who *owns* a
+schema: ownership decides what `reconcile --prune` may drop, exposure decides
+what is readable from outside.
+
 ### Translating to another engine
 
 `dbd emit --dialect mysql|tsql|sqlite` rewrites a **PostgreSQL** project's
