@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xdf596009d9785783
+// docs-digest: 0x406085c41f9c0522
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -137,6 +137,7 @@ async fn doc_docs_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
         // e.refers, e.references             — typed edges (FK, view dep, function call)
         // e.reads, e.writes                  — separated, for functions and procedures
+        // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
 }
@@ -406,6 +407,7 @@ async fn doc_src_assets_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
         // e.refers, e.references             — typed edges (FK, view dep, function call)
         // e.reads, e.writes                  — separated, for functions and procedures
+        // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
 }
