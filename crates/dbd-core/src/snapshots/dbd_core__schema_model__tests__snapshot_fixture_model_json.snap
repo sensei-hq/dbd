@@ -1,9 +1,10 @@
 ---
 source: crates/dbd-core/src/schema_model.rs
-assertion_line: 328
+assertion_line: 514
 expression: json
 ---
 {
+  "version": 2,
   "project": {
     "name": "example",
     "db": "postgresql",
@@ -35,6 +36,7 @@ expression: json
         {
           "name": "lookup_id",
           "type": "uuid",
+          "fk": true,
           "note": "Identifier for the lookup category. References the lookups table to specify the category."
         },
         {
@@ -83,7 +85,8 @@ expression: json
         },
         {
           "name": "category_id",
-          "type": "uuid"
+          "type": "uuid",
+          "fk": true
         },
         {
           "name": "notes",
@@ -177,6 +180,224 @@ expression: json
         "t": "lookups",
         "c": "id"
       }
+    }
+  ],
+  "entities": [
+    {
+      "schema": "config",
+      "name": "genders",
+      "kind": "view"
+    },
+    {
+      "schema": "config",
+      "name": "genders_mv",
+      "kind": "materialized_view"
+    },
+    {
+      "schema": "staging",
+      "name": "import_lookup_values",
+      "kind": "procedure"
+    },
+    {
+      "schema": "staging",
+      "name": "import_lookups",
+      "kind": "procedure"
+    }
+  ],
+  "deps": [
+    {
+      "from": {
+        "s": "",
+        "n": "advanced"
+      },
+      "to": {
+        "s": "",
+        "n": "basic"
+      },
+      "kind": "member"
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "to": {
+        "s": "config",
+        "n": "uuid_generate_v4"
+      },
+      "kind": "calls",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "to": {
+        "s": "config",
+        "n": "now"
+      },
+      "kind": "calls",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "categories"
+      },
+      "kind": "reads",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "uuid_generate_v4"
+      },
+      "kind": "calls",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "now"
+      },
+      "kind": "calls",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "genders"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "genders"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "config",
+        "n": "genders_mv"
+      },
+      "to": {
+        "s": "config",
+        "n": "genders"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookup_values"
+      },
+      "to": {
+        "s": "staging",
+        "n": "lookup_values"
+      },
+      "kind": "reads",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookup_values"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookup_values"
+      },
+      "kind": "writes"
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookups"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "kind": "reads"
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookups"
+      },
+      "to": {
+        "s": "staging",
+        "n": "lookups"
+      },
+      "kind": "reads",
+      "unresolved": true
+    },
+    {
+      "from": {
+        "s": "staging",
+        "n": "import_lookups"
+      },
+      "to": {
+        "s": "config",
+        "n": "lookups"
+      },
+      "kind": "writes"
     }
   ]
 }

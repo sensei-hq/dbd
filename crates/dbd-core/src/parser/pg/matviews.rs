@@ -46,6 +46,8 @@ pub(crate) fn parse_matview(mut entity: Entity, sql: &str) -> Result<Entity> {
         entity.body = vec![body];
     }
 
+    entity.comment = common::entity_comment(&parsed);
+
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
 
     // Trailing CREATE INDEX statements land in table_def.indexes, exactly like
