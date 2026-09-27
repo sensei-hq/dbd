@@ -486,6 +486,21 @@ impl Design {
         self.parser
     }
 
+    /// The active target's name — the first key under `target:` in
+    /// design.yaml, or `postgres` when none is declared.
+    ///
+    /// It decides which schemas are the platform's rather than the project's:
+    /// on `supabase`, `auth` and friends are Supabase's and prune must not
+    /// touch them. Mirrors how `reset` already resolves its target.
+    pub fn target_name(&self) -> &str {
+        self.config
+            .target
+            .keys()
+            .next()
+            .map(String::as_str)
+            .unwrap_or("postgres")
+    }
+
     /// `source.dialect` as the project wrote it, for a message that has to
     /// name what the user set rather than the reader it selected.
     pub fn dialect(&self) -> &str {

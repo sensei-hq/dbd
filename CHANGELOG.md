@@ -9,6 +9,39 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **`reconcile --prune` no longer drops what the platform owns** (#7). Prune
+  is the only dbd operation that drops an object the design does **not**
+  declare — `reset` emits a `DROP` per *declared* entity, and its protection
+  covers the schema object alone. So prune is the only one that can destroy
+  something the project never knew about, and it had no protection at all.
+
+  On a Supabase target that bites: one project table declared in `auth` puts
+  the whole schema into `managed_schemas`, every table Supabase keeps there
+  reads as an orphan, and prune drops the lot. Recreating them loses the
+  policies and grants the environment runs on.
+
+  `SUPABASE_PROTECTED` could not express the fix, because it conflated two
+  properties. It is now two lists:
+
+  - `SUPABASE_INFRASTRUCTURE` — `auth`, `storage`, `vault` and the rest.
+    Supabase owns them and the project owns nothing in them, so prune never
+    touches their contents.
+  - `SUPABASE_PROTECTED` — the above **plus `public`**, protected from
+    `DROP SCHEMA` because recreating it loses grants, while its *contents*
+    stay the project's. `public` is still prunable, and reset still drops
+    entities in it.
+
+  The filter applies to the **drops**, not to `managed_schemas`. Narrowing the
+  managed set would also narrow the live snapshot, so a table the project
+  legitimately keeps in `auth` could be created and then never checked for
+  drift again — a blind spot traded for the fix. Filtering drops keeps every
+  declared object fully reconciled and removes only the dangerous operation.
+
+- **`Design::target_name()`** is public — which schemas belong to the platform
+  rather than the project depends on it.
+
 ## [0.21.0] — 2026-09-26
 
 **`dbd emit`** translates a PostgreSQL schema into MySQL, T-SQL or SQLite DDL.
