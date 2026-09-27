@@ -9,6 +9,33 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-09-27
+
+**The schema model became a model of the schema.** `dbd diagram --json` emitted
+tables and foreign keys and nothing else — `build` filtered
+`entity_type == Table` behind a doc comment calling itself "an extension point
+for view/function/procedure later". v2 adds views, materialized views,
+functions and procedures, plus the dependency graph an ER diagram cannot show:
+what reads, writes and calls what. It states its own `version` now, because it
+is read by dbd's viewer, by the package being extracted for sensei and Rokkit,
+and by anything pointed at the JSON.
+
+Found while building it: **`COMMENT ON` was captured for tables and nothing
+else.** A comment lives on `TableDef::comments`, a view or routine has no
+`TableDef`, so its comment parsed cleanly and was dropped — blanking every
+non-table row of the entity description table the diagram generates.
+
+Also in this release, both carved out of #7: a schema can declare itself
+**exposed** (PostgREST-served) so `dbd inspect` can report exposed tables with
+no RLS policy, and **`reconcile --prune` no longer drops what the platform
+owns** — the one operation that could destroy an object the project never
+declared, previously unprotected.
+
+**Breaking:** `config::SchemaGrantConfig` is renamed `SchemaOptions`.
+`SchemaModel` and `Column` gained fields, so struct literals in embedding code
+need updating; deserialization is unaffected (the new fields carry serde
+defaults).
+
 ### Added
 
 - **Schema model v2 — views, routines, the dependency graph, and comments
@@ -1240,7 +1267,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.21.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.22.0...main
+[0.22.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.22.0
 [0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
 [0.18.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.18.0
