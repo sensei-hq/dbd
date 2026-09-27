@@ -11,6 +11,47 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ### Added
 
+- **Schema model v2 — views, routines, the dependency graph, and comments
+  everywhere** (#24). `dbd diagram --json` was tables and foreign keys, and
+  nothing else: `build` filtered `entity_type == Table`, and `TableNode.kind`
+  was hardcoded `"table"` behind a doc comment calling itself "an extension
+  point for view/function/procedure later". Anything rendering from that JSON
+  could draw an ER diagram and stop.
+
+  The model now states a `version` (`2`) and carries:
+
+  - `entities` — views, materialized views, functions and procedures;
+  - `deps` — what reads, writes or calls what, the call/reference graph the ER
+    diagram could never show;
+  - `fk`/`uq` on each column, so a renderer picks a glyph without re-scanning
+    `refs` and the index list to work out what the column is.
+
+  `tables` and `refs` keep their exact v1 shape and contents. Folding every
+  kind into one array under a `kind` discriminator would read tidier and would
+  silently change what every existing consumer of `tables` receives — at the
+  moment the viewer is being extracted into a package dbd, sensei and Rokkit
+  share. `version` is there so the next extension is not a guess downstream.
+
+  `deps` is a projection of `Entity::refs`, already resolved and deduplicated:
+  no second parse. An edge whose target is not a project entity — a built-in
+  like `now()`, or a genuine dangling reference — carries `"unresolved": true`
+  rather than being dropped. The edge is real; only the endpoint cannot be
+  placed, and dimming it beats pretending the call does not happen.
+
+- **`COMMENT ON` is captured for views, materialized views, functions and
+  procedures** (#24). A table's comments live on `TableDef::comments`. Nothing
+  else has a `TableDef`, so `COMMENT ON VIEW recent IS '…'` parsed cleanly
+  through libpg_query and was dropped on the floor — confirmed by probing all
+  three parsers, every one reporting `comment=None` on a file that plainly has
+  one.
+
+  Not cosmetic: the diagram's entity description table is built from comments,
+  so every non-table row in it came out blank. New `Entity::comment`, captured
+  by one shared helper and projected to `note` (first line) / `noteMd` (full)
+  exactly as a table's comment already is. Tables deliberately keep
+  `TableDef::comments` as their single source of truth rather than gaining a
+  second home for the same string.
+
 - **Exposed vs internal schemas** (#7). A schema can declare whether something
   outside the database serves it — PostgREST on Supabase:
 

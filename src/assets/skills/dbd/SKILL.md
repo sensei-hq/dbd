@@ -301,6 +301,24 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 `DeployComplete` / `ImportComplete`, `DbdError` / `Result`. The free fn
 `dbd_core::design::apply_policies` remains available to apply policies alone.
 
+### The schema model as a wire format
+
+`dbd diagram --json` writes a `SchemaModel` — the same type `dbd_core::schema_model::build(&design, scope)` returns. It is read by dbd's own viewer, by the shared viewer package, and by external indexers, so it is a cross-repo contract rather than an internal shape, and it states its own `version` (currently `2`).
+
+| Field | What it holds |
+| --- | --- |
+| `tables` | Tables, with columns (`pk`/`nn`/`en`/`fk`/`uq`, type, default, comment) and indexes |
+| `refs` | Foreign keys — the ER edges, column-level, as `{s,t,c}` |
+| `entities` | Views, materialized views, functions and procedures (`schema`, `name`, `kind`, `note`, `noteMd`) |
+| `deps` | `{from, to, kind}` where `kind` is `reads` \| `writes` \| `calls` \| `member` — the call/reference graph |
+| `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
+
+`entities` and `deps` are separate arrays rather than folded into `tables`/`refs` under a `kind` discriminator. Folding reads tidier and would silently change what every existing consumer of `tables` receives; the version field is there so the next extension is not a guess downstream.
+
+`deps` is a projection of `Entity::refs`, already resolved and deduplicated — no second parse. An edge whose target is not a project entity (a Postgres built-in like `now()`, or a genuine dangling reference) carries `"unresolved": true` instead of being dropped: the edge is real, only the endpoint is unplaceable, so a renderer should dim it rather than pretend the call does not happen.
+
+Comments reach every kind. A table's live on `TableDef::comments`; a view, materialized view, function or procedure has no `TableDef`, so its own `COMMENT ON` lands on `Entity::comment`. Both project to `note` (first line — the one-line summary an entity table shows) and `noteMd` (the full text).
+
 ### Parsing SQL without a dbd project
 
 An embedder with its own scanner — a code indexer, say — wants entities and
@@ -312,6 +330,7 @@ for e in &parsed.entities {
     // e.entity_type / e.schema / e.name  — read off the CREATE statement
     // e.refers, e.references             — typed edges (FK, view dep, function call)
     // e.reads, e.writes                  — separated, for functions and procedures
+    // e.comment                          — its own COMMENT ON (non-tables)
 }
 ```
 
