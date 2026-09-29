@@ -1,4 +1,26 @@
-export type Column = { name: string; type: string; pk?: boolean; nn?: boolean; en?: boolean; def?: string; note?: string };
+/* The TypeScript mirror of `crates/dbd-core/src/schema_model.rs`.
+   ============================================================================
+   Hand-maintained, and deliberately so: the viewer that reads it moved to
+   `@rokkit/graph`, which does NOT import this type. Keeping the mirror here
+   means the package never becomes a third definition to keep in step.
+
+   v2 (2026-09-27) added `version`, `entities`, `deps`, and `fk`/`uq` on
+   `Column`. Everything v2 added is optional here, so a v1 payload — a share
+   link encoded before the upgrade — still validates and still renders. */
+
+export type Column = {
+  name: string;
+  type: string;
+  pk?: boolean;
+  nn?: boolean;
+  en?: boolean;
+  def?: string;
+  note?: string;
+  /** v2. Declared by dbd, which resolved the constraint against the whole database. */
+  fk?: boolean;
+  /** v2. Previously only derivable from `Index.unique`. */
+  uq?: boolean;
+};
 export type Index = { def: string; unique?: boolean; name?: string };
 export type Table = {
   schema: string;
@@ -11,11 +33,60 @@ export type Table = {
 };
 export type RefEnd = { s: string; t: string; c: string };
 export type Ref = { from: RefEnd; to: RefEnd; action?: string };
+
+/** v2. One end of a dependency: schema and name, no column. */
+export type NodeRef = { s: string; n: string };
+
+/**
+ * v2. A non-table entity: a view, materialized view, function, procedure or trigger.
+ *
+ * No columns — a parsed routine has none and a view's are not read. What it has is a body
+ * and the things it depends on, which are in `SchemaModel.deps`.
+ */
+export type EntityNode = {
+  schema: string;
+  name: string;
+  /** `view` | `materialized_view` | `function` | `procedure` | `trigger` */
+  kind: string;
+  note?: string;
+  noteMd?: string;
+};
+
+/** v2. One dependency edge: a view reading a table, a routine calling a routine. */
+export type DepEdge = {
+  from: NodeRef;
+  to: NodeRef;
+  /** `reads` | `writes` | `calls` | `member` */
+  kind: string;
+  /**
+   * The target did not resolve to anything in the project — a built-in, or a genuine
+   * dangling reference. A renderer should DIM rather than drop it: the edge is real, the
+   * endpoint is not placeable.
+   */
+  unresolved?: boolean;
+};
+
+/**
+ * A schema is two graphs, and this type keeps them apart on purpose.
+ *
+ * `tables` + `refs` is the ER diagram: entities and their foreign keys. `entities` + `deps`
+ * is the dependency graph: what reads, writes or calls what. An ER renderer wants the first
+ * pair and a call-graph renderer wants the second — see `toGraphInput` in
+ * `@rokkit/graph/schema`, which takes the scope as an argument.
+ */
 export type SchemaModel = {
+  /** v2 onward. Absent on a v1 payload. */
+  version?: number;
   project: { name: string; db: string; note?: string };
   schemas: { name: string; tables: number; enums: number }[];
+  /** Tables only. Every other kind is in `entities`. */
   tables: Table[];
+  /** Foreign keys only. The dependency graph is `deps`. */
   refs: Ref[];
+  /** v2. Views, materialized views, functions, procedures and triggers. */
+  entities?: EntityNode[];
+  /** v2. What reads, writes or calls what. */
+  deps?: DepEdge[];
 };
 
 export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
@@ -34,35 +105,13 @@ export function validateModel(value: unknown): ValidationResult {
     if (typeof tt.schema !== 'string' || typeof tt.name !== 'string' || !Array.isArray(tt.columns))
       return { ok: false, error: 'malformed table entry' };
   }
+  // v2 halves are optional, but a PRESENT one has to be the right shape — a payload carrying
+  // `entities: {}` would otherwise reach the renderer and fail there instead of here.
+  if (v.entities !== undefined && !Array.isArray(v.entities))
+    return { ok: false, error: 'entities must be an array' };
+  if (v.deps !== undefined && !Array.isArray(v.deps))
+    return { ok: false, error: 'deps must be an array' };
   return { ok: true, model: value as SchemaModel };
 }
 
 export const nodeId = (schema: string, name: string) => `${schema}.${name}`;
-
-export type LayoutColumn = Column & { fk: boolean };
-export type LayoutData = { tables: { schema: string; name: string; columns: LayoutColumn[] }[]; refs: Ref[] };
-
-/** Map a SchemaModel to the layout's input, deriving a per-column `fk` flag from refs. */
-export function toLayoutData(model: SchemaModel): LayoutData {
-  const fkCols = new Set<string>();
-  for (const r of model.refs) fkCols.add(`${r.from.s}.${r.from.t}.${r.from.c}`);
-  return {
-    tables: model.tables.map((t) => ({
-      schema: t.schema,
-      name: t.name,
-      columns: t.columns.map((c) => ({ ...c, fk: fkCols.has(`${t.schema}.${t.name}.${c.name}`) })),
-    })),
-    refs: model.refs,
-  };
-}
-
-/** Tables connected to `id` (schema.name) via any ref, either direction. */
-export function neighborsOf(model: SchemaModel, id: string): Set<string> {
-  const out = new Set<string>();
-  for (const r of model.refs) {
-    const f = nodeId(r.from.s, r.from.t), t = nodeId(r.to.s, r.to.t);
-    if (f === id) out.add(t);
-    if (t === id) out.add(f);
-  }
-  return out;
-}
