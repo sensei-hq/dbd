@@ -4,10 +4,14 @@ import Page from '../../routes/diagram/+page.svelte';
 import { encodeFragment } from './fragment';
 import type { SchemaModel } from './model';
 
+// `[data-graph-node]` is @rokkit/graph's node hook — it replaced dbd's `[data-card]` when the
+// viewer moved into the package. The assertion is unchanged in intent: the diagram rendered
+// a card per table.
+
 it('renders the bundled sample diagram by default (no payload)', async () => {
   const { container } = render(Page);
   await new Promise((r) => setTimeout(r, 0));
-  expect(container.querySelectorAll('[data-card]').length).toBeGreaterThanOrEqual(2);
+  expect(container.querySelectorAll('[data-graph-node]').length).toBeGreaterThanOrEqual(2);
 });
 
 it('renders a model decoded from the URL fragment', async () => {
@@ -24,6 +28,6 @@ it('renders a model decoded from the URL fragment', async () => {
   const { container } = render(Page);
   // `widgets` comes from the decoded fragment, not the sample → proves decode ran.
   await findAllByText(container, 'widgets');
-  expect(container.querySelectorAll('[data-card]').length).toBeGreaterThanOrEqual(2);
+  expect(container.querySelectorAll('[data-graph-node]').length).toBeGreaterThanOrEqual(2);
   window.location.hash = '';
 });
