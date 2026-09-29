@@ -51,6 +51,7 @@
 		"@rokkit/actions": "^1.4.1",
 		"@rokkit/app": "^1.4.1",
 		"@rokkit/core": "^1.4.1",
+		"@rokkit/graph": "link:@rokkit/graph",
 		"@rokkit/icons": "^1.4.1",
 		"@rokkit/states": "^1.4.1",
 		"@rokkit/themes": "^1.4.1",
