@@ -9,6 +9,72 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-29
+
+**The viewer stopped being dbd's to maintain.** 0.22.0 shipped schema model v2
+and noted the viewer was "being extracted into a package dbd, sensei and Rokkit
+share". This is that extraction arriving from the other side: the ER diagram now
+renders through `@rokkit/graph`, and dbd's own layout engine — clustering, edge
+routing, card geometry and their tests — is deleted. 921 lines net, none of which
+described anything specific to dbd.
+
+**The Rust tree is byte-identical to 0.22.0.** `crates/`, `Cargo.toml` and
+`Cargo.lock` carry no change; `dbd-core` and `dbd-cli` 0.23.0 are 0.22.0
+republished under a new number. By the rule 0.13.1 stated — site work that leaves
+the Rust tree untouched carries no bump of its own — this release exists because
+the website and the CLI are versioned together, not because the crates moved.
+Nothing installed from crates.io behaves differently.
+
+Found while building it: **`@rokkit/graph` was never a dependency.** It was a
+`link:` to a sibling checkout on one machine, so CI and the Cloudflare build
+would have resolved nothing the moment the diagram started importing it.
+
+### Changed
+
+- **The ER diagram renders through `@rokkit/graph`** rather than dbd's own
+  layout code. `DiagramView` and `EntityDiagram` call `Graph` and
+  `toGraphInput`; `layout.ts`, `layout-clusters.ts`, `layout-edges.ts`,
+  `layout-types.ts` and `layout-cards.ts` are gone along with their tests.
+
+  The layout maths was never dbd-specific — it clustered nodes by schema and
+  routed edges between cards, which is what any node-link diagram does. Keeping
+  a private copy meant dbd owned a general-purpose renderer as a side effect of
+  wanting to draw one schema. The page tests assert the same property through
+  the package's `[data-graph-node]` hook instead of the retired `[data-card]`:
+  a card per table, unchanged in intent.
+
+- **Every `@rokkit/*` package 1.4.1 → 1.7.0, all ten resolved from the
+  registry.** `@rokkit/graph` moves off `link:` to `^1.7.0` now that it is
+  published.
+
+- **The `SchemaModel` TypeScript mirror tracks v2** — `version`, `entities`,
+  `deps`, and `fk`/`uq` on `Column`, matching `schema_model.rs` as of 0.22.0.
+
+  Every v2 addition is optional in the mirror, which is what keeps an old share
+  link working: a fragment encoded against v1 still validates and still renders.
+  The mirror stays hand-maintained in dbd on purpose — `@rokkit/graph` does not
+  import it, so the package never becomes a third definition to hold in step.
+
+### Fixed
+
+- **Two `@rokkit/*` packages resolved through symlinks into a local checkout,
+  and only one of them said so.** `@rokkit/graph` was declared
+  `link:@rokkit/graph` — honest about being a link, but pointing at
+  `~/Developer/rokkit`, a path that exists on one machine. It is what renders
+  the diagram, so CI and the deployed build would have had nothing to import.
+
+  `@rokkit/themes` was worse for being quiet: `package.json` asked for `^1.4.1`
+  while `node_modules` served 1.7.0 from that same checkout. Local builds and CI
+  were resolving different code with nothing in the tree to indicate it. Both
+  links are gone; all ten packages now carry integrity hashes in `bun.lock`.
+
+- **Runtime-selected node icons were purged from the stylesheet.**
+  `@rokkit/graph` picks a node's icon from its kind at runtime, so the class
+  names appear nowhere in source and UnoCSS's extractor dropped them — the
+  glyph vanished and each card rendered a blank box where its kind should be.
+  `uno.config.ts` now safelists `DEFAULT_ICONS`, which the package exports
+  precisely so the list is not hand-maintained downstream.
+
 ## [0.22.0] — 2026-09-27
 
 **The schema model became a model of the schema.** `dbd diagram --json` emitted
@@ -1267,7 +1333,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.22.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.23.0...main
+[0.23.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.23.0
 [0.22.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.22.0
 [0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
 [0.19.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.19.0
