@@ -1,46 +1,54 @@
 # Checkpoint
 
-**Slice:** #24 schema model v2 — complete on `develop`, unreleased.
+**Slice:** ER diagram rendered by `@rokkit/graph` 1.7.0. Merged to `develop`
+and `main`, **not yet pushed** (both branches ahead of origin).
 
 ## Done
 
-- **#24 schema model v2** (`316b06c` red, `d55e2b5` green, `e38d28e` docs).
-  `version: 2`; `entities` (views, matviews, functions, procedures); `deps`
-  (reads/writes/calls/member, projected from `Entity::refs`, `unresolved`
-  rather than dropped); `fk`/`uq` on `Column`. `tables`/`refs` keep their v1
-  shape so the viewer extraction is not invalidated.
-- **`COMMENT ON` for non-tables** (`389f36c` red, `d55e2b5` green). New
-  `Entity::comment` — a view/matview/routine has no `TableDef`, so its comment
-  was parsed and dropped, blanking every non-table row of the diagram's
-  entity description table.
-- **Docs on all four surfaces** — guide, both llms files, both SKILL.md
-  copies. Website is generated from `docs/` by `copy-content.mjs`; no agent
-  describes the model shape.
-- Earlier in `[Unreleased]`: #7 carve-outs — exposed/internal schemas, and
-  `reconcile --prune` no longer dropping platform-owned objects.
+- **Diagram renders from `@rokkit/graph`** — `DiagramView`/`EntityDiagram` call
+  `Graph` + `toGraphInput`; dbd's own `layout*.ts` (clusters, edges, types) and
+  their tests are deleted. Net −921 lines.
+- **`SchemaModel` site mirror upgraded to v2** — matches the v0.22.0 crate.
+- **rokkit 1.7.0, all ten packages from the registry** — `@rokkit/graph` was a
+  `link:` to `~/Developer/rokkit`, a path that exists on one machine; CI and the
+  Cloudflare build would have resolved nothing. `@rokkit/themes` was a second
+  stray symlink that package.json never declared (asked ^1.4.1, served 1.7.0
+  locally), so local and CI were building different code silently. Both gone.
+
+## Verified on merged `main`
+
+    bun install --frozen-lockfile   exit 0   # the CI gate
+    bun run test                    29/29
+    bun run check                   0 errors 0 warnings
+    CF_PAGES=1 bun run build        adapter-cloudflare, exit 0
+    cargo test / clippy -D warnings / fmt --check   all green (pre-commit hook)
+
+Browser against the registry copy: `/diagram` renders 6 tables across both
+schemas with FK edges and pk/fk icons, `/`, `/guide` render, 0 console errors.
 
 ## Next
 
-    make minor      # breaking: config::SchemaGrantConfig → SchemaOptions
+    git push origin develop main    # 3 and 5 commits ahead respectively
 
-Workspace green (1023 dbd-core + CLI suites), clippy + fmt + doc-examples
-clean. Release checklist item 5 — install the artifact and re-run the repro —
-still to do after the bump.
+Then decide whether this warrants a release — see the open question below.
 
 ## Open questions
 
+- **`CHANGELOG.md [Unreleased]` is empty** and covers none of this slice: the
+  graph refactor, the v2 mirror, or the rokkit upgrade. It needs writing before
+  any release is cut. No version bump has been made; site/package.json is still
+  0.22.0.
 - Does sensei's 43,737 count occurrences or unique pairs? Until settled, a
   residual difference is not a defect.
-- #7 (multi-tenant) stays open but is largely superseded by scopes; prune and
-  exposed schemas were carved out of it.
 
 ## Known-broken / carried forward
 
-- The viewer does not yet render `entities`/`deps` — that is rokkit#159,
-  running in a separate session.
+- `shiki` peer warning on install: `@rokkit/ui` declares `^3.23.0` at both
+  1.4.1 and 1.7.0, installed `shiki@4.4.3` comes from `@devframes/service-shiki`.
+  Unchanged by the upgrade, and the site's `CodeBlock` does not use it.
 - `emit` covers tables and views only; routines are skipped and reported.
 - `CREATE ROLE … IN ROLE …` is not read as a membership; `GRANT … TO …` is.
-- `cmd_format --check` still calls `std::process::exit(1)`, so that path
-  cannot be tested in-process.
-- The commit gate tests the **worktree**, not the index — a staged-only
-  change is not what it verifies.
+- `cmd_format --check` calls `std::process::exit(1)`, so that path cannot be
+  tested in-process.
+- The commit gate tests the **worktree**, not the index — a staged-only change
+  is not what it verifies.
