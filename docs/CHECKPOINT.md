@@ -11,13 +11,12 @@ merged to `develop`; `main` and production untouched.
   the root's style — dbd owns the `GraphState` (tint on, no selection highlight).
 - `/diagram` and `/projects` use the home page's `ThemeSwitcherToggle`.
 - `auth.users` on one line in the entity header and the entities list.
-- Hint pill moved to the top of the canvas. CHANGELOG `[Unreleased]` written.
+- Hint pill moved to the canvas top. CHANGELOG `[Unreleased]` written.
 
 ## Verified
 
     vitest 44/44 · svelte-check 0/0 · CF_PAGES=1 build exit 0
     bun install --frozen-lockfile: no changes · make _check-ci green per commit
-
 Production build driven in a browser, light and dark, 1024–1440 wide.
 
 ## Next
@@ -25,14 +24,12 @@ Production build driven in a browser, light and dark, 1024–1440 wide.
     git push origin develop          # CI's `site` job is the gate
     gh run list --branch develop
 
-Then the Details-tab redesign (dbdocs-style: table info, fields, references,
-dependencies), the project overview, and the snapshot changelog — one issue each.
+Then: Details tab dbdocs-style, project overview, snapshot changelog (an issue each).
 
 ## Open questions
 
 - Ship to production now (merge `main`), or ride with the next release?
-- `CLAUDE.md` names `docs_match_code::the_website_copies_match_the_docs`, which
-  does not exist; `site/src/lib/content/` is generated and gitignored.
+- `CLAUDE.md` names a `docs_match_code` website-copies gate that does not exist.
 
 ## Known-broken / upstream
 
