@@ -35,6 +35,7 @@ pub mod entity;
 pub mod error;
 pub mod formatter;
 pub mod github;
+pub mod history;
 pub mod init;
 pub mod parser;
 pub mod path_safe;

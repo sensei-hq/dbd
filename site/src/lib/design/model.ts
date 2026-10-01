@@ -5,8 +5,9 @@
    means the package never becomes a third definition to keep in step.
 
    v2 (2026-09-27) added `version`, `entities`, `deps`, and `fk`/`uq` on
-   `Column`. Everything v2 added is optional here, so a v1 payload — a share
-   link encoded before the upgrade — still validates and still renders. */
+   `Column`; v3 (2026-10-01) added `history`. Everything past v1 is optional
+   here, so a share link encoded before an upgrade still validates and still
+   renders. */
 
 export type Column = {
   name: string;
@@ -66,6 +67,45 @@ export type DepEdge = {
   unresolved?: boolean;
 };
 
+/** v3. What happened to an entity or a field in one version. */
+export type ChangeOp = 'added' | 'removed' | 'modified' | 'renamed';
+
+/** v3. A column, constraint, index or enum value inside a modified entity. */
+export type FieldEdit = {
+  kind: 'column' | 'constraint' | 'index' | 'value';
+  name: string;
+  op: ChangeOp;
+  /** Before: the definition, or for a rename the old name. */
+  from?: string;
+  /** After: the definition, or for a rename the new name. */
+  to?: string;
+  /** What changed when the definition reads the same either side — `comment`. */
+  note?: string;
+};
+
+/** v3. A table or enum one version added, removed or modified. */
+export type EntityChange = {
+  kind: 'table' | 'enum';
+  schema: string;
+  name: string;
+  op: ChangeOp;
+  fields: FieldEdit[];
+};
+
+/**
+ * v3. One version of the schema, from `snapshots/NNN.json` (`crates/dbd-core/src/history.rs`).
+ * The first carries `baseline` counts instead of changes; a multi-stage version spans
+ * `version`…`through`.
+ */
+export type HistoryEntry = {
+  version: number;
+  through?: number;
+  description: string;
+  timestamp: string;
+  baseline?: { tables: number; enums: number };
+  changes: EntityChange[];
+};
+
 /**
  * A schema is two graphs, and this type keeps them apart on purpose.
  *
@@ -87,6 +127,8 @@ export type SchemaModel = {
   entities?: EntityNode[];
   /** v2. What reads, writes or calls what. */
   deps?: DepEdge[];
+  /** v3. What each snapshot changed, oldest first. Absent when there are no snapshots. */
+  history?: HistoryEntry[];
 };
 
 export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
@@ -111,6 +153,8 @@ export function validateModel(value: unknown): ValidationResult {
     return { ok: false, error: 'entities must be an array' };
   if (v.deps !== undefined && !Array.isArray(v.deps))
     return { ok: false, error: 'deps must be an array' };
+  if (v.history !== undefined && !Array.isArray(v.history))
+    return { ok: false, error: 'history must be an array' };
   return { ok: true, model: value as SchemaModel };
 }
 
