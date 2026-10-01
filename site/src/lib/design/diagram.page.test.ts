@@ -4,6 +4,7 @@ import Page from '../../routes/diagram/+page.svelte';
 import { encodeFragment } from './fragment';
 import type { SchemaModel } from './model';
 import { vibe } from '@rokkit/states';
+import { sampleModel } from './data';
 
 // `[data-graph-node]` is @rokkit/graph's node hook — it replaced dbd's `[data-card]` when the
 // viewer moved into the package. The assertion is unchanged in intent: the diagram rendered
@@ -176,15 +177,27 @@ describe('the app header', () => {
 });
 
 describe('the root overview', () => {
-  it('is where the page opens, with tabs Overview, Diagram, Entities', async () => {
+  it('is where the page opens, with tabs Overview, Diagram, Entities, Changelog', async () => {
     const { container } = render(Page);
     await tick();
     expect(q(container, '[data-overview]')).not.toBeNull();
     expect(q(container, '[data-graph-node]')).toBeNull();
     const tabs = [...container.querySelectorAll('button')]
       .map((b) => b.textContent?.trim())
-      .filter((t) => ['Overview', 'Diagram', 'Entities'].includes(t ?? ''));
-    expect(tabs).toEqual(['Overview', 'Diagram', 'Entities']);
+      .filter((t) => ['Overview', 'Diagram', 'Entities', 'Changelog'].includes(t ?? ''));
+    expect(tabs).toEqual(['Overview', 'Diagram', 'Entities', 'Changelog']);
+  });
+
+  it('lists the latest versions under Recent changes, and opens the changelog from there', async () => {
+    const { container } = render(Page);
+    await tick();
+    const recent = q(container, '[data-overview] [data-section="recent"]')!;
+    const newest = Math.max(...sampleModel.history!.map((h) => h.version));
+    expect(recent.querySelector('[data-version]')?.getAttribute('data-version')).toBe(String(newest));
+    expect(recent.querySelectorAll('[data-version]').length).toBeLessThanOrEqual(3);
+    await fireEvent.click(await findByRole(recent as HTMLElement, 'button', { name: /changelog/i }));
+    await tick();
+    expect(q(container, '[data-changelog]')).not.toBeNull();
   });
 
   it('shows a tile per count, with its icon', async () => {
@@ -204,5 +217,62 @@ describe('the root overview', () => {
       p.textContent?.includes('Storefront catalog'),
     );
     expect(header).toHaveLength(1);
+  });
+});
+
+describe('the changelog', () => {
+  async function openChangelog() {
+    const view = render(Page);
+    await tick();
+    await fireEvent.click(await findByRole(view.container, 'button', { name: 'Changelog' }));
+    await tick();
+    return view.container;
+  }
+
+  it('shows one card per version, newest first', async () => {
+    const container = await openChangelog();
+    const versions = [...container.querySelectorAll('[data-changelog] [data-version]')].map((v) =>
+      Number(v.getAttribute('data-version')),
+    );
+    expect(versions).toEqual(sampleModel.history!.map((h) => h.version).sort((a, b) => b - a));
+  });
+
+  it('lists each changed entity with what happened to it', async () => {
+    const container = await openChangelog();
+    const v2 = q(container, '[data-changelog] [data-version="2"]')!;
+    const rows = [...v2.querySelectorAll('[data-change]')].map((r) => ({
+      id: r.getAttribute('data-change'),
+      op: r.getAttribute('data-op'),
+    }));
+    expect(rows).toEqual(
+      sampleModel.history!
+        .find((h) => h.version === 2)!
+        .changes.map((c) => ({ id: `${c.schema}.${c.name}`, op: c.op })),
+    );
+  });
+
+  it('spells out a rename and a modified column inside their entity', async () => {
+    const container = await openChangelog();
+    const text = q(container, '[data-changelog]')!.textContent!.replace(/\s+/g, ' ');
+    expect(text).toMatch(/display_name → name/);
+    expect(text).toMatch(/numeric\(10,2\) → integer not null default 0/);
+  });
+
+  it('shows the baseline as counts, not a list', async () => {
+    const container = await openChangelog();
+    const base = q(container, '[data-changelog] [data-version="1"]')!;
+    expect(base.querySelectorAll('[data-change]')).toHaveLength(0);
+    expect(base.textContent).toMatch(/5 tables/);
+  });
+
+  it('explains an empty changelog instead of showing nothing', async () => {
+    const { history: _h, ...noHistory } = sampleModel;
+    window.location.hash = '#' + (await encodeFragment(noHistory));
+    const view = render(Page);
+    await findAllByText(view.container, 'shopdb');
+    await fireEvent.click(await findByRole(view.container, 'button', { name: 'Changelog' }));
+    await tick();
+    expect(q(view.container, '[data-changelog]')?.textContent).toMatch(/no snapshots/i);
+    window.location.hash = '';
   });
 });
