@@ -46,14 +46,10 @@
             class="group cursor-pointer border-b border-line-soft align-top hover:bg-paper-2"
             onclick={() => onNav?.(nodeId(t.schema, t.name))}
           >
-            <td class="py-3.5 pr-4">
-              <div class="font-mono text-xs text-faint" style="overflow-wrap: anywhere;">{t.schema}.</div>
-              <div
-                class="font-display text-sm font-semibold text-fg group-hover:text-accent-2"
-                style="overflow-wrap: anywhere;"
-              >
-                {t.name}
-              </div>
+            <!-- One qualified name on one line; it wraps only where the column is too narrow. -->
+            <td class="py-3.5 pr-4" style="overflow-wrap: anywhere;">
+              <span class="font-mono text-xs text-faint">{t.schema}.</span><span
+                class="font-display text-sm font-semibold text-fg group-hover:text-accent-2">{t.name}</span>
             </td>
             <td class="py-3.5 pr-4 font-mono text-xs text-muted">{t.columns.length}</td>
             <td class="py-3.5 pr-4 font-mono text-xs text-muted">{rc || '—'}</td>
