@@ -54,6 +54,19 @@ pub struct TableSnapshot {
     pub table_constraints: Vec<TableConstraint>,
 }
 
+/// A version's place in a multi-stage run: `index` of `of` (#29).
+///
+/// A rename, a type change or an enum-value removal is cut as consecutive
+/// versions that only make sense together. The changelog groups them back into
+/// one by this marker — never by the snapshot's description, which a person
+/// may have typed `"(stage 1/2)"` into. Written on every graph since, `1/1` for
+/// an ordinary version, so a graph without it is one written before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationStage {
+    pub index: u32,
+    pub of: u32,
+}
+
 /// Migration graph metadata (stored as graph.json in each migration folder).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationGraph {
@@ -65,6 +78,9 @@ pub struct MigrationGraph {
     pub added: Vec<String>,
     pub altered: Vec<String>,
     pub dropped: Vec<String>,
+    /// Absent on a graph written before stages were marked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<MigrationStage>,
 }
 
 /// A pending migration with its source directory and metadata.
@@ -188,6 +204,20 @@ pub fn pending_data_sql_todos(pending: &[PendingMigration]) -> Result<Vec<DataSq
 }
 
 // ── Snapshot I/O ────────────────────────────────────────
+
+/// The migration graph written alongside snapshot `version`, if there is one.
+///
+/// A baseline has none, and neither does a project whose `migrations/` was
+/// cleaned out; an unreadable one is treated as absent rather than as an error —
+/// the graph is only consulted for its stage marker, and the snapshot itself is
+/// what the history is built from.
+pub(crate) fn read_graph(project_dir: &Path, version: u32) -> Option<MigrationGraph> {
+    let file = project_dir
+        .join(MIGRATIONS_DIR)
+        .join(pad_version(version))
+        .join("graph.json");
+    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
+}
 
 /// List all snapshots in the snapshots directory, sorted by version.
 pub fn list_snapshots(dir: &Path) -> Vec<SnapshotInfo> {
@@ -408,7 +438,7 @@ pub struct TodoItem {
 /// spelling, so widening a column reads `TYPE character varying(60)` rather than
 /// `TYPE varchar(60)`. Both are the same type; this matches what `dbd diff`
 /// already emits.
-fn canonical_types(snap: &Snapshot) -> Snapshot {
+pub(crate) fn canonical_types(snap: &Snapshot) -> Snapshot {
     let no_enums = std::collections::HashMap::new();
     let mut out = snap.clone();
     for table in &mut out.tables {
@@ -525,6 +555,7 @@ pub fn prepare_snapshot(
                 added,
                 altered,
                 dropped,
+                stage: Some(MigrationStage { index: 1, of: 1 }),
             };
 
             SnapshotResult {
@@ -1074,6 +1105,10 @@ fn build_stage1(
         added: builder.added,
         altered: builder.altered,
         dropped: builder.dropped,
+        stage: Some(MigrationStage {
+            index: 1,
+            of: ctx.num_stages,
+        }),
     };
 
     SnapshotResult {
@@ -1106,6 +1141,10 @@ fn build_stage2(ctx: &MultiStageCtx, stage1_snap: Snapshot) -> SnapshotResult {
         added: vec![],
         altered: builder.altered,
         dropped: builder.dropped,
+        stage: Some(MigrationStage {
+            index: 2,
+            of: ctx.num_stages,
+        }),
     };
 
     SnapshotResult {
@@ -1138,6 +1177,10 @@ fn build_stage3(ctx: &MultiStageCtx) -> SnapshotResult {
         added: builder.added,
         altered: builder.altered,
         dropped: vec![],
+        stage: Some(MigrationStage {
+            index: 3,
+            of: ctx.num_stages,
+        }),
     };
 
     SnapshotResult {
@@ -1297,6 +1340,7 @@ mod tests {
             added: vec![],
             altered: vec!["config.lookup_values".to_string()],
             dropped: vec![],
+            stage: None,
         };
         fs::write(dir.join("graph.json"), serde_json::to_string_pretty(&graph).unwrap()).unwrap();
     }
@@ -1500,6 +1544,31 @@ mod tests {
         assert_eq!(graph.from_version, 1);
         assert_eq!(graph.to_version, 2);
         assert!(graph.altered.contains(&"config.users".to_string()));
+    }
+
+    /// A single-stage version says so structurally (#29): the changelog groups
+    /// stages by this marker, not by a description a person may have typed.
+    #[test]
+    fn a_single_stage_graph_records_stage_one_of_one() {
+        let prev = Snapshot {
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "int"), col("email", "text")],
+        )];
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add email (stage 1/2)");
+        assert_eq!(result.graph.unwrap().stage, Some(MigrationStage { index: 1, of: 1 }));
     }
 
     // ── SC3: No changes ─────────────────────────────────────
@@ -2138,6 +2207,19 @@ mod tests {
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
         assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
+        let stages: Vec<_> = result
+            .snapshots
+            .iter()
+            .map(|r| r.graph.as_ref().unwrap().stage)
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                Some(MigrationStage { index: 1, of: 2 }),
+                Some(MigrationStage { index: 2, of: 2 })
+            ],
+            "each stage's graph names its place in the run"
+        );
         // Stage 1 should have data.sql file
         assert!(
             result.snapshots[0]

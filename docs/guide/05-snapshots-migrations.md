@@ -50,6 +50,8 @@ v(N): data.sql (TODO: map removed values to remaining)
 v(N+1): ALTER columns to TEXT + DROP old enum
 v(N+2): CREATE new enum + ALTER columns back
 
+Each version's `migrations/NNN/graph.json` records its place in the run as `"stage": {"index": k, "of": n}` — `1/1` for an ordinary version — so tools can group the stages back into the one change they make up; the viewer's changelog does exactly that. Graphs written before the marker existed have no `stage`, and are read by their snapshot's `(stage k/n)` description instead.
+
 ## Data corrections (*.data.sql)
 
 Migration folders can contain data correction scripts:

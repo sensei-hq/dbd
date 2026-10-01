@@ -1,39 +1,37 @@
 # Checkpoint
 
-**Slice:** #25 — the viewer on `@rokkit/graph` 1.7's bare canvas. Site-only,
-merged to `develop`; `main` and production untouched.
+**Slice:** #27 Details tab, #28 overview, #29 snapshot changelog — built,
+reviewed and fixed; PR #30 (`feat/details-tab` → develop) open. #29 reaches Rust.
 
 ## Done
 
-- Root diagram composes `ErDiagram`: `flow`, schema tint + legend, density /
-  edge-style / zoom controls. `arrange` removed with `cluster`.
-- Entity diagram composes `Neighborhood` with depth / edge / zoom controls, in
-  the root's style — dbd owns the `GraphState` (tint on, no selection highlight).
-- `/diagram` and `/projects` use the home page's `ThemeSwitcherToggle`.
-- `auth.users` on one line in the entity header and the entities list.
-- Hint pill moved to the canvas top. CHANGELOG `[Unreleased]` written.
+- PR #26 merged (0a7ac9e); #25 closed; production verified live.
+- #27: Details = Table info · Fields (Name/Type/Settings/Default/References/
+  Notes) · References in+out · Dependencies (v2 `deps`) · Indexes.
+- #28: root opens on Overview — counts with diagram icons, note, per schema,
+  Recent changes (latest three).
+- #29: `dbd_core::history`; `SchemaModel` v3 `history`; `graph.json` carries
+  `stage {index, of}`; scoped history via `scope::admits`. Site Changelog tab.
+- Data-correctness review: 7 defects found, all fixed red-first (`c9035be`).
+- Docs: guide 04/05, llms.txt, llms-full.txt, both SKILL.md copies, CHANGELOG.
 
 ## Verified
 
-    vitest 44/44 · svelte-check 0/0 · CF_PAGES=1 build exit 0
-    bun install --frozen-lockfile: no changes · make _check-ci green per commit
-Production build driven in a browser, light and dark, 1024–1440 wide.
+    cargo test --workspace 1632/0 · clippy 1.98 + 1.99 clean · fmt clean
+    vitest 85/85 · svelte-check 0/0 · CF_PAGES=1 build exit 0
+    release binary: snapshot writes stage 1/1; history v1–v3 on the fixture
 
 ## Next
 
-    git push origin develop          # CI's `site` job is the gate
-    gh run list --branch develop
-
-Then: Details tab dbdocs-style, project overview, snapshot changelog (an issue each).
+    gh pr checks 30     # then merge #30 into develop
+    # #27–#29 close only via a develop → main PR that names them
 
 ## Open questions
 
-- Ship to production now (merge `main`), or ride with the next release?
-- `CLAUDE.md` names a `docs_match_code` website-copies gate that does not exist.
+- Next release is a minor (0.24.0): `SchemaModel` gained a pub field.
 
 ## Known-broken / upstream
 
-- rokkit#170 — a one-sided focus is drawn off-centre in its neighbourhood.
-- rokkit#171 — past fit, zoom anchors top-left; right/bottom unreachable.
-- rokkit#172 — `Neighborhood` lacks `groupTint`; dbd works around it.
-- Preview on :4317 — :4173 is shared with another session's rokkit checks.
+- rokkit#170 off-centre neighbourhood · #171 zoom/pan extent · #172 style parity.
+- History has no views/routines: snapshots hold tables and enums only.
+- Snapshots cut before inline FKs were recorded show a one-time FK "change".

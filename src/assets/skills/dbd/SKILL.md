@@ -303,7 +303,7 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 
 ### The schema model as a wire format
 
-`dbd diagram --json` writes a `SchemaModel` — the same type `dbd_core::schema_model::build(&design, scope)` returns. It is read by dbd's own viewer, by the shared viewer package, and by external indexers, so it is a cross-repo contract rather than an internal shape, and it states its own `version` (currently `2`).
+`dbd diagram --json` writes a `SchemaModel` — the same type `dbd_core::schema_model::build(&design, scope)` returns. It is read by dbd's own viewer, by the shared viewer package, and by external indexers, so it is a cross-repo contract rather than an internal shape, and it states its own `version` (currently `3`).
 
 | Field | What it holds |
 | --- | --- |
@@ -312,12 +312,15 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 | `entities` | Views, materialized views, functions and procedures (`schema`, `name`, `kind`, `note`, `noteMd`) |
 | `deps` | `{from, to, kind}` where `kind` is `reads` \| `writes` \| `calls` \| `member` — the call/reference graph |
 | `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
+| `history` | What each snapshot changed, oldest first (v3; omitted when there are none) — `{version, through?, description, timestamp, baseline?, changes}` |
 
 `entities` and `deps` are separate arrays rather than folded into `tables`/`refs` under a `kind` discriminator. Folding reads tidier and would silently change what every existing consumer of `tables` receives; the version field is there so the next extension is not a guess downstream.
 
 `deps` is a projection of `Entity::refs`, already resolved and deduplicated — no second parse. An edge whose target is not a project entity (a Postgres built-in like `now()`, or a genuine dangling reference) carries `"unresolved": true` instead of being dropped: the edge is real, only the endpoint is unplaceable, so a renderer should dim it rather than pretend the call does not happen.
 
 Comments reach every kind. A table's live on `TableDef::comments`; a view, materialized view, function or procedure has no `TableDef`, so its own `COMMENT ON` lands on `Entity::comment`. Both project to `note` (first line — the one-line summary an entity table shows) and `noteMd` (the full text).
+
+`history` is not filled by `build`, which reads the design and nothing else; `dbd diagram` attaches `dbd_core::history::load(project_dir)` — or `load_scoped(project_dir, &schemas)` under `--scope`, which filters before diffing so the baseline counts the scope. It reuses `diff::diff` and `classify_changes`, so the changelog describes a step the way the migration did: each `changes[]` item is `{kind: table|enum, schema, name, op: added|removed|modified, fields}` and each field `{kind: column|constraint|index|value, name, op: added|removed|modified|renamed, from?, to?, note?}`. The first snapshot is a `baseline` of counts; a multi-stage change is one entry spanning `version`..`through`; types are canonicalised first; output is sorted. An unreadable snapshot is an error from `load` — `dbd diagram` warns and omits the history rather than ship one with a hole.
 
 ### Parsing SQL without a dbd project
 

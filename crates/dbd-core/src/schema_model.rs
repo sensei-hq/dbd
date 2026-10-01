@@ -12,7 +12,7 @@ use crate::scope::ResolvedScope;
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaModel {
     /// Wire-format version. `2` added [`Self::entities`], [`Self::deps`], and
-    /// `fk`/`uq` on [`Column`].
+    /// `fk`/`uq` on [`Column`]; `3` added [`Self::history`].
     ///
     /// This type is read by dbd's own viewer, by a shared component package,
     /// and by external consumers, so it is a cross-repo contract rather than
@@ -42,10 +42,17 @@ pub struct SchemaModel {
     /// deduplicated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<DepEdge>,
+    /// What each snapshot changed, oldest first (v3) — see [`crate::history`].
+    ///
+    /// Not filled by [`build`], which reads the design and nothing else; the
+    /// caller that knows the project directory attaches it. Absent when the
+    /// project has no snapshots, so a v2 consumer reads a v3 payload unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<crate::history::HistoryEntry>,
 }
 
 fn default_version() -> u32 {
-    2
+    3
 }
 
 /// A non-table entity: a view, materialized view, function or procedure.
@@ -272,6 +279,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         schemas,
         tables,
         refs,
+        history: Vec::new(),
     }
 }
 
@@ -566,6 +574,7 @@ mod tests {
             version: 2,
             entities: vec![],
             deps: vec![],
+            history: vec![],
             project: ProjectInfo {
                 name: "p".into(),
                 db: "postgresql".into(),
