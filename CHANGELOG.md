@@ -9,10 +9,55 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-**The viewer gets its controls back** (#25). `@rokkit/graph` 1.7 made `Graph` a
-bare canvas — no density bar, no zoom buttons — and changed its default layout
-from `cluster` to `flow`, so the 0.23.0 viewer drew a different diagram with no
-controls and no visible schema. Site-only: the Rust tree is unchanged.
+**The viewer documents the schema, and remembers it.** It opens on a project
+overview (#28), each table has a documentation page (#27), and a changelog shows
+what every snapshot changed (#29) — which is the one part that reaches Rust:
+`dbd diagram` now reads `snapshots/` and the schema model moves to **v3**. First,
+the diagram got its controls back (#25): `@rokkit/graph` 1.7 made `Graph` a bare
+canvas and changed its default layout from `cluster` to `flow`, so the 0.23.0
+viewer drew a different diagram with no controls and no visible schema.
+
+**For embedders: the next release is a minor.** `SchemaModel` has a new public
+field, `history`, so code that builds one as a struct literal must name it
+(`history: vec![]`). The JSON is additive — omitted when empty, and a v2 payload
+still deserializes.
+
+### Added
+
+- **A changelog, from snapshots** (#29). `dbd_core::history::load` turns
+  `snapshots/NNN.json` into one entry per version: the first a baseline of
+  table and enum counts, each later one the tables and enums it added, removed
+  or modified, with their column, index, constraint and enum-value edits. It
+  reuses `diff::diff` and `classify_changes`, so a step reads the way its
+  migration did; a rename or type change cut in stages is one version that reads
+  as the rename or type change (never the synthetic `_new` column); type
+  spellings are canonicalised; output is sorted. `dbd diagram` attaches it
+  (scoped under `--scope`), and an unreadable snapshot costs the changelog with
+  a warning, not the diagram. The viewer's **Changelog** tab shows it newest
+  first, a card per version. Views and routines have no history yet — snapshots
+  hold tables and enums only.
+- **A project overview** (#28) — the page the viewer opens on: database and
+  model version, a tile per count (schemas, tables, each entity kind present,
+  enums, references) in its diagram icon, the project note in full, the counts
+  per schema, and the latest three versions from the changelog.
+- **A Details tab per table** (#27): table info (the comment as markdown), then
+  Fields — Name, Type, Settings, Default, References, Notes, with notes rendered
+  as markdown — then references in and out, the views and routines that read or
+  write the table, and indexes. Full width; the fields table scrolls sideways
+  rather than squeezing its notes.
+
+### Changed
+
+- **`SchemaModel` is version 3**, adding `history`.
+- **`graph.json` records each version's stage** — `"stage": {"index", "of"}`,
+  `1/1` for an ordinary version — so the changelog groups a multi-stage change by
+  structure, not by a description a person may have typed `(stage 1/2)` into.
+  Graphs written before it have none and still read.
+- **The viewer opens on Overview**; the tabs are Overview · Diagram · Entities ·
+  Changelog.
+- **`/diagram` and `/projects` use the home page's theme switcher**
+  (`@rokkit/app`'s `ThemeSwitcherToggle`) instead of a page-local moon/sun
+  button — one colour-mode control across the site.
 
 ### Fixed
 
@@ -29,12 +74,9 @@ controls and no visible schema. Site-only: the Rust tree is unchanged.
   `users` in the entity header and the entities list.
 - **The "click a table" hint moved to the top of the canvas**; the controls and
   legend own the bottom edge, and it overlapped the legend.
-
-### Changed
-
-- **`/diagram` and `/projects` use the home page's theme switcher**
-  (`@rokkit/app`'s `ThemeSwitcherToggle`) instead of a page-local moon/sun
-  button — one colour-mode control across the site.
+- **A comment naming the same `code` twice no longer crashes the page.** Inline
+  code was keyed by its own text (Svelte's `each_key_duplicate`) in the entities
+  list and the Details tab; every comment now goes through one renderer.
 
 ### Known issues (upstream)
 

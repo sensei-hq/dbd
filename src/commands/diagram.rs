@@ -53,7 +53,26 @@ pub fn cmd_diagram(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let model = dbd_core::schema_model::build(&design, Some(&resolved));
+    let mut model = dbd_core::schema_model::build(&design, Some(&resolved));
+
+    // The changelog (#29), seen through the same scope as the diagram — which may
+    // be a `default` scope with no --scope given. A scope is a set of entities, and
+    // the history names tables that no longer exist, so each is asked of the scope's
+    // definition rather than of today's model; see `scope::admits`.
+    let history = if resolved.is_all {
+        dbd_core::history::load(project_dir)
+    } else {
+        let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
+        let scopes = &design.config().scopes;
+        dbd_core::history::load_scoped(project_dir, |schema, name| {
+            dbd_core::scope::admits(scopes, &resolved, &existing, &format!("{schema}.{name}"))
+        })
+    };
+    match history {
+        Ok(history) => model.history = history,
+        // The diagram is still right without it; a history with a hole would not be.
+        Err(e) => output::warn(&format!("changelog omitted — {e}")),
+    }
 
     if json {
         let s = serde_json::to_string_pretty(&model).context("Failed to serialize schema model")?;
@@ -142,6 +161,138 @@ mod tests {
         )
         .unwrap();
         assert!(out.exists());
+    }
+
+    fn write_snapshot(project: &std::path::Path, file: &str, body: &str) {
+        let dir = project.join("snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
+    const SNAPSHOT_V1: &str = r#"{ "version": 1, "description": "v1", "timestamp": "2026-09-01T10:00:00Z",
+        "tables": [], "enums": [{ "name": "status", "schema": "app", "values": ["a"] }] }"#;
+
+    fn diagram_json(project: &std::path::Path) -> serde_json::Value {
+        let out = project.join("model.json");
+        cmd_diagram(
+            &project.join("design.yaml"),
+            "dev",
+            project,
+            true,
+            &out,
+            false,
+            None,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+
+    /// A project with snapshots carries its changelog in the model the viewer reads (#29).
+    #[test]
+    fn diagram_json_carries_the_snapshot_history() {
+        let proj = testutil::copy_fixture_project();
+        write_snapshot(proj.path(), "001.json", SNAPSHOT_V1);
+        let model = diagram_json(proj.path());
+        assert_eq!(model["version"], 3);
+        assert_eq!(model["history"][0]["version"], 1);
+        assert_eq!(model["history"][0]["baseline"]["enums"], 1);
+    }
+
+    /// An unreadable snapshot costs the changelog, not the diagram: the command
+    /// still writes the model, without a history that would misattribute changes.
+    #[test]
+    fn diagram_json_survives_an_unreadable_snapshot_without_history() {
+        let proj = testutil::copy_fixture_project();
+        write_snapshot(proj.path(), "001.json", SNAPSHOT_V1);
+        write_snapshot(proj.path(), "002.json", "{ not json");
+        let model = diagram_json(proj.path());
+        assert!(model["tables"].as_array().is_some_and(|t| !t.is_empty()));
+        assert!(model.get("history").is_none());
+    }
+
+    fn table_snapshot(schema: &str, name: &str) -> String {
+        format!(
+            r#"{{ "name": "{name}", "schema": "{schema}", "indexes": [], "table_constraints": [], "columns": [
+                {{ "name": "id", "data_type": "integer", "nullable": false, "default_value": null,
+                   "is_pk": true, "is_unique": false, "comment": null, "inline_fk": null }}] }}"#
+        )
+    }
+
+    fn snapshot_json(version: u32, tables: &[String]) -> String {
+        format!(
+            r#"{{ "version": {version}, "description": "v{version}", "timestamp": "2026-09-0{version}T10:00:00Z",
+                 "tables": [{}], "enums": [] }}"#,
+            tables.join(",")
+        )
+    }
+
+    /// A fixture copy with two extra scopes: one table, and one schema.
+    fn scoped_project() -> tempfile::TempDir {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&cfg).unwrap().replacen(
+            "scopes:\n",
+            "scopes:\n  one_table:\n    includes:\n      - config.lookups\n  staging_only:\n    includes:\n      - staging\n",
+            1,
+        );
+        std::fs::write(&cfg, yaml).unwrap();
+        proj
+    }
+
+    fn diagram_json_scoped(project: &std::path::Path, scope: &str) -> serde_json::Value {
+        let out = project.join("model.json");
+        cmd_diagram(
+            &project.join("design.yaml"),
+            "dev",
+            project,
+            true,
+            &out,
+            false,
+            None,
+            Some(scope),
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+
+    /// A scope is a set of entities, not of schemas: the changelog of a one-table
+    /// scope counts that table and lists only its changes.
+    #[test]
+    fn a_scoped_changelog_covers_the_scopes_entities_not_their_schemas() {
+        let proj = scoped_project();
+        let three = [
+            table_snapshot("config", "lookups"),
+            table_snapshot("config", "lookup_values"),
+            table_snapshot("config", "extra"),
+        ];
+        write_snapshot(proj.path(), "001.json", &snapshot_json(1, &three));
+        write_snapshot(proj.path(), "002.json", &snapshot_json(2, &three[..2]));
+        let model = diagram_json_scoped(proj.path(), "one_table");
+        assert_eq!(model["history"][0]["baseline"]["tables"], 1);
+        assert_eq!(model["history"][1]["changes"], serde_json::json!([]));
+    }
+
+    /// A table dropped since is still in the scope it was in: the scope is matched by
+    /// its own definition, not by what survives in today's design.
+    #[test]
+    fn a_scoped_changelog_keeps_the_drop_of_a_table_that_no_longer_exists() {
+        let proj = scoped_project();
+        write_snapshot(
+            proj.path(),
+            "001.json",
+            &snapshot_json(1, &[table_snapshot("staging", "raw")]),
+        );
+        write_snapshot(proj.path(), "002.json", &snapshot_json(2, &[]));
+        let model = diagram_json_scoped(proj.path(), "staging_only");
+        assert_eq!(
+            model["history"][1]["changes"],
+            serde_json::json!([{ "kind": "table", "schema": "staging", "name": "raw", "op": "removed", "fields": [] }])
+        );
     }
 
     /// URL mode with `print_url = true` encodes + prints the URL and skips the

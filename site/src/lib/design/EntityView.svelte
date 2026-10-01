@@ -1,22 +1,9 @@
-<script lang="ts" module>
-  // Type helpers ported from docs/mockup/designs/entity-page.jsx.
-  export function typeSize(type: string): string {
-    const mm = type.match(/\(([^)]+)\)/);
-    if (mm) return mm[1];
-    if (type.endsWith('[]')) return '[]';
-    return '—';
-  }
-  export function baseType(type: string): string {
-    return type.replace(/\([^)]*\)/, '').replace(/\[\]$/, '');
-  }
-</script>
-
 <script lang="ts">
-  import Icon from '$lib/design/Icon.svelte';
   import { nodeId, type Column, type Ref, type SchemaModel } from '$lib/design/model';
   import Tabs from './Tabs.svelte';
   import EntityDiagram from './EntityDiagram.svelte';
-  import { noteBlocks, type Seg } from './md';
+  import Markdown from './Markdown.svelte';
+  import { noteBlocks } from './md';
 
   let {
     model,
@@ -39,28 +26,44 @@
   const fkCols = $derived(new Set(outRefs.map((r) => r.from.c)));
   const refsForCol = (col: string): Ref[] => outRefs.filter((r) => r.from.c === col);
 
+  // `uq` is v2. A v1 payload says the same thing only as a unique index on one plain column,
+  // so both count — an expression index like `(lower(email))` names no column and does not.
+  const uniqueCols = $derived(
+    new Set([
+      ...(table?.columns.filter((c) => c.uq).map((c) => c.name) ?? []),
+      ...(table?.indexes ?? [])
+        .filter((ix) => ix.unique)
+        .map((ix) => ix.def.replace(/^\(|\)$/g, '').trim())
+        .filter((col) => /^[A-Za-z_][\w$]*$/.test(col)),
+    ]),
+  );
+
   type Badge = { label: string; cls: string };
   function propBadges(c: Column): Badge[] {
     const out: Badge[] = [];
     if (c.pk) out.push({ label: 'PK', cls: 'pk' });
-    if (fkCols.has(c.name)) out.push({ label: 'FK', cls: 'fk' });
+    if (c.fk || fkCols.has(c.name)) out.push({ label: 'FK', cls: 'fk' });
     if (c.nn) out.push({ label: 'NN', cls: '' });
+    if (uniqueCols.has(c.name) && !c.pk) out.push({ label: 'UNIQUE', cls: '' });
     if (c.en) out.push({ label: 'ENUM', cls: '' });
     return out;
   }
 
-  const comment = $derived(noteBlocks(table?.noteMd));
+  const comment = $derived(noteBlocks(table?.noteMd ?? table?.note));
+
+  // `deps` is v2: a v1 payload has no dependency graph at all, which is different from a
+  // table nothing depends on — the first omits the section, the second says so.
+  const hasDeps = $derived(model.deps !== undefined);
+  const usedBy = $derived(
+    (model.deps ?? []).filter(
+      (d) => d.to.s === schema && d.to.n === name && !(d.from.s === schema && d.from.n === name),
+    ),
+  );
+  const kindOf = (s: string, n: string): string =>
+    model.entities?.find((e) => e.schema === s && e.name === n)?.kind.replace(/_/g, ' ') ??
+    (model.tables.some((t) => t.schema === s && t.name === n) ? 'table' : 'unknown');
 </script>
 
-{#snippet segs(parts: Seg[])}
-  {#each parts as part (part.text)}
-    {#if part.code}
-      <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;">{part.text}</code>
-    {:else}
-      {part.text}
-    {/if}
-  {/each}
-{/snippet}
 
 {#if table}
   <div class="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -91,85 +94,179 @@
     </div>
 
     {#if tab === 'details'}
+      <!-- Full width, on the header's left edge: the fields table has six columns and a
+           centred measure starved the notes. -->
       <div class="ds-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-bg">
-        <div class="mx-auto max-w-4xl px-6 py-6">
-          {#if comment.length}
-            <section class="mb-8">
-              <h2 class="font-mono text-label uppercase text-faint">Comment</h2>
-              <div class="mt-3 flex flex-col gap-2 text-sm leading-relaxed text-muted">
-                {#each comment as block (block)}
-                  {#if block.type === 'ul'}
-                    <ul class="flex list-disc flex-col gap-1 pl-5">
-                      {#each block.lines as line (line)}<li>{@render segs(line)}</li>{/each}
-                    </ul>
-                  {:else}
-                    <p>{@render segs(block.lines[0])}</p>
-                  {/if}
-                {/each}
-              </div>
-            </section>
-          {/if}
+        <div class="px-6 py-6">
+          <section data-section="info">
+            <h2 class="font-mono text-label uppercase text-faint">Table info</h2>
+            <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
+              {#if comment.length}
+                <Markdown blocks={comment} />
+              {:else}
+                <p class="text-faint">No comment on this table — add one with <code
+                    class="rounded bg-code-bg px-1 font-mono text-accent-2"
+                    style="font-size: 0.85em;">COMMENT ON TABLE</code>.</p>
+              {/if}
+            </div>
+          </section>
 
-          <section>
-            <h2 class="font-mono text-label uppercase text-faint">Columns</h2>
-            <table class="mt-3 w-full table-fixed border-collapse text-left">
-              <colgroup>
-                <col style="width: 30%;" />
-                <col style="width: 104px;" />
-                <col style="width: 130px;" />
-                <col style="width: 64px;" />
-                <col />
-              </colgroup>
-              <thead>
-                <tr class="font-mono text-xs uppercase tracking-wider text-faint">
-                  <th class="ds-th py-2.5 pr-4 font-medium">Column</th>
-                  <th class="ds-th py-2.5 pr-4 font-medium">Props</th>
-                  <th class="ds-th py-2.5 pr-4 font-medium">Type</th>
-                  <th class="ds-th py-2.5 pr-4 font-medium">Size</th>
-                  <th class="ds-th py-2.5 font-medium">Refs</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each table.columns as c (c.name)}
-                  {@const rr = refsForCol(c.name)}
-                  <tr data-col-row={c.name} class="border-b border-line-soft align-top">
-                    <td class="py-2.5 pr-4">
-                      <div class="font-mono text-xs font-semibold text-fg" style="overflow-wrap: anywhere;">{c.name}</div>
-                      {#if c.note}<div class="mt-0.5 text-xs leading-snug text-muted">{c.note}</div>{/if}
-                      {#if c.def}<div class="mt-0.5 font-mono text-faint" style="font-size: 0.66rem;">default: {c.def}</div>{/if}
-                    </td>
-                    <td class="py-2.5 pr-4">
-                      <div class="flex flex-wrap gap-1">
-                        {#each propBadges(c) as b (b.label)}<span class="col-badge {b.cls}">{b.label}</span>{/each}
-                      </div>
-                    </td>
-                    <td class="py-2.5 pr-4 font-mono text-xs text-muted" style="overflow-wrap: anywhere;">{baseType(c.type)}</td>
-                    <td class="whitespace-nowrap py-2.5 pr-4 font-mono text-xs text-faint">{typeSize(c.type)}</td>
-                    <td class="py-2.5">
-                      {#if rr.length}
+          <section data-section="fields" class="mt-8">
+            <h2 class="font-mono text-label uppercase text-faint">
+              Fields <span class="text-faint">· {table.columns.length}</span>
+            </h2>
+            <!-- Scrolls sideways below its minimum rather than squeezing Notes to nothing. -->
+            <div class="mt-3 overflow-x-auto">
+              <table class="w-full table-fixed border-collapse text-left" style="min-width: 56rem;">
+                <colgroup>
+                  <col style="width: 16%;" />
+                  <col style="width: 13%;" />
+                  <col style="width: 150px;" />
+                  <col style="width: 12%;" />
+                  <col style="width: 18%;" />
+                  <col />
+                </colgroup>
+                <thead>
+                  <tr class="font-mono text-xs uppercase tracking-wider text-faint">
+                    <th class="ds-th py-2.5 pr-4 font-medium">Name</th>
+                    <th class="ds-th py-2.5 pr-4 font-medium">Type</th>
+                    <th class="ds-th py-2.5 pr-4 font-medium">Settings</th>
+                    <th class="ds-th py-2.5 pr-4 font-medium">Default</th>
+                    <th class="ds-th py-2.5 pr-4 font-medium">References</th>
+                    <th class="ds-th py-2.5 font-medium">Notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each table.columns as c (c.name)}
+                    {@const rr = refsForCol(c.name)}
+                    {@const note = noteBlocks(c.note)}
+                    <tr data-col-row={c.name} class="border-b border-line-soft align-top">
+                      <td
+                        data-cell="name"
+                        class="py-2.5 pr-4 font-mono text-xs font-semibold text-fg"
+                        style="overflow-wrap: anywhere;">{c.name}</td
+                      >
+                      <td
+                        data-cell="type"
+                        class="py-2.5 pr-4 font-mono text-xs text-muted"
+                        style="overflow-wrap: anywhere;">{c.type}</td
+                      >
+                      <td data-cell="settings" class="py-2.5 pr-4">
+                        <div class="flex flex-wrap gap-1">
+                          {#each propBadges(c) as b (b.label)}<span data-badge class="col-badge {b.cls}"
+                              >{b.label}</span
+                            >{/each}
+                        </div>
+                      </td>
+                      <td
+                        data-cell="default"
+                        class="py-2.5 pr-4 font-mono text-xs {c.def ? 'text-muted' : 'text-faint'}"
+                        style="overflow-wrap: anywhere;">{c.def ?? '—'}</td
+                      >
+                      <td data-cell="refs" class="py-2.5 pr-4">
                         {#each rr as r (r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                          <!-- Wraps rather than truncates: a cut-off target is a broken link label. -->
                           <button
                             type="button"
-                            class="block max-w-full truncate font-mono text-xs text-accent-2 hover:underline"
-                            title={'→ ' + r.to.s + '.' + r.to.t + '.' + r.to.c}
+                            class="block max-w-full text-left font-mono text-xs text-accent-2 hover:underline"
+                            style="overflow-wrap: anywhere;"
                             onclick={() => onNav(nodeId(r.to.s, r.to.t))}
                           >
                             → {r.to.s}.{r.to.t}.{r.to.c}
                           </button>
+                        {:else}
+                          <span class="font-mono text-xs text-faint">—</span>
                         {/each}
-                      {:else}
-                        <span class="font-mono text-xs text-faint">—</span>
-                      {/if}
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
+                      </td>
+                      <td data-cell="notes" class="py-2.5 text-xs leading-snug text-muted">
+                        {#if note.length}
+                          <div class="flex flex-col gap-1"><Markdown blocks={note} /></div>
+                        {:else}
+                          <span class="text-faint">—</span>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
           </section>
 
+          <section data-section="references" class="mt-8">
+            <h2 class="font-mono text-label uppercase text-faint">
+              References <span class="text-faint">· {outRefs.length + inRefs.length}</span>
+            </h2>
+            {#if outRefs.length || inRefs.length}
+              <div class="mt-3 flex flex-col">
+                {#each outRefs as r (r.from.c + '>' + r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                  <button
+                    data-ref="out"
+                    type="button"
+                    class="flex items-center gap-3 border-b border-line-soft py-2.5 text-left font-mono text-xs text-muted last:border-0 hover:text-fg"
+                    onclick={() => onNav(nodeId(r.to.s, r.to.t))}
+                  >
+                    <span class="col-badge">out</span>
+                    <span
+                      ><span class="text-fg">{r.from.c}</span> → <span class="font-semibold text-accent-2"
+                        >{r.to.s}.{r.to.t}</span
+                      >.{r.to.c}</span
+                    >
+                    {#if r.action}<span class="col-badge ml-auto">{r.action}</span>{/if}
+                  </button>
+                {/each}
+                {#each inRefs as r (r.from.s + '.' + r.from.t + '.' + r.from.c + '>' + r.to.c)}
+                  <button
+                    data-ref="in"
+                    type="button"
+                    class="flex items-center gap-3 border-b border-line-soft py-2.5 text-left font-mono text-xs text-muted last:border-0 hover:text-fg"
+                    onclick={() => onNav(nodeId(r.from.s, r.from.t))}
+                  >
+                    <span class="col-badge">in</span>
+                    <span
+                      ><span class="font-semibold text-accent-2">{r.from.s}.{r.from.t}</span
+                      >.{r.from.c} → <span class="text-fg">{r.to.c}</span></span
+                    >
+                    {#if r.action}<span class="col-badge ml-auto">{r.action}</span>{/if}
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <p class="mt-3 text-sm text-faint">No foreign keys in or out.</p>
+            {/if}
+          </section>
+
+          {#if hasDeps}
+            <section data-section="dependencies" class="mt-8">
+              <h2 class="font-mono text-label uppercase text-faint">
+                Dependencies <span class="text-faint">· {usedBy.length}</span>
+              </h2>
+              {#if usedBy.length}
+                <div class="mt-3 flex flex-col">
+                  {#each usedBy as d (d.from.s + '.' + d.from.n + ':' + d.kind)}
+                    <div
+                      data-dep={nodeId(d.from.s, d.from.n)}
+                      class="flex items-center gap-3 border-b border-line-soft py-2.5 font-mono text-xs text-muted last:border-0 {d.unresolved
+                        ? 'opacity-60'
+                        : ''}"
+                      title={d.unresolved ? 'Not defined in this project' : undefined}
+                    >
+                      <span class="font-semibold text-fg">{d.from.s}.{d.from.n}</span>
+                      <span class="col-badge">{kindOf(d.from.s, d.from.n)}</span>
+                      <span class="ml-auto text-faint">{d.kind}</span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="mt-3 text-sm text-faint">Nothing reads, writes or calls this table.</p>
+              {/if}
+            </section>
+          {/if}
+
           {#if table.indexes?.length}
-            <section class="mt-8">
-              <h2 class="font-mono text-label uppercase text-faint">Indexes</h2>
+            <section data-section="indexes" class="mt-8 pb-6">
+              <h2 class="font-mono text-label uppercase text-faint">
+                Indexes <span class="text-faint">· {table.indexes.length}</span>
+              </h2>
               <div class="mt-3 flex flex-col gap-0">
                 {#each table.indexes as ix (ix.def)}
                   <div class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0">
@@ -177,27 +274,6 @@
                     {#if ix.unique}<span class="col-badge pk">UNIQUE</span>{/if}
                     {#if ix.name}<span class="ml-auto font-mono text-faint" style="font-size: 0.66rem;">{ix.name}</span>{/if}
                   </div>
-                {/each}
-              </div>
-            </section>
-          {/if}
-
-          {#if inRefs.length}
-            <section class="mt-8 pb-6">
-              <h2 class="font-mono text-label uppercase text-faint">Referenced by</h2>
-              <div class="mt-3 flex flex-col">
-                {#each inRefs as r (r.from.s + '.' + r.from.t + '.' + r.from.c)}
-                  <button
-                    type="button"
-                    class="flex items-center gap-2 border-b border-line-soft py-2.5 text-left font-mono text-xs text-muted last:border-0 hover:text-fg"
-                    onclick={() => onNav(nodeId(r.from.s, r.from.t))}
-                  >
-                    <span class="font-semibold text-accent-2">{r.from.s}.{r.from.t}</span>
-                    <span class="text-faint">.{r.from.c}</span>
-                    <Icon name="arrowR" size={12} class="text-faint" />
-                    <span>{r.to.c}</span>
-                    {#if r.action}<span class="col-badge ml-auto">{r.action}</span>{/if}
-                  </button>
                 {/each}
               </div>
             </section>
