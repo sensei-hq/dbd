@@ -118,6 +118,26 @@ pub enum Op {
 /// that cannot be read is an error rather than a skipped version: a history with a
 /// silent hole would attribute that version's changes to the next one.
 pub fn load(project_dir: &Path) -> Result<Vec<HistoryEntry>> {
+    Ok(from_snapshots(&read_all(project_dir)?))
+}
+
+/// [`load`], seen through a scope: only the tables and enums in `schemas`.
+///
+/// Filtered *before* the diff, so the baseline counts the scope and a version
+/// lists only what it changed there. Not applied to an unscoped read, where
+/// filtering by the schemas that exist today would hide a table that went away
+/// along with its whole schema.
+pub fn load_scoped(project_dir: &Path, schemas: &[String]) -> Result<Vec<HistoryEntry>> {
+    let mut snapshots = read_all(project_dir)?;
+    for snap in &mut snapshots {
+        snap.tables.retain(|t| schemas.contains(&t.schema));
+        snap.enums.retain(|e| schemas.contains(&e.schema));
+    }
+    Ok(from_snapshots(&snapshots))
+}
+
+/// Every snapshot, oldest first, canonicalised the way snapshot creation does.
+fn read_all(project_dir: &Path) -> Result<Vec<Snapshot>> {
     let mut snapshots = Vec::new();
     for info in snapshot::list_snapshots(project_dir) {
         let snap = snapshot::read_snapshot(info.version, project_dir)?.ok_or_else(|| {
@@ -125,7 +145,7 @@ pub fn load(project_dir: &Path) -> Result<Vec<HistoryEntry>> {
         })?;
         snapshots.push(snapshot::canonical_types(&snap));
     }
-    Ok(from_snapshots(&snapshots))
+    Ok(snapshots)
 }
 
 /// The history of an ordered run of snapshots, already canonicalised.

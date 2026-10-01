@@ -53,7 +53,22 @@ pub fn cmd_diagram(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let model = dbd_core::schema_model::build(&design, Some(&resolved));
+    let mut model = dbd_core::schema_model::build(&design, Some(&resolved));
+
+    // The changelog (#29). Scoped only when a scope was asked for: filtering by
+    // the schemas that exist today would hide a table dropped with its schema.
+    let history = match scope {
+        Some(_) => {
+            let schemas: Vec<String> = model.schemas.iter().map(|s| s.name.clone()).collect();
+            dbd_core::history::load_scoped(project_dir, &schemas)
+        }
+        None => dbd_core::history::load(project_dir),
+    };
+    match history {
+        Ok(history) => model.history = history,
+        // The diagram is still right without it; a history with a hole would not be.
+        Err(e) => output::warn(&format!("changelog omitted — {e}")),
+    }
 
     if json {
         let s = serde_json::to_string_pretty(&model).context("Failed to serialize schema model")?;
