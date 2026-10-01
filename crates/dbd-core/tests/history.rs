@@ -314,3 +314,44 @@ fn a_corrupt_snapshot_is_an_error_not_a_gap() {
         "a history with a silent hole would misreport what changed"
     );
 }
+
+#[test]
+fn a_scoped_history_counts_and_lists_only_its_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![
+            table("app", "orders", vec![pk("id", "uuid")]),
+            table("billing", "invoices", vec![pk("id", "uuid")]),
+        ],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "both schemas move",
+        vec![
+            table("app", "orders", vec![pk("id", "uuid"), col("note", "text")]),
+            table(
+                "billing",
+                "invoices",
+                vec![pk("id", "uuid"), col("paid_at", "timestamptz")],
+            ),
+        ],
+        vec![],
+    );
+    let h = serde_json::to_value(history::load_scoped(dir.path(), &["app".to_string()]).unwrap()).unwrap();
+    assert_eq!(
+        h[0]["baseline"],
+        json!({ "tables": 1, "enums": 0 }),
+        "the baseline counts the scope, not the project"
+    );
+    assert_eq!(
+        h[1]["changes"],
+        json!([{ "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
+            { "kind": "column", "name": "note", "op": "added", "to": "text" }
+        ]}])
+    );
+}

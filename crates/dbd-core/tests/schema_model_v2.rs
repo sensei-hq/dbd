@@ -115,15 +115,17 @@ fn table_and_column_comments_survive() {
 
 #[test]
 fn the_model_states_its_version() {
+    // 3 since #29 added `history`; everything v2 added is unchanged, which the
+    // rest of this file holds it to.
     let tmp = tempfile::tempdir().unwrap();
-    assert_eq!(model(tmp.path()).version, 2);
+    assert_eq!(model(tmp.path()).version, 3);
 }
 
 #[test]
 fn the_version_is_serialized() {
     let tmp = tempfile::tempdir().unwrap();
     let json = serde_json::to_string(&model(tmp.path())).unwrap();
-    assert!(json.contains("\"version\":2"), "a consumer must be able to read it");
+    assert!(json.contains("\"version\":3"), "a consumer must be able to read it");
 }
 
 // ── Non-table entities ──────────────────────────────────────────────────────
