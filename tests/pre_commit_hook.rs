@@ -57,10 +57,10 @@ fn effective_commands() -> Vec<String> {
     let hook = hook_text();
     let mut lines: Vec<String> = hook.lines().map(str::to_string).collect();
 
-    for target in ["_check-ci"] {
-        if hook.contains(&format!("make {target}")) {
-            lines.extend(make_dry_run(target).lines().map(str::to_string));
-        }
+    // The one make target the hook delegates to.
+    let target = "_check-ci";
+    if hook.contains(&format!("make {target}")) {
+        lines.extend(make_dry_run(target).lines().map(str::to_string));
     }
     lines
 }
