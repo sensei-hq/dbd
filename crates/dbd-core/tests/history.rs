@@ -31,7 +31,11 @@ fn write(dir: &Path, version: u32, description: &str, tables: Vec<Value>, enums:
     let snap = json!({ "version": version, "description": description,
                        "timestamp": format!("2026-09-{:02}T10:00:00Z", version),
                        "tables": tables, "enums": enums });
-    std::fs::write(snapshots.join(format!("{version:03}.json")), serde_json::to_string_pretty(&snap).unwrap()).unwrap();
+    std::fs::write(
+        snapshots.join(format!("{version:03}.json")),
+        serde_json::to_string_pretty(&snap).unwrap(),
+    )
+    .unwrap();
 }
 
 fn history_json(dir: &Path) -> Value {
@@ -47,64 +51,119 @@ fn a_project_with_no_snapshots_has_no_history() {
 #[test]
 fn the_first_snapshot_is_a_baseline_of_counts_not_a_list_of_everything_added() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "v1 GA",
-        vec![table("app", "orders", vec![pk("id", "uuid")]), table("app", "customers", vec![pk("id", "uuid")])],
-        vec![json!({ "name": "order_status", "schema": "app", "values": ["pending", "paid"] })]);
-    assert_eq!(history_json(dir.path()), json!([{
-        "version": 1, "description": "v1 GA", "timestamp": "2026-09-01T10:00:00Z",
-        "baseline": { "tables": 2, "enums": 1 }, "changes": []
-    }]));
+    write(
+        dir.path(),
+        1,
+        "v1 GA",
+        vec![
+            table("app", "orders", vec![pk("id", "uuid")]),
+            table("app", "customers", vec![pk("id", "uuid")]),
+        ],
+        vec![json!({ "name": "order_status", "schema": "app", "values": ["pending", "paid"] })],
+    );
+    assert_eq!(
+        history_json(dir.path()),
+        json!([{
+            "version": 1, "description": "v1 GA", "timestamp": "2026-09-01T10:00:00Z",
+            "baseline": { "tables": 2, "enums": 1 }, "changes": []
+        }])
+    );
 }
 
 #[test]
 fn a_version_lists_what_changed_since_the_one_before_it() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "baseline", vec![table("app", "orders", vec![pk("id", "uuid"), col("status", "text")])], vec![]);
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "orders", vec![pk("id", "uuid"), col("status", "text")])],
+        vec![],
+    );
     let mut status = col("status", "text");
     status["nullable"] = json!(false);
     status["default_value"] = json!("'pending'");
-    write(dir.path(), 2, "orders get a placed_at",
+    write(
+        dir.path(),
+        2,
+        "orders get a placed_at",
         vec![
-            table("app", "orders", vec![pk("id", "uuid"), status, col("placed_at", "timestamptz")]),
+            table(
+                "app",
+                "orders",
+                vec![pk("id", "uuid"), status, col("placed_at", "timestamptz")],
+            ),
             table("app", "customers", vec![pk("id", "uuid")]),
         ],
-        vec![json!({ "name": "order_status", "schema": "app", "values": ["pending"] })]);
+        vec![json!({ "name": "order_status", "schema": "app", "values": ["pending"] })],
+    );
 
     let h = history_json(dir.path());
-    assert_eq!(h[1], json!({
-        "version": 2, "description": "orders get a placed_at", "timestamp": "2026-09-02T10:00:00Z",
-        "changes": [
-            { "kind": "table", "schema": "app", "name": "customers", "op": "added", "fields": [] },
-            { "kind": "enum", "schema": "app", "name": "order_status", "op": "added", "fields": [] },
-            { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
-                { "kind": "column", "name": "placed_at", "op": "added", "to": "timestamp with time zone" },
-                { "kind": "column", "name": "status", "op": "modified",
-                  "from": "text", "to": "text not null default 'pending'" }
-            ]}
-        ]
-    }));
+    assert_eq!(
+        h[1],
+        json!({
+            "version": 2, "description": "orders get a placed_at", "timestamp": "2026-09-02T10:00:00Z",
+            "changes": [
+                { "kind": "table", "schema": "app", "name": "customers", "op": "added", "fields": [] },
+                { "kind": "enum", "schema": "app", "name": "order_status", "op": "added", "fields": [] },
+                { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
+                    { "kind": "column", "name": "placed_at", "op": "added", "to": "timestamp with time zone" },
+                    { "kind": "column", "name": "status", "op": "modified",
+                      "from": "text", "to": "text not null default 'pending'" }
+                ]}
+            ]
+        })
+    );
 }
 
 #[test]
 fn a_dropped_table_and_column_are_removals() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "baseline",
-        vec![table("app", "orders", vec![pk("id", "uuid"), col("legacy", "text")]), table("app", "old", vec![pk("id", "uuid")])],
-        vec![]);
-    write(dir.path(), 2, "prune", vec![table("app", "orders", vec![pk("id", "uuid")])], vec![]);
-    assert_eq!(history_json(dir.path())[1]["changes"], json!([
-        { "kind": "table", "schema": "app", "name": "old", "op": "removed", "fields": [] },
-        { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
-            { "kind": "column", "name": "legacy", "op": "removed", "from": "text" }
-        ]}
-    ]));
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![
+            table("app", "orders", vec![pk("id", "uuid"), col("legacy", "text")]),
+            table("app", "old", vec![pk("id", "uuid")]),
+        ],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "prune",
+        vec![table("app", "orders", vec![pk("id", "uuid")])],
+        vec![],
+    );
+    assert_eq!(
+        history_json(dir.path())[1]["changes"],
+        json!([
+            { "kind": "table", "schema": "app", "name": "old", "op": "removed", "fields": [] },
+            { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
+                { "kind": "column", "name": "legacy", "op": "removed", "from": "text" }
+            ]}
+        ])
+    );
 }
 
 #[test]
 fn a_type_spelled_two_ways_is_not_a_change() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "baseline", vec![table("app", "t", vec![col("code", "varchar(32)")])], vec![]);
-    write(dir.path(), 2, "respelled", vec![table("app", "t", vec![col("code", "character varying(32)")])], vec![]);
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![col("code", "varchar(32)")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "respelled",
+        vec![table("app", "t", vec![col("code", "character varying(32)")])],
+        vec![],
+    );
     let h = history_json(dir.path());
     assert_eq!(h[1]["version"], json!(2), "the version is still listed — it was cut");
     assert_eq!(h[1]["changes"], json!([]));
@@ -113,33 +172,81 @@ fn a_type_spelled_two_ways_is_not_a_change() {
 #[test]
 fn a_two_stage_rename_is_one_version_and_reads_as_a_rename() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "baseline", vec![table("app", "t", vec![pk("id", "int"), col("nick", "text")])], vec![]);
-    write(dir.path(), 2, "rename nick (stage 1/2)",
-        vec![table("app", "t", vec![pk("id", "int"), col("nick", "text"), col("handle", "text")])], vec![]);
-    write(dir.path(), 3, "rename nick (stage 2/2)",
-        vec![table("app", "t", vec![pk("id", "int"), col("handle", "text")])], vec![]);
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![pk("id", "int"), col("nick", "text")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "rename nick (stage 1/2)",
+        vec![table(
+            "app",
+            "t",
+            vec![pk("id", "int"), col("nick", "text"), col("handle", "text")],
+        )],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "rename nick (stage 2/2)",
+        vec![table("app", "t", vec![pk("id", "int"), col("handle", "text")])],
+        vec![],
+    );
 
     let h = history_json(dir.path());
-    assert_eq!(h.as_array().unwrap().len(), 2, "baseline + one logical version, not three entries");
-    assert_eq!(h[1], json!({
-        "version": 2, "through": 3, "description": "rename nick", "timestamp": "2026-09-03T10:00:00Z",
-        "changes": [{ "kind": "table", "schema": "app", "name": "t", "op": "modified", "fields": [
-            { "kind": "column", "name": "handle", "op": "renamed", "from": "nick", "to": "handle" }
-        ]}]
-    }));
+    assert_eq!(
+        h.as_array().unwrap().len(),
+        2,
+        "baseline + one logical version, not three entries"
+    );
+    assert_eq!(
+        h[1],
+        json!({
+            "version": 2, "through": 3, "description": "rename nick", "timestamp": "2026-09-03T10:00:00Z",
+            "changes": [{ "kind": "table", "schema": "app", "name": "t", "op": "modified", "fields": [
+                { "kind": "column", "name": "handle", "op": "renamed", "from": "nick", "to": "handle" }
+            ]}]
+        })
+    );
 }
 
 #[test]
 fn a_two_stage_type_change_never_shows_the_intermediate_column() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), 1, "baseline", vec![table("app", "t", vec![col("n", "int")])], vec![]);
-    write(dir.path(), 2, "widen n (stage 1/2)", vec![table("app", "t", vec![col("n", "int"), col("n_new", "bigint")])], vec![]);
-    write(dir.path(), 3, "widen n (stage 2/2)", vec![table("app", "t", vec![col("n", "bigint")])], vec![]);
-    assert_eq!(history_json(dir.path())[1]["changes"], json!([
-        { "kind": "table", "schema": "app", "name": "t", "op": "modified", "fields": [
-            { "kind": "column", "name": "n", "op": "modified", "from": "integer", "to": "bigint" }
-        ]}
-    ]));
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![col("n", "int")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "widen n (stage 1/2)",
+        vec![table("app", "t", vec![col("n", "int"), col("n_new", "bigint")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "widen n (stage 2/2)",
+        vec![table("app", "t", vec![col("n", "bigint")])],
+        vec![],
+    );
+    assert_eq!(
+        history_json(dir.path())[1]["changes"],
+        json!([
+            { "kind": "table", "schema": "app", "name": "t", "op": "modified", "fields": [
+                { "kind": "column", "name": "n", "op": "modified", "from": "integer", "to": "bigint" }
+            ]}
+        ])
+    );
 }
 
 #[test]
@@ -148,31 +255,53 @@ fn enum_values_added_and_removed() {
     let e = |values: Vec<&str>| json!({ "name": "status", "schema": "app", "values": values });
     write(dir.path(), 1, "baseline", vec![], vec![e(vec!["a", "b", "c"])]);
     write(dir.path(), 2, "values", vec![], vec![e(vec!["a", "c", "d"])]);
-    assert_eq!(history_json(dir.path())[1]["changes"], json!([
-        { "kind": "enum", "schema": "app", "name": "status", "op": "modified", "fields": [
-            { "kind": "value", "name": "b", "op": "removed" },
-            { "kind": "value", "name": "d", "op": "added" }
-        ]}
-    ]));
+    assert_eq!(
+        history_json(dir.path())[1]["changes"],
+        json!([
+            { "kind": "enum", "schema": "app", "name": "status", "op": "modified", "fields": [
+                { "kind": "value", "name": "b", "op": "removed" },
+                { "kind": "value", "name": "d", "op": "added" }
+            ]}
+        ])
+    );
 }
 
 #[test]
 fn indexes_and_constraints_are_named_by_what_they_are() {
     let dir = tempfile::tempdir().unwrap();
-    let base = table("app", "orders", vec![pk("id", "uuid"), col("customer_id", "uuid"), col("email", "text")]);
-    write(dir.path(), 1, "baseline", vec![base.clone(), table("app", "customers", vec![pk("id", "uuid")])], vec![]);
+    let base = table(
+        "app",
+        "orders",
+        vec![pk("id", "uuid"), col("customer_id", "uuid"), col("email", "text")],
+    );
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![base.clone(), table("app", "customers", vec![pk("id", "uuid")])],
+        vec![],
+    );
     let mut next = base;
     next["indexes"] = json!([{ "name": "orders_email_key", "columns": [{ "name": "email", "is_expression": false,
         "order": null, "nulls_first": null, "opclass": null }], "unique": true, "index_type": null }]);
     next["table_constraints"] = json!([{ "type": "foreign_key", "name": null, "columns": ["customer_id"],
         "ref_schema": "app", "ref_table": "customers", "ref_columns": ["id"], "on_delete": null, "on_update": null }]);
-    write(dir.path(), 2, "keys", vec![next, table("app", "customers", vec![pk("id", "uuid")])], vec![]);
-    assert_eq!(history_json(dir.path())[1]["changes"], json!([
-        { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
-            { "kind": "constraint", "name": "foreign key (customer_id) → app.customers (id)", "op": "added" },
-            { "kind": "index", "name": "orders_email_key", "op": "added", "to": "unique (email)" }
-        ]}
-    ]));
+    write(
+        dir.path(),
+        2,
+        "keys",
+        vec![next, table("app", "customers", vec![pk("id", "uuid")])],
+        vec![],
+    );
+    assert_eq!(
+        history_json(dir.path())[1]["changes"],
+        json!([
+            { "kind": "table", "schema": "app", "name": "orders", "op": "modified", "fields": [
+                { "kind": "constraint", "name": "foreign key (customer_id) → app.customers (id)", "op": "added" },
+                { "kind": "index", "name": "orders_email_key", "op": "added", "to": "unique (email)" }
+            ]}
+        ])
+    );
 }
 
 #[test]
@@ -180,5 +309,8 @@ fn a_corrupt_snapshot_is_an_error_not_a_gap() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), 1, "baseline", vec![], vec![]);
     std::fs::write(dir.path().join("snapshots/002.json"), "{ not json").unwrap();
-    assert!(history::load(dir.path()).is_err(), "a history with a silent hole would misreport what changed");
+    assert!(
+        history::load(dir.path()).is_err(),
+        "a history with a silent hole would misreport what changed"
+    );
 }
