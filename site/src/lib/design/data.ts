@@ -45,6 +45,7 @@ const ROOT_TABS: Tab[] = [
   { id: 'overview', label: 'Overview', icon: 'doc' },
   { id: 'diagram', label: 'Diagram', icon: 'grid' },
   { id: 'entities', label: 'Entities', icon: 'rows' },
+  { id: 'changelog', label: 'Changelog', icon: 'clock' },
 ];
 
 /** Header data for a project, with an optional drilled-into entity crumb. */
@@ -82,7 +83,7 @@ export function buildContentHeaderData(model: SchemaModel, activeTab = 'overview
 
 // ---- sample schema (2 schemas, cross-schema refs, enums, notes) ----
 export const sampleModel: SchemaModel = {
-  version: 2,
+  version: 3,
   project: { name: 'shopdb', db: 'postgresql', note: 'Storefront catalog, customers and orders.' },
   schemas: [
     { name: 'auth', tables: 2, enums: 0 },
@@ -183,6 +184,72 @@ export const sampleModel: SchemaModel = {
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'orders' }, kind: 'writes' },
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'order_items' }, kind: 'writes' },
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'products' }, kind: 'reads' },
+  ],
+  // v3: four versions, so the bundled sample shows a changelog — a baseline, an addition, a
+  // two-stage rename and a type change. Shaped as `dbd diagram` emits it: oldest first,
+  // changes sorted by schema then name.
+  history: [
+    {
+      version: 1,
+      description: 'v1 GA',
+      timestamp: '2026-06-02T09:00:00Z',
+      baseline: { tables: 5, enums: 1 },
+      changes: [],
+    },
+    {
+      version: 2,
+      description: 'order line items',
+      timestamp: '2026-07-14T16:20:00Z',
+      changes: [
+        { kind: 'table', schema: 'shop', name: 'order_items', op: 'added', fields: [] },
+        {
+          kind: 'table',
+          schema: 'shop',
+          name: 'orders',
+          op: 'modified',
+          fields: [{ kind: 'column', name: 'placed_at', op: 'added', to: 'timestamp with time zone not null default now()' }],
+        },
+      ],
+    },
+    {
+      version: 3,
+      through: 4,
+      description: 'rename display_name',
+      timestamp: '2026-08-20T11:05:00Z',
+      changes: [
+        {
+          kind: 'table',
+          schema: 'auth',
+          name: 'users',
+          op: 'modified',
+          fields: [{ kind: 'column', name: 'name', op: 'renamed', from: 'display_name', to: 'name' }],
+        },
+      ],
+    },
+    {
+      version: 5,
+      description: 'totals in cents',
+      timestamp: '2026-09-18T08:40:00Z',
+      changes: [
+        {
+          kind: 'enum',
+          schema: 'shop',
+          name: 'order_status',
+          op: 'modified',
+          fields: [{ kind: 'value', name: 'cancelled', op: 'added' }],
+        },
+        {
+          kind: 'table',
+          schema: 'shop',
+          name: 'orders',
+          op: 'modified',
+          fields: [
+            { kind: 'column', name: 'total_cents', op: 'modified', from: 'numeric(10,2)', to: 'integer not null default 0' },
+            { kind: 'index', name: 'orders_status_placed_idx', op: 'added', to: '(status, placed_at)' },
+          ],
+        },
+      ],
+    },
   ],
 };
 
