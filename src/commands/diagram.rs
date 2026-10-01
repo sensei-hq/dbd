@@ -209,6 +209,88 @@ mod tests {
         assert!(model.get("history").is_none());
     }
 
+    fn table_snapshot(schema: &str, name: &str) -> String {
+        format!(
+            r#"{{ "name": "{name}", "schema": "{schema}", "indexes": [], "table_constraints": [], "columns": [
+                {{ "name": "id", "data_type": "integer", "nullable": false, "default_value": null,
+                   "is_pk": true, "is_unique": false, "comment": null, "inline_fk": null }}] }}"#
+        )
+    }
+
+    fn snapshot_json(version: u32, tables: &[String]) -> String {
+        format!(
+            r#"{{ "version": {version}, "description": "v{version}", "timestamp": "2026-09-0{version}T10:00:00Z",
+                 "tables": [{}], "enums": [] }}"#,
+            tables.join(",")
+        )
+    }
+
+    /// A fixture copy with two extra scopes: one table, and one schema.
+    fn scoped_project() -> tempfile::TempDir {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&cfg).unwrap().replacen(
+            "scopes:\n",
+            "scopes:\n  one_table:\n    includes:\n      - config.lookups\n  staging_only:\n    includes:\n      - staging\n",
+            1,
+        );
+        std::fs::write(&cfg, yaml).unwrap();
+        proj
+    }
+
+    fn diagram_json_scoped(project: &std::path::Path, scope: &str) -> serde_json::Value {
+        let out = project.join("model.json");
+        cmd_diagram(
+            &project.join("design.yaml"),
+            "dev",
+            project,
+            true,
+            &out,
+            false,
+            None,
+            Some(scope),
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+
+    /// A scope is a set of entities, not of schemas: the changelog of a one-table
+    /// scope counts that table and lists only its changes.
+    #[test]
+    fn a_scoped_changelog_covers_the_scopes_entities_not_their_schemas() {
+        let proj = scoped_project();
+        let three = [
+            table_snapshot("config", "lookups"),
+            table_snapshot("config", "lookup_values"),
+            table_snapshot("config", "extra"),
+        ];
+        write_snapshot(proj.path(), "001.json", &snapshot_json(1, &three));
+        write_snapshot(proj.path(), "002.json", &snapshot_json(2, &three[..2]));
+        let model = diagram_json_scoped(proj.path(), "one_table");
+        assert_eq!(model["history"][0]["baseline"]["tables"], 1);
+        assert_eq!(model["history"][1]["changes"], serde_json::json!([]));
+    }
+
+    /// A table dropped since is still in the scope it was in: the scope is matched by
+    /// its own definition, not by what survives in today's design.
+    #[test]
+    fn a_scoped_changelog_keeps_the_drop_of_a_table_that_no_longer_exists() {
+        let proj = scoped_project();
+        write_snapshot(
+            proj.path(),
+            "001.json",
+            &snapshot_json(1, &[table_snapshot("staging", "raw")]),
+        );
+        write_snapshot(proj.path(), "002.json", &snapshot_json(2, &[]));
+        let model = diagram_json_scoped(proj.path(), "staging_only");
+        assert_eq!(
+            model["history"][1]["changes"],
+            serde_json::json!([{ "kind": "table", "schema": "staging", "name": "raw", "op": "removed", "fields": [] }])
+        );
+    }
+
     /// URL mode with `print_url = true` encodes + prints the URL and skips the
     /// browser-open (so it's safe and DB-free in tests).
     #[test]

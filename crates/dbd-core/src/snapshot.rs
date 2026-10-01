@@ -1502,6 +1502,31 @@ mod tests {
         assert!(graph.altered.contains(&"config.users".to_string()));
     }
 
+    /// A single-stage version says so structurally (#29): the changelog groups
+    /// stages by this marker, not by a description a person may have typed.
+    #[test]
+    fn a_single_stage_graph_records_stage_one_of_one() {
+        let prev = Snapshot {
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "int")],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let entities = vec![make_table_entity(
+            "config.users",
+            vec![col("id", "int"), col("email", "text")],
+        )];
+        let result = prepare_snapshot(&entities, Some(&prev), 2, "add email (stage 1/2)");
+        assert_eq!(result.graph.unwrap().stage, Some(MigrationStage { index: 1, of: 1 }));
+    }
+
     // ── SC3: No changes ─────────────────────────────────────
 
     #[test]
@@ -2138,6 +2163,19 @@ mod tests {
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
         assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
+        let stages: Vec<_> = result
+            .snapshots
+            .iter()
+            .map(|r| r.graph.as_ref().unwrap().stage)
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                Some(MigrationStage { index: 1, of: 2 }),
+                Some(MigrationStage { index: 2, of: 2 })
+            ],
+            "each stage's graph names its place in the run"
+        );
         // Stage 1 should have data.sql file
         assert!(
             result.snapshots[0]

@@ -342,7 +342,7 @@ fn a_scoped_history_counts_and_lists_only_its_schemas() {
         ],
         vec![],
     );
-    let h = serde_json::to_value(history::load_scoped(dir.path(), &["app".to_string()]).unwrap()).unwrap();
+    let h = serde_json::to_value(history::load_scoped(dir.path(), |schema, _| schema == "app").unwrap()).unwrap();
     assert_eq!(
         h[0]["baseline"],
         json!({ "tables": 1, "enums": 0 }),
@@ -354,4 +354,219 @@ fn a_scoped_history_counts_and_lists_only_its_schemas() {
             { "kind": "column", "name": "note", "op": "added", "to": "text" }
         ]}])
     );
+}
+
+/// `migrations/NNN/graph.json`, the way `dbd snapshot` writes it since #29 — with
+/// its place in a multi-stage run.
+fn graph(dir: &Path, version: u32, index: u32, of: u32) {
+    let d = dir.join("migrations").join(format!("{version:03}"));
+    std::fs::create_dir_all(&d).unwrap();
+    let g = json!({ "fromVersion": version - 1, "toVersion": version, "added": [], "altered": [], "dropped": [],
+                    "stage": { "index": index, "of": of } });
+    std::fs::write(d.join("graph.json"), g.to_string()).unwrap();
+}
+
+#[test]
+fn an_extension_index_names_its_access_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = table("app", "docs", vec![pk("id", "uuid"), col("embedding", "vector(3)")]);
+    write(dir.path(), 1, "baseline", vec![t.clone()], vec![]);
+    let mut next = t;
+    next["indexes"] = json!([{ "name": "docs_embedding_idx", "columns": [{ "name": "embedding", "is_expression": false,
+        "order": null, "nulls_first": null, "opclass": null }], "unique": false, "index_type": { "other": "hnsw" } }]);
+    write(dir.path(), 2, "ann", vec![next], vec![]);
+    assert_eq!(
+        history_json(dir.path())[1]["changes"][0]["fields"][0]["to"],
+        json!("(embedding) using hnsw")
+    );
+}
+
+#[test]
+fn a_rename_that_also_tightens_the_column_says_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = col("handle", "text");
+    handle["nullable"] = json!(false);
+    handle["default_value"] = json!("''");
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![pk("id", "int"), col("nick", "text")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "rename nick (stage 1/2)",
+        vec![table(
+            "app",
+            "t",
+            vec![pk("id", "int"), col("nick", "text"), handle.clone()],
+        )],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "rename nick (stage 2/2)",
+        vec![table("app", "t", vec![pk("id", "int"), handle])],
+        vec![],
+    );
+    assert_eq!(
+        history_json(dir.path())[1]["changes"][0]["fields"],
+        json!([
+            { "kind": "column", "name": "handle", "op": "modified", "from": "text", "to": "text not null default ''" },
+            { "kind": "column", "name": "handle", "op": "renamed", "from": "nick", "to": "handle" }
+        ])
+    );
+}
+
+#[test]
+fn an_inline_foreign_key_action_is_part_of_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let fk = |on_delete: Value| {
+        json!({ "name": null, "columns": ["customer_id"], "ref_schema": "app",
+        "ref_table": "customers", "ref_columns": ["id"], "on_delete": on_delete, "on_update": null })
+    };
+    let mut before = col("customer_id", "uuid");
+    before["inline_fk"] = fk(json!(null));
+    let mut after = col("customer_id", "uuid");
+    after["inline_fk"] = fk(json!("cascade"));
+    after["comment"] = json!("Owner.");
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "orders", vec![before])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "cascade",
+        vec![table("app", "orders", vec![after])],
+        vec![],
+    );
+    assert_eq!(
+        history_json(dir.path())[1]["changes"][0]["fields"][0],
+        json!({ "kind": "column", "name": "customer_id", "op": "modified",
+                "from": "uuid references app.customers (id)",
+                "to": "uuid references app.customers (id) on delete cascade" })
+    );
+}
+
+#[test]
+fn a_changed_constraint_is_one_modification_not_a_removal_and_an_addition() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_fk = |on_delete: Value| {
+        let mut t = table("app", "orders", vec![pk("id", "uuid"), col("customer_id", "uuid")]);
+        t["table_constraints"] = json!([{ "type": "foreign_key", "name": null, "columns": ["customer_id"],
+            "ref_schema": "app", "ref_table": "customers", "ref_columns": ["id"], "on_delete": on_delete, "on_update": null }]);
+        t
+    };
+    write(dir.path(), 1, "baseline", vec![with_fk(json!(null))], vec![]);
+    write(dir.path(), 2, "cascade", vec![with_fk(json!("cascade"))], vec![]);
+    assert_eq!(
+        history_json(dir.path())[1]["changes"][0]["fields"],
+        json!([{ "kind": "constraint", "name": "foreign key (customer_id) → app.customers (id)", "op": "modified",
+                 "from": "foreign key (customer_id) → app.customers (id)",
+                 "to": "foreign key (customer_id) → app.customers (id) on delete cascade" }])
+    );
+}
+
+#[test]
+fn versions_marked_single_stage_are_never_grouped_whatever_their_descriptions_say() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![pk("id", "int"), col("a", "text")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "cleanup (stage 1/2)",
+        vec![table("app", "t", vec![pk("id", "int")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "cleanup (stage 2/2)",
+        vec![table("app", "t", vec![pk("id", "int"), col("b", "text")])],
+        vec![],
+    );
+    graph(dir.path(), 2, 1, 1);
+    graph(dir.path(), 3, 1, 1);
+    let h = history_json(dir.path());
+    assert_eq!(
+        h.as_array().unwrap().len(),
+        3,
+        "two ordinary versions, not one invented rename"
+    );
+    assert_eq!(h[1]["changes"][0]["fields"][0]["op"], json!("removed"));
+    assert_eq!(h[2]["changes"][0]["fields"][0]["op"], json!("added"));
+}
+
+#[test]
+fn stages_marked_in_the_graph_are_grouped_whatever_their_descriptions_say() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![col("n", "int")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "widen n",
+        vec![table("app", "t", vec![col("n", "int"), col("n_new", "bigint")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "widen n",
+        vec![table("app", "t", vec![col("n", "bigint")])],
+        vec![],
+    );
+    graph(dir.path(), 2, 1, 2);
+    graph(dir.path(), 3, 2, 2);
+    let h = history_json(dir.path());
+    assert_eq!(h.as_array().unwrap().len(), 2);
+    assert_eq!(h[1]["through"], json!(3));
+}
+
+#[test]
+fn an_unmarked_stage_run_that_drops_before_it_adds_is_not_dbds_and_is_not_grouped() {
+    // A snapshot from before stages were marked: only the description says "stage". dbd
+    // always expands before it contracts — stage 1 still holds everything the run removes —
+    // so a "stage 1" that already dropped the column is two ordinary versions.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        1,
+        "baseline",
+        vec![table("app", "t", vec![pk("id", "int"), col("a", "text")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        2,
+        "cleanup (stage 1/2)",
+        vec![table("app", "t", vec![pk("id", "int")])],
+        vec![],
+    );
+    write(
+        dir.path(),
+        3,
+        "cleanup (stage 2/2)",
+        vec![table("app", "t", vec![pk("id", "int"), col("b", "text")])],
+        vec![],
+    );
+    assert_eq!(history_json(dir.path()).as_array().unwrap().len(), 3);
 }
