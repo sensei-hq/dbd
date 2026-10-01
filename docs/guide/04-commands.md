@@ -305,7 +305,7 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | nul
 
 ## `dbd diagram`
 
-Open the schema in the **hosted interactive viewer** — sidebar schema→table navigation, a pannable/zoomable ER diagram, and a per-table detail panel. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained.
+Open the schema in the **hosted interactive viewer** — a project overview, a pannable/zoomable ER diagram, an entities list, a changelog built from your snapshots, and a per-table page with its fields, references, dependencies and a relationship diagram. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained.
 
 ```sh
 dbd diagram                        # build the model and open it in your browser
@@ -319,7 +319,7 @@ dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 
 ### The model JSON
 
-The model carries a `version` (currently `2`), and being JSON rather than DBML it covers more than tables:
+The model carries a `version` (currently `3`), and being JSON rather than DBML it covers more than tables:
 
 | Field | What it holds |
 | --- | --- |
@@ -328,12 +328,15 @@ The model carries a `version` (currently `2`), and being JSON rather than DBML i
 | `entities` | Views, materialized views, functions and procedures |
 | `deps` | What reads, writes or calls what — the call/reference graph |
 | `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
+| `history` | What each snapshot changed, oldest first — omitted when the project has none |
 
 `entities` and `deps` are separate from `tables` and `refs` on purpose: an ER renderer wants foreign keys, a call-graph renderer wants dependencies, and folding them into one array would change what every existing consumer of `tables` receives.
 
 A dependency edge whose target is not a project entity — a Postgres built-in like `now()`, or a genuine dangling reference — is marked `"unresolved": true` rather than dropped. The edge is real; only its endpoint cannot be placed on the diagram.
 
 Comments reach the model for **every** kind, not just tables: `note` is the first line (the one-line summary an entity table shows) and `noteMd` the full text.
+
+`history` is read from `snapshots/` and is what the viewer's Changelog tab draws. The first snapshot is a **baseline** — counts of tables and enums, not every one listed as added; each later entry lists the tables and enums that version added, removed or modified, with their column, index, constraint and enum-value edits. A rename or type change that `dbd snapshot` cut in stages is one entry (`version` to `through`) and reads as the rename or type change, never as the intermediate column. A type spelled two ways (`varchar(32)`, `character varying(32)`) is not a change. Snapshots record tables and enums only, so views and routines have no history, and a project that has not been released has no snapshots at all. With `--scope`, the history covers the scope's schemas only — its baseline counts them, not the project.
 
 ---
 

@@ -184,6 +184,49 @@ fn traverse(
     (visited, parent)
 }
 
+/// Whether an entity named `qualified` (`schema.name`) — in today's design or long
+/// gone — falls in `resolved`.
+///
+/// An entity the design still has is in scope exactly when resolution put it
+/// there, which accounts for excludes and the `deps` closure. A name the design no
+/// longer has cannot be resolved, so it is matched against the scope's own
+/// includes and excludes instead: the changelog of a table dropped three versions
+/// ago stays in the scope that table was in. `existing` is every entity name the
+/// design has now.
+pub fn admits(
+    scopes: &IndexMap<String, ScopeEntry>,
+    resolved: &ResolvedScope,
+    existing: &HashSet<String>,
+    qualified: &str,
+) -> bool {
+    if resolved.is_all {
+        return true;
+    }
+    if existing.contains(qualified) {
+        return resolved.entities.contains(qualified);
+    }
+    let Some(ScopeEntry::Spec(spec)) = scopes.get(&resolved.name) else {
+        return true;
+    };
+    let included = spec.includes.is_empty() || spec.includes.iter().any(|i| item_names(i, qualified));
+    included && !spec.excludes.iter().any(|i| item_names(i, qualified))
+}
+
+/// Whether a scope item names `qualified`, by the same grammar [`match_item`]
+/// resolves — `schema`, `schema.name`, `prefix.*` — but without requiring the
+/// entity to exist.
+fn item_names(item: &str, qualified: &str) -> bool {
+    if let Some(prefix) = item.strip_suffix(".*") {
+        return qualified.len() > prefix.len()
+            && qualified.starts_with(prefix)
+            && qualified.as_bytes()[prefix.len()] == b'.';
+    }
+    if item.contains('.') {
+        return qualified == item;
+    }
+    qualified.split_once('.').is_some_and(|(schema, _)| schema == item)
+}
+
 /// Resolve a scope name against the loaded entities.
 ///
 /// `name = None` → the `default` scope if defined, else `all`.
