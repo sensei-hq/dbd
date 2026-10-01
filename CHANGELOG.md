@@ -49,6 +49,10 @@ still deserializes.
 ### Changed
 
 - **`SchemaModel` is version 3**, adding `history`.
+- **`graph.json` records each version's stage** — `"stage": {"index", "of"}`,
+  `1/1` for an ordinary version — so the changelog groups a multi-stage change by
+  structure, not by a description a person may have typed `(stage 1/2)` into.
+  Graphs written before it have none and still read.
 - **The viewer opens on Overview**; the tabs are Overview · Diagram · Entities ·
   Changelog.
 - **`/diagram` and `/projects` use the home page's theme switcher**
