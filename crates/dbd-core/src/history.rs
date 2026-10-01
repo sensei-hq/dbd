@@ -31,9 +31,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{self, ChangeAction, ComplexChange, DiffAction, FieldChange, FieldDetail, FieldType};
-use crate::entity::{ColumnDef, EntityType, IdentityKind, IndexDef, TableConstraint};
+use crate::entity::{ColumnDef, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, TableConstraint};
 use crate::error::{DbdError, Result};
-use crate::snapshot::{self, Snapshot};
+use crate::snapshot::{self, MigrationStage, Snapshot};
 
 /// One version of the schema: what it changed since the version before it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,7 +103,9 @@ pub enum FieldKind {
     Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Declared in the order edits to one field are listed: what arrived, what left,
+/// then a modification before the rename it accompanies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Op {
     Added,
@@ -118,43 +120,55 @@ pub enum Op {
 /// that cannot be read is an error rather than a skipped version: a history with a
 /// silent hole would attribute that version's changes to the next one.
 pub fn load(project_dir: &Path) -> Result<Vec<HistoryEntry>> {
-    Ok(from_snapshots(&read_all(project_dir)?))
+    Ok(from_versions(&read_all(project_dir)?))
 }
 
-/// [`load`], seen through a scope: only the tables and enums in `schemas`.
+/// [`load`], seen through a scope: only the tables and enums `keep(schema, name)`
+/// admits.
 ///
 /// Filtered *before* the diff, so the baseline counts the scope and a version
-/// lists only what it changed there. Not applied to an unscoped read, where
-/// filtering by the schemas that exist today would hide a table that went away
-/// along with its whole schema.
-pub fn load_scoped(project_dir: &Path, schemas: &[String]) -> Result<Vec<HistoryEntry>> {
-    let mut snapshots = read_all(project_dir)?;
-    for snap in &mut snapshots {
-        snap.tables.retain(|t| schemas.contains(&t.schema));
-        snap.enums.retain(|e| schemas.contains(&e.schema));
+/// lists only what it changed there. The predicate is asked about names that no
+/// longer exist too — a table dropped three versions ago — so it has to answer
+/// from the scope's definition, not from today's design; see
+/// [`crate::scope::admits`].
+pub fn load_scoped(project_dir: &Path, keep: impl Fn(&str, &str) -> bool) -> Result<Vec<HistoryEntry>> {
+    let mut versions = read_all(project_dir)?;
+    for v in &mut versions {
+        v.snapshot.tables.retain(|t| keep(&t.schema, &t.name));
+        v.snapshot.enums.retain(|e| keep(&e.schema, &e.name));
     }
-    Ok(from_snapshots(&snapshots))
+    Ok(from_versions(&versions))
+}
+
+/// A snapshot and the stage marker its migration graph carries, if any.
+struct Versioned {
+    snapshot: Snapshot,
+    stage: Option<MigrationStage>,
 }
 
 /// Every snapshot, oldest first, canonicalised the way snapshot creation does.
-fn read_all(project_dir: &Path) -> Result<Vec<Snapshot>> {
-    let mut snapshots = Vec::new();
+fn read_all(project_dir: &Path) -> Result<Vec<Versioned>> {
+    let mut versions = Vec::new();
     for info in snapshot::list_snapshots(project_dir) {
         let snap = snapshot::read_snapshot(info.version, project_dir)?.ok_or_else(|| {
             DbdError::Migration(format!("snapshot {} is listed but cannot be read", info.file.display()))
         })?;
-        snapshots.push(snapshot::canonical_types(&snap));
+        versions.push(Versioned {
+            stage: snapshot::read_graph(project_dir, info.version).and_then(|g| g.stage),
+            snapshot: snapshot::canonical_types(&snap),
+        });
     }
-    Ok(snapshots)
+    Ok(versions)
 }
 
-/// The history of an ordered run of snapshots, already canonicalised.
-fn from_snapshots(snapshots: &[Snapshot]) -> Vec<HistoryEntry> {
+/// The history of an ordered run of versions, already canonicalised.
+fn from_versions(versions: &[Versioned]) -> Vec<HistoryEntry> {
     let mut entries = Vec::new();
     let mut i = 0;
-    while i < snapshots.len() {
-        let end = i + stage_run(&snapshots[i..]);
-        let (first, last) = (&snapshots[i], &snapshots[end - 1]);
+    while i < versions.len() {
+        let before = i.checked_sub(1).map(|prev| &versions[prev].snapshot);
+        let end = i + stage_run(before, &versions[i..]);
+        let (first, last) = (&versions[i].snapshot, &versions[end - 1].snapshot);
         let (description, _) = split_stage(&first.description);
         let mut entry = HistoryEntry {
             version: first.version,
@@ -164,7 +178,7 @@ fn from_snapshots(snapshots: &[Snapshot]) -> Vec<HistoryEntry> {
             baseline: None,
             changes: Vec::new(),
         };
-        match i.checked_sub(1).map(|prev| &snapshots[prev]) {
+        match before {
             None => {
                 entry.baseline = Some(Baseline {
                     tables: last.tables.len(),
@@ -179,19 +193,92 @@ fn from_snapshots(snapshots: &[Snapshot]) -> Vec<HistoryEntry> {
     entries
 }
 
-/// How many snapshots from the start of `run` make up one version: the stages of
-/// a multi-stage change, or just the one.
-fn stage_run(run: &[Snapshot]) -> usize {
-    let (base, stage) = split_stage(&run[0].description);
+/// How many versions from the start of `run` make up one: the stages of a
+/// multi-stage change, or just the one.
+///
+/// The migration graph's stage marker decides when there is one — it is written
+/// by dbd, so a description a person typed `"(stage 1/2)"` into cannot merge two
+/// ordinary versions. A graph written before markers existed has none; then the
+/// description's suffix is the only evidence, and it is trusted only for a run
+/// shaped the way dbd stages always are: expand, then contract. Stage 1 still
+/// holds everything the run finally removes.
+fn stage_run(before: Option<&Snapshot>, run: &[Versioned]) -> usize {
+    match run[0].stage {
+        Some(first) => {
+            if first.index != 1 || first.of <= 1 {
+                return 1;
+            }
+            let mut len = 1;
+            while len < run.len() && len < first.of as usize {
+                match run[len].stage {
+                    Some(s) if s.of == first.of && s.index as usize == len + 1 => len += 1,
+                    _ => break,
+                }
+            }
+            len
+        }
+        None => {
+            let len = described_stage_run(run);
+            match before {
+                Some(before)
+                    if len > 1 && expands_before_contracting(before, &run[0].snapshot, &run[len - 1].snapshot) =>
+                {
+                    len
+                }
+                _ => 1,
+            }
+        }
+    }
+}
+
+/// The run the descriptions' `(stage k/n)` suffixes claim, for unmarked versions.
+fn described_stage_run(run: &[Versioned]) -> usize {
+    let (base, stage) = split_stage(&run[0].snapshot.description);
     let Some((1, total)) = stage else { return 1 };
     let mut len = 1;
-    while len < run.len() && len < total {
-        match split_stage(&run[len].description) {
+    while len < run.len() && len < total && run[len].stage.is_none() {
+        match split_stage(&run[len].snapshot.description) {
             (b, Some((k, t))) if b == base && t == total && k == len + 1 => len += 1,
             _ => break,
         }
     }
     len
+}
+
+/// Whether `stage1` still holds every table, column, enum and enum value that the
+/// run from `before` to `last` removes — dbd's expand-then-contract shape.
+fn expands_before_contracting(before: &Snapshot, stage1: &Snapshot, last: &Snapshot) -> bool {
+    let table = |s: &Snapshot, schema: &str, name: &str| {
+        s.tables.iter().find(|t| t.schema == schema && t.name == name).cloned()
+    };
+    for t in &before.tables {
+        let Some(kept) = table(stage1, &t.schema, &t.name) else {
+            return false;
+        };
+        let Some(after) = table(last, &t.schema, &t.name) else {
+            continue;
+        };
+        for c in &t.columns {
+            let removed = !after.columns.iter().any(|a| a.name == c.name);
+            if removed && !kept.columns.iter().any(|k| k.name == c.name) {
+                return false;
+            }
+        }
+    }
+    for e in &before.enums {
+        let find = |s: &Snapshot| {
+            s.enums
+                .iter()
+                .find(|x| x.schema == e.schema && x.name == e.name)
+                .cloned()
+        };
+        let Some(kept) = find(stage1) else { return false };
+        let after = find(last).map(|a| a.values).unwrap_or_default();
+        if e.values.iter().any(|v| !after.contains(v) && !kept.values.contains(v)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `"rename nick (stage 1/2)"` → `("rename nick", Some((1, 2)))`.
@@ -249,18 +336,38 @@ fn changes_between(before: &Snapshot, after: &Snapshot) -> Vec<EntityChange> {
                 table_name,
                 old_name,
                 new_name,
-                ..
+                col_def,
             } => {
-                entity_mut(&mut by_entity, table_name, EntityKind::Table)
-                    .fields
-                    .push(FieldEdit {
+                // classify pairs a drop and an add by type alone, so the renamed column may
+                // also have changed nullability or default — say that too, or the reader
+                // thinks a column that now rejects NULL was only renamed.
+                let (schema, table) = split_name(table_name);
+                let old_col = before
+                    .tables
+                    .iter()
+                    .find(|t| t.schema == schema && t.name == table)
+                    .and_then(|t| t.columns.iter().find(|c| &c.name == old_name));
+                let fields = &mut entity_mut(&mut by_entity, table_name, EntityKind::Table).fields;
+                if let Some(old_col) = old_col
+                    && column_signature(old_col) != column_signature(col_def)
+                {
+                    fields.push(FieldEdit {
                         kind: FieldKind::Column,
                         name: new_name.clone(),
-                        op: Op::Renamed,
-                        from: Some(old_name.clone()),
-                        to: Some(new_name.clone()),
+                        op: Op::Modified,
+                        from: Some(column_signature(old_col)),
+                        to: Some(column_signature(col_def)),
                         note: None,
                     });
+                }
+                fields.push(FieldEdit {
+                    kind: FieldKind::Column,
+                    name: new_name.clone(),
+                    op: Op::Renamed,
+                    from: Some(old_name.clone()),
+                    to: Some(new_name.clone()),
+                    note: None,
+                });
             }
             ComplexChange::EnumValueRemoval {
                 enum_name,
@@ -277,7 +384,46 @@ fn changes_between(before: &Snapshot, after: &Snapshot) -> Vec<EntityChange> {
 
     let mut out: Vec<EntityChange> = by_entity.into_values().collect();
     for entity in &mut out {
-        entity.fields.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        entity.fields = merge_replacements(std::mem::take(&mut entity.fields));
+        entity
+            .fields
+            .sort_by(|a, b| (a.kind, &a.name, a.op).cmp(&(b.kind, &b.name, b.op)));
+    }
+    out
+}
+
+/// A constraint or index whose definition changed comes out of `diff` as a drop
+/// and an add under the same name. Read as two edits it says "removed X, added X"
+/// and counts twice; it is one modification, before → after.
+fn merge_replacements(fields: Vec<FieldEdit>) -> Vec<FieldEdit> {
+    let mut out: Vec<FieldEdit> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let replaceable = matches!(f.kind, FieldKind::Constraint | FieldKind::Index);
+        let partner = out.iter().position(|o| {
+            replaceable
+                && o.kind == f.kind
+                && o.name == f.name
+                && matches!((o.op, f.op), (Op::Removed, Op::Added) | (Op::Added, Op::Removed))
+        });
+        match partner {
+            Some(at) => {
+                let other = out.remove(at);
+                let (removed, added) = if other.op == Op::Removed {
+                    (other, f)
+                } else {
+                    (f, other)
+                };
+                out.push(FieldEdit {
+                    kind: added.kind,
+                    from: Some(removed.from.unwrap_or_else(|| removed.name.clone())),
+                    to: Some(added.to.unwrap_or_else(|| added.name.clone())),
+                    name: added.name,
+                    op: Op::Modified,
+                    note: None,
+                });
+            }
+            None => out.push(f),
+        }
     }
     out
 }
@@ -364,7 +510,10 @@ fn described(kind: FieldKind, op: Op, from: Option<&FieldDetail>, to: Option<&Fi
             FieldDetail::Column(c) => Some(column_signature(c)),
             _ => None,
         }),
-        FieldDetail::Constraint(tc) => (constraint_name(tc), |_| None),
+        FieldDetail::Constraint(tc) => (constraint_name(tc), |d| match d {
+            FieldDetail::Constraint(tc) => Some(constraint_definition(tc)).filter(|def| *def != constraint_name(tc)),
+            _ => None,
+        }),
         FieldDetail::Index(ix) => (ix.name.clone().unwrap_or_else(|| index_definition(ix)), |d| match d {
             FieldDetail::Index(ix) => Some(index_definition(ix)),
             _ => None,
@@ -409,10 +558,56 @@ fn column_signature(c: &ColumnDef) -> String {
             qualified(&fk.ref_schema, &fk.ref_table),
             fk.ref_columns.join(", ")
         ));
+        s.push_str(&fk_actions(fk));
     }
     s
 }
 
+/// ` on delete cascade on update restrict`, for whichever are set.
+fn fk_actions(fk: &ForeignKey) -> String {
+    let word = |a: FkAction| match a {
+        FkAction::Cascade => "cascade",
+        FkAction::Restrict => "restrict",
+        FkAction::SetNull => "set null",
+        FkAction::SetDefault => "set default",
+        FkAction::NoAction => "no action",
+    };
+    let mut s = String::new();
+    if let Some(a) = fk.on_delete {
+        s.push_str(&format!(" on delete {}", word(a)));
+    }
+    if let Some(a) = fk.on_update {
+        s.push_str(&format!(" on update {}", word(a)));
+    }
+    s
+}
+
+/// A constraint in full: its identity plus what can change under it — the FK
+/// actions, `nulls not distinct`, and its own name when it has one.
+fn constraint_definition(tc: &TableConstraint) -> String {
+    let mut s = constraint_name(tc);
+    match tc {
+        TableConstraint::ForeignKey(fk) => s.push_str(&fk_actions(fk)),
+        TableConstraint::Unique {
+            nulls_not_distinct: true,
+            ..
+        } => s.push_str(" nulls not distinct"),
+        _ => {}
+    }
+    let name = match tc {
+        TableConstraint::PrimaryKey { name, .. }
+        | TableConstraint::Unique { name, .. }
+        | TableConstraint::Check { name, .. } => name.clone(),
+        TableConstraint::ForeignKey(fk) => fk.name.clone(),
+    };
+    if let Some(n) = name {
+        s.push_str(&format!(" named {n}"));
+    }
+    s
+}
+
+/// What a constraint *is* — the part that stays put while its options change, so a
+/// changed constraint pairs with itself.
 fn constraint_name(tc: &TableConstraint) -> String {
     match tc {
         TableConstraint::PrimaryKey { columns, .. } => format!("primary key ({})", columns.join(", ")),
@@ -428,16 +623,28 @@ fn constraint_name(tc: &TableConstraint) -> String {
 }
 
 fn index_definition(ix: &IndexDef) -> String {
-    let columns: Vec<&str> = ix.columns.iter().map(|c| c.name.as_str()).collect();
+    let columns: Vec<String> = ix
+        .columns
+        .iter()
+        .map(|c| match &c.opclass {
+            Some(op) => format!("{} {op}", c.name),
+            None => c.name.clone(),
+        })
+        .collect();
     let mut s = format!("{}({})", if ix.unique { "unique " } else { "" }, columns.join(", "));
-    if let Some(t) = &ix.index_type {
-        s.push_str(&format!(
-            " using {}",
-            serde_json::to_value(t)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_default()
-        ));
+    // btree is what an index is when nothing says otherwise; naming it is noise.
+    if let Some(t) = ix.index_type.as_ref().filter(|t| t.amname() != "btree") {
+        s.push_str(&format!(" using {}", t.amname()));
+    }
+    if !ix.include.is_empty() {
+        s.push_str(&format!(" include ({})", ix.include.join(", ")));
+    }
+    if ix.nulls_not_distinct {
+        s.push_str(" nulls not distinct");
+    }
+    if !ix.with_options.is_empty() {
+        let opts: Vec<String> = ix.with_options.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+        s.push_str(&format!(" with ({})", opts.join(", ")));
     }
     if let Some(p) = &ix.predicate {
         s.push_str(&format!(" where {p}"));
