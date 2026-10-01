@@ -127,6 +127,15 @@ describe('the Fields table', () => {
     expect(onNav).toHaveBeenCalledWith('app.customers');
   });
 
+  it('renders a note that names the same `code` twice', () => {
+    const m: SchemaModel = {
+      ...model,
+      tables: [{ ...model.tables[0], columns: [{ name: 'a', type: 'int', note: 'Copy of `id`, not `id` itself.' }] }],
+    };
+    const { container } = open(m);
+    expect([...cell(container, 'a', 'notes').querySelectorAll('code')].map(text)).toEqual(['id', 'id']);
+  });
+
   it('renders a markdown note — bullets as a list, `code` as code', () => {
     const { container } = open();
     const notes = cell(container, 'status', 'notes');
