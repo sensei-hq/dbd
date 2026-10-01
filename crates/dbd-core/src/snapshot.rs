@@ -408,7 +408,7 @@ pub struct TodoItem {
 /// spelling, so widening a column reads `TYPE character varying(60)` rather than
 /// `TYPE varchar(60)`. Both are the same type; this matches what `dbd diff`
 /// already emits.
-fn canonical_types(snap: &Snapshot) -> Snapshot {
+pub(crate) fn canonical_types(snap: &Snapshot) -> Snapshot {
     let no_enums = std::collections::HashMap::new();
     let mut out = snap.clone();
     for table in &mut out.tables {
