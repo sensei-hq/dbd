@@ -75,6 +75,7 @@ export function buildContentHeaderData(model: SchemaModel, activeTab = 'diagram'
 
 // ---- sample schema (2 schemas, cross-schema refs, enums, notes) ----
 export const sampleModel: SchemaModel = {
+  version: 2,
   project: { name: 'shopdb', db: 'postgresql', note: 'Storefront catalog, customers and orders.' },
   schemas: [
     { name: 'auth', tables: 2, enums: 0 },
@@ -136,7 +137,7 @@ export const sampleModel: SchemaModel = {
       columns: [
         { name: 'id', type: 'uuid', pk: true, nn: true, note: 'Order primary key.' },
         { name: 'customer_id', type: 'uuid', nn: true, note: 'Who placed the order → shop.customers.' },
-        { name: 'status', type: 'order_status', nn: true, en: true, def: 'pending', note: 'Lifecycle state; see the order_status enum.' },
+        { name: 'status', type: 'order_status', nn: true, en: true, def: 'pending', note: 'Lifecycle state, from the `order_status` enum:\n- `pending` until payment clears\n- `paid`, then `shipped`\n- `cancelled` from either earlier state' },
         { name: 'total_cents', type: 'integer', nn: true, def: '0', note: 'Order total in cents, summed from line items.' },
         { name: 'placed_at', type: 'timestamptz', nn: true, def: 'now()', note: 'When the order was submitted.' },
       ],
@@ -162,6 +163,19 @@ export const sampleModel: SchemaModel = {
     { from: { s: 'shop', t: 'orders', c: 'customer_id' }, to: { s: 'shop', t: 'customers', c: 'id' } },
     { from: { s: 'shop', t: 'order_items', c: 'order_id' }, to: { s: 'shop', t: 'orders', c: 'id' } },
     { from: { s: 'shop', t: 'order_items', c: 'product_id' }, to: { s: 'shop', t: 'products', c: 'id' } },
+  ],
+  // v2: the dependency half, so the bundled sample shows what a Details tab's Dependencies
+  // section and the overview's counts look like with views and routines in the project.
+  entities: [
+    { schema: 'shop', name: 'order_totals', kind: 'view', note: 'Per-order line count and total.' },
+    { schema: 'shop', name: 'place_order', kind: 'procedure', note: 'Checkout: one order and its lines.' },
+  ],
+  deps: [
+    { from: { s: 'shop', n: 'order_totals' }, to: { s: 'shop', n: 'orders' }, kind: 'reads' },
+    { from: { s: 'shop', n: 'order_totals' }, to: { s: 'shop', n: 'order_items' }, kind: 'reads' },
+    { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'orders' }, kind: 'writes' },
+    { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'order_items' }, kind: 'writes' },
+    { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'products' }, kind: 'reads' },
   ],
 };
 
