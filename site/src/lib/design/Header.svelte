@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ThemeSwitcherToggle } from '@rokkit/app';
   import Icon from '$lib/design/Icon.svelte';
   import type { HeaderData } from './data';
   // Inlined trusted local SVG (Vite resolves `?raw` to the file's text). Lives
@@ -7,16 +8,13 @@
 
   let {
     data,
-    theme = 'light',
     brandHref,
     showUser = true,
     onBrand,
     onCrumb,
-    onToggleTheme,
     onShare,
   }: {
     data: HeaderData;
-    theme?: 'light' | 'dark';
     /** When set, the brand renders as a link to this URL; otherwise a button. */
     brandHref?: string;
     /** Hide the user avatar when there's no signed-in user yet. */
@@ -24,7 +22,6 @@
     onBrand?: () => void;
     /** Clicked an intermediate crumb (no href, not current) — e.g. project name. */
     onCrumb?: (index: number) => void;
-    onToggleTheme?: () => void;
     onShare?: () => void;
   } = $props();
 </script>
@@ -68,14 +65,9 @@
       <Icon name="link" size={14} />
       Share
     </button>
-    <button
-      type="button"
-      class="ds-iconbtn"
-      title={theme === 'light' ? 'Switch to dark' : 'Switch to light'}
-      onclick={onToggleTheme}
-    >
-      <Icon name={theme === 'light' ? 'moon' : 'sun'} size={17} />
-    </button>
+    <!-- The marketing nav's switcher: one colour-mode control across the site, driving the
+         shared `vibe` store that the root layout's `themable` persists. -->
+    <ThemeSwitcherToggle variant="single" size="md" />
     {#if showUser && data.user}
       <div class="hdr-avatar font-display font-semibold select-none" title={data.user.email}>
         {data.user.initials}
