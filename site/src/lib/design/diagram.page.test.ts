@@ -9,9 +9,21 @@ import { vibe } from '@rokkit/states';
 // viewer moved into the package. The assertion is unchanged in intent: the diagram rendered
 // a card per table.
 
-it('renders the bundled sample diagram by default (no payload)', async () => {
-  const { container } = render(Page);
-  await new Promise((r) => setTimeout(r, 0));
+// The root opens on the project overview (#28); the diagram is one tab over.
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const q = (root: Element, sel: string) => root.querySelector(sel);
+const qa = (root: Element, sel: string) => root.querySelectorAll(sel);
+
+async function openDiagram() {
+  const view = render(Page);
+  await tick();
+  await fireEvent.click(await findByRole(view.container, 'button', { name: 'Diagram' }));
+  await tick();
+  return view;
+}
+
+it('renders the bundled sample diagram on the Diagram tab (no payload)', async () => {
+  const { container } = await openDiagram();
   expect(container.querySelectorAll('[data-graph-node]').length).toBeGreaterThanOrEqual(2);
 });
 
@@ -26,7 +38,7 @@ it('renders a model decoded from the URL fragment', async () => {
     refs: [],
   };
   window.location.hash = '#' + (await encodeFragment(model));
-  const { container } = render(Page);
+  const { container } = await openDiagram();
   // `widgets` comes from the decoded fragment, not the sample → proves decode ran.
   await findAllByText(container, 'widgets');
   expect(container.querySelectorAll('[data-graph-node]').length).toBeGreaterThanOrEqual(2);
@@ -37,22 +49,16 @@ it('renders a model decoded from the URL fragment', async () => {
 // layout of `flow` instead of `cluster`. These pin what the viewer gets back by composing the
 // package's named diagrams instead — `ErDiagram` at the root, `Neighborhood` on an entity.
 
-const tick = () => new Promise((r) => setTimeout(r, 0));
-const q = (root: Element, sel: string) => root.querySelector(sel);
-const qa = (root: Element, sel: string) => root.querySelectorAll(sel);
-
 describe('the root ER diagram', () => {
   it('ranks by reference direction and paints each card with its schema', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     expect(q(container, '[data-graph-layout]')?.getAttribute('data-graph-layout')).toBe('flow');
     // `flow` draws no schema boxes, so without the tint the schema a table belongs to is gone.
     expect(q(container, '[data-graph-paper]')?.hasAttribute('data-graph-group-tint')).toBe(true);
   });
 
   it('keys the schema tint in a legend', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     const entries = [...qa(container, '[data-graph-legend] [data-graph-legend-entry]')].map((e) =>
       e.textContent?.trim(),
     );
@@ -60,8 +66,7 @@ describe('the root ER diagram', () => {
   });
 
   it('has a density control that changes how many rows each card shows', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     const keyRows = qa(container, '[data-graph-row]').length;
     await fireEvent.click(q(container, '[data-graph-density="full"]')!);
     await tick();
@@ -69,8 +74,7 @@ describe('the root ER diagram', () => {
   });
 
   it('has zoom buttons that move the zoom off fit', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     const reset = q(container, '[data-graph-zoom="reset"]')!;
     expect(reset.textContent?.trim()).toBe('100%');
     await fireEvent.click(q(container, '[data-graph-zoom="in"]')!);
@@ -79,8 +83,7 @@ describe('the root ER diagram', () => {
   });
 
   it('has an edge-style toggle', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     const toggle = q(container, '[data-graph-edge-style]')!;
     expect(toggle.getAttribute('data-graph-edge-style')).toBe('curved');
     await fireEvent.click(toggle);
@@ -91,8 +94,7 @@ describe('the root ER diagram', () => {
   });
 
   it('opens a table when its card is clicked', async () => {
-    const { container } = render(Page);
-    await tick();
+    const { container } = await openDiagram();
     await fireEvent.click(q(container, '[data-graph-node="shop.orders"]')!);
     await tick();
     expect(q(container, 'h1')?.textContent?.trim()).toBe('orders');
@@ -101,8 +103,7 @@ describe('the root ER diagram', () => {
 
 describe("an entity's relationship diagram", () => {
   async function openDiagramTab(entity: string) {
-    const view = render(Page);
-    await tick();
+    const view = await openDiagram();
     await fireEvent.click(q(view.container, `[data-graph-node="${entity}"]`)!);
     await tick();
     await fireEvent.click(await findByRole(view.container, 'button', { name: 'Diagram' }));
@@ -171,5 +172,37 @@ describe('the app header', () => {
     await tick();
     expect(vibe.mode).toBe('dark');
     vibe.mode = 'light';
+  });
+});
+
+describe('the root overview', () => {
+  it('is where the page opens, with tabs Overview, Diagram, Entities', async () => {
+    const { container } = render(Page);
+    await tick();
+    expect(q(container, '[data-overview]')).not.toBeNull();
+    expect(q(container, '[data-graph-node]')).toBeNull();
+    const tabs = [...container.querySelectorAll('button')]
+      .map((b) => b.textContent?.trim())
+      .filter((t) => ['Overview', 'Diagram', 'Entities'].includes(t ?? ''));
+    expect(tabs).toEqual(['Overview', 'Diagram', 'Entities']);
+  });
+
+  it('shows a tile per count, with its icon', async () => {
+    const { container } = render(Page);
+    await tick();
+    const tile = q(container, '[data-count="tables"]')!;
+    expect(tile.textContent?.replace(/\s+/g, ' ')).toContain('6 Tables');
+    expect(tile.querySelector('[data-count-icon]')?.className).toContain('i-glyph:table');
+  });
+
+  it('renders the project note in full, and drops the header copy of it', async () => {
+    const { container } = render(Page);
+    await tick();
+    const notes = q(container, '[data-overview] [data-section="notes"]')!;
+    expect(notes.textContent).toContain('Storefront catalog, customers and orders.');
+    const header = [...container.querySelectorAll('p')].filter((p) =>
+      p.textContent?.includes('Storefront catalog'),
+    );
+    expect(header).toHaveLength(1);
   });
 });
