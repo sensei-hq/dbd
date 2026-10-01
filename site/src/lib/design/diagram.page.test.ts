@@ -3,6 +3,7 @@ import { render, findAllByText, findByRole, fireEvent } from '@testing-library/s
 import Page from '../../routes/diagram/+page.svelte';
 import { encodeFragment } from './fragment';
 import type { SchemaModel } from './model';
+import { vibe } from '@rokkit/states';
 
 // `[data-graph-node]` is @rokkit/graph's node hook — it replaced dbd's `[data-card]` when the
 // viewer moved into the package. The assertion is unchanged in intent: the diagram rendered
@@ -154,5 +155,21 @@ describe("an entity's relationship diagram", () => {
     await tick();
     expect(q(container, 'h1')?.textContent?.trim()).toBe('orders');
     expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
+  });
+});
+
+describe('the app header', () => {
+  // The marketing nav's switcher, not a page-local moon/sun button — one control for colour
+  // mode across the whole site.
+  it('switches colour mode with the same ThemeSwitcherToggle as the home page', async () => {
+    vibe.mode = 'light';
+    const { container } = render(Page);
+    await tick();
+    const toggle = q(container, 'header [data-toggle][data-toggle-variant="button"]');
+    expect(toggle).not.toBeNull();
+    await fireEvent.click(toggle!);
+    await tick();
+    expect(vibe.mode).toBe('dark');
+    vibe.mode = 'light';
   });
 });
