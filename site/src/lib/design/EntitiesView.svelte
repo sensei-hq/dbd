@@ -1,6 +1,7 @@
 <script lang="ts">
   import { nodeId, type SchemaModel, type Table } from '$lib/design/model';
-  import { noteBlocks as blocks, type Seg } from './md';
+  import Markdown from './Markdown.svelte';
+  import { noteBlocks } from './md';
 
   let { model, onNav }: { model: SchemaModel; onNav?: (key: string) => void } = $props();
 
@@ -11,16 +12,6 @@
     ).length;
   }
 </script>
-
-{#snippet segs(parts: Seg[])}
-  {#each parts as part (part.text)}
-    {#if part.code}
-      <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;">{part.text}</code>
-    {:else}
-      {part.text}
-    {/if}
-  {/each}
-{/snippet}
 
 <div class="ds-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-bg">
   <div class="mx-auto max-w-5xl px-6 pb-6">
@@ -55,17 +46,7 @@
             <td class="py-3.5 pr-4 font-mono text-xs text-muted">{rc || '—'}</td>
             <td class="py-3.5 text-sm">
               <div class="flex max-w-2xl flex-col gap-2 text-sm leading-relaxed text-muted">
-                {#each blocks(t.noteMd) as block (block)}
-                  {#if block.type === 'ul'}
-                    <ul class="flex list-disc flex-col gap-1 pl-5">
-                      {#each block.lines as line (line)}
-                        <li>{@render segs(line)}</li>
-                      {/each}
-                    </ul>
-                  {:else}
-                    <p>{@render segs(block.lines[0])}</p>
-                  {/if}
-                {/each}
+                <Markdown blocks={noteBlocks(t.noteMd)} />
               </div>
             </td>
           </tr>
