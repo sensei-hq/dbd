@@ -40,9 +40,10 @@ mod tests {
 
     fn sample_model() -> SchemaModel {
         SchemaModel {
-            version: 2,
+            version: 3,
             entities: vec![],
             deps: vec![],
+            history: vec![],
             project: ProjectInfo {
                 name: "Acme".to_string(),
                 db: "postgres".to_string(),
