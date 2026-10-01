@@ -1,7 +1,7 @@
 # Checkpoint
 
-**Slice:** #27 Details tab, #28 overview, #29 snapshot changelog — all built,
-reviewed and fixed on local `feat/details-tab` (unpushed). #29 reaches Rust.
+**Slice:** #27 Details tab, #28 overview, #29 snapshot changelog — built,
+reviewed and fixed; PR #30 (`feat/details-tab` → develop) open. #29 reaches Rust.
 
 ## Done
 
@@ -22,12 +22,12 @@ reviewed and fixed on local `feat/details-tab` (unpushed). #29 reaches Rust.
 
 ## Next
 
-    git push origin feat/details-tab && gh pr create --base develop
-    # after PR #26 (develop → main) merges, so #26 stays scoped to #25
+    gh pr checks 30     # then merge #30 into develop
+    # #27–#29 close only via a develop → main PR that names them
 
 ## Open questions
 
-- Merge PR #26 (deploys production)? Then push + PR this branch.
+- PR #26 merged (0a7ac9e); #25 closed; production verified live.
 - Next release is a minor (0.24.0): `SchemaModel` gained a pub field.
 
 ## Known-broken / upstream
