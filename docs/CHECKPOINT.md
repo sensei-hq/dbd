@@ -5,6 +5,7 @@ reviewed and fixed; PR #30 (`feat/details-tab` → develop) open. #29 reaches Ru
 
 ## Done
 
+- PR #26 merged (0a7ac9e); #25 closed; production verified live.
 - #27: Details = Table info · Fields (Name/Type/Settings/Default/References/
   Notes) · References in+out · Dependencies (v2 `deps`) · Indexes.
 - #28: root opens on Overview — counts with diagram icons, note, per schema,
@@ -27,7 +28,6 @@ reviewed and fixed; PR #30 (`feat/details-tab` → develop) open. #29 reaches Ru
 
 ## Open questions
 
-- PR #26 merged (0a7ac9e); #25 closed; production verified live.
 - Next release is a minor (0.24.0): `SchemaModel` gained a pub field.
 
 ## Known-broken / upstream
