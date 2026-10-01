@@ -129,4 +129,30 @@ describe("an entity's relationship diagram", () => {
     await tick();
     expect(q(container, 'h1')?.textContent?.trim()).toBe('customers');
   });
+
+  // The root's look, carried over: schema tint on every card and no selection highlight.
+  // `Neighborhood` has no `groupTint` prop, and a selected focus outlines every neighbour as
+  // `related` — and dims the second ring to 0.3, which is the ring a reader asked to see.
+
+  it('paints each card with its schema, as the root diagram does', async () => {
+    const container = await openDiagramTab('shop.orders');
+    expect(q(container, '[data-graph-paper]')?.hasAttribute('data-graph-group-tint')).toBe(true);
+  });
+
+  it('shows the second ring at full strength, with no card selected, related or dim', async () => {
+    const container = await openDiagramTab('shop.customers');
+    const oneHop = qa(container, '[data-graph-node]').length;
+    await fireEvent.click(q(container, '[data-graph-depth="2"]')!);
+    await tick();
+    expect(qa(container, '[data-graph-node]').length).toBeGreaterThan(oneHop);
+    expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
+  });
+
+  it('leaves no highlight behind when the focus card itself is clicked', async () => {
+    const container = await openDiagramTab('shop.orders');
+    await fireEvent.click(q(container, '[data-graph-node="shop.orders"]')!);
+    await tick();
+    expect(q(container, 'h1')?.textContent?.trim()).toBe('orders');
+    expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
+  });
 });
