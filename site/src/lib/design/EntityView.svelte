@@ -2,7 +2,8 @@
   import { nodeId, type Column, type Ref, type SchemaModel } from '$lib/design/model';
   import Tabs from './Tabs.svelte';
   import EntityDiagram from './EntityDiagram.svelte';
-  import { noteBlocks, type Block, type Seg } from './md';
+  import Markdown from './Markdown.svelte';
+  import { noteBlocks } from './md';
 
   let {
     model,
@@ -63,27 +64,6 @@
     (model.tables.some((t) => t.schema === s && t.name === n) ? 'table' : 'unknown');
 </script>
 
-{#snippet segs(parts: Seg[])}
-  {#each parts as part, i (i)}
-    {#if part.code}
-      <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;">{part.text}</code>
-    {:else}
-      {part.text}
-    {/if}
-  {/each}
-{/snippet}
-
-{#snippet markdown(blocks: Block[])}
-  {#each blocks as block, i (i)}
-    {#if block.type === 'ul'}
-      <ul class="flex list-disc flex-col gap-1 pl-5">
-        {#each block.lines as line, j (j)}<li>{@render segs(line)}</li>{/each}
-      </ul>
-    {:else}
-      <p>{@render segs(block.lines[0])}</p>
-    {/if}
-  {/each}
-{/snippet}
 
 {#if table}
   <div class="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -122,7 +102,7 @@
             <h2 class="font-mono text-label uppercase text-faint">Table info</h2>
             <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
               {#if comment.length}
-                {@render markdown(comment)}
+                <Markdown blocks={comment} />
               {:else}
                 <p class="text-faint">No comment on this table — add one with <code
                     class="rounded bg-code-bg px-1 font-mono text-accent-2"
@@ -200,7 +180,7 @@
                       </td>
                       <td data-cell="notes" class="py-2.5 text-xs leading-snug text-muted">
                         {#if note.length}
-                          <div class="flex flex-col gap-1">{@render markdown(note)}</div>
+                          <div class="flex flex-col gap-1"><Markdown blocks={note} /></div>
                         {:else}
                           <span class="text-faint">—</span>
                         {/if}
