@@ -55,14 +55,18 @@ pub fn cmd_diagram(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let mut model = dbd_core::schema_model::build(&design, Some(&resolved));
 
-    // The changelog (#29). Scoped only when a scope was asked for: filtering by
-    // the schemas that exist today would hide a table dropped with its schema.
-    let history = match scope {
-        Some(_) => {
-            let schemas: Vec<String> = model.schemas.iter().map(|s| s.name.clone()).collect();
-            dbd_core::history::load_scoped(project_dir, &schemas)
-        }
-        None => dbd_core::history::load(project_dir),
+    // The changelog (#29), seen through the same scope as the diagram — which may
+    // be a `default` scope with no --scope given. A scope is a set of entities, and
+    // the history names tables that no longer exist, so each is asked of the scope's
+    // definition rather than of today's model; see `scope::admits`.
+    let history = if resolved.is_all {
+        dbd_core::history::load(project_dir)
+    } else {
+        let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
+        let scopes = &design.config().scopes;
+        dbd_core::history::load_scoped(project_dir, |schema, name| {
+            dbd_core::scope::admits(scopes, &resolved, &existing, &format!("{schema}.{name}"))
+        })
     };
     match history {
         Ok(history) => model.history = history,
