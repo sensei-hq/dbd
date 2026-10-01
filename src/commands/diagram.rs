@@ -144,6 +144,56 @@ mod tests {
         assert!(out.exists());
     }
 
+    fn write_snapshot(project: &std::path::Path, file: &str, body: &str) {
+        let dir = project.join("snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
+    const SNAPSHOT_V1: &str = r#"{ "version": 1, "description": "v1", "timestamp": "2026-09-01T10:00:00Z",
+        "tables": [], "enums": [{ "name": "status", "schema": "app", "values": ["a"] }] }"#;
+
+    fn diagram_json(project: &std::path::Path) -> serde_json::Value {
+        let out = project.join("model.json");
+        cmd_diagram(
+            &project.join("design.yaml"),
+            "dev",
+            project,
+            true,
+            &out,
+            false,
+            None,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
+    }
+
+    /// A project with snapshots carries its changelog in the model the viewer reads (#29).
+    #[test]
+    fn diagram_json_carries_the_snapshot_history() {
+        let proj = testutil::copy_fixture_project();
+        write_snapshot(proj.path(), "001.json", SNAPSHOT_V1);
+        let model = diagram_json(proj.path());
+        assert_eq!(model["version"], 3);
+        assert_eq!(model["history"][0]["version"], 1);
+        assert_eq!(model["history"][0]["baseline"]["enums"], 1);
+    }
+
+    /// An unreadable snapshot costs the changelog, not the diagram: the command
+    /// still writes the model, without a history that would misattribute changes.
+    #[test]
+    fn diagram_json_survives_an_unreadable_snapshot_without_history() {
+        let proj = testutil::copy_fixture_project();
+        write_snapshot(proj.path(), "001.json", SNAPSHOT_V1);
+        write_snapshot(proj.path(), "002.json", "{ not json");
+        let model = diagram_json(proj.path());
+        assert!(model["tables"].as_array().is_some_and(|t| !t.is_empty()));
+        assert!(model.get("history").is_none());
+    }
+
     /// URL mode with `print_url = true` encodes + prints the URL and skips the
     /// browser-open (so it's safe and DB-free in tests).
     #[test]
