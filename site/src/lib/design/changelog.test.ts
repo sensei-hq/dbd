@@ -1,5 +1,5 @@
 import { it, expect, describe } from 'vitest';
-import { newestFirst, versionLabel, versionSummary, versionDate } from './changelog';
+import { newestFirst, summaryParts, versionLabel, versionSummary, versionDate } from './changelog';
 import { sampleModel } from './data';
 import type { HistoryEntry } from './model';
 
@@ -70,5 +70,26 @@ describe('versionDate', () => {
 
   it('shows an unreadable timestamp as it was written rather than as Invalid Date', () => {
     expect(versionDate(entry({ timestamp: 'yesterday' }))).toBe('yesterday');
+  });
+});
+
+describe('summaryParts', () => {
+  it('names only what the version did, so a card does not read "+0 added · −0 removed"', () => {
+    expect(summaryParts({ added: 0, modified: 2, removed: 0, fields: 3 })).toEqual([
+      { op: 'modified', text: '~2 modified' },
+      { op: 'fields', text: '3 field changes' },
+    ]);
+  });
+
+  it('says each part in the singular when there is one', () => {
+    expect(summaryParts({ added: 1, modified: 0, removed: 1, fields: 1 }).map((p) => p.text)).toEqual([
+      '+1 added',
+      '−1 removed',
+      '1 field change',
+    ]);
+  });
+
+  it('is empty for a version that changed nothing', () => {
+    expect(summaryParts({ added: 0, modified: 0, removed: 0, fields: 0 })).toEqual([]);
   });
 });
