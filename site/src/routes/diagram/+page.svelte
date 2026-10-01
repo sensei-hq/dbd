@@ -115,8 +115,9 @@
         {:else}
           <div class="relative min-h-0 min-w-0 flex-1 bg-bg-deep">
             <DiagramView {model} {selected} onSelect={pick} />
+            <!-- Top, not bottom: the diagram's controls and schema legend own the bottom edge. -->
             <div
-              class="pointer-events-none absolute bottom-5 left-1/2 z-20 -translate-x-1/2 whitespace-nowrap rounded-full border border-line bg-paper px-4 py-2 text-xs text-faint"
+              class="pointer-events-none absolute top-4 left-1/2 z-20 -translate-x-1/2 whitespace-nowrap rounded-full border border-line bg-paper px-4 py-2 text-xs text-faint"
             >
               click a table to open it · drop a schema .json to load your own
             </div>
