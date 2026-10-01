@@ -1,39 +1,39 @@
 # Checkpoint
 
-**Slice:** viewer docs — #27 Details tab and #28 overview done on local
-`feat/details-tab` (unpushed); #29 snapshot changelog in design.
+**Slice:** #27 Details tab, #28 overview, #29 snapshot changelog — all built
+on local `feat/details-tab` (unpushed). #29 reaches Rust: SchemaModel v3.
 
 ## Done
 
-- #25 merged to `develop`; PR #26 (develop → main) green, awaiting merge.
-- CI fix: clippy 1.99 `single_element_loop` in `tests/pre_commit_hook.rs`.
 - #27: Details = Table info · Fields (Name/Type/Settings/Default/References/
-  Notes) · References in+out · Dependencies (v2 `deps`) · Indexes. Full width.
-- #28: root opens on Overview — counts with diagram-card icons, note, per
-  schema. `OVERVIEW_ICONS` spread into the UnoCSS safelist.
-- One `Markdown.svelte` renderer; fixed a duplicate-key crash on repeated
-  inline code in comments (Details and Entities).
+  Notes) · References in+out · Dependencies (v2 `deps`) · Indexes.
+- #28: root opens on Overview — counts with diagram icons, note, per schema,
+  Recent changes (latest three).
+- #29: `dbd_core::history` (baseline; multi-stage grouped; canonical types;
+  sorted; scoped under `--scope`); `SchemaModel.history`, version 3; `dbd
+  diagram` attaches it, warns and omits on an unreadable snapshot. Site
+  Changelog tab, newest first.
+- Docs: guide, llms.txt, llms-full.txt, both SKILL.md copies → v3 + history.
+  CHANGELOG [Unreleased] says the next release is a minor (new pub field).
 
 ## Verified
 
-    vitest 70/70 · svelte-check 0/0 · CF_PAGES=1 build exit 0
-    all 10 overview glyphs present in the shipped CSS · browser 1024/1440
+    cargo test --workspace 1622+ · clippy 1.98 and 1.99 clean · fmt clean
+    vitest 85/85 · svelte-check 0/0 · CF_PAGES=1 build exit 0
+    release binary on tests/fixtures/embedded → 751-byte link → Changelog renders
 
 ## Next
 
-    # #29: map snapshot/diff/schema_model, then design the history field
-    git push origin feat/details-tab   # only after PR #26 merges
+    # after PR #26 merges: push feat/details-tab, PR into develop
+    git push origin feat/details-tab
 
 ## Open questions
 
-- Merge PR #26 to `main` (deploys production)?
-- #29: compute history in Rust (reusing `diff`) vs in the browser; URL
-  size budget for share links carrying history.
-- `CLAUDE.md` names a `docs_match_code` website-copies gate that does not exist.
+- Merge PR #26 (develop → main) — deploys production.
+- Push + PR `feat/details-tab` now, or after #26?
 
 ## Known-broken / upstream
 
-- rokkit#170 off-centre neighbourhood · #171 zoom/pan extent · #172
-  Neighborhood style parity (dbd works around it).
-- #28 "recent changes" waits on #29.
+- rokkit#170 off-centre neighbourhood · #171 zoom/pan extent · #172 style parity.
+- History has no views/routines: snapshots hold tables and enums only.
 - Preview on :4317 — :4173 is shared with another session.
