@@ -1,34 +1,31 @@
 # Checkpoint
 
-**Slice:** #27 Details tab, #28 overview, #29 snapshot changelog — built,
-reviewed and fixed; PR #30 (`feat/details-tab` → develop) open. #29 reaches Rust.
+**Slice:** #25, #27, #28, #29 shipped — merged to `main` (`9c4a0e3`) and live
+on https://dbd.sensei-hq.com/diagram. Nothing in flight. Not yet released.
 
 ## Done
 
-- PR #26 merged (0a7ac9e); #25 closed; production verified live.
-- #27: Details = Table info · Fields (Name/Type/Settings/Default/References/
-  Notes) · References in+out · Dependencies (v2 `deps`) · Indexes.
-- #28: root opens on Overview — counts with diagram icons, note, per schema,
-  Recent changes (latest three).
-- #29: `dbd_core::history`; `SchemaModel` v3 `history`; `graph.json` carries
-  `stage {index, of}`; scoped history via `scope::admits`. Site Changelog tab.
-- Data-correctness review: 7 defects found, all fixed red-first (`c9035be`).
-- Docs: guide 04/05, llms.txt, llms-full.txt, both SKILL.md copies, CHANGELOG.
+- #25 (PR #26): viewer on `@rokkit/graph` 1.7 — ErDiagram/Neighborhood,
+  controls, schema tint + legend, shared theme switcher.
+- #27: Details tab — info, fields (notes, defaults), references, dependencies.
+- #28: root opens on Overview — counts with icons, note, per schema, recent.
+- #29: changelog from snapshots — `dbd_core::history`, `SchemaModel` v3,
+  `graph.json` stage marker, `scope::admits`; site Changelog tab.
+- PR #30 → develop, PR #31 → main; #25 and #27–#29 closed by their PRs.
 
 ## Verified
 
-    cargo test --workspace 1632/0 · clippy 1.98 + 1.99 clean · fmt clean
-    vitest 85/85 · svelte-check 0/0 · CF_PAGES=1 build exit 0
-    release binary: snapshot writes stage 1/1; history v1–v3 on the fixture
+    main 9c4a0e3: CI, CodeQL, Cloudflare production build all green
+    production: Overview, Changelog (v5…v1), Details sections checked live
 
 ## Next
 
-    gh pr checks 30     # then merge #30 into develop
-    # #27–#29 close only via a develop → main PR that names them
+    # cut 0.24.0 — a minor: SchemaModel gained a pub field (history)
+    # follow the Release Checklist in ~/.claude/CLAUDE.md
 
 ## Open questions
 
-- Next release is a minor (0.24.0): `SchemaModel` gained a pub field.
+- When to cut 0.24.0; the CHANGELOG [Unreleased] section is ready for it.
 
 ## Known-broken / upstream
 
