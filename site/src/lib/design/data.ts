@@ -40,7 +40,9 @@ export type ContentHeaderData = {
 
 export const BRAND = { name: 'dbd', badge: 'designs' };
 
+// Overview first: the root opens on the project at a glance (#28).
 const ROOT_TABS: Tab[] = [
+  { id: 'overview', label: 'Overview', icon: 'doc' },
   { id: 'diagram', label: 'Diagram', icon: 'grid' },
   { id: 'entities', label: 'Entities', icon: 'rows' },
 ];
@@ -59,15 +61,20 @@ export function buildHeaderData(projectName: string, entityName?: string): Heade
 }
 
 /** Content-header data derived from a SchemaModel (no version/push metadata). */
-export function buildContentHeaderData(model: SchemaModel, activeTab = 'diagram'): ContentHeaderData {
+export function buildContentHeaderData(model: SchemaModel, activeTab = 'overview'): ContentHeaderData {
   const enums = model.schemas.reduce((a, s) => a + s.enums, 0);
+  // The overview shows the note in full and the counts as tiles; the header's one-line
+  // copies would say the same thing twice, so they step aside on that tab.
+  const overview = activeTab === 'overview';
   return {
-    project: { name: model.project.name, db: model.project.db, note: model.project.note },
-    stats: [
-      { value: model.tables.length, label: 'tables' },
-      { value: enums, label: 'enums' },
-      { value: model.refs.length, label: 'refs' },
-    ],
+    project: { name: model.project.name, db: model.project.db, note: overview ? undefined : model.project.note },
+    stats: overview
+      ? []
+      : [
+          { value: model.tables.length, label: 'tables' },
+          { value: enums, label: 'enums' },
+          { value: model.refs.length, label: 'refs' },
+        ],
     tabs: ROOT_TABS,
     activeTab,
   };

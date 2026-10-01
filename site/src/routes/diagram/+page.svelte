@@ -7,6 +7,7 @@
   import DiagramView from '$lib/design/DiagramView.svelte';
   import EntitiesView from '$lib/design/EntitiesView.svelte';
   import EntityView from '$lib/design/EntityView.svelte';
+  import OverviewView from '$lib/design/OverviewView.svelte';
   import { buildHeaderData, buildContentHeaderData, sampleModel } from '$lib/design/data';
   import { saveDiagram } from '$lib/design/store';
   import { decodeFragment } from '$lib/design/fragment';
@@ -19,7 +20,7 @@
   let error = $state<string | null>(null);
   let dragging = $state(false);
   let selected = $state<string | null>(null);
-  let rootTab = $state('diagram');
+  let rootTab = $state('overview');
 
   function accept(value: unknown): SchemaModel | null {
     const res = validateModel(value);
@@ -103,7 +104,9 @@
     {:else}
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">
         <ContentHeader data={contentHeaderData} bind:activeTab={rootTab} />
-        {#if rootTab === 'entities'}
+        {#if rootTab === 'overview'}
+          <OverviewView {model} />
+        {:else if rootTab === 'entities'}
           <EntitiesView {model} onNav={pick} />
         {:else}
           <div class="relative min-h-0 min-w-0 flex-1 bg-bg-deep">

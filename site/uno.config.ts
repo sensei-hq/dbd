@@ -1,6 +1,7 @@
 import { defineConfig } from 'unocss';
 import { presetRokkit } from '@rokkit/unocss';
 import { DEFAULT_ICONS } from '@rokkit/graph/icons';
+import { OVERVIEW_ICONS } from './src/lib/design/overview';
 import rokkitConfig from './rokkit.config.js';
 
 // presetRokkit bundles presetWind3 + presetIcons + presetTypography + the
@@ -12,7 +13,9 @@ export default defineConfig({
 	// appear in source and UnoCSS's extractor purges them — the icons silently vanish and the
 	// cards render a blank box. presetRokkit already exposes the `glyph` collection; only the
 	// safelist is needed, and the package exports the exact list to avoid hand-maintaining it.
-	safelist: Object.values(DEFAULT_ICONS),
+	// The project overview picks its tile icons the same way — from a count's kind — so it
+	// exports its list too.
+	safelist: [...new Set([...Object.values(DEFAULT_ICONS), ...Object.values(OVERVIEW_ICONS)])],
 	theme: {
 		fontFamily: {
 			display: ['"Space Grotesk"', 'system-ui', 'sans-serif'],
