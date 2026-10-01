@@ -9,9 +9,13 @@
   import Markdown from './Markdown.svelte';
   import { noteBlocks } from './md';
   import { databaseLabel, overviewCounts, schemaRows, OVERVIEW_ICONS } from './overview';
+  import { newestFirst, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
   import type { SchemaModel } from './model';
 
-  let { model }: { model: SchemaModel } = $props();
+  let { model, onTab }: { model: SchemaModel; onTab?: (id: string) => void } = $props();
+
+  // The latest three — the overview's glance at the changelog, not a second copy of it.
+  const recent = $derived(newestFirst(model.history ?? []).slice(0, 3));
 
   const counts = $derived(overviewCounts(model));
   const schemas = $derived(schemaRows(model));
@@ -55,6 +59,34 @@
         {/if}
       </div>
     </section>
+
+    {#if recent.length}
+      <section data-section="recent" class="mt-8">
+        <h2 class="font-mono text-label uppercase text-faint">Recent changes</h2>
+        <div class="mt-3 flex max-w-3xl flex-col">
+          {#each recent as entry (entry.version)}
+            {@const parts = summaryParts(versionSummary(entry)).filter((p) => p.op !== 'fields')}
+            <div
+              data-version={entry.version}
+              class="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-line-soft py-2.5 text-sm"
+            >
+              <span class="ds-badge">{versionLabel(entry)}</span>
+              <span class="text-fg">{entry.description || 'Untitled version'}</span>
+              <span class="ml-auto font-mono text-xs text-faint">
+                {#if entry.baseline}baseline{:else if parts.length}{parts
+                    .map((p) => p.text.split(' ')[0])
+                    .join(' ')}{:else}no changes{/if} · {versionDate(entry)}
+              </span>
+            </div>
+          {/each}
+        </div>
+        <button
+          type="button"
+          class="mt-3 font-mono text-xs text-accent-2 hover:underline"
+          onclick={() => onTab?.('changelog')}>View the full changelog →</button
+        >
+      </section>
+    {/if}
 
     <section data-section="schemas" class="mt-8">
       <h2 class="font-mono text-label uppercase text-faint">

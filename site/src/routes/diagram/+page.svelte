@@ -8,6 +8,7 @@
   import EntitiesView from '$lib/design/EntitiesView.svelte';
   import EntityView from '$lib/design/EntityView.svelte';
   import OverviewView from '$lib/design/OverviewView.svelte';
+  import ChangelogView from '$lib/design/ChangelogView.svelte';
   import { buildHeaderData, buildContentHeaderData, sampleModel } from '$lib/design/data';
   import { saveDiagram } from '$lib/design/store';
   import { decodeFragment } from '$lib/design/fragment';
@@ -105,9 +106,11 @@
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">
         <ContentHeader data={contentHeaderData} bind:activeTab={rootTab} />
         {#if rootTab === 'overview'}
-          <OverviewView {model} />
+          <OverviewView {model} onTab={(id) => (rootTab = id)} />
         {:else if rootTab === 'entities'}
           <EntitiesView {model} onNav={pick} />
+        {:else if rootTab === 'changelog'}
+          <ChangelogView {model} onNav={pick} />
         {:else}
           <div class="relative min-h-0 min-w-0 flex-1 bg-bg-deep">
             <DiagramView {model} {selected} onSelect={pick} />
