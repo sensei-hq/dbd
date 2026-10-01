@@ -67,9 +67,13 @@
     <!-- header -->
     <div class="border-b border-line bg-paper">
       <div class="px-6 pb-3 pt-5">
-        <div class="font-mono text-xs text-faint">{schema}.</div>
         <div class="flex flex-wrap items-center gap-3">
-          <h1 class="font-display text-h3 font-semibold tracking-tight">{name}</h1>
+          <!-- One qualified name, `auth.users`: the schema is the name's lead-in, not a line
+               above it. The heading stays the bare table name. -->
+          <div class="flex items-baseline">
+            <span class="font-mono text-sm text-faint">{schema}.</span>
+            <h1 class="font-display text-h3 font-semibold tracking-tight">{name}</h1>
+          </div>
           <span class="ds-badge">{table.columns.length} columns</span>
           {#if inRefs.length || outRefs.length}
             <span class="ds-badge">{outRefs.length} out · {inRefs.length} in</span>

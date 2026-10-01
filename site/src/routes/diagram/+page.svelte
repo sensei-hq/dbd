@@ -1,7 +1,6 @@
 <script lang="ts">
   import '$lib/design/styles.css';
   import { onMount } from 'svelte';
-  import { vibe } from '@rokkit/states';
   import Header from '$lib/design/Header.svelte';
   import Sidebar from '$lib/design/Sidebar.svelte';
   import ContentHeader from '$lib/design/ContentHeader.svelte';
@@ -12,10 +11,6 @@
   import { saveDiagram } from '$lib/design/store';
   import { decodeFragment } from '$lib/design/fragment';
   import { validateModel, type SchemaModel } from '$lib/design/model';
-
-  // Dark mode is the site-wide rokkit [data-mode]; drive the shared store.
-  const theme = $derived<'light' | 'dark'>(vibe.mode === 'dark' ? 'dark' : 'light');
-  const toggleTheme = () => (vibe.mode = vibe.mode === 'dark' ? 'light' : 'dark');
 
   // The model arrives via the `#1.<payload>` share link (decoded client-side) or
   // an uploaded .json (the large-schema fallback). The bundled sample is the
@@ -95,11 +90,9 @@
 >
   <Header
     data={headerData}
-    {theme}
     brandHref="/projects"
     showUser={false}
     onCrumb={() => (selected = null)}
-    onToggleTheme={toggleTheme}
   />
 
   <div class="flex min-h-0 flex-1">
@@ -115,8 +108,9 @@
         {:else}
           <div class="relative min-h-0 min-w-0 flex-1 bg-bg-deep">
             <DiagramView {model} {selected} onSelect={pick} />
+            <!-- Top, not bottom: the diagram's controls and schema legend own the bottom edge. -->
             <div
-              class="pointer-events-none absolute bottom-5 left-1/2 z-20 -translate-x-1/2 whitespace-nowrap rounded-full border border-line bg-paper px-4 py-2 text-xs text-faint"
+              class="pointer-events-none absolute top-4 left-1/2 z-20 -translate-x-1/2 whitespace-nowrap rounded-full border border-line bg-paper px-4 py-2 text-xs text-faint"
             >
               click a table to open it · drop a schema .json to load your own
             </div>
