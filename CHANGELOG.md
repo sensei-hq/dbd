@@ -9,6 +9,44 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+**The viewer gets its controls back** (#25). `@rokkit/graph` 1.7 made `Graph` a
+bare canvas — no density bar, no zoom buttons — and changed its default layout
+from `cluster` to `flow`, so the 0.23.0 viewer drew a different diagram with no
+controls and no visible schema. Site-only: the Rust tree is unchanged.
+
+### Fixed
+
+- **The ER diagram composes `ErDiagram`**: `flow` ranking (every edge leaves a
+  card's right side and enters the next one's left), the schema painted as a
+  spine on each card and keyed in a legend under the canvas, and the density,
+  edge-style and zoom controls over it. `arrange` is gone — it ordered
+  `cluster`'s boxes, and `flow` has none.
+- **The entity diagram composes `Neighborhood`**, with depth, edge-style and
+  zoom controls, in the root's style: schema tint on every card and no
+  selection highlight. A selected focus had outlined every neighbour as
+  related and dimmed the second ring to 30% — the ring a reader asked to see.
+- **A qualified name sits on one line.** `auth.users` read as `auth.` above
+  `users` in the entity header and the entities list.
+- **The "click a table" hint moved to the top of the canvas**; the controls and
+  legend own the bottom edge, and it overlapped the legend.
+
+### Changed
+
+- **`/diagram` and `/projects` use the home page's theme switcher**
+  (`@rokkit/app`'s `ThemeSwitcherToggle`) instead of a page-local moon/sun
+  button — one colour-mode control across the site.
+
+### Known issues (upstream)
+
+Raised on `@rokkit/graph`, where they live:
+[rokkit#170](https://github.com/jerrythomas/rokkit/issues/170) — a table that
+references nothing (or that nothing references) is drawn off-centre in its
+neighbourhood; [rokkit#171](https://github.com/jerrythomas/rokkit/issues/171) —
+past fit, zoom anchors at the top-left and the right and bottom of the drawing
+cannot be scrolled to; [rokkit#172](https://github.com/jerrythomas/rokkit/issues/172) —
+`Neighborhood` cannot match `ErDiagram`'s style without owning its state, which
+dbd now does.
+
 ## [0.23.0] — 2026-09-29
 
 **The viewer stopped being dbd's to maintain.** 0.22.0 shipped schema model v2

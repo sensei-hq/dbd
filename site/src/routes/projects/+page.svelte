@@ -1,15 +1,11 @@
 <script lang="ts">
   import '$lib/design/styles.css';
   import { onMount } from 'svelte';
-  import { vibe } from '@rokkit/states';
   import Header from '$lib/design/Header.svelte';
   import Icon from '$lib/design/Icon.svelte';
   import ProjectsView from '$lib/design/ProjectsView.svelte';
   import { BRAND, sampleUser, type HeaderData } from '$lib/design/data';
   import { listDiagrams, deleteDiagram, type SavedDiagram } from '$lib/design/store';
-
-  const theme = $derived<'light' | 'dark'>(vibe.mode === 'dark' ? 'dark' : 'light');
-  const toggleTheme = () => (vibe.mode = vibe.mode === 'dark' ? 'light' : 'dark');
 
   const headerData: HeaderData = {
     brand: BRAND,
@@ -57,7 +53,7 @@
 </svelte:head>
 
 <div class="dbd-app flex min-h-screen flex-col">
-  <Header data={headerData} {theme} brandHref="/" showUser={false} onToggleTheme={toggleTheme} />
+  <Header data={headerData} brandHref="/" showUser={false} />
 
   <main class="mx-auto w-full max-w-5xl flex-1 px-5 py-8 lg:py-10">
     <div class="flex flex-wrap items-end gap-4">
