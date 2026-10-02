@@ -2,6 +2,7 @@
   import { nodeId, type Column, type Ref, type SchemaModel } from '$lib/design/model';
   import Tabs from './Tabs.svelte';
   import EntityDiagram from './EntityDiagram.svelte';
+  import EntityChangelog from './EntityChangelog.svelte';
   import Markdown from './Markdown.svelte';
   import { noteBlocks } from './md';
 
@@ -87,6 +88,7 @@
         tabs={[
           { id: 'details', label: 'Details', icon: 'rows' },
           { id: 'diagram', label: 'Diagram', icon: 'grid' },
+          { id: 'changelog', label: 'Changelog', icon: 'clock' },
         ]}
         active={tab}
         onChange={(id) => (tab = id)}
@@ -280,6 +282,8 @@
           {/if}
         </div>
       </div>
+    {:else if tab === 'changelog'}
+      <EntityChangelog {model} kind="table" {schema} {name} />
     {:else}
       <EntityDiagram {model} {entityKey} {onNav} />
     {/if}

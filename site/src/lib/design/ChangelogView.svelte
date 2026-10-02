@@ -8,21 +8,13 @@
    * from `snapshots/` (`crates/dbd-core/src/history.rs`) — this only renders it.
    */
   import { OVERVIEW_ICONS } from './overview';
-  import { newestFirst, OP_MARK, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
-  import type { ChangeOp, FieldEdit, SchemaModel } from './model';
+  import FieldEdits from './FieldEdits.svelte';
+  import { newestFirst, OP_CLASS, OP_MARK, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
+  import type { SchemaModel } from './model';
 
   let { model, onNav }: { model: SchemaModel; onNav?: (key: string) => void } = $props();
 
   const entries = $derived(newestFirst(model.history ?? []));
-
-  // Two hues on this site, by design: jade for what arrived, sky for what changed, and a
-  // struck-through muted name for what left.
-  const OP_CLASS: Record<ChangeOp, string> = {
-    added: 'text-success',
-    modified: 'text-accent-2',
-    renamed: 'text-accent-2',
-    removed: 'text-faint',
-  };
 
   const PART_CLASS: Record<string, string> = {
     added: 'text-success',
@@ -36,12 +28,6 @@
 
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-  /** The definition side of an edit, as one line: `from → to`, or whichever side exists. */
-  function detail(f: FieldEdit): string {
-    if (f.op === 'renamed') return `${f.from} → ${f.to}`;
-    if (f.from && f.to) return `${f.from} → ${f.to}`;
-    return f.to ?? f.from ?? f.note ?? '';
-  }
 </script>
 
 <div data-changelog class="ds-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-bg">
@@ -109,21 +95,9 @@
                           <summary class="flex cursor-pointer list-none items-center gap-2 py-2 hover:bg-paper-2">
                             {@render row()}
                           </summary>
-                          <ul class="mb-2 ml-5 flex flex-col gap-1 border-l border-line-soft pl-4">
-                            {#each c.fields as f, i (i)}
-                              <li data-field-op={f.op} class="flex flex-wrap items-baseline gap-2 font-mono text-xs text-muted">
-                                <span class="w-3 {OP_CLASS[f.op]}">{OP_MARK[f.op]}</span>
-                                <span class="text-faint">{f.kind}</span>
-                                <!-- A rename is its own `old → new`; naming the new one first says it twice. -->
-                                {#if f.op !== 'renamed'}<span class={f.op === 'removed' ? 'text-faint line-through' : 'text-fg'}
-                                    >{f.name}</span
-                                  >{/if}
-                                {#if detail(f)}<span class={f.op === 'renamed' ? 'text-fg' : ''} style="overflow-wrap: anywhere;"
-                                    >{detail(f)}</span
-                                  >{/if}
-                              </li>
-                            {/each}
-                          </ul>
+                          <div class="mb-2 ml-5 border-l border-line-soft pl-4">
+                            <FieldEdits fields={c.fields} />
+                          </div>
                         </details>
                       {:else}
                         <div class="flex items-center gap-2 py-2">

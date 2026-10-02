@@ -1,6 +1,10 @@
 <script lang="ts">
+  /**
+   * Every entity, by schema (#34) — tables, views, routines, triggers and enums, each in its
+   * diagram icon — with a filter by entity type and a search within the kinds that are on.
+   */
   import Icon from '$lib/design/Icon.svelte';
-  import { nodeId } from '$lib/design/model';
+  import { allEntities, kindCounts, kindLabel, KIND_ICON, type Kind } from './entities';
   import type { SidebarData } from './data';
 
   let {
@@ -16,25 +20,22 @@
   let query = $state('');
   // Per-schema collapse override; absent = open.
   let collapsed = $state<Record<string, boolean>>({});
-  let enumsOpen = $state<Record<string, boolean>>({});
+  // Kinds switched off. Empty = every kind shown, which is the default.
+  let hidden = $state<Record<string, boolean>>({});
 
   const q = $derived(query.trim().toLowerCase());
+  const kinds = $derived(kindCounts(data.model));
 
-  const groups = $derived.by(() =>
-    data.model.schemas
-      .map((s) => {
-        let tables = data.model.tables.filter((t) => t.schema === s.name);
-        let enums = data.enums.filter((e) => e.schema === s.name);
-        if (q) {
-          tables = tables.filter((t) => t.name.toLowerCase().includes(q));
-          enums = enums.filter((e) => e.name.toLowerCase().includes(q));
-        }
-        return { schema: s, tables, enums };
-      })
-      .filter((g) => !q || g.tables.length || g.enums.length)
-  );
+  const groups = $derived.by(() => {
+    const shown = allEntities(data.model).filter(
+      (e) => !hidden[e.kind] && (!q || e.name.toLowerCase().includes(q)),
+    );
+    const schemas = [...new Set(shown.map((e) => e.schema))];
+    return schemas.map((schema) => ({ schema, items: shown.filter((e) => e.schema === schema) }));
+  });
 
   const isOpen = (name: string) => !collapsed[name];
+  const toggle = (kind: Kind) => (hidden[kind] = !hidden[kind]);
 </script>
 
 <aside
@@ -72,63 +73,63 @@
     />
   </div>
 
+  <!-- filter by entity type: one toggle per kind the project has -->
+  {#if kinds.length > 1}
+    <div class="flex flex-wrap gap-1 px-3 pb-2" role="group" aria-label="Show entity types">
+      {#each kinds as { kind, count } (kind)}
+        <button
+          type="button"
+          data-kind-filter={kind}
+          aria-pressed={!hidden[kind]}
+          class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[0.68rem] transition-colors {hidden[
+            kind
+          ]
+            ? 'border-line-soft text-faint'
+            : 'border-line bg-accent-soft text-accent-2'}"
+          onclick={() => toggle(kind)}
+        >
+          <span class="{KIND_ICON[kind]} text-[0.8rem]" aria-hidden="true"></span>
+          <span>{kindLabel(kind, count)}</span>
+          <span class="opacity-70">{count}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
+
   <!-- grouped list -->
   <div class="ds-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-4">
-    {#each groups as { schema, tables, enums } (schema.name)}
-      <div class="mt-1">
-        <button type="button" class="tree-group-head" onclick={() => (collapsed[schema.name] = !collapsed[schema.name])}>
-          <Icon name={isOpen(schema.name) || q ? 'chevD' : 'chevR'} size={12} class="text-faint" />
-          <span>{schema.name}</span>
-          <span class="ml-auto font-normal text-faint">{tables.length}</span>
+    {#each groups as { schema, items } (schema)}
+      <div class="mt-1" data-schema-group={schema}>
+        <button type="button" class="tree-group-head" onclick={() => (collapsed[schema] = !collapsed[schema])}>
+          <Icon name={isOpen(schema) || q ? 'chevD' : 'chevR'} size={12} class="text-faint" />
+          <span>{schema}</span>
+          <span class="ml-auto font-normal text-faint">{items.length}</span>
         </button>
 
-        {#if isOpen(schema.name) || q}
+        {#if isOpen(schema) || q}
           <div class="flex flex-col">
-            {#each tables as table (table.name)}
-              {@const key = nodeId(schema.name, table.name)}
+            {#each items as item (item.kind + ':' + item.key)}
               <button
                 type="button"
-                class="tree-item {selectedKey === key ? 'sel' : ''}"
-                onclick={() => onPick?.(key)}
+                data-entity-key={item.key}
+                data-kind={item.kind}
+                title={item.kind.replace(/_/g, ' ')}
+                class="tree-item {selectedKey === item.key ? 'sel' : ''}"
+                onclick={() => onPick?.(item.key)}
               >
-                <Icon name="table" size={12} class="flex-none opacity-60" />
-                <span class="ti-name">{table.name}</span>
+                <span class="{KIND_ICON[item.kind]} flex-none text-[0.8rem] opacity-60" aria-hidden="true"></span>
+                <span class="ti-name">{item.name}</span>
               </button>
             {/each}
-
-            {#if enums.length}
-              <button
-                type="button"
-                class="tree-group-head"
-                style="padding-left: 26px; color: var(--muted); font-weight: 500;"
-                onclick={() => (enumsOpen[schema.name] = !enumsOpen[schema.name])}
-              >
-                <Icon name={enumsOpen[schema.name] || q ? 'chevD' : 'chevR'} size={11} class="text-faint" />
-                <span>enums</span>
-                <span class="ml-auto font-normal text-faint">{enums.length}</span>
-              </button>
-              {#if enumsOpen[schema.name] || q}
-                {#each enums as en (en.name)}
-                  {@const key = nodeId(schema.name, en.name)}
-                  <button
-                    type="button"
-                    class="tree-item {selectedKey === key ? 'sel' : ''}"
-                    style="padding-left: 42px;"
-                    onclick={() => onPick?.(key)}
-                  >
-                    <Icon name="enumI" size={12} class="flex-none opacity-60" />
-                    <span class="ti-name">{en.name}</span>
-                  </button>
-                {/each}
-              {/if}
-            {/if}
           </div>
         {/if}
       </div>
     {/each}
 
     {#if groups.length === 0}
-      <p class="px-3 py-6 text-center text-xs text-faint">Nothing matches “{query}”.</p>
+      <p class="px-3 py-6 text-center text-xs text-faint">
+        {q ? `Nothing matches “${query}”.` : 'Every entity type is switched off.'}
+      </p>
     {/if}
   </div>
 </aside>

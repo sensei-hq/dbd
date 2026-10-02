@@ -12,7 +12,7 @@ use crate::scope::ResolvedScope;
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaModel {
     /// Wire-format version. `2` added [`Self::entities`], [`Self::deps`], and
-    /// `fk`/`uq` on [`Column`]; `3` added [`Self::history`].
+    /// `fk`/`uq` on [`Column`]; `3` added [`Self::history`] and [`Self::enums`].
     ///
     /// This type is read by dbd's own viewer, by a shared component package,
     /// and by external consumers, so it is a cross-repo contract rather than
@@ -49,6 +49,9 @@ pub struct SchemaModel {
     /// project has no snapshots, so a v2 consumer reads a v3 payload unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<crate::history::HistoryEntry>,
+    /// Enum types with their values (v3). Absent when the project has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enums: Vec<EnumNode>,
 }
 
 fn default_version() -> u32 {
@@ -66,6 +69,22 @@ pub struct EntityNode {
     pub name: String,
     /// `view` | `materialized_view` | `function` | `procedure`
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
+    pub note_md: Option<String>,
+}
+
+/// An enum type and its values, in declaration order (v3).
+///
+/// The model carried only a per-schema count, so a viewer could neither list an
+/// enum nor show what it allows. Named like every other entity — by its file
+/// stem — so it lines up with the snapshot history, which names enums the same way.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct EnumNode {
+    pub schema: String,
+    pub name: String,
+    pub values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
@@ -251,6 +270,20 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         .collect();
     entities_out.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
 
+    // v3: the enums themselves, not just their count.
+    let mut enums: Vec<EnumNode> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Enum)
+        .map(|e| EnumNode {
+            schema: e.schema.clone().unwrap_or_default(),
+            name: e.name.rsplit('.').next().unwrap_or(&e.name).to_string(),
+            values: e.enum_values.iter().map(|v| v.name.clone()).collect(),
+            note: note_first_line(e.comment.as_deref()),
+            note_md: e.comment.clone(),
+        })
+        .collect();
+    enums.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
+
     let known: std::collections::HashSet<&str> = entities.iter().map(|e| e.name.as_str()).collect();
     let mut deps: Vec<DepEdge> = Vec::new();
     for e in &entities {
@@ -280,6 +313,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         tables,
         refs,
         history: Vec::new(),
+        enums,
     }
 }
 
@@ -575,6 +609,7 @@ mod tests {
             entities: vec![],
             deps: vec![],
             history: vec![],
+            enums: vec![],
             project: ProjectInfo {
                 name: "p".into(),
                 db: "postgresql".into(),

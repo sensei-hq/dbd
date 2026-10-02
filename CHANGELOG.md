@@ -36,6 +36,18 @@ still deserializes.
   a warning, not the diagram. The viewer's **Changelog** tab shows it newest
   first, a card per version. Views and routines have no history yet — snapshots
   hold tables and enums only.
+- **Every entity in the sidebar, filterable by type** (#34). Views,
+  materialized views, functions, procedures, triggers and enums are listed
+  beside the tables in their diagram icons, with a toggle per kind and search
+  within the kinds that are on. A view or routine opens a page of what it uses
+  and what uses it, with its dependency neighbourhood; an enum, its values and
+  the columns of its type. `SchemaModel` v3 gains `enums` (values in order and
+  the comment), and the parser now keeps an enum's `COMMENT ON TYPE`, which it
+  parsed and dropped.
+- **Each table and enum has its own changelog** (#33): the versions that
+  changed it, newest first, with the edits inside — the project changelog
+  narrowed to one entity. One that no version touched has been there since the
+  baseline.
 - **A project overview** (#28) — the page the viewer opens on: database and
   model version, a tile per count (schemas, tables, each entity kind present,
   enums, references) in its diagram icon, the project note in full, the counts
@@ -48,7 +60,7 @@ still deserializes.
 
 ### Changed
 
-- **`SchemaModel` is version 3**, adding `history`.
+- **`SchemaModel` is version 3**, adding `history` and `enums`.
 - **rokkit 1.8.2** (from 1.7.0). The entity diagram is a plain `Neighborhood`
   again — the package now tints by schema and withholds the states a focus
   selection made meaningless (rokkit#172), so dbd no longer owns its state; a
