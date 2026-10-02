@@ -44,6 +44,7 @@ mod tests {
             entities: vec![],
             deps: vec![],
             history: vec![],
+            enums: vec![],
             project: ProjectInfo {
                 name: "Acme".to_string(),
                 db: "postgres".to_string(),

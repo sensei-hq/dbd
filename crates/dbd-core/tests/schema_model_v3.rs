@@ -69,3 +69,36 @@ fn a_v2_payload_still_reads() {
     let back: SchemaModel = serde_json::from_value(v2).unwrap();
     assert!(back.history.is_empty());
 }
+
+fn with_enum(dir: &Path) -> Design {
+    let design = project(dir);
+    drop(design);
+    let e = dir.join("ddl/enum/app");
+    std::fs::create_dir_all(&e).unwrap();
+    std::fs::write(
+        e.join("status.ddl"),
+        "set search_path to app;\ncreate type status as enum ('active', 'paused', 'closed');\ncomment on type status is 'Account lifecycle.';",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap()
+}
+
+/// The sidebar lists enums and their pages show their values (#34) — v3 carries them.
+#[test]
+fn the_model_carries_each_enum_with_its_values_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let json = serde_json::to_value(build(&with_enum(tmp.path()), None)).unwrap();
+    assert_eq!(
+        json["enums"],
+        json!([{ "schema": "app", "name": "status", "values": ["active", "paused", "closed"],
+                 "note": "Account lifecycle.", "noteMd": "Account lifecycle." }])
+    );
+    assert_eq!(json["version"], 3, "additive within the unreleased v3");
+}
+
+#[test]
+fn a_model_without_enums_omits_the_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let json = serde_json::to_value(build(&project(tmp.path()), None)).unwrap();
+    assert!(json.get("enums").is_none());
+}

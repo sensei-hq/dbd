@@ -19,12 +19,9 @@ export type HeaderData = {
   user: User;
 };
 
-export type EnumDef = { schema: string; name: string; values: string[] };
-
 export type SidebarData = {
   project: { name: string };
   model: SchemaModel;
-  enums: EnumDef[];
 };
 
 export type Stat = { value: number; label: string };
@@ -183,6 +180,15 @@ export const sampleModel: SchemaModel = {
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'order_items' }, kind: 'writes' },
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'products' }, kind: 'reads' },
   ],
+  // v3: the enum itself, not just its count.
+  enums: [
+    {
+      schema: 'shop',
+      name: 'order_status',
+      values: ['pending', 'paid', 'shipped', 'cancelled'],
+      note: 'Where an order is in its lifecycle.',
+    },
+  ],
   // v3: four versions, so the bundled sample shows a changelog — a baseline, an addition, a
   // two-stage rename and a type change. Shaped as `dbd diagram` emits it: oldest first,
   // changes sorted by schema then name.
@@ -250,9 +256,5 @@ export const sampleModel: SchemaModel = {
     },
   ],
 };
-
-export const sampleEnums: EnumDef[] = [
-  { schema: 'shop', name: 'order_status', values: ['pending', 'paid', 'shipped', 'cancelled'] },
-];
 
 export const sampleUser: User = { name: 'Sam Reyes', email: 'sam@example.dev', initials: 'SR' };

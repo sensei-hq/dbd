@@ -305,7 +305,7 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | nul
 
 ## `dbd diagram`
 
-Open the schema in the **hosted interactive viewer** — a project overview, a pannable/zoomable ER diagram, an entities list, a changelog built from your snapshots, and a per-table page with its fields, references, dependencies and a relationship diagram. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained.
+Open the schema in the **hosted interactive viewer** — a project overview, a pannable/zoomable ER diagram, an entities list, a changelog built from your snapshots, and a sidebar of every entity (filterable by type) where each opens a page: a table's fields, references, dependencies, relationship diagram and own changelog; a view's or routine's uses and users; an enum's values. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained.
 
 ```sh
 dbd diagram                        # build the model and open it in your browser
@@ -329,6 +329,7 @@ The model carries a `version` (currently `3`), and being JSON rather than DBML i
 | `deps` | What reads, writes or calls what — the call/reference graph |
 | `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
 | `history` | What each snapshot changed, oldest first — omitted when the project has none |
+| `enums` | Enum types with their values in order, and their comment — omitted when there are none |
 
 `entities` and `deps` are separate from `tables` and `refs` on purpose: an ER renderer wants foreign keys, a call-graph renderer wants dependencies, and folding them into one array would change what every existing consumer of `tables` receives.
 
