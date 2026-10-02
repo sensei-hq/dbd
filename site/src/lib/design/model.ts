@@ -5,7 +5,7 @@
    means the package never becomes a third definition to keep in step.
 
    v2 (2026-09-27) added `version`, `entities`, `deps`, and `fk`/`uq` on
-   `Column`; v3 (2026-10-01) added `history`. Everything past v1 is optional
+   `Column`; v3 (2026-10-01) added `history` and `enums`. Everything past v1 is optional
    here, so a share link encoded before an upgrade still validates and still
    renders. */
 
@@ -65,6 +65,15 @@ export type DepEdge = {
    * endpoint is not placeable.
    */
   unresolved?: boolean;
+};
+
+/** v3. An enum type and its values, in declaration order. */
+export type EnumNode = {
+  schema: string;
+  name: string;
+  values: string[];
+  note?: string;
+  noteMd?: string;
 };
 
 /** v3. What happened to an entity or a field in one version. */
@@ -129,6 +138,8 @@ export type SchemaModel = {
   deps?: DepEdge[];
   /** v3. What each snapshot changed, oldest first. Absent when there are no snapshots. */
   history?: HistoryEntry[];
+  /** v3. Enum types with their values. Absent when the project has none. */
+  enums?: EnumNode[];
 };
 
 export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
@@ -155,6 +166,8 @@ export function validateModel(value: unknown): ValidationResult {
     return { ok: false, error: 'deps must be an array' };
   if (v.history !== undefined && !Array.isArray(v.history))
     return { ok: false, error: 'history must be an array' };
+  if (v.enums !== undefined && !Array.isArray(v.enums))
+    return { ok: false, error: 'enums must be an array' };
   return { ok: true, model: value as SchemaModel };
 }
 

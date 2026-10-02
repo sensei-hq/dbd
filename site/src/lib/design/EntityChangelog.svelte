@@ -6,22 +6,26 @@
    */
   import FieldEdits from './FieldEdits.svelte';
   import { entityHistory, OP_CLASS, OP_MARK, versionDate, versionLabel } from './changelog';
-  import type { EntityChange, SchemaModel } from './model';
+  import type { SchemaModel } from './model';
 
-  let {
-    model,
-    kind,
-    schema,
-    name,
-  }: { model: SchemaModel; kind: EntityChange['kind']; schema: string; name: string } = $props();
+  let { model, kind, schema, name }: { model: SchemaModel; kind: string; schema: string; name: string } = $props();
 
-  const history = $derived(entityHistory(model.history ?? [], kind, schema, name));
+  // Snapshots record tables and enums; every other kind has no history to narrow.
+  const tracked = $derived(kind === 'table' || kind === 'enum');
+  const history = $derived(
+    tracked ? entityHistory(model.history ?? [], kind as 'table' | 'enum', schema, name) : { rows: [] },
+  );
 </script>
 
 <div data-entity-changelog class="ds-scroll min-h-0 min-w-0 flex-1 overflow-y-auto bg-bg">
   <div class="px-6 py-6">
     <h2 class="font-mono text-label uppercase text-faint">Changelog</h2>
-    {#if !model.history?.length}
+    {#if !tracked}
+      <p class="mt-3 max-w-2xl text-sm text-faint">
+        No history for a {kind.replace(/_/g, ' ')} yet — snapshots record tables and enums only, so
+        what changed in views and routines is not kept.
+      </p>
+    {:else if !model.history?.length}
       <p class="mt-3 max-w-2xl text-sm text-faint">
         No snapshots yet, so there is no history to show. It begins with the first snapshot —
         <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;">dbd release</code>
