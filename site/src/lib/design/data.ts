@@ -7,6 +7,7 @@
    so the diagram can reuse `toLayoutData` / `layout.ts`.
    ============================================================ */
 import type { SchemaModel } from '$lib/design/model';
+import { splitLead } from '$lib/design/md';
 
 // ---- prop types ----
 export type Crumb = { label: string; href?: string; current?: boolean };
@@ -64,18 +65,15 @@ export function buildHeaderData(projectName: string, entityName?: string): Heade
 /** Content-header data derived from a SchemaModel (no version/push metadata). */
 export function buildContentHeaderData(model: SchemaModel, activeTab = 'overview'): ContentHeaderData {
   const enums = model.schemas.reduce((a, s) => a + s.enums, 0);
-  // The overview shows the note in full and the counts as tiles; the header's one-line
-  // copies would say the same thing twice, so they step aside on that tab.
-  const overview = activeTab === 'overview';
+  // The same on every tab: a header that changes when you switch tabs reads as the page
+  // breaking. The subtitle is the note's first paragraph; the overview renders the rest.
   return {
-    project: { name: model.project.name, db: model.project.db, note: overview ? undefined : model.project.note },
-    stats: overview
-      ? []
-      : [
-          { value: model.tables.length, label: 'tables' },
-          { value: enums, label: 'enums' },
-          { value: model.refs.length, label: 'refs' },
-        ],
+    project: { name: model.project.name, db: model.project.db, note: splitLead(model.project.note).lead },
+    stats: [
+      { value: model.tables.length, label: 'tables' },
+      { value: enums, label: 'enums' },
+      { value: model.refs.length, label: 'refs' },
+    ],
     tabs: ROOT_TABS,
     activeTab,
   };
