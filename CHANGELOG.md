@@ -49,6 +49,12 @@ still deserializes.
 ### Changed
 
 - **`SchemaModel` is version 3**, adding `history`.
+- **rokkit 1.8.2** (from 1.7.0). The entity diagram is a plain `Neighborhood`
+  again — the package now tints by schema and withholds the states a focus
+  selection made meaningless (rokkit#172), so dbd no longer owns its state; a
+  clicked focus is the one card marked selected. Zoomed content is fully
+  reachable and zoom holds its place (rokkit#171). `@rokkit/ui`'s widened
+  `shiki` peer clears the install warning carried since 0.23.0.
 - **`graph.json` records each version's stage** — `"stage": {"index", "of"}`,
   `1/1` for an ordinary version — so the changelog groups a multi-stage change by
   structure, not by a description a person may have typed `(stage 1/2)` into.
@@ -74,6 +80,9 @@ still deserializes.
   `users` in the entity header and the entities list.
 - **The "click a table" hint moved to the top of the canvas**; the controls and
   legend own the bottom edge, and it overlapped the legend.
+- **The header stays put on the Overview tab.** It dropped its subtitle and
+  stats there; it now shows the note's first paragraph and the stats on every
+  tab, and the overview's Notes renders what follows.
 - **A comment naming the same `code` twice no longer crashes the page.** Inline
   code was keyed by its own text (Svelte's `each_key_duplicate`) in the entities
   list and the Details tab; every comment now goes through one renderer.
@@ -81,13 +90,11 @@ still deserializes.
 ### Known issues (upstream)
 
 Raised on `@rokkit/graph`, where they live:
-[rokkit#170](https://github.com/jerrythomas/rokkit/issues/170) — a table that
-references nothing (or that nothing references) is drawn off-centre in its
-neighbourhood; [rokkit#171](https://github.com/jerrythomas/rokkit/issues/171) —
-past fit, zoom anchors at the top-left and the right and bottom of the drawing
-cannot be scrolled to; [rokkit#172](https://github.com/jerrythomas/rokkit/issues/172) —
-`Neighborhood` cannot match `ErDiagram`'s style without owning its state, which
-dbd now does.
+[rokkit#170](https://github.com/jerrythomas/rokkit/issues/170) — since 1.8.1 a
+table that nothing references (`sessions`, `order_items` in the sample) has its
+neighbourhood drawn off to the right: the layout reserves an empty column to
+centre the focus, and the asked-for behaviour is to centre the drawn cards.
+rokkit#171 and rokkit#172 are fixed in 1.8.2.
 
 ## [0.23.0] — 2026-09-29
 
