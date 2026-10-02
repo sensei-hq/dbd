@@ -93,6 +93,17 @@ mod tests {
         parse_enum(entity, sql).unwrap()
     }
 
+    /// `COMMENT ON TYPE` parsed cleanly and was dropped: an enum has no
+    /// `TableDef`, and the entity-comment reader did not accept types — the gap
+    /// the views and routines had before 0.22. An enum's page reads its note (#34).
+    #[test]
+    fn an_enum_carries_its_own_comment_on_type() {
+        let e = parse(
+            "set search_path to app;\ncreate type status as enum ('a', 'b');\ncomment on type status is 'Account lifecycle.';",
+        );
+        assert_eq!(e.comment.as_deref(), Some("Account lifecycle."));
+    }
+
     #[test]
     fn plain_create_type_yields_its_labels() {
         let e = parse("set search_path to app;\ncreate type status as enum ('a', 'b');");
