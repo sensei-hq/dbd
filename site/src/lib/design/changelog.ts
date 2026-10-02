@@ -1,6 +1,6 @@
 /* What a changelog card says about a version (#29). Pure, so the counts can be checked
    against the entries they sit above. */
-import type { HistoryEntry } from './model';
+import type { ChangeOp, EntityChange, HistoryEntry } from './model';
 
 export type Summary = { added: number; modified: number; removed: number; fields: number };
 
@@ -54,3 +54,40 @@ export function versionDate(entry: HistoryEntry): string {
 
 /** The marker a change wears, by what happened. */
 export const OP_MARK: Record<string, string> = { added: '+', removed: '−', modified: '~', renamed: '↻' };
+
+/**
+ * Two hues on this site, by design: jade for what arrived, sky for what changed, and a muted
+ * struck-through name for what left. Shared by every changelog list so they cannot disagree.
+ */
+export const OP_CLASS: Record<ChangeOp, string> = {
+  added: 'text-success',
+  modified: 'text-accent-2',
+  renamed: 'text-accent-2',
+  removed: 'text-faint',
+};
+
+export type EntityHistory = {
+  /** Newest first: each version that touched the entity, with the entity's own change. */
+  rows: { entry: HistoryEntry; change: EntityChange }[];
+  /** When no version added the entity, the version it has been there since — the baseline. */
+  sinceBaseline?: number;
+};
+
+/**
+ * One table's or enum's changelog (#33): the project history narrowed to it. Matched on kind
+ * as well as name, so a table and an enum that share a name are two histories.
+ */
+export function entityHistory(
+  history: HistoryEntry[],
+  kind: EntityChange['kind'],
+  schema: string,
+  name: string,
+): EntityHistory {
+  const rows = newestFirst(history).flatMap((entry) => {
+    const change = entry.changes.find((c) => c.kind === kind && c.schema === schema && c.name === name);
+    return change ? [{ entry, change }] : [];
+  });
+  if (history.length === 0 || rows.some((r) => r.change.op === 'added')) return { rows };
+  const baseline = history.find((h) => h.baseline) ?? history[0];
+  return { rows, sinceBaseline: baseline.version };
+}
