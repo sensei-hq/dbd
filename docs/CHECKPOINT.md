@@ -17,15 +17,19 @@ the sidebar (#34) — merged to `develop` (`234c784`), not yet on `main`.
     cargo test --workspace 1635/0 · clippy 1.98 + 1.99 · fmt
     vitest 114/114 · svelte-check 0/0 · CF build exit 0 · PR #35 CI green
 
-## Next
+## Next — on hold for rokkit#170
 
+Decided 2026-10-02: do not ship `develop` → `main` until rokkit#170 is fixed.
+When rokkit publishes the fix:
+
+    # bump every @rokkit/* in site/package.json to the fixed version
+    # verify sessions + order_items neighbourhoods centre their cards
     gh pr create --base main --head develop   # closes #33, #34; deploys
     # then cut 0.24.0 (a minor) per the Release Checklist
 
 ## Open questions
 
-- Ship develop → main now? It carries rokkit#170's regression (below).
-- rokkit#170 reopened + corrected: centre the drawn cards, not the focus.
+- None open; shipping waits on rokkit#170 (reopened + corrected).
 
 ## Known-broken / upstream
 
