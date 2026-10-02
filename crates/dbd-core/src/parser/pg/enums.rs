@@ -20,10 +20,14 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
     // of invalid SQL. Recording an error only here keeps the invariant
     // `Design::ensure_fully_parsed` relies on: apply refuses only on real
     // breakage, never on a parser limitation.
-    if let Err(e) = pg_query::parse(sql) {
-        entity.errors.push(format!("Parse error: {e}"));
-        return Ok(entity);
-    }
+    let parsed = match pg_query::parse(sql) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            entity.errors.push(format!("Parse error: {e}"));
+            return Ok(entity);
+        }
+    };
+    entity.comment = common::entity_comment(&parsed);
 
     match enum_values(sql) {
         // `CREATE TYPE e AS ENUM ()` is valid Postgres with zero labels — not
