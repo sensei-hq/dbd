@@ -217,13 +217,23 @@ describe('the root overview', () => {
     await tick();
     const subtitle = () =>
       [...container.querySelectorAll('p')].filter((p) => p.textContent?.includes('Storefront catalog')).length;
-    const stats = () => container.textContent?.includes('6 tables');
+    const stats = () => container.textContent?.replace(/\s+/g, ' ').includes('6 tables');
     expect(subtitle()).toBe(1);
     expect(stats()).toBe(true);
     await fireEvent.click(await findByRole(container, 'button', { name: 'Diagram' }));
     await tick();
     expect(subtitle()).toBe(1);
     expect(stats()).toBe(true);
+  });
+
+  it('says where a note comes from when the project has none', async () => {
+    const { note: _n, ...project } = sampleModel.project;
+    window.location.hash = '#' + (await encodeFragment({ ...sampleModel, project }));
+    const view = render(Page);
+    await findAllByText(view.container, 'shopdb');
+    await tick();
+    expect(q(view.container, '[data-overview] [data-section="notes"]')?.textContent).toMatch(/project\.note/);
+    window.location.hash = '';
   });
 
   it('leaves a one-line note to the subtitle rather than printing it twice', async () => {
