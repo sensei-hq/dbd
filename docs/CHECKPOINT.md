@@ -1,34 +1,35 @@
 # Checkpoint
 
-**Slice:** #25, #27, #28, #29 shipped — merged to `main` (`9c4a0e3`) and live
-on https://dbd.sensei-hq.com/diagram. Nothing in flight. Not yet released.
+**Slice:** rokkit 1.8.2 (#32), per-entity changelog (#33) and every entity in
+the sidebar (#34) — merged to `develop` (`234c784`), not yet on `main`.
 
 ## Done
 
-- #25 (PR #26): viewer on `@rokkit/graph` 1.7 — ErDiagram/Neighborhood,
-  controls, schema tint + legend, shared theme switcher.
-- #27: Details tab — info, fields (notes, defaults), references, dependencies.
-- #28: root opens on Overview — counts with icons, note, per schema, recent.
-- #29: changelog from snapshots — `dbd_core::history`, `SchemaModel` v3,
-  `graph.json` stage marker, `scope::admits`; site Changelog tab.
-- PR #30 → develop, PR #31 → main; #25 and #27–#29 closed by their PRs.
+- #32: rokkit 1.8.2; EntityDiagram is a plain Neighborhood (rokkit#172 fixed);
+  header stays put on Overview (subtitle = note's first paragraph).
+- #33: entity page Changelog tab — `entityHistory`, shared `FieldEdits`.
+- #34: `SchemaModel` v3 `enums`; parser keeps `COMMENT ON TYPE`; sidebar lists
+  every entity with a kind filter; ObjectView (views/routines) and EnumView.
+- Docs: guide 04, llms.txt, llms-full.txt, both SKILL.md copies, CHANGELOG.
 
 ## Verified
 
-    main 9c4a0e3: CI, CodeQL, Cloudflare production build all green
-    production: Overview, Changelog (v5…v1), Details sections checked live
+    cargo test --workspace 1635/0 · clippy 1.98 + 1.99 · fmt
+    vitest 114/114 · svelte-check 0/0 · CF build exit 0 · PR #35 CI green
 
 ## Next
 
-    # cut 0.24.0 — a minor: SchemaModel gained a pub field (history)
-    # follow the Release Checklist in ~/.claude/CLAUDE.md
+    gh pr create --base main --head develop   # closes #33, #34; deploys
+    # then cut 0.24.0 (a minor) per the Release Checklist
 
 ## Open questions
 
-- When to cut 0.24.0; the CHANGELOG [Unreleased] section is ready for it.
+- Ship develop → main now? It carries rokkit#170's regression (below).
+- rokkit#170 reopened + corrected: centre the drawn cards, not the focus.
 
 ## Known-broken / upstream
 
-- rokkit#170 off-centre neighbourhood · #171 zoom/pan extent · #172 style parity.
+- rokkit#170: since 1.8.1, `sessions`/`order_items` neighbourhoods draw shifted
+  right (card margins 461/41) — an empty column reserved to centre the focus.
 - History has no views/routines: snapshots hold tables and enums only.
 - Snapshots cut before inline FKs were recorded show a one-time FK "change".
