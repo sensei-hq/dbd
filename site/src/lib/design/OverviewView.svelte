@@ -7,7 +7,7 @@
    * `overview.ts`, which derives them from the model and nothing else.
    */
   import Markdown from './Markdown.svelte';
-  import { noteBlocks } from './md';
+  import { splitLead } from './md';
   import { databaseLabel, overviewCounts, schemaRows, OVERVIEW_ICONS } from './overview';
   import { newestFirst, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
   import type { SchemaModel } from './model';
@@ -19,7 +19,9 @@
 
   const counts = $derived(overviewCounts(model));
   const schemas = $derived(schemaRows(model));
-  const note = $derived(noteBlocks(model.project.note));
+  // The header already shows the note's first paragraph; this shows what follows it, and
+  // nothing for a one-paragraph note rather than the same sentence a second time.
+  const rest = $derived(splitLead(model.project.note).rest);
   const hasEntities = $derived(model.entities !== undefined);
 </script>
 
@@ -45,20 +47,22 @@
       </div>
     </section>
 
-    <section data-section="notes" class="mt-8">
-      <h2 class="font-mono text-label uppercase text-faint">Notes</h2>
-      <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
-        {#if note.length}
-          <Markdown blocks={note} />
-        {:else}
-          <p class="text-faint">
-            No project note — set <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;"
-              >project.note</code
-            > in design.yaml.
-          </p>
-        {/if}
-      </div>
-    </section>
+    {#if rest.length || !model.project.note?.trim()}
+      <section data-section="notes" class="mt-8">
+        <h2 class="font-mono text-label uppercase text-faint">Notes</h2>
+        <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
+          {#if rest.length}
+            <Markdown blocks={rest} />
+          {:else}
+            <p class="text-faint">
+              No project note — set <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;"
+                >project.note</code
+              > in design.yaml.
+            </p>
+          {/if}
+        </div>
+      </section>
+    {/if}
 
     {#if recent.length}
       <section data-section="recent" class="mt-8">
