@@ -133,9 +133,9 @@ describe("an entity's relationship diagram", () => {
     expect(q(container, 'h1')?.textContent?.trim()).toBe('customers');
   });
 
-  // The root's look, carried over: schema tint on every card and no selection highlight.
-  // `Neighborhood` has no `groupTint` prop, and a selected focus outlines every neighbour as
-  // `related` — and dims the second ring to 0.3, which is the ring a reader asked to see.
+  // The root's look, carried over: schema tint on every card and no selection highlight at
+  // rest. Before rokkit 1.8.1 a selected focus outlined every neighbour as `related` and
+  // dimmed the second ring to 0.3 — the ring a reader asked to see (rokkit#172).
 
   it('paints each card with its schema, as the root diagram does', async () => {
     const container = await openDiagramTab('shop.orders');
@@ -151,12 +151,16 @@ describe("an entity's relationship diagram", () => {
     expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
   });
 
-  it('leaves no highlight behind when the focus card itself is clicked', async () => {
+  it('marks only the focus when its own card is clicked — no neighbour related or dim', async () => {
     const container = await openDiagramTab('shop.orders');
     await fireEvent.click(q(container, '[data-graph-node="shop.orders"]')!);
     await tick();
     expect(q(container, 'h1')?.textContent?.trim()).toBe('orders');
-    expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
+    const states = [...qa(container, '[data-graph-node][data-node-state]')].map((n) => [
+      n.getAttribute('data-graph-node'),
+      n.getAttribute('data-node-state'),
+    ]);
+    expect(states).toEqual([['shop.orders', 'selected']]);
   });
 });
 
