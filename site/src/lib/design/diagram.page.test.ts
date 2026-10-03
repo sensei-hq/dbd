@@ -151,6 +151,24 @@ describe("an entity's relationship diagram", () => {
     expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
   });
 
+  // rokkit#170: 1.8.1 reserved an empty column on the side with no neighbours to centre the
+  // focus, which pushed the drawn cards of a table nothing references (order_items, sessions)
+  // off to one side. The cards are what is centred; nothing is reserved for an empty side.
+  it('reserves no empty column on a side with no neighbours', async () => {
+    for (const entity of ['shop.order_items', 'auth.users']) {
+      const container = await openDiagramTab(entity);
+      const world = q(container, '[data-graph-world]') as HTMLElement;
+      const cards = [...qa(container, '[data-graph-node]')].map((n) => {
+        const s = (n as HTMLElement).style;
+        return { left: parseFloat(s.left), right: parseFloat(s.left) + parseFloat(s.width) };
+      });
+      const firstLeft = Math.min(...cards.map((c) => c.left));
+      const lastRight = Math.max(...cards.map((c) => c.right));
+      expect(firstLeft, `${entity}: nothing reserved before the first card`).toBeLessThan(40);
+      expect(parseFloat(world.style.width) - lastRight, `${entity}: nothing reserved after the last`).toBeLessThan(40);
+    }
+  });
+
   it('marks only the focus when its own card is clicked — no neighbour related or dim', async () => {
     const container = await openDiagramTab('shop.orders');
     await fireEvent.click(q(container, '[data-graph-node="shop.orders"]')!);
