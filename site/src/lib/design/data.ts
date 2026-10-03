@@ -7,6 +7,7 @@
    so the diagram can reuse `toLayoutData` / `layout.ts`.
    ============================================================ */
 import type { SchemaModel } from '$lib/design/model';
+import { splitLead } from '$lib/design/md';
 
 // ---- prop types ----
 export type Crumb = { label: string; href?: string; current?: boolean };
@@ -18,12 +19,9 @@ export type HeaderData = {
   user: User;
 };
 
-export type EnumDef = { schema: string; name: string; values: string[] };
-
 export type SidebarData = {
   project: { name: string };
   model: SchemaModel;
-  enums: EnumDef[];
 };
 
 export type Stat = { value: number; label: string };
@@ -64,18 +62,15 @@ export function buildHeaderData(projectName: string, entityName?: string): Heade
 /** Content-header data derived from a SchemaModel (no version/push metadata). */
 export function buildContentHeaderData(model: SchemaModel, activeTab = 'overview'): ContentHeaderData {
   const enums = model.schemas.reduce((a, s) => a + s.enums, 0);
-  // The overview shows the note in full and the counts as tiles; the header's one-line
-  // copies would say the same thing twice, so they step aside on that tab.
-  const overview = activeTab === 'overview';
+  // The same on every tab: a header that changes when you switch tabs reads as the page
+  // breaking. The subtitle is the note's first paragraph; the overview renders the rest.
   return {
-    project: { name: model.project.name, db: model.project.db, note: overview ? undefined : model.project.note },
-    stats: overview
-      ? []
-      : [
-          { value: model.tables.length, label: 'tables' },
-          { value: enums, label: 'enums' },
-          { value: model.refs.length, label: 'refs' },
-        ],
+    project: { name: model.project.name, db: model.project.db, note: splitLead(model.project.note).lead },
+    stats: [
+      { value: model.tables.length, label: 'tables' },
+      { value: enums, label: 'enums' },
+      { value: model.refs.length, label: 'refs' },
+    ],
     tabs: ROOT_TABS,
     activeTab,
   };
@@ -185,6 +180,15 @@ export const sampleModel: SchemaModel = {
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'order_items' }, kind: 'writes' },
     { from: { s: 'shop', n: 'place_order' }, to: { s: 'shop', n: 'products' }, kind: 'reads' },
   ],
+  // v3: the enum itself, not just its count.
+  enums: [
+    {
+      schema: 'shop',
+      name: 'order_status',
+      values: ['pending', 'paid', 'shipped', 'cancelled'],
+      note: 'Where an order is in its lifecycle.',
+    },
+  ],
   // v3: four versions, so the bundled sample shows a changelog — a baseline, an addition, a
   // two-stage rename and a type change. Shaped as `dbd diagram` emits it: oldest first,
   // changes sorted by schema then name.
@@ -252,9 +256,5 @@ export const sampleModel: SchemaModel = {
     },
   ],
 };
-
-export const sampleEnums: EnumDef[] = [
-  { schema: 'shop', name: 'order_status', values: ['pending', 'paid', 'shipped', 'cancelled'] },
-];
 
 export const sampleUser: User = { name: 'Sam Reyes', email: 'sam@example.dev', initials: 'SR' };

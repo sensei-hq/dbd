@@ -313,6 +313,7 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 | `deps` | `{from, to, kind}` where `kind` is `reads` \| `writes` \| `calls` \| `member` — the call/reference graph |
 | `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
 | `history` | What each snapshot changed, oldest first (v3; omitted when there are none) — `{version, through?, description, timestamp, baseline?, changes}` |
+| `enums` | Enum types (v3; omitted when there are none) — `{schema, name, values, note?, noteMd?}`, values in declaration order, named by file stem like every entity |
 
 `entities` and `deps` are separate arrays rather than folded into `tables`/`refs` under a `kind` discriminator. Folding reads tidier and would silently change what every existing consumer of `tables` receives; the version field is there so the next extension is not a guess downstream.
 

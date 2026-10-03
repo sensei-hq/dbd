@@ -20,10 +20,14 @@ pub(crate) fn parse_enum(mut entity: Entity, sql: &str) -> Result<Entity> {
     // of invalid SQL. Recording an error only here keeps the invariant
     // `Design::ensure_fully_parsed` relies on: apply refuses only on real
     // breakage, never on a parser limitation.
-    if let Err(e) = pg_query::parse(sql) {
-        entity.errors.push(format!("Parse error: {e}"));
-        return Ok(entity);
-    }
+    let parsed = match pg_query::parse(sql) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            entity.errors.push(format!("Parse error: {e}"));
+            return Ok(entity);
+        }
+    };
+    entity.comment = common::entity_comment(&parsed);
 
     match enum_values(sql) {
         // `CREATE TYPE e AS ENUM ()` is valid Postgres with zero labels — not
@@ -91,6 +95,17 @@ mod tests {
     fn parse(sql: &str) -> Entity {
         let entity = Entity::new(EntityType::Enum, "app.status");
         parse_enum(entity, sql).unwrap()
+    }
+
+    /// `COMMENT ON TYPE` parsed cleanly and was dropped: an enum has no
+    /// `TableDef`, and the entity-comment reader did not accept types — the gap
+    /// the views and routines had before 0.22. An enum's page reads its note (#34).
+    #[test]
+    fn an_enum_carries_its_own_comment_on_type() {
+        let e = parse(
+            "set search_path to app;\ncreate type status as enum ('a', 'b');\ncomment on type status is 'Account lifecycle.';",
+        );
+        assert_eq!(e.comment.as_deref(), Some("Account lifecycle."));
     }
 
     #[test]

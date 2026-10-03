@@ -9,6 +9,9 @@
   import EntityView from '$lib/design/EntityView.svelte';
   import OverviewView from '$lib/design/OverviewView.svelte';
   import ChangelogView from '$lib/design/ChangelogView.svelte';
+  import ObjectView from '$lib/design/ObjectView.svelte';
+  import EnumView from '$lib/design/EnumView.svelte';
+  import { entityAt } from '$lib/design/entities';
   import { buildHeaderData, buildContentHeaderData, sampleModel } from '$lib/design/data';
   import { saveDiagram } from '$lib/design/store';
   import { decodeFragment } from '$lib/design/fragment';
@@ -65,7 +68,10 @@
   const entityName = $derived(selected ? selected.split('.')[1] : undefined);
   const headerData = $derived(buildHeaderData(model.project.name, entityName));
   const contentHeaderData = $derived(buildContentHeaderData(model, rootTab));
-  const sidebarData = $derived({ project: { name: model.project.name }, model, enums: [] });
+  const sidebarData = $derived({ project: { name: model.project.name }, model });
+  // Which page a selection opens: a table its fields, a view or routine its dependencies, an
+  // enum its values.
+  const selectedKind = $derived(selected ? entityAt(model, selected)?.kind : undefined);
 
   // string → select a table/entity; '' (sidebar project button) / null → root.
   const pick = (key: string | null) => (selected = key || null);
@@ -100,7 +106,11 @@
   <div class="flex min-h-0 flex-1">
     <Sidebar data={sidebarData} selectedKey={selected} onPick={pick} />
 
-    {#if selected}
+    {#if selected && selectedKind === 'enum'}
+      <EnumView {model} entityKey={selected} onNav={pick} />
+    {:else if selected && selectedKind && selectedKind !== 'table'}
+      <ObjectView {model} entityKey={selected} onNav={pick} />
+    {:else if selected}
       <EntityView {model} entityKey={selected} onNav={pick} />
     {:else}
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">

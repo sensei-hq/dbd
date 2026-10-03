@@ -1,6 +1,6 @@
 ---
 source: crates/dbd-core/src/schema_model.rs
-assertion_line: 514
+assertion_line: 602
 expression: json
 ---
 {
@@ -398,6 +398,17 @@ expression: json
         "n": "lookups"
       },
       "kind": "writes"
+    }
+  ],
+  "enums": [
+    {
+      "schema": "config",
+      "name": "status",
+      "values": [
+        "active",
+        "inactive",
+        "archived"
+      ]
     }
   ]
 }
