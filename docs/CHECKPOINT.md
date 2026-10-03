@@ -1,39 +1,33 @@
 # Checkpoint
 
-**Slice:** rokkit 1.8.2 (#32), per-entity changelog (#33) and every entity in
-the sidebar (#34) — merged to `develop` (`234c784`), not yet on `main`.
+**Slice:** shipped — rokkit 1.9.0, per-entity changelog (#33), every entity in
+the sidebar (#34). `main` `66c8779`, live on https://dbd.sensei-hq.com/diagram.
 
 ## Done
 
-- #32: rokkit 1.8.2; EntityDiagram is a plain Neighborhood (rokkit#172 fixed);
-  header stays put on Overview (subtitle = note's first paragraph).
-- #33: entity page Changelog tab — `entityHistory`, shared `FieldEdits`.
-- #34: `SchemaModel` v3 `enums`; parser keeps `COMMENT ON TYPE`; sidebar lists
-  every entity with a kind filter; ObjectView (views/routines) and EnumView.
-- Docs: guide 04, llms.txt, llms-full.txt, both SKILL.md copies, CHANGELOG.
+- rokkit 1.9.0 (#32, #36): rokkit#170/#171/#172 all fixed upstream; plain
+  Neighborhood; header stable across tabs. Guard test: no reserved column.
+- #33: Changelog tab per table and enum (`entityHistory`, `FieldEdits`).
+- #34: `SchemaModel` v3 `enums`; parser keeps `COMMENT ON TYPE`; sidebar of
+  every entity with a kind filter; ObjectView and EnumView.
+- PR #37 (develop → main) merged; #33, #34 closed.
 
 ## Verified
 
-    cargo test --workspace 1635/0 · clippy 1.98 + 1.99 · fmt
-    vitest 114/114 · svelte-check 0/0 · CF build exit 0 · PR #35 CI green
+    main 66c8779: CI, CodeQL, Cloudflare production build all green
+    live: 9 entities + 4 chips; one- and two-sided neighbourhoods centred;
+    view uses, enum values, shop.orders' changelog (v5, v2)
 
-## Next — on hold for rokkit#170
+## Next
 
-Decided 2026-10-02: do not ship `develop` → `main` until rokkit#170 is fixed.
-When rokkit publishes the fix:
-
-    # bump every @rokkit/* in site/package.json to the fixed version
-    # verify sessions + order_items neighbourhoods centre their cards
-    gh pr create --base main --head develop   # closes #33, #34; deploys
-    # then cut 0.24.0 (a minor) per the Release Checklist
+    # cut 0.24.0 — a minor: SchemaModel gained pub fields (history, enums)
+    # follow the Release Checklist in ~/.claude/CLAUDE.md
 
 ## Open questions
 
-- None open; shipping waits on rokkit#170 (reopened + corrected).
+- When to cut 0.24.0; CHANGELOG [Unreleased] is ready for it.
 
 ## Known-broken / upstream
 
-- rokkit#170: since 1.8.1, `sessions`/`order_items` neighbourhoods draw shifted
-  right (card margins 461/41) — an empty column reserved to centre the focus.
 - History has no views/routines: snapshots hold tables and enums only.
 - Snapshots cut before inline FKs were recorded show a one-time FK "change".
