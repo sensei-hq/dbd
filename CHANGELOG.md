@@ -9,22 +9,28 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-**The viewer documents the schema, and remembers it.** It opens on a project
-overview (#28), each table has a documentation page (#27), and a changelog shows
-what every snapshot changed (#29) — which is the one part that reaches Rust:
-`dbd diagram` now reads `snapshots/` and the schema model moves to **v3**. First,
-the diagram got its controls back (#25): `@rokkit/graph` 1.7 made `Graph` a bare
-canvas and changed its default layout from `cluster` to `flow`, so the 0.23.0
-viewer drew a different diagram with no controls and no visible schema.
+## [0.24.0] — 2026-10-03
 
-**For embedders: the next release is a minor.** `SchemaModel` has a new public
-field, `history`, so code that builds one as a struct literal must name it
-(`history: vec![]`). The JSON is additive — omitted when empty, and a v2 payload
-still deserializes.
+**The viewer documents the schema, and remembers it.** It opens on a project
+overview ([#28]); every entity — tables, views, routines, triggers and enums — is
+in the sidebar, filterable by type, and opens a page of its own ([#27], [#34]); and
+a changelog shows what every snapshot changed, for the project and for each
+table and enum ([#29], [#33]). The changelog is the part that reaches Rust:
+`dbd diagram` now reads `snapshots/`, and the schema model moves to **v3**,
+carrying `history` and `enums`. First, the diagram got its controls back ([#25]):
+`@rokkit/graph` 1.7 made `Graph` a bare canvas and changed its default layout,
+so the 0.23.0 viewer drew a different diagram with no controls and no visible
+schema; the site is now on rokkit 1.9.0.
+
+**For embedders: a minor, and a breaking one in the 0.x sense.** `SchemaModel`
+has two new public fields, `history` and `enums`, so code that builds one as a
+struct literal must name them (`history: vec![], enums: vec![]`); and
+`MigrationGraph` gains `stage`. The JSON is additive — each is omitted when
+empty, and a v2 payload still deserializes.
 
 ### Added
 
-- **A changelog, from snapshots** (#29). `dbd_core::history::load` turns
+- **A changelog, from snapshots** ([#29]). `dbd_core::history::load` turns
   `snapshots/NNN.json` into one entry per version: the first a baseline of
   table and enum counts, each later one the tables and enums it added, removed
   or modified, with their column, index, constraint and enum-value edits. It
@@ -36,7 +42,7 @@ still deserializes.
   a warning, not the diagram. The viewer's **Changelog** tab shows it newest
   first, a card per version. Views and routines have no history yet — snapshots
   hold tables and enums only.
-- **Every entity in the sidebar, filterable by type** (#34). Views,
+- **Every entity in the sidebar, filterable by type** ([#34]). Views,
   materialized views, functions, procedures, triggers and enums are listed
   beside the tables in their diagram icons, with a toggle per kind and search
   within the kinds that are on. A view or routine opens a page of what it uses
@@ -44,15 +50,15 @@ still deserializes.
   the columns of its type. `SchemaModel` v3 gains `enums` (values in order and
   the comment), and the parser now keeps an enum's `COMMENT ON TYPE`, which it
   parsed and dropped.
-- **Each table and enum has its own changelog** (#33): the versions that
+- **Each table and enum has its own changelog** ([#33]): the versions that
   changed it, newest first, with the edits inside — the project changelog
   narrowed to one entity. One that no version touched has been there since the
   baseline.
-- **A project overview** (#28) — the page the viewer opens on: database and
+- **A project overview** ([#28]) — the page the viewer opens on: database and
   model version, a tile per count (schemas, tables, each entity kind present,
   enums, references) in its diagram icon, the project note in full, the counts
   per schema, and the latest three versions from the changelog.
-- **A Details tab per table** (#27): table info (the comment as markdown), then
+- **A Details tab per table** ([#27]): table info (the comment as markdown), then
   Fields — Name, Type, Settings, Default, References, Notes, with notes rendered
   as markdown — then references in and out, the views and routines that read or
   write the table, and indexes. Full width; the fields table scrolls sideways
@@ -99,6 +105,13 @@ still deserializes.
 - **A comment naming the same `code` twice no longer crashes the page.** Inline
   code was keyed by its own text (Svelte's `each_key_duplicate`) in the entities
   list and the Details tab; every comment now goes through one renderer.
+
+[#25]: https://github.com/sensei-hq/dbd/issues/25
+[#27]: https://github.com/sensei-hq/dbd/issues/27
+[#28]: https://github.com/sensei-hq/dbd/issues/28
+[#29]: https://github.com/sensei-hq/dbd/issues/29
+[#33]: https://github.com/sensei-hq/dbd/issues/33
+[#34]: https://github.com/sensei-hq/dbd/issues/34
 
 ## [0.23.0] — 2026-09-29
 
@@ -1425,6 +1438,7 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
 [Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.23.0...main
+[0.24.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.0
 [0.23.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.23.0
 [0.22.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.22.0
 [0.21.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.21.0
