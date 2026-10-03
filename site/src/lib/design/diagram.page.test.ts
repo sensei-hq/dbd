@@ -133,9 +133,9 @@ describe("an entity's relationship diagram", () => {
     expect(q(container, 'h1')?.textContent?.trim()).toBe('customers');
   });
 
-  // The root's look, carried over: schema tint on every card and no selection highlight.
-  // `Neighborhood` has no `groupTint` prop, and a selected focus outlines every neighbour as
-  // `related` — and dims the second ring to 0.3, which is the ring a reader asked to see.
+  // The root's look, carried over: schema tint on every card and no selection highlight at
+  // rest. Before rokkit 1.8.1 a selected focus outlined every neighbour as `related` and
+  // dimmed the second ring to 0.3 — the ring a reader asked to see (rokkit#172).
 
   it('paints each card with its schema, as the root diagram does', async () => {
     const container = await openDiagramTab('shop.orders');
@@ -151,12 +151,34 @@ describe("an entity's relationship diagram", () => {
     expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
   });
 
-  it('leaves no highlight behind when the focus card itself is clicked', async () => {
+  // rokkit#170: 1.8.1 reserved an empty column on the side with no neighbours to centre the
+  // focus, which pushed the drawn cards of a table nothing references (order_items, sessions)
+  // off to one side. The cards are what is centred; nothing is reserved for an empty side.
+  it('reserves no empty column on a side with no neighbours', async () => {
+    for (const entity of ['shop.order_items', 'auth.users']) {
+      const container = await openDiagramTab(entity);
+      const world = q(container, '[data-graph-world]') as HTMLElement;
+      const cards = [...qa(container, '[data-graph-node]')].map((n) => {
+        const s = (n as HTMLElement).style;
+        return { left: parseFloat(s.left), right: parseFloat(s.left) + parseFloat(s.width) };
+      });
+      const firstLeft = Math.min(...cards.map((c) => c.left));
+      const lastRight = Math.max(...cards.map((c) => c.right));
+      expect(firstLeft, `${entity}: nothing reserved before the first card`).toBeLessThan(40);
+      expect(parseFloat(world.style.width) - lastRight, `${entity}: nothing reserved after the last`).toBeLessThan(40);
+    }
+  });
+
+  it('marks only the focus when its own card is clicked — no neighbour related or dim', async () => {
     const container = await openDiagramTab('shop.orders');
     await fireEvent.click(q(container, '[data-graph-node="shop.orders"]')!);
     await tick();
     expect(q(container, 'h1')?.textContent?.trim()).toBe('orders');
-    expect(qa(container, '[data-graph-node][data-node-state]').length).toBe(0);
+    const states = [...qa(container, '[data-graph-node][data-node-state]')].map((n) => [
+      n.getAttribute('data-graph-node'),
+      n.getAttribute('data-node-state'),
+    ]);
+    expect(states).toEqual([['shop.orders', 'selected']]);
   });
 });
 
@@ -208,15 +230,52 @@ describe('the root overview', () => {
     expect(tile.querySelector('[data-count-icon]')?.className).toContain('i-glyph:table');
   });
 
-  it('renders the project note in full, and drops the header copy of it', async () => {
+  it('keeps the header as it is on every tab — the subtitle and the stats stay put', async () => {
     const { container } = render(Page);
     await tick();
-    const notes = q(container, '[data-overview] [data-section="notes"]')!;
-    expect(notes.textContent).toContain('Storefront catalog, customers and orders.');
-    const header = [...container.querySelectorAll('p')].filter((p) =>
-      p.textContent?.includes('Storefront catalog'),
+    const subtitle = () =>
+      [...container.querySelectorAll('p')].filter((p) => p.textContent?.includes('Storefront catalog')).length;
+    const stats = () => container.textContent?.replace(/\s+/g, ' ').includes('6 tables');
+    expect(subtitle()).toBe(1);
+    expect(stats()).toBe(true);
+    await fireEvent.click(await findByRole(container, 'button', { name: 'Diagram' }));
+    await tick();
+    expect(subtitle()).toBe(1);
+    expect(stats()).toBe(true);
+  });
+
+  it('says where a note comes from when the project has none', async () => {
+    const { note: _n, ...project } = sampleModel.project;
+    window.location.hash = '#' + (await encodeFragment({ ...sampleModel, project }));
+    const view = render(Page);
+    await findAllByText(view.container, 'shopdb');
+    await tick();
+    expect(q(view.container, '[data-overview] [data-section="notes"]')?.textContent).toMatch(/project\.note/);
+    window.location.hash = '';
+  });
+
+  it('leaves a one-line note to the subtitle rather than printing it twice', async () => {
+    const { container } = render(Page);
+    await tick();
+    expect(q(container, '[data-overview] [data-section="notes"]')).toBeNull();
+  });
+
+  it('renders a longer note in full under Notes, with its first line as the subtitle', async () => {
+    const note = 'Storefront catalog.\n- customers and their orders\n- products and stock';
+    window.location.hash = '#' + (await encodeFragment({ ...sampleModel, project: { ...sampleModel.project, note } }));
+    const view = render(Page);
+    await findAllByText(view.container, 'products and stock');
+    const notes = q(view.container, '[data-overview] [data-section="notes"]')!;
+    expect([...notes.querySelectorAll('li')].map((li) => li.textContent?.trim())).toEqual([
+      'customers and their orders',
+      'products and stock',
+    ]);
+    // In the header, not the overview's own first paragraph.
+    const subtitle = [...view.container.querySelectorAll('p')].find(
+      (p) => !p.closest('[data-overview]') && p.textContent?.trim() === 'Storefront catalog.',
     );
-    expect(header).toHaveLength(1);
+    expect(subtitle).toBeDefined();
+    window.location.hash = '';
   });
 });
 

@@ -36,6 +36,18 @@ still deserializes.
   a warning, not the diagram. The viewer's **Changelog** tab shows it newest
   first, a card per version. Views and routines have no history yet — snapshots
   hold tables and enums only.
+- **Every entity in the sidebar, filterable by type** (#34). Views,
+  materialized views, functions, procedures, triggers and enums are listed
+  beside the tables in their diagram icons, with a toggle per kind and search
+  within the kinds that are on. A view or routine opens a page of what it uses
+  and what uses it, with its dependency neighbourhood; an enum, its values and
+  the columns of its type. `SchemaModel` v3 gains `enums` (values in order and
+  the comment), and the parser now keeps an enum's `COMMENT ON TYPE`, which it
+  parsed and dropped.
+- **Each table and enum has its own changelog** (#33): the versions that
+  changed it, newest first, with the edits inside — the project changelog
+  narrowed to one entity. One that no version touched has been there since the
+  baseline.
 - **A project overview** (#28) — the page the viewer opens on: database and
   model version, a tile per count (schemas, tables, each entity kind present,
   enums, references) in its diagram icon, the project note in full, the counts
@@ -48,7 +60,14 @@ still deserializes.
 
 ### Changed
 
-- **`SchemaModel` is version 3**, adding `history`.
+- **`SchemaModel` is version 3**, adding `history` and `enums`.
+- **rokkit 1.9.0** (from 1.7.0). The entity diagram is a plain `Neighborhood`
+  again — the package now tints by schema and withholds the states a focus
+  selection made meaningless (rokkit#172), so dbd no longer owns its state; a
+  clicked focus is the one card marked selected. Zoomed content is fully
+  reachable and zoom holds its place (rokkit#171), and a neighbourhood centres
+  its drawn cards whichever side is empty (rokkit#170). `@rokkit/ui`'s widened
+  `shiki` peer clears the install warning carried since 0.23.0.
 - **`graph.json` records each version's stage** — `"stage": {"index", "of"}`,
   `1/1` for an ordinary version — so the changelog groups a multi-stage change by
   structure, not by a description a person may have typed `(stage 1/2)` into.
@@ -74,20 +93,12 @@ still deserializes.
   `users` in the entity header and the entities list.
 - **The "click a table" hint moved to the top of the canvas**; the controls and
   legend own the bottom edge, and it overlapped the legend.
+- **The header stays put on the Overview tab.** It dropped its subtitle and
+  stats there; it now shows the note's first paragraph and the stats on every
+  tab, and the overview's Notes renders what follows.
 - **A comment naming the same `code` twice no longer crashes the page.** Inline
   code was keyed by its own text (Svelte's `each_key_duplicate`) in the entities
   list and the Details tab; every comment now goes through one renderer.
-
-### Known issues (upstream)
-
-Raised on `@rokkit/graph`, where they live:
-[rokkit#170](https://github.com/jerrythomas/rokkit/issues/170) — a table that
-references nothing (or that nothing references) is drawn off-centre in its
-neighbourhood; [rokkit#171](https://github.com/jerrythomas/rokkit/issues/171) —
-past fit, zoom anchors at the top-left and the right and bottom of the drawing
-cannot be scrolled to; [rokkit#172](https://github.com/jerrythomas/rokkit/issues/172) —
-`Neighborhood` cannot match `ErDiagram`'s style without owning its state, which
-dbd now does.
 
 ## [0.23.0] — 2026-09-29
 
