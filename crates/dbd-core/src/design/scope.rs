@@ -170,6 +170,32 @@ impl Design {
         Err(DbdError::Config(msg))
     }
 
+    /// The tables and enums the whole design declares that `desired` leaves out,
+    /// as `(schema, name)` the way a snapshot spells them (#40).
+    ///
+    /// A scope narrows what is applied, not what the project owns. Unscoped,
+    /// `desired` is the whole design and this is empty.
+    pub(in crate::design) fn declared_out_of_scope(
+        &self,
+        desired: &[&Entity],
+    ) -> std::collections::HashSet<(String, String)> {
+        let all: Vec<Entity> = self.entities_in_scope(None, None, None).into_iter().cloned().collect();
+        if all.len() == desired.len() {
+            return Default::default();
+        }
+        let desired: Vec<Entity> = desired.iter().map(|e| (*e).clone()).collect();
+        let keys = |s: crate::snapshot::Snapshot| -> std::collections::HashSet<(String, String)> {
+            s.tables
+                .into_iter()
+                .map(|t| (t.schema, t.name))
+                .chain(s.enums.into_iter().map(|e| (e.schema, e.name)))
+                .collect()
+        };
+        let declared = keys(crate::reconcile::raw_snapshot_from_entities(&all));
+        let wanted = keys(crate::reconcile::raw_snapshot_from_entities(&desired));
+        declared.difference(&wanted).cloned().collect()
+    }
+
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.

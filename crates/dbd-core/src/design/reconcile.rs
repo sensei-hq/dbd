@@ -278,9 +278,12 @@ impl Design {
 
         // Live snapshot, restricted to managed schemas. Tables here but not in
         // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
+        // Under a scope, also hide what the design declares outside it: those are
+        // the project's own, not orphans, and a scoped `--prune` dropped them (#40).
+        let hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
         let live_full = snapshot_from_entities(&live_entities);
-        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
+        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
         self.drop_platform_owned_drops(&mut plan);
@@ -289,7 +292,10 @@ impl Design {
         // above, so converge them from the RAW snapshots — adding declared FKs
         // the live DB lacks and dropping (destructive) ones the design removed.
         let desired_raw = raw_snapshot_from_entities(&desired_owned);
-        let live_raw = restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas);
+        let live_raw = hide_declared(
+            restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas),
+            &hidden,
+        );
         plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Secondary indexes (issue #12): canonicalize also strips indexes, so —
@@ -461,9 +467,11 @@ impl Design {
 
         // Live snapshot, restricted to managed schemas. Raw so introspected
         // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
+        // The same hiding as `reconcile`, so the diff shows what reconcile would do (#40).
+        let hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
         let live_full = raw_snapshot_from_entities(&live_entities);
-        let live = restrict_snapshot_to_schemas(live_full, &managed_schemas);
+        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);
 
