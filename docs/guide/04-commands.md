@@ -455,7 +455,9 @@ schemas. Two kinds of destruction each need an explicit opt-in:
 - **`--allow-destructive`** — drop a *column*, constraint, foreign key, or index from a managed table,
   or remove a *value* from an enum (see **Enum value removal** below).
 - **`--prune`** — drop a whole *table* still in a managed schema but no longer in the design (an
-  orphan). Without `--prune`, orphans are reported and left in place.
+  orphan). Without `--prune`, orphans are reported and left in place. Under `--scope`, a table the design
+  declares outside the scope is never an orphan — a scope narrows what is applied, not what the
+  project owns.
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 Reconcile is **disabled once the project is released** (`project.released: true`) — see `dbd release`.
