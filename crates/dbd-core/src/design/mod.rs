@@ -218,6 +218,28 @@ fn restrict_snapshot_to_schemas(
     }
 }
 
+/// Remove from a live snapshot the tables and enums in `hidden` — those the
+/// design declares but the scope leaves out (#40).
+///
+/// They sit in a managed schema without being desired, so left in they read as
+/// orphans and `--prune` dropped them. Removed here, a scoped reconcile neither
+/// alters nor prunes them, and a live object the design does not declare at all
+/// is still an orphan. `hidden` is empty when there is no scope.
+fn hide_declared(
+    live: crate::snapshot::Snapshot,
+    hidden: &std::collections::HashSet<(String, String)>,
+) -> crate::snapshot::Snapshot {
+    if hidden.is_empty() {
+        return live;
+    }
+    let keep = |schema: &str, name: &str| !hidden.contains(&(schema.to_string(), name.to_string()));
+    crate::snapshot::Snapshot {
+        tables: live.tables.into_iter().filter(|t| keep(&t.schema, &t.name)).collect(),
+        enums: live.enums.into_iter().filter(|e| keep(&e.schema, &e.name)).collect(),
+        ..live
+    }
+}
+
 /// Whether an import plan entry runs under a scope's working set.
 /// An entry with write-targets is kept only if ALL targets are in scope;
 /// a proc-less entry is kept if its staging table is in scope.
