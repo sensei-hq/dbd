@@ -1,32 +1,37 @@
 # Checkpoint
 
-**Slice:** #40 fixed on `develop` (`98480df`) — `reconcile --prune --scope` no
-longer drops the project's own out-of-scope tables. Not yet on `main` or released.
+**Slice:** #7 multi-project isolation — design proposed, awaiting approval.
+Spec: `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`.
 
 ## Done
 
-- v0.24.0 released and verified (crates.io, `main` `d36902c`).
-- #40: `declared_out_of_scope` + `hide_declared` in reconcile and diff_live;
-  3 embedded-PG tests (scoped reconcile, scoped diff, unscoped control).
-- Docs: guide 04, llms.txt, llms-full.txt; CHANGELOG [Unreleased] Fixed entry.
+- v0.24.1 released and verified against the crates.io artifact: 0.24.0 pruned
+  2 tables in the #40 repro (`orders` lost, FK gone), 0.24.1 pruned only `stray`.
+- #40 closed (PR #43 → `main` `d71fdd6`, every check green).
+- #7 design written: exclusive schema ownership in `dbd.ownership`, a core
+  `preflight` on every mutating entry point, and ownership-aware reset.
 
-## Verified
+## Remaining (once approved)
 
-    embedded suite 55/55 · workspace 1635/0 · clippy 1.99 --all-features
-    PR #42 green on every check (incl. the embedded CI job)
+- Phase 1 (patch): roles and extensions leave `managed_schemas`; cron jobs
+  tagged by project; heal folds only its own legacy rows; import staging moves
+  into `dbd`, one table per project.
+- Phase 2 (minor): `dbd.ownership`, `preflight`, reset guards, `init --from-db`
+  and `merge` onboarding, `inspect --shared`, SQLite parity.
+- Phase 3: docs, skills, site mirrors, `dbd-pattern-verifier`.
 
 ## Next
 
-    # if releasing the fix: cut 0.24.1 (patch) per the Release Checklist —
-    # PR develop → main (closes #40), then `make bump` on develop
+    # after approval: phase 1, test-first, starting with T1 (role/extension
+    # no longer pulls `public` into managed_schemas) on a fix/ branch off develop
 
 ## Open questions
 
-- Cut 0.24.1 for #40 (data loss in released versions)?
-- #7: keep for separately-maintained designs on one DB, or close in favour of
-  "one design + scopes" now that #40 makes scopes safe?
+- The spec's three "Decisions to confirm": `public` is exclusive; name reuse
+  is detected without a `project.id` field; a schema is released when the
+  design drops it.
 
 ## Known-broken / upstream
 
-- History has no views/routines: snapshots hold tables and enums only.
+- History has no views or routines: snapshots hold tables and enums only.
 - Snapshots cut before inline FKs were recorded show a one-time FK "change".
