@@ -3745,3 +3745,110 @@ async fn reconcile_does_not_prune_a_platform_owned_table() {
         "an orphan in the project's own schema must still be prunable: {dropped:?}"
     );
 }
+
+// ── #40: a scope narrows what is applied, not what the project owns ─────────
+
+/// A project with two tables in one schema — `orders` references `items` — and a
+/// scope that selects only `items`. Deployed whole, plus one live table the design
+/// does not declare at all.
+async fn scoped_project(adapter: &dyn dbd_core::DatabaseAdapter) -> (tempfile::TempDir, Design) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: scoped_prune\n  version: 1\n\
+         source:\n  dialect: postgresql\nschemas:\n  - app\n\
+         scopes:\n  items_only:\n    includes:\n      - app.items\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\ncreate table if not exists items (id integer primary key, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/orders.ddl"),
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, item_id integer references app.items (id)\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create the whole design");
+    adapter
+        .execute_script("create table app.stray (id integer);")
+        .await
+        .expect("an undeclared table");
+    (tmp, design)
+}
+
+fn orders_fk() -> String {
+    "SELECT 1 FROM information_schema.table_constraints \
+     WHERE table_schema = 'app' AND table_name = 'orders' AND constraint_type = 'FOREIGN KEY'"
+        .to_string()
+}
+
+/// `reconcile --prune --scope items_only` dropped `app.orders` — the design's own
+/// table, outside the scope but in the scope's schema (#40).
+#[tokio::test]
+async fn a_scoped_reconcile_prunes_only_what_the_design_does_not_declare() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_prune").await.unwrap();
+    let (_tmp, design) = scoped_project(&*adapter).await;
+    let scope = design.resolve_scope(Some("items_only"), None).expect("scope");
+
+    let plan = design
+        .reconcile(&*adapter, false, false, true, Some(&scope), Progress::none())
+        .await
+        .expect("scoped reconcile");
+
+    let dropped: Vec<&str> = plan.dropped.iter().map(|d| d.entity_name.as_str()).collect();
+    assert_eq!(
+        dropped,
+        vec!["app.stray"],
+        "only what no part of the design declares is an orphan"
+    );
+    assert_table_exists(&*adapter, "app", "orders").await;
+    assert_catalog(&*adapter, true, &orders_fk(), "app.orders foreign key").await;
+    assert_table_absent(&*adapter, "app", "stray").await;
+}
+
+/// `dbd diff --scope` must show what reconcile would do — no drop for `app.orders`.
+#[tokio::test]
+async fn a_scoped_diff_reports_no_drop_for_the_designs_own_tables() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_diff").await.unwrap();
+    let (_tmp, design) = scoped_project(&*adapter).await;
+    let scope = design.resolve_scope(Some("items_only"), None).expect("scope");
+
+    let diff = design.diff_live(&*adapter, Some(&scope)).await.expect("scoped diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert_eq!(
+        touched,
+        vec!["Drop app.stray"],
+        "the scoped diff names the orphan and nothing else"
+    );
+}
+
+/// Unscoped, nothing changes: the stray is the only orphan and both tables stay.
+#[tokio::test]
+async fn an_unscoped_reconcile_still_prunes_orphans_and_keeps_every_declared_table() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "unscoped_prune").await.unwrap();
+    let (_tmp, design) = scoped_project(&*adapter).await;
+
+    let plan = design
+        .reconcile(&*adapter, false, false, true, None, Progress::none())
+        .await
+        .expect("unscoped reconcile");
+    let dropped: Vec<&str> = plan.dropped.iter().map(|d| d.entity_name.as_str()).collect();
+    assert_eq!(dropped, vec!["app.stray"]);
+    assert_table_exists(&*adapter, "app", "items").await;
+    assert_table_exists(&*adapter, "app", "orders").await;
+}
