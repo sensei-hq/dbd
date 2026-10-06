@@ -1,31 +1,30 @@
 # Checkpoint
 
-**Slice:** shipped — rokkit 1.9.0, per-entity changelog (#33), every entity in
-the sidebar (#34). `main` `66c8779`, live on https://dbd.sensei-hq.com/diagram.
+**Slice:** #40 fixed on `develop` (`98480df`) — `reconcile --prune --scope` no
+longer drops the project's own out-of-scope tables. Not yet on `main` or released.
 
 ## Done
 
-- rokkit 1.9.0 (#32, #36): rokkit#170/#171/#172 all fixed upstream; plain
-  Neighborhood; header stable across tabs. Guard test: no reserved column.
-- #33: Changelog tab per table and enum (`entityHistory`, `FieldEdits`).
-- #34: `SchemaModel` v3 `enums`; parser keeps `COMMENT ON TYPE`; sidebar of
-  every entity with a kind filter; ObjectView and EnumView.
-- PR #37 (develop → main) merged; #33, #34 closed.
+- v0.24.0 released and verified (crates.io, `main` `d36902c`).
+- #40: `declared_out_of_scope` + `hide_declared` in reconcile and diff_live;
+  3 embedded-PG tests (scoped reconcile, scoped diff, unscoped control).
+- Docs: guide 04, llms.txt, llms-full.txt; CHANGELOG [Unreleased] Fixed entry.
 
 ## Verified
 
-    main 66c8779: CI, CodeQL, Cloudflare production build all green
-    live: 9 entities + 4 chips; one- and two-sided neighbourhoods centred;
-    view uses, enum values, shop.orders' changelog (v5, v2)
+    embedded suite 55/55 · workspace 1635/0 · clippy 1.99 --all-features
+    PR #42 green on every check (incl. the embedded CI job)
 
 ## Next
 
-    # cut 0.24.0 — a minor: SchemaModel gained pub fields (history, enums)
-    # follow the Release Checklist in ~/.claude/CLAUDE.md
+    # if releasing the fix: cut 0.24.1 (patch) per the Release Checklist —
+    # PR develop → main (closes #40), then `make bump` on develop
 
 ## Open questions
 
-- When to cut 0.24.0; CHANGELOG [Unreleased] is ready for it.
+- Cut 0.24.1 for #40 (data loss in released versions)?
+- #7: keep for separately-maintained designs on one DB, or close in favour of
+  "one design + scopes" now that #40 makes scopes safe?
 
 ## Known-broken / upstream
 

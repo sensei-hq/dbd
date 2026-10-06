@@ -132,7 +132,7 @@ Global flags: `--scope <name>` selects a `scopes:` entity subset; `--deps report
 - The bookkeeping table records environment (dev/prod) and version in the database: `dbd.meta` in a dedicated `dbd` schema on Postgres/Supabase (paired with `dbd.migrations`; not PostgREST-exposed, excluded from reverse-engineering/reset), `_dbd_meta`/`_dbd_migrations` on SQLite (no schemas there, so the prefix is the namespace). Legacy `public._dbd_meta`/`public._dbd_migrations` (and scoped-apply strays) heal into `dbd.meta`/`dbd.migrations` automatically on the next write
 - `dbd reset` blocked in prod (always) and in dev after v1 snapshot
 - `project.released` (set by `dbd release`) disables the in-place `dbd reconcile` workflow — after release, schema changes must go through snapshots + `dbd apply`
-- `dbd reconcile` never touches schemas the design doesn't declare; column drops need `--allow-destructive`, whole-table (orphan) drops need `--prune`
+- `dbd reconcile` never touches schemas the design doesn't declare; column drops need `--allow-destructive`, whole-table (orphan) drops need `--prune`; under `--scope`, tables the design declares outside the scope are left alone, never pruned
 - `--force` overrides safety guards
 - For Convex (codegen target) the equivalent state lives in `<output>/.dbd_state.json`
 
