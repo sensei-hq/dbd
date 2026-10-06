@@ -3811,7 +3811,7 @@ async fn a_scoped_reconcile_prunes_only_what_the_design_does_not_declare() {
         "only what no part of the design declares is an orphan"
     );
     assert_table_exists(&*adapter, "app", "orders").await;
-    assert_catalog(&*adapter, true, &orders_fk(), "app.orders' foreign key").await;
+    assert_catalog(&*adapter, true, &orders_fk(), "app.orders foreign key").await;
     assert_table_absent(&*adapter, "app", "stray").await;
 }
 
