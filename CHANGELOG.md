@@ -9,6 +9,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.24.1] — 2026-10-06
+
+**A data-loss fix.** `dbd reconcile --prune --scope` could drop tables the design
+declares, whenever they were outside the scope but in a schema the scope touches.
+Every release with `--scope` is affected; upgrade before running a scoped prune.
+
 ### Fixed
 
 - **`reconcile --prune --scope` no longer drops the project's own tables.**
@@ -1451,6 +1457,7 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
 [Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.23.0...main
+[0.24.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.1
 [0.24.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.0
 [0.23.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.23.0
 [0.22.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.22.0
