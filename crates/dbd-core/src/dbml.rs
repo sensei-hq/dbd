@@ -1601,6 +1601,34 @@ mod tests {
         );
     }
 
+    /// A column comment keeps its line breaks. They were flattened to spaces
+    /// before the note was escaped, so a markdown comment came back from
+    /// `init --from-dbml` as one run-on line. DBML's `\n` escape keeps the note
+    /// on the one line both parsers read settings from.
+    #[test]
+    fn a_multi_line_column_comment_round_trips_with_its_line_breaks() {
+        let mut code = col("code", "text");
+        code.comment = Some("line one\n- line two".to_string());
+        let entities = vec![make_table_entity("app.t", vec![pk_col("id", "int"), code], vec![])];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let table = parsed.iter().find(|e| e.name == "app.t").expect("table read back");
+        let comment = table.table_def.as_ref().unwrap().columns[1].comment.as_deref();
+        assert_eq!(comment, Some("line one\n- line two"), "{}", doc.content);
+    }
+
     /// An enum column's type is written the way the table's own `search_path`
     /// resolves it. Written bare, `init --from-dbml` built `mood` unqualified,
     /// and the apply failed with `type "mood" does not exist` — the enum lives
