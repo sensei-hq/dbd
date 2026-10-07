@@ -728,7 +728,11 @@ fn sequence_name(written: &str, schema: Option<&str>) -> String {
     }
 }
 
-/// Whether `column` leads one of the table's keys or indexes.
+/// Whether `column` leads a key declared inside the `CREATE TABLE` — the
+/// primary key or a UNIQUE.
+///
+/// Not an index: MySQL checks that an AUTO_INCREMENT column leads a key when
+/// the table is created, and an index is a separate `CREATE INDEX` after it.
 fn leads_a_key(td: &TableDef, pk: &[String], column: &str) -> bool {
     let leads = |cols: &[String]| cols.first().is_some_and(|c| c == column);
     leads(pk)
@@ -737,16 +741,12 @@ fn leads_a_key(td: &TableDef, pk: &[String], column: &str) -> bool {
             TableConstraint::Unique { columns, .. } => leads(columns),
             _ => false,
         })
-        || td
-            .indexes
-            .iter()
-            .any(|ix| ix.columns.first().is_some_and(|k| !k.is_expression && k.name == column))
 }
 
 /// The one column the target numbers itself, if any.
 ///
 /// Every target numbers at most one column per table, and two of them only
-/// some columns: MySQL one that leads a key (InnoDB keeps the counter in that
+/// some columns: MySQL one that leads the primary key or a UNIQUE (InnoDB keeps the counter in that
 /// index), SQLite only a single-column INTEGER PRIMARY KEY, which is the
 /// rowid. The first sequence-backed column that qualifies gets it; the rest
 /// are reported where they are emitted.
@@ -819,8 +819,8 @@ fn numbering(
                 target.label()
             ),
             (None, Target::MySql) => {
-                "MySQL numbers only a column that leads a key, which this one does not — inserts must \
-                 now supply it"
+                "MySQL numbers only a column that leads the primary key or a UNIQUE, which this one does \
+                 not — inserts must now supply it"
                     .to_string()
             }
             (None, Target::Sqlite) => {
@@ -1798,7 +1798,9 @@ fn column_default(
                 Target::MySql | Target::Sqlite => {
                     let counter = match (numbered, target) {
                         (Some(other), _) => format!("the table's one numbered column is `{other}`"),
-                        (None, Target::MySql) => "MySQL numbers only a column that leads a key".to_string(),
+                        (None, Target::MySql) => {
+                            "MySQL numbers only a column that leads the primary key or a UNIQUE".to_string()
+                        }
                         (None, _) => "SQLite numbers only a single-column INTEGER PRIMARY KEY".to_string(),
                     };
                     lose(
