@@ -56,8 +56,8 @@ pub async fn cmd_inspect(
 
     // Count what this run is actually about, the way every other command
     // counts it: under a scope, the entities it builds (closure included).
-    let (total_entities, design_entities) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, total_entities, design_entities);
+    let (run_entities, design_entities) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, run_entities, design_entities);
     report_scope_gaps(&resolved, &report, verbosity)?;
     let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
 
@@ -129,7 +129,7 @@ pub async fn cmd_inspect(
     // the tally is what a reader is looking for.
     let blocking = report.issues.len() + todos.len() + matview_errors.len();
     output::always("");
-    output::summary(blocking, report.warnings.len(), total_entities);
+    output::summary(blocking, report.warnings.len(), run_entities);
     if !report.out_of_scope_issues.is_empty() {
         output::always(&format!(
             "({} error(s) outside scope '{}')",
