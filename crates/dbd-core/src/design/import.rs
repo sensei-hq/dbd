@@ -22,7 +22,80 @@ impl Design {
         if let Some(n) = name {
             self.check_import_name(n)?;
         }
-        Ok(())
+        self.check_import_staging(name)
+    }
+
+    /// Whether `import.staging` lets an import load into `schema`.
+    ///
+    /// An empty list declares no restriction: a project that never set it
+    /// loads every schema, as it always has. A target with no schema cannot be
+    /// vouched for once a list is set — it resolves through the database's
+    /// search_path, to whatever schema that names.
+    fn import_schema_allowed(&self, schema: Option<&str>) -> bool {
+        let staging = &self.config.import.staging;
+        staging.is_empty() || schema.is_some_and(|s| staging.iter().any(|allowed| allowed == s))
+    }
+
+    /// Refuse an import into a table outside `import.staging`.
+    ///
+    /// `import.staging` lists the schemas an import may load, and the load
+    /// truncates its table first. The list was parsed and never read, so a
+    /// data file under `import/app/` emptied a live table and replaced its
+    /// rows. Public for the ad-hoc `-n <table> -f <file>` load, which names a
+    /// table rather than a data file and is held to the same list.
+    pub fn check_import_target(&self, table: &str) -> Result<()> {
+        let schema = table.split_once('.').map(|(schema, _)| schema);
+        if self.import_schema_allowed(schema) {
+            return Ok(());
+        }
+        let allowed = self.config.import.staging.join(", ");
+        Err(DbdError::Config(match schema {
+            Some(schema) => format!(
+                "{table} is not in a staging schema — import.staging allows only: {allowed}. An import \
+                 loads staging tables; list '{schema}' under import.staging if it is one"
+            ),
+            None => format!(
+                "{table} names no schema, so import.staging ({allowed}) cannot vouch for it — \
+                 qualify it with its staging schema, e.g. {}.{table}",
+                self.config.import.staging[0]
+            ),
+        }))
+    }
+
+    /// Refuse every data file this run would load outside `import.staging`
+    /// (see [`Design::check_import_target`]), naming each — all at once, so
+    /// fixing one does not just reveal the next.
+    ///
+    /// Only the files `name` selects are judged: `-n` narrows the run to one
+    /// file, and a misplaced file the run does not touch cannot harm it.
+    fn check_import_staging(&self, name: Option<&str>) -> Result<()> {
+        let outside: Vec<String> = self
+            .import_tables
+            .iter()
+            .filter(|t| name.is_none_or(|n| t.name == n))
+            .filter(|t| !self.import_schema_allowed(t.schema.as_deref()))
+            .map(|t| {
+                let file = t
+                    .file
+                    .as_deref()
+                    .map(|f| f.strip_prefix(&self.project_dir).unwrap_or(f));
+                format!(
+                    "  {} → {}",
+                    file.map(|f| f.display().to_string()).unwrap_or_default(),
+                    t.name
+                )
+            })
+            .collect();
+        if outside.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!(
+            "import refused: import.staging allows only {}, and these data files load other schemas:\n{}\n\
+             An import loads (and by default truncates) staging tables only. Move each file under \
+             import/<staging schema>/, or list its schema under import.staging if it is a staging schema.",
+            self.config.import.staging.join(", "),
+            outside.join("\n")
+        )))
     }
 
     /// A `-n` must select a data file this run loads.

@@ -19,37 +19,58 @@ fn format_from_ext(path: &Path) -> &'static str {
     }
 }
 
-/// Resolve the schema-qualified name of a `Table` entity matching `name`.
-/// Falls back to `name` verbatim when no matching table is found (so an
-/// ad-hoc COPY target can still be addressed by its bare name).
+/// Resolve the schema-qualified name of the table `name` means.
+///
+/// When the project lists schemas under `import.staging`, a name matching a
+/// table in one of them means that one — it is the only kind an import may
+/// load. Taking whichever table matched first resolved `-n lookups` to the
+/// live `config.lookups` beside `staging.lookups`. The staging table may be
+/// one the project only has a data file for. Otherwise the first declared
+/// table matching wins, and failing that `name` verbatim (so an ad-hoc COPY
+/// target can still be addressed by its bare name).
 fn resolve_table_name(design: &Design, name: &str) -> String {
-    design
+    let matches = |e: &&Entity| e.name == name || e.name.ends_with(&format!(".{name}"));
+    let staging = &design.config().import.staging;
+    let in_staging = |e: &&Entity| {
+        e.name
+            .split_once('.')
+            .is_some_and(|(schema, _)| staging.iter().any(|s| s == schema))
+    };
+    let declared = design
         .entities()
         .iter()
-        .find(|e| e.entity_type == EntityType::Table && (e.name == name || e.name.ends_with(&format!(".{name}"))))
+        .filter(|e| e.entity_type == EntityType::Table)
+        .filter(matches);
+    declared
+        .clone()
+        .chain(design.import_tables().iter().filter(matches))
+        .find(in_staging)
+        .or_else(|| declared.clone().next())
         .map(|e| e.name.clone())
         .unwrap_or_else(|| name.to_string())
 }
 
-/// Hold an ad-hoc `-f` import to the scope, as every other import is held.
+/// Hold an ad-hoc `-f` import to the scope and to `import.staging`, as every
+/// other import is held.
 ///
 /// It ignored `--scope` entirely, loading into a table the scope does not
 /// build. A table the design declares must be one the scope builds. One it
 /// does not declare is a deliberate ad-hoc COPY target (see
 /// [`resolve_table_name`]) that no scope can contain — so the scope is not
-/// applied to it, and that is said rather than left silent.
+/// applied to it, and that is said rather than left silent. Neither may load
+/// outside the schemas `import.staging` lists.
 fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope, qualified: &str) -> Result<()> {
-    if resolved.is_all {
-        return Ok(());
+    if !resolved.is_all {
+        if design.entities().iter().any(|e| e.name == qualified) {
+            design.resolve_name(qualified, Some(resolved))?;
+        } else {
+            output::warn(&format!(
+                "--scope {} not applied to {qualified}: the design does not declare it, so no scope contains it",
+                resolved.name
+            ));
+        }
     }
-    if design.entities().iter().any(|e| e.name == qualified) {
-        design.resolve_name(qualified, Some(resolved))?;
-    } else {
-        output::warn(&format!(
-            "--scope {} not applied to {qualified}: the design does not declare it, so no scope contains it",
-            resolved.name
-        ));
-    }
+    design.check_import_target(qualified)?;
     Ok(())
 }
 
