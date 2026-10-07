@@ -684,28 +684,84 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
 
 /// Update the `project.version` field in a design.yaml file.
 pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
+    set_project_key(config_path, "version", &version.to_string(), |c| {
+        c.project.version == Some(version)
+    })
+}
+
+/// Set the `project.released` flag in a design.yaml file.
+pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
+    set_project_key(config_path, "released", &released.to_string(), |c| {
+        c.project.released == released
+    })
+}
+
+/// Set one scalar `key` under `project:`, editing that line in place.
+///
+/// design.yaml is hand-written: re-serialising it through serde dropped every
+/// comment, blank line and flow-style list each time `dbd snapshot` bumped the
+/// version. The edit touches one line (or adds one at the end of the
+/// `project:` block); the result is re-parsed and must say what was asked, and
+/// a layout the line edit cannot handle — a flow-style `project: {…}` — falls
+/// back to the old whole-file rewrite rather than guessing.
+fn set_project_key(config_path: &Path, key: &str, value: &str, took: impl Fn(&DesignConfig) -> bool) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
-    value["project"]["version"] = serde_yaml::Value::Number(serde_yaml::Number::from(version));
-    let output = serde_yaml::to_string(&value)?;
+    let edited = edit_project_key(&content, key, value)
+        .filter(|out| serde_yaml::from_str::<DesignConfig>(out).is_ok_and(|c| took(&c)));
+    let output = match edited {
+        Some(out) => out,
+        None => {
+            let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
+            let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
+            doc["project"][key] = parsed;
+            serde_yaml::to_string(&doc)?
+        }
+    };
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::write(config_path, output)?;
     Ok(())
 }
 
-/// Set the `project.released` flag in a design.yaml file.
-pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
-    value["project"]["released"] = serde_yaml::Value::Bool(released);
-    let output = serde_yaml::to_string(&value)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::write(config_path, output)?;
-    Ok(())
+/// `content` with `key: value` set inside the block-style `project:` mapping,
+/// everything else byte-for-byte. `None` when there is no such block.
+fn edit_project_key(content: &str, key: &str, value: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    // Any non-blank line at column 0 ends the block — a comment there
+    // introduces the key below it, not the end of `project:`.
+    let is_top_key = |l: &str| !l.trim().is_empty() && !l.starts_with([' ', '\t']);
+    let header = lines.iter().position(|l| {
+        let code = l.split('#').next().unwrap_or("").trim_end();
+        code == "project:"
+    })?;
+    let end = (header + 1..lines.len())
+        .find(|&i| is_top_key(lines[i]))
+        .unwrap_or(lines.len());
+    let indent: String = lines[header + 1..end]
+        .iter()
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| l.chars().take_while(|c| *c == ' ').collect())?;
+    let prefix = format!("{indent}{key}:");
+
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    if let Some(i) = (header + 1..end).find(|&i| lines[i].starts_with(&prefix)) {
+        // Keep a trailing comment on the line it annotates.
+        let comment = lines[i].find(" #").map(|p| lines[i][p..].trim_end().to_string());
+        let newline = if lines[i].ends_with('\n') { "\n" } else { "" };
+        out[i] = format!("{prefix} {value}{}{newline}", comment.unwrap_or_default());
+    } else {
+        // After the block's last non-blank line, so a blank line separating it
+        // from the next key stays where it was.
+        let last = (header + 1..end)
+            .rev()
+            .find(|&i| !lines[i].trim().is_empty() && !lines[i].trim_start().starts_with('#'))?;
+        if !out[last].ends_with('\n') {
+            out[last].push('\n');
+        }
+        out.insert(last + 1, format!("{prefix} {value}\n"));
+    }
+    Some(out.concat())
 }
 
 #[cfg(test)]
