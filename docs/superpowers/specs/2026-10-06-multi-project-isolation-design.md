@@ -1,6 +1,6 @@
 # Multi-Project Isolation in One Database (#7)
 
-**Date:** 2026-10-06 (rev 2, 2026-10-07)
+**Date:** 2026-10-06 (rev 3, 2026-10-07)
 **Status:** Proposed
 **Scope:** Let several owners share one database safely: independent projects
 from different repositories, and modules of one workspace kept under
@@ -15,6 +15,10 @@ that are wrong even with a single project.
 - Ownership moves from schemas to entities.
 - `public` is no longer a special case.
 - Modules get their own roots.
+
+**Rev 3** settles configuration: one root manifest with a `modules:` block, a
+comparison of projects, modules and scopes, and `dbd split` for converting
+sensei.
 
 Sensei is the motivating case. Its `dojo` scope pulls 31 entities out of the
 `sensei` and `staging` schemas, which it shares with the app's own tables.
@@ -45,8 +49,8 @@ Schema-level ownership could not express that.
 | **Owner** | Whatever deploys into the database and holds ownership: a single-root project (today's layout) or one module of a workspace. Its identity is `project.name` or `<project>/<module>`. |
 | **Entity ownership** | Each entity has exactly one owner per database. Only the owner creates, alters or drops it. |
 | **Use** | An owner may reference another owner's entity (FK, view, join, function body) but not change it. dbd records each use, and the entity's owner cannot break it. |
-| **Workspace** | `database/design.yaml` plus module roots `database/<module>/`. A project without modules is a workspace of one, so today's layout is unchanged. |
-| **Module** | A partition: entities never overlap between modules. Modules declare `depends_on`. |
+| **Workspace** | `database/design.yaml` with a `modules:` block, plus one folder per module (`database/<module>/`). A project without modules is a workspace of one, so today's layout is unchanged. |
+| **Module** | A partition: entities never overlap between modules. Declared under `modules:` with `depends_on`; its files live in its folder. |
 | **Scope** | A selection that may overlap. In a workspace, a scope selects modules (and can still select entities). |
 
 Modules partition and scopes select. That is why scopes could never carry
@@ -191,43 +195,83 @@ pub(crate) async fn preflight(&self, adapter: &dyn Adapter, mode: Preflight) -> 
 
 ## 2. Workspaces and module roots
 
-### Layout
+### Projects, modules and scopes
+
+Three ways to divide a database. The first two are owners; the third is not.
+
+| | Separate projects (multi-tenant) | Modules (one workspace) | Scopes |
+|---|---|---|---|
+| **What it is** | Independent designs that happen to share a database | One design partitioned into parts that evolve separately | Named selections of one design, for deploying subsets |
+| **Where it lives** | One repository each, with its own `database/design.yaml` | One repository: `database/design.yaml` with a `modules:` block, plus a folder per module | `scopes:` in `design.yaml`; one `ddl/` tree |
+| **Can entities overlap?** | No: the registry refuses | No: `dbd inspect` refuses before any database is touched | Yes, freely; that is their purpose |
+| **Owner in the database** | Each project (`project.name`) | Each module (`<project>/<module>`) | None of their own. Every scope of a project is the same owner (#40) |
+| **Version, snapshots, migrations** | Per project | Per module | Shared by the whole project |
+| **References across the boundary** | Allowed to entities the other owner owns, recorded and guarded | Allowed along `depends_on`, recorded and guarded | Gaps are reported or pulled in (`deps`) |
+| **Use when** | Different teams, repositories or release cadences | One team, but the design is large, or parts need to deploy to different databases or release separately | Same parts, different deployment targets |
+
+Scopes keep working inside a workspace and become coarser and simpler: a scope
+selects modules, and can still select individual entities.
+
+### One manifest
+
+There is a single `database/design.yaml`. Module folders hold DDL and data, not
+configuration:
 
 ```
 database/
-  design.yaml          # workspace: project, target (url, extensions, roles), scopes, defaults
-  shared/
-    module.yaml        # optional; name defaults to the folder
-    ddl/ import/ policies/ snapshots/ migrations/
-  core/
-    module.yaml        # depends_on: [shared]
-    ddl/ import/ policies/ snapshots/ migrations/
-  dojo/
-    module.yaml        # depends_on: [shared]
-    ddl/ ...
+  design.yaml
+  shared/  ddl/ import/ policies/ snapshots/ migrations/
+  core/    ddl/ import/ policies/ snapshots/ migrations/
+  dojo/    ddl/ import/ ...
 ```
 
-Each `database/<module>/` has exactly the layout a project root has today. A
-module can therefore be lifted into its own repository unchanged and become an
-independent project. The registry treats both cases the same way.
+```yaml
+project:
+  name: sensei
+target:
+  postgres:
+    url: $DATABASE_URL
+    extensions: [{ name: vector, schema: extensions }]
+modules:
+  shared:
+    note: Reference data the app and Dōjō both need
+  core:
+    depends_on: [shared]
+  dojo:
+    depends_on: [shared]
+scopes:
+  dojo:    { modules: [dojo], extensions: [] }   # + shared, via depends_on
+  default: { modules: [core] }                    # + shared
+import:
+  staging: [staging]
+  options: { truncate: true, null_value: "" }
+```
 
-`module.yaml` holds what is per-module:
+Why one manifest:
 
-- `depends_on`
-- `import`, `apply` hooks, `export`, `materialized_views`, `ignore`
-- the module's own `scopes`, for entity-level selection inside it
+- Everything that configures the project already names entities by their
+  qualified names: `import.tables`, `export`, `materialized_views`, `ignore`,
+  hook `writes:`. The owning module of `sensei.rule_packs` is known from which
+  folder its DDL is in. A per-module manifest would only repeat names the folder
+  already settles.
+- The only per-module facts are `depends_on`, an optional `note`, an optional
+  `path` (default `<module>/`), and apply hooks that belong to one module
+  (`modules.<name>.apply`). All of those fit in one block.
+- One file shows the whole database: what is in it, what depends on what, and
+  what deploys where.
+- A module that later moves to its own repository takes its folder, and its
+  `modules.<name>` block becomes that repository's `design.yaml`.
 
-The workspace `design.yaml` holds what is per-database:
+`export:` keeps its current meaning: the data export behind `dbd export`.
+Typically that is views that dereference foreign keys so the output matches
+the import staging tables, which lets the data of a long-running system move
+from one database to another. Each `export:` entry belongs to the module that
+owns the view, and `dbd export --module core` narrows to one module. Nothing in
+this design reuses the word "export" for module boundaries.
 
-- `project`, `source`, `target` (extensions, roles), `schemas` (exposure,
-  grants), `external`, `format`
-- the workspace `scopes`
-
-A module's `module.yaml` may override `source.search_path`.
-
-A project with no `module.yaml` anywhere and a `ddl/` at the root is a workspace
-of one module. Its identity stays `project.name`, so nothing changes for
-existing projects.
+A project without a `modules:` block is a workspace of one module rooted at
+`database/`. Its identity stays `project.name`, so nothing changes for existing
+projects.
 
 ### Behaviour
 
@@ -243,19 +287,43 @@ existing projects.
   (`<project>/<module>`). Each module also has its own version, `snapshots/`
   and `migrations/`, so modules release independently.
 - **Selecting what to run.** `--module core` selects one module, plus its
-  dependencies under `deps: include`. Workspace scopes select modules:
-
-  ```yaml
-  scopes:
-    dojo:    { modules: [dojo] }           # + shared, via depends_on
-    default: { modules: [core] }           # + shared
-  ```
-
-  Sensei's 32-entry `dojo` includes list becomes this one line.
+  dependencies. Workspace scopes select modules (above). Sensei's 32-entry
+  `dojo` includes list becomes one line.
 - **Running inside a module folder** finds the workspace root by walking up, as
   Cargo does, and selects that module.
 - **The viewer** groups the diagram and sidebar by module, alongside the schema
   tint.
+
+### Converting an existing project: `dbd split`
+
+Sensei is the only project using scopes, and its scopes already encode the
+partition. Each region of the scopes' Venn diagram, computed on the expanded
+sets after `deps: include`, is a module:
+
+| Region | Becomes | Sensei today |
+|---|---|---|
+| in `dojo` and `default` | `shared` | the 29 listed lookup, rule-pack and metric entities and their imports, plus whatever `deps: include` adds |
+| only in `dojo` | `dojo` | the `dojo` schema, `staging.tenants`, `staging.import_tenants` |
+| only in `default` | `core` | everything else |
+
+`dbd split --from-scopes` prints that plan: modules, entity counts, the
+`depends_on` it infers from references, and the rewritten `scopes:`.
+`--write` then:
+
+- moves the files (`git mv` when the folder is in git)
+- splits `import/` by the module that owns each target table
+- writes `modules:` and the new `scopes:`
+
+Module names default to the region (`shared`, `<scope>`, `core`) and can be
+renamed in the plan. With more than two scopes there can be more regions. Empty
+regions are dropped, and the plan says which regions came from which scopes.
+
+On the database side there is no manual step. Sensei is pre-release and has no
+snapshots or migrations to divide. On each database, the first deploy after the
+split sees that the predecessor owner `sensei` is the same project. It retires
+that meta row, and each module claims its entities: the workspace transfer
+rule. The main database gets `sensei/shared` and `sensei/core`; the Dōjō
+database gets `sensei/shared` and `sensei/dojo`.
 
 ---
 
@@ -307,12 +375,12 @@ These are carried over from rev 1. Each is wrong today even with one project:
 |---|---|---|
 | 1 | The four fixes above (patch) | H2, H4, H5, H7 |
 | 2 | Entity ownership for single-root projects: `dbd.objects` and `dbd.uses`, `preflight`, prune and release rules, uses guard, reset rules, backfill, `--adopt-from`, `--allow-ownership-change`, `dbd inspect --shared`, `init --from-db` and `merge` skipping other owners' entities, SQLite (minor) | H1, H3, H6, H8, H9; all of #7's acceptance criteria |
-| 3 | Workspaces: `database/<module>/`, `module.yaml`, `depends_on`, static overlap check, per-module bookkeeping, snapshots and migrations, `--module`, module-selecting scopes, viewer grouping, and converting sensei as the proving case (minor) | the clutter, plus scopes standing in for modules |
+| 3 | Workspaces: `database/<module>/`, the `modules:` block, `depends_on`, static overlap check, per-module bookkeeping, snapshots and migrations, `--module`, module-selecting scopes, viewer grouping, `dbd split --from-scopes`, and converting sensei as the proving case (minor) | the clutter, plus scopes standing in for modules |
 | 4 | Logical replication: publication and subscription entities, subscriber tables generated from the owner's definition | runtime cross-database sync |
 
 Docs ship with each phase:
 
-- guide 03 (`module.yaml`, workspace `scopes`)
+- guide 03 (`modules:`, module-selecting `scopes`)
 - guide 04 (new flags, `inspect --shared`)
 - a new guide, "Sharing a database: projects, modules and shared entities"
 - `llms.txt`, `llms-full.txt`, both `SKILL.md` copies, the site mirrors
@@ -349,15 +417,17 @@ failing.
 | T20 | 3 | `core` references `dojo` without `depends_on` | gap error |
 | T21 | 3 | Workspace deploy of shared, core and dojo into one database | three meta rows; ownership by module |
 | T22 | 3 | An entity file moves from `core/` to `shared/` | ownership transfers; nothing is pruned |
-| T23 | 3 | Sensei converted; `--scope dojo` and default deploys | the same entities deploy to each database as with today's scopes |
+| T23 | 3 | `dbd split --from-scopes` on a fixture shaped like sensei | three modules; `shared` is the intersection; inferred `depends_on`; imports split by owning module |
+| T24 | 3 | Sensei converted; `--scope dojo` and default deploys | the same entities deploy to each database as with today's scopes; the `sensei` meta row is retired; module rows exist |
 
 ---
 
 ## Decisions to confirm
 
-1. **No exports list.** What a module protects is derived from what other
-   owners actually use. An optional `exports:` could restrict the surface
-   later. Recommended: no ceremony until a real need appears.
+1. **No list of what a module offers to others.** What a module protects is
+   derived from what other owners actually use. If a restriction is ever
+   needed, it gets a name that does not clash with `export:`, such as
+   `provides:`. Recommended: no ceremony until a real need appears.
 2. **Per-module versions, snapshots and migrations.** Recommended, because
    modules exist to evolve independently. The alternative is one workspace
    version.
@@ -365,6 +435,8 @@ failing.
    may both have a `shared` module. The alternative is bare module names.
 4. **Unowned entities in a shared schema are reported, never pruned.** An
    explicit `dbd adopt <entity>` can come later if reports pile up.
+5. **One root manifest**, with module folders holding no configuration.
+   Recommended (see section 2). The alternative is a `module.yaml` per module.
 
 ## Open / Deferred
 
