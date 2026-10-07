@@ -851,6 +851,32 @@ mod tests {
         );
     }
 
+    /// DBML's lexer reads `\` in a quoted string as an escape, so a backslash
+    /// is written `\\` and a quote `\'` — wherever dbd writes a string.
+    #[test]
+    fn strings_are_written_with_dbml_escapes() {
+        let column = ColumnDef {
+            comment: Some(r"C:\temp, the user's".to_string()),
+            default_value: Some("'it''s'".to_string()),
+            ..col("path", "text")
+        };
+        assert_eq!(
+            emit_column(&column, &std::collections::HashSet::new()),
+            r#"  "path" text [default: 'it\'s', note: 'C:\\temp, the user\'s']"#
+        );
+
+        let mut kind = Entity::new(EntityType::Enum, "app.kind");
+        kind.enum_values = vec![EnumValue {
+            name: "plain".to_string(),
+            note: Some(r"the user's \d".to_string()),
+        }];
+        assert!(
+            emit_enum(&kind).contains(r#""plain" [note: 'the user\'s \\d']"#),
+            "got:\n{}",
+            emit_enum(&kind)
+        );
+    }
+
     #[test]
     fn table_with_note() {
         let mut entity = make_table_entity("config.lookups", vec![col("id", "INT")], vec![]);

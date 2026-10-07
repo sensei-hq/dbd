@@ -1834,4 +1834,102 @@ mod tests {
         crate::parser::parse_entity(fake_path, &sql)
             .unwrap_or_else(|e| panic!("emitted DDL failed to re-parse: {e}\nSQL:\n{sql}"));
     }
+
+    // ── DBML string escapes ──────────────────────────────────────────────────
+
+    /// DBML reads a backslash in a quoted string as an escape, exactly like
+    /// its own lexer: `\\` is a backslash, `\n` a newline, `\'` a quote, and
+    /// any other `\x` is `x`.
+    #[test]
+    fn quoted_strings_read_dbml_escapes() {
+        assert_eq!(parse_single_line_string(r"'C:\\temp'").as_deref(), Some(r"C:\temp"));
+        assert_eq!(parse_single_line_string(r"'one\ntwo'").as_deref(), Some("one\ntwo"));
+        assert_eq!(parse_single_line_string(r"'it\'s'").as_deref(), Some("it's"));
+        assert_eq!(parse_single_line_string(r"'\d+'").as_deref(), Some("d+"));
+    }
+
+    /// Every string dbd writes into DBML — an enum value's note, a column's
+    /// note and string default, a table's single- and multi-line note — must
+    /// come back with its quotes and backslashes intact. An unescaped `'`
+    /// ended the string early (the enum note vanished, the `'it''s'` default
+    /// came back as `'it''''s'`), and a `'''` inside a multi-line note ended
+    /// the note.
+    #[test]
+    fn quotes_and_backslashes_survive_the_round_trip() {
+        use crate::dbml::{DbmlParams, generate_dbml};
+        use crate::entity::{EnumValue, TableComments};
+
+        let mut kind = Entity::new(EntityType::Enum, "app.kind");
+        kind.enum_values = vec![EnumValue {
+            name: "plain".into(),
+            note: Some(r"the user's C:\ drive".into()),
+        }];
+
+        let column = ColumnDef {
+            name: "path".into(),
+            data_type: "text".into(),
+            nullable: true,
+            default_value: Some("'it''s'".into()),
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: Some(r"Windows path, e.g. C:\temp — the user's".into()),
+            inline_fk: None,
+        };
+        let table_with_note = |name: &str, note: &str| {
+            let mut t = Entity::new(EntityType::Table, name);
+            t.table_def = Some(TableDef {
+                columns: vec![column.clone()],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments {
+                    table: Some(note.into()),
+                    ..Default::default()
+                },
+            });
+            t
+        };
+        let single_note = r"Matches \d+ in the user's codes";
+        let multi_note = "First line.\nA ''' run, a C:\\temp path, the user's note.";
+
+        let doc = generate_dbml(&DbmlParams {
+            entities: &[
+                kind,
+                table_with_note("app.single", single_note),
+                table_with_note("app.multi", multi_note),
+            ],
+            project_name: "Escapes",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+        let dbml = &doc.content;
+        let parsed = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}\n{dbml}"));
+
+        assert_eq!(
+            find_enum(&parsed, "app.kind").enum_values[0].note.as_deref(),
+            Some(r"the user's C:\ drive"),
+            "\n{dbml}"
+        );
+        for (name, note) in [("app.single", single_note), ("app.multi", multi_note)] {
+            let td = find_table(&parsed, name).table_def.as_ref().unwrap();
+            assert_eq!(
+                td.columns[0].comment.as_deref(),
+                Some(r"Windows path, e.g. C:\temp — the user's"),
+                "{name}:\n{dbml}"
+            );
+            assert_eq!(
+                td.columns[0].default_value.as_deref(),
+                Some("'it''s'"),
+                "{name}:\n{dbml}"
+            );
+            assert_eq!(td.comments.table.as_deref(), Some(note), "{name}:\n{dbml}");
+        }
+    }
 }
