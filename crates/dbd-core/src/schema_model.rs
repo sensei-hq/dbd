@@ -242,13 +242,22 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
     let stubs = collect_stubs(design, &tables, &refs);
 
     let mut schema_set: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    // A schema is one of the model's when the model draws anything in it — a
+    // schema of views or routines alone is listed with zero tables and enums,
+    // not dropped while its entities are drawn under it. Externals, roles and
+    // the like are not drawn, so they place no schema here.
     for e in &entities {
         let Some(s) = &e.schema else { continue };
+        let drawn = matches!(e.entity_type, EntityType::Table | EntityType::Enum) || node_kind(e.entity_type).is_some();
+        if !drawn {
+            continue;
+        }
+        let counts = schema_set.entry(s.clone()).or_insert((0, 0));
         match e.entity_type {
-            EntityType::Table => schema_set.entry(s.clone()).or_insert((0, 0)).0 += 1,
-            EntityType::Enum => schema_set.entry(s.clone()).or_insert((0, 0)).1 += 1,
-            _ => continue,
-        };
+            EntityType::Table => counts.0 += 1,
+            EntityType::Enum => counts.1 += 1,
+            _ => {}
+        }
     }
     let schemas = schema_set
         .into_iter()
