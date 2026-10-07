@@ -978,6 +978,24 @@ mod tests {
         assert_eq!(d.columns[2].identity, None);
     }
 
+    /// `serial` is `integer NOT NULL DEFAULT nextval(…)` — no primary key. Marking
+    /// it one put a key in the model that the database never has: reconcile then
+    /// planned `ADD PRIMARY KEY (seq_no)` beside the real one, and every real
+    /// run failed with "multiple primary keys"; DBML, the viewer and `emit`
+    /// showed a composite key that does not exist.
+    #[test]
+    fn a_serial_column_is_not_a_primary_key_unless_declared_one() {
+        let d = def("create table t (id uuid primary key, seq_no serial, label text);");
+        let seq_no = d.columns.iter().find(|c| c.name == "seq_no").expect("seq_no");
+        assert!(!seq_no.is_pk, "serial alone declares no key");
+        assert!(!seq_no.nullable, "serial is NOT NULL");
+        let pk: Vec<&str> = d.columns.iter().filter(|c| c.is_pk).map(|c| c.name.as_str()).collect();
+        assert_eq!(pk, vec!["id"]);
+
+        let declared = def("create table u (id serial primary key);");
+        assert!(declared.columns[0].is_pk, "a serial declared as the key still is one");
+    }
+
     /// SERIAL is sugar for an integer plus an owned sequence, not an IDENTITY
     /// column — so it must not set `identity`. The `is_pk` it does set mirrors
     /// the sqlparser incumbent, which reconcile's snapshot shape depends on.
