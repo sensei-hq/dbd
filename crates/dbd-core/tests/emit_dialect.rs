@@ -1194,3 +1194,59 @@ fn a_note_quoting_a_multi_line_comment_stays_a_comment() {
     let (sql, _) = emit_with(Dialect::Sqlite, "", &COMMENTED, None);
     on_sqlite(&sql, "", "select 'ok'").unwrap_or_else(|e| panic!("{e}"));
 }
+
+// ── A key on unbounded text is bounded, not dropped ────────────────────────
+
+const TEXT_KEYS: [(&str, &str); 2] = [
+    (
+        "table/app/countries.ddl",
+        "create table countries (code text primary key, name text not null unique);",
+    ),
+    (
+        "table/app/cities.ddl",
+        "create table cities (\n  \
+           id      integer primary key\n, \
+           country text not null references countries (code)\n, \
+           note    text\n\
+         );",
+    ),
+];
+
+/// MySQL refuses a TEXT column in a PRIMARY KEY, UNIQUE or FOREIGN KEY without
+/// a prefix length, and SQL Server refuses nvarchar(max) in any key. Leaving
+/// the constraint out would lose the key and every foreign key that points at
+/// it, so the column is bounded instead — VARCHAR(255) / nvarchar(450), the
+/// most a 900-byte SQL Server key holds — and the bound is reported: a longer
+/// value is now refused. A foreign key's own column gets the same bound, so
+/// the two sides still match.
+#[test]
+fn a_key_on_unbounded_text_is_bounded_and_reported() {
+    for (dialect, bounded) in [(Dialect::MySql, "VARCHAR(255)"), (Dialect::TSql, "nvarchar(450)")] {
+        let (sql, report) = emit_with(dialect, "", &TEXT_KEYS, None);
+        let stmts = statements(&sql);
+        for key in ["PRIMARY KEY", "UNIQUE", "FOREIGN KEY"] {
+            assert!(stmts.contains(key), "{dialect:?}: the {key} stays: {sql}");
+        }
+        for (entity, column) in [
+            ("app.countries", "code"),
+            ("app.countries", "name"),
+            ("app.cities", "country"),
+        ] {
+            assert!(
+                report
+                    .iter()
+                    .any(|d| d.entity == entity && d.column.as_deref() == Some(column) && d.to == bounded),
+                "{dialect:?}: {entity}.{column} is bounded to {bounded} and reported: {report:?}"
+            );
+        }
+        assert!(
+            about(&report, "note").is_empty(),
+            "{dialect:?}: a column in no key keeps its type: {report:?}"
+        );
+    }
+    let (sqlite, report) = emit_with(Dialect::Sqlite, "", &TEXT_KEYS, None);
+    assert!(
+        report.iter().all(|d| d.column.is_none()),
+        "SQLite keys TEXT as it is: {report:?}\n{sqlite}"
+    );
+}
