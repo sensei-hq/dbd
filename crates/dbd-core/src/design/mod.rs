@@ -2019,6 +2019,28 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// `combine` writes the script `apply` would run. Apply adds `public` to every
+    /// `SET search_path` (so an extension installed there resolves); combine
+    /// wrote the files as they were, and `psql -f init.sql` failed where apply
+    /// succeeded.
+    #[test]
+    fn combine_writes_the_search_path_apply_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        assert!(sql.contains("set search_path to app, public;"), "{sql}");
+    }
+
     /// A scope that keeps an extension but excludes the schema it installs into
     /// contradicts itself: `inspect` passed it and apply failed with `schema
     /// "ext" does not exist`. Refused where the scope is resolved, so every
