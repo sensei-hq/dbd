@@ -961,9 +961,17 @@ impl Design {
             if entity.entity_type == EntityType::External {
                 continue;
             }
-            // Check file exists for file-based entities
+            // Check file exists for file-based entities. A scanned file's path
+            // already starts with the project directory (the scan is rooted
+            // there), so joining it on again doubled a relative `-s proj` into
+            // `proj/proj/ddl/…` and reported every file missing. Only a path
+            // not already under it is resolved against it.
             if let Some(ref file) = entity.file {
-                let full_path = self.project_dir.join(file);
+                let full_path = if file.starts_with(&self.project_dir) {
+                    file.clone()
+                } else {
+                    self.project_dir.join(file)
+                };
                 if !full_path.exists() {
                     entity.errors.push(format!("File not found: {}", file.display()));
                 }
