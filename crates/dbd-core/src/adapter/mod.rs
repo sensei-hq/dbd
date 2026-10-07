@@ -325,7 +325,13 @@ pub(crate) fn delimited_header(data: &str, tab: bool, file: &Path) -> Result<Opt
     if !read {
         return Ok(None);
     }
-    let rows_at = bom + reader.position().byte() as usize;
+    let mut rows_at = bom + reader.position().byte() as usize;
+    // The reader ends a CRLF record at its `\r` and leaves the `\n` to the next
+    // read. Rows handed on from there start with a `\n` that COPY reads as a
+    // row of its own.
+    if data[..rows_at].ends_with('\r') && data[rows_at..].starts_with('\n') {
+        rows_at += 1;
+    }
     Ok(Some((header.iter().map(str::to_string).collect(), rows_at)))
 }
 
