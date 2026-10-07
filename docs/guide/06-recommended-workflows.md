@@ -112,7 +112,8 @@ it **refuses** if the source database is behind your project version (see Versio
 Designed the schema visually first? Reverse-engineer the DBML export — no connection needed:
 
 ```sh
-dbd init --from-dbml schema.dbml         # schemas + enums + tables + foreign keys
+dbd init --from-dbml schema.dbml         # schemas, enums, tables (CHECKs, indexes) and foreign keys
+dbd init --from-dbml schema.dbml --target supabase   # the same, for a Supabase database
 ```
 
 ### Keep a project in sync with a drifting database
@@ -129,12 +130,13 @@ dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the dif
 
 | Source | Captured |
 |--------|----------|
-| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, comments, `serial`/identity columns), views, materialized views (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: partial/expression indexes, triggers. |
+| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns), views, materialized views (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: triggers. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target. |
 | **SQLite** (`--from-db sqlite://…`) | tables, user indexes, and views — captured **verbatim** from `sqlite_master` (CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID` all survive). No schemas/enums/functions/sequences/roles; triggers skipped. Files land flat (`ddl/table/<name>.ddl`); `design.yaml` carries `schemas: []`. |
-| **DBML** (`--from-dbml <file>`) | schemas + enums + tables + foreign keys only — DBML can't express functions, procedures, views, standalone sequences, roles, or check constraints. `serial`/identity survive (dbd's DBML carries `bigserial`/`[increment]`). |
+| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes and key order survive; a table-level UNIQUE comes back as a named unique index; enum comments are lost. |
 
-The generated `design.yaml` target dialect comes from the connection URL scheme (`postgres://` →
-`postgres`, `sqlite://`/`file:` → `sqlite`). Secrets never land in the repo — the target `url` is
+The generated `design.yaml` target comes from the source: the connection URL scheme
+(`postgres://` → `postgres`, `sqlite://`/`file:` → `sqlite`), `supabase` for a PostgreSQL database
+with Supabase's `auth` and `storage` schemas, and `--target` for a DBML file. Secrets never land in the repo — the target `url` is
 written as the literal `$DATABASE_URL` reference, not the connection string you passed.
 
 ## Version safety

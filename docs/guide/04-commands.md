@@ -390,9 +390,22 @@ dbd dbml --scope hub -f hub.dbml   # Document only the entities in the 'hub' sco
 dbd dbml --scope hub --deps include  # Expand to the dependency closure first
 ```
 
-Generated natively — no `@dbml/core` dependency. Includes Project block, enums, tables with columns/indexes/comments, standalone Ref blocks with FK actions (including composite refs as `t.(c1, c2) > o.(c1, c2)`), `TableGroup` blocks, and stub tables for external FK targets.
+Generated natively — no `@dbml/core` dependency. Includes the Project block, enums, tables with columns, indexes, CHECKs and comments, standalone Ref blocks with FK actions (composite refs as `t.(c1, c2) > o.(c1, c2)`), `TableGroup` blocks, and a stub table for every table a Ref points at that the document does not define.
 
-**Scope-aware.** `--scope` documents only the entities that deploy under that scope (its working set). `--deps include` (or a scope whose `deps: include`) first expands the selection to its dependency closure, so the diagram is self-contained. Unlike `apply`/`deploy`, `dbml` does not gate on dependency gaps — it is documentation, so it simply emits the filtered set (out-of-scope FK targets still appear as external stub tables).
+What DBML has no syntax for travels where DBML keeps it, so `init --from-dbml` can read it back:
+
+- **CHECK constraints** go in the table's `checks { … }` block, each expression in backticks, with `[name: '…']` when the constraint is named.
+- **Expression indexes** keep their key in backticks (`` `lower(email)` ``), rather than reading back as a column named `lower(email)`.
+- **Table-level UNIQUE constraints** are written as unique indexes — DBML has no constraint syntax — and come back as named unique indexes, which enforce the same thing.
+- **Index notes** hold what an index's settings cannot, one fact per line: `where: <predicate>` for a partial index, `order: <entry>, …` when a key is not plain ascending (`asc` or `desc`, optionally `nulls first`/`nulls last`, one entry per key), and `nulls not distinct`. Only those lines are read back.
+- **Generated columns and `ALWAYS` identities** ride in custom column properties: `generated always as: '<expression>'`, and `generated as identity: 'always'` beside `increment` — a bare `increment` means `BY DEFAULT`.
+- Strings are escaped the way DBML's own lexer reads them, so a quote or backslash in a note or default survives.
+
+`checks` blocks need `@dbml/core` 5.0 or later and custom column properties 9.1 or later; tooling older than that cannot read a document that uses them.
+
+**Stubs.** A Ref to a table the document does not define is a DBML error, so each such table gets a stub with only the referenced columns — typed from the design when the design defines the table, `varchar` otherwise — and a note saying why: declared `external:`, defined in this project but outside this document, or referenced and defined nowhere.
+
+**Scope-aware.** `--scope` documents only the entities that deploy under that scope (its working set) and prints `scope 'hub': N of M entities`. `--deps include` (or a scope whose `deps: include`) first expands the selection to its dependency closure, so the diagram is self-contained. Unlike `apply`/`deploy`, `dbml` does not gate on dependency gaps — it is documentation, so it simply emits the filtered set, and an out-of-scope FK target appears as a stub typed from the design. (Before 0.25 a `--scope` document with such a Ref did not parse at all.) A `deps: include` scope whose closure needs something the scope excludes is refused.
 
 **Multi-document.** If `design.yaml` declares multiple `dbml.<key>` entries (each with its own `include`/`exclude`, `output`, `auto_group_by_schema`, `groups`), `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`). See [design.yaml reference](03-design-yaml.md#dbml) for the full schema.
 
@@ -418,17 +431,17 @@ Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | nul
 
 ## `dbd diagram`
 
-Open the schema in the **hosted interactive viewer** — a project overview, a pannable/zoomable ER diagram, a table list, a changelog built from your snapshots, and a sidebar of every entity (filterable by type) where each opens a page: a table's fields, references, dependencies, relationship diagram and own changelog; a view's or routine's uses and users; an enum's values. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained. The full guide is [the schema viewer](11-schema-viewer.md).
+Open the schema in the **hosted interactive viewer** — a project overview, a pannable/zoomable ER diagram, a table list, a changelog built from your snapshots, and a sidebar of every entity (filterable by type) where each opens a page: a table's fields, references, CHECKs, indexes, dependencies, relationship diagram and own changelog; a view's, routine's or sequence's uses and users; an enum's values; and, for a table a foreign key lands on that the model does not carry, a stub page saying why. The model is gzip-compressed into the URL fragment (client-side only, never sent to a server), so the link is private and self-contained. The full guide is [the schema viewer](11-schema-viewer.md).
 
 ```sh
 dbd diagram                        # build the model and open it in your browser
 dbd diagram --print-url            # print the viewer URL instead of opening a browser
 dbd diagram --site http://localhost:5173   # point at a different site (or set $DBD_DIAGRAM_URL)
 dbd diagram --json -f schema.json  # write the raw SchemaModel JSON (drop it onto <site>/diagram)
-dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
+dbd diagram --scope hub            # scope-aware (the scope's working set, its history too)
 ```
 
-`dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model; drag the file onto the site's `/diagram` page, or feed it to other tooling.
+`dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model; drag the file onto the site's `/diagram` page, or feed it to other tooling. A `deps: include` scope whose closure needs something the scope excludes is refused, as every command refuses it, rather than drawn as an empty model.
 
 ### The model JSON
 
@@ -436,11 +449,12 @@ The model carries a `version` (currently `3`), and being JSON rather than DBML i
 
 | Field | What it holds |
 | --- | --- |
-| `tables` | Tables, with columns (`pk`/`nn`/`en`/`fk`/`uq`, type, default, comment) and indexes |
-| `refs` | Foreign keys — the ER edges, column-level, as `{s,t,c}` |
-| `entities` | Views, materialized views, functions, procedures and triggers |
-| `deps` | What reads, writes or calls what — the call/reference graph |
-| `schemas` / `project` | Schema list with counts, and the project's name, dialect and note |
+| `tables` | Tables, with columns (`pk`/`nn`/`en`/`fk`/`uq`, type, default, comment, and `identity` or `generated`), indexes (a partial index's predicate as `where`) and `checks` (`{name?, expression}`) |
+| `refs` | Foreign keys — the ER edges, column-level, as `{s,t,c}` — every one, landing on a table or a stub |
+| `stubs` | The tables `refs` land on that `tables` does not carry: table-shaped, only the referenced columns, `kind` `external`, `out_of_scope` or `unresolved` — omitted when there are none |
+| `entities` | Views, materialized views, functions, procedures, triggers and sequences |
+| `deps` | What reads, writes, calls or uses what — the call/reference graph (`uses` is a column's enum or sequence) |
+| `schemas` / `project` | Every schema the model draws something in, with its table and enum counts; and the project's name, dialect and note |
 | `history` | What each snapshot changed, oldest first — omitted when the project has none |
 | `enums` | Enum types with their values in order, and their comment — omitted when there are none |
 
@@ -448,9 +462,9 @@ The model carries a `version` (currently `3`), and being JSON rather than DBML i
 
 A dependency edge whose target is not a project entity — a Postgres built-in like `now()`, or a genuine dangling reference — is marked `"unresolved": true` rather than dropped. The edge is real; only its endpoint cannot be placed on the diagram.
 
-Comments reach the model for **every** kind, not just tables: `note` is the first line (the one-line summary an entity table shows) and `noteMd` the full text.
+Comments reach the model for **every** kind, sequences included, not just tables: `note` is the first line (the one-line summary an entity table shows) and `noteMd` the full text.
 
-`history` is read from `snapshots/` and is what the viewer's Changelog tab draws. The first snapshot is a **baseline** — counts of tables and enums, not every one listed as added; each later entry lists the tables and enums that version added, removed or modified, with their column, index, constraint and enum-value edits. A rename or type change that `dbd snapshot` cut in stages is one entry (`version` to `through`) and reads as the rename or type change, never as the intermediate column. A type spelled two ways (`varchar(32)`, `character varying(32)`) is not a change. Snapshots record tables and enums only, so views and routines have no history. A project with no snapshots has no history; `dbd release`, `dbd snapshot`, `dbd init --from-db` and `dbd merge` all write them. With `--scope`, the history covers the scope's tables and enums only — its baseline counts them, not the project.
+`history` is read from `snapshots/` and is what the viewer's Changelog tab draws. The first snapshot is a **baseline** — counts of tables and enums, not every one listed as added; each later entry lists the tables and enums that version added, removed or modified, with their column, index, constraint and enum-value edits. A rename or type change that `dbd snapshot` cut in stages is one entry (`version` to `through`) and reads as the rename or type change, never as the intermediate column. A type spelled two ways (`varchar(32)`, `character varying(32)`) is not a change. Snapshots record tables and enums only, so views and routines have no history. A project with no snapshots has no history; `dbd release`, `dbd snapshot`, `dbd init --from-db` and `dbd merge` all write them. With `--scope`, the history covers the scope's working set — the `deps: include` closure too, so it matches what the diagram draws — and its baseline counts that, not the project.
 
 ---
 
@@ -874,7 +888,7 @@ schema-qualification warnings for cross-object references; the DDL is valid and 
 | Flag | Description |
 |------|-------------|
 | `--from-db [CONN]` | Reverse-engineer instead of scaffolding. With no value, the connection resolves from `-d`/`--database` then `$DATABASE_URL`. |
-| `--from-dbml <FILE>` | Reverse-engineer from a DBML file instead of a connection; mutually exclusive with `--from-db`. Produces schemas + enums + tables + foreign keys only (see note below). |
+| `--from-dbml <FILE>` | Reverse-engineer from a DBML file instead of a connection; mutually exclusive with `--from-db`. Produces schemas, enums, tables and foreign keys (see note below); `--target postgres` (default) or `supabase`. |
 | `--name NAME` | `project.name` (default: the database name from the connection). |
 | `--version N` | Base `project.version` written to `design.yaml`, and the version of the baseline snapshot (default `1`). |
 | `--schema S` | Limit to exactly these schemas (repeatable). |
@@ -917,7 +931,8 @@ its own project safely.
 
 **What's captured (and what isn't).** Reverse-engineering covers the **data model**:
 schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check
-constraints, indexes incl. `USING gin/gist/brin/hash`, and table + column comments), views,
+constraints, indexes incl. `USING gin/gist/brin/hash`, partial (`… WHERE …`) and expression
+(`lower(name)`) indexes and key order, and table + column comments), views,
 **materialized views** (definition + indexes from `pg_matviews`, written to
 `ddl/materialized_view/<schema>/<name>.ddl`),
 and **functions & procedures** (full bodies, captured verbatim via `pg_get_functiondef`;
@@ -936,19 +951,20 @@ self-contained.
 through the column itself — such columns emit `serial`/`bigserial`/`smallserial` or
 `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` rather than a separate sequence file.
 
-**From a DBML file (`--from-dbml`).** A DBML source produces **schemas + enums + tables + foreign
-keys only** — DBML cannot express functions, procedures, views, standalone sequences, roles, or
-check constraints, so none of those appear. `serial`/identity columns survive (dbd's DBML carries
-`bigserial`/`[increment]`, so the reconstructed column keeps it). All the schema-selection flags
-(`--schema`/`--exclude-schema`/`--all-schemas`) still filter the parsed entities; `--roles` is a
-no-op since DBML has no roles.
+**From a DBML file (`--from-dbml`).** A DBML source produces **schemas, enums, tables and foreign
+keys** — DBML cannot express functions, procedures, views, standalone sequences or roles, so none
+of those appear. What `dbd dbml` writes comes back: CHECK constraints (from `checks`), identity
+columns with `ALWAYS` kept apart from `BY DEFAULT`, `serial` columns, generated columns, a
+column's `UNIQUE`, partial and expression indexes and their key order. A table-level UNIQUE comes
+back as a named unique index, which enforces the same thing. An enum's comment is lost — DBML
+cannot express one. All the schema-selection flags (`--schema`/`--exclude-schema`/`--all-schemas`)
+still filter the parsed entities; `--roles` is a no-op since DBML has no roles.
 
-Not yet captured:
+Not yet captured from a database:
 
-- **Partial indexes** (`… WHERE …`) and **expression indexes** (e.g. `lower(name)`) — these
-  are skipped, since they can't be represented losslessly yet.
 - **Triggers**, aggregates, operators, domains, composite types.
-- dbd's own bookkeeping — the `dbd` schema (`dbd.meta`/`dbd.migrations`) — is always excluded.
+- dbd's own bookkeeping — the `dbd` schema (`dbd.meta`, `dbd.migrations`, `dbd.matview_stamps`)
+  — is always excluded.
 
 Column order reflects the database's **physical** order (which can differ from a
 hand-authored file after `ALTER TABLE ADD COLUMN`). Run `dbd format` on the result to
