@@ -873,6 +873,29 @@ mod tests {
         .unwrap();
     }
 
+    /// `-c` names the config file inside the source, for deploy as for every
+    /// other command. Deploy read `design.yaml` whatever `-c` said.
+    #[tokio::test]
+    async fn deploy_reads_the_config_named_by_dash_c() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("staging.yaml"), "project:\n  name: other\n").unwrap();
+        cmd_deploy(
+            src.path().to_str().unwrap(),
+            Path::new("staging.yaml"),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("deploy -c staging.yaml must read staging.yaml");
+    }
+
     /// A source directory that exists but has no `design.yaml` is a clear,
     /// actionable error — resolved entirely from the local filesystem.
     #[tokio::test]
