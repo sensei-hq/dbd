@@ -4733,3 +4733,52 @@ async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the
     assert_table_exists(&*adapter, "app", "t").await;
     assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
 }
+
+// ── Reset forgets the stamps of the matviews it drops ─────────────────────────
+
+/// `reset --clean` dropped the materialized view and left its row in
+/// `dbd.matview_stamps`. A stamp outliving its view describes something that no
+/// longer exists — and a later view of the same name, built by hand, would read
+/// as one dbd created. Both resets that drop the view must forget its stamp:
+/// the default one, which drops it by name, and `--clean`, which drops its
+/// schema.
+#[tokio::test]
+async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_stamp_reset").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: mv_stamp_reset\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/materialized_view/app/mv.ddl",
+                "create materialized view if not exists app.mv as select id from app.items with data;\n",
+            ),
+        ],
+    );
+    let stamp = "SELECT 1 FROM dbd.matview_stamps WHERE project = 'mv_stamp_reset' AND matview = 'app.mv'";
+
+    for (drop_schemas, drop_extensions, label) in [(false, false, "the default reset"), (true, true, "reset --clean")] {
+        design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+        assert_catalog(&*adapter, true, stamp, "the stamp deploy recorded for app.mv").await;
+
+        design
+            .reset(&*adapter, "postgres", false, drop_schemas, drop_extensions, None)
+            .await
+            .unwrap_or_else(|e| panic!("{label} failed: {e}"));
+
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mv'",
+            "matview app.mv",
+        )
+        .await;
+        assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
+    }
+}
