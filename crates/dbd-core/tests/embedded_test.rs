@@ -3852,3 +3852,45 @@ async fn an_unscoped_reconcile_still_prunes_orphans_and_keeps_every_declared_tab
     assert_table_exists(&*adapter, "app", "items").await;
     assert_table_exists(&*adapter, "app", "orders").await;
 }
+
+/// A role, or an extension declared without `schema:`, made `public` a managed
+/// schema, so `reconcile --prune` dropped tables in `public` that the design
+/// never declared — data loss for anything else living there.
+#[tokio::test]
+async fn a_role_or_bare_extension_does_not_let_prune_reach_public() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "role_public").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: role_public\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: prune_probe_role\n    \
+         extensions:\n      - plpgsql\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\ncreate table if not exists items (id integer primary key);\n",
+    )
+    .unwrap();
+    adapter
+        .execute_script("create table public.not_mine (id integer);")
+        .await
+        .expect("a table the design does not own");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+
+    let plan = design
+        .reconcile(&*adapter, false, false, true, None, Progress::none())
+        .await
+        .expect("reconcile --prune");
+
+    let dropped: Vec<&str> = plan.dropped.iter().map(|d| d.entity_name.as_str()).collect();
+    assert!(
+        dropped.is_empty(),
+        "nothing outside `app` is the design's to prune: {dropped:?}"
+    );
+    assert_table_exists(&*adapter, "public", "not_mine").await;
+    assert_table_exists(&*adapter, "app", "items").await;
+}
