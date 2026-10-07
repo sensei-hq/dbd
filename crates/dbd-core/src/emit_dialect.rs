@@ -263,6 +263,12 @@ pub fn emit_schema(
             .filter(|e| e.entity_type == EntityType::Sequence && e.errors.is_empty())
             .map(|e| e.name.clone())
             .collect(),
+        enums: design
+            .entities()
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Enum)
+            .map(|e| e.name.clone())
+            .collect(),
     };
     let mut out: Vec<String> = Vec::new();
     let mut report = Vec::new();
@@ -539,6 +545,18 @@ struct Script {
     /// `schema.name` of every sequence in the emitted set. Only SQL Server
     /// creates them; a default drawing from one outside it cannot apply.
     sequences: HashSet<String>,
+    /// `schema.name` of every enum the design declares — the whole design,
+    /// since a column's type is what it is whatever the scope keeps.
+    enums: HashSet<String>,
+}
+
+impl Script {
+    /// Whether the type a column names is one of this project's enums. A bare
+    /// name matches an enum of that name in any schema: the column's file may
+    /// have reached it through its `search_path`.
+    fn is_enum(&self, ty: &str) -> bool {
+        self.enums.contains(ty) || (!ty.contains('.') && self.enums.iter().any(|n| n.rsplit('.').next() == Some(ty)))
+    }
 }
 
 /// Whether `e` becomes an object in the target — and so needs its schema to
@@ -628,7 +646,7 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     let mut lines: Vec<String> = Vec::new();
     for c in &td.columns {
         let before = report.len();
-        let mut ty = map_type(&c.data_type, target, e, c, report);
+        let mut ty = map_type(&c.data_type, script, e, c, report);
         if bounded.contains(&c.name) {
             let to = key_bound(&c.data_type, target);
             report.push(Downgrade {
@@ -1614,7 +1632,9 @@ fn quote_all(columns: &[String], target: Target) -> String {
 }
 
 /// PostgreSQL's type as the target's, recording the loss when there is one.
-fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Vec<Downgrade>) -> String {
+fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut Vec<Downgrade>) -> String {
+    let target = script.target;
+    let label = target.label();
     let t = pg.trim().to_lowercase();
     let mut lose = |to: &str, reason: &str| {
         report.push(Downgrade {
@@ -1639,9 +1659,21 @@ fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Ve
         );
     }
 
+    // PostgreSQL writes a zone after any precision — `time (3) with time zone`
+    // — so the zone is read off the end before the type is cut at its
+    // parenthesis. Cut first, it was a plain `time` or `timestamp`, and SQL
+    // Server got a `datetime2` with no offset.
+    let (t, zoned) = match t.strip_suffix(" with time zone") {
+        Some(rest) => (rest.trim(), true),
+        None => (t.strip_suffix(" without time zone").unwrap_or(&t).trim(), false),
+    };
     // `varchar(20)` keeps its length; match on the base.
-    let base = t.split('(').next().unwrap_or(&t).trim();
-    let args = t.find('(').map(|i| &t[i..]).unwrap_or("");
+    let base = match (t.split('(').next().unwrap_or(t).trim(), zoned) {
+        ("time", true) => "timetz",
+        ("timestamp", true) => "timestamptz",
+        (base, _) => base,
+    };
+    let args = t.find('(').map(|i| t[i..].trim()).unwrap_or("");
 
     match (base, target) {
         ("jsonb" | "json", Target::MySql) => "JSON".to_string(),
@@ -1711,23 +1743,98 @@ fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Ve
         ("bytea", Target::TSql) => "varbinary(max)".to_string(),
         ("bytea", Target::Sqlite) => "BLOB".to_string(),
 
-        // Anything left is a user-defined type — most often an enum, which dbd
-        // knows the labels of only at the project level. Text plus a note is
-        // the honest floor; a CHECK would need the labels threaded here.
-        _ => {
-            let to = match target {
-                Target::MySql => "VARCHAR(255)",
-                Target::TSql => "nvarchar(255)",
-                Target::Sqlite => "TEXT",
-            };
-            lose(
-                to,
-                &format!(
-                    "`{base}` is not a built-in type here — if it is an enum, the allowed values \
-                     are no longer enforced"
+        // Blank-padded to its length on both targets that have it; PostgreSQL
+        // spells a bare `char` as `char(1)`. A bare `bpchar` has no length at
+        // all, so it is not this.
+        ("char" | "character" | "bpchar", _) if !args.is_empty() => {
+            let n: u32 = args.trim_matches(['(', ')']).trim().parse().unwrap_or(1);
+            match target {
+                Target::MySql if n <= 255 => format!("CHAR({n})"),
+                Target::MySql => lose(
+                    &format!("VARCHAR({n})"),
+                    "MySQL's CHAR holds at most 255 characters, so it is a VARCHAR — no longer padded to its length",
                 ),
-            )
+                Target::TSql if n <= 4000 => format!("nchar({n})"),
+                Target::TSql => lose(
+                    "nvarchar(max)",
+                    "SQL Server's nchar holds at most 4000 characters, so it is an nvarchar(max) — no longer \
+                     padded to its length",
+                ),
+                Target::Sqlite => "TEXT".to_string(),
+            }
         }
+
+        // Single precision everywhere.
+        ("real" | "float4", Target::MySql) => "FLOAT".to_string(),
+        ("real" | "float4", Target::TSql) => "real".to_string(),
+        ("real" | "float4", Target::Sqlite) => "REAL".to_string(),
+
+        // A time of day, its fractional precision kept; SQLite keeps every date
+        // and time as text, as it does `date`.
+        ("time", Target::MySql) => format!("TIME{args}"),
+        ("time", Target::TSql) => format!("time{args}"),
+        ("time", Target::Sqlite) => "TEXT".to_string(),
+
+        // Neither MySQL nor SQL Server keeps a time of day with its offset.
+        ("timetz", Target::MySql) => lose(
+            &format!("TIME{args}"),
+            "MySQL's TIME has no time zone, so a value's offset is not kept — times from different \
+             zones now compare as if they shared one",
+        ),
+        ("timetz", Target::TSql) => lose(
+            &format!("time{args}"),
+            "SQL Server's time has no time zone, so a value's offset is not kept — times from different \
+             zones now compare as if they shared one",
+        ),
+        ("timetz", Target::Sqlite) => "TEXT".to_string(),
+
+        // `interval day to second` names its fields after the type.
+        (b, _) if b == "interval" || b.starts_with("interval ") => lose(
+            &text_of(target, 255),
+            &format!(
+                "{label} has no interval type, so it is stored as its text form — adding it to a date, \
+                 or comparing two of them, no longer works"
+            ),
+        ),
+
+        ("inet" | "cidr", _) => lose(
+            // 49: the longest text form PostgreSQL writes — an IPv6 address
+            // with an IPv4 one inside it (45 characters) and a `/128` netmask.
+            &text_of(target, 49),
+            &format!(
+                "{label} has no type for a network address, so it is stored as its text form — an \
+                 address is no longer validated, and PostgreSQL's containment operators (<<, >>=) \
+                 have nothing to work on"
+            ),
+        ),
+
+        // Anything left is a type dbd does not map — an enum when the project
+        // declares one by that name, whose labels the target's text column no
+        // longer enforces. Text plus a note is the honest floor; a CHECK would
+        // need the labels threaded here. Only a declared enum is called one:
+        // `money` reported as "if it is an enum" sent readers looking for an
+        // enum that does not exist.
+        _ if script.is_enum(base) => lose(
+            &text_of(target, 255),
+            &format!("`{base}` is an enum, and {label} gets it as text — the allowed values are no longer enforced"),
+        ),
+        _ => lose(
+            &text_of(target, 255),
+            &format!(
+                "dbd has no {label} mapping for `{base}`, so it is stored as text — whatever the type \
+                 validated or computed is not carried"
+            ),
+        ),
+    }
+}
+
+/// A text column of up to `n` characters on `target` — SQLite's TEXT has no
+/// length.
+fn text_of(target: Target, n: u32) -> String {
+    match target {
+        Target::MySql => format!("VARCHAR({n})"),
+        Target::TSql => format!("nvarchar({n})"),
+        Target::Sqlite => "TEXT".to_string(),
     }
 }
 
