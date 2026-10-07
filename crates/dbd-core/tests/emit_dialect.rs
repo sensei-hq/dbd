@@ -1296,3 +1296,30 @@ fn mysql_numbers_only_a_column_whose_key_is_inside_the_create_table() {
         "{report:?}"
     );
 }
+
+// ── A file dbd could not read is not silently missing ──────────────────────
+
+/// An entity whose file does not parse was filtered out of the script without
+/// a word: exit 0, an empty report, and a schema missing a table. It cannot be
+/// emitted — there is no structure to translate — but the omission is a loss
+/// like any other, and is reported.
+#[test]
+fn an_entity_whose_file_does_not_parse_is_reported_as_missing() {
+    let files = [
+        ("table/app/good.ddl", "create table good (id integer primary key);"),
+        ("table/app/bad.ddl", "create table bad (id integer primary key,, oops);"),
+    ];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.bad" && d.to == "nothing" && d.reason.contains("syntax error")),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains("app.bad")),
+            "{dialect:?}: and the file says so: {sql}"
+        );
+    }
+}
