@@ -457,6 +457,38 @@ async fn a_jsonl_export_imports_back_to_the_same_values() {
     .await;
 }
 
+// ── Test: a UTF-16 DDL file applies ───────────────────────────────────────────
+
+/// SSMS writes UTF-16LE with a BOM. The project load decodes it, but `apply`
+/// read the file again with `read_to_string`, took the error for "no DDL", and
+/// skipped the table while reporting success.
+#[tokio::test]
+async fn a_utf16_ddl_file_applies_to_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("design.yaml"),
+        "project:\n  name: ssms\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ddl/table/app")).unwrap();
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "set search_path to app;\ncreate table if not exists wide (id integer primary key);\n".encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(dir.path().join("ddl/table/app/wide.ddl"), utf16).unwrap();
+    let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    assert_table_exists(&*adapter, "app", "wide").await;
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
