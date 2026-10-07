@@ -765,9 +765,7 @@ fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &Enum
     use std::collections::{BTreeMap, HashSet};
 
     let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
-    // Each target's referenced columns, with the type of the first column seen
-    // referencing it — what a stub falls back to when nothing declares one.
-    let mut targets: BTreeMap<String, BTreeMap<&str, String>> = BTreeMap::new();
+    let mut targets: BTreeMap<String, StubTarget> = BTreeMap::new();
     for entity in documented {
         let Some(table_def) = &entity.table_def else {
             continue;
@@ -795,10 +793,14 @@ fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &Enum
             if defined.contains(&target) {
                 continue;
             }
-            let columns = targets.entry(target).or_default();
+            let stub = targets.entry(target).or_default();
+            let key: Vec<&str> = fk.ref_columns.iter().map(String::as_str).collect();
+            if !stub.keys.contains(&key) {
+                stub.keys.push(key);
+            }
             for (i, column) in fk.ref_columns.iter().enumerate() {
                 let source_type = source_types.get(i).cloned().flatten();
-                let entry = columns.entry(column.as_str()).or_default();
+                let entry = stub.columns.entry(column.as_str()).or_default();
                 if entry.is_empty()
                     && let Some(source_type) = source_type
                 {
@@ -810,14 +812,25 @@ fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &Enum
 
     targets
         .iter()
-        .map(|(target, columns)| {
+        .map(|(target, stub)| {
             let known = design.iter().find(|e| {
                 matches!(e.entity_type, EntityType::Table | EntityType::External) && qualified_name(e) == *target
             });
-            emit_stub_block(target, columns, known, enums)
+            emit_stub_block(target, stub, known, enums)
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What the document's foreign keys say about a table it does not define.
+#[derive(Default)]
+struct StubTarget<'a> {
+    /// Each referenced column, with the type of the first column seen
+    /// referencing it — what the stub falls back to when nothing declares one.
+    columns: std::collections::BTreeMap<&'a str, String>,
+    /// Each distinct column set a foreign key references, in first-seen order.
+    /// Postgres requires every one to be unique, so the stub declares it.
+    keys: Vec<Vec<&'a str>>,
 }
 
 /// `schema.table` for an entity, as the document's `Table` and `Ref` lines
@@ -836,17 +849,12 @@ fn qualified_name(entity: &Entity) -> String {
 /// `varchar` it used to get made `dbml2sql` write a `uuid` foreign key to a
 /// `varchar` key, which Postgres refuses. `varchar` is left for a column with
 /// neither.
-fn emit_stub_block(
-    target: &str,
-    columns: &std::collections::BTreeMap<&str, String>,
-    known: Option<&Entity>,
-    enums: &EnumTypes,
-) -> String {
+fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enums: &EnumTypes) -> String {
     let (schema, table) = target.split_once('.').unwrap_or(("public", target));
     let known_columns = known.and_then(|e| e.table_def.as_ref().map(|td| (td.columns.as_slice(), &e.schema_path)));
 
     let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
-    for (column, referencing_type) in columns {
+    for (column, referencing_type) in &stub.columns {
         let known_type = known_columns.and_then(|(cols, path)| {
             cols.iter()
                 .find(|c| c.name == *column)
@@ -857,6 +865,27 @@ fn emit_stub_block(
             .unwrap_or_else(|| "varchar".to_string());
         lines.push(format!("  \"{column}\" {}", quote_type_if_needed(&data_type)));
     }
+    // A foreign key's target is unique; said here, `dbml2sql` writes the
+    // constraint its foreign keys need instead of one Postgres refuses.
+    let keys: Vec<IndexDef> = stub
+        .keys
+        .iter()
+        .map(|key| IndexDef {
+            columns: key
+                .iter()
+                .map(|column| IndexColumn {
+                    name: column.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique: true,
+            ..Default::default()
+        })
+        .collect();
+    lines.push(String::new());
+    lines.push("  indexes {".to_string());
+    lines.extend(emit_indexes(&keys).into_iter().map(|line| format!("    {line}")));
+    lines.push("  }".to_string());
     let note = match known.map(|e| e.entity_type) {
         Some(EntityType::External) => "External entity — managed outside this project",
         Some(_) => "Defined in this project, outside this document — only the referenced columns are shown",
