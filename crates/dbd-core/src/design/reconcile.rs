@@ -384,7 +384,9 @@ impl Design {
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
-        let version = self.config.project.version.unwrap_or(1);
+        // No `project.version` means no migration applied — 0, as `apply`
+        // records. Recording 1 made a dev `reset` refuse as if migrations ran.
+        let version = self.config.project.version.unwrap_or(0);
         adapter
             .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
             .await?;
