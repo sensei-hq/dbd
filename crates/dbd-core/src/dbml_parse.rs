@@ -438,9 +438,9 @@ impl<'a> Parser<'a> {
     fn consume_triple_quoted(&mut self, rest: &str) -> Result<String> {
         let mut body = String::new();
         // Closing `'''` may be on the same line.
-        if let Some(end) = rest.find("'''") {
+        if let Some(end) = closing_triple_quote(rest) {
             self.pos += 1;
-            return Ok(rest[..end].to_string());
+            return Ok(unescape_dbml(&rest[..end]));
         }
         if !rest.is_empty() {
             body.push_str(rest);
@@ -453,7 +453,7 @@ impl<'a> Parser<'a> {
             }
             let raw = self.lines[self.pos];
             self.pos += 1;
-            if let Some(end) = raw.find("'''") {
+            if let Some(end) = closing_triple_quote(raw) {
                 body.push_str(&raw[..end]);
                 break;
             }
@@ -462,14 +462,11 @@ impl<'a> Parser<'a> {
         }
         // dbd emits `'''\n<text>\n'''`, so the first body line is empty and the
         // last has a trailing newline — trim one leading and one trailing
-        // newline to recover the original text.
-        let trimmed = body
-            .strip_prefix('\n')
-            .unwrap_or(&body)
-            .strip_suffix('\n')
-            .map(str::to_string)
-            .unwrap_or(body.clone());
-        Ok(trimmed)
+        // newline to recover the original text. Trimmed before unescaping, so
+        // an escaped `\n` at either end is text, not layout.
+        let trimmed = body.strip_prefix('\n').unwrap_or(&body);
+        let trimmed = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+        Ok(unescape_dbml(trimmed))
     }
 }
 
@@ -927,9 +924,9 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
     // Walk back to the matching `[`, balancing nested brackets and ignoring
     // brackets inside quotes.
     //
-    // Escape-awareness (backward walk): a `'` that is immediately preceded by
-    // a `\` is an escaped apostrophe — it must NOT toggle `in_quote`.  We
-    // detect this by peeking at bytes[i - 1] whenever we land on a `'`.
+    // Escape-awareness (backward walk): a `'` preceded by an odd run of `\`
+    // is an escaped apostrophe — it must NOT toggle `in_quote`. An even run is
+    // escaped backslashes, so `'C:\\'` still ends at its last quote.
     let bytes = trimmed.as_bytes();
     let mut depth = 0i32;
     let mut in_quote = false;
@@ -939,10 +936,8 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
         let c = bytes[i] as char;
         match c {
             '\'' => {
-                // A `'` preceded by `\` is an escaped apostrophe — skip toggle.
-                if i > 0 && bytes[i - 1] == b'\\' {
-                    // Don't toggle; the `\` itself is not a quote character.
-                } else {
+                let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
+                if backslashes % 2 == 0 {
                     in_quote = !in_quote;
                 }
             }
@@ -1058,8 +1053,8 @@ fn split_first_colon(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Parse a single-line quoted string value (`'…'` or `"…"`), unescaping `\'`.
-/// Returns `None` if the input is not a quoted string.
+/// Parse a single-line quoted string value (`'…'` or `"…"`), reading its
+/// escapes the way DBML does. Returns `None` if the input is not a quoted string.
 fn parse_single_line_string(s: &str) -> Option<String> {
     let s = s.trim();
     let inner = if let Some(rest) = s.strip_prefix('\'') {
@@ -1068,7 +1063,72 @@ fn parse_single_line_string(s: &str) -> Option<String> {
         let rest = s.strip_prefix('"')?;
         rest.strip_suffix('"')?
     };
-    Some(inner.replace("\\'", "'"))
+    Some(unescape_dbml(inner))
+}
+
+/// Read the backslash escapes in a DBML quoted string, mirroring DBML's own
+/// lexer: `\\`, `\'`, `\"`, `` \` ``, `\n`, `\t`, `\r`, `\0`, `\b`, `\v`, `\f`,
+/// `\uHHHH`, an escaped line break (which joins the lines), and `\ ` (kept as
+/// written). Any other `\x` reads as `x`. Reading only `\'` meant a `\\` that
+/// dbdiagram.io shows as one backslash came back as two.
+fn unescape_dbml(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('b') => out.push('\u{8}'),
+            Some('v') => out.push('\u{b}'),
+            Some('f') => out.push('\u{c}'),
+            Some('\n') => {}
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some(' ') => out.push_str("\\ "),
+            Some('u') => {
+                let hex: String = chars.clone().take(4).collect();
+                match u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .filter(|_| hex.len() == 4)
+                    .and_then(char::from_u32)
+                {
+                    Some(ch) => {
+                        out.push(ch);
+                        chars.nth(3);
+                    }
+                    None => out.push_str("\\u"),
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Byte offset of the `'''` that closes a DBML multi-line string in `s`,
+/// skipping escaped characters — an escaped quote is part of the text, not
+/// the start of the closing run.
+fn closing_triple_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' if s[i..].starts_with("'''") => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]

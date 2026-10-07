@@ -276,7 +276,7 @@ fn emit_enum(entity: &Entity) -> String {
 
     for value in &entity.enum_values {
         match &value.note {
-            Some(note) => lines.push(format!("  \"{}\" [note: '{}']", value.name, note)),
+            Some(note) => lines.push(format!("  \"{}\" [note: {}]", value.name, dbml_string(note))),
             None => lines.push(format!("  \"{}\"", value.name)),
         }
     }
@@ -378,8 +378,8 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     }
     if let Some(ref comment) = col.comment {
         // Inline notes must be single-line — collapse newlines
-        let inline = comment.trim().replace('\n', " ").replace('\'', "\\'");
-        settings.push(format!("note: '{}'", inline));
+        let inline = comment.trim().replace('\n', " ");
+        settings.push(format!("note: {}", dbml_string(&inline)));
     }
 
     let settings_str = if settings.is_empty() {
@@ -406,7 +406,7 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
             settings.push("unique".to_string());
         }
         if let Some(ref name) = idx.name {
-            settings.push(format!("name: '{}'", name));
+            settings.push(format!("name: {}", dbml_string(name)));
         }
 
         let settings_str = if settings.is_empty() {
@@ -623,8 +623,14 @@ fn quote_default(value: &str) -> String {
     if trimmed.contains('(') || trimmed.contains("::") || trimmed.contains('+') {
         return format!("`{}`", trimmed);
     }
-    // String literal
-    format!("'{}'", trimmed.trim_matches('\''))
+    // String literal — a SQL `'…'` (whose `''` is one quote) or a bare word.
+    // DBML gets the text itself, in DBML's escaping: SQL's doubled quote is
+    // not a DBML escape, and written as-is it ends the string.
+    let text = match trimmed.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => trimmed.trim_matches('\'').to_string(),
+    };
+    dbml_string(&text)
 }
 
 fn quote_type_if_needed(data_type: &str) -> String {
@@ -641,10 +647,50 @@ fn quote_type_if_needed(data_type: &str) -> String {
 fn quote_dbml_string(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.contains('\n') {
-        format!("'''\n{}\n'''", trimmed)
+        format!("'''\n{}\n'''", dbml_multiline_body(trimmed))
     } else {
-        format!("'{}'", trimmed.replace('\'', "\\'"))
+        dbml_string(trimmed)
     }
+}
+
+/// A DBML single-quoted string literal, `'…'`.
+///
+/// DBML's lexer reads a backslash in a quoted string as an escape — `\\`,
+/// `\'`, `\n`, and any other `\x` as plain `x` — and a single-quoted string
+/// cannot span lines. So every backslash and quote is escaped and a line break
+/// written as `\n`. Escaping only the quote made `C:\temp` read back as
+/// `C:<tab>emp` and a regex `\d` as `d`; not escaping it at all ended the
+/// string at the first apostrophe.
+fn dbml_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The body of a DBML `'''` string. Backslashes are escapes there too, and
+/// three quotes in a row end the string, so each `\` is doubled and a quote
+/// that would open a `'''` run is escaped. Other quotes stay as written —
+/// apostrophes are common in prose notes and DBML needs nothing done to them.
+fn dbml_multiline_body(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' if text[i..].starts_with("'''") => out.push_str("\\'"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
