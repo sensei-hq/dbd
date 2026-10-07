@@ -17,7 +17,7 @@
   import { ErDiagram } from '@rokkit/graph';
   import { toGraphInput } from '@rokkit/graph/schema';
   import { vibe } from '@rokkit/states';
-  import type { SchemaModel } from '$lib/design/model';
+  import { withStubs, type SchemaModel } from '$lib/design/model';
   // From the package now, not the local copy — the local layout is deleted.
   import type { Density, EdgeStyle } from '@rokkit/graph';
 
@@ -35,10 +35,11 @@
     onSelect?: (key: string | null) => void;
   } = $props();
 
-  // `er` is the ER half of the model: tables and foreign keys. Views, routines and triggers
-  // live in the v2 `entities`/`deps` half — a view is a derived projection and a routine is
-  // behaviour, so neither is an entity and neither belongs on this canvas.
-  const input = $derived(toGraphInput(model, 'er'));
+  // `er` is the ER half of the model: tables and foreign keys, plus the stubs those keys land
+  // on outside the model. Views, routines and triggers live in the v2 `entities`/`deps` half — a
+  // view is a derived projection and a routine is behaviour, so neither is an entity and neither
+  // belongs on this canvas.
+  const input = $derived(toGraphInput(withStubs(model), 'er'));
 
   // Without this the group ramp resolves from the LIGHT ladder forever, so every card keeps
   // a pale tint in dark mode and the canvas reads as light whatever the page is set to.

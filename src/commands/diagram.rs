@@ -53,19 +53,24 @@ pub fn cmd_diagram(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let mut model = dbd_core::schema_model::build(&design, Some(&resolved));
+    // No context added: a scope that cannot resolve fails here with exactly the
+    // error `dbml`, `apply` and the rest give for it.
+    let mut model = dbd_core::schema_model::build(&design, Some(&resolved))?;
 
     // The changelog (#29), seen through the same scope as the diagram — which may
     // be a `default` scope with no --scope given. A scope is a set of entities, and
     // the history names tables that no longer exist, so each is asked of the scope's
-    // definition rather than of today's model; see `scope::admits`.
+    // definition rather than of today's model; see `scope::admits`. The set is the
+    // working set the model was built from, so under `deps: include` the changelog
+    // covers every table the diagram draws.
     let history = if resolved.is_all {
         dbd_core::history::load(project_dir)
     } else {
+        let working = design.working_set(&resolved)?;
         let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
         let scopes = &design.config().scopes;
         dbd_core::history::load_scoped(project_dir, |schema, name| {
-            dbd_core::scope::admits(scopes, &resolved, &existing, &format!("{schema}.{name}"))
+            dbd_core::scope::admits(scopes, &resolved, &working, &existing, &format!("{schema}.{name}"))
         })
     };
     match history {
@@ -161,6 +166,35 @@ mod tests {
         )
         .unwrap();
         assert!(out.exists());
+    }
+
+    /// A `deps: include` scope whose closure needs an entity it also excludes is a
+    /// contradiction every other command refuses. The diagram drew it as an empty
+    /// project and exited 0, which reads as "this scope has nothing in it".
+    #[test]
+    fn a_scope_that_excludes_its_own_dependency_is_refused_with_the_error_every_command_gives() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("model.json");
+        let err = cmd_diagram(
+            &cfg,
+            "dev",
+            proj.path(),
+            true,
+            &out,
+            false,
+            None,
+            Some("conflicting"),
+            None,
+            Verbosity::Normal,
+        )
+        .expect_err("a contradictory scope must not produce a model");
+
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        let scope = design.resolve_scope(Some("conflicting"), None).unwrap();
+        let everyone_elses = design.working_set(&scope).unwrap_err().to_string();
+        assert_eq!(format!("{err:#}"), everyone_elses);
+        assert!(!out.exists(), "nothing is written for a scope that cannot resolve");
     }
 
     fn write_snapshot(project: &std::path::Path, file: &str, body: &str) {
@@ -275,6 +309,33 @@ mod tests {
         let model = diagram_json_scoped(proj.path(), "one_table");
         assert_eq!(model["history"][0]["baseline"]["tables"], 1);
         assert_eq!(model["history"][1]["changes"], serde_json::json!([]));
+    }
+
+    /// Under `deps: include` the model draws the scope and everything it depends on,
+    /// so the changelog has to cover that same set. It was filtered by the scope as
+    /// written, before expansion, and a table the diagram drew had no history.
+    #[test]
+    fn a_scoped_changelog_covers_the_tables_deps_include_pulls_in() {
+        let proj = scoped_project();
+        let both = [
+            table_snapshot("config", "lookups"),
+            table_snapshot("config", "lookup_values"),
+        ];
+        write_snapshot(proj.path(), "001.json", &snapshot_json(1, &both));
+        // `incomplete_auto` names only lookup_values; its FK pulls lookups in.
+        let model = diagram_json_scoped(proj.path(), "incomplete_auto");
+        let drawn: Vec<&str> = model["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            drawn,
+            ["lookup_values", "lookups"],
+            "precondition: the closure is drawn"
+        );
+        assert_eq!(model["history"][0]["baseline"]["tables"], 2);
     }
 
     /// A table dropped since is still in the scope it was in: the scope is matched by

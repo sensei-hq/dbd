@@ -1,6 +1,8 @@
 import { it, expect, describe } from 'vitest';
 import { render, fireEvent, findByRole } from '@testing-library/svelte';
 import Page from '../../routes/diagram/+page.svelte';
+import ObjectView from './ObjectView.svelte';
+import type { SchemaModel } from './model';
 import { sampleModel } from './data';
 
 // Every entity the sidebar lists opens a page (#34): a view or routine shows what it uses and
@@ -78,5 +80,32 @@ describe('an enum page', () => {
     await fireEvent.click(await findByRole(page, 'button', { name: 'Changelog' }));
     const versions = [...page.querySelectorAll('[data-entity-changelog] [data-version]')].map((v) => v.getAttribute('data-version'));
     expect(versions).toEqual(['5']);
+  });
+});
+
+describe('a sequence page', () => {
+  const withSequence: SchemaModel = {
+    ...sampleModel,
+    entities: [
+      ...(sampleModel.entities ?? []),
+      { schema: 'shop', name: 'invoice_no', kind: 'sequence', noteMd: 'Invoice numbers.' },
+    ],
+  };
+  const openSequence = () =>
+    render(ObjectView, { props: { model: withSequence, entityKey: 'shop.invoice_no', onNav: () => {} } }).container;
+
+  it('names the sequence and its kind, and describes it by its comment', () => {
+    const page = openSequence();
+    expect(text(page.querySelector('h1'))).toBe('invoice_no');
+    expect(text(page.querySelector('[data-kind-badge]'))).toBe('sequence');
+    expect(text(page.querySelector('[data-section="info"] p'))).toBe('Invoice numbers.');
+  });
+
+  // A column default's `nextval('…')` is recorded as a call to `nextval`, not as a use of the
+  // sequence, so "nothing uses it" would be a claim the model cannot back.
+  it('does not claim that nothing uses it', () => {
+    const usedBy = text(openSequence().querySelector('[data-section="used-by"]'));
+    expect(usedBy).not.toMatch(/nothing in this project uses it/i);
+    expect(usedBy).toMatch(/nextval/);
   });
 });

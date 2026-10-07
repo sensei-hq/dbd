@@ -1,13 +1,30 @@
 /* Every entity in one list (#34): tables, the v2 entities (views, materialized views, routines,
-   triggers) and the v3 enums, so the sidebar and the entity pages share one notion of what
+   triggers, and since v3 sequences) and the v3 enums, so the sidebar and the entity pages share one notion of what
    exists. Keyed `schema.name` — the id the diagram gives the same node. */
 import { OVERVIEW_ICONS } from './overview';
 import type { SchemaModel } from './model';
 
-export type Kind = 'table' | 'view' | 'materialized_view' | 'function' | 'procedure' | 'trigger' | 'enum';
+export type Kind =
+  | 'table'
+  | 'view'
+  | 'materialized_view'
+  | 'function'
+  | 'procedure'
+  | 'trigger'
+  | 'sequence'
+  | 'enum';
 
-/** Reading order: storage, derived data, behaviour, then the types they use. */
-export const KIND_ORDER: Kind[] = ['table', 'view', 'materialized_view', 'function', 'procedure', 'trigger', 'enum'];
+/** Reading order: storage, derived data, behaviour, then the sequences and types tables use. */
+export const KIND_ORDER: Kind[] = [
+  'table',
+  'view',
+  'materialized_view',
+  'function',
+  'procedure',
+  'trigger',
+  'sequence',
+  'enum',
+];
 
 const LABELS: Record<Kind, [string, string]> = {
   table: ['Table', 'Tables'],
@@ -16,6 +33,7 @@ const LABELS: Record<Kind, [string, string]> = {
   function: ['Function', 'Functions'],
   procedure: ['Procedure', 'Procedures'],
   trigger: ['Trigger', 'Triggers'],
+  sequence: ['Sequence', 'Sequences'],
   enum: ['Enum', 'Enums'],
 };
 
@@ -29,6 +47,7 @@ export const KIND_ICON: Record<Kind, string> = {
   function: OVERVIEW_ICONS.function,
   procedure: OVERVIEW_ICONS.procedure,
   trigger: OVERVIEW_ICONS.trigger,
+  sequence: OVERVIEW_ICONS.sequence,
   enum: OVERVIEW_ICONS.enums,
 };
 
