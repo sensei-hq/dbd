@@ -622,6 +622,13 @@ impl DatabaseAdapter for ConvexAdapter {
         self.run_npx(&args).await
     }
 
+    async fn truncate_table(&self, _table: &str) -> Result<()> {
+        // Nothing to run: `import_data` loads with `npx convex import --replace`,
+        // which empties the table before writing it — the truncate this step
+        // asks for. Convex has no SQL to send a separate statement through.
+        Ok(())
+    }
+
     async fn export_data(&self, _entity: &Entity, _out_dir: Option<&Path>) -> Result<()> {
         // Convex CLI exports the entire deployment as a zip, not per table.
         // Point the user at the CLI rather than implementing a partial story.

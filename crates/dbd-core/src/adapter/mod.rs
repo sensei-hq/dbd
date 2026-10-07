@@ -157,6 +157,18 @@ pub trait DatabaseAdapter: Send + Sync {
     /// maps to SQL NULL (empty string = the default, meaning an empty cell is NULL).
     async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()>;
 
+    /// Empty `table` (a `schema.name`) before an import reloads it — the
+    /// `import.options.truncate` step.
+    ///
+    /// Routed through the adapter because the statement is not portable: the
+    /// default is SQL's `TRUNCATE TABLE`, which Postgres runs, but SQLite has no
+    /// `TRUNCATE` and Convex runs no SQL at all. Sending the Postgres statement
+    /// to every target made the default import fail on both.
+    async fn truncate_table(&self, table: &str) -> Result<()> {
+        self.execute_script(&format!("TRUNCATE TABLE {}", crate::sql_quote::qualified(table)))
+            .await
+    }
+
     /// Export a table's data to a file.
     ///
     /// `out_dir`:

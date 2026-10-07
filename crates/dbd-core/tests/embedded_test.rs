@@ -257,6 +257,51 @@ async fn import_data_honors_null_value_sentinel() {
     .await;
 }
 
+// ── Test: the default import empties a staging table before loading it ────────
+
+/// `truncate: true` is the default. The step moved behind
+/// `DatabaseAdapter::truncate_table` so SQLite and Convex could run it their
+/// own way; this pins that Postgres still empties the table.
+#[tokio::test]
+async fn the_default_import_truncates_a_staging_table_on_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("design.yaml"), "project:\n  name: t\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("import/stage")).unwrap();
+    std::fs::write(dir.path().join("import/stage/items.csv"), "id,name\n1,fresh\n").unwrap();
+    let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA stage; CREATE TABLE stage.items (id integer, name text); \
+             INSERT INTO stage.items VALUES (99, 'stale');",
+        )
+        .await
+        .unwrap();
+
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM stage.items WHERE id = 99",
+        "the stale row",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM stage.items WHERE id = 1 AND name = 'fresh'",
+        "the row loaded from the file",
+    )
+    .await;
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]

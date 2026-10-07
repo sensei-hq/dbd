@@ -348,6 +348,17 @@ impl DatabaseAdapter for SqliteAdapter {
         }
     }
 
+    async fn truncate_table(&self, table: &str) -> Result<()> {
+        // SQLite has no `TRUNCATE`; an unfiltered `DELETE` is its equivalent,
+        // and SQLite optimizes it to drop the table's pages wholesale. The
+        // schema is stripped as everywhere else here — SQLite has none.
+        self.execute_script(&format!(
+            "DELETE FROM {}",
+            crate::sql_quote::ident(Self::bare_name(table))
+        ))
+        .await
+    }
+
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let table = Self::bare_name(&entity.name);
         let format = entity.format.as_deref().unwrap_or("csv");
