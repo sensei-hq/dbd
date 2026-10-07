@@ -12,8 +12,10 @@ description: >-
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
   convention, or a `--scope` that drops them), RLS expected from `dbd apply`
   without `--with-policies`, post-DDL SQL parked in `import.after` (which
-  never runs on `dbd apply`) instead of `apply.after`, and a scoped
-  `reconcile --prune` on a dbd older than 0.24.1. Reviews from the files
+  never runs on `dbd apply`) instead of `apply.after`, a scoped
+  `reconcile --prune` on a dbd older than 0.24.1, and any `reconcile --prune`
+  on a dbd older than 0.25 in a design whose roles or schema-less extensions
+  made `public` managed. Reviews from the files
   (no DB needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only
   if the binary is present.
 
@@ -54,8 +56,10 @@ Read `project.released` in `design.yaml` and look for `snapshots/`:
 - neither → **pre-release**.
 - snapshots but no `released` flag → **snapshots but not released** — what `dbd init --from-db`
   and `dbd merge` leave. Judge it as released (changes go snapshot → apply), but note that dbd
-  checks only the flag: `reconcile` still runs there and `dbd release` refuses. Recommend
-  setting `released: true` by hand if reconcile must be blocked.
+  checks only the flag, so `reconcile` still runs there. Recommend `dbd release`: on a project
+  with snapshots it releases at the latest snapshot's version (no second baseline), after
+  `dbd snapshot` has captured any change no snapshot records and with `project.version` matching
+  the latest snapshot — it refuses otherwise.
 
 Establish this before judging the workflow, and state which one you concluded and why (the
 file evidence).
@@ -68,6 +72,10 @@ file evidence).
    - A **scoped prune** (`reconcile --prune --scope …`) in a script, CI job or advice where the
      dbd in use is older than 0.24.1 → violation: those versions dropped the design's own tables
      outside the scope (#40). Fix: upgrade first.
+   - Any **`reconcile --prune`** where the dbd in use is older than 0.25 and the design declares a
+     role (`ddl/role/` or `target.roles`) or an extension with no `schema:` → violation: those
+     versions treated `public` as managed and dropped every table there the design does not
+     declare. Fix: upgrade first.
    - **Pre-release** project with hand-written migration files / snapshots being authored by hand,
      or someone hand-editing the live DB instead of `reconcile` → violation.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
@@ -100,10 +108,11 @@ file evidence).
      `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
    - A `--scope` in the deploy command whose working set excludes the staging tables (or the
      tables the import procedures write to) — those entries are dropped from the import plan.
-   - A SQLite or Convex target without `import.options.truncate: false` — the default truncate
-     is SQL those targets reject, so the import fails before loading anything.
-   - An import loader written as a **function** — it is matched, then `CALL`ed, which
-     PostgreSQL refuses; it must be a procedure.
+   - A Convex target with a `.json` data file holding JSON Lines — Convex's importer reads a
+     `.json` file as a JSON array only; rename it `.jsonl` or rewrite it as an array.
+   - An import loader written as a **function** — dbd runs only procedures, so the function is
+     never called and its target stays empty (dbd warns: `… has no loader procedure`); it must
+     be a procedure.
    - Evidence: the `import/` tree next to the actual deploy/install invocation.
 8. **RLS expected but never applied** — an install path that runs `dbd apply` (RLS is opt-in,
    needs `--with-policies`) while the project has a `policies/` directory, or docs claiming
