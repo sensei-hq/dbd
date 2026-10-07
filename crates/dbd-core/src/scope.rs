@@ -35,10 +35,15 @@ pub struct ScopeGap {
 }
 
 /// Entity types a scope can select (schemas handled separately via auto-add).
+///
+/// Sequences included: one belongs to its schema like a table does. Leaving
+/// them out dropped every sequence from every scope, so a table whose default
+/// draws from one could not be applied under any scope.
 pub(crate) fn is_scopable(e: &Entity) -> bool {
     matches!(
         e.entity_type,
         EntityType::Enum
+            | EntityType::Sequence
             | EntityType::Table
             | EntityType::View
             | EntityType::MaterializedView
