@@ -828,6 +828,43 @@ mod tests {
         );
     }
 
+    /// A column's own UNIQUE — which is how both the DDL parser and the DBML
+    /// parser carry one — must reach the emitted DDL, once: not again when a
+    /// table-level UNIQUE on that column already says it.
+    #[test]
+    fn emit_table_writes_a_columns_own_unique_once() {
+        use crate::entity::{ColumnDef, TableConstraint, TableDef};
+
+        let column = |name: &str| ColumnDef {
+            name: name.into(),
+            data_type: "text".into(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: true,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+        };
+        let mut e = Entity::new(EntityType::Table, "app.people");
+        e.table_def = Some(TableDef {
+            columns: vec![column("email"), column("handle")],
+            constraints: vec![TableConstraint::Unique {
+                name: None,
+                columns: vec!["handle".into()],
+                nulls_not_distinct: false,
+            }],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+
+        let sql = emit_table(&e);
+        assert!(sql.contains("\"email\" text UNIQUE"), "got:\n{sql}");
+        assert!(!sql.contains("\"handle\" text UNIQUE"), "got:\n{sql}");
+        assert!(sql.contains("UNIQUE (\"handle\")"), "got:\n{sql}");
+    }
+
     #[test]
     fn emit_table_identity_by_default() {
         use crate::entity::{ColumnDef, IdentityKind, TableDef};
