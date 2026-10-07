@@ -338,6 +338,48 @@ mod tests {
         .unwrap();
     }
 
+    /// A target `url: $VAR` whose variable is unset names no database, so the
+    /// dry run stays the offline preview it always was. Most projects write
+    /// `url: $DATABASE_URL`; were the unresolved `$VAR` taken for a URL, every
+    /// dry run on a machine without the variable would fail to connect to it.
+    #[tokio::test]
+    async fn reset_dry_run_with_an_unset_url_variable_needs_no_database() {
+        const VAR: &str = "DBD_TEST_RESET_DRY_RUN_NEVER_SET";
+        assert!(std::env::var_os(VAR).is_none(), "{VAR} must be unset for this test");
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            format!("project:\n  name: t\ntarget:\n  postgres:\n    url: ${VAR}\nschemas:\n  - app\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
+        cmd_reset(
+            &config,
+            "dev",
+            tmp.path(),
+            None,
+            None,
+            ResetOptions {
+                dry_run: true,
+                force: false,
+                drop_schemas: false,
+                drop_extensions: false,
+                allow_scope_change: false,
+            },
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
     /// Creating the first snapshot against a fresh copy writes a baseline and
     /// bumps the config version — run against a throwaway copy, never the repo.
     #[test]
