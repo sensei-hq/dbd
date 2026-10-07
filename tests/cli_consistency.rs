@@ -369,6 +369,33 @@ fn inspect_under_a_scope_advises_only_on_what_the_scope_builds() {
     );
 }
 
+/// `inspect -n` is about one entity, but it counted the whole design ("31
+/// entities") and advised on every other table — an RLS warning for tables the
+/// reader never asked about, under the name of the one they did.
+#[test]
+fn inspect_of_a_named_entity_counts_and_advises_on_that_entity_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    advisory_outside_hub_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["inspect", "-n", "hub.nodes"]);
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert!(out.status.success(), "nothing wrong with hub.nodes:\n{text}\n{err}");
+    assert_eq!(summary_count(&text), Some(1), "one entity was inspected:\n{text}");
+    assert!(!text.contains("Suggestions:"), "no enum advice for app.orders: {text}");
+    assert!(!err.contains("No RLS policy"), "no RLS advice for app.orders: {err}");
+    assert!(
+        !text.contains("Materialized view errors"),
+        "no matview error for app.order_counts: {text}"
+    );
+
+    // Named, the entity the advice is about still gets it.
+    let out = dbd(tmp.path(), &["inspect", "-n", "app.orders"]);
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert_eq!(summary_count(&text), Some(1), "{text}");
+    assert!(text.contains("Suggestions:"), "{text}");
+    assert!(err.contains("No RLS policy on 1 table(s)"), "{err}");
+}
+
 // ── one count for one scope ─────────────────────────────────────────────────
 
 /// A `deps: include` scope whose closure adds an entity, an `extensions: []`
