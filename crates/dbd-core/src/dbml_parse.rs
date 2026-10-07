@@ -723,6 +723,7 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
 
     let mut unique = false;
     let mut name = None;
+    let mut note = None;
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
             .ok_or_else(|| parse_err(format!("malformed index settings in `{table}`: {settings_str}")))?;
@@ -735,19 +736,26 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
                         name = parse_single_line_string(&v);
                     }
                 }
-                _ => { /* pk / type / note on indexes — ignore */ }
+                "note" => note = value.as_deref().and_then(parse_single_line_string),
+                _ => { /* pk / type on indexes — ignore */ }
             }
         }
     }
 
-    // DBML's `indexes` block has no syntax for a partial `WHERE`, an operator
-    // class, or storage parameters, so those stay at their defaults.
-    Ok(IndexDef {
+    let mut index = IndexDef {
         name,
         columns: keys,
         unique,
         ..Default::default()
-    })
+    };
+    // The partial `WHERE`, key order and `NULLS NOT DISTINCT` have no DBML
+    // syntax; dbd carries them in the note (see `crate::dbml::index_note`).
+    // An operator class, `INCLUDE` and storage parameters are not carried and
+    // stay at their defaults.
+    if let Some(note) = note {
+        crate::dbml::index_note::read(&note, &mut index);
+    }
+    Ok(index)
 }
 
 /// One index key: DBML writes an expression in backticks and a column by

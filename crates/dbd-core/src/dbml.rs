@@ -408,6 +408,9 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
         if let Some(ref name) = idx.name {
             settings.push(format!("name: {}", dbml_string(name)));
         }
+        if let Some(note) = index_note::write(idx) {
+            settings.push(format!("note: {}", dbml_string(&note)));
+        }
 
         let settings_str = if settings.is_empty() {
             String::new()
@@ -429,6 +432,112 @@ fn index_key(key: &IndexColumn) -> String {
         format!("`{}`", key.name)
     } else {
         key.name.clone()
+    }
+}
+
+/// The index `note:` convention: where dbd writes what DBML's index syntax
+/// cannot hold, and where [`crate::dbml_parse`] reads it back.
+///
+/// DBML's index settings are `type` (btree or hash), `name`, `unique`, `pk` and
+/// `note`; its reference parser rejects anything else. So a partial index's
+/// `WHERE`, a key's sort order and `NULLS NOT DISTINCT` have nowhere to go but
+/// the note — and dropping them is not cosmetic. A unique index on
+/// `(customer_id) WHERE status = 'open'` came back from `init --from-dbml` as a
+/// unique index on `(customer_id)`: one order per customer, ever.
+///
+/// The note holds one fact per line. These are the only lines read back, each
+/// matched exactly at the start of a line, and anything else is ignored (an
+/// index has no comment to keep it in):
+///
+/// - `where: <predicate>` — the partial-index predicate, SQL as written. A
+///   line break inside it is written as a space, since lines separate facts.
+/// - `order: <entry>, <entry>, …` — one entry per key, in key order: `asc` or
+///   `desc`, optionally followed by `nulls first` or `nulls last`. Written only
+///   when some key is not plain ascending. `asc` reads back as no stated
+///   direction, which is what Postgres means by an unadorned key. A line whose
+///   entries do not cover every key, or do not parse, is ignored whole rather
+///   than applied to the wrong keys.
+/// - `nulls not distinct` — the index treats NULLs as equal.
+pub(crate) mod index_note {
+    use crate::entity::{IndexColumn, IndexDef, SortOrder};
+
+    const WHERE: &str = "where:";
+    const ORDER: &str = "order:";
+    const NULLS_NOT_DISTINCT: &str = "nulls not distinct";
+
+    /// The note for `ix`, or `None` when DBML's own syntax already says it all.
+    pub(crate) fn write(ix: &IndexDef) -> Option<String> {
+        let mut lines = Vec::new();
+        if let Some(predicate) = &ix.predicate {
+            lines.push(format!("{WHERE} {}", predicate.replace(['\r', '\n'], " ")));
+        }
+        if ix
+            .columns
+            .iter()
+            .any(|k| k.order == Some(SortOrder::Desc) || k.nulls_first.is_some())
+        {
+            let entries: Vec<String> = ix.columns.iter().map(order_entry).collect();
+            lines.push(format!("{ORDER} {}", entries.join(", ")));
+        }
+        if ix.nulls_not_distinct {
+            lines.push(NULLS_NOT_DISTINCT.to_string());
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Apply the convention's lines in `note` to `ix`, whose keys are already set.
+    pub(crate) fn read(note: &str, ix: &mut IndexDef) {
+        for line in note.lines().map(str::trim) {
+            if let Some(predicate) = line.strip_prefix(WHERE).map(str::trim) {
+                if !predicate.is_empty() {
+                    ix.predicate = Some(predicate.to_string());
+                }
+            } else if let Some(entries) = line.strip_prefix(ORDER) {
+                read_order(entries, &mut ix.columns);
+            } else if line == NULLS_NOT_DISTINCT {
+                ix.nulls_not_distinct = true;
+            }
+        }
+    }
+
+    fn order_entry(key: &IndexColumn) -> String {
+        let direction = if key.order == Some(SortOrder::Desc) {
+            "desc"
+        } else {
+            "asc"
+        };
+        match key.nulls_first {
+            Some(true) => format!("{direction} nulls first"),
+            Some(false) => format!("{direction} nulls last"),
+            None => direction.to_string(),
+        }
+    }
+
+    fn read_order(entries: &str, keys: &mut [IndexColumn]) {
+        let parsed: Option<Vec<_>> = entries.split(',').map(parse_order_entry).collect();
+        if let Some(parsed) = parsed.filter(|p| p.len() == keys.len()) {
+            for (key, (order, nulls_first)) in keys.iter_mut().zip(parsed) {
+                key.order = order;
+                key.nulls_first = nulls_first;
+            }
+        }
+    }
+
+    fn parse_order_entry(entry: &str) -> Option<(Option<SortOrder>, Option<bool>)> {
+        let words: Vec<String> = entry.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let (order, rest) = match words.split_first()? {
+            (&"asc", rest) => (None, rest),
+            (&"desc", rest) => (Some(SortOrder::Desc), rest),
+            _ => return None,
+        };
+        let nulls_first = match rest {
+            [] => None,
+            ["nulls", "first"] => Some(true),
+            ["nulls", "last"] => Some(false),
+            _ => return None,
+        };
+        Some((order, nulls_first))
     }
 }
 
