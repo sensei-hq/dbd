@@ -66,7 +66,7 @@ export const overview = {
 		},
 		{
 			title: 'Data loading',
-			body: 'CSV, TSV and JSONL files loaded into staging tables with automatic procedure calls.'
+			body: 'CSV, TSV, JSON and JSONL files loaded into staging tables, then moved into place by the procedures that read them.'
 		},
 		{
 			title: 'Documentation',
@@ -94,7 +94,7 @@ export const overview = {
 		},
 		{
 			title: 'Interactive schema viewer',
-			body: 'dbd diagram opens your schema in the browser: an overview, an ER diagram, a page for every table, view, routine, trigger and enum, and a changelog built from your snapshots.'
+			body: 'dbd diagram opens your schema in the browser: an overview, an ER diagram, a page for every table, view, routine, trigger, sequence and enum, and a changelog built from your snapshots.'
 		},
 		{
 			title: 'Deploy straight from GitHub',
@@ -251,9 +251,9 @@ export const commands = {
 		},
 		{
 			cmd: 'dbd import',
-			body: 'Load CSV, TSV and JSON Lines from import/ into staging tables, then call the procedures that read them.'
+			body: 'Load CSV, TSV, JSON and JSON Lines from import/ into staging tables, then call the procedures that read them.'
 		},
-		{ cmd: 'dbd export', body: 'Dump table data back out to CSV, TSV or JSONL.' },
+		{ cmd: 'dbd export', body: 'Dump table data — and the views export: lists — back out to CSV, TSV or JSONL.' },
 		{ cmd: 'dbd refresh', body: 'Refresh materialized views now, outside their pg_cron schedule.' },
 		{
 			cmd: 'dbd emit',
