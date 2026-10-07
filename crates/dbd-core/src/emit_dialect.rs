@@ -63,6 +63,13 @@
 //! Anything else is PostgreSQL SQL that dbd does not translate, so it is left
 //! out and reported — a row that omits the column gets NULL, or is refused.
 //!
+//! # Comments
+//!
+//! MySQL keeps a table's and a column's (`COMMENT`), SQL Server a table's, a
+//! column's and a view's (the `MS_Description` extended property SSMS shows).
+//! Every other comment — all of them on SQLite, a view's on MySQL — is
+//! reported, since it was documentation someone wrote.
+//!
 //! # SQL Server's schemas and batches
 //!
 //! SQL Server keeps the schema in a name, so the script creates every schema
@@ -105,16 +112,20 @@ pub struct Downgrade {
 
 impl Downgrade {
     /// The note written into the emitted file at the site of the loss.
+    ///
+    /// One line, always: a note quotes what was lost — a comment, an
+    /// expression — and that can span lines. A second line would not be a
+    /// comment, and the script would break on it.
     fn comment(&self, target: Target) -> String {
         let what = match &self.column {
             Some(c) => format!("`{c}` was {}", self.from),
             None => format!("{} was {}", self.entity, self.from),
         };
+        let note = format!("{what} — emitted as {}; {}", self.to, self.reason);
         format!(
-            "{} dbd: {what} — emitted as {}; {}",
+            "{} dbd: {}",
             target.comment_prefix(),
-            self.to,
-            self.reason
+            note.split_whitespace().collect::<Vec<_>>().join(" ")
         )
     }
 }
@@ -263,10 +274,12 @@ pub fn emit_schema(
             EntityType::Table => {
                 out.push(emit_table(e, &script, &mut report));
                 out.extend(emit_indexes(e, target, &mut report));
+                out.extend(descriptions(e, target));
             }
             EntityType::View | EntityType::MaterializedView => {
                 if let Some(sql) = emit_view(e, target, &mut report) {
                     out.push(sql);
+                    out.extend(descriptions(e, target));
                 }
             }
             EntityType::Sequence => {
@@ -415,6 +428,12 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
                     .to_string(),
             });
         }
+        let comment = column_comment(td, c);
+        if let Some(text) = comment
+            && target == Target::Sqlite
+        {
+            report.push(comment_lost(e, Some(&c.name), text, target));
+        }
         // A note goes immediately above the column it explains.
         for d in &report[before..] {
             lines.push(format!("  {}", d.comment(target)));
@@ -446,6 +465,11 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         }
         if let Some(default) = default {
             col.push_str(&format!(" DEFAULT {default}"));
+        }
+        if let Some(text) = comment
+            && target == Target::MySql
+        {
+            col.push_str(&format!(" COMMENT {}", string_literal(text, target)));
         }
         lines.push(format!("{col},"));
     }
@@ -517,7 +541,97 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         }
     }
 
-    format!("CREATE TABLE {name} (\n{}\n);", table_body(&lines))
+    // MySQL keeps a table's comment as a table option; SQL Server as an
+    // extended property, written after the table ([`descriptions`]); SQLite
+    // keeps none.
+    let mut head = String::new();
+    let mut options = String::new();
+    match (td.comments.table.as_deref(), target) {
+        (Some(text), Target::MySql) => options = format!(" COMMENT={}", string_literal(text, target)),
+        (Some(text), Target::Sqlite) => {
+            let d = comment_lost(e, None, text, target);
+            head = format!("{}\n", d.comment(target));
+            report.push(d);
+        }
+        _ => {}
+    }
+    format!("{head}CREATE TABLE {name} (\n{}\n){options};", table_body(&lines))
+}
+
+/// Column `c`'s comment — on the column, or recorded with the table's.
+fn column_comment<'a>(td: &'a TableDef, c: &'a ColumnDef) -> Option<&'a str> {
+    c.comment
+        .as_deref()
+        .or_else(|| td.comments.columns.get(&c.name).map(String::as_str))
+}
+
+/// A comment the target has nowhere to keep — documentation someone wrote,
+/// gone from the emitted schema.
+fn comment_lost(e: &Entity, column: Option<&str>, text: &str, target: Target) -> Downgrade {
+    let on = match (column, e.entity_type) {
+        (Some(_), _) => "a column",
+        (None, EntityType::View | EntityType::MaterializedView) => "a view",
+        (None, _) => "a table",
+    };
+    Downgrade {
+        entity: e.name.clone(),
+        column: column.map(str::to_string),
+        from: format!("the comment `{text}`"),
+        to: "nothing".to_string(),
+        reason: format!("{} keeps no comment on {on}", target.label()),
+    }
+}
+
+/// SQL Server's comments: an `MS_Description` extended property — the one SSMS
+/// shows — per commented table, column and view, in a batch after the object.
+/// A view's must be: `CREATE VIEW` is alone in its batch.
+fn descriptions(e: &Entity, target: Target) -> Option<String> {
+    if target != Target::TSql {
+        return None;
+    }
+    let n = |s: &str| format!("N'{}'", s.replace('\'', "''"));
+    let schema = e.schema.as_deref().unwrap_or("dbo");
+    let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
+    let (level1, items): (&str, Vec<(Option<&str>, &str)>) = match (e.entity_type, &e.table_def) {
+        (EntityType::Table, Some(td)) => (
+            "TABLE",
+            td.comments
+                .table
+                .as_deref()
+                .map(|t| (None, t))
+                .into_iter()
+                .chain(
+                    td.columns
+                        .iter()
+                        .filter_map(|c| column_comment(td, c).map(|t| (Some(c.name.as_str()), t))),
+                )
+                .collect(),
+        ),
+        (EntityType::View | EntityType::MaterializedView, _) => {
+            ("VIEW", e.comment.as_deref().map(|t| (None, t)).into_iter().collect())
+        }
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = items
+        .iter()
+        .map(|(column, text)| {
+            let mut sql = format!(
+                "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = {}, \
+                 @level0type = N'SCHEMA', @level0name = {}, @level1type = N'{level1}', @level1name = {}",
+                n(text),
+                n(schema),
+                n(bare)
+            );
+            if let Some(c) = column {
+                sql.push_str(&format!(", @level2type = N'COLUMN', @level2name = {}", n(c)));
+            }
+            sql + ";"
+        })
+        .collect();
+    Some(lines.join("\n"))
 }
 
 /// The lines of a `CREATE TABLE`, without the comma after the last clause.
@@ -1089,6 +1203,11 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
             ));
         }
     }
+    if let Some(text) = e.comment.as_deref()
+        && target != Target::TSql
+    {
+        report.push(comment_lost(e, None, text, target));
+    }
     report.push(lost(
         "a view body in PostgreSQL SQL".to_string(),
         "the same text, untranslated",
@@ -1460,12 +1579,16 @@ fn read_default(expr: &str, pg_type: &str) -> PgDefault {
 /// A string literal in the target's syntax.
 ///
 /// MySQL reads a backslash in a string as an escape, so `'a\b'` — a literal
-/// backslash in PostgreSQL — must be doubled there. SQL Server stores a plain
+/// backslash in PostgreSQL — must be doubled there, and a line break can be
+/// written as one, keeping a column on its line. SQL Server stores a plain
 /// `'…'` in the database's code page, so anything outside ASCII needs `N'…'`.
 fn string_literal(s: &str, target: Target) -> String {
     let quoted = s.replace('\'', "''");
     match target {
-        Target::MySql => format!("'{}'", quoted.replace('\\', "\\\\")),
+        Target::MySql => format!(
+            "'{}'",
+            quoted.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
+        ),
         Target::TSql if !s.is_ascii() => format!("N'{quoted}'"),
         Target::TSql | Target::Sqlite => format!("'{quoted}'"),
     }
