@@ -19,8 +19,10 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 # CSV/TSV data files are read as CSV (RFC 4180): quoted fields, doubled quotes,
 # delimiters and newlines inside quotes. Splitting lines on the delimiter read
-# none of that — see `adapter::delimited_header`.
-csv = "1"
+# none of that. csv-core rather than csv: only its field-at-a-time reader shows
+# whether a field was quoted, which is how CSV tells '' from NULL — see
+# `adapter::Delimited`.
+csv-core = "0.1"
 
 # SQL Parsing
 sqlparser = { version = "0.62", features = ["visitor"] }

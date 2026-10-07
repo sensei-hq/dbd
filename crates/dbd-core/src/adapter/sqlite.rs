@@ -342,7 +342,10 @@ impl DatabaseAdapter for SqliteAdapter {
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
-            "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
+            "csv" | "tsv" => {
+                let records = super::Delimited::new(&data, format == "tsv", file_path);
+                self.import_delimited(records, table, null_value).await
+            }
             "json" | "jsonl" => {
                 let records = super::json_records(&data, format, file_path)?;
                 self.import_json_records(&records, table).await
@@ -666,19 +669,25 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
-    async fn import_delimited(&self, data: &str, table: &str, tab: bool, null_value: &str) -> Result<()> {
-        let sep = if tab { '\t' } else { ',' };
-        let mut lines = data.lines();
-        let header_line = match lines.next() {
-            Some(h) if !h.trim().is_empty() => h,
-            _ => return Ok(()),
+    /// Load a CSV/TSV file's rows into `table`, each value into the column its
+    /// header names.
+    ///
+    /// Read by [`super::Delimited`], as Postgres reads the same file: each line
+    /// was split on the delimiter and every cell trimmed, so a quoted comma was
+    /// "too many columns" and a quote stayed in the value — a CSV Postgres
+    /// exported could not be imported here. An unquoted field matching
+    /// `null_value` is NULL; a quoted one is a value, as in Postgres's COPY,
+    /// which writes `''` as `""` and NULL as an empty field.
+    async fn import_delimited(&self, mut records: super::Delimited<'_>, table: &str, null_value: &str) -> Result<()> {
+        let Some(header) = records.next_record()? else {
+            return Ok(()); // An empty file: no columns, no rows.
         };
-        let columns: Vec<&str> = header_line.split(sep).map(|s| s.trim()).collect();
-        if columns.is_empty() {
-            return Ok(());
-        }
-        let col_count = columns.len();
-        let cols_clause = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let col_count = header.len();
+        let cols_clause = header
+            .iter()
+            .map(|f| crate::sql_quote::ident(&f.value))
+            .collect::<Vec<_>>()
+            .join(",");
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -688,23 +697,18 @@ impl SqliteAdapter {
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
         let mut batch: Vec<Vec<Option<String>>> = Vec::with_capacity(batch_rows);
-        for line in lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let values: Vec<&str> = line.split(sep).collect();
-            if values.len() != col_count {
+        while let Some(record) = records.next_record()? {
+            if record.len() != col_count {
                 return Err(DbdError::Config(format!(
-                    "csv row has {} columns, expected {col_count}",
-                    values.len()
+                    "{}: the row on line {} has {} field(s), but the header has {col_count}",
+                    records.file().display(),
+                    records.line(),
+                    record.len()
                 )));
             }
-            let row: Vec<Option<String>> = values
-                .iter()
-                .map(|v| {
-                    let t = v.trim();
-                    if t == null_value { None } else { Some(t.to_string()) }
-                })
+            let row: Vec<Option<String>> = record
+                .into_iter()
+                .map(|f| (f.quoted || f.value != null_value).then_some(f.value))
                 .collect();
             batch.push(row);
             if batch.len() >= batch_rows {
@@ -800,7 +804,10 @@ async fn flush_csv_batch(
     rows: &[Vec<Option<String>>],
 ) -> Result<()> {
     let placeholders = multi_row_placeholders(col_count, rows.len());
-    let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
+    let sql = format!(
+        "INSERT INTO {} ({cols_clause}) VALUES {placeholders}",
+        crate::sql_quote::ident(table)
+    );
     let mut q = sqlx::query(&sql);
     for row in rows {
         for cell in row {

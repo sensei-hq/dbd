@@ -298,41 +298,154 @@ pub(crate) fn json_records(data: &str, format: &str, file: &Path) -> Result<Vec<
         .collect())
 }
 
+/// One field of a CSV or TSV record.
+pub(crate) struct Field {
+    pub value: String,
+    /// Whether the field was quoted. Quoting is how CSV tells an empty string
+    /// (`""`) from NULL (an empty field): Postgres's COPY writes them so, and
+    /// never reads a quoted field as NULL.
+    pub quoted: bool,
+}
+
+/// A CSV or TSV data file, read a record at a time.
+///
+/// RFC 4180, as Postgres's `COPY … (FORMAT csv)` reads it: a quoted field may
+/// hold the delimiter, a line break and a doubled quote; nothing is trimmed;
+/// a TSV is the same format with a tab between fields (`DELIMITER E'\t'`).
+/// A blank line is skipped, as SQLite's import always did (Postgres's COPY
+/// refuses one in a table of more than one column). csv-core does the parsing; this adds what it does not
+/// report — whether a field was quoted, and a quote left open at the end of
+/// the file, which csv-core would read as one value holding every row after
+/// it. One reader for every SQL adapter, so a file reads the same on each.
+pub(crate) struct Delimited<'a> {
+    data: &'a str,
+    file: &'a Path,
+    reader: csv_core::Reader,
+    /// Offset of the next byte csv-core has not read.
+    at: usize,
+    /// Offset of the first byte of the record last read.
+    record_at: usize,
+}
+
+impl<'a> Delimited<'a> {
+    pub(crate) fn new(data: &'a str, tab: bool, file: &'a Path) -> Self {
+        // A byte-order mark (spreadsheet exports start with one) is not part
+        // of the first field — skipped here, not by csv-core, so the first
+        // byte of every field is what decides whether it was quoted.
+        let at = if data.starts_with('\u{feff}') {
+            '\u{feff}'.len_utf8()
+        } else {
+            0
+        };
+        Self {
+            data,
+            file,
+            reader: csv_core::ReaderBuilder::new()
+                .delimiter(if tab { b'\t' } else { b',' })
+                .build(),
+            at,
+            record_at: at,
+        }
+    }
+
+    /// The next record, or `None` at the end of the file.
+    pub(crate) fn next_record(&mut self) -> Result<Option<Vec<Field>>> {
+        let bytes = self.data.as_bytes();
+        let mut fields = Vec::new();
+        let mut value = Vec::new();
+        // The field's first byte. csv-core consumes the blank lines before a
+        // record, and the `\n` of a CRLF, as part of the field that follows.
+        let mut start: Option<usize> = None;
+        let mut out = [0u8; 8192];
+        loop {
+            let input = &bytes[self.at..];
+            let (result, nin, nout) = self.reader.read_field(input, &mut out);
+            if start.is_none() {
+                start = input[..nin]
+                    .iter()
+                    .position(|b| !matches!(b, b'\r' | b'\n'))
+                    .map(|i| self.at + i);
+                if let Some(first) = start
+                    && fields.is_empty()
+                {
+                    self.record_at = first;
+                }
+            }
+            self.at += nin;
+            value.extend_from_slice(&out[..nout]);
+            match result {
+                csv_core::ReadFieldResult::InputEmpty | csv_core::ReadFieldResult::OutputFull => continue,
+                csv_core::ReadFieldResult::End => return Ok(None),
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    let quoted = start.is_some_and(|s| bytes[s] == b'"');
+                    if quoted && self.at == bytes.len() {
+                        self.refuse_an_open_quote(start.unwrap_or(self.at))?;
+                    }
+                    let value = String::from_utf8(std::mem::take(&mut value)).map_err(|e| {
+                        crate::error::DbdError::Config(format!("{}: not UTF-8: {e}", self.file.display()))
+                    })?;
+                    fields.push(Field { value, quoted });
+                    start = None;
+                    if record_end {
+                        return Ok(Some(fields));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Refuse a quoted field that ran to the end of the file unclosed. Its
+    /// quotes are the opening one, doubled pairs, and the closing one — an
+    /// odd count means the closing one never came.
+    fn refuse_an_open_quote(&self, start: usize) -> Result<()> {
+        let quotes = self.data.as_bytes()[start..].iter().filter(|b| **b == b'"').count();
+        if quotes % 2 == 0 {
+            return Ok(());
+        }
+        Err(crate::error::DbdError::Config(format!(
+            "{}: the quote opened on line {} is never closed — every row after it would load as part \
+             of one value",
+            self.file.display(),
+            self.line_of(start)
+        )))
+    }
+
+    /// The data file, for messages about it.
+    pub(crate) fn file(&self) -> &Path {
+        self.file
+    }
+
+    /// The line the record last read starts on, counting from 1.
+    pub(crate) fn line(&self) -> usize {
+        self.line_of(self.record_at)
+    }
+
+    fn line_of(&self, offset: usize) -> usize {
+        1 + self.data.as_bytes()[..offset].iter().filter(|b| **b == b'\n').count()
+    }
+
+    /// Offset into the data where the next record begins — the rows still to
+    /// read, as written.
+    pub(crate) fn offset(&self) -> usize {
+        // csv-core ends a CRLF record at its `\r` and leaves the `\n` to the
+        // next read. Rows handed on from there start with a `\n` that COPY
+        // reads as a row of its own.
+        if self.data[..self.at].ends_with('\r') && self.data[self.at..].starts_with('\n') {
+            self.at + 1
+        } else {
+            self.at
+        }
+    }
+}
+
 /// A CSV or TSV data file's header: the column names it loads, and the byte
 /// offset where its rows begin. `None` for a file with no header — no columns,
-/// nothing to load.
-///
-/// Read as CSV (RFC 4180) — a header may quote a name, and a TSV is the same
-/// format with a tab between fields, as Postgres's `COPY … (FORMAT csv,
-/// DELIMITER E'\t')` reads it. A UTF-8 byte-order mark is not part of the
-/// first name: spreadsheet exports start with one. The offset is into `data`,
-/// so the rows after the header can be handed on as written.
+/// nothing to load. Read by [`Delimited`], so a header may quote a name.
 pub(crate) fn delimited_header(data: &str, tab: bool, file: &Path) -> Result<Option<(Vec<String>, usize)>> {
-    let bom = if data.starts_with('\u{feff}') {
-        '\u{feff}'.len_utf8()
-    } else {
-        0
-    };
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(if tab { b'\t' } else { b',' })
-        .has_headers(false)
-        .flexible(true)
-        .from_reader(&data.as_bytes()[bom..]);
-    let mut header = csv::StringRecord::new();
-    let read = reader
-        .read_record(&mut header)
-        .map_err(|e| crate::error::DbdError::Config(format!("{}: unreadable header: {e}", file.display())))?;
-    if !read {
-        return Ok(None);
-    }
-    let mut rows_at = bom + reader.position().byte() as usize;
-    // The reader ends a CRLF record at its `\r` and leaves the `\n` to the next
-    // read. Rows handed on from there start with a `\n` that COPY reads as a
-    // row of its own.
-    if data[..rows_at].ends_with('\r') && data[rows_at..].starts_with('\n') {
-        rows_at += 1;
-    }
-    Ok(Some((header.iter().map(str::to_string).collect(), rows_at)))
+    let mut reader = Delimited::new(data, tab, file);
+    Ok(reader
+        .next_record()?
+        .map(|header| (header.into_iter().map(|f| f.value).collect(), reader.offset())))
 }
 
 /// The columns of `table` a data file's header names, in the header's order —
