@@ -546,6 +546,22 @@ mod tests {
         assert_eq!(names, ["a b", "c"]);
     }
 
+    /// A value longer than the reader's buffer arrives in pieces; it is still
+    /// one value, still quoted, and the record after it starts where it should.
+    #[test]
+    fn a_value_longer_than_the_read_buffer_is_one_field() {
+        let long = format!("{},{}", "x".repeat(20_000), "y".repeat(20_000));
+        let data = format!("v,w\n\"{long}\",b\nc,d\n");
+        let mut reader = Delimited::new(&data, false, Path::new("t.csv"));
+        reader.next_record().unwrap().unwrap();
+        let row = reader.next_record().unwrap().unwrap();
+        assert_eq!(row[0].value, long);
+        assert!(row[0].quoted && !row[1].quoted);
+        let next = reader.next_record().unwrap().unwrap();
+        assert_eq!((next[0].value.as_str(), reader.line()), ("c", 3));
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
     // ── Matching a header to the table's columns ─────────────────────────────
 
     fn columns(names: &[&str]) -> Vec<String> {
