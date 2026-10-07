@@ -40,6 +40,15 @@
 //! takes or refuses an explicit value differently from ALWAYS / BY DEFAULT, or
 //! cannot number the column at all, it is reported.
 //!
+//! # Sequences
+//!
+//! SQL Server has `CREATE SEQUENCE`, so a sequence is emitted there with every
+//! bound resolved to PostgreSQL's and spelled out — SQL Server's own defaults
+//! start at the type's minimum — and `nextval('s')` becomes `NEXT VALUE FOR`.
+//! MySQL and SQLite have none: the sequence is reported, an integer key that
+//! drew from it is numbered by the table instead (reported, as the nearest
+//! thing), and any other column loses the default (reported).
+//!
 //! # Defaults
 //!
 //! A default is read from libpg_query's tree. A literal goes across without
@@ -215,6 +224,11 @@ pub fn emit_schema(
             .filter(|e| e.entity_type == EntityType::External)
             .map(|e| e.name.clone())
             .collect(),
+        sequences: entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Sequence && e.errors.is_empty())
+            .map(|e| e.name.clone())
+            .collect(),
     };
     let mut out: Vec<String> = Vec::new();
     let mut report = Vec::new();
@@ -248,6 +262,11 @@ pub fn emit_schema(
                     out.push(sql);
                 }
             }
+            EntityType::Sequence => {
+                if let Some(sql) = emit_sequence(e, target, &mut report) {
+                    out.push(sql);
+                }
+            }
             EntityType::Function | EntityType::Procedure | EntityType::Trigger => {
                 report.push(Downgrade {
                     entity: e.name.clone(),
@@ -277,6 +296,9 @@ struct Script {
     tables: HashSet<String>,
     /// `schema.name` of every table the design declares `external:`.
     externals: HashSet<String>,
+    /// `schema.name` of every sequence in the emitted set. Only SQL Server
+    /// creates them; a default drawing from one outside it cannot apply.
+    sequences: HashSet<String>,
 }
 
 /// Whether `e` becomes an object in the target — and so needs its schema to
@@ -284,7 +306,7 @@ struct Script {
 fn emits_an_object(e: &Entity) -> bool {
     matches!(
         e.entity_type,
-        EntityType::Table | EntityType::View | EntityType::MaterializedView
+        EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence
     )
 }
 
@@ -360,7 +382,7 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     } else {
         inline_pk.clone()
     };
-    let numbered = numbered_column(td, &pk, target);
+    let numbered = numbered_column(td, &pk, target, e.schema.as_deref());
 
     let mut lines: Vec<String> = Vec::new();
     for c in &td.columns {
@@ -370,7 +392,7 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         let default = c
             .default_value
             .as_deref()
-            .and_then(|d| column_default(d, e, c, &ty, target, report));
+            .and_then(|d| column_default(d, e, c, &ty, numbered, script, report));
         // A note goes immediately above the column it explains.
         for d in &report[before..] {
             lines.push(format!("  {}", d.comment(target)));
@@ -489,19 +511,56 @@ fn table_body(lines: &[String]) -> String {
         .join("\n")
 }
 
-/// How column `c` draws its values from a sequence PostgreSQL keeps for it,
-/// if it does: an identity column, or `serial`, which takes an explicit value
-/// the way BY DEFAULT does.
-fn sequence_kind(c: &ColumnDef) -> Option<IdentityKind> {
-    if c.identity.is_some() {
-        return c.identity;
+/// Where a column's values come from, when PostgreSQL draws them from a
+/// sequence.
+#[derive(Debug, Clone, PartialEq)]
+enum Drawn {
+    /// `GENERATED … AS IDENTITY`.
+    Identity(IdentityKind),
+    /// `serial` and its siblings: an integer with a sequence of its own, which
+    /// takes an explicit value the way BY DEFAULT does.
+    Serial,
+    /// `DEFAULT nextval('seq')` on an integer column — the sequence,
+    /// schema-qualified.
+    NextVal(String),
+}
+
+/// How column `c` draws its values from a sequence, if it does. `schema` is
+/// the table's, which an unqualified sequence name resolves to.
+fn drawn(c: &ColumnDef, schema: Option<&str>) -> Option<Drawn> {
+    if let Some(kind) = c.identity {
+        return Some(Drawn::Identity(kind));
     }
     let t = c.data_type.trim().to_lowercase();
-    matches!(
+    if matches!(
         t.as_str(),
         "serial" | "bigserial" | "smallserial" | "serial2" | "serial4" | "serial8"
-    )
-    .then_some(IdentityKind::ByDefault)
+    ) {
+        return Some(Drawn::Serial);
+    }
+    let integer = matches!(
+        t.as_str(),
+        "integer" | "int" | "int4" | "bigint" | "int8" | "smallint" | "int2"
+    );
+    match c.default_value.as_deref().map(|d| read_default(d, &c.data_type)) {
+        Some(PgDefault::NextVal(written)) if integer => Some(Drawn::NextVal(sequence_name(&written, schema))),
+        _ => None,
+    }
+}
+
+/// The sequence `nextval('…')` names, schema-qualified the way `search_path`
+/// would have — the table's own schema for a bare name.
+fn sequence_name(written: &str, schema: Option<&str>) -> String {
+    let parts: Vec<String> = written
+        .split('.')
+        .map(|p| p.trim().trim_matches('"').to_string())
+        .collect();
+    match (parts.as_slice(), schema) {
+        ([bare], Some(s)) => format!("{s}.{bare}"),
+        ([bare], None) => bare.clone(),
+        // `db.schema.name` names the same sequence as `schema.name`.
+        (many, _) => many[many.len() - 2..].join("."),
+    }
 }
 
 /// Whether `column` leads one of the table's keys or indexes.
@@ -526,10 +585,17 @@ fn leads_a_key(td: &TableDef, pk: &[String], column: &str) -> bool {
 /// index), SQLite only a single-column INTEGER PRIMARY KEY, which is the
 /// rowid. The first sequence-backed column that qualifies gets it; the rest
 /// are reported where they are emitted.
-fn numbered_column<'a>(td: &'a TableDef, pk: &[String], target: Target) -> Option<&'a str> {
+///
+/// A column that drew from a named sequence is a candidate only where the
+/// target has no sequences: SQL Server keeps drawing from the sequence itself.
+fn numbered_column<'a>(td: &'a TableDef, pk: &[String], target: Target, schema: Option<&str>) -> Option<&'a str> {
     td.columns
         .iter()
-        .filter(|c| sequence_kind(c).is_some())
+        .filter(|c| match drawn(c, schema) {
+            Some(Drawn::NextVal(_)) => target != Target::TSql,
+            Some(_) => true,
+            None => false,
+        })
         .find(|c| match target {
             Target::TSql => true,
             Target::Sqlite => pk.len() == 1 && pk[0] == c.name,
@@ -548,6 +614,11 @@ fn numbered_column<'a>(td: &'a TableDef, pk: &[String], target: Target) -> Optio
 /// IDENTITY refuses one, so BY DEFAULT is what loses there. A column the target
 /// cannot number at all is a plain column, and reported, since inserts must now
 /// supply it.
+///
+/// A column that drew from a named sequence is numbered only where the target
+/// has no sequences, as the nearest thing — always reported, since the table's
+/// counter is not that sequence. Where it is not numbered, its default says
+/// what happened ([`column_default`]).
 fn numbering(
     e: &Entity,
     c: &ColumnDef,
@@ -555,11 +626,16 @@ fn numbering(
     target: Target,
     report: &mut Vec<Downgrade>,
 ) -> Option<&'static str> {
-    let kind = sequence_kind(c)?;
-    let from = match c.identity {
-        Some(IdentityKind::Always) => "`GENERATED ALWAYS AS IDENTITY`".to_string(),
-        Some(IdentityKind::ByDefault) => "`GENERATED BY DEFAULT AS IDENTITY`".to_string(),
-        None => format!("`{}`, numbered by a sequence of its own", c.data_type),
+    let drawn = drawn(c, e.schema.as_deref())?;
+    let is_numbered = numbered == Some(c.name.as_str());
+    if matches!(drawn, Drawn::NextVal(_)) && (target == Target::TSql || !is_numbered) {
+        return None;
+    }
+    let from = match &drawn {
+        Drawn::Identity(IdentityKind::Always) => "`GENERATED ALWAYS AS IDENTITY`".to_string(),
+        Drawn::Identity(IdentityKind::ByDefault) => "`GENERATED BY DEFAULT AS IDENTITY`".to_string(),
+        Drawn::Serial => format!("`{}`, numbered by a sequence of its own", c.data_type),
+        Drawn::NextVal(_) => format!("the default `{}`", c.default_value.as_deref().unwrap_or_default()),
     };
     let mut lose = |to: &str, reason: String| {
         report.push(Downgrade {
@@ -571,7 +647,7 @@ fn numbering(
         });
     };
 
-    if numbered != Some(c.name.as_str()) {
+    if !is_numbered {
         let reason = match (numbered, target) {
             (Some(other), _) => format!(
                 "{} numbers one column per table and `{other}` has it — inserts must now supply this one",
@@ -603,8 +679,16 @@ fn numbering(
         Target::TSql => "IDENTITY(1,1)",
         Target::Sqlite => "PRIMARY KEY AUTOINCREMENT",
     };
-    match (kind, target) {
-        (IdentityKind::Always, Target::MySql | Target::Sqlite) => lose(
+    match (&drawn, target) {
+        (Drawn::NextVal(seq), _) => lose(
+            clause,
+            format!(
+                "{} has no sequences; the table's own counter is the nearest thing — it counts from 1 \
+                 by 1 whatever `{seq}` did, and nothing else can draw from it",
+                target.label()
+            ),
+        ),
+        (Drawn::Identity(IdentityKind::Always), Target::MySql | Target::Sqlite) => lose(
             clause,
             format!(
                 "{} takes an explicit value for it where ALWAYS refused one, so the column no longer \
@@ -612,7 +696,7 @@ fn numbering(
                 target.label()
             ),
         ),
-        (IdentityKind::ByDefault, Target::TSql) => lose(
+        (Drawn::Identity(IdentityKind::ByDefault) | Drawn::Serial, Target::TSql) => lose(
             clause,
             "SQL Server refuses an explicit value for an IDENTITY column unless SET IDENTITY_INSERT is \
              ON, where PostgreSQL took one — an insert or a data load that supplies the id now fails"
@@ -932,6 +1016,90 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
     Some(format!("{note}\nCREATE VIEW {name} AS {body};"))
 }
 
+/// A sequence: `CREATE SEQUENCE` on SQL Server; everywhere else, a note where
+/// it would have been, and a report entry.
+///
+/// SQL Server's defaults are not PostgreSQL's — its MINVALUE, and so its first
+/// value, is the type's minimum (-2^63 for bigint), and it caches by default —
+/// so every bound is resolved to what PostgreSQL would have used and spelled
+/// out. The options come from the file's own `CREATE SEQUENCE`, read through
+/// libpg_query, because the model keeps none.
+fn emit_sequence(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<String> {
+    if target != Target::TSql {
+        let d = Downgrade {
+            entity: e.name.clone(),
+            column: None,
+            from: "a sequence".to_string(),
+            to: "nothing".to_string(),
+            reason: format!(
+                "{} has no sequences — a column that drew its default from this one is reported \
+                 where it is",
+                target.label()
+            ),
+        };
+        let note = d.comment(target);
+        report.push(d);
+        return Some(note);
+    }
+
+    let name = table_name(e, target, report);
+    let before = report.len();
+    let read = e
+        .file
+        .as_deref()
+        .and_then(|f| crate::source_text::read_to_string(f).ok())
+        .and_then(|sql| crate::parser::pg::sequences::sequence_options(&sql));
+    if read.is_none() {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: None,
+            from: "a sequence whose options dbd could not read back".to_string(),
+            to: "PostgreSQL's defaults".to_string(),
+            reason: "the file did not yield its CREATE SEQUENCE again, so any START, INCREMENT or \
+                     bound it set is not carried"
+                .to_string(),
+        });
+    }
+    let o = read.unwrap_or_default();
+
+    let (ty, lowest, highest) = match o.data_type.as_deref() {
+        Some("int2" | "smallint") => ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
+        Some("int4" | "integer" | "int") => ("int", i64::from(i32::MIN), i64::from(i32::MAX)),
+        _ => ("bigint", i64::MIN, i64::MAX),
+    };
+    let increment = o.increment.unwrap_or(1);
+    let ascending = increment > 0;
+    let min = o.min.flatten().unwrap_or(if ascending { 1 } else { lowest });
+    let max = o.max.flatten().unwrap_or(if ascending { highest } else { -1 });
+    let start = o.start.unwrap_or(if ascending { min } else { max });
+    let cycle = if o.cycle.unwrap_or(false) { "CYCLE" } else { "NO CYCLE" };
+    // PostgreSQL's CACHE 1 hands out one value at a time, which is SQL
+    // Server's NO CACHE; its own default would skip numbers after a restart.
+    let cache = match o.cache.unwrap_or(1) {
+        n if n > 1 => format!("CACHE {n}"),
+        _ => "NO CACHE".to_string(),
+    };
+
+    if let Some(owner) = &o.owned_by {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: None,
+            from: format!("`OWNED BY {owner}`"),
+            to: "a sequence of its own".to_string(),
+            reason: "SQL Server cannot tie a sequence to a column, so dropping the column no longer \
+                     drops the sequence"
+                .to_string(),
+        });
+    }
+
+    let mut out: Vec<String> = report[before..].iter().map(|d| d.comment(target)).collect();
+    out.push(format!(
+        "CREATE SEQUENCE {name} AS {ty} START WITH {start} INCREMENT BY {increment} MINVALUE {min} \
+         MAXVALUE {max} {cycle} {cache};"
+    ));
+    Some(out.join("\n"))
+}
+
 fn quote_all(columns: &[String], target: Target) -> String {
     columns.iter().map(|c| target.quote(c)).collect::<Vec<_>>().join(", ")
 }
@@ -1075,6 +1243,8 @@ enum PgDefault {
     Today,
     /// `gen_random_uuid()`, or `uuid_generate_v4()` from `uuid-ossp`.
     RandomUuid,
+    /// `nextval('seq')` — the sequence as written.
+    NextVal(String),
     /// Anything else — PostgreSQL SQL that dbd does not translate.
     Other,
 }
@@ -1094,6 +1264,7 @@ enum Literal {
 /// function can be schema-qualified, and the tree settles both.
 fn read_default(expr: &str, pg_type: &str) -> PgDefault {
     use pg_query::NodeEnum;
+    use pg_query::protobuf::AConst;
     use pg_query::protobuf::SqlValueFunctionOp as Svf;
     use pg_query::protobuf::a_const::Val;
 
@@ -1168,14 +1339,32 @@ fn read_default(expr: &str, pg_type: &str) -> PgDefault {
             Svf::SvfopCurrentDate => PgDefault::Today,
             _ => PgDefault::Other,
         },
-        Some(NodeEnum::FuncCall(f)) if f.args.is_empty() => {
+        Some(NodeEnum::FuncCall(f)) => {
             let name = f.funcname.last().and_then(|n| match n.node.as_ref() {
                 Some(NodeEnum::String(s)) => Some(s.sval.to_lowercase()),
                 _ => None,
             });
-            match name.as_deref() {
-                Some("now" | "transaction_timestamp") => PgDefault::Now,
-                Some("gen_random_uuid" | "uuid_generate_v4") => PgDefault::RandomUuid,
+            match (name.as_deref(), f.args.as_slice()) {
+                (Some("now" | "transaction_timestamp"), []) => PgDefault::Now,
+                (Some("gen_random_uuid" | "uuid_generate_v4"), []) => PgDefault::RandomUuid,
+                // `nextval('app.s')`, or `nextval('app.s'::regclass)` as an
+                // introspected default spells it.
+                (Some("nextval"), [arg]) => {
+                    let mut arg = arg;
+                    while let Some(NodeEnum::TypeCast(cast)) = arg.node.as_ref() {
+                        let Some(inner) = cast.arg.as_deref() else {
+                            return PgDefault::Other;
+                        };
+                        arg = inner;
+                    }
+                    match arg.node.as_ref() {
+                        Some(NodeEnum::AConst(AConst {
+                            val: Some(Val::Sval(s)),
+                            ..
+                        })) => PgDefault::NextVal(s.sval.clone()),
+                        _ => PgDefault::Other,
+                    }
+                }
                 _ => PgDefault::Other,
             }
         }
@@ -1209,15 +1398,26 @@ const SQLITE_RANDOM_UUID: &str = "(lower(hex(randomblob(4))) || '-' || lower(hex
 /// omits the column gets NULL instead, or is refused when it is `NOT NULL`.
 ///
 /// A literal goes across; so do the clock and a random UUID, which every target
-/// can make. Anything else is PostgreSQL SQL that dbd does not translate.
+/// can make, and `nextval` on SQL Server, which has sequences. Anything else is
+/// PostgreSQL SQL that dbd does not translate. `numbered` is the one column
+/// the target numbers itself, which takes the place of a `nextval` default
+/// when it is this one.
+#[allow(clippy::too_many_arguments)]
 fn column_default(
     pg: &str,
     e: &Entity,
     c: &ColumnDef,
     ty: &str,
-    target: Target,
+    numbered: Option<&str>,
+    script: &Script,
     report: &mut Vec<Downgrade>,
 ) -> Option<String> {
+    let target = script.target;
+    let consequence = if c.nullable {
+        "a row that omits the column now gets NULL"
+    } else {
+        "a row that omits the column is now refused, since it is NOT NULL"
+    };
     let pg_type = c.data_type.trim().to_lowercase();
     let is_array = pg_type.ends_with("[]");
     let base = pg_type.split('(').next().unwrap_or(&pg_type).trim().to_string();
@@ -1274,12 +1474,47 @@ fn column_default(
                 "(UUID())".to_string()
             }
         },
+        PgDefault::NextVal(written) => {
+            let seq = sequence_name(&written, e.schema.as_deref());
+            match target {
+                Target::TSql if script.sequences.contains(&seq) => {
+                    let (schema, bare) = match seq.rsplit_once('.') {
+                        Some((s, b)) => (Some(s), b),
+                        None => (None, seq.as_str()),
+                    };
+                    format!("NEXT VALUE FOR {}", qualified(schema, bare, target))
+                }
+                Target::TSql => {
+                    lose(
+                        "no default",
+                        format!(
+                            "it draws from `{seq}`, which is not in the emitted script (outside the scope, \
+                             or not part of the project) — {consequence}"
+                        ),
+                    );
+                    return None;
+                }
+                // The table's own counter stands in for the sequence; `numbering`
+                // reported that.
+                Target::MySql | Target::Sqlite if numbered == Some(c.name.as_str()) => return None,
+                Target::MySql | Target::Sqlite => {
+                    let counter = match (numbered, target) {
+                        (Some(other), _) => format!("the table's one numbered column is `{other}`"),
+                        (None, Target::MySql) => "MySQL numbers only a column that leads a key".to_string(),
+                        (None, _) => "SQLite numbers only a single-column INTEGER PRIMARY KEY".to_string(),
+                    };
+                    lose(
+                        "no default",
+                        format!(
+                            "{} has no sequences to draw from, and {counter} — {consequence}",
+                            target.label()
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
         PgDefault::Other => {
-            let consequence = if c.nullable {
-                "a row that omits the column now gets NULL"
-            } else {
-                "a row that omits the column is now refused, since it is NOT NULL"
-            };
             lose(
                 "no default",
                 format!(

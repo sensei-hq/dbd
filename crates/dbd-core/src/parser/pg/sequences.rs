@@ -49,6 +49,101 @@ fn declares_a_sequence(parsed: &pg_query::ParseResult) -> bool {
         .any(|n| matches!(n, pg_query::NodeEnum::CreateSeqStmt(_)))
 }
 
+/// What a `CREATE SEQUENCE` says, as written — `None` where it is silent.
+///
+/// The model keeps no sequence structure (see the module note), so `emit`,
+/// which has to write a sequence for an engine whose defaults differ, reads it
+/// here from libpg_query's tree. Silence is kept as silence because
+/// PostgreSQL's defaults depend on direction: a descending sequence starts at
+/// -1, not 1, and the caller resolves them.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct SequenceOptions {
+    /// `AS <type>` as libpg_query names it: `int2`, `int4`, `int8`.
+    pub data_type: Option<String>,
+    pub increment: Option<i64>,
+    /// `Some(None)` is an explicit `NO MINVALUE`.
+    pub min: Option<Option<i64>>,
+    /// `Some(None)` is an explicit `NO MAXVALUE`.
+    pub max: Option<Option<i64>>,
+    pub start: Option<i64>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    /// `OWNED BY table.column`, as written. `None` for no clause and for
+    /// `OWNED BY NONE`, which says the same thing.
+    pub owned_by: Option<String>,
+}
+
+/// The options of the first `CREATE SEQUENCE` in `sql`, or `None` when it has
+/// none or does not parse.
+pub(crate) fn sequence_options(sql: &str) -> Option<SequenceOptions> {
+    use pg_query::NodeEnum;
+
+    let parsed = pg_query::parse(sql).ok()?;
+    let create = parsed
+        .protobuf
+        .stmts
+        .iter()
+        .find_map(|s| match s.stmt.as_ref()?.node.as_ref()? {
+            NodeEnum::CreateSeqStmt(c) => Some(c.clone()),
+            _ => None,
+        })?;
+
+    // Integers past i32 arrive as a `Float` holding the digits.
+    let number = |node: Option<&pg_query::protobuf::Node>| -> Option<i64> {
+        match node?.node.as_ref()? {
+            NodeEnum::Integer(i) => Some(i64::from(i.ival)),
+            NodeEnum::Float(f) => f.fval.parse().ok(),
+            _ => None,
+        }
+    };
+    let names = |items: &[pg_query::protobuf::Node]| -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut o = SequenceOptions::default();
+    for opt in &create.options {
+        let Some(NodeEnum::DefElem(d)) = opt.node.as_ref() else {
+            continue;
+        };
+        let arg = d.arg.as_deref();
+        match d.defname.as_str() {
+            "as" => {
+                if let Some(NodeEnum::TypeName(t)) = arg.and_then(|a| a.node.as_ref()) {
+                    o.data_type = names(&t.names).pop();
+                }
+            }
+            "increment" => o.increment = number(arg),
+            // A bare `NO MINVALUE` / `NO MAXVALUE` carries no argument.
+            "minvalue" => o.min = Some(number(arg)),
+            "maxvalue" => o.max = Some(number(arg)),
+            "start" => o.start = number(arg),
+            "cache" => o.cache = number(arg),
+            "cycle" => {
+                o.cycle = match arg.and_then(|a| a.node.as_ref()) {
+                    Some(NodeEnum::Boolean(b)) => Some(b.boolval),
+                    _ => Some(true),
+                };
+            }
+            "owned_by" => {
+                if let Some(NodeEnum::List(l)) = arg.and_then(|a| a.node.as_ref()) {
+                    let parts = names(&l.items);
+                    if !(parts.len() == 1 && parts[0].eq_ignore_ascii_case("none")) {
+                        o.owned_by = Some(parts.join("."));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(o)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
