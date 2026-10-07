@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x094d3890d30b4c19
+// docs-digest: 0xc7e657b59edc6330
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -820,6 +820,10 @@ async fn doc_docs_guide_12_embedding_md_4() -> dbd_core::Result<()> {
             },
         )
         .await?;
+
+    // The configured grants, on the schemas this scope builds — what `dbd apply` runs next.
+    let grants = design.apply_grants(&*adapter, Some(&scope)).await?;
+    println!("grants: {grants:?}");
     Ok(())
 }
 
@@ -846,7 +850,10 @@ async fn doc_docs_guide_12_embedding_md_5() -> dbd_core::Result<()> {
 
     design
         .deploy(&*adapter, /* dry_run */ false, Some(&scope), |s| {
-            println!("v{}: {} table(s) imported", s.apply.to_version, s.import.tables);
+            println!(
+                "v{}: grants {:?}, {} table(s) imported",
+                s.apply.to_version, s.grants, s.import.tables
+            );
             println!(
                 "{} policy file(s) applied, {} failed",
                 s.policies.applied.len(),
@@ -986,7 +993,7 @@ async fn doc_docs_guide_12_embedding_md_9() -> dbd_core::Result<()> {
 
     design.combine(Path::new("init.sql"), None)?; // `dbd combine`
 
-    let mut model = dbd_core::schema_model::build(&design, None);
+    let mut model = dbd_core::schema_model::build(&design, None)?;
     model.history = dbd_core::history::load(design.project_dir())?;
     std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
     Ok(())
@@ -1010,13 +1017,58 @@ async fn doc_docs_guide_12_embedding_md_10() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
     let design = dbd_core::Design::from_config(path, "prod")?;
-    let history = dbd_core::history::load_scoped(design.project_dir(), |schema, _name| schema == "app")?;
+    let scope = design.resolve_scope(Some("hub"), None)?;
+    let working_set = design.working_set(&scope)?;
+    let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
+    let history = dbd_core::history::load_scoped(design.project_dir(), |schema, name| {
+        dbd_core::scope::admits(
+            &design.config().scopes,
+            &scope,
+            &working_set,
+            &existing,
+            &format!("{schema}.{name}"),
+        )
+    })?;
     Ok(())
 }
 
 // docs/guide/12-embedding.md — block 11
 #[allow(unused, clippy::all)]
 async fn doc_docs_guide_12_embedding_md_11() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    let design = dbd_core::Design::from_config(path, "prod")?;
+    let scope = design.resolve_scope(Some("hub"), None)?;
+    let entities = design.scoped_entities(&scope)?;
+    let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
+        entities: &entities,
+        design_entities: design.entities(),
+        project_name: &design.config().project.name,
+        database_type: &design.config().source.dialect,
+        project_note: design.config().project.note.as_deref(),
+        docs: &design.config().dbml,
+    });
+    for doc in &docs {
+        std::fs::write(&doc.file_name, &doc.content)?;
+    }
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 12
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1043,9 +1095,9 @@ async fn doc_docs_guide_12_embedding_md_11() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 12
+// docs/guide/12-embedding.md — block 13
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1081,9 +1133,9 @@ async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 13
+// docs/guide/12-embedding.md — block 14
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1110,9 +1162,9 @@ async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 14
+// docs/guide/12-embedding.md — block 15
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_15() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1143,9 +1195,9 @@ async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 15
+// docs/guide/12-embedding.md — block 16
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_15() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]

@@ -14,7 +14,7 @@ current crate.
 
 ```toml
 [dependencies]
-dbd-core = "0.24"
+dbd-core = "0.25"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -26,8 +26,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 The Convex adapter is always compiled. `Design::deploy` does not need the
 `deploy` feature — that feature is only the GitHub download. While the crate is
-`0.x`, the **minor** version is the breaking one: `0.24 → 0.25` may need code
-changes, and the CHANGELOG says which.
+`0.x`, the **minor** version is the breaking one: `0.24 → 0.25` needs code
+changes, and the CHANGELOG lists them under *Library API*.
 
 Async methods need a Tokio runtime.
 
@@ -95,6 +95,13 @@ PostgreSQL, SQLite or Convex — and refuses MySQL and SQL Server URLs by name
 pass `&*adapter`. The concrete adapters are public too —
 `adapter::postgres::PostgresAdapter::new(url, project)` and so on.
 
+An adapter of your own implements `DatabaseAdapter`. Two methods arrived in 0.25,
+both with defaults: `stamp_matview(qualified, stamp)` records a materialized
+view's drift stamp (a no-op unless the target has materialized views; Postgres
+keeps it in `dbd.matview_stamps`), and `truncate_table(table)` is the import's
+truncate step (`TRUNCATE TABLE` unless overridden — SQLite runs `DELETE FROM`,
+Convex nothing, since its import replaces the table).
+
 ## Scope
 
 ```rust
@@ -107,6 +114,13 @@ design.check_scope_gaps(&hub)?;                            // the gap check appl
 
 The second argument overrides the scope's `deps` policy, like `--deps`. See
 [Scopes](07-scopes.md).
+
+`working_set(&scope)` is the set of names a run acts on — the closure under
+`deps: include` — and `scope_counts(&scope)` the `(kept, total)` pair every
+command prints as `scope 'hub': N of M entities`, externals left out of both.
+`resolve_name(name, Some(&scope))` is the `-n` check: `no entity named 'X'`,
+or `X is outside scope 'S'` when the design has it and the scope does not
+build it.
 
 ## Apply
 
@@ -131,21 +145,31 @@ design
         },
     })
     .await?;
+
+// The configured grants, on the schemas this scope builds — what `dbd apply` runs next.
+let grants = design.apply_grants(&*adapter, Some(&scope)).await?;
+println!("grants: {grants:?}");
 ```
 
 `apply(adapter, name, dry_run, scope, progress)` applies schemas, entities and
 pending migrations — on PostgreSQL in one transaction — then stamps new
 materialized views, syncs pg_cron refresh jobs and runs `apply.after`. `name`
-limits the run to one entity.
+limits the run to one entity, and is refused when it names nothing the scope
+builds, as `resolve_name` says. `entities_to_apply(name, scope)` is what it
+would act on, behind the same gates and without a database — the list
+`dbd apply --dry-run` prints.
 
 The three callbacks travel together in one `Progress` value; they are not three
 arguments. `Progress::none()` is a silent run. `ApplyComplete` carries
 `strategy` (`Fresh`, `Migrate` or `Current`), `from_version`, `to_version`,
 `applied`, `migrated`, `created`, `dropped`, the hook counts and any warnings.
 
-`apply` does not apply RLS policies or the configured grants — `dbd apply` adds
-the grants itself. Use `deploy` for both, or `design::apply_policies` for the
-policies alone.
+`apply` does not apply RLS policies or the configured grants.
+`apply_grants(adapter, scope)` applies the grants — under a scope, only on the
+schemas the scope builds — and returns a `GrantsOutcome`: `None` when the design
+declares none, `Applied`, or `Unsupported` on SQLite and Convex, which have no
+grant model. `deploy` does both; `design::apply_policies` applies the policies
+alone.
 
 ## Deploy
 
@@ -156,7 +180,7 @@ let scope = design.resolve_scope(None, None)?;
 
 design
     .deploy(&*adapter, /* dry_run */ false, Some(&scope), |s| {
-        println!("v{}: {} table(s) imported", s.apply.to_version, s.import.tables);
+        println!("v{}: grants {:?}, {} table(s) imported", s.apply.to_version, s.grants, s.import.tables);
         println!("{} policy file(s) applied, {} failed", s.policies.applied.len(), s.policies.failed.len());
         for w in s.warnings() {
             eprintln!("warning: {w}");
@@ -165,8 +189,9 @@ design
     .await?;
 ```
 
-`deploy` is the pipeline `dbd deploy` runs: apply, then the configured grants,
-then import, then every policy under `policies/`. A failing policy file does not
+`deploy` is the pipeline `dbd deploy` runs: apply, then the configured grants
+(`apply_grants`, reported in `DeployComplete::grants`), then import, then every
+policy under `policies/`. A failing policy file does not
 fail the deploy — it lands in `policies.failed`, and `warnings()` lists it with
 the apply and import warnings and any policy the scope skipped.
 `deploy_with_progress(adapter, dry_run, scope, Progress { … })` adds the per-step
@@ -197,8 +222,22 @@ for (file, err) in &report.failed {
 ```
 
 `import_data` takes the same five arguments as `apply`, and runs the same import
-`dbd import` does — load, procedures, `import.after`. `apply_policies` takes an
-optional `(scope_name, working_set)` pair; `None` applies every file.
+`dbd import` does — truncate, load, procedures, `import.after`. The truncate goes
+through the adapter (`DatabaseAdapter::truncate_table`), so it runs on SQLite and
+Convex too. Only a procedure is a loader: `ImportPlanEntry.procedure` names the
+procedure that reads the staging table, never a function.
+
+`scoped_import_plan(name, scope)` is the plan a run under `scope` keeps, with one
+line per entry it leaves out saying which table is outside the scope — an entry
+needs every table its procedure writes and, when the design declares it, its
+staging table. `import_warnings(name)` lists what the scan and the plan left out
+before any scope: a missing `import/`, another environment's files, a data file
+that failed to parse, a function reading a staging table no procedure loads.
+`design::import_entry_in_scope` is deprecated in favour of `scoped_import_plan`.
+
+`apply_policies` takes an optional `(scope_name, working_set)` pair; `None`
+applies every file. `design::plan_policies(project_dir, scope)` is the same filter
+without a database — what `dbd policies --dry-run` lists.
 
 ## Diff and reconcile
 
@@ -243,26 +282,55 @@ for layer in &graph.layers {
 
 design.combine(Path::new("init.sql"), None)?;          // `dbd combine`
 
-let mut model = dbd_core::schema_model::build(&design, None);
+let mut model = dbd_core::schema_model::build(&design, None)?;
 model.history = dbd_core::history::load(design.project_dir())?;
 std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
 ```
 
 `schema_model::build(design, scope)` is the model `dbd diagram` encodes (see
-[The schema viewer](11-schema-viewer.md#the-model)); it does not read
+[The schema viewer](11-schema-viewer.md#the-model)). It returns
+`Result<SchemaModel>`: a scope whose `deps: include` closure needs something the
+scope excludes is refused, as every command refuses it. It does not read
 `snapshots/`, so attach the changelog yourself. Under a scope, filter the
 history with `history::load_scoped(project_dir, keep)`, where `keep(schema,
-name)` says which tables and enums to keep:
+name)` says which tables and enums to keep. `scope::admits` is the predicate
+`dbd diagram` passes: it answers from the scope's working set — closure
+included — and, for a table the design no longer has, from the scope's own
+`includes` and `excludes`:
 
 ```rust
 let design = dbd_core::Design::from_config(path, "prod")?;
-let history = dbd_core::history::load_scoped(design.project_dir(), |schema, _name| schema == "app")?;
+let scope = design.resolve_scope(Some("hub"), None)?;
+let working_set = design.working_set(&scope)?;
+let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
+let history = dbd_core::history::load_scoped(design.project_dir(), |schema, name| {
+    dbd_core::scope::admits(&design.config().scopes, &scope, &working_set, &existing, &format!("{schema}.{name}"))
+})?;
 ```
 
 DBML comes from `dbml::generate_dbml(&DbmlParams)` and
 `dbml::generate_all(&DbmlMultiParams)`: parameter structs carrying the entities
-to document (`design.entities()`, or `design.scoped_entities(&scope)?`), the
-project name, the database type and the filters. Each returns `DbmlDocument`s.
+to document, the project name, the database type and the filters. Each returns
+`DbmlDocument`s. `DbmlMultiParams.design_entities` is every entity in the design
+— wider than `entities` when a scope narrowed them — and gives the stub table for
+a referenced table the document leaves out its real column types:
+
+```rust
+let design = dbd_core::Design::from_config(path, "prod")?;
+let scope = design.resolve_scope(Some("hub"), None)?;
+let entities = design.scoped_entities(&scope)?;
+let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
+    entities: &entities,
+    design_entities: design.entities(),
+    project_name: &design.config().project.name,
+    database_type: &design.config().source.dialect,
+    project_note: design.config().project.note.as_deref(),
+    docs: &design.config().dbml,
+});
+for doc in &docs {
+    std::fs::write(&doc.file_name, &doc.content)?;
+}
+```
 
 ## Translate to another engine
 
@@ -278,8 +346,9 @@ for d in &downgrades {
 }
 ```
 
-`emit_schema(design, target, scope)` is `dbd emit`. See
-[Other dialects](13-other-dialects.md#dbd-emit).
+`emit_schema(design, target, scope)` is `dbd emit`: the script — with a comment
+at every downgrade, and for SQL Server a `GO` after every statement — and the
+same downgrades as a list. See [Other dialects](13-other-dialects.md#dbd-emit).
 
 ## Parse SQL without a project
 
@@ -318,10 +387,13 @@ inside a dbd project and wrong outside one.
   (`Declaration`, `Migration`, `Data`, `Mixed`, `Empty`); and its
   `schema_path`.
 - Each `Entity` keeps every reference in one list, `refs`, each with a `kind`
-  (`Reads`, `Writes`, `Calls`, `Member`), a `schema_source` (stated, inferred or
-  resolved) and an `unresolved` flag. `reads()`, `writes()`, `calls()` and
+  (`Reads`, `Writes`, `Calls`, `Member`, `Uses`), a `schema_source` (stated,
+  inferred or resolved) and an `unresolved` flag. `Uses` is a column's type or
+  the sequence its default draws from — what makes a table depend on its enum
+  and its sequence; like `Calls` it is soft, so one that resolves to nothing (a
+  built-in type) is dropped. `reads()`, `writes()`, `calls()` and
   `refs_of(kind)` filter it; `refers()` yields each referenced name once and
-  skips unresolved ones.
+  skips unresolved ones. An exhaustive `match` on `RefKind` needs a `Uses` arm.
 - `Dialect::detect(sql)` guesses a dialect from the text and fails closed —
   SQL that every dialect accepts is `Unstated`.
 - `references::resolve_references(&mut entities, &externals, &ignore)` resolves
@@ -349,7 +421,7 @@ embedder that wants them makes them itself:
   database to whatever scope they are given.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.
-- **Grants on apply.** `dbd apply` applies the configured grants after
+- **Grants on apply.** `dbd apply` calls `Design::apply_grants` after
   `Design::apply`; `Design::deploy` includes them.
 
 ```rust

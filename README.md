@@ -309,7 +309,7 @@ Both hooks scan the project's `ddl/` tree themselves, so pre-commit invokes them
 ```toml
 # Cargo.toml
 [dependencies]
-dbd-core = "0.24"
+dbd-core = "0.25"
 ```
 
 ```rust
