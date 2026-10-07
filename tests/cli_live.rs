@@ -335,6 +335,21 @@ async fn an_unversioned_database_is_neither_up_to_date_nor_freshly_installed_aft
     assert!(combined(&o).contains("up to date"), "now it is:\n{}", combined(&o));
 }
 
+/// The other side of the check above: an empty database is still a fresh
+/// install. Asking whether the design is already there must not find dbd's own
+/// bookkeeping, or every first apply would read as an adoption.
+#[tokio::test]
+async fn an_empty_database_is_still_a_fresh_install() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("Fresh install at v1"), "{}", combined(&o));
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
