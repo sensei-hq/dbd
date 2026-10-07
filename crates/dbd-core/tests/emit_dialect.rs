@@ -448,3 +448,101 @@ fn indexes_are_emitted_and_what_cannot_carry_is_reported() {
         "SQL Server leaves the expression index out and says so: {report:?}"
     );
 }
+
+// ── Building blocks for the tests below ─────────────────────────────────────
+
+const ALL: [Dialect; 3] = [Dialect::MySql, Dialect::TSql, Dialect::Sqlite];
+
+/// A project of `files` — each `(path under ddl/, sql)`, read under
+/// `search_path app` — with `extra` appended to `design.yaml` (an `external:`
+/// or `scopes:` block).
+fn project_with(dir: &Path, extra: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!(
+            "project:\n  name: p\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\nschemas:\n  - app\n{extra}"
+        ),
+    )
+    .unwrap();
+    for (path, sql) in files {
+        let file = dir.join("ddl").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, format!("set search_path to app;\n{sql}\n")).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+/// [`project_with`], emitted — under `scope` when one is named.
+fn emit_with(dialect: Dialect, extra: &str, files: &[(&str, &str)], scope: Option<&str>) -> (String, Vec<Downgrade>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = project_with(tmp.path(), extra, files);
+    let resolved = scope.map(|s| design.resolve_scope(Some(s), None).expect("scope"));
+    emit_schema(&design, dialect, resolved.as_ref()).expect("emits")
+}
+
+// ── A key to a table the script does not create is left out ────────────────
+
+/// `auth.users` is someone else's table: declared `external:`, never emitted.
+/// A key to it is a statement the target refuses (SQL Server and MySQL check
+/// the parent exists), so the script would not apply on its own.
+#[test]
+fn a_foreign_key_to_an_external_table_is_left_out_and_reported() {
+    let files = [(
+        "table/app/profiles.ddl",
+        "create table profiles (id integer primary key, user_id uuid not null references auth.users (id));",
+    )];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "\nexternal:\n  - name: auth.users\n", &files, None);
+        assert!(
+            !statements(&sql).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: a key to an external table cannot apply: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.profiles" && d.from.contains("auth.users") && d.to == "no foreign key"),
+            "{dialect:?}: and leaving it out must be reported: {report:?}"
+        );
+    }
+}
+
+/// Under `--scope` the parent may simply not be in the script. The key comes
+/// out with it, and says so — the emitted script must apply on its own.
+#[test]
+fn a_foreign_key_to_a_table_outside_the_scope_is_left_out_and_reported() {
+    let files = [
+        (
+            "table/app/customers.ddl",
+            "create table customers (id integer primary key);",
+        ),
+        (
+            "table/app/orders.ddl",
+            "create table orders (id integer primary key, customer_id integer references customers (id));",
+        ),
+    ];
+    let scopes = "\nscopes:\n  just_orders:\n    includes: [app.orders]\n";
+    for dialect in ALL {
+        let (whole, _) = emit_with(dialect, scopes, &files, None);
+        assert!(
+            statements(&whole).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: with its parent in the script, the key stays: {whole}"
+        );
+
+        let (sql, report) = emit_with(dialect, scopes, &files, Some("just_orders"));
+        assert!(
+            !sql.lines()
+                .any(|l| l.starts_with("CREATE TABLE") && l.contains("customers")),
+            "{dialect:?}: the scope leaves the parent out: {sql}"
+        );
+        assert!(
+            !statements(&sql).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: the parent is not in the script: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.orders" && d.from.contains("app.customers") && d.to == "no foreign key"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
