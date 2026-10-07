@@ -601,3 +601,54 @@ fn deps_given_to_a_command_without_a_scope_is_warned_about() {
         stderr(&out)
     );
 }
+
+// ── each message says what is true ──────────────────────────────────────────
+
+/// doctor counts issues, not entities, yet ended every run with the entity
+/// summary — "0 entities — no issues" on a project with tables in it.
+#[test]
+fn doctor_reports_issues_not_an_entity_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let clean = dbd(tmp.path(), &["doctor"]);
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    assert!(
+        !stdout(&clean).contains("entities"),
+        "doctor never counted entities: {}",
+        stdout(&clean)
+    );
+
+    // A plural type folder is one auto-fixable issue.
+    write(
+        tmp.path(),
+        "ddl/tables/app/extra.ddl",
+        "set search_path to app;\ncreate table if not exists extra (id integer primary key);\n",
+    );
+    let found = dbd(tmp.path(), &["doctor"]);
+    let text = stdout(&found);
+    assert!(!text.contains("entities"), "{text}");
+    assert!(text.contains("1 issue"), "the tally counts issues: {text}");
+}
+
+/// Under `deps: include` a gap is not a failure — the closure pulls it in. The
+/// dry run printed each one with the ✗ an error gets.
+#[test]
+fn auto_included_dependencies_are_not_reported_as_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    counted_scope_project(tmp.path());
+
+    for args in [
+        &["deploy", "--dry-run", "--scope", "hub_edges"][..],
+        &["inspect", "--scope", "hub_edges"],
+    ] {
+        let out = dbd(tmp.path(), args);
+        let text = stdout(&out);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        assert!(
+            text.contains("hub.nodes"),
+            "{args:?} still names the dependency: {text}"
+        );
+        assert!(!text.contains('✗'), "{args:?} must not mark it as a failure: {text}");
+    }
+}

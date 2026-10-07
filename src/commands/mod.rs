@@ -747,6 +747,27 @@ mod tests {
         assert!(migrate.contains("0 dropped"), "expected dropped count in: {migrate}");
     }
 
+    /// A project with no `project.version` is not at "v0": it has no version.
+    /// Every apply of one is a `Fresh` plan (its database records version 0),
+    /// so every apply said "Fresh install at v0" — a version that does not exist.
+    #[test]
+    fn an_unversioned_apply_does_not_claim_a_version() {
+        let s = ApplyComplete {
+            strategy: ApplyStrategy::Fresh,
+            from_version: 0,
+            to_version: 0,
+            applied: 3,
+            ..Default::default()
+        };
+        let out = format_apply_summary(&s);
+        assert!(!out.contains("v0"), "there is no v0: {out}");
+        assert!(out.contains("3 entities"), "the count is still reported: {out}");
+        assert!(
+            out.contains("project.version"),
+            "and the reason there is no version: {out}"
+        );
+    }
+
     #[test]
     fn format_import_summary_reports_counts() {
         let s = ImportComplete {
