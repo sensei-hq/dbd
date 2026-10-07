@@ -2019,6 +2019,39 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// A scope that keeps an extension but excludes the schema it installs into
+    /// contradicts itself: `inspect` passed it and apply failed with `schema
+    /// "ext" does not exist`. Refused where the scope is resolved, so every
+    /// command says so.
+    #[test]
+    fn a_scope_that_excludes_its_extensions_schema_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/core")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - ext\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: citext\n        schema: ext\n\
+             scopes:\n  contradicts:\n    includes: [core]\n    excludes: [ext]\n  consistent:\n    includes: [core]\n\
+             \x20   excludes: [ext]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let err = design.resolve_scope(Some("contradicts"), None).unwrap_err().to_string();
+        assert!(
+            err.contains("citext") && err.contains("ext"),
+            "names the extension and its schema: {err}"
+        );
+        design
+            .resolve_scope(Some("consistent"), None)
+            .expect("excluding the schema is fine when the scope installs no extension into it");
+    }
+
     /// An extension installed `WITH SCHEMA x` needs `x`. Every scope keeps the
     /// extension (unless its `extensions:` allowlist says otherwise) but only
     /// kept the schemas its own entities live in, so any scope without `x`
