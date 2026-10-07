@@ -780,25 +780,11 @@ pub async fn cmd_apply(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        // Surface the same gap/closure errors a real apply would (dry-run must
-        // not hide a misconfigured scope).
-        design.check_scope_gaps(&resolved).context("scope check failed")?;
-        let ws = design.working_set(&resolved)?;
-        let entities: Vec<_> = design
-            .entities()
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != dbd_core::EntityType::External)
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| {
-                resolved.is_all
-                    || ws.contains(&e.name)
-                    || matches!(
-                        e.entity_type,
-                        dbd_core::EntityType::Extension | dbd_core::EntityType::Role
-                    )
-            })
-            .collect();
+        // The real apply's own gate, not a copy of it: the scope's gaps and
+        // closure, its `extensions:` allowlist, and the refusal of a file that
+        // did not parse. A preview that filters for itself lists what the run
+        // will not do and passes what the run refuses.
+        let entities = design.entities_to_apply(name, Some(&resolved))?;
 
         for entity in &entities {
             let detail = match &entity.file {
