@@ -69,9 +69,13 @@ pub async fn cmd_inspect(
 
     print_report_findings(&report, scope_name, verbosity);
 
-    // Auto-format DDL files when --fix is passed
+    // Auto-format DDL files when --fix is passed. Under a scope, only the files
+    // the scope builds: a scoped inspect that rewrites the rest of the project
+    // has quietly stopped being scoped.
     if fix {
-        fix_format_ddl(config, project_dir, verbosity)?;
+        let only: Option<std::collections::HashSet<std::path::PathBuf>> =
+            (!resolved.is_all).then(|| scoped.iter().filter_map(|e| e.file.clone()).collect());
+        fix_format_ddl(config, project_dir, only.as_ref(), verbosity)?;
     }
 
     // Report unresolved data.sql TODOs across all migration directories
@@ -313,8 +317,14 @@ pub(crate) fn inspect_exit_code(blocking_errors: usize) -> i32 {
     if blocking_errors > 0 { 1 } else { 0 }
 }
 
-/// Auto-format every DDL file under `project_dir` in place (the `--fix` path).
-fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Result<()> {
+/// Auto-format DDL files under `project_dir` in place (the `--fix` path):
+/// every file, or only those in `only` when given.
+fn fix_format_ddl(
+    config: &Path,
+    project_dir: &Path,
+    only: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let format_config = if config.exists() {
         dbd_core::config::read(config)?.format
     } else {
@@ -323,7 +333,7 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
 
     let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
-    for file in &files {
+    for file in files.iter().filter(|f| only.is_none_or(|set| set.contains(*f))) {
         let content = safe_read(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
         if content != formatted {

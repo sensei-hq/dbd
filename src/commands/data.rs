@@ -29,6 +29,28 @@ fn resolve_table_name(design: &Design, name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Hold an ad-hoc `-f` import to the scope, as every other import is held.
+///
+/// It ignored `--scope` entirely, loading into a table the scope does not
+/// build. A table the design declares must be one the scope builds. One it
+/// does not declare is a deliberate ad-hoc COPY target (see
+/// [`resolve_table_name`]) that no scope can contain — so the scope is not
+/// applied to it, and that is said rather than left silent.
+fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope, qualified: &str) -> Result<()> {
+    if resolved.is_all {
+        return Ok(());
+    }
+    if design.entities().iter().any(|e| e.name == qualified) {
+        design.resolve_name(qualified, Some(resolved))?;
+    } else {
+        output::warn(&format!(
+            "--scope {} not applied to {qualified}: the design does not declare it, so no scope contains it",
+            resolved.name
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_import_dry_run(
     config: &Path,
@@ -49,6 +71,8 @@ pub fn cmd_import_dry_run(
             None => bail!("--file requires --name <entity>"),
         };
         let qualified = resolve_table_name(&design, name);
+        let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        check_adhoc_import_target(&design, &resolved, &qualified)?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
         return Ok(());
@@ -156,6 +180,8 @@ pub(crate) async fn import_with_adapter(
             None => bail!("--file requires --name <entity>"),
         };
         let qualified = resolve_table_name(design, name);
+        let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        check_adhoc_import_target(design, &resolved, &qualified)?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
