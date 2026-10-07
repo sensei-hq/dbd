@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
-use super::{format_apply_summary, get_adapter, safe_read, safe_write};
+use super::{format_apply_summary, get_adapter, safe_read_ddl, safe_write};
 use crate::output::{self, Verbosity};
 
 /// Warn when the config loaded but no authored DDL was scanned under the
@@ -305,7 +305,7 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
     let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
     for file in &files {
-        let content = safe_read(project_dir, file)?;
+        let content = safe_read_ddl(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
         if content != formatted {
             changed += 1;
@@ -1042,7 +1042,7 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
     let mut changed = 0;
 
     for file in &files {
-        let content = safe_read(project_dir, file)?;
+        let content = safe_read_ddl(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
 
         if content != formatted {
@@ -1905,6 +1905,33 @@ mod tests {
         cmd_format(&missing_config, tmp.path(), /*check*/ false, Verbosity::Normal).unwrap();
 
         let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
+        assert_ne!(formatted, "create table public.thing(id int,name text);");
+    }
+
+    /// `format` read each DDL file with `read_to_string`, so one file saved by
+    /// SSMS (UTF-16) failed the whole run — though the project load decodes it.
+    /// A file it rewrites is written back as UTF-8, as every file dbd writes is.
+    #[test]
+    fn format_reads_a_utf16_ddl_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/table/public/thing.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "create table public.thing(id int,name text);".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, utf16).unwrap();
+
+        cmd_format(
+            &tmp.path().join("design.yaml"),
+            tmp.path(),
+            /*check*/ false,
+            Verbosity::Normal,
+        )
+        .expect("a UTF-16 DDL file must be formatted, not fail the run");
+
+        let formatted = std::fs::read_to_string(&path).expect("rewritten as UTF-8");
+        assert!(formatted.contains("thing"), "{formatted:?}");
         assert_ne!(formatted, "create table public.thing(id int,name text);");
     }
 

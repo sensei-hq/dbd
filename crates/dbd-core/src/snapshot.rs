@@ -133,8 +133,10 @@ fn todos_in_migration_dir(version: u32, dir: &Path) -> Result<Vec<DataSqlTodo>> 
         if !entry.path().to_string_lossy().ends_with(".data.sql") {
             continue;
         }
-        let content = std::fs::read_to_string(entry.path()) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            .map_err(|e| DbdError::Config(format!("read {}: {e}", entry.path().display())))?;
+        // Decoded as `apply` decodes the file it then runs, so a `.data.sql`
+        // re-saved by SSMS is checked rather than failing the gate on its
+        // encoding. Still fails closed on a file `source_text` cannot read.
+        let content = crate::source_text::read_to_string(entry.path())?;
         let todo_lines: Vec<String> = content
             .lines()
             .filter(|line| {
@@ -2409,6 +2411,24 @@ mod tests {
         assert_eq!(todos[0].version, 2);
         assert_eq!(todos[0].lines.len(), 1);
         assert!(todos[0].lines[0].contains("TODO:"));
+    }
+
+    /// `apply` runs a `.data.sql` decoded (it may have been hand-edited in
+    /// SSMS), but the TODO gate in front of it read the file with
+    /// `read_to_string` — so a UTF-16 one blocked the apply with an encoding
+    /// error instead of being checked for TODOs.
+    #[test]
+    fn a_utf16_data_sql_is_checked_for_todos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = make_data_sql(&tmp, 2, "");
+        fs::write(
+            &file,
+            crate::source_text::utf16le("-- TODO: Data correction required for config.users.score.\n"),
+        )
+        .unwrap();
+        let todos = scan_data_sql_todos(tmp.path()).expect("a UTF-16 data.sql must be readable");
+        assert_eq!(todos.len(), 1);
+        assert!(todos[0].lines[0].contains("TODO:"), "{:?}", todos[0].lines);
     }
 
     #[test]

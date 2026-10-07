@@ -1336,21 +1336,28 @@ impl DatabaseAdapter for PostgresAdapter {
                 // connections don't share `search_path`, so unqualified names (a bare
                 // `_temp`, or a CALL qualified with the target's own schema) resolve
                 // nondeterministically and fail. See sensei-hq/dbd#6.
+                //
+                // The procedure is installed here, by the load that needs it, rather
+                // than left to the caller: only the full import plan used to, so an
+                // ad-hoc `dbd import -n … -f rows.jsonl` against a database that had
+                // never run one failed for want of a procedure the user never wrote.
+                self.ensure_import_procedure().await?;
                 self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
                     .await?;
                 self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
 
-                // Insert each line as a JSONB row
-                for line in data.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let insert = format!(
-                        "INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ('{}'::jsonb)",
-                        line.replace('\'', "''")
-                    );
-                    self.execute_script(&insert).await?;
+                // Stage each record as a JSONB row — bound, not interpolated into
+                // `execute_script`, which rewrites every `set search_path to …;`
+                // in its text to add `public`. A record is data, and a value that
+                // quoted the statement was altered on the way in. On the pool, as
+                // the CSV `COPY` is: an import never runs inside an apply batch.
+                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::jsonb)");
+                for record in super::json_records(&data, format, file_path)? {
+                    sqlx::query(&insert)
+                        .bind(record)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| DbdError::Config(format!("staging a JSON record failed: {e}")))?;
                 }
 
                 // Move data from the temp table to the target. `entity.name` is the
@@ -1369,6 +1376,15 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let format = entity.format.as_deref().unwrap_or("csv");
+        // Refused rather than defaulted: the file is named for the format asked
+        // for, so anything that fell through to CSV — `-f json` — wrote CSV into
+        // a `.json` file that the import then reads as JSON and rejects.
+        if !matches!(format, "csv" | "tsv" | "jsonl") {
+            return Err(DbdError::Config(format!(
+                "cannot export {} as {format}: Postgres exports csv, tsv or jsonl",
+                entity.name
+            )));
+        }
 
         // The file is named after the table (and, without `--out`, the directory
         // after its schema). A quoted identifier may hold path separators, and
@@ -1388,30 +1404,45 @@ impl DatabaseAdapter for PostgresAdapter {
         // Quoted part by part rather than by string-replacing the dot: that left
         // an embedded `"` free to close the quoting and continue the statement.
         let qualified = crate::sql_quote::qualified(&entity.name);
-        let copy_sql = match format {
-            "tsv" => {
-                format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')")
-            }
-            "jsonl" => format!("COPY (SELECT row_to_json(t) FROM {qualified} t) TO STDOUT"),
-            _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
-        };
-
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
-
         let mut data = Vec::new();
-        let mut copy = conn
-            .copy_out_raw(&copy_sql)
-            .await
-            .map_err(|e| DbdError::Config(format!("COPY OUT failed: {e}")))?;
-
         use futures_lite::StreamExt;
-        while let Some(chunk) = copy.next().await {
-            let chunk = chunk.map_err(|e| DbdError::Config(format!("COPY OUT read failed: {e}")))?;
-            data.extend_from_slice(&chunk);
+
+        if format == "jsonl" {
+            // Fetched as rows, not `COPY … TO STDOUT`: COPY's text format escapes
+            // every backslash again, and the JSON `row_to_json` renders is full
+            // of them — a newline came out as `\\n`, a quote as `\\"`, and the
+            // file imported back as different values (or as no JSON at all).
+            let sql = format!("SELECT row_to_json(t)::text FROM {qualified} t");
+            let mut rows = sqlx::query_scalar::<_, String>(&sql).fetch(&self.pool);
+            while let Some(line) = rows.next().await {
+                let line = line.map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
+                data.extend_from_slice(line.as_bytes());
+                data.push(b'\n');
+            }
+        } else {
+            let copy_sql = match format {
+                "tsv" => format!(
+                    "COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
+                ),
+                // csv — the only format left once the guard above has run.
+                _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+            };
+
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
+
+            let mut copy = conn
+                .copy_out_raw(&copy_sql)
+                .await
+                .map_err(|e| DbdError::Config(format!("COPY OUT failed: {e}")))?;
+
+            while let Some(chunk) = copy.next().await {
+                let chunk = chunk.map_err(|e| DbdError::Config(format!("COPY OUT read failed: {e}")))?;
+                data.extend_from_slice(&chunk);
+            }
         }
 
         // `Some(dir)` → write `dir/<name>.<format>` (flat).

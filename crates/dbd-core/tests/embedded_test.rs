@@ -257,6 +257,310 @@ async fn import_data_honors_null_value_sentinel() {
     .await;
 }
 
+// ── Test: the default import empties a staging table before loading it ────────
+
+/// `truncate: true` is the default. The step moved behind
+/// `DatabaseAdapter::truncate_table` so SQLite and Convex could run it their
+/// own way; this pins that Postgres still empties the table.
+#[tokio::test]
+async fn the_default_import_truncates_a_staging_table_on_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("design.yaml"), "project:\n  name: t\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("import/stage")).unwrap();
+    std::fs::write(dir.path().join("import/stage/items.csv"), "id,name\n1,fresh\n").unwrap();
+    let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA stage; CREATE TABLE stage.items (id integer, name text); \
+             INSERT INTO stage.items VALUES (99, 'stale');",
+        )
+        .await
+        .unwrap();
+
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM stage.items WHERE id = 99",
+        "the stale row",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM stage.items WHERE id = 1 AND name = 'fresh'",
+        "the row loaded from the file",
+    )
+    .await;
+}
+
+// ── Test: a function reading a staging table does not fail the import ─────────
+
+/// The import runs each loader with `CALL`, and Postgres refuses `CALL` on a
+/// function ("is not a procedure"). A helper function that merely reads a
+/// staging table was matched as its loader, so the whole import failed.
+#[tokio::test]
+async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write("design.yaml", "project:\n  name: t\nschemas:\n  - stage\n");
+    write(
+        "ddl/table/stage/items.ddl",
+        "set search_path to stage;\ncreate table if not exists items (id integer, name text);\n",
+    );
+    write(
+        "ddl/function/stage/item_count.ddl",
+        "set search_path to stage;\n\
+         create or replace function item_count() returns bigint language sql\n\
+         as $$ select count(*) from stage.items $$;\n",
+    );
+    write("import/stage/items.csv", "id,name\n1,a\n");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("a helper function must not fail the import");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM stage.items WHERE id = 1",
+        "the staged row",
+    )
+    .await;
+}
+
+// ── Test: a `.json` file may hold a JSON array ────────────────────────────────
+
+/// A `.json` file is what most tools mean by one: a JSON array of records. The
+/// Postgres load split every file into lines and parsed each as a record, so a
+/// pretty-printed array failed on its opening `[`.
+#[tokio::test]
+async fn a_json_array_file_imports_one_row_per_record() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.json");
+    std::fs::write(
+        &path,
+        "[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n",
+    )
+    .unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.people");
+    entity.file = Some(path);
+    entity.format = Some("json".to_string());
+
+    adapter
+        .import_data(&entity, "", false)
+        .await
+        .expect("a JSON array must import");
+
+    for (id, name) in [(1, "alpha"), (2, "beta")] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM app.people WHERE id = {id} AND name = '{name}'"),
+            &format!("record {id}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 WHERE (SELECT count(*) FROM app.people) <> 2",
+        "a row count other than 2",
+    )
+    .await;
+}
+
+// ── Test: JSONL export → import is a round trip ───────────────────────────────
+
+/// `dbd export -f jsonl` is how data moves to a new database, so what it writes
+/// must import back to the same values. It wrote `COPY … TO STDOUT` in text
+/// format, which escapes every backslash in the JSON a second time: a newline
+/// came back as the two characters `\n`, a quote as `\"`.
+#[tokio::test]
+async fn a_jsonl_export_imports_back_to_the_same_values() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    // A backslash, both quotes, a newline and a tab — everything an escaping
+    // layer could touch. Kept beside the table as the expected value.
+    adapter
+        .execute_script(
+            r#"CREATE SCHEMA app;
+               CREATE TABLE app.notes (id integer, body text);
+               INSERT INTO app.notes VALUES (1, E'C:\\temp "double" ''single''\nsecond line\tend');
+               CREATE TABLE app.expected AS SELECT * FROM app.notes;"#,
+        )
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.format = Some("jsonl".to_string());
+    adapter
+        .export_data(&entity, Some(out.path()))
+        .await
+        .expect("export failed");
+
+    // The file itself must hold the value, not an escaped rendering of it.
+    let written = std::fs::read_to_string(out.path().join("notes.jsonl")).unwrap();
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines.len(), 1, "one row, one line: {written:?}");
+    let row: serde_json::Value =
+        serde_json::from_str(lines[0]).unwrap_or_else(|e| panic!("each line must be JSON ({e}): {written:?}"));
+    assert_eq!(
+        row["body"], "C:\\temp \"double\" 'single'\nsecond line\tend",
+        "the exported value: {written:?}"
+    );
+
+    // And it imports back to exactly what was exported.
+    adapter.execute_script("TRUNCATE app.notes").await.unwrap();
+    let mut import = Entity::new(EntityType::Table, "app.notes");
+    import.file = Some(out.path().join("notes.jsonl"));
+    import.format = Some("jsonl".to_string());
+    adapter.import_data(&import, "", false).await.expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "(SELECT * FROM app.notes EXCEPT ALL SELECT * FROM app.expected) \
+         UNION ALL (SELECT * FROM app.expected EXCEPT ALL SELECT * FROM app.notes)",
+        "a row that differs after the round trip",
+    )
+    .await;
+}
+
+// ── Test: a UTF-16 DDL file applies ───────────────────────────────────────────
+
+/// SSMS writes UTF-16LE with a BOM. The project load decodes it, but `apply`
+/// read the file again with `read_to_string`, took the error for "no DDL", and
+/// skipped the table while reporting success.
+#[tokio::test]
+async fn a_utf16_ddl_file_applies_to_postgres() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("design.yaml"),
+        "project:\n  name: ssms\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ddl/table/app")).unwrap();
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "set search_path to app;\ncreate table if not exists wide (id integer primary key);\n".encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(dir.path().join("ddl/table/app/wide.ddl"), utf16).unwrap();
+    let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+
+    assert_table_exists(&*adapter, "app", "wide").await;
+}
+
+// ── Test: a JSON record is imported as written ────────────────────────────────
+
+/// Each staged JSON record was sent as an interpolated `INSERT` through
+/// `execute_script`, which rewrites every `set search_path to …;` it finds to
+/// append `, public` — inside a string value too. A note that quoted the
+/// statement came back altered.
+#[tokio::test]
+async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.notes (id integer, body text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.jsonl");
+    std::fs::write(
+        &path,
+        "{\"id\": 1, \"body\": \"first run set search_path to app; then load\"}\n",
+    )
+    .unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.file = Some(path);
+    entity.format = Some("jsonl".to_string());
+    adapter.import_data(&entity, "", false).await.expect("import failed");
+
+    // Read back through the export, not a SQL predicate: a predicate quoting
+    // the same text goes through `execute_script` too, and is rewritten to
+    // match the damage.
+    let out = tempfile::tempdir().unwrap();
+    let mut export = Entity::new(EntityType::Table, "app.notes");
+    export.format = Some("jsonl".to_string());
+    adapter
+        .export_data(&export, Some(out.path()))
+        .await
+        .expect("export failed");
+    let written = std::fs::read_to_string(out.path().join("notes.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    assert_eq!(row["body"], "first run set search_path to app; then load");
+}
+
+// ── Test: an export format dbd cannot write is refused ────────────────────────
+
+/// Any format but `tsv` and `jsonl` fell through to CSV, and the file was still
+/// named for the format asked for: `-f json` wrote CSV into `notes.json`, which
+/// the import then reads as JSON and rejects. SQLite already refuses.
+#[tokio::test]
+async fn an_export_format_postgres_cannot_write_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.notes (id integer); INSERT INTO app.notes VALUES (1);")
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.format = Some("json".to_string());
+    let err = adapter
+        .export_data(&entity, Some(out.path()))
+        .await
+        .expect_err("a format the export cannot write must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("json") && msg.contains("jsonl"),
+        "say what was asked and what works: {msg}"
+    );
+    assert!(!out.path().join("notes.json").exists(), "and write nothing");
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
