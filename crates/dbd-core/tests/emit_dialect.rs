@@ -267,3 +267,116 @@ fn a_surviving_key_is_not_reported_as_a_downgrade() {
         "a key that survived is not a downgrade: {report:?}"
     );
 }
+
+// ── Keys, checks and indexes come across ────────────────────────────────────
+
+/// A project with the constraints and indexes `emit` used to drop without a
+/// word: an inline FK with an action, a table-level FK, column and table
+/// CHECKs, and indexes plain, expression and partial.
+fn keyed_project(dir: &Path) -> Design {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: keyed\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let t = dir.join("ddl/table/app");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(
+        t.join("customers.ddl"),
+        "set search_path to app;\n\
+         create table if not exists customers (\n  id integer primary key\n, email text not null\n);\n\
+         create unique index customers_email_key on customers (lower(email));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        t.join("orders.ddl"),
+        "set search_path to app;\n\
+         create table if not exists orders (\n  \
+           id          integer primary key\n, \
+           customer_id integer not null references customers (id) on delete cascade\n, \
+           parent_id   integer\n, \
+           total       numeric(10,2) not null check (total >= 0)\n, \
+           status      text not null\n, \
+           constraint orders_parent_fk foreign key (parent_id) references orders (id)\n, \
+           constraint orders_status_check check (status in ('open', 'paid'))\n\
+         );\n\
+         create index orders_customer_idx on orders (customer_id);\n\
+         create index orders_open_idx on orders (status) where status = 'open';\n",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+fn emit_keyed(dialect: Dialect) -> (String, Vec<Downgrade>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = keyed_project(tmp.path());
+    emit_schema(&design, dialect, None).expect("emits")
+}
+
+/// Every target has FOREIGN KEY, so a key is carried, never dropped — an
+/// emitted schema without its keys applies cleanly and enforces nothing.
+#[test]
+fn foreign_keys_are_emitted_on_every_target() {
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, _) = emit_keyed(dialect);
+        let upper = sql.to_uppercase();
+        assert_eq!(
+            upper.matches("FOREIGN KEY").count(),
+            2,
+            "{dialect:?}: the inline and the table-level key: {sql}"
+        );
+        assert!(
+            upper.contains("ON DELETE CASCADE"),
+            "{dialect:?}: the action comes too: {sql}"
+        );
+    }
+}
+
+/// CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd does
+/// not translate — so it is emitted AND reported, the way a view body is.
+#[test]
+fn checks_are_emitted_and_their_untranslated_expression_reported() {
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_keyed(dialect);
+        assert_eq!(
+            sql.to_uppercase().matches("CHECK (").count(),
+            2,
+            "{dialect:?}: the column and the table check: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity.ends_with("orders") && d.from.contains("CHECK")),
+            "{dialect:?}: an untranslated CHECK must be reported: {report:?}"
+        );
+    }
+}
+
+/// Indexes are part of the schema: a plain one is emitted as-is, and what a
+/// target cannot express — an expression key, a partial predicate — is
+/// reported rather than lost.
+#[test]
+fn indexes_are_emitted_and_what_cannot_carry_is_reported() {
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_keyed(dialect);
+        let upper = sql.to_uppercase();
+        assert!(upper.contains("CREATE INDEX"), "{dialect:?}: plain index: {sql}");
+        assert!(sql.contains("orders_customer_idx"), "{dialect:?}: {sql}");
+        assert!(
+            upper.contains("CREATE UNIQUE INDEX"),
+            "{dialect:?}: unique index: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity.ends_with("customers") && d.from.contains("expression")),
+            "{dialect:?}: an expression key must be reported: {report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity.ends_with("orders") && d.from.contains("WHERE")),
+            "{dialect:?}: a partial index predicate must be reported: {report:?}"
+        );
+    }
+}
