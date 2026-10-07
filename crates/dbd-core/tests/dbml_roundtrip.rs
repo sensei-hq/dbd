@@ -304,3 +304,23 @@ fn a_generated_column_survives_dbml_and_back() {
         assert_eq!(generated(td, name), generated(&original, name), "{name}:\n{dbml}");
     }
 }
+
+/// `[increment]` cannot say ALWAYS, so an ALWAYS identity came back BY
+/// DEFAULT — a column that silently started accepting hand-written ids.
+#[test]
+fn an_always_identity_stays_always_through_dbml_and_back() {
+    let customers = parse(
+        "ddl/table/shop/customers.ddl",
+        "create table shop.customers (id bigint generated always as identity primary key, email text);",
+    );
+    let original = customers.table_def.clone().unwrap();
+    let dbml = document(&[customers]);
+    let reversed = reverse(&dbml);
+
+    assert_eq!(original.columns[0].identity, Some(IdentityKind::Always));
+    assert_eq!(
+        table(&reversed, "shop.customers").columns[0].identity,
+        Some(IdentityKind::Always),
+        "\n{dbml}"
+    );
+}
