@@ -2542,36 +2542,83 @@ import:
         );
     }
 
-    /// A `--name` that matches no staging file is a typo, and must not look
-    /// like an empty-but-healthy import.
+    /// A `-n` that names nothing is a typo. The import reported it as a
+    /// warning and carried on — exiting 0 and running every `import.after`
+    /// hook — so a mistyped name still ran the project's loader script. It is
+    /// refused before anything runs, in the words every other command uses for
+    /// a name that matches nothing.
     #[tokio::test]
-    async fn import_warns_when_name_filter_matches_nothing() {
+    async fn an_unknown_import_name_is_refused_before_anything_runs() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
+        assert!(
+            !design.config().import.after.is_empty(),
+            "precondition: the fixture declares an import.after hook"
+        );
 
         let mock = MockAdapter::new();
-        let mut summary: Option<ImportComplete> = None;
-        design
-            .import_data(
-                &mock,
-                Some("staging.does_not_exist"),
-                true,
-                None,
-                Progress {
-                    on_start: |_: &str| {},
-                    on_done: |_: &str, _: Option<&str>| {},
-                    on_complete: |s| summary = Some(s),
-                },
-            )
+        let err = design
+            .import_data(&mock, Some("staging.does_not_exist"), false, None, Progress::none())
             .await
-            .unwrap();
+            .expect_err("an unknown -n must be refused");
 
-        let summary = summary.expect("import must always report a summary");
-        assert_eq!(summary.tables, 0);
         assert!(
-            summary.warnings.iter().any(|w| w.contains("does_not_exist")),
-            "an unmatched --name must be reported: {:?}",
-            summary.warnings
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "nothing may run — no truncate, no CALL, no import.after hook: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "no data file may load");
+    }
+
+    /// The plan every preview prints is refused the same way, so a dry run
+    /// cannot accept a name the real run refuses.
+    #[test]
+    fn an_unknown_import_name_is_refused_by_the_plan() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        let err = design
+            .scoped_import_plan(Some("staging.does_not_exist"), None)
+            .expect_err("an unknown -n must be refused");
+        assert!(
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+    }
+
+    /// A table the design declares but has no data file for selects nothing to
+    /// load either. "No entity named" would be false, so the refusal says what
+    /// is actually missing.
+    #[test]
+    fn an_import_name_without_a_data_file_is_refused_naming_what_is_missing() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        assert!(
+            design.entities().iter().any(|e| e.name == "config.lookups"),
+            "precondition: config.lookups is a declared table"
+        );
+        let err = design
+            .scoped_import_plan(Some("config.lookups"), None)
+            .expect_err("a name with no data file selects nothing");
+        let msg = err.to_string();
+        assert!(msg.contains("config.lookups") && msg.contains("no data file"), "{msg}");
+    }
+
+    /// The wrong-`-e` case: the file exists, under another env's folder. The
+    /// refusal names it, since that is the one thing that tells the user what
+    /// to change.
+    #[test]
+    fn an_import_name_whose_file_belongs_to_another_env_says_which_file() {
+        let tmp = project_with_import_files(&[("dev/staging/seed.csv", "id\n1\n")]);
+        let design = load_project(tmp.path(), "prod");
+        let err = design
+            .scoped_import_plan(Some("staging.seed"), None)
+            .expect_err("a file of another env is not this run's to load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/dev/staging/seed.csv") && msg.contains("'prod'"),
+            "{msg}"
         );
     }
 

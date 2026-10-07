@@ -466,6 +466,10 @@ fn an_unknown_name_is_an_error_on_every_command_that_takes_one() {
         &["graph", "-n", "app.nope"],
         &["refresh", "-n", "app.nope"],
         &["export", "-n", "app.nope"],
+        &["import", "--dry-run", "-n", "app.nope"],
+        // Refused before connecting: no DATABASE_URL is set, so a refusal that
+        // waited for the adapter would report the connection instead.
+        &["import", "-n", "app.nope"],
     ] {
         let out = dbd(tmp.path(), args);
         assert!(!out.status.success(), "{args:?} must fail: {}", stdout(&out));
