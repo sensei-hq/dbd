@@ -1908,6 +1908,33 @@ mod tests {
         assert_ne!(formatted, "create table public.thing(id int,name text);");
     }
 
+    /// `format` read each DDL file with `read_to_string`, so one file saved by
+    /// SSMS (UTF-16) failed the whole run — though the project load decodes it.
+    /// A file it rewrites is written back as UTF-8, as every file dbd writes is.
+    #[test]
+    fn format_reads_a_utf16_ddl_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/table/public/thing.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "create table public.thing(id int,name text);".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, utf16).unwrap();
+
+        cmd_format(
+            &tmp.path().join("design.yaml"),
+            tmp.path(),
+            /*check*/ false,
+            Verbosity::Normal,
+        )
+        .expect("a UTF-16 DDL file must be formatted, not fail the run");
+
+        let formatted = std::fs::read_to_string(&path).expect("rewritten as UTF-8");
+        assert!(formatted.contains("thing"), "{formatted:?}");
+        assert_ne!(formatted, "create table public.thing(id int,name text);");
+    }
+
     /// Mixed fixture for `select_matviews`: two matviews in `analytics`, one
     /// in `reporting`, plus a non-matview table — so the None/`schema.*`/name
     /// cases are all distinguishable from each other.

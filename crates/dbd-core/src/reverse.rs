@@ -524,6 +524,34 @@ mod tests {
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
     }
 
+    /// An existing DDL file is compared by its text, decoded as the project
+    /// scan decodes it. Read with `read_to_string`, a UTF-16 file failed and was
+    /// classified as absent — `Create` — so `merge` reported creating a file it
+    /// was overwriting, and rewrote one whose text it already matched.
+    #[test]
+    fn an_existing_utf16_file_is_compared_by_its_text() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("ddl/table/shop")).unwrap();
+        fs::write(
+            root.join("ddl/table/shop/same.ddl"),
+            crate::source_text::utf16le("SAME"),
+        )
+        .unwrap();
+        fs::write(root.join("ddl/table/shop/old.ddl"), crate::source_text::utf16le("OLD")).unwrap();
+
+        let generated = vec![
+            (PathBuf::from("ddl/table/shop/same.ddl"), "SAME".to_string()),
+            (PathBuf::from("ddl/table/shop/old.ddl"), "NEW".to_string()),
+        ];
+        let plan = build_plan(root, generated, &["shop".to_string()]);
+        let action = |p: &str| plan.items.iter().find(|i| i.path == Path::new(p)).unwrap().action;
+
+        assert_eq!(action("ddl/table/shop/same.ddl"), FileAction::Skip);
+        assert_eq!(action("ddl/table/shop/old.ddl"), FileAction::Conflict);
+    }
+
     #[test]
     fn stale_matview_file_is_detected_as_orphan() {
         use std::fs;

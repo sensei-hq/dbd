@@ -909,6 +909,24 @@ schemas:
         );
     }
 
+    /// The check read each file with `read_to_string` and skipped any it could
+    /// not, so a misfiled view saved by SSMS (UTF-16) was never reported —
+    /// though the project load decodes it and `reset` drops it the wrong way.
+    #[test]
+    fn ddl_mismatch_flags_a_utf16_matview_under_view_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/view/analytics/daily.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            crate::source_text::utf16le("CREATE MATERIALIZED VIEW analytics.daily AS SELECT 1;"),
+        )
+        .unwrap();
+        let found = detect_ddl_type_mismatches(tmp.path());
+        assert_eq!(found.len(), 1, "the UTF-16 file must be read, not skipped");
+        assert_eq!(found[0].declared, "materialized_view");
+    }
+
     #[test]
     fn ddl_mismatch_flags_plain_view_under_matview_folder() {
         let tmp = tempfile::tempdir().unwrap();

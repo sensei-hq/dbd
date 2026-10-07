@@ -2411,6 +2411,24 @@ mod tests {
         assert!(todos[0].lines[0].contains("TODO:"));
     }
 
+    /// `apply` runs a `.data.sql` decoded (it may have been hand-edited in
+    /// SSMS), but the TODO gate in front of it read the file with
+    /// `read_to_string` — so a UTF-16 one blocked the apply with an encoding
+    /// error instead of being checked for TODOs.
+    #[test]
+    fn a_utf16_data_sql_is_checked_for_todos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = make_data_sql(&tmp, 2, "");
+        fs::write(
+            &file,
+            crate::source_text::utf16le("-- TODO: Data correction required for config.users.score.\n"),
+        )
+        .unwrap();
+        let todos = scan_data_sql_todos(tmp.path()).expect("a UTF-16 data.sql must be readable");
+        assert_eq!(todos.len(), 1);
+        assert!(todos[0].lines[0].contains("TODO:"), "{:?}", todos[0].lines);
+    }
+
     #[test]
     fn ds4_multiple_versions_only_todo_files_returned() {
         let tmp = tempfile::TempDir::new().unwrap();
