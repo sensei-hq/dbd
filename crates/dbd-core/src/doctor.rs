@@ -342,16 +342,22 @@ fn migrate_import_section(
 
 // ── Plural DDL folder migration ────────────────────────────────────────────
 
-/// Plural DDL type folders and their canonical singular form. dbd accepts both
-/// when scanning, but singular is canonical; `dbd doctor --fix` migrates plural
-/// folders to singular.
+/// Non-canonical DDL type folders — plurals and the `matview` shorthand — and
+/// their canonical form. The scanner accepts all of them
+/// ([`crate::entity::EntityType::from_folder_name`]), but the singular is
+/// canonical; `dbd doctor --fix` migrates the rest to it. Keep the two lists in
+/// step: a name the scanner accepts and this omits is never migrated.
 const PLURAL_DDL_DIRS: &[(&str, &str)] = &[
     ("tables", "table"),
     ("views", "view"),
+    ("materialized_views", "materialized_view"),
+    ("matviews", "materialized_view"),
+    ("matview", "materialized_view"),
     ("functions", "function"),
     ("procedures", "procedure"),
     ("enums", "enum"),
     ("roles", "role"),
+    ("sequences", "sequence"),
 ];
 
 /// A `ddl/<plural>/` folder that should use the canonical singular name.
