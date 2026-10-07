@@ -30,6 +30,10 @@ impl Design {
         // the valid, in-scope, name-matching entities. The gate runs even under
         // `dry_run`: a gappy scope is misconfigured regardless of writes.
         let working_set = self.scope_working_set(scope)?;
+        // A `name` that selects nothing applied nothing and reported success.
+        if let Some(n) = name {
+            self.resolve_name(n, scope)?;
+        }
         // Refuse a design with a file dbd could not read, before any write.
         // `entities_in_scope` drops those entities silently, which is how apply
         // used to report success while never creating the object. Like the scope
@@ -37,6 +41,15 @@ impl Design {
         // incomplete whether or not we are about to write.
         self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
         let entities = self.entities_in_scope(scope, working_set.as_ref(), name);
+        // The name exists, but as something apply never builds: an `external:`
+        // declaration, or an import staging table with no DDL of its own.
+        if let Some(n) = name
+            && entities.is_empty()
+        {
+            return Err(DbdError::Config(format!(
+                "{n} has no DDL in this design for apply to run — it is declared external or is an import staging table"
+            )));
+        }
         Ok((working_set, entities))
     }
 
