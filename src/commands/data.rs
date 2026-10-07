@@ -59,16 +59,12 @@ pub fn cmd_import_dry_run(
     // Surface the same gap/closure errors a real import would (dry-run must
     // not hide a misconfigured scope).
     design.check_scope_gaps(&resolved).context("scope check failed")?;
-    let plan = design.import_plan(name);
-    let ws = design.working_set(&resolved)?;
-    let plan: Vec<_> = plan
-        .into_iter()
-        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
-        .collect();
+    let (plan, skips) = design.scoped_import_plan(name, Some(&resolved))?;
 
-    // Anything the scan or plan left out, before listing what remains — so a
-    // preview that shows no steps still explains itself.
-    for warning in design.import_warnings(name) {
+    // Anything the scan, plan or scope left out, before listing what remains —
+    // so a preview that shows no steps still explains itself, exactly as the
+    // real import would.
+    for warning in design.import_warnings(name).into_iter().chain(skips) {
         output::warn(&warning);
     }
 

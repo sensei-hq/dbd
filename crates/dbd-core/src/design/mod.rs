@@ -259,9 +259,12 @@ fn hide_declared(
 /// An entry with write-targets is kept only if ALL targets are in scope;
 /// a proc-less entry is kept if its staging table is in scope.
 ///
-/// Public so CLI previews (`import --dry-run`, `deploy`'s non-empty guard) can
-/// filter the plan identically to how `import_data` filters it internally —
-/// one source of truth for the predicate.
+/// Superseded: it cannot see whether the design declares the staging table, so
+/// it kept an import whose staging table the scope never built.
+#[deprecated(
+    since = "0.25.0",
+    note = "use Design::scoped_import_plan, which also requires a declared staging table and says why an entry was skipped"
+)]
 pub fn import_entry_in_scope(
     entry: &ImportPlanEntry,
     working_set: &std::collections::HashSet<String>,
@@ -3961,7 +3964,9 @@ import:
         std::fs::write(dir.join("import/staging/lookups.csv"), "name\nalpha\n").unwrap();
         let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
         let plan = |scope: &str| {
-            let s = design.resolve_scope(Some(scope), Some(DepsPolicy::Include)).unwrap();
+            // `report`, the default: under `include` the procedure's write to
+            // config.lookups would legitimately pull the target in.
+            let s = design.resolve_scope(Some(scope), None).unwrap();
             design.scoped_import_plan(None, Some(&s)).unwrap()
         };
 
@@ -3985,6 +3990,7 @@ import:
     }
 
     #[test]
+    #[allow(deprecated)]
     fn import_entry_in_scope_predicate() {
         use std::collections::HashSet;
         let mut entry = ImportPlanEntry {

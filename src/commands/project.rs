@@ -376,17 +376,12 @@ pub async fn cmd_deploy(
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
-        let ws = design.working_set(&resolved)?;
-        let import_plan: Vec<_> = design
-            .import_plan(None)
-            .into_iter()
-            .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
-            .collect();
+        let (import_plan, skips) = design.scoped_import_plan(None, Some(&resolved))?;
         output::info(
             verbosity,
             &format!("{} data file(s) would be imported.", import_plan.len()),
         );
-        for warning in design.import_warnings(None) {
+        for warning in design.import_warnings(None).into_iter().chain(skips) {
             output::warn(&warning);
         }
 
