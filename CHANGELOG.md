@@ -9,6 +9,62 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+**Commands now do what the documentation says.** An audit of the guides
+against the code found the reverse cases too — behaviour the docs promised
+that the code never had — and those are fixed here, in the code. Two of them
+were destructive: a database deployed with `-e production` was not protected
+by reset's prod guard, and a Supabase project's `reset --schemas` dropped
+`public`.
+
+### Changed
+
+- **`-e` takes `dev` or `prod`** (and the aliases `development` and
+  `production`), and refuses any other name. Aliases are normalised where they
+  are parsed, so bookkeeping records `prod`, never `production`. A name like
+  `-e staging` used to be accepted and then matched no `import/<env>/` folder.
+- **`dbd reset --target` defaults to the design's target** — its first
+  `target:` key — instead of `postgres`. Pass `--target` to override.
+- **Library: grants moved into core.** `Design::apply_grants` applies the
+  design's schema and target grants, and `Design::deploy` calls it;
+  `DeployComplete` gains a `grants: GrantsOutcome` field. Code that builds a
+  `DeployComplete` literal needs the field (or `..Default::default()`).
+
+### Fixed
+
+- **A database deployed with `-e production` is protected by reset's prod
+  guard.** The guard matched `prod` only, and `-e production` was recorded
+  verbatim, so `dbd reset` ran against it. Existing rows that say `production`
+  are now read as prod too.
+- **`dbd reset --schemas` on a Supabase project keeps `public`.** The protected
+  schema set came from `--target`, which defaulted to `postgres` whatever the
+  design targeted, so `public` was dropped `CASCADE` unless the flag was given.
+- **`dbd deploy` applies grants.** They ran only inside `dbd apply`'s handler,
+  so a deploy — and every embedder calling `Design::deploy` — got a schema with
+  no grants and no warning. They now run between the schema and the data.
+- **`dbd deploy` honours `-c`.** It read `design.yaml` whatever `-c` named.
+- **`dbd emit` carries foreign keys, CHECK constraints and indexes.** They were
+  dropped without a report entry, though the report is the only safeguard
+  `emit` offers. A CHECK expression or an index predicate passes through
+  untranslated and is reported; an index the target would reject — an
+  expression key on SQL Server, a key on an unbounded text column on MySQL or
+  SQL Server — is left out and reported, so the script still applies.
+- **`GITHUB_TOKEN` authenticates GitHub downloads**, so `dbd deploy` can fetch a
+  private repository. It was documented and never sent. It goes to
+  `api.github.com` only.
+- **A GitHub `--source` outside `dbd deploy` is refused with the way out.**
+  Only `deploy` downloads a source; other commands failed trying to read
+  `owner/repo/design.yaml` from disk. They now say to clone the repository and
+  pass its path.
+- **`dbd init --target` refuses a target it has no scaffold for.** `convex`,
+  `sqlite` or a typo silently produced a PostgreSQL project.
+- **`dbd doctor --fix` migrates every folder alias the scanner reads**:
+  `materialized_views`, `matview`, `matviews` and `sequences` were scanned but
+  never moved to their canonical folder.
+- **The viewer refuses a schema model newer than it reads**, saying so, instead
+  of rendering it with whatever the new version added silently dropped.
+- **`--help` for `--source` and `dbd diff`** no longer claim a GitHub source
+  works everywhere, or that reconcile skips CHECKs and comments.
+
 ## [0.24.1] — 2026-10-06
 
 **A data-loss fix.** `dbd reconcile --prune --scope` could drop tables the design
