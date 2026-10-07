@@ -1,5 +1,5 @@
 use crate::config::DbmlDocConfig;
-use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexDef, TableConstraint, TableDef};
+use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef};
 
 /// Parameters for DBML generation.
 pub struct DbmlParams<'a> {
@@ -39,6 +39,13 @@ pub struct DbmlDocument {
 
 /// Generate DBML from parsed entities, applying include/exclude filters.
 pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
+    // The filters run in here, so `entities` is already the whole design.
+    generate_dbml_in(params, params.entities)
+}
+
+/// [`generate_dbml`], typing stub tables from `design` — every entity in the
+/// design, which is wider than `params.entities` when a scope narrowed them.
+fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
     let mut sections = Vec::new();
 
     // Project block
@@ -82,12 +89,6 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         sections.push(refs);
     }
 
-    // External entity stub tables (for FK targets that are External entities)
-    let external_stubs = emit_external_stubs(params.entities);
-    if !external_stubs.is_empty() {
-        sections.push(external_stubs);
-    }
-
     // Table groups — explicit first, then auto-by-schema for any schema the
     // explicit groups didn't cover.
     let included_tables: Vec<&Entity> = filtered
@@ -95,6 +96,15 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         .copied()
         .filter(|e| e.entity_type == EntityType::Table)
         .collect();
+
+    // A stub for every table a Ref points at that this document does not
+    // define: a Ref to an undefined table is a DBML error, whether the target
+    // is an External, a table a scope or filter left out, or one the design
+    // never declares.
+    let stubs = emit_ref_target_stubs(&included_tables, design);
+    if !stubs.is_empty() {
+        sections.push(stubs);
+    }
     let table_groups = emit_table_groups(&included_tables, &params.groups, params.auto_group_by_schema);
     if !table_groups.is_empty() {
         sections.push(table_groups);
@@ -109,7 +119,13 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
 /// Inputs for `generate_all`. Mirrors `DbmlParams` but the per-doc filter
 /// state comes from the `DesignConfig` rather than being repeated per call.
 pub struct DbmlMultiParams<'a> {
+    /// The entities to document — under `--scope`, the scope's working set.
     pub entities: &'a [Entity],
+    /// Every entity in the design, before a scope narrowed `entities`. Read
+    /// only to give a stub table — the stand-in for a referenced table the
+    /// document leaves out — the referenced columns' real types instead of a
+    /// `varchar` guess. Pass `entities` again when nothing was narrowed.
+    pub design_entities: &'a [Entity],
     pub project_name: &'a str,
     pub database_type: &'a str,
     pub project_note: Option<&'a str>,
@@ -123,18 +139,21 @@ pub struct DbmlMultiParams<'a> {
 /// no-config default).
 pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
     if params.docs.is_empty() {
-        let doc = generate_dbml(&DbmlParams {
-            entities: params.entities,
-            project_name: params.project_name,
-            database_type: params.database_type,
-            project_note: params.project_note,
-            include_schemas: vec![],
-            exclude_schemas: vec![],
-            include_tables: vec![],
-            exclude_tables: vec![],
-            groups: vec![],
-            auto_group_by_schema: false,
-        });
+        let doc = generate_dbml_in(
+            &DbmlParams {
+                entities: params.entities,
+                project_name: params.project_name,
+                database_type: params.database_type,
+                project_note: params.project_note,
+                include_schemas: vec![],
+                exclude_schemas: vec![],
+                include_tables: vec![],
+                exclude_tables: vec![],
+                groups: vec![],
+                auto_group_by_schema: false,
+            },
+            params.design_entities,
+        );
         return vec![doc];
     }
 
@@ -159,18 +178,21 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
                 tables: g.tables.clone(),
             })
             .collect();
-        let mut doc = generate_dbml(&DbmlParams {
-            entities: params.entities,
-            project_name: params.project_name,
-            database_type: params.database_type,
-            project_note: params.project_note,
-            include_schemas: inc_schemas,
-            exclude_schemas: exc_schemas,
-            include_tables: inc_tables,
-            exclude_tables: exc_tables,
-            groups,
-            auto_group_by_schema: cfg.auto_group_by_schema,
-        });
+        let mut doc = generate_dbml_in(
+            &DbmlParams {
+                entities: params.entities,
+                project_name: params.project_name,
+                database_type: params.database_type,
+                project_note: params.project_note,
+                include_schemas: inc_schemas,
+                exclude_schemas: exc_schemas,
+                include_tables: inc_tables,
+                exclude_tables: exc_tables,
+                groups,
+                auto_group_by_schema: cfg.auto_group_by_schema,
+            },
+            params.design_entities,
+        );
         doc.file_name = cfg.output.clone().unwrap_or_else(|| format!("{key}.dbml"));
         out.push(doc);
     }
@@ -276,7 +298,7 @@ fn emit_enum(entity: &Entity) -> String {
 
     for value in &entity.enum_values {
         match &value.note {
-            Some(note) => lines.push(format!("  \"{}\" [note: '{}']", value.name, note)),
+            Some(note) => lines.push(format!("  \"{}\" [note: {}]", value.name, dbml_string(note))),
             None => lines.push(format!("  \"{}\"", value.name)),
         }
     }
@@ -304,13 +326,42 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
         lines.push(emit_column(col, &pk_columns));
     }
 
-    // Indexes block
-    let idx_block = emit_indexes(&table_def.indexes);
+    // Indexes block. A table-level UNIQUE is listed here first: DBML has no
+    // constraint syntax for it, and a named unique index is how DBML spells
+    // one. Leaving it out made `init --from-dbml` rebuild a table that accepts
+    // the duplicates the design refuses. It reads back as a unique index —
+    // DBML cannot tell the two apart — which enforces the same thing under the
+    // same name.
+    let indexes: Vec<IndexDef> = unique_constraint_indexes(table_def)
+        .chain(table_def.indexes.iter().cloned())
+        .collect();
+    let idx_block = emit_indexes(&indexes);
     if !idx_block.is_empty() {
         lines.push(String::new());
         lines.push("  indexes {".to_string());
         for idx_line in idx_block {
             lines.push(format!("    {}", idx_line));
+        }
+        lines.push("  }".to_string());
+    }
+
+    // Checks block. DBML has had `checks { … }` since @dbml/core v5; without
+    // it every CHECK the design enforces was missing from the document and
+    // from the table `init --from-dbml` rebuilt. The parser has already hoisted
+    // column-level CHECKs into table constraints, so they all land here.
+    let checks: Vec<String> = table_def
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Check { name, expression } => Some(check_line(name.as_deref(), expression)),
+            _ => None,
+        })
+        .collect();
+    if !checks.is_empty() {
+        lines.push(String::new());
+        lines.push("  checks {".to_string());
+        for check in checks {
+            lines.push(format!("    {check}"));
         }
         lines.push("  }".to_string());
     }
@@ -325,6 +376,64 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     lines.join("\n")
 }
 
+/// One entry of a `checks { … }` block: the expression in backticks, named
+/// when the constraint is. DBML reads a backticked expression raw and to the
+/// next backtick — there is no escape — so a line break is written as a space
+/// (the parser on the other side is line-based) and an expression containing a
+/// backtick cannot be written faithfully at all.
+fn check_line(name: Option<&str>, expression: &str) -> String {
+    let expression = expression.replace(['\r', '\n'], " ");
+    match name {
+        Some(name) => format!("`{expression}` [name: {}]", dbml_string(name)),
+        None => format!("`{expression}`"),
+    }
+}
+
+/// Each table-level `UNIQUE` constraint as the unique index DBML writes it as.
+fn unique_constraint_indexes(table_def: &TableDef) -> impl Iterator<Item = IndexDef> + '_ {
+    table_def.constraints.iter().filter_map(|c| match c {
+        TableConstraint::Unique {
+            name,
+            columns,
+            nulls_not_distinct,
+        } => Some(IndexDef {
+            name: name.clone(),
+            columns: columns
+                .iter()
+                .map(|column| IndexColumn {
+                    name: column.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique: true,
+            nulls_not_distinct: *nulls_not_distinct,
+            ..Default::default()
+        }),
+        _ => None,
+    })
+}
+
+/// The custom-property key a generated column's expression travels under.
+///
+/// DBML has no generated-column syntax. Without one, `GENERATED ALWAYS AS
+/// (total_cents / 100.0) STORED` came back from `init --from-dbml` as a plain
+/// writable column. Since @dbml/core v9.1 a column may carry custom properties
+/// — string-valued `key: 'value'` settings DBML keeps as metadata — so the
+/// expression rides in one, read back by [`crate::dbml_parse`].
+///
+/// The key reads like the SQL it stands for and is spelled so a user's own
+/// tag (`generated: "by-etl"`, `pii: "true"`) cannot be mistaken for it: a tag
+/// read as an expression would become a real `GENERATED` clause.
+pub(crate) const GENERATED_PROPERTY: &str = "generated always as";
+
+/// The custom-property key an identity column's kind travels under, beside
+/// `increment` — DBML's only identity vocabulary, which cannot tell ALWAYS
+/// from BY DEFAULT. A bare `increment` reads as BY DEFAULT, so only ALWAYS
+/// writes the property (`'always'`), and documents without one are unchanged.
+/// Without it an ALWAYS identity came back BY DEFAULT: a column that silently
+/// started accepting hand-written ids.
+pub(crate) const IDENTITY_PROPERTY: &str = "generated as identity";
+
 fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) -> String {
     let data_type = quote_type_if_needed(&col.data_type);
     let mut settings = Vec::new();
@@ -332,8 +441,11 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     if col.is_pk || pk_columns.contains(&col.name) {
         settings.push("pk".to_string());
     }
-    if col.identity.is_some() {
+    if let Some(kind) = col.identity {
         settings.push("increment".to_string());
+        if kind == crate::entity::IdentityKind::Always {
+            settings.push(format!("{IDENTITY_PROPERTY}: 'always'"));
+        }
     }
     if !col.nullable {
         settings.push("not null".to_string());
@@ -344,10 +456,13 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     if let Some(ref default) = col.default_value {
         settings.push(format!("default: {}", quote_default(default)));
     }
+    if let Some(ref expression) = col.generated {
+        settings.push(format!("{GENERATED_PROPERTY}: {}", dbml_string(expression)));
+    }
     if let Some(ref comment) = col.comment {
         // Inline notes must be single-line — collapse newlines
-        let inline = comment.trim().replace('\n', " ").replace('\'', "\\'");
-        settings.push(format!("note: '{}'", inline));
+        let inline = comment.trim().replace('\n', " ");
+        settings.push(format!("note: {}", dbml_string(&inline)));
     }
 
     let settings_str = if settings.is_empty() {
@@ -364,16 +479,9 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
 
     for idx in indexes {
         let cols = if idx.columns.len() == 1 {
-            idx.columns[0].name.clone()
+            index_key(&idx.columns[0])
         } else {
-            format!(
-                "({})",
-                idx.columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
         };
 
         let mut settings = Vec::new();
@@ -381,7 +489,10 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
             settings.push("unique".to_string());
         }
         if let Some(ref name) = idx.name {
-            settings.push(format!("name: '{}'", name));
+            settings.push(format!("name: {}", dbml_string(name)));
+        }
+        if let Some(note) = index_note::write(idx) {
+            settings.push(format!("note: {}", dbml_string(&note)));
         }
 
         let settings_str = if settings.is_empty() {
@@ -394,6 +505,123 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
     }
 
     lines
+}
+
+/// One index key as DBML writes it: a column by name, an expression in
+/// backticks. Written bare, an expression reads back as a column literally
+/// named `lower(email)`, and the DDL rebuilt from it quotes it as one.
+fn index_key(key: &IndexColumn) -> String {
+    if key.is_expression {
+        format!("`{}`", key.name)
+    } else {
+        key.name.clone()
+    }
+}
+
+/// The index `note:` convention: where dbd writes what DBML's index syntax
+/// cannot hold, and where [`crate::dbml_parse`] reads it back.
+///
+/// DBML's index settings are `type` (btree or hash), `name`, `unique`, `pk` and
+/// `note`; its reference parser rejects anything else. So a partial index's
+/// `WHERE`, a key's sort order and `NULLS NOT DISTINCT` have nowhere to go but
+/// the note — and dropping them is not cosmetic. A unique index on
+/// `(customer_id) WHERE status = 'open'` came back from `init --from-dbml` as a
+/// unique index on `(customer_id)`: one order per customer, ever.
+///
+/// The note holds one fact per line. These are the only lines read back, each
+/// matched exactly at the start of a line, and anything else is ignored (an
+/// index has no comment to keep it in):
+///
+/// - `where: <predicate>` — the partial-index predicate, SQL as written. A
+///   line break inside it is written as a space, since lines separate facts.
+/// - `order: <entry>, <entry>, …` — one entry per key, in key order: `asc` or
+///   `desc`, optionally followed by `nulls first` or `nulls last`. Written only
+///   when some key is not plain ascending. `asc` reads back as no stated
+///   direction, which is what Postgres means by an unadorned key. A line whose
+///   entries do not cover every key, or do not parse, is ignored whole rather
+///   than applied to the wrong keys.
+/// - `nulls not distinct` — the index treats NULLs as equal.
+pub(crate) mod index_note {
+    use crate::entity::{IndexColumn, IndexDef, SortOrder};
+
+    const WHERE: &str = "where:";
+    const ORDER: &str = "order:";
+    const NULLS_NOT_DISTINCT: &str = "nulls not distinct";
+
+    /// The note for `ix`, or `None` when DBML's own syntax already says it all.
+    pub(crate) fn write(ix: &IndexDef) -> Option<String> {
+        let mut lines = Vec::new();
+        if let Some(predicate) = &ix.predicate {
+            lines.push(format!("{WHERE} {}", predicate.replace(['\r', '\n'], " ")));
+        }
+        if ix
+            .columns
+            .iter()
+            .any(|k| k.order == Some(SortOrder::Desc) || k.nulls_first.is_some())
+        {
+            let entries: Vec<String> = ix.columns.iter().map(order_entry).collect();
+            lines.push(format!("{ORDER} {}", entries.join(", ")));
+        }
+        if ix.nulls_not_distinct {
+            lines.push(NULLS_NOT_DISTINCT.to_string());
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Apply the convention's lines in `note` to `ix`, whose keys are already set.
+    pub(crate) fn read(note: &str, ix: &mut IndexDef) {
+        for line in note.lines().map(str::trim) {
+            if let Some(predicate) = line.strip_prefix(WHERE).map(str::trim) {
+                if !predicate.is_empty() {
+                    ix.predicate = Some(predicate.to_string());
+                }
+            } else if let Some(entries) = line.strip_prefix(ORDER) {
+                read_order(entries, &mut ix.columns);
+            } else if line == NULLS_NOT_DISTINCT {
+                ix.nulls_not_distinct = true;
+            }
+        }
+    }
+
+    fn order_entry(key: &IndexColumn) -> String {
+        let direction = if key.order == Some(SortOrder::Desc) {
+            "desc"
+        } else {
+            "asc"
+        };
+        match key.nulls_first {
+            Some(true) => format!("{direction} nulls first"),
+            Some(false) => format!("{direction} nulls last"),
+            None => direction.to_string(),
+        }
+    }
+
+    fn read_order(entries: &str, keys: &mut [IndexColumn]) {
+        let parsed: Option<Vec<_>> = entries.split(',').map(parse_order_entry).collect();
+        if let Some(parsed) = parsed.filter(|p| p.len() == keys.len()) {
+            for (key, (order, nulls_first)) in keys.iter_mut().zip(parsed) {
+                key.order = order;
+                key.nulls_first = nulls_first;
+            }
+        }
+    }
+
+    fn parse_order_entry(entry: &str) -> Option<(Option<SortOrder>, Option<bool>)> {
+        let words: Vec<String> = entry.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let (order, rest) = match words.split_first()? {
+            (&"asc", rest) => (None, rest),
+            (&"desc", rest) => (Some(SortOrder::Desc), rest),
+            _ => return None,
+        };
+        let nulls_first = match rest {
+            [] => None,
+            ["nulls", "first"] => Some(true),
+            ["nulls", "last"] => Some(false),
+            _ => return None,
+        };
+        Some((order, nulls_first))
+    }
 }
 
 fn emit_all_refs(entities: &[Entity]) -> String {
@@ -471,100 +699,82 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
     format!("Ref: {} > {}{}", source_cols, target_cols, settings_str)
 }
 
-/// Generate stub Table blocks for External entities that are FK targets.
+/// Stub `Table` blocks for every table a Ref from `documented` points at that
+/// `documented` does not define, each holding only the referenced columns.
 ///
-/// Scans all Table entities for FK constraints (inline + table-level) pointing
-/// to an External entity. For each such external, emits a minimal Table block
-/// containing only the referenced columns plus an "[external]" note.
-/// External entities with no FK references (e.g. functions like auth.uid) are skipped.
-fn emit_external_stubs(entities: &[Entity]) -> String {
-    // Collect external entity names for quick lookup
-    let external_names: std::collections::HashSet<&str> = entities
-        .iter()
-        .filter(|e| e.entity_type == EntityType::External)
-        .map(|e| e.name.as_str())
-        .collect();
+/// A Ref to a table the document does not define is a DBML error, and stubs
+/// used to exist only for External entities — so `dbd dbml --scope` wrote Refs
+/// to the scope's out-of-scope parents with nothing for them to land on. The
+/// target is looked up in `design`: a table the design defines keeps the
+/// referenced columns' real types; an External, or a table the design never
+/// declares, has no types to give and gets `varchar`.
+fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity]) -> String {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-    if external_names.is_empty() {
-        return String::new();
-    }
-
-    // For each external entity, collect referenced columns from FK constraints
-    let mut external_refs: std::collections::HashMap<&str, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
-
-    for entity in entities {
-        if entity.entity_type != EntityType::Table {
-            continue;
-        }
-        let Some(ref table_def) = entity.table_def else {
+    let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
+    let mut targets: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for entity in documented {
+        let Some(table_def) = &entity.table_def else {
             continue;
         };
-
-        // Inline FKs from columns
-        for col in &table_def.columns {
-            if let Some(ref fk) = col.inline_fk {
-                record_external_fk(fk, &external_names, &mut external_refs);
+        let inline = table_def.columns.iter().filter_map(|c| c.inline_fk.as_ref());
+        let table_level = table_def.constraints.iter().filter_map(|c| match c {
+            TableConstraint::ForeignKey(fk) => Some(fk),
+            _ => None,
+        });
+        for fk in inline.chain(table_level) {
+            // Named exactly as `emit_ref` names the target, so the stub is the
+            // table the Ref line points at.
+            let target = format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table);
+            if !defined.contains(&target) {
+                targets
+                    .entry(target)
+                    .or_default()
+                    .extend(fk.ref_columns.iter().map(String::as_str));
             }
         }
-
-        // Table-level FK constraints
-        for constraint in &table_def.constraints {
-            if let TableConstraint::ForeignKey(fk) = constraint {
-                record_external_fk(fk, &external_names, &mut external_refs);
-            }
-        }
     }
 
-    if external_refs.is_empty() {
-        return String::new();
-    }
-
-    let mut blocks = Vec::new();
-    let mut sorted_names: Vec<&&str> = external_refs.keys().collect();
-    sorted_names.sort();
-
-    for ext_name in sorted_names {
-        let cols = external_refs.get(ext_name).unwrap();
-        blocks.push(emit_external_stub_block(ext_name, cols));
-    }
-
-    blocks.join("\n")
+    targets
+        .iter()
+        .map(|(target, columns)| {
+            let known = design.iter().find(|e| {
+                matches!(e.entity_type, EntityType::Table | EntityType::External) && qualified_name(e) == *target
+            });
+            emit_stub_block(target, columns, known)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// If `fk` targets a known external entity, record its referenced columns under
-/// that entity's name in `external_refs`.
-fn record_external_fk<'a>(
-    fk: &crate::entity::ForeignKey,
-    external_names: &std::collections::HashSet<&'a str>,
-    external_refs: &mut std::collections::HashMap<&'a str, std::collections::HashSet<String>>,
-) {
-    let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
-    let qualified = format!("{}.{}", ref_schema, fk.ref_table);
-    if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
-        let entry = external_refs.entry(ext_name).or_default();
-        for rc in &fk.ref_columns {
-            entry.insert(rc.clone());
-        }
-    }
+/// `schema.table` for an entity, as the document's `Table` and `Ref` lines
+/// name it.
+fn qualified_name(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+    let base = entity.name.split('.').next_back().unwrap_or(&entity.name);
+    format!("{schema}.{base}")
 }
 
-/// Render a DBML stub `Table` block for one external entity and its referenced
-/// columns (typed generically as `varchar`, since the real types are unknown).
-fn emit_external_stub_block(ext_name: &str, cols: &std::collections::HashSet<String>) -> String {
-    let (schema, table_name) = match ext_name.split_once('.') {
-        Some((s, t)) => (s, t),
-        None => ("public", ext_name),
+/// One stub `Table` block: the referenced `columns` of `target`, typed from
+/// `known` when the design defines it, and a note saying why it is a stub.
+fn emit_stub_block(target: &str, columns: &std::collections::BTreeSet<&str>, known: Option<&Entity>) -> String {
+    let (schema, table) = target.split_once('.').unwrap_or(("public", target));
+    let known_columns = known.and_then(|e| e.table_def.as_ref()).map(|td| td.columns.as_slice());
+
+    let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
+    for column in columns {
+        let data_type = known_columns
+            .and_then(|cols| cols.iter().find(|c| c.name == *column))
+            .map_or_else(|| "varchar".to_string(), |c| quote_type_if_needed(&c.data_type));
+        lines.push(format!("  \"{column}\" {data_type}"));
+    }
+    let note = match known.map(|e| e.entity_type) {
+        Some(EntityType::External) => "External entity — managed outside this project",
+        Some(_) => "Defined in this project, outside this document — only the referenced columns are shown",
+        None => "Referenced, but not defined in this project",
     };
-
-    let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, table_name)];
-    let mut sorted_cols: Vec<&String> = cols.iter().collect();
-    sorted_cols.sort();
-    for col_name in sorted_cols {
-        lines.push(format!("  \"{}\" varchar", col_name));
-    }
     lines.push(String::new());
-    lines.push("  Note: 'External entity — managed outside this project'".to_string());
+    lines.push(format!("  Note: {}", dbml_string(note)));
     lines.push("}\n".to_string());
     lines.join("\n")
 }
@@ -587,8 +797,14 @@ fn quote_default(value: &str) -> String {
     if trimmed.contains('(') || trimmed.contains("::") || trimmed.contains('+') {
         return format!("`{}`", trimmed);
     }
-    // String literal
-    format!("'{}'", trimmed.trim_matches('\''))
+    // String literal — a SQL `'…'` (whose `''` is one quote) or a bare word.
+    // DBML gets the text itself, in DBML's escaping: SQL's doubled quote is
+    // not a DBML escape, and written as-is it ends the string.
+    let text = match trimmed.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => trimmed.trim_matches('\'').to_string(),
+    };
+    dbml_string(&text)
 }
 
 fn quote_type_if_needed(data_type: &str) -> String {
@@ -605,16 +821,56 @@ fn quote_type_if_needed(data_type: &str) -> String {
 fn quote_dbml_string(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.contains('\n') {
-        format!("'''\n{}\n'''", trimmed)
+        format!("'''\n{}\n'''", dbml_multiline_body(trimmed))
     } else {
-        format!("'{}'", trimmed.replace('\'', "\\'"))
+        dbml_string(trimmed)
     }
+}
+
+/// A DBML single-quoted string literal, `'…'`.
+///
+/// DBML's lexer reads a backslash in a quoted string as an escape — `\\`,
+/// `\'`, `\n`, and any other `\x` as plain `x` — and a single-quoted string
+/// cannot span lines. So every backslash and quote is escaped and a line break
+/// written as `\n`. Escaping only the quote made `C:\temp` read back as
+/// `C:<tab>emp` and a regex `\d` as `d`; not escaping it at all ended the
+/// string at the first apostrophe.
+fn dbml_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The body of a DBML `'''` string. Backslashes are escapes there too, and
+/// three quotes in a row end the string, so each `\` is doubled and a quote
+/// that would open a `'''` run is escaped. Other quotes stay as written —
+/// apostrophes are common in prose notes and DBML needs nothing done to them.
+fn dbml_multiline_body(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' if text[i..].starts_with("'''") => out.push_str("\\'"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{EnumValue, FkAction, IndexColumn, TableComments};
+    use crate::entity::{EnumValue, FkAction, TableComments};
 
     fn make_table_entity(name: &str, columns: Vec<ColumnDef>, constraints: Vec<TableConstraint>) -> Entity {
         let mut entity = Entity::new(EntityType::Table, name);
@@ -740,6 +996,217 @@ mod tests {
         let block = emit_table("config.lookups", "config", table_def);
         assert!(block.contains("indexes {"));
         assert!(block.contains("name [unique, name: 'idx_lookups_name']"));
+    }
+
+    /// DBML has no table-constraint syntax for UNIQUE; its spelling is a unique
+    /// index, single-column or composite, carrying the constraint's name.
+    #[test]
+    fn a_table_level_unique_constraint_is_written_as_a_named_unique_index() {
+        let entity = make_table_entity(
+            "shop.orders",
+            vec![col("customer_id", "uuid"), col("ref_code", "text")],
+            vec![
+                TableConstraint::Unique {
+                    name: Some("orders_ref_code_uq".to_string()),
+                    columns: vec!["ref_code".to_string()],
+                    nulls_not_distinct: false,
+                },
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec!["customer_id".to_string(), "ref_code".to_string()],
+                    nulls_not_distinct: false,
+                },
+            ],
+        );
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("ref_code [unique, name: 'orders_ref_code_uq']"),
+            "got:\n{block}"
+        );
+        assert!(block.contains("(customer_id, ref_code) [unique]"), "got:\n{block}");
+    }
+
+    /// DBML writes an index expression in backticks — bare, `lower(email)`
+    /// reads as a column of that name.
+    #[test]
+    fn an_expression_index_key_is_written_in_backticks() {
+        let mut entity = make_table_entity(
+            "shop.customers",
+            vec![col("tenant_id", "bigint"), col("email", "text")],
+            vec![],
+        );
+        let expression = |name: &str| IndexColumn {
+            name: name.to_string(),
+            is_expression: true,
+            ..Default::default()
+        };
+        entity.table_def.as_mut().unwrap().indexes = vec![
+            IndexDef {
+                name: Some("customers_email_lower_idx".to_string()),
+                columns: vec![expression("lower(email)")],
+                ..Default::default()
+            },
+            IndexDef {
+                name: Some("customers_tenant_email_idx".to_string()),
+                columns: vec![
+                    IndexColumn {
+                        name: "tenant_id".to_string(),
+                        ..Default::default()
+                    },
+                    expression("lower(email)"),
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let block = emit_table("shop.customers", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("`lower(email)` [name: 'customers_email_lower_idx']"),
+            "got:\n{block}"
+        );
+        assert!(
+            block.contains("(tenant_id, `lower(email)`) [name: 'customers_tenant_email_idx']"),
+            "got:\n{block}"
+        );
+    }
+
+    /// DBML's index settings stop at `type`, `name`, `unique`, `pk` and `note`,
+    /// so the partial predicate, key order and `NULLS NOT DISTINCT` ride in the
+    /// note, one fact per line.
+    #[test]
+    fn index_facts_dbml_cannot_express_are_written_into_the_note() {
+        let mut entity = make_table_entity(
+            "shop.orders",
+            vec![col("customer_id", "bigint"), col("created_at", "timestamptz")],
+            vec![],
+        );
+        let key = |name: &str| IndexColumn {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        entity.table_def.as_mut().unwrap().indexes = vec![
+            IndexDef {
+                name: Some("orders_one_open_per_customer".to_string()),
+                columns: vec![key("customer_id")],
+                unique: true,
+                predicate: Some("status = 'open'".to_string()),
+                ..Default::default()
+            },
+            IndexDef {
+                name: Some("orders_recent_idx".to_string()),
+                columns: vec![
+                    key("customer_id"),
+                    IndexColumn {
+                        order: Some(crate::entity::SortOrder::Desc),
+                        nulls_first: Some(false),
+                        ..key("created_at")
+                    },
+                ],
+                nulls_not_distinct: true,
+                ..Default::default()
+            },
+        ];
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains(
+                r"customer_id [unique, name: 'orders_one_open_per_customer', note: 'where: status = \'open\'']"
+            ),
+            "got:\n{block}"
+        );
+        assert!(
+            block.contains(
+                r"(customer_id, created_at) [name: 'orders_recent_idx', note: 'order: asc, desc nulls last\nnulls not distinct']"
+            ),
+            "got:\n{block}"
+        );
+    }
+
+    /// DBML has no generated-column syntax; the expression rides in a custom
+    /// property whose key reads like the SQL it stands for.
+    #[test]
+    fn a_generated_column_carries_its_expression_as_a_custom_property() {
+        let column = ColumnDef {
+            generated: Some("coalesce(note, 'n/a')".to_string()),
+            ..col("label", "text")
+        };
+        assert_eq!(
+            emit_column(&column, &std::collections::HashSet::new()),
+            r#"  "label" text [generated always as: 'coalesce(note, \'n/a\')']"#
+        );
+    }
+
+    /// `increment` is DBML's whole vocabulary for identity; ALWAYS adds a
+    /// custom property, BY DEFAULT stays a bare `increment`.
+    #[test]
+    fn an_always_identity_says_so_in_a_custom_property() {
+        let identity = |kind| ColumnDef {
+            identity: Some(kind),
+            nullable: false,
+            ..col("id", "bigint")
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            emit_column(&identity(crate::entity::IdentityKind::Always), &none),
+            r#"  "id" bigint [increment, generated as identity: 'always', not null]"#
+        );
+        assert_eq!(
+            emit_column(&identity(crate::entity::IdentityKind::ByDefault), &none),
+            r#"  "id" bigint [increment, not null]"#
+        );
+    }
+
+    /// A table's CHECK constraints go in DBML's `checks { … }` block, each
+    /// expression in backticks, named when the constraint is.
+    #[test]
+    fn check_constraints_are_written_in_a_checks_block() {
+        let entity = make_table_entity(
+            "shop.orders",
+            vec![col("qty", "integer"), col("total_cents", "integer")],
+            vec![
+                TableConstraint::Check {
+                    name: Some("orders_total_positive".to_string()),
+                    expression: "total_cents >= 0".to_string(),
+                },
+                TableConstraint::Check {
+                    name: None,
+                    expression: "qty > 0".to_string(),
+                },
+            ],
+        );
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("  checks {\n    `total_cents >= 0` [name: 'orders_total_positive']\n    `qty > 0`\n  }"),
+            "got:\n{block}"
+        );
+    }
+
+    /// DBML's lexer reads `\` in a quoted string as an escape, so a backslash
+    /// is written `\\` and a quote `\'` — wherever dbd writes a string.
+    #[test]
+    fn strings_are_written_with_dbml_escapes() {
+        let column = ColumnDef {
+            comment: Some(r"C:\temp, the user's".to_string()),
+            default_value: Some("'it''s'".to_string()),
+            ..col("path", "text")
+        };
+        assert_eq!(
+            emit_column(&column, &std::collections::HashSet::new()),
+            r#"  "path" text [default: 'it\'s', note: 'C:\\temp, the user\'s']"#
+        );
+
+        let mut kind = Entity::new(EntityType::Enum, "app.kind");
+        kind.enum_values = vec![EnumValue {
+            name: "plain".to_string(),
+            note: Some(r"the user's \d".to_string()),
+        }];
+        assert!(
+            emit_enum(&kind).contains(r#""plain" [note: 'the user\'s \\d']"#),
+            "got:\n{}",
+            emit_enum(&kind)
+        );
     }
 
     #[test]
@@ -1073,6 +1540,51 @@ mod tests {
         );
     }
 
+    /// A filter that leaves a referenced table out of the document must still
+    /// stub it — a Ref to an undefined table is a DBML error — and, since the
+    /// table is in the design, the stub keeps the referenced column's type.
+    #[test]
+    fn a_referenced_table_left_out_of_the_document_is_stubbed_with_its_real_types() {
+        let lookups = make_table_entity(
+            "config.lookups",
+            vec![pk_col("id", "uuid"), col("name", "text")],
+            vec![],
+        );
+        let values = make_table_entity(
+            "config.lookup_values",
+            vec![pk_col("id", "uuid"), col("lookup_id", "uuid")],
+            vec![TableConstraint::ForeignKey(ForeignKey {
+                columns: vec!["lookup_id".to_string()],
+                ref_schema: Some("config".to_string()),
+                ref_table: "lookups".to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            })],
+        );
+        let entities = vec![lookups, values];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec!["config.lookups".to_string()],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let start = doc
+            .content
+            .find("Table \"config\".\"lookups\" {")
+            .unwrap_or_else(|| panic!("no stub:\n{}", doc.content));
+        let stub = &doc.content[start..];
+        let stub = &stub[..stub.find('}').unwrap()];
+        assert!(stub.contains("\"id\" uuid"), "got:\n{}", doc.content);
+        assert!(!stub.contains("\"name\""), "got:\n{}", doc.content);
+    }
+
     #[test]
     fn external_entity_without_fk_refs_skipped() {
         let table_entity = make_table_entity("config.profiles", vec![pk_col("id", "UUID")], vec![]);
@@ -1211,6 +1723,7 @@ mod tests {
             std::collections::HashMap::new();
         let docs = generate_all(&DbmlMultiParams {
             entities: &entities,
+            design_entities: &entities,
             project_name: "P",
             database_type: "PostgreSQL",
             project_note: None,
@@ -1258,6 +1771,7 @@ mod tests {
 
         let docs = generate_all(&DbmlMultiParams {
             entities: &entities,
+            design_entities: &entities,
             project_name: "P",
             database_type: "PostgreSQL",
             project_note: None,

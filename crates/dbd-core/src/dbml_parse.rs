@@ -213,6 +213,7 @@ impl<'a> Parser<'a> {
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk_cols: Vec<String> = Vec::new();
         let mut indexes: Vec<IndexDef> = Vec::new();
+        let mut checks: Vec<TableConstraint> = Vec::new();
         let mut table_note: Option<String> = None;
 
         self.pos += 1;
@@ -234,17 +235,31 @@ impl<'a> Parser<'a> {
             let kw = keyword(&line);
             match kw.as_str() {
                 "indexes" => {
-                    self.parse_indexes_block(&line, &qualified, &mut indexes)?;
+                    for entry in self.block_entries(&line, "indexes", &qualified)? {
+                        indexes.push(parse_index_line(&entry, &qualified)?);
+                    }
+                }
+                // Only as a block opener: an unquoted column may well be named
+                // `checks`, and `checks int` is a column.
+                "checks" if opens_block(&line) => {
+                    for entry in self.block_entries(&line, "checks", &qualified)? {
+                        checks.push(parse_check_line(&entry, &qualified)?);
+                    }
                 }
                 "note" => {
                     table_note = Some(self.consume_note_value(&line)?);
                 }
                 _ => {
-                    // A column definition.
-                    let col = parse_column(&line, &qualified)?;
+                    // A column definition, with any `check:` settings it carries.
+                    let (col, col_checks) = parse_column(&line, &qualified)?;
                     if col.is_pk {
                         pk_cols.push(col.name.clone());
                     }
+                    checks.extend(
+                        col_checks
+                            .into_iter()
+                            .map(|expression| TableConstraint::Check { name: None, expression }),
+                    );
                     columns.push(col);
                     self.pos += 1;
                 }
@@ -258,6 +273,7 @@ impl<'a> Parser<'a> {
                 columns: pk_cols,
             });
         }
+        constraints.append(&mut checks);
 
         let comments = Self::table_comments_from(table_note, &columns);
 
@@ -301,14 +317,16 @@ impl<'a> Parser<'a> {
         comments
     }
 
-    /// Parse an `indexes { … }` block. `header` is the line beginning with
-    /// `indexes`; the `{` may be on that line or a following one.
-    fn parse_indexes_block(&mut self, header: &str, table: &str, out: &mut Vec<IndexDef>) -> Result<()> {
-        self.advance_to_indexes_brace(header, table)?;
+    /// The entry lines of a `<kind> { … }` block inside a table — `indexes` or
+    /// `checks`. `header` is the line beginning with `kind`; the `{` may be on
+    /// that line or a following one.
+    fn block_entries(&mut self, header: &str, kind: &str, table: &str) -> Result<Vec<String>> {
+        self.advance_past_open_brace(header, kind, table)?;
 
+        let mut entries = Vec::new();
         loop {
             if self.pos >= self.lines.len() {
-                return Err(parse_err(format!("unterminated indexes block in `{table}`")));
+                return Err(parse_err(format!("unterminated {kind} block in `{table}`")));
             }
             let line = strip_comment(self.lines[self.pos]).trim().to_string();
             self.pos += 1;
@@ -318,14 +336,14 @@ impl<'a> Parser<'a> {
             if line.starts_with('}') {
                 break;
             }
-            out.push(parse_index_line(&line, table)?);
+            entries.push(line);
         }
-        Ok(())
+        Ok(entries)
     }
 
-    /// Advance the cursor just past the `{` that opens an `indexes` block —
+    /// Advance the cursor just past the `{` that opens a `kind` block —
     /// whether the brace is on the header line or a following line.
-    fn advance_to_indexes_brace(&mut self, header: &str, table: &str) -> Result<()> {
+    fn advance_past_open_brace(&mut self, header: &str, kind: &str, table: &str) -> Result<()> {
         if header.contains('{') {
             self.pos += 1;
             return Ok(());
@@ -341,7 +359,7 @@ impl<'a> Parser<'a> {
             if l.contains('{') {
                 return Ok(());
             }
-            return Err(parse_err(format!("indexes block in `{table}` is missing `{{`")));
+            return Err(parse_err(format!("{kind} block in `{table}` is missing `{{`")));
         }
         Ok(())
     }
@@ -438,9 +456,9 @@ impl<'a> Parser<'a> {
     fn consume_triple_quoted(&mut self, rest: &str) -> Result<String> {
         let mut body = String::new();
         // Closing `'''` may be on the same line.
-        if let Some(end) = rest.find("'''") {
+        if let Some(end) = closing_triple_quote(rest) {
             self.pos += 1;
-            return Ok(rest[..end].to_string());
+            return Ok(unescape_dbml(&rest[..end]));
         }
         if !rest.is_empty() {
             body.push_str(rest);
@@ -453,7 +471,7 @@ impl<'a> Parser<'a> {
             }
             let raw = self.lines[self.pos];
             self.pos += 1;
-            if let Some(end) = raw.find("'''") {
+            if let Some(end) = closing_triple_quote(raw) {
                 body.push_str(&raw[..end]);
                 break;
             }
@@ -462,14 +480,11 @@ impl<'a> Parser<'a> {
         }
         // dbd emits `'''\n<text>\n'''`, so the first body line is empty and the
         // last has a trailing newline — trim one leading and one trailing
-        // newline to recover the original text.
-        let trimmed = body
-            .strip_prefix('\n')
-            .unwrap_or(&body)
-            .strip_suffix('\n')
-            .map(str::to_string)
-            .unwrap_or(body.clone());
-        Ok(trimmed)
+        // newline to recover the original text. Trimmed before unescaping, so
+        // an escaped `\n` at either end is text, not layout.
+        let trimmed = body.strip_prefix('\n').unwrap_or(&body);
+        let trimmed = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+        Ok(unescape_dbml(trimmed))
     }
 }
 
@@ -597,8 +612,9 @@ fn parse_value_note(rest: &str) -> Option<String> {
     None
 }
 
-/// Parse a column definition line: `"name" <type> [settings]`.
-fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
+/// Parse a column definition line: `"name" <type> [settings]`, returning the
+/// column and the expressions of any `check:` settings on it.
+fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
     let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
 
@@ -618,6 +634,7 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
         comment: None,
         inline_fk: None,
     };
+    let mut checks = Vec::new();
 
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
@@ -629,7 +646,35 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
                 "unique" => col.is_unique = true,
                 "not null" => col.nullable = false,
                 "null" => col.nullable = true,
-                "increment" => { /* type already carries serial/bigserial */ }
+                // DBML's auto-increment. A serial type already is one; any
+                // other type is an identity column — which is what dbd's
+                // exporter writes `increment` for. DBML cannot say ALWAYS or
+                // BY DEFAULT, so it reads as BY DEFAULT: generated unless a
+                // value is supplied, as serial behaves.
+                // Settings apply in any order, so an explicit kind from the
+                // `generated as identity` property is never overwritten here.
+                "increment" if !crate::emit::is_serial_type(&col.data_type) => {
+                    col.identity.get_or_insert(crate::entity::IdentityKind::ByDefault);
+                    col.nullable = false;
+                }
+                "increment" => {}
+                // dbd's custom property naming the identity kind `increment`
+                // cannot. An unknown kind is refused: guessing would build a
+                // column that accepts, or refuses, what the design did not say.
+                key if key == crate::dbml::IDENTITY_PROPERTY && !crate::emit::is_serial_type(&col.data_type) => {
+                    let kind = value.as_deref().and_then(parse_single_line_string).unwrap_or_default();
+                    col.identity = Some(match kind.trim().to_ascii_lowercase().as_str() {
+                        "always" => crate::entity::IdentityKind::Always,
+                        "by default" => crate::entity::IdentityKind::ByDefault,
+                        _ => {
+                            return Err(parse_err(format!(
+                                "column `{}` in `{table}`: unknown identity kind `{kind}` (expected 'always' or 'by default')",
+                                col.name
+                            )));
+                        }
+                    });
+                    col.nullable = false;
+                }
                 "default" => {
                     if let Some(v) = value {
                         col.default_value = Some(parse_default_value(&v));
@@ -642,12 +687,59 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
                         col.comment = Some(s);
                     }
                 }
+                // dbd's custom property for a generated column's expression.
+                key if key == crate::dbml::GENERATED_PROPERTY => {
+                    col.generated = value.as_deref().and_then(parse_single_line_string);
+                }
+                // DBML's column-level CHECK; a column may carry several.
+                "check" => {
+                    let expression = value.as_deref().and_then(backticked).ok_or_else(|| {
+                        parse_err(format!(
+                            "check on `{table}` is not a backticked expression: {settings_str}"
+                        ))
+                    })?;
+                    checks.push(expression);
+                }
                 _ => { /* unknown setting — ignore (forward-compatible) */ }
             }
         }
     }
 
-    Ok(col)
+    Ok((col, checks))
+}
+
+/// Whether a table-body line opens a block: the keyword alone, or followed by
+/// its `{` — not a column that happens to share the keyword's name.
+fn opens_block(line: &str) -> bool {
+    let rest = line.get(first_word(line).len()..).unwrap_or("").trim();
+    rest.is_empty() || rest.starts_with('{')
+}
+
+/// The expression inside a DBML backtick expression, or `None` if `s` is not
+/// one.
+fn backticked(s: &str) -> Option<String> {
+    s.trim()
+        .strip_prefix('`')?
+        .strip_suffix('`')
+        .map(|expression| expression.trim().to_string())
+}
+
+/// One entry of a `checks { … }` block: `` `<expression>` [name: '…'] ``.
+fn parse_check_line(line: &str, table: &str) -> Result<TableConstraint> {
+    let (expression_part, settings_part) = split_trailing_settings(line.trim());
+    let expression = backticked(expression_part)
+        .ok_or_else(|| parse_err(format!("check in `{table}` is not a backticked expression: {line}")))?;
+    let mut name = None;
+    if let Some(settings_str) = settings_part {
+        let settings = extract_settings(settings_str)
+            .ok_or_else(|| parse_err(format!("malformed check settings in `{table}`: {settings_str}")))?;
+        for (key, value) in settings {
+            if key.eq_ignore_ascii_case("name") {
+                name = value.as_deref().and_then(parse_single_line_string);
+            }
+        }
+    }
+    Ok(TableConstraint::Check { name, expression })
 }
 
 /// Parse a column type token. Strips surrounding quotes (types with spaces are
@@ -706,22 +798,27 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     let (cols_part, settings_part) = split_trailing_settings(line);
     let cols_part = cols_part.trim();
 
-    let column_names: Vec<String> = if let Some(inner) = cols_part.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        inner
-            .split(',')
-            .map(|c| unquote(c.trim()))
-            .filter(|c| !c.is_empty())
+    // A tuple is split only at its top-level commas: a backticked expression
+    // key such as `coalesce(b, 'x, y')` carries commas of its own.
+    let raw_keys: Vec<String> = if let Some(inner) = cols_part.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        split_top_level_commas(inner)
+            .ok_or_else(|| parse_err(format!("malformed index in `{table}`: {line}")))?
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
             .collect()
     } else {
-        vec![unquote(cols_part)]
+        vec![cols_part.to_string()]
     };
+    let keys: Vec<IndexColumn> = raw_keys.iter().map(|k| parse_index_key(k)).collect();
 
-    if column_names.iter().any(|c| c.is_empty()) || column_names.is_empty() {
+    if keys.is_empty() || keys.iter().any(|k| k.name.is_empty()) {
         return Err(parse_err(format!("malformed index in `{table}`: {line}")));
     }
 
     let mut unique = false;
     let mut name = None;
+    let mut note = None;
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
             .ok_or_else(|| parse_err(format!("malformed index settings in `{table}`: {settings_str}")))?;
@@ -734,25 +831,44 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
                         name = parse_single_line_string(&v);
                     }
                 }
-                _ => { /* pk / type / note on indexes — ignore */ }
+                "note" => note = value.as_deref().and_then(parse_single_line_string),
+                _ => { /* pk / type on indexes — ignore */ }
             }
         }
     }
 
-    // DBML's `indexes` block has no syntax for a partial `WHERE`, an operator
-    // class, or storage parameters, so those stay at their defaults.
-    Ok(IndexDef {
+    let mut index = IndexDef {
         name,
-        columns: column_names
-            .into_iter()
-            .map(|name| IndexColumn {
-                name,
-                ..Default::default()
-            })
-            .collect(),
+        columns: keys,
         unique,
         ..Default::default()
-    })
+    };
+    // The partial `WHERE`, key order and `NULLS NOT DISTINCT` have no DBML
+    // syntax; dbd carries them in the note (see `crate::dbml::index_note`).
+    // An operator class, `INCLUDE` and storage parameters are not carried and
+    // stay at their defaults.
+    if let Some(note) = note {
+        crate::dbml::index_note::read(&note, &mut index);
+    }
+    Ok(index)
+}
+
+/// One index key: DBML writes an expression in backticks and a column by
+/// (optionally quoted) name. Flagging the expression is what keeps the
+/// emitter from quoting `lower(email)` as an identifier.
+fn parse_index_key(key: &str) -> IndexColumn {
+    let key = key.trim();
+    match backticked(key) {
+        Some(expression) => IndexColumn {
+            name: expression,
+            is_expression: true,
+            ..Default::default()
+        },
+        None => IndexColumn {
+            name: unquote(key),
+            ..Default::default()
+        },
+    }
 }
 
 /// Parse the body of a standalone `Ref:` (everything after the `:`).
@@ -911,9 +1027,9 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
     // Walk back to the matching `[`, balancing nested brackets and ignoring
     // brackets inside quotes.
     //
-    // Escape-awareness (backward walk): a `'` that is immediately preceded by
-    // a `\` is an escaped apostrophe — it must NOT toggle `in_quote`.  We
-    // detect this by peeking at bytes[i - 1] whenever we land on a `'`.
+    // Escape-awareness (backward walk): a `'` preceded by an odd run of `\`
+    // is an escaped apostrophe — it must NOT toggle `in_quote`. An even run is
+    // escaped backslashes, so `'C:\\'` still ends at its last quote.
     let bytes = trimmed.as_bytes();
     let mut depth = 0i32;
     let mut in_quote = false;
@@ -923,10 +1039,8 @@ fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
         let c = bytes[i] as char;
         match c {
             '\'' => {
-                // A `'` preceded by `\` is an escaped apostrophe — skip toggle.
-                if i > 0 && bytes[i - 1] == b'\\' {
-                    // Don't toggle; the `\` itself is not a quote character.
-                } else {
+                let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
+                if backslashes % 2 == 0 {
                     in_quote = !in_quote;
                 }
             }
@@ -1042,8 +1156,8 @@ fn split_first_colon(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Parse a single-line quoted string value (`'…'` or `"…"`), unescaping `\'`.
-/// Returns `None` if the input is not a quoted string.
+/// Parse a single-line quoted string value (`'…'` or `"…"`), reading its
+/// escapes the way DBML does. Returns `None` if the input is not a quoted string.
 fn parse_single_line_string(s: &str) -> Option<String> {
     let s = s.trim();
     let inner = if let Some(rest) = s.strip_prefix('\'') {
@@ -1052,7 +1166,72 @@ fn parse_single_line_string(s: &str) -> Option<String> {
         let rest = s.strip_prefix('"')?;
         rest.strip_suffix('"')?
     };
-    Some(inner.replace("\\'", "'"))
+    Some(unescape_dbml(inner))
+}
+
+/// Read the backslash escapes in a DBML quoted string, mirroring DBML's own
+/// lexer: `\\`, `\'`, `\"`, `` \` ``, `\n`, `\t`, `\r`, `\0`, `\b`, `\v`, `\f`,
+/// `\uHHHH`, an escaped line break (which joins the lines), and `\ ` (kept as
+/// written). Any other `\x` reads as `x`. Reading only `\'` meant a `\\` that
+/// dbdiagram.io shows as one backslash came back as two.
+fn unescape_dbml(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('b') => out.push('\u{8}'),
+            Some('v') => out.push('\u{b}'),
+            Some('f') => out.push('\u{c}'),
+            Some('\n') => {}
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some(' ') => out.push_str("\\ "),
+            Some('u') => {
+                let hex: String = chars.clone().take(4).collect();
+                match u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .filter(|_| hex.len() == 4)
+                    .and_then(char::from_u32)
+                {
+                    Some(ch) => {
+                        out.push(ch);
+                        chars.nth(3);
+                    }
+                    None => out.push_str("\\u"),
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Byte offset of the `'''` that closes a DBML multi-line string in `s`,
+/// skipping escaped characters — an escaped quote is part of the text, not
+/// the start of the closing run.
+fn closing_triple_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' if s[i..].starts_with("'''") => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1126,6 +1305,47 @@ mod tests {
         )));
     }
 
+    /// `increment` is DBML's auto-increment. On a serial type the type already
+    /// says so; on any other it is the identity dbd's exporter wrote it for,
+    /// and DBML cannot say ALWAYS, so it reads as BY DEFAULT.
+    #[test]
+    fn increment_reads_as_identity_unless_the_type_is_serial() {
+        let dbml = "Table \"app\".\"t\" {\n  \"id\" bigint [pk, increment]\n  \"seq\" bigserial [increment]\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[0].identity, Some(crate::entity::IdentityKind::ByDefault));
+        assert!(!td.columns[0].nullable, "an identity column is NOT NULL");
+        assert_eq!(td.columns[1].identity, None, "bigserial carries its own sequence");
+    }
+
+    /// The `generated as identity` custom property names the identity kind
+    /// `increment` cannot; an unknown kind is refused rather than guessed.
+    #[test]
+    fn the_generated_as_identity_property_names_the_identity_kind() {
+        use crate::entity::IdentityKind;
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" bigint [increment, generated as identity: 'always']\n  \"b\" bigint [increment, generated as identity: 'by default']\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[0].identity, Some(IdentityKind::Always));
+        assert_eq!(td.columns[1].identity, Some(IdentityKind::ByDefault));
+
+        let unknown = "Table \"app\".\"t\" {\n  \"a\" bigint [increment, generated as identity: 'sometimes']\n}\n";
+        let err = parse_dbml(unknown).unwrap_err();
+        assert!(err.to_string().contains("sometimes"), "got: {err}");
+    }
+
+    /// The `generated always as` custom property is a generated column's
+    /// expression; a user's own custom property is metadata and changes nothing.
+    #[test]
+    fn the_generated_always_as_property_makes_a_generated_column() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" numeric [generated always as: 'a / 100.0', not null]\n  \"c\" text [generated: \"by-etl\", pii: 'true']\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[1].generated.as_deref(), Some("a / 100.0"));
+        assert!(!td.columns[1].nullable, "the other settings still apply");
+        assert_eq!(td.columns[2].generated, None, "a user's tag is not dbd's convention");
+    }
+
     #[test]
     fn parse_indexes_block_bare_and_parenthesized() {
         let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" int\n\n  indexes {\n    a [unique, name: 'idx_a']\n    (a, b) [name: 'idx_ab']\n  }\n}\n";
@@ -1145,6 +1365,72 @@ mod tests {
         assert!(!idx_ab.unique);
         let cols: Vec<&str> = idx_ab.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(cols, vec!["a", "b"]);
+    }
+
+    /// A backticked index key is an expression, and a comma inside one does
+    /// not split the key list.
+    #[test]
+    fn a_backticked_index_key_is_an_expression() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" text\n\n  indexes {\n    `lower(b)` [name: 'idx_lower']\n    (a, `coalesce(b, 'x, y')`) [name: 'idx_mixed']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let keys = |i: usize| -> Vec<(&str, bool)> {
+            td.indexes[i]
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.is_expression))
+                .collect()
+        };
+        assert_eq!(keys(0), vec![("lower(b)", true)]);
+        assert_eq!(keys(1), vec![("a", false), ("coalesce(b, 'x, y')", true)]);
+    }
+
+    /// Only dbd's own note lines are read as index facts. A prose note from
+    /// dbdiagram.io, or an `order:` line that does not cover every key, leaves
+    /// the index as DBML's syntax describes it rather than half-applying.
+    #[test]
+    fn an_index_note_outside_the_convention_changes_nothing() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" int\n\n  indexes {\n    (a, b) [name: 'idx_prose', note: 'Where the search page looks things up']\n    (a, b) [name: 'idx_short', note: 'order: desc']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        for ix in &td.indexes {
+            assert_eq!(ix.predicate, None, "{:?}", ix.name);
+            assert!(!ix.nulls_not_distinct, "{:?}", ix.name);
+            assert!(
+                ix.columns.iter().all(|c| c.order.is_none() && c.nulls_first.is_none()),
+                "{:?}",
+                ix.name
+            );
+        }
+    }
+
+    /// Both of DBML's CHECK spellings read as table CHECK constraints: the
+    /// `checks { … }` block (named or not) and a column's `check:` setting,
+    /// which may repeat.
+    #[test]
+    fn checks_blocks_and_column_checks_read_as_check_constraints() {
+        let dbml = "Table \"app\".\"t\" {\n  \"qty\" int [not null, check: `qty > 0`, check: `qty < 1000`]\n  \"total\" int\n\n  checks {\n    `total >= 0` [name: 't_total_positive']\n    `total <> 13`\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let mut found: Vec<(Option<&str>, &str)> = td
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::Check { name, expression } => Some((name.as_deref(), expression.as_str())),
+                _ => None,
+            })
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![
+                (None, "qty < 1000"),
+                (None, "qty > 0"),
+                (None, "total <> 13"),
+                (Some("t_total_positive"), "total >= 0"),
+            ]
+        );
+        assert!(!td.columns[0].nullable, "the other settings still apply");
     }
 
     #[test]
@@ -1799,5 +2085,103 @@ mod tests {
         let fake_path = std::path::Path::new("ddl/table/public/t.sql");
         crate::parser::parse_entity(fake_path, &sql)
             .unwrap_or_else(|e| panic!("emitted DDL failed to re-parse: {e}\nSQL:\n{sql}"));
+    }
+
+    // ── DBML string escapes ──────────────────────────────────────────────────
+
+    /// DBML reads a backslash in a quoted string as an escape, exactly like
+    /// its own lexer: `\\` is a backslash, `\n` a newline, `\'` a quote, and
+    /// any other `\x` is `x`.
+    #[test]
+    fn quoted_strings_read_dbml_escapes() {
+        assert_eq!(parse_single_line_string(r"'C:\\temp'").as_deref(), Some(r"C:\temp"));
+        assert_eq!(parse_single_line_string(r"'one\ntwo'").as_deref(), Some("one\ntwo"));
+        assert_eq!(parse_single_line_string(r"'it\'s'").as_deref(), Some("it's"));
+        assert_eq!(parse_single_line_string(r"'\d+'").as_deref(), Some("d+"));
+    }
+
+    /// Every string dbd writes into DBML — an enum value's note, a column's
+    /// note and string default, a table's single- and multi-line note — must
+    /// come back with its quotes and backslashes intact. An unescaped `'`
+    /// ended the string early (the enum note vanished, the `'it''s'` default
+    /// came back as `'it''''s'`), and a `'''` inside a multi-line note ended
+    /// the note.
+    #[test]
+    fn quotes_and_backslashes_survive_the_round_trip() {
+        use crate::dbml::{DbmlParams, generate_dbml};
+        use crate::entity::{EnumValue, TableComments};
+
+        let mut kind = Entity::new(EntityType::Enum, "app.kind");
+        kind.enum_values = vec![EnumValue {
+            name: "plain".into(),
+            note: Some(r"the user's C:\ drive".into()),
+        }];
+
+        let column = ColumnDef {
+            name: "path".into(),
+            data_type: "text".into(),
+            nullable: true,
+            default_value: Some("'it''s'".into()),
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: Some(r"Windows path, e.g. C:\temp — the user's".into()),
+            inline_fk: None,
+        };
+        let table_with_note = |name: &str, note: &str| {
+            let mut t = Entity::new(EntityType::Table, name);
+            t.table_def = Some(TableDef {
+                columns: vec![column.clone()],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments {
+                    table: Some(note.into()),
+                    ..Default::default()
+                },
+            });
+            t
+        };
+        let single_note = r"Matches \d+ in the user's codes";
+        let multi_note = "First line.\nA ''' run, a C:\\temp path, the user's note.";
+
+        let doc = generate_dbml(&DbmlParams {
+            entities: &[
+                kind,
+                table_with_note("app.single", single_note),
+                table_with_note("app.multi", multi_note),
+            ],
+            project_name: "Escapes",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+        let dbml = &doc.content;
+        let parsed = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}\n{dbml}"));
+
+        assert_eq!(
+            find_enum(&parsed, "app.kind").enum_values[0].note.as_deref(),
+            Some(r"the user's C:\ drive"),
+            "\n{dbml}"
+        );
+        for (name, note) in [("app.single", single_note), ("app.multi", multi_note)] {
+            let td = find_table(&parsed, name).table_def.as_ref().unwrap();
+            assert_eq!(
+                td.columns[0].comment.as_deref(),
+                Some(r"Windows path, e.g. C:\temp — the user's"),
+                "{name}:\n{dbml}"
+            );
+            assert_eq!(
+                td.columns[0].default_value.as_deref(),
+                Some("'it''s'"),
+                "{name}:\n{dbml}"
+            );
+            assert_eq!(td.comments.table.as_deref(), Some(note), "{name}:\n{dbml}");
+        }
     }
 }
