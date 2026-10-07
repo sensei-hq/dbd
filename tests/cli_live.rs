@@ -249,6 +249,51 @@ async fn export_counts_what_it_writes_and_names_what_the_scope_left_out() {
     );
 }
 
+/// Run `dbd <args>` with stderr folded into stdout, in the order it was
+/// written — what a terminal shows, and the only way to see whether a warning
+/// came before or after a line.
+fn dbd_interleaved(dir: &Path, url: &str, args: &[&str]) -> (bool, String) {
+    let bin = assert_cmd::cargo::cargo_bin("dbd");
+    let config = dir.join("design.yaml");
+    let o = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("\"$0\" \"$@\" 2>&1")
+        .arg(bin)
+        .args(args)
+        .args(["-c", config.to_str().unwrap(), "-d", url])
+        .current_dir(dir)
+        .output()
+        .expect("sh failed to run");
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// A deploy runs schema, then data, then policies. It reported "Applied 1
+/// policy file(s)" first and the import's warnings after it, so the output
+/// read as if the import ran last — or that a policy applied before a load it
+/// was written to protect.
+#[tokio::test]
+async fn deploy_reports_each_phase_in_the_order_it_ran() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let p = dir.join("policies/app");
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(
+        p.join("widgets.sql"),
+        "alter table app.widgets enable row level security;\n",
+    )
+    .unwrap();
+
+    let (ok, text) = dbd_interleaved(dir, &url, &["deploy"]);
+    assert!(ok, "{text}");
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`:\n{text}"));
+    assert!(
+        at("no import/ directory") < at("Applied 1 policy file(s)"),
+        "the import's warning comes before the policy phase:\n{text}"
+    );
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
