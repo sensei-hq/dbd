@@ -1924,6 +1924,19 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// `-e production` was recorded verbatim before the CLI normalised it, and
+    /// such a row is still a prod database — it must not slip past the guard.
+    #[tokio::test]
+    async fn reset_blocked_when_the_database_says_production() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "prod").unwrap();
+        let mock = MockAdapter::new().with_meta("production", 0);
+
+        let result = design.reset(&mock, "postgres", false, false, false, None).await;
+        assert!(result.is_err(), "a database marked `production` must block reset");
+        assert!(result.unwrap_err().to_string().contains("prod"));
+    }
+
     #[tokio::test]
     async fn reset_blocked_after_v1() {
         let config_path = fixture_dir().join("design.yaml");

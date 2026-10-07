@@ -467,6 +467,21 @@ mod tests {
         );
     }
 
+    /// `-e` takes the documented names and nothing else. An alias is stored as
+    /// its canonical form, so `-e production` records `prod` — the value the
+    /// reset guard and the `import/<env>/` folders key on.
+    #[test]
+    fn environment_aliases_normalise_and_unknown_names_are_refused() {
+        let env = |v: &str| Cli::try_parse_from(["dbd", "-e", v, "inspect"]).map(|c| c.environment);
+        assert_eq!(env("production").unwrap(), "prod");
+        assert_eq!(env("prod").unwrap(), "prod");
+        assert_eq!(env("development").unwrap(), "dev");
+        assert_eq!(env("dev").unwrap(), "dev");
+        assert!(env("staging").is_err(), "an unknown environment must not parse");
+        let default = Cli::try_parse_from(["dbd", "inspect"]).unwrap();
+        assert_eq!(default.environment, "prod");
+    }
+
     /// `dbd deploy` cache flags default to false and flip to true when present.
     #[test]
     fn deploy_cache_flags_parse() {
