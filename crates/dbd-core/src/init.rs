@@ -193,6 +193,30 @@ mod tests {
         );
     }
 
+    /// `supabase_*.*` reads as "every supabase_ schema", but `ignore` matches a
+    /// `prefix.*` pattern by its literal prefix — there is no glob inside it —
+    /// so the scaffold's pattern could only ever match a schema literally named
+    /// `supabase_*`, and a reference into Supabase's own schemas was reported
+    /// as unresolved on every scaffolded project.
+    #[test]
+    fn the_supabase_scaffold_ignores_supabases_own_schemas() {
+        let config: crate::config::DesignConfig = serde_yaml::from_str(&generate_supabase_config("p")).unwrap();
+        for target in [
+            "supabase_functions.http_request",
+            "supabase_migrations.schema_migrations",
+        ] {
+            let mut e = crate::entity::Entity::new(crate::entity::EntityType::Function, "public.notify");
+            e.refs = vec![crate::entity::Ref::stated(target, crate::entity::RefKind::Reads)];
+            let mut entities = vec![e];
+            crate::references::resolve_references(&mut entities, &[], &config.ignore);
+            assert!(
+                entities[0].warnings.is_empty(),
+                "{target} is Supabase's, and the scaffold must ignore it: {:?}",
+                entities[0].warnings
+            );
+        }
+    }
+
     #[test]
     fn generates_directory_gitkeeps() {
         let files = generate_init_files("test", "postgres");
