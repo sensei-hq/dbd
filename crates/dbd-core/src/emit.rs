@@ -676,6 +676,29 @@ mod tests {
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
     }
 
+    /// A CHECK keeps the name it was given. Written unnamed, `init --from-dbml`
+    /// and `init --from-db` rebuilt `qty_positive` as Postgres's own
+    /// `t_qty_check` — a different constraint to anything that names it.
+    #[test]
+    fn a_named_check_round_trips_with_its_name() {
+        let ddl = "create table app.t (\n  qty int constraint qty_positive check (qty > 0),\n  code text check (length(code) < 10)\n);";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+
+        let reparsed = crate::parser::parse_entity(path, &emit_table(&entity)).unwrap();
+        let checks: Vec<Option<String>> = reparsed
+            .table_def
+            .unwrap()
+            .constraints
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::entity::TableConstraint::Check { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, [Some("qty_positive".to_string()), None]);
+    }
+
     #[test]
     fn emit_entity_dispatches_by_type() {
         let s = Entity::new(EntityType::Schema, "shop");
