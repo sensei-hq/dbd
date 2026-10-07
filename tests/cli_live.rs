@@ -713,3 +713,44 @@ async fn an_import_refuses_a_data_file_outside_the_staging_schemas_and_keeps_the
     assert!(csv.contains("1,live"), "the live row must survive: {csv}");
     assert!(!csv.contains("replaced"), "and nothing may replace it: {csv}");
 }
+
+// ── a skipped hook is named even when the run fails ─────────────────────────
+
+/// A scope skips a hook whose tables it leaves out, and said so only in the
+/// summary a successful run prints. When the run then failed — often *because*
+/// the hook did not prepare what the DDL needed — the error came with no word
+/// of the skip, and nothing explained it.
+#[tokio::test]
+async fn a_scoped_apply_that_fails_still_names_the_hook_it_skipped() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}\napply:\n  before:\n    - sql/seed_users.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/seed_users.sql"),
+        "insert into app.users (id) values (1);\n",
+    )
+    .unwrap();
+    // Parses, and fails when Postgres runs it.
+    std::fs::write(
+        dir.join("ddl/table/hub/broken.ddl"),
+        "set search_path to hub;\ncreate table if not exists broken (id integer primary key default hub.no_such_fn());\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+
+    assert!(!o.status.success(), "the apply must fail: {}", combined(&o));
+    assert!(
+        combined(&o).contains("before-script sql/seed_users.sql skipped"),
+        "the failure must still name the skipped hook: {}",
+        combined(&o)
+    );
+}

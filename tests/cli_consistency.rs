@@ -154,6 +154,39 @@ fn apply_dry_run_under_a_scope_is_not_blocked_by_a_file_outside_it() {
     assert!(stdout(&out).contains("hub.nodes"), "{}", stdout(&out));
 }
 
+// ── a preview names the hooks its scope skips ───────────────────────────────
+
+/// An `apply.after` hook that writes `app.users`, which scope `hub` leaves out.
+fn add_app_only_after_hook(dir: &Path) {
+    let yaml = fs::read_to_string(dir.join("design.yaml")).unwrap();
+    write(
+        dir,
+        "design.yaml",
+        &format!("{yaml}\napply:\n  after:\n    - sql/seed_users.sql\n"),
+    );
+    write(dir, "sql/seed_users.sql", "insert into app.users (id) values (1);\n");
+}
+
+/// The real run skips a hook whose tables the scope leaves out, and says so —
+/// but only in the summary a successful run prints. The previews never named
+/// it, so a dry run promised a run that would quietly not seed anything.
+#[test]
+fn apply_and_deploy_dry_runs_name_a_hook_the_scope_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_app_only_after_hook(tmp.path());
+
+    for command in ["apply", "deploy"] {
+        let out = dbd(tmp.path(), &[command, "--dry-run", "--scope", "hub"]);
+        assert!(out.status.success(), "{command}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("after-script sql/seed_users.sql skipped") && stderr(&out).contains("app.users"),
+            "{command} --dry-run must name the skipped hook and why: {}",
+            stderr(&out)
+        );
+    }
+}
+
 // ── a document says what it leaves out ──────────────────────────────────────
 
 /// `dbml` and `diagram` cannot document a file dbd could not read, and both
