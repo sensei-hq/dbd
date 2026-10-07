@@ -996,6 +996,39 @@ import:
         assert!(entry.format().is_none());
     }
 
+    /// `dbd snapshot` and `dbd release` change one key in `project:`. They
+    /// re-serialised the whole file, so every comment, blank line and
+    /// flow-style list in a hand-written design.yaml was lost.
+    #[test]
+    fn version_and_release_edits_leave_the_rest_of_design_yaml_as_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("design.yaml");
+        let original = "# The app's database.\n\
+                        project:\n  name: test   # keep this\n  note: hello\n\n\
+                        # schemas we own\nschemas: [app, staging]\n";
+        std::fs::write(&path, original).unwrap();
+
+        update_version(&path, 3).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            "# The app's database.\nproject:\n  name: test   # keep this\n  note: hello\n  version: 3\n\n\
+             # schemas we own\nschemas: [app, staging]\n"
+        );
+
+        update_version(&path, 4).unwrap();
+        set_released(&path, true).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            "# The app's database.\nproject:\n  name: test   # keep this\n  note: hello\n  version: 4\n  released: true\n\n\
+             # schemas we own\nschemas: [app, staging]\n"
+        );
+        let config = read(&path).unwrap();
+        assert_eq!(config.project.version, Some(4));
+        assert!(config.project.released);
+    }
+
     #[test]
     fn update_version_writes_and_round_trips() {
         let tmp = tempfile::TempDir::new().unwrap();
