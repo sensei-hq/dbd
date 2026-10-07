@@ -121,8 +121,9 @@ impl Design {
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
-        let hook_scope = match (scope, working_set.as_ref()) {
-            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), ws)),
+        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
+        let hook_scope = match (scope, outside.as_ref()) {
+            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
             _ => None,
         };
 

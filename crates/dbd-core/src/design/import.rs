@@ -301,7 +301,8 @@ impl Design {
         let procedures = self
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
-        let hook_scope = narrowed.as_ref().map(|(name, ws)| (*name, ws));
+        let outside = narrowed.as_ref().map(|(name, ws)| (*name, self.managed_outside(ws)));
+        let hook_scope = outside.as_ref().map(|(name, out)| (*name, out));
         let after = hooks::run_hooks(
             adapter,
             &self.project_dir,

@@ -245,6 +245,19 @@ impl Design {
         declared.difference(&wanted).cloned().collect()
     }
 
+    /// What the design manages that a working set leaves out — the names a
+    /// scoped hook must not touch. Externals are not the design's to manage.
+    pub(in crate::design) fn managed_outside(
+        &self,
+        working_set: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        self.entities
+            .iter()
+            .filter(|e| e.entity_type != EntityType::External && !working_set.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
