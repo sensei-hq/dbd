@@ -1,37 +1,38 @@
 # Checkpoint
 
-**Slice:** #7 design at rev 3 (proposed). Website/docs audit done; fixes not started.
-Spec: `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`.
+**Slice:** `docs/feature-coverage` — docs + website match dbd 0.24.1, describing the
+post-fix behaviour of the six audit bugs (fixed in parallel on `fix/audit-bugs`).
+Parallel, unchanged here: #7 design rev 3 (proposed).
 
 ## Done
 
-- #7 rev 3: entity-level ownership (`dbd.objects`, `dbd.uses`), no special
-  schemas, workspaces with one root manifest (`modules:` block,
-  `database/<module>/` folders), `dbd split --from-scopes` for sensei.
-- Audit of the guides, llms files, SKILL.md and site pages against 0.24.1.
+- Site: `/changelog` (last 5 releases, tested parser), Viewer/Changelog in nav,
+  footer adds viewer/changelog/llms-full, sitemap; home page names every command.
+- Guides 01–06 corrected; new 07 scopes, 08 targets, 09 access control, 10 data,
+  11 viewer, 12 embedding (examples compiled by doc_examples), 13 dialects.
+- README, llms.txt, llms-full.txt, SKILL.md + verifier agent (both copies).
+- Two independent audits of 07–13 against the code; all findings corrected.
 
 ## Remaining
 
-- #7: approval of the 5 decisions in the spec, then phase 1 (patch).
-- Audit, code bugs (each test-first): `-e production` passes the reset prod
-  guard; `reset --target` ignores the design's target; `deploy` skips grants
-  and ignores `-c`; `emit` drops FKs/CHECKs/indexes unreported;
-  `GITHUB_TOKEN` is never read.
-- Audit, docs: ~20 wrong statements; new guides (scopes, targets, access
-  control, import/export, viewer, embedding); home page cards.
+- Merge `fix/audit-bugs` first: the docs state its behaviour (-e aliases,
+  reset --target default, deploy grants and -c, emit FKs/CHECKs/indexes,
+  GITHUB_TOKEN, deploy-only GitHub sources). Re-read 04/08/13 against it.
+- Code-side follow-ups found while documenting (see the slice report): cli.rs
+  help for `diff`/`--source`/`reset --target`; export skips views; scopes skip
+  sequences; SQLite/Convex import TRUNCATE; UTF-16 skipped on apply.
 
 ## Next
 
-    # on approval: fix/reset-env-guard off develop, red test first
+    git -C /Users/Jerry/Developer/dbd-docs log --oneline develop..docs/feature-coverage
 
 ## Open questions
 
-- Fix code or docs for each mismatch? Recommended: code for the 6 bugs above,
-  docs for the rest.
-- The release checklist cites `the_website_copies_match_the_docs`; no such
-  test exists (site content is gitignored and regenerated at build).
+- Should `dbd export` accept views (unblocks the documented migration pattern)?
+- `fix/audit-bugs` emit handles some indexes differently from the brief
+  (MySQL drops predicates, T-SQL omits expression indexes); docs say "reported,
+  and passed through, built without its predicate, or left out".
 
 ## Known-broken / upstream
 
-- The 6 code bugs above.
-- History has no views or routines: snapshots hold tables and enums only.
+- The code-side items above; `DBD_CATALOG_TTL` is read by dead code only.
