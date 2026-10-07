@@ -438,17 +438,23 @@ impl Design {
                 // Only where the table still exists: a generated drop is a bare
                 // `DROP TABLE … CASCADE`, and a database whose scope never had
                 // the table would fail on it.
-                let result: Result<()> = async {
+                let result: Result<bool> = async {
                     if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         // Decoded like the migration's `.sql` and `.data.sql`.
                         let sql = crate::source_text::read_to_string(drop_sql_path)?;
                         adapter.execute_script(&sql).await?;
+                        return Ok(true);
                     }
-                    Ok(())
+                    Ok(false)
                 }
                 .await;
-                report_step_result(&desc, on_done, result)?;
-                counts.dropped += 1;
+                // Counted only when it ran: the summary must not claim a drop
+                // that left the table where it was.
+                let dropped = matches!(result, Ok(true));
+                report_step_result(&desc, on_done, result.map(|_| ()))?;
+                if dropped {
+                    counts.dropped += 1;
+                }
             }
             ExecutionStep::RecordMigration { version, checksum } => {
                 let desc = format!("migration to v{version}");

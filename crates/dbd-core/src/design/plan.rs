@@ -156,9 +156,19 @@ fn plan_migrate(
             if !drop_in_scope(table_name) {
                 continue;
             }
+            // `dbd snapshot` writes a dropped table's statement where it writes
+            // every per-table migration — `<schema>/<table>.sql`. A hand-written
+            // `<table>.drop.sql` still wins; looking only for that name meant
+            // no generated drop ever ran.
+            let explicit = migration_entity_sql_path(&migration.migration_dir, table_name, ".drop.sql");
+            let drop_sql_path = if explicit.exists() {
+                explicit
+            } else {
+                migration_entity_sql_path(&migration.migration_dir, table_name, ".sql")
+            };
             steps.push(ExecutionStep::DropEntity {
                 entity_name: table_name.clone(),
-                drop_sql_path: migration_entity_sql_path(&migration.migration_dir, table_name, ".drop.sql"),
+                drop_sql_path,
                 migration_version: migration.to_version,
             });
         }
