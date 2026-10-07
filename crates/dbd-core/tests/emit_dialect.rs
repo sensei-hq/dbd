@@ -1058,3 +1058,48 @@ fn sqlite_computes_a_generated_column() {
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(total, "10", "{sql}");
 }
+
+// ── A materialized view becomes a view, and says so ────────────────────────
+
+const MATVIEW: [(&str, &str); 2] = [
+    (
+        "table/app/orders.ddl",
+        "create table orders (id integer primary key, total numeric(10,2));",
+    ),
+    (
+        "materialized_view/app/order_totals.ddl",
+        "create materialized view order_totals as select id, total from orders with data;\n\
+         create unique index order_totals_id_idx on order_totals (id);",
+    ),
+];
+
+/// None of the three has materialized views, so one becomes a plain view —
+/// the query runs on every read instead of serving stored rows. That is a
+/// loss, reported. Its indexes (a unique one is what REFRESH CONCURRENTLY
+/// needs) cannot apply to a plain view: each is left out, and reported.
+#[test]
+fn a_materialized_view_becomes_a_view_and_its_indexes_are_reported() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &MATVIEW, None);
+        let stmts = statements(&sql);
+        assert!(stmts.contains("CREATE VIEW"), "{dialect:?}: {sql}");
+        assert!(!stmts.contains("INDEX"), "{dialect:?}: a view cannot be indexed: {sql}");
+        assert!(
+            report.iter().any(|d| d.entity == "app.order_totals"
+                && d.from.contains("materialized view")
+                && d.to == "a plain view"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            report.iter().any(|d| d.entity == "app.order_totals"
+                && d.from.contains("order_totals_id_idx")
+                && d.to == "no index"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            sql.lines()
+                .any(|l| l.starts_with("-- dbd:") && l.contains("order_totals_id_idx")),
+            "{dialect:?}: and the file says so: {sql}"
+        );
+    }
+}
