@@ -213,6 +213,7 @@ impl<'a> Parser<'a> {
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk_cols: Vec<String> = Vec::new();
         let mut indexes: Vec<IndexDef> = Vec::new();
+        let mut checks: Vec<TableConstraint> = Vec::new();
         let mut table_note: Option<String> = None;
 
         self.pos += 1;
@@ -234,17 +235,31 @@ impl<'a> Parser<'a> {
             let kw = keyword(&line);
             match kw.as_str() {
                 "indexes" => {
-                    self.parse_indexes_block(&line, &qualified, &mut indexes)?;
+                    for entry in self.block_entries(&line, "indexes", &qualified)? {
+                        indexes.push(parse_index_line(&entry, &qualified)?);
+                    }
+                }
+                // Only as a block opener: an unquoted column may well be named
+                // `checks`, and `checks int` is a column.
+                "checks" if opens_block(&line) => {
+                    for entry in self.block_entries(&line, "checks", &qualified)? {
+                        checks.push(parse_check_line(&entry, &qualified)?);
+                    }
                 }
                 "note" => {
                     table_note = Some(self.consume_note_value(&line)?);
                 }
                 _ => {
-                    // A column definition.
-                    let col = parse_column(&line, &qualified)?;
+                    // A column definition, with any `check:` settings it carries.
+                    let (col, col_checks) = parse_column(&line, &qualified)?;
                     if col.is_pk {
                         pk_cols.push(col.name.clone());
                     }
+                    checks.extend(
+                        col_checks
+                            .into_iter()
+                            .map(|expression| TableConstraint::Check { name: None, expression }),
+                    );
                     columns.push(col);
                     self.pos += 1;
                 }
@@ -258,6 +273,7 @@ impl<'a> Parser<'a> {
                 columns: pk_cols,
             });
         }
+        constraints.append(&mut checks);
 
         let comments = Self::table_comments_from(table_note, &columns);
 
@@ -301,14 +317,16 @@ impl<'a> Parser<'a> {
         comments
     }
 
-    /// Parse an `indexes { … }` block. `header` is the line beginning with
-    /// `indexes`; the `{` may be on that line or a following one.
-    fn parse_indexes_block(&mut self, header: &str, table: &str, out: &mut Vec<IndexDef>) -> Result<()> {
-        self.advance_to_indexes_brace(header, table)?;
+    /// The entry lines of a `<kind> { … }` block inside a table — `indexes` or
+    /// `checks`. `header` is the line beginning with `kind`; the `{` may be on
+    /// that line or a following one.
+    fn block_entries(&mut self, header: &str, kind: &str, table: &str) -> Result<Vec<String>> {
+        self.advance_past_open_brace(header, kind, table)?;
 
+        let mut entries = Vec::new();
         loop {
             if self.pos >= self.lines.len() {
-                return Err(parse_err(format!("unterminated indexes block in `{table}`")));
+                return Err(parse_err(format!("unterminated {kind} block in `{table}`")));
             }
             let line = strip_comment(self.lines[self.pos]).trim().to_string();
             self.pos += 1;
@@ -318,14 +336,14 @@ impl<'a> Parser<'a> {
             if line.starts_with('}') {
                 break;
             }
-            out.push(parse_index_line(&line, table)?);
+            entries.push(line);
         }
-        Ok(())
+        Ok(entries)
     }
 
-    /// Advance the cursor just past the `{` that opens an `indexes` block —
+    /// Advance the cursor just past the `{` that opens a `kind` block —
     /// whether the brace is on the header line or a following line.
-    fn advance_to_indexes_brace(&mut self, header: &str, table: &str) -> Result<()> {
+    fn advance_past_open_brace(&mut self, header: &str, kind: &str, table: &str) -> Result<()> {
         if header.contains('{') {
             self.pos += 1;
             return Ok(());
@@ -341,7 +359,7 @@ impl<'a> Parser<'a> {
             if l.contains('{') {
                 return Ok(());
             }
-            return Err(parse_err(format!("indexes block in `{table}` is missing `{{`")));
+            return Err(parse_err(format!("{kind} block in `{table}` is missing `{{`")));
         }
         Ok(())
     }
@@ -594,8 +612,9 @@ fn parse_value_note(rest: &str) -> Option<String> {
     None
 }
 
-/// Parse a column definition line: `"name" <type> [settings]`.
-fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
+/// Parse a column definition line: `"name" <type> [settings]`, returning the
+/// column and the expressions of any `check:` settings on it.
+fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
     let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
 
@@ -615,6 +634,7 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
         comment: None,
         inline_fk: None,
     };
+    let mut checks = Vec::new();
 
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
@@ -648,12 +668,55 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
                         col.comment = Some(s);
                     }
                 }
+                // DBML's column-level CHECK; a column may carry several.
+                "check" => {
+                    let expression = value.as_deref().and_then(backticked).ok_or_else(|| {
+                        parse_err(format!(
+                            "check on `{table}` is not a backticked expression: {settings_str}"
+                        ))
+                    })?;
+                    checks.push(expression);
+                }
                 _ => { /* unknown setting — ignore (forward-compatible) */ }
             }
         }
     }
 
-    Ok(col)
+    Ok((col, checks))
+}
+
+/// Whether a table-body line opens a block: the keyword alone, or followed by
+/// its `{` — not a column that happens to share the keyword's name.
+fn opens_block(line: &str) -> bool {
+    let rest = line.get(first_word(line).len()..).unwrap_or("").trim();
+    rest.is_empty() || rest.starts_with('{')
+}
+
+/// The expression inside a DBML backtick expression, or `None` if `s` is not
+/// one.
+fn backticked(s: &str) -> Option<String> {
+    s.trim()
+        .strip_prefix('`')?
+        .strip_suffix('`')
+        .map(|expression| expression.trim().to_string())
+}
+
+/// One entry of a `checks { … }` block: `` `<expression>` [name: '…'] ``.
+fn parse_check_line(line: &str, table: &str) -> Result<TableConstraint> {
+    let (expression_part, settings_part) = split_trailing_settings(line.trim());
+    let expression = backticked(expression_part)
+        .ok_or_else(|| parse_err(format!("check in `{table}` is not a backticked expression: {line}")))?;
+    let mut name = None;
+    if let Some(settings_str) = settings_part {
+        let settings = extract_settings(settings_str)
+            .ok_or_else(|| parse_err(format!("malformed check settings in `{table}`: {settings_str}")))?;
+        for (key, value) in settings {
+            if key.eq_ignore_ascii_case("name") {
+                name = value.as_deref().and_then(parse_single_line_string);
+            }
+        }
+    }
+    Ok(TableConstraint::Check { name, expression })
 }
 
 /// Parse a column type token. Strips surrounding quotes (types with spaces are
@@ -772,9 +835,9 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
 /// emitter from quoting `lower(email)` as an identifier.
 fn parse_index_key(key: &str) -> IndexColumn {
     let key = key.trim();
-    match key.strip_prefix('`').and_then(|k| k.strip_suffix('`')) {
+    match backticked(key) {
         Some(expression) => IndexColumn {
-            name: expression.trim().to_string(),
+            name: expression,
             is_expression: true,
             ..Default::default()
         },

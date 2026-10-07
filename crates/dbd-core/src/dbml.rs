@@ -345,6 +345,27 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
         lines.push("  }".to_string());
     }
 
+    // Checks block. DBML has had `checks { … }` since @dbml/core v5; without
+    // it every CHECK the design enforces was missing from the document and
+    // from the table `init --from-dbml` rebuilt. The parser has already hoisted
+    // column-level CHECKs into table constraints, so they all land here.
+    let checks: Vec<String> = table_def
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Check { name, expression } => Some(check_line(name.as_deref(), expression)),
+            _ => None,
+        })
+        .collect();
+    if !checks.is_empty() {
+        lines.push(String::new());
+        lines.push("  checks {".to_string());
+        for check in checks {
+            lines.push(format!("    {check}"));
+        }
+        lines.push("  }".to_string());
+    }
+
     // Table note
     if let Some(ref note) = table_def.comments.table {
         lines.push(String::new());
@@ -353,6 +374,19 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
 
     lines.push("}\n".to_string());
     lines.join("\n")
+}
+
+/// One entry of a `checks { … }` block: the expression in backticks, named
+/// when the constraint is. DBML reads a backticked expression raw and to the
+/// next backtick — there is no escape — so a line break is written as a space
+/// (the parser on the other side is line-based) and an expression containing a
+/// backtick cannot be written faithfully at all.
+fn check_line(name: Option<&str>, expression: &str) -> String {
+    let expression = expression.replace(['\r', '\n'], " ");
+    match name {
+        Some(name) => format!("`{expression}` [name: {}]", dbml_string(name)),
+        None => format!("`{expression}`"),
+    }
 }
 
 /// Each table-level `UNIQUE` constraint as the unique index DBML writes it as.
