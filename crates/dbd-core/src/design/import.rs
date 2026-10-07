@@ -10,20 +10,63 @@ impl Design {
         self.import_tables.iter().filter(|t| !t.errors.is_empty()).collect()
     }
 
+    /// What every import path refuses before it touches the database: the
+    /// import itself, its `--dry-run`, and `deploy` (which validates its
+    /// import phase before applying anything, so a refusal never lands half a
+    /// deploy). `name` is the caller's `-n`, if any.
+    ///
+    /// Public so a caller can refuse before it even connects — the mistake is
+    /// in the command line or the project, and an error about the database
+    /// would hide it.
+    pub fn check_import_plan(&self, name: Option<&str>) -> Result<()> {
+        if let Some(n) = name {
+            self.check_import_name(n)?;
+        }
+        Ok(())
+    }
+
+    /// A `-n` must select a data file this run loads.
+    ///
+    /// It was a warning, and the run went on — exiting 0 and running every
+    /// `import.after` hook — so a typo still ran the project's loader script.
+    /// Selecting nothing is never what the name was for, so each way it can
+    /// fail is refused, saying which it is.
+    fn check_import_name(&self, name: &str) -> Result<()> {
+        if self.import_tables.iter().any(|t| t.name == name) {
+            return Ok(());
+        }
+        // The wrong-`-e` case: the file exists, under another env's folder.
+        // Naming it is what tells the user which flag to change.
+        let elsewhere: Vec<String> = self
+            .import_scan_skips
+            .skipped_by_env
+            .iter()
+            .filter(|(_, rel)| Entity::from_import_file(&Path::new("import").join(rel)).name == name)
+            .map(|(_, rel)| format!("import/{}", rel.display()))
+            .collect();
+        if !elsewhere.is_empty() {
+            return Err(DbdError::Config(format!(
+                "no data file for {name} in this run: {} belongs to another env, and this run's env is '{}'",
+                elsewhere.join(", "),
+                self.env
+            )));
+        }
+        // The words every command uses for a name that matches nothing.
+        self.resolve_name(name, None)?;
+        Err(DbdError::Config(format!(
+            "{name} has no data file under import/ — nothing to import \
+             (a table's data file is import/<schema>/<table>.csv, .tsv, .json or .jsonl)"
+        )))
+    }
+
     /// Diagnostics for everything the `import/` scan and plan construction left
     /// out, before any scope filtering. Empty when nothing was excluded.
     ///
-    /// `name` is the caller's `--name` filter, if any, so an entity name that
-    /// matches no staging file is reported as the typo it is rather than as a
-    /// clean empty import.
+    /// `name` is the caller's `--name` filter, if any. A name that selects no
+    /// data file is not reported here: it is refused by
+    /// [`Design::check_import_plan`].
     pub fn import_warnings(&self, name: Option<&str>) -> Vec<String> {
         let mut warnings = Vec::new();
-
-        if let Some(n) = name
-            && !self.import_tables.iter().any(|t| t.name == n)
-        {
-            warnings.push(format!("no staging data file matches --name {n} — nothing to import"));
-        }
 
         if self.import_scan_skips.dir_missing {
             warnings.push(
@@ -105,12 +148,15 @@ impl Design {
     /// targets alone kept an import whose staging table the scope never built.
     ///
     /// The one rule for `import`, `deploy`, and both commands' `--dry-run`.
-    /// `None` or the all-scope keeps the whole plan.
+    /// `None` or the all-scope keeps the whole plan. Refuses what
+    /// [`Design::check_import_plan`] refuses, so no preview can show a plan
+    /// the real run would not carry out.
     pub fn scoped_import_plan(
         &self,
         name: Option<&str>,
         scope: Option<&ResolvedScope>,
     ) -> Result<(Vec<ImportPlanEntry>, Vec<String>)> {
+        self.check_import_plan(name)?;
         let plan = self.import_plan(name);
         let Some(scope) = scope.filter(|s| !s.is_all) else {
             return Ok((plan, Vec::new()));

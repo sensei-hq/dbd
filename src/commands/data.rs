@@ -156,6 +156,12 @@ pub async fn cmd_import(
     if file.is_some() && name.is_none() {
         bail!("--file requires --name <entity>");
     }
+    // Likewise a `-n` that selects no data file: refused here, before the
+    // connection, so the error names the typo rather than the database. (An
+    // ad-hoc `-f` load names its target table, not a data file under import/.)
+    if file.is_none() {
+        design.check_import_plan(name)?;
+    }
 
     let adapter = get_adapter(config, database_url).await?;
     import_with_adapter(&*adapter, &design, name, file, scope, deps, verbosity).await
