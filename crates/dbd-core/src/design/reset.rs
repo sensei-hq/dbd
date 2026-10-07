@@ -29,7 +29,9 @@ impl Design {
     /// Reset the database (with safety guards). `scope` restricts the dropped
     /// schemas to that scope's working set (`None`/all-scope ⇒ everything). Roles
     /// are only dropped on a full reset — a subset scope leaves shared roles
-    /// intact since roles are not scope-selectable.
+    /// intact since roles are not scope-selectable. The bookkeeping of what it
+    /// drops goes too: the project's recorded migrations, and the drift stamp of
+    /// every materialized view the reset removed.
     pub async fn reset(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -60,7 +62,15 @@ impl Design {
         }
 
         if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
+            // The matviews that exist now and not after the drop are the ones
+            // this reset dropped — by name, with their schema, or by CASCADE
+            // from what they read. Their drift stamps go with them.
+            let before = adapter.matview_states().await?;
             adapter.execute_script(&sql).await?;
+            let after = adapter.matview_states().await?;
+            let mut dropped: Vec<String> = before.into_keys().filter(|mv| !after.contains_key(mv)).collect();
+            dropped.sort();
+            adapter.forget_matview_stamps(&dropped).await?;
         }
         adapter.clear_project_migrations().await?;
 
