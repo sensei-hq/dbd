@@ -5066,8 +5066,11 @@ async fn removing_an_enum_value_drops_only_the_views_over_its_column() {
         "the views, recreated over the new type",
     )
     .await;
+    // The body names `orders` bare, as its file's `set search_path to app`
+    // allows, so it resolves on the caller's path. Set here, in the same script
+    // and so on the same connection: a pooled one may carry any earlier path.
     adapter
-        .execute_script("CALL app.void_order(1)")
+        .execute_script("SET search_path TO app; CALL app.void_order(1)")
         .await
         .expect("the procedure still runs against the recreated type");
 }
