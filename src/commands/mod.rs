@@ -648,12 +648,30 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read {}", file.display()))
 }
 
-/// [`safe_read`] for a DDL file: decoded by `source_text` exactly as the
-/// project load decodes it (UTF-16 behind a BOM included), so a file the load
-/// reads is never one a command over the same tree cannot.
-pub(super) fn safe_read_ddl(root: &Path, file: &Path) -> Result<String> {
+/// Format one DDL file — rewriting it when `write` — in the encoding it was
+/// saved in; whether it needed formatting. Shared by `format` and
+/// `inspect --fix`, so the two cannot disagree about a file.
+///
+/// Read by `source_text` exactly as the project load reads it (UTF-16 behind a
+/// BOM included), so a file the load reads is never one this cannot.
+pub(super) fn format_in_place(
+    root: &Path,
+    file: &Path,
+    config: &dbd_core::config::FormatConfig,
+    write: bool,
+) -> Result<bool> {
     let canon = safe_canonicalize_within(root, file)?;
-    dbd_core::source_text::read_to_string(&canon).with_context(|| format!("Failed to read {}", file.display()))
+    let (content, encoding) = dbd_core::source_text::read_with_encoding(&canon)
+        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let formatted = dbd_core::formatter::format_ddl(&content, config);
+    if content == formatted {
+        return Ok(false);
+    }
+    if write {
+        std::fs::write(&canon, encoding.encode(&formatted)) // nosemgrep: path validated by safe_canonicalize_within
+            .with_context(|| format!("Failed to write {}", file.display()))?;
+    }
+    Ok(true)
 }
 
 pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {

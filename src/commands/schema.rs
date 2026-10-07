@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
-use super::{format_apply_summary, get_adapter, safe_canonicalize_within, safe_read_ddl, safe_write};
+use super::{format_apply_summary, format_in_place, get_adapter, safe_canonicalize_within};
 use crate::output::{self, Verbosity};
 
 /// Warn when the config loaded but no authored DDL was scanned under the
@@ -343,11 +343,8 @@ fn fix_format_ddl(
     let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
     for file in files.iter().filter(|f| only.is_none_or(|set| set.contains(*f))) {
-        let content = safe_read_ddl(project_dir, file)?;
-        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
-        if content != formatted {
+        if format_in_place(project_dir, file, &format_config, true)? {
             changed += 1;
-            safe_write(project_dir, file, &formatted)?;
             output::info(verbosity, &format!("  formatted: {}", file.display()));
         }
     }
@@ -1150,17 +1147,10 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
     let mut changed = 0;
 
     for file in &files {
-        let content = safe_read_ddl(project_dir, file)?;
-        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
-
-        if content != formatted {
+        if format_in_place(project_dir, file, &format_config, !check)? {
             changed += 1;
-            if check {
-                output::info(verbosity, &format!("  would reformat: {}", file.display()));
-            } else {
-                safe_write(project_dir, file, &formatted)?;
-                output::info(verbosity, &format!("  formatted: {}", file.display()));
-            }
+            let verb = if check { "would reformat" } else { "formatted" };
+            output::info(verbosity, &format!("  {verb}: {}", file.display()));
         }
     }
 
