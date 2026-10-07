@@ -1096,6 +1096,20 @@ mod tests {
         );
     }
 
+    /// DBML has no generated-column syntax; the expression rides in a custom
+    /// property whose key reads like the SQL it stands for.
+    #[test]
+    fn a_generated_column_carries_its_expression_as_a_custom_property() {
+        let column = ColumnDef {
+            generated: Some("coalesce(note, 'n/a')".to_string()),
+            ..col("label", "text")
+        };
+        assert_eq!(
+            emit_column(&column, &std::collections::HashSet::new()),
+            r#"  "label" text [generated always as: 'coalesce(note, \'n/a\')']"#
+        );
+    }
+
     /// A table's CHECK constraints go in DBML's `checks { … }` block, each
     /// expression in backticks, named when the constraint is.
     #[test]
