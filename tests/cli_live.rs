@@ -359,7 +359,12 @@ async fn reset_dry_run_refuses_where_the_real_reset_would() {
     );
 
     // ── A database pinned to another scope ──
-    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    // `-e dev`: `-e` defaults to prod, and the prod guard must not be what fires.
+    let o = dbd(
+        dir,
+        &url,
+        &["apply", "-e", "dev", "--scope", "hub", "--allow-scope-change"],
+    );
     assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
 
     let real = dbd(dir, &url, &["reset"]);
