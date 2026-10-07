@@ -294,17 +294,6 @@ impl Design {
         let (plan, skips) = self.scoped_import_plan(name, scope)?;
         warnings.extend(skips);
 
-        // Ensure internal dbd procedures are present before any JSONL import runs.
-        // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
-        if !dry_run {
-            let has_jsonl = plan
-                .iter()
-                .any(|e| e.table.format.as_deref().is_some_and(|f| f == "json" || f == "jsonl"));
-            if has_jsonl {
-                adapter.ensure_import_procedure().await?;
-            }
-        }
-
         // Run the import phases in order, tallying each for the summary.
         let tables = self
             .import_load_staging(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
