@@ -3894,3 +3894,38 @@ async fn a_role_or_bare_extension_does_not_let_prune_reach_public() {
     assert_table_exists(&*adapter, "public", "not_mine").await;
     assert_table_exists(&*adapter, "app", "items").await;
 }
+
+/// `serial` declares no key. The model claimed one, so after reconcile created
+/// the table, the next diff wanted `ADD PRIMARY KEY (seq_no)` beside the real
+/// key, and every real reconcile failed with "multiple primary keys".
+#[tokio::test]
+async fn reconcile_converges_on_a_serial_column_that_is_not_the_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "serial_converge").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: serial_converge\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id uuid primary key, seq_no serial, label text);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "nothing left to change: {touched:?}");
+}
