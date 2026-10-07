@@ -49,6 +49,13 @@ pub async fn cmd_reset(
     let target = reset_target(target, &design);
 
     if dry_run {
+        // A preview of a reset the real run would refuse is a false promise, so
+        // with a database to ask, ask it first. With none configured the plan
+        // is all there is to show, and the dry run stays database-free.
+        if let Some(url) = super::configured_database_url(config, database_url)? {
+            let adapter = get_adapter(config, Some(&url)).await?;
+            check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+        }
         let sql = design
             .reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?
             .unwrap_or_else(|| "-- nothing to drop".to_string());
@@ -87,11 +94,32 @@ pub(crate) async fn reset_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
 ) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
     design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
         .await?;
+    Ok(())
+}
+
+/// Every guard a reset checks before it drops anything, read-only: the scope
+/// pin (cleared by `--force` or `--allow-scope-change`), then prod and applied
+/// migrations (cleared by `--force` alone).
+///
+/// One function for both runs, so `--dry-run` refuses exactly where the real
+/// reset does. [`Design::reset`] checks the second guard again after it heals
+/// the bookkeeping; this read needs no heal, since meta is read under either
+/// layout.
+pub(crate) async fn check_reset_guards(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    resolved: &dbd_core::ResolvedScope,
+    force: bool,
+    allow_scope_change: bool,
+) -> Result<()> {
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    if !force {
+        Design::check_reset_guard(meta.as_ref())?;
+    }
     Ok(())
 }
 

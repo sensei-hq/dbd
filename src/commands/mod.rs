@@ -573,6 +573,26 @@ pub(super) async fn get_adapter(
         .context("Failed to connect to database")
 }
 
+/// The database a connecting command would reach, or `None` when nothing
+/// names one: `-d`/`DATABASE_URL`, else the default target's `url` with a
+/// `$VAR` resolved from the environment — the URL [`get_adapter`] connects to.
+/// An unset `$VAR`, or an empty value, names nothing.
+///
+/// For the commands that work offline but must ask a database that exists:
+/// `reset --dry-run` previews without one, and checks its guards against one.
+pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>) -> Result<Option<String>> {
+    let usable = |u: &str| !u.is_empty() && !u.starts_with('$');
+    if let Some(u) = database_url.filter(|u| usable(u)) {
+        return Ok(Some(u.to_string()));
+    }
+    let design_config = dbd_core::config::read(config).context("Failed to read config")?;
+    Ok(design_config
+        .get_target(None)
+        .and_then(|t| t.url.as_deref())
+        .map(resolve_env_vars)
+        .filter(|u| usable(u)))
+}
+
 fn resolve_env_vars(s: &str) -> String {
     if let Some(var) = s.strip_prefix('$') {
         std::env::var(var).unwrap_or_else(|_| s.to_string())

@@ -46,19 +46,8 @@ impl Design {
         // — every ownership operation calls this up front.
         adapter.heal_bookkeeping().await?;
 
-        if !force && let Some(meta) = adapter.get_project_meta().await? {
-            // Compared through the alias table: rows written before the CLI
-            // normalised `-e` can say `production`.
-            if crate::config::normalize_env(Some(&meta.env)).is_ok_and(|env| env == "prod") {
-                return Err(DbdError::SafetyGuard(
-                    "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
-                ));
-            }
-            if meta.version >= 1 {
-                return Err(DbdError::SafetyGuard(
-                    "reset is blocked — database has applied migrations. Use --force to override.".to_string(),
-                ));
-            }
+        if !force {
+            Self::check_reset_guard(adapter.get_project_meta().await?.as_ref())?;
         }
 
         if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
@@ -74,6 +63,30 @@ impl Design {
         }
         adapter.clear_project_migrations().await?;
 
+        Ok(())
+    }
+
+    /// The guard [`Design::reset`] checks unless forced: a database marked prod,
+    /// or one with applied migrations, is not reset. `meta` is the database's
+    /// recorded meta (`None` for one dbd has never written to, which passes).
+    ///
+    /// Public so a preview refuses exactly where the real run does: `reset
+    /// --dry-run` printed the whole plan for a prod database, and exited 0,
+    /// while the real run refused it.
+    pub fn check_reset_guard(meta: Option<&crate::adapter::ProjectMeta>) -> Result<()> {
+        let Some(meta) = meta else { return Ok(()) };
+        // Compared through the alias table: rows written before the CLI
+        // normalised `-e` can say `production`.
+        if crate::config::normalize_env(Some(&meta.env)).is_ok_and(|env| env == "prod") {
+            return Err(DbdError::SafetyGuard(
+                "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
+            ));
+        }
+        if meta.version >= 1 {
+            return Err(DbdError::SafetyGuard(
+                "reset is blocked — database has applied migrations. Use --force to override.".to_string(),
+            ));
+        }
         Ok(())
     }
 
