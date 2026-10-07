@@ -29,7 +29,8 @@
 //! translate, so it goes across verbatim and is reported, like a view body. An
 //! index the target would reject outright — an expression key on SQL Server, a
 //! key on an unbounded text column on MySQL or SQL Server — is left out and
-//! reported, so the script still applies.
+//! reported, so the script still applies. So is a foreign key to a table the
+//! script does not create — one declared `external:`, or left out by `--scope`.
 //!
 //! # SQL Server's schemas and batches
 //!
@@ -49,6 +50,7 @@ use crate::entity::{
 };
 use crate::error::{DbdError, Result};
 use crate::parser::Dialect;
+use std::collections::HashSet;
 
 /// One thing the target could not express faithfully.
 ///
@@ -184,6 +186,20 @@ pub fn emit_schema(
              the script in one call must split on it first.",
         );
     }
+    let script = Script {
+        target,
+        tables: entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Table && e.errors.is_empty() && e.table_def.is_some())
+            .map(|e| e.name.clone())
+            .collect(),
+        externals: design
+            .entities()
+            .iter()
+            .filter(|e| e.entity_type == EntityType::External)
+            .map(|e| e.name.clone())
+            .collect(),
+    };
     let mut out: Vec<String> = Vec::new();
     let mut report = Vec::new();
 
@@ -208,7 +224,7 @@ pub fn emit_schema(
     for e in entities.iter().filter(|e| e.errors.is_empty()) {
         match e.entity_type {
             EntityType::Table => {
-                out.push(emit_table(e, target, &mut report));
+                out.push(emit_table(e, &script, &mut report));
                 out.extend(emit_indexes(e, target, &mut report));
             }
             EntityType::View | EntityType::MaterializedView => {
@@ -235,6 +251,16 @@ pub fn emit_schema(
     }
 
     Ok((join_script(&header, &out, target), report))
+}
+
+/// What the script as a whole holds. A statement naming something outside it —
+/// a key to a table it does not create — cannot apply on its own.
+struct Script {
+    target: Target,
+    /// `schema.name` of every table the script creates.
+    tables: HashSet<String>,
+    /// `schema.name` of every table the design declares `external:`.
+    externals: HashSet<String>,
 }
 
 /// Whether `e` becomes an object in the target — and so needs its schema to
@@ -295,7 +321,8 @@ fn table_name(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
     }
 }
 
-fn emit_table(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String {
+fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> String {
+    let target = script.target;
     let Some(td) = &e.table_def else {
         return format!("{} dbd: {} has no readable structure.", target.comment_prefix(), e.name);
     };
@@ -356,11 +383,13 @@ fn emit_table(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
     });
     for fk in inline.chain(declared) {
         let before = report.len();
-        let clause = foreign_key(e, fk, target, report);
+        let clause = foreign_key(e, fk, script, report);
         for d in &report[before..] {
             lines.push(format!("  {}", d.comment(target)));
         }
-        lines.push(format!("  {clause},"));
+        if let Some(clause) = clause {
+            lines.push(format!("  {clause},"));
+        }
     }
 
     // CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd
@@ -386,15 +415,65 @@ fn emit_table(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
         }
     }
 
-    let body = lines.join("\n");
-    let body = body.trim_end().trim_end_matches(',').to_string();
-    format!("CREATE TABLE {name} (\n{body}\n);")
+    format!("CREATE TABLE {name} (\n{}\n);", table_body(&lines))
+}
+
+/// The lines of a `CREATE TABLE`, without the comma after the last clause.
+///
+/// The last line is not always a clause: a note about something left out (a
+/// key to a table the script does not create) can come after it, and a comma
+/// left before the closing parenthesis is a syntax error on every target.
+fn table_body(lines: &[String]) -> String {
+    let last = lines.iter().rposition(|l| !l.trim_start().starts_with("--"));
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if Some(i) == last {
+                l.trim_end_matches(',')
+            } else {
+                l.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One `FOREIGN KEY … REFERENCES …` clause. An unqualified parent resolves to
 /// the child's own schema, as `search_path` would have.
-fn foreign_key(e: &Entity, fk: &ForeignKey, target: Target, report: &mut Vec<Downgrade>) -> String {
-    let parent = qualified(fk.ref_schema.as_deref().or(e.schema.as_deref()), &fk.ref_table, target);
+///
+/// `None` when the parent is not in the script — declared `external:`, or left
+/// out by `--scope`. SQL Server and MySQL refuse a key to a table that does not
+/// exist, and SQLite accepts one and then fails every insert, so the key is
+/// left out and reported: the script has to apply on its own.
+fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Downgrade>) -> Option<String> {
+    let target = script.target;
+    let parent_schema = fk.ref_schema.as_deref().or(e.schema.as_deref());
+    let parent_name = match parent_schema {
+        Some(s) => format!("{s}.{}", fk.ref_table),
+        None => fk.ref_table.clone(),
+    };
+    if !script.tables.contains(&parent_name) {
+        let why = if script.externals.contains(&parent_name) {
+            format!(
+                "`{parent_name}` is declared `external:` — managed outside this project, so the script does not create it"
+            )
+        } else {
+            format!("`{parent_name}` is not in the emitted script (outside the scope, or not part of the project)")
+        };
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: None,
+            from: format!("a foreign key ({}) to `{parent_name}`", fk.columns.join(", ")),
+            to: "no foreign key".to_string(),
+            reason: format!(
+                "{why}; a key to a table that is not there would fail the script, so it is left \
+                 out — add it once the parent exists"
+            ),
+        });
+        return None;
+    }
+    let parent = qualified(parent_schema, &fk.ref_table, target);
     let mut sql = match &fk.name {
         Some(n) => format!("CONSTRAINT {} ", target.quote(n)),
         None => String::new(),
@@ -419,7 +498,7 @@ fn foreign_key(e: &Entity, fk: &ForeignKey, target: Target, report: &mut Vec<Dow
             }),
         }
     }
-    sql
+    Some(sql)
 }
 
 /// The target's keyword for a referential action; `None` when it has none.
