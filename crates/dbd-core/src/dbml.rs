@@ -742,6 +742,35 @@ mod tests {
         assert!(block.contains("name [unique, name: 'idx_lookups_name']"));
     }
 
+    /// DBML has no table-constraint syntax for UNIQUE; its spelling is a unique
+    /// index, single-column or composite, carrying the constraint's name.
+    #[test]
+    fn a_table_level_unique_constraint_is_written_as_a_named_unique_index() {
+        let entity = make_table_entity(
+            "shop.orders",
+            vec![col("customer_id", "uuid"), col("ref_code", "text")],
+            vec![
+                TableConstraint::Unique {
+                    name: Some("orders_ref_code_uq".to_string()),
+                    columns: vec!["ref_code".to_string()],
+                    nulls_not_distinct: false,
+                },
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec!["customer_id".to_string(), "ref_code".to_string()],
+                    nulls_not_distinct: false,
+                },
+            ],
+        );
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("ref_code [unique, name: 'orders_ref_code_uq']"),
+            "got:\n{block}"
+        );
+        assert!(block.contains("(customer_id, ref_code) [unique]"), "got:\n{block}");
+    }
+
     #[test]
     fn table_with_note() {
         let mut entity = make_table_entity("config.lookups", vec![col("id", "INT")], vec![]);
