@@ -1513,3 +1513,171 @@ fn grants_and_policies_outside_the_scope_are_not_reported() {
         );
     }
 }
+
+// ── A built-in type maps to the target's own; only an enum is called one ───
+
+/// The first word of the type `column` is declared with in the emitted
+/// `CREATE TABLE`.
+fn declared_type(sql: &str, dialect: Dialect, column: &str) -> String {
+    let quoted = match dialect {
+        Dialect::MySql => format!("`{column}` "),
+        Dialect::TSql => format!("[{column}] "),
+        _ => format!("\"{column}\" "),
+    };
+    sql.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(quoted.as_str()))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|ty| ty.trim_end_matches(',').to_string())
+        .unwrap_or_else(|| panic!("{dialect:?}: no column `{column}` in:\n{sql}"))
+}
+
+/// `char(n)`, `real`/`float4` and `time` have an equivalent on every target,
+/// and fell through to the catch-all meant for a user-defined type: emitted as
+/// VARCHAR(255) or nvarchar(255), and reported as "not a built-in type — if it
+/// is an enum, the allowed values are no longer enforced". Neither half was
+/// true. They are built in, none is an enum, and the mapping loses nothing —
+/// so it is the target's own type, and not reported.
+///
+/// PostgreSQL writes a precision before the zone — `timestamp (3) with time
+/// zone` — so reading the type up to its parenthesis took it for a plain
+/// `timestamp`, and SQL Server got a `datetime2` with no offset.
+#[test]
+fn a_built_in_type_with_an_equivalent_maps_faithfully() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, code char(3), letter character, ratio real, \
+         f4 float4, opens time, opens_ms time(3), closes time without time zone, \
+         stamped timestamp(3) with time zone);",
+    )];
+    let expected: [(Dialect, [(&str, &str); 8]); 3] = [
+        (
+            Dialect::MySql,
+            [
+                ("code", "CHAR(3)"),
+                ("letter", "CHAR(1)"),
+                ("ratio", "FLOAT"),
+                ("f4", "FLOAT"),
+                ("opens", "TIME"),
+                ("opens_ms", "TIME(3)"),
+                ("closes", "TIME"),
+                ("stamped", "DATETIME"),
+            ],
+        ),
+        (
+            Dialect::TSql,
+            [
+                ("code", "nchar(3)"),
+                ("letter", "nchar(1)"),
+                ("ratio", "real"),
+                ("f4", "real"),
+                ("opens", "time"),
+                ("opens_ms", "time(3)"),
+                ("closes", "time"),
+                ("stamped", "datetimeoffset"),
+            ],
+        ),
+        (
+            Dialect::Sqlite,
+            [
+                ("code", "TEXT"),
+                ("letter", "TEXT"),
+                ("ratio", "REAL"),
+                ("f4", "REAL"),
+                ("opens", "TEXT"),
+                ("opens_ms", "TEXT"),
+                ("closes", "TEXT"),
+                ("stamped", "TEXT"),
+            ],
+        ),
+    ];
+    for (dialect, columns) in expected {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        for (column, ty) in columns {
+            assert_eq!(
+                declared_type(&sql, dialect, column),
+                ty,
+                "{dialect:?} `{column}`:\n{sql}"
+            );
+            assert!(
+                about(&report, column).is_empty(),
+                "{dialect:?}: `{column}` maps faithfully, so it is not reported: {:?}",
+                about(&report, column)
+            );
+        }
+    }
+}
+
+/// `timetz`, `interval`, `inet` and `cidr` have no faithful equivalent here
+/// and do lose something — but what they lose is not an enum's labels, and the
+/// report said it was. Each is reported with what is actually lost.
+#[test]
+fn a_built_in_type_without_an_equivalent_is_reported_for_what_it_loses() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, opens_tz timetz, closes_tz time with time zone, \
+         opens_tz3 time(3) with time zone, wait interval, ip inet, net cidr);",
+    )];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        let mut lossy = vec![
+            ("wait", "interval type"),
+            ("ip", "network address"),
+            ("net", "network address"),
+        ];
+        // SQLite keeps every date and time as text, the offset included — the
+        // convention `timestamptz` → TEXT already follows unreported.
+        if dialect != Dialect::Sqlite {
+            lossy.extend([
+                ("opens_tz", "time zone"),
+                ("closes_tz", "time zone"),
+                ("opens_tz3", "time zone"),
+            ]);
+        }
+        for (column, loss) in lossy {
+            let entries = about(&report, column);
+            assert_eq!(
+                entries.len(),
+                1,
+                "{dialect:?}: `{column}` is reported once: {report:?}\n{sql}"
+            );
+            assert!(
+                entries[0].reason.contains(loss),
+                "{dialect:?}: `{column}` says it loses its {loss}: {:?}",
+                entries[0]
+            );
+            assert!(
+                !entries[0].reason.contains("enum"),
+                "{dialect:?}: `{column}` is not an enum, and must not be called one: {:?}",
+                entries[0]
+            );
+        }
+    }
+}
+
+/// The enum wording is kept for the one case it describes — a column whose type
+/// is an enum this project declares. A type dbd simply has no mapping for is
+/// reported as that, not as a possible enum.
+#[test]
+fn only_a_declared_enum_is_reported_as_one() {
+    let files = [
+        ("enum/app/status.ddl", "create type status as enum ('open', 'closed');"),
+        (
+            "table/app/t.ddl",
+            "create table t (id integer primary key, state status, cash money);",
+        ),
+    ];
+    for dialect in ALL {
+        let (_, report) = emit_with(dialect, "", &files, None);
+        let state = about(&report, "state");
+        assert!(
+            state.len() == 1 && state[0].reason.contains("enum") && state[0].reason.contains("allowed values"),
+            "{dialect:?}: a declared enum loses its labels, and says so: {report:?}"
+        );
+        let cash = about(&report, "cash");
+        assert!(
+            cash.len() == 1 && !cash[0].reason.contains("enum"),
+            "{dialect:?}: `money` is not an enum here, and is not called one: {report:?}"
+        );
+    }
+}
