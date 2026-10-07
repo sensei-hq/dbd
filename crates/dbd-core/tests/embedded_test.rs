@@ -998,6 +998,55 @@ async fn migration_upgrades_schema() {
     assert_column_exists(&*adapter, "app", "items", "notes").await;
 }
 
+// ── Test: init --from-db keeps a view's and a matview's own comment ───────────
+
+/// `init --from-db` wrote a table's comment and dropped a view's and a
+/// materialized view's: neither introspection read them nor the emitter wrote
+/// them. A matview comment that is a drift stamp a dbd before 0.25 wrote is
+/// dbd's, not the author's, and stays out of the file.
+#[tokio::test]
+async fn reverse_engineering_keeps_a_views_and_a_matviews_own_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.t (id int primary key); \
+             CREATE VIEW app.v AS SELECT id FROM app.t; \
+             COMMENT ON VIEW app.v IS 'the view''s comment'; \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT id FROM app.t; \
+             COMMENT ON MATERIALIZED VIEW app.mv IS 'the matview'; \
+             CREATE MATERIALIZED VIEW app.stamped AS SELECT id FROM app.t; \
+             COMMENT ON MATERIALIZED VIEW app.stamped IS 'dbd:hash=v2:abc123';",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let emitted = |name: &str| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} introspected"));
+        dbd_core::emit::emit_entity(e).unwrap_or_default()
+    };
+
+    let v = emitted("app.v");
+    assert!(
+        v.contains(r#"COMMENT ON VIEW "app"."v" IS 'the view''s comment';"#),
+        "{v}"
+    );
+    let mv = emitted("app.mv");
+    assert!(
+        mv.contains(r#"COMMENT ON MATERIALIZED VIEW "app"."mv" IS 'the matview';"#),
+        "{mv}"
+    );
+    let stamped = emitted("app.stamped");
+    assert!(
+        !stamped.contains("COMMENT ON"),
+        "a legacy stamp is not the author's comment: {stamped}"
+    );
+}
+
 // ── Test 6: Postgres introspection ───────────────────────────────────────────
 
 #[tokio::test]
