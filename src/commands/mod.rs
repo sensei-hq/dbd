@@ -857,6 +857,34 @@ mod tests {
     }
 
     /// The `run` dispatcher routes a non-DB command (Doctor) to its handler.
+    /// Only `deploy` downloads a GitHub source. Any other command given one
+    /// says so, instead of failing to read `owner/repo/design.yaml` from disk.
+    #[tokio::test]
+    async fn a_github_source_outside_deploy_is_refused_with_the_way_out() {
+        use crate::cli::Commands;
+        let source = "sensei-hq/no-such-local-dir/database";
+        let err = run(
+            &Commands::Inspect {
+                name: None,
+                fix: false,
+                from_db: false,
+            },
+            &Path::new(source).join("design.yaml"),
+            "dev",
+            None,
+            Path::new(source),
+            source,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dbd deploy"), "names the command that can: {err}");
+        assert!(err.contains("clone"), "and the way out: {err}");
+    }
+
     #[tokio::test]
     async fn run_dispatches_non_db_command() {
         use crate::cli::Commands;

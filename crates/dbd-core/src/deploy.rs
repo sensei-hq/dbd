@@ -213,6 +213,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// `GITHUB_TOKEN` reaches GitHub's API, which serves private tarballs to a
+    /// bearer token — and nothing else. A token sent to whatever host a URL
+    /// names would leak to the first non-GitHub source.
+    #[test]
+    fn the_token_goes_to_the_github_api_only() {
+        let api = "https://api.github.com/repos/o/r/tarball/main";
+        assert_eq!(github_auth(api, Some("t0k")).as_deref(), Some("Bearer t0k"));
+        assert_eq!(github_auth(api, None), None, "no token, no header");
+        assert_eq!(github_auth(api, Some("")), None, "an empty token is no token");
+        for elsewhere in [
+            "https://codeload.github.com/o/r/tar.gz/main",
+            "http://api.github.com/repos/o/r/tarball/main",
+            "https://api.github.com.evil.example/repos/o/r/tarball/main",
+            "https://example.com/api.github.com/",
+        ] {
+            assert_eq!(github_auth(elsewhere, Some("t0k")), None, "{elsewhere}");
+        }
+    }
+
     #[test]
     fn resolve_subpath_without_sub() {
         let base = PathBuf::from("/cache/owner-repo-HEAD");
