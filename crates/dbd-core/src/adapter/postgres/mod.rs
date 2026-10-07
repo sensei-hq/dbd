@@ -1390,30 +1390,44 @@ impl DatabaseAdapter for PostgresAdapter {
         // Quoted part by part rather than by string-replacing the dot: that left
         // an embedded `"` free to close the quoting and continue the statement.
         let qualified = crate::sql_quote::qualified(&entity.name);
-        let copy_sql = match format {
-            "tsv" => {
-                format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')")
-            }
-            "jsonl" => format!("COPY (SELECT row_to_json(t) FROM {qualified} t) TO STDOUT"),
-            _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
-        };
-
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
-
         let mut data = Vec::new();
-        let mut copy = conn
-            .copy_out_raw(&copy_sql)
-            .await
-            .map_err(|e| DbdError::Config(format!("COPY OUT failed: {e}")))?;
-
         use futures_lite::StreamExt;
-        while let Some(chunk) = copy.next().await {
-            let chunk = chunk.map_err(|e| DbdError::Config(format!("COPY OUT read failed: {e}")))?;
-            data.extend_from_slice(&chunk);
+
+        if format == "jsonl" {
+            // Fetched as rows, not `COPY … TO STDOUT`: COPY's text format escapes
+            // every backslash again, and the JSON `row_to_json` renders is full
+            // of them — a newline came out as `\\n`, a quote as `\\"`, and the
+            // file imported back as different values (or as no JSON at all).
+            let sql = format!("SELECT row_to_json(t)::text FROM {qualified} t");
+            let mut rows = sqlx::query_scalar::<_, String>(&sql).fetch(&self.pool);
+            while let Some(line) = rows.next().await {
+                let line = line.map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
+                data.extend_from_slice(line.as_bytes());
+                data.push(b'\n');
+            }
+        } else {
+            let copy_sql = match format {
+                "tsv" => format!(
+                    "COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
+                ),
+                _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+            };
+
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| DbdError::Config(format!("Connection acquire failed: {e}")))?;
+
+            let mut copy = conn
+                .copy_out_raw(&copy_sql)
+                .await
+                .map_err(|e| DbdError::Config(format!("COPY OUT failed: {e}")))?;
+
+            while let Some(chunk) = copy.next().await {
+                let chunk = chunk.map_err(|e| DbdError::Config(format!("COPY OUT read failed: {e}")))?;
+                data.extend_from_slice(&chunk);
+            }
         }
 
         // `Some(dir)` → write `dir/<name>.<format>` (flat).
