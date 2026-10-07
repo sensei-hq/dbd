@@ -82,6 +82,15 @@ pub async fn run(
     verbosity: Verbosity,
 ) -> Result<()> {
     warn_if_scope_ignored(command, scope);
+    // `deploy` downloads a GitHub source; nothing else does. Several commands
+    // write into the project (snapshot, release, format, inspect --fix), and a
+    // downloaded tree is a cache — so the rest take a local path only.
+    if !matches!(command, Commands::Deploy { .. }) && dbd_core::github::is_github_source(source) {
+        anyhow::bail!(
+            "`{source}` looks like a GitHub source, and only `dbd deploy` fetches one. \
+             For other commands, clone the repository and pass its local path to --source."
+        );
+    }
     match command {
         Commands::Inspect { name, fix, from_db } => {
             schema::cmd_inspect(
