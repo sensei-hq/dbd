@@ -1309,6 +1309,41 @@ mod tests {
         expected.iter().map(|(id, v)| (*id, v.map(str::to_string))).collect()
     }
 
+    /// A SQLite export imports back to the same values. Cells were joined with
+    /// the delimiter unquoted, so a comma, quote or line break in a value broke
+    /// the row, and NULL and `''` both came out empty. Written as Postgres
+    /// writes CSV — quoted where needed, NULL empty, `''` as `""` — the RFC 4180
+    /// reader on the other side gets back what was there.
+    #[tokio::test]
+    async fn a_csv_export_imports_back_to_the_same_values() {
+        let expected = rows(&[
+            (1, Some("Japan, Nippon")),
+            (2, Some("say \"hi\"")),
+            (3, Some("two\nlines")),
+            (4, Some("  padded  ")),
+            (5, Some("")),
+            (6, None),
+        ]);
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        for (id, v) in &expected {
+            sqlx::query("INSERT INTO t (id, v) VALUES (?, ?)")
+                .bind(id)
+                .bind(v)
+                .execute(&a.pool)
+                .await
+                .unwrap();
+        }
+        let mut entity = Entity::new(EntityType::Table, "default.t");
+        entity.format = Some("csv".to_string());
+        let out = tempfile::tempdir().unwrap();
+        a.export_data(&entity, Some(out.path())).await.unwrap();
+        let body = std::fs::read_to_string(out.path().join("t.csv")).unwrap();
+
+        let got = load_delimited("csv", &body, "").await.expect("the export must import");
+        assert_eq!(got, expected, "{body}");
+    }
+
     /// RFC 4180: a quoted field may hold the delimiter, a doubled quote and a
     /// line break, and nothing is trimmed. Each line was split on commas and
     /// every cell trimmed — a quoted comma was "too many columns", quotes were
