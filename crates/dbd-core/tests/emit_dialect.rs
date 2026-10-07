@@ -1829,3 +1829,51 @@ fn a_check_is_translated_for_sqlite_or_left_out_and_reported() {
         "and leaving it out is reported: {report:?}"
     );
 }
+
+/// A view written for SQLite returns what it returned on PostgreSQL where
+/// SQLite can say so. A column PostgreSQL names itself is called that — SQLite
+/// would call `count(*)` `count(*)`, and a view reading `count` found nothing.
+/// NULL sorts last going up, as in PostgreSQL, where SQLite puts it first. And
+/// LIKE's backslash escapes, as PostgreSQL's does and SQLite's does not.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_sqlite_view_keeps_postgres_column_names_null_order_and_like_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = |body: &str| format!("set search_path to core;\n{body}\n");
+    let design = project_from(
+        tmp.path(),
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n",
+        &[
+            (
+                "ddl/table/core/items.ddl",
+                &file("create table items (id integer primary key, name text, grp text not null);"),
+            ),
+            (
+                "ddl/view/core/counts.ddl",
+                &file("create view counts as select grp, count(*) from items group by grp;"),
+            ),
+            (
+                "ddl/view/core/busy.ddl",
+                &file("create view busy as select grp from counts where count > 1;"),
+            ),
+            (
+                "ddl/view/core/ordered.ddl",
+                &file("create view ordered as select name from items order by name;"),
+            ),
+            (
+                "ddl/view/core/underscored.ddl",
+                &file("create view underscored as select name from items where name like 'a\\_%';"),
+            ),
+        ],
+    );
+    let (sql, _) = emit_schema(&design, Dialect::Sqlite, None).expect("emits");
+    let rows = "insert into core_items values (1, 'a_x', 'g'), (2, 'abc', 'g'), (3, null, 'h');";
+    for (query, expected) in [
+        ("select group_concat(grp) from core_busy", "g"),
+        ("select coalesce(name, 'NULL') from core_ordered limit 1", "a_x"),
+        ("select group_concat(name) from core_underscored", "a_x"),
+    ] {
+        let got = on_sqlite(&sql, rows, query).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(got, expected, "`{query}`:\n{sql}");
+    }
+}
