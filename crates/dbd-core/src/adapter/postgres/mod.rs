@@ -948,7 +948,8 @@ impl PostgresAdapter {
     async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("schemaname");
         let sql = format!(
-            "SELECT schemaname, viewname, definition \
+            "SELECT schemaname, viewname, definition, \
+                    obj_description(format('%I.%I', schemaname, viewname)::regclass, 'pg_class') AS comment \
              FROM pg_views \
              WHERE {ns_filter} \
              ORDER BY schemaname, viewname"
@@ -966,6 +967,7 @@ impl PostgresAdapter {
                 let definition: String = row.get("definition");
                 let mut e = Entity::new(EntityType::View, &format!("{schema}.{viewname}"));
                 e.body = vec![definition];
+                e.comment = row.get("comment");
                 e
             })
             .collect();
@@ -987,7 +989,8 @@ impl PostgresAdapter {
 
         let ns_filter = Self::schema_filter_column("schemaname");
         let sql = format!(
-            "SELECT schemaname, matviewname, definition \
+            "SELECT schemaname, matviewname, definition, \
+                    obj_description(format('%I.%I', schemaname, matviewname)::regclass, 'pg_class') AS comment \
              FROM pg_matviews \
              WHERE {ns_filter} \
              ORDER BY schemaname, matviewname"
@@ -1009,6 +1012,10 @@ impl PostgresAdapter {
 
             let mut e = Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
             e.body = vec![definition];
+            // A dbd before 0.25 kept its drift stamp as the matview's whole
+            // comment; that is dbd's bookkeeping, not the author's comment.
+            let comment: Option<String> = row.get("comment");
+            e.comment = comment.filter(|c| crate::reconcile::parse_dbd_hash(Some(c)).is_none());
             if !indexes.is_empty() {
                 e.table_def = Some(TableDef {
                     columns: Vec::new(),

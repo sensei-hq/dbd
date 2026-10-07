@@ -348,7 +348,12 @@ pub fn emit_view(entity: &Entity) -> String {
     let name = bare(&entity.name);
     let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
-    format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
+    let qname = format!("{}.{}", q(schema), q(name));
+    let mut out = format!("CREATE VIEW {qname} AS {body};");
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
+    }
+    out
 }
 
 /// `CREATE MATERIALIZED VIEW IF NOT EXISTS "schema"."name" AS <definition> WITH DATA;`
@@ -375,6 +380,12 @@ pub fn emit_matview(entity: &Entity) -> String {
             out.push('\n');
             out.push_str(&emit_index_sql(ix, &qname, name, true));
         }
+    }
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!(
+            "\nCOMMENT ON MATERIALIZED VIEW {qname} IS '{}';",
+            esc(comment)
+        ));
     }
     out
 }
