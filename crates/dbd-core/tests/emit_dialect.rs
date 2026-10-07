@@ -546,3 +546,170 @@ fn a_foreign_key_to_a_table_outside_the_scope_is_left_out_and_reported() {
         );
     }
 }
+
+// ── The emitted SQLite script applies ───────────────────────────────────────
+
+/// Apply `script` to a fresh in-memory SQLite database with foreign keys
+/// enforced, run `then`, and return the one text value `query` selects.
+///
+/// The end-to-end check the other targets cannot have here: the script either
+/// lands on a real engine or the error says which statement did not.
+#[cfg(feature = "sqlite")]
+fn on_sqlite(script: &str, then: &str, query: &str) -> Result<String, String> {
+    use sqlx::Connection;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::raw_sql("PRAGMA foreign_keys = ON;")
+            .execute(&mut db)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::raw_sql(script)
+            .execute(&mut db)
+            .await
+            .map_err(|e| format!("the script does not apply: {e}\n{script}"))?;
+        if !then.is_empty() {
+            sqlx::raw_sql(then)
+                .execute(&mut db)
+                .await
+                .map_err(|e| format!("`{then}` failed: {e}\n{script}"))?;
+        }
+        sqlx::query_scalar::<_, String>(query)
+            .fetch_one(&mut db)
+            .await
+            .map_err(|e| format!("`{query}` failed: {e}"))
+    })
+}
+
+/// Every fixture in this file, emitted for SQLite, is a script SQLite accepts.
+#[cfg(feature = "sqlite")]
+#[test]
+fn the_emitted_sqlite_script_applies() {
+    let external = [(
+        "table/app/profiles.ddl",
+        "create table profiles (id integer primary key, user_id uuid not null references auth.users (id));",
+    )];
+    for (label, sql) in [
+        ("orders", emit(Dialect::Sqlite).0),
+        ("keyed", emit_keyed(Dialect::Sqlite).0),
+        (
+            "external",
+            emit_with(Dialect::Sqlite, "\nexternal:\n  - name: auth.users\n", &external, None).0,
+        ),
+        ("defaults", emit_with(Dialect::Sqlite, "", &DEFAULTS, None).0),
+    ] {
+        if let Err(e) = on_sqlite(&sql, "", "select 'ok'") {
+            panic!("{label}: {e}");
+        }
+    }
+}
+
+// ── A default is translated, or reported ───────────────────────────────────
+
+/// Defaults of every shape: literals behind a cast, the clock, a random UUID,
+/// and a function call nothing translates.
+const DEFAULTS: [(&str, &str); 1] = [(
+    "table/app/things.ddl",
+    "create table things (\n  \
+       id      integer primary key\n, \
+       uid     uuid not null default gen_random_uuid()\n, \
+       status  text not null default 'open'::text\n, \
+       path    varchar(40) default 'a\\b'\n, \
+       made    date default current_date\n, \
+       at      timestamptz default now()\n, \
+       flag    boolean not null default true\n, \
+       digest  text default md5(random()::text)\n\
+     );",
+)];
+
+/// `md5(random()::text)` is PostgreSQL SQL, and dbd does not translate
+/// expressions. Dropping it was right — the target may not have the function —
+/// but dropping it without a word left a column that is silently NULL.
+#[test]
+fn a_default_nothing_translates_is_dropped_and_reported() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &DEFAULTS, None);
+        assert!(!sql.contains("md5"), "{dialect:?}: it is not emitted: {sql}");
+        assert!(
+            report
+                .iter()
+                .any(|d| d.column.as_deref() == Some("digest") && d.from.contains("md5") && d.to == "no default"),
+            "{dialect:?}: and dropping it is reported: {report:?}"
+        );
+    }
+}
+
+/// `'open'::text` is a literal behind a PostgreSQL cast. `::` is a syntax error
+/// on all three targets; the literal is what the default means.
+#[test]
+fn a_cast_literal_default_keeps_the_literal_and_drops_the_cast() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &DEFAULTS, None);
+        assert!(!statements(&sql).contains("::"), "{dialect:?}: {sql}");
+        assert!(sql.contains("'open'"), "{dialect:?}: {sql}");
+        assert!(
+            !report.iter().any(|d| d.column.as_deref() == Some("status")),
+            "{dialect:?}: a literal is faithful, not a downgrade: {report:?}"
+        );
+    }
+}
+
+/// The defaults with a faithful equivalent are translated, not dropped.
+#[test]
+fn the_clock_and_a_random_uuid_are_translated() {
+    let (tsql, report) = emit_with(Dialect::TSql, "", &DEFAULTS, None);
+    assert!(tsql.contains("DEFAULT NEWID()"), "gen_random_uuid() is NEWID(): {tsql}");
+    assert!(
+        tsql.contains("[made] date DEFAULT CONVERT(date, SYSDATETIME())"),
+        "{tsql}"
+    );
+    assert!(
+        !report
+            .iter()
+            .any(|d| d.column.as_deref() == Some("uid") || d.column.as_deref() == Some("made")),
+        "both are faithful on SQL Server: {report:?}"
+    );
+
+    let (mysql, report) = emit_with(Dialect::MySql, "", &DEFAULTS, None);
+    assert!(mysql.contains("DEFAULT (CURRENT_DATE)"), "{mysql}");
+    // MySQL's UUID() is version 1 — time and host, not random — so it is the
+    // nearest thing, and reported.
+    assert!(mysql.contains("DEFAULT (UUID())"), "{mysql}");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.column.as_deref() == Some("uid") && d.from.contains("gen_random_uuid")),
+        "{report:?}"
+    );
+}
+
+/// MySQL takes a default on a TEXT column only as an expression — `('open')`,
+/// not `'open'` — and reads a backslash in a string as an escape, which a
+/// PostgreSQL literal does not.
+#[test]
+fn mysql_gets_a_text_default_as_an_expression_and_its_backslashes_escaped() {
+    let (mysql, _) = emit_with(Dialect::MySql, "", &DEFAULTS, None);
+    assert!(mysql.contains("`status` TEXT NOT NULL DEFAULT ('open')"), "{mysql}");
+    assert!(mysql.contains(r"DEFAULT 'a\\b'"), "{mysql}");
+}
+
+/// On SQLite the translated defaults are checked by the engine itself: a row
+/// given only its key gets a UUID-shaped id, the literal, today, and `1`.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_fills_the_translated_defaults() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &DEFAULTS, None);
+    let row = on_sqlite(
+        &sql,
+        "insert into app_things (id) values (1);",
+        "select length(uid) || '|' || substr(uid, 15, 1) || '|' || status || '|' || path || '|' \
+         || (made = date('now')) || '|' || flag from app_things",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(row, r"36|4|open|a\b|1|1", "{sql}");
+}
