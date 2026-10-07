@@ -1939,6 +1939,55 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// A sequence belongs to its schema like a table does. `is_scopable` left
+    /// sequences out, so every scope dropped them — even one that only
+    /// excludes another schema — and the table whose default draws from one
+    /// failed to apply.
+    #[test]
+    fn a_scope_keeps_the_sequences_of_the_schemas_it_keeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/sequence/app", "ddl/table/app", "ddl/table/staging"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\n  - staging\n\
+             scopes:\n  no_staging:\n    excludes: [staging]\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/sequence/app/item_seq.ddl"),
+            "set search_path to app;\ncreate sequence if not exists item_seq;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            "set search_path to app;\ncreate table if not exists items (id integer primary key default nextval('app.item_seq'));\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/raw.ddl"),
+            "set search_path to staging;\ncreate table if not exists raw (line text);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        for name in ["no_staging", "app_only"] {
+            let scope = design.resolve_scope(Some(name), None).unwrap();
+            let names: Vec<String> = design
+                .scoped_entities(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert!(
+                names.contains(&"app.item_seq".to_string()),
+                "{name} keeps app's sequence: {names:?}"
+            );
+            assert!(!names.contains(&"staging.raw".to_string()), "{name}: {names:?}");
+        }
+    }
+
     /// A role, or an extension declared without `schema:`, lives in no schema.
     /// `managed_schemas` mapped both to `public`, so a design with either made
     /// `public` managed and `reconcile --prune` dropped tables there that the
