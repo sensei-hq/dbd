@@ -486,6 +486,12 @@ pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
             "{} entities applied (no project.version — the database is not versioned).",
             s.applied
         ),
+        // The database had no version but was not empty — built before the
+        // project had one, typically. Its objects were applied over in place.
+        ApplyStrategy::Fresh if s.previously_built => format!(
+            "v{} recorded on a database that was already built but had no version — {} entities applied.",
+            s.to_version, s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }

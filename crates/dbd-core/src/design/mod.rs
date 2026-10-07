@@ -46,6 +46,12 @@ pub struct ApplyComplete {
     /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
     /// Realtime must say so, not report a clean success.
     pub warnings: Vec<String>,
+    /// For a [`ApplyStrategy::Fresh`] run: whether the database was already
+    /// built before it — dbd had applied it without a version, or the design's
+    /// objects were already there. A database with no recorded version is not
+    /// necessarily empty, and calling this run a fresh install said it was.
+    /// Always `false` for the other strategies.
+    pub previously_built: bool,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded

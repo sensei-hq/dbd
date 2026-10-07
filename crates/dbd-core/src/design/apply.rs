@@ -198,6 +198,7 @@ impl Design {
                 before_scripts: before.ran,
                 after_scripts: after.ran,
                 warnings: [before.warnings, after.warnings].concat(),
+                previously_built: false,
             });
             return Ok(());
         }
@@ -219,6 +220,15 @@ impl Design {
             &pending,
             working_set.as_ref(),
         );
+
+        // No recorded version does not mean an empty database: one built
+        // before the project had a version records none, and neither does one
+        // built by hand. Asked before the plan runs, since its SetVersion step
+        // writes the very record this looks for.
+        let previously_built = plan.strategy == ApplyStrategy::Fresh && {
+            let live: std::collections::HashSet<String> = adapter.list_entities().await?.into_iter().collect();
+            adapter.get_project_meta().await?.is_some() || valid_entities.iter().any(|e| live.contains(&e.name))
+        };
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();
@@ -352,6 +362,7 @@ impl Design {
             before_scripts: before.ran,
             after_scripts: after.ran,
             warnings: [before.warnings, after.warnings].concat(),
+            previously_built,
         });
         Ok(())
     }
