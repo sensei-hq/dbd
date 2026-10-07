@@ -36,6 +36,13 @@ impl From<DepsArg> for dbd_core::config::DepsPolicy {
     }
 }
 
+/// `-e` as its canonical name. Aliases normalise here, at the boundary, so every
+/// command, the bookkeeping row and the `import/<env>/` folders see `dev` or
+/// `prod` — never `production`, which the reset guard would not recognise.
+fn parse_environment(value: &str) -> Result<String, String> {
+    dbd_core::config::normalize_env(Some(value)).map_err(|e| e.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "dbd", version, about = "Database schema management as code")]
 pub struct Cli {
@@ -50,8 +57,8 @@ pub struct Cli {
     #[arg(short, long, env = "DATABASE_URL", global = true, hide_env_values = true)]
     pub database: Option<String>,
 
-    /// Environment (dev or prod)
-    #[arg(short, long, default_value = "prod", global = true)]
+    /// Environment: dev or prod (development and production are accepted)
+    #[arg(short, long, default_value = "prod", global = true, value_parser = parse_environment)]
     pub environment: String,
 
     /// Source directory or GitHub repo (owner/repo/path)
