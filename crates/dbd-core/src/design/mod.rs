@@ -1036,11 +1036,14 @@ impl Design {
             Some(s) => self.scoped_entities(s)?,
             None => self.entities.clone(),
         };
+        // The script is for this project's own engine, so dbd's generated
+        // statements are written in its dialect too (see `combined_ddl`).
+        let dialect = crate::parser::Dialect::from_label(&self.dialect).unwrap_or_default();
         let combined: Vec<String> = entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
-            .filter_map(script::ddl_from_entity)
+            .filter_map(|e| script::combined_ddl(e, dialect))
             .collect();
 
         std::fs::write(file, combined.join("\n"))?;
