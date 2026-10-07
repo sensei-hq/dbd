@@ -2062,6 +2062,57 @@ import:
         );
     }
 
+    /// A scope skips a hook only for what the design manages outside it. A hook
+    /// touching an `external:` table — or one it creates itself — was skipped
+    /// under every named scope, because the working set never holds such names;
+    /// the apply then failed on the schema that hook was there to prepare.
+    #[tokio::test]
+    async fn a_scoped_apply_runs_hooks_that_touch_only_what_the_design_does_not_manage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/table/billing", "sql"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\n  - billing\nexternal:\n  - name: auth.users\n\
+             apply:\n  before:\n    - sql/auth.sql\n    - sql/billing.sql\n\
+             scopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/auth.sql"),
+            "create schema if not exists auth;\ncreate table if not exists auth.users (id uuid primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/billing.sql"),
+            "insert into billing.invoices (id) values (1);\n",
+        )
+        .unwrap();
+        for (schema, table) in [("app", "items"), ("billing", "invoices")] {
+            std::fs::write(
+                dir.join(format!("ddl/table/{schema}/{table}.ddl")),
+                format!("set search_path to {schema};\ncreate table if not exists {table} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+        let mock = MockAdapter::new();
+        design
+            .apply(&mock, None, false, Some(&scope), Progress::none())
+            .await
+            .unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(scripts.contains("auth.users"), "the external's hook runs: {scripts}");
+        assert!(
+            !scripts.contains("billing.invoices"),
+            "a hook on a managed table outside the scope does not: {scripts}"
+        );
+    }
+
     /// A trigger written in a table's file fires a function the table then
     /// depends on. The parser skipped `CREATE TRIGGER`, so no edge existed:
     /// `inspect` said all was well and apply ran the trigger before the
