@@ -39,6 +39,13 @@ pub struct DbmlDocument {
 
 /// Generate DBML from parsed entities, applying include/exclude filters.
 pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
+    // The filters run in here, so `entities` is already the whole design.
+    generate_dbml_in(params, params.entities)
+}
+
+/// [`generate_dbml`], typing stub tables from `design` — every entity in the
+/// design, which is wider than `params.entities` when a scope narrowed them.
+fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
     let mut sections = Vec::new();
 
     // Project block
@@ -82,12 +89,6 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         sections.push(refs);
     }
 
-    // External entity stub tables (for FK targets that are External entities)
-    let external_stubs = emit_external_stubs(params.entities);
-    if !external_stubs.is_empty() {
-        sections.push(external_stubs);
-    }
-
     // Table groups — explicit first, then auto-by-schema for any schema the
     // explicit groups didn't cover.
     let included_tables: Vec<&Entity> = filtered
@@ -95,6 +96,15 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
         .copied()
         .filter(|e| e.entity_type == EntityType::Table)
         .collect();
+
+    // A stub for every table a Ref points at that this document does not
+    // define: a Ref to an undefined table is a DBML error, whether the target
+    // is an External, a table a scope or filter left out, or one the design
+    // never declares.
+    let stubs = emit_ref_target_stubs(&included_tables, design);
+    if !stubs.is_empty() {
+        sections.push(stubs);
+    }
     let table_groups = emit_table_groups(&included_tables, &params.groups, params.auto_group_by_schema);
     if !table_groups.is_empty() {
         sections.push(table_groups);
@@ -109,7 +119,13 @@ pub fn generate_dbml(params: &DbmlParams) -> DbmlDocument {
 /// Inputs for `generate_all`. Mirrors `DbmlParams` but the per-doc filter
 /// state comes from the `DesignConfig` rather than being repeated per call.
 pub struct DbmlMultiParams<'a> {
+    /// The entities to document — under `--scope`, the scope's working set.
     pub entities: &'a [Entity],
+    /// Every entity in the design, before a scope narrowed `entities`. Read
+    /// only to give a stub table — the stand-in for a referenced table the
+    /// document leaves out — the referenced columns' real types instead of a
+    /// `varchar` guess. Pass `entities` again when nothing was narrowed.
+    pub design_entities: &'a [Entity],
     pub project_name: &'a str,
     pub database_type: &'a str,
     pub project_note: Option<&'a str>,
@@ -123,18 +139,21 @@ pub struct DbmlMultiParams<'a> {
 /// no-config default).
 pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
     if params.docs.is_empty() {
-        let doc = generate_dbml(&DbmlParams {
-            entities: params.entities,
-            project_name: params.project_name,
-            database_type: params.database_type,
-            project_note: params.project_note,
-            include_schemas: vec![],
-            exclude_schemas: vec![],
-            include_tables: vec![],
-            exclude_tables: vec![],
-            groups: vec![],
-            auto_group_by_schema: false,
-        });
+        let doc = generate_dbml_in(
+            &DbmlParams {
+                entities: params.entities,
+                project_name: params.project_name,
+                database_type: params.database_type,
+                project_note: params.project_note,
+                include_schemas: vec![],
+                exclude_schemas: vec![],
+                include_tables: vec![],
+                exclude_tables: vec![],
+                groups: vec![],
+                auto_group_by_schema: false,
+            },
+            params.design_entities,
+        );
         return vec![doc];
     }
 
@@ -159,18 +178,21 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
                 tables: g.tables.clone(),
             })
             .collect();
-        let mut doc = generate_dbml(&DbmlParams {
-            entities: params.entities,
-            project_name: params.project_name,
-            database_type: params.database_type,
-            project_note: params.project_note,
-            include_schemas: inc_schemas,
-            exclude_schemas: exc_schemas,
-            include_tables: inc_tables,
-            exclude_tables: exc_tables,
-            groups,
-            auto_group_by_schema: cfg.auto_group_by_schema,
-        });
+        let mut doc = generate_dbml_in(
+            &DbmlParams {
+                entities: params.entities,
+                project_name: params.project_name,
+                database_type: params.database_type,
+                project_note: params.project_note,
+                include_schemas: inc_schemas,
+                exclude_schemas: exc_schemas,
+                include_tables: inc_tables,
+                exclude_tables: exc_tables,
+                groups,
+                auto_group_by_schema: cfg.auto_group_by_schema,
+            },
+            params.design_entities,
+        );
         doc.file_name = cfg.output.clone().unwrap_or_else(|| format!("{key}.dbml"));
         out.push(doc);
     }
@@ -616,100 +638,82 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
     format!("Ref: {} > {}{}", source_cols, target_cols, settings_str)
 }
 
-/// Generate stub Table blocks for External entities that are FK targets.
+/// Stub `Table` blocks for every table a Ref from `documented` points at that
+/// `documented` does not define, each holding only the referenced columns.
 ///
-/// Scans all Table entities for FK constraints (inline + table-level) pointing
-/// to an External entity. For each such external, emits a minimal Table block
-/// containing only the referenced columns plus an "[external]" note.
-/// External entities with no FK references (e.g. functions like auth.uid) are skipped.
-fn emit_external_stubs(entities: &[Entity]) -> String {
-    // Collect external entity names for quick lookup
-    let external_names: std::collections::HashSet<&str> = entities
-        .iter()
-        .filter(|e| e.entity_type == EntityType::External)
-        .map(|e| e.name.as_str())
-        .collect();
+/// A Ref to a table the document does not define is a DBML error, and stubs
+/// used to exist only for External entities — so `dbd dbml --scope` wrote Refs
+/// to the scope's out-of-scope parents with nothing for them to land on. The
+/// target is looked up in `design`: a table the design defines keeps the
+/// referenced columns' real types; an External, or a table the design never
+/// declares, has no types to give and gets `varchar`.
+fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity]) -> String {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-    if external_names.is_empty() {
-        return String::new();
-    }
-
-    // For each external entity, collect referenced columns from FK constraints
-    let mut external_refs: std::collections::HashMap<&str, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
-
-    for entity in entities {
-        if entity.entity_type != EntityType::Table {
-            continue;
-        }
-        let Some(ref table_def) = entity.table_def else {
+    let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
+    let mut targets: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for entity in documented {
+        let Some(table_def) = &entity.table_def else {
             continue;
         };
-
-        // Inline FKs from columns
-        for col in &table_def.columns {
-            if let Some(ref fk) = col.inline_fk {
-                record_external_fk(fk, &external_names, &mut external_refs);
+        let inline = table_def.columns.iter().filter_map(|c| c.inline_fk.as_ref());
+        let table_level = table_def.constraints.iter().filter_map(|c| match c {
+            TableConstraint::ForeignKey(fk) => Some(fk),
+            _ => None,
+        });
+        for fk in inline.chain(table_level) {
+            // Named exactly as `emit_ref` names the target, so the stub is the
+            // table the Ref line points at.
+            let target = format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table);
+            if !defined.contains(&target) {
+                targets
+                    .entry(target)
+                    .or_default()
+                    .extend(fk.ref_columns.iter().map(String::as_str));
             }
         }
-
-        // Table-level FK constraints
-        for constraint in &table_def.constraints {
-            if let TableConstraint::ForeignKey(fk) = constraint {
-                record_external_fk(fk, &external_names, &mut external_refs);
-            }
-        }
     }
 
-    if external_refs.is_empty() {
-        return String::new();
-    }
-
-    let mut blocks = Vec::new();
-    let mut sorted_names: Vec<&&str> = external_refs.keys().collect();
-    sorted_names.sort();
-
-    for ext_name in sorted_names {
-        let cols = external_refs.get(ext_name).unwrap();
-        blocks.push(emit_external_stub_block(ext_name, cols));
-    }
-
-    blocks.join("\n")
+    targets
+        .iter()
+        .map(|(target, columns)| {
+            let known = design.iter().find(|e| {
+                matches!(e.entity_type, EntityType::Table | EntityType::External) && qualified_name(e) == *target
+            });
+            emit_stub_block(target, columns, known)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// If `fk` targets a known external entity, record its referenced columns under
-/// that entity's name in `external_refs`.
-fn record_external_fk<'a>(
-    fk: &crate::entity::ForeignKey,
-    external_names: &std::collections::HashSet<&'a str>,
-    external_refs: &mut std::collections::HashMap<&'a str, std::collections::HashSet<String>>,
-) {
-    let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
-    let qualified = format!("{}.{}", ref_schema, fk.ref_table);
-    if let Some(ext_name) = external_names.iter().find(|n| **n == qualified) {
-        let entry = external_refs.entry(ext_name).or_default();
-        for rc in &fk.ref_columns {
-            entry.insert(rc.clone());
-        }
-    }
+/// `schema.table` for an entity, as the document's `Table` and `Ref` lines
+/// name it.
+fn qualified_name(entity: &Entity) -> String {
+    let schema = entity.schema.as_deref().unwrap_or("public");
+    let base = entity.name.split('.').next_back().unwrap_or(&entity.name);
+    format!("{schema}.{base}")
 }
 
-/// Render a DBML stub `Table` block for one external entity and its referenced
-/// columns (typed generically as `varchar`, since the real types are unknown).
-fn emit_external_stub_block(ext_name: &str, cols: &std::collections::HashSet<String>) -> String {
-    let (schema, table_name) = match ext_name.split_once('.') {
-        Some((s, t)) => (s, t),
-        None => ("public", ext_name),
+/// One stub `Table` block: the referenced `columns` of `target`, typed from
+/// `known` when the design defines it, and a note saying why it is a stub.
+fn emit_stub_block(target: &str, columns: &std::collections::BTreeSet<&str>, known: Option<&Entity>) -> String {
+    let (schema, table) = target.split_once('.').unwrap_or(("public", target));
+    let known_columns = known.and_then(|e| e.table_def.as_ref()).map(|td| td.columns.as_slice());
+
+    let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
+    for column in columns {
+        let data_type = known_columns
+            .and_then(|cols| cols.iter().find(|c| c.name == *column))
+            .map_or_else(|| "varchar".to_string(), |c| quote_type_if_needed(&c.data_type));
+        lines.push(format!("  \"{column}\" {data_type}"));
+    }
+    let note = match known.map(|e| e.entity_type) {
+        Some(EntityType::External) => "External entity — managed outside this project",
+        Some(_) => "Defined in this project, outside this document — only the referenced columns are shown",
+        None => "Referenced, but not defined in this project",
     };
-
-    let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, table_name)];
-    let mut sorted_cols: Vec<&String> = cols.iter().collect();
-    sorted_cols.sort();
-    for col_name in sorted_cols {
-        lines.push(format!("  \"{}\" varchar", col_name));
-    }
     lines.push(String::new());
-    lines.push("  Note: 'External entity — managed outside this project'".to_string());
+    lines.push(format!("  Note: {}", dbml_string(note)));
     lines.push("}\n".to_string());
     lines.join("\n")
 }
@@ -1598,6 +1602,7 @@ mod tests {
             std::collections::HashMap::new();
         let docs = generate_all(&DbmlMultiParams {
             entities: &entities,
+            design_entities: &entities,
             project_name: "P",
             database_type: "PostgreSQL",
             project_note: None,
@@ -1645,6 +1650,7 @@ mod tests {
 
         let docs = generate_all(&DbmlMultiParams {
             entities: &entities,
+            design_entities: &entities,
             project_name: "P",
             database_type: "PostgreSQL",
             project_note: None,

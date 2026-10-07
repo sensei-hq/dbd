@@ -448,6 +448,7 @@ fn dbml_respects_scope_filtering() {
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
+        design_entities: d.entities(),
         project_name: &d.config().project.name,
         database_type: &d.config().source.dialect,
         project_note: d.config().project.note.as_deref(),
