@@ -1210,6 +1210,19 @@ mod tests {
         )));
     }
 
+    /// `increment` is DBML's auto-increment. On a serial type the type already
+    /// says so; on any other it is the identity dbd's exporter wrote it for,
+    /// and DBML cannot say ALWAYS, so it reads as BY DEFAULT.
+    #[test]
+    fn increment_reads_as_identity_unless_the_type_is_serial() {
+        let dbml = "Table \"app\".\"t\" {\n  \"id\" bigint [pk, increment]\n  \"seq\" bigserial [increment]\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[0].identity, Some(crate::entity::IdentityKind::ByDefault));
+        assert!(!td.columns[0].nullable, "an identity column is NOT NULL");
+        assert_eq!(td.columns[1].identity, None, "bigserial carries its own sequence");
+    }
+
     #[test]
     fn parse_indexes_block_bare_and_parenthesized() {
         let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" int\n\n  indexes {\n    a [unique, name: 'idx_a']\n    (a, b) [name: 'idx_ab']\n  }\n}\n";
