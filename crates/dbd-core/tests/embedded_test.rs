@@ -4375,3 +4375,119 @@ async fn reconcile_without_a_version_records_none_applied() {
         .await
         .expect("a dev reset of an unversioned project is allowed");
 }
+
+// ── Reconcile creates in the dependency order apply uses ──────────────────────
+
+/// Write `files` (path relative to `dir`, SQL) under a fresh project at `dir`
+/// whose `design.yaml` is `yaml`, and load it.
+fn write_project(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(dir.join("design.yaml"), yaml).unwrap();
+    for (rel, sql) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, sql).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// Reconcile ran every table create (pass A) before any function (pass C), so
+/// on a fresh database a table whose default calls a project function failed
+/// with `function core.default_tier() does not exist`, and a trigger declared in
+/// a table file failed on its trigger function — leaving the tables created
+/// before it behind. `apply` has always created both in dependency order; the
+/// entity refs record the default's call and the trigger's function, so the
+/// order is there to follow.
+///
+/// The second phase is the same mistake on the ALTER path: a column added to an
+/// existing table with a default calling a function that is new in this run.
+#[tokio::test]
+async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_triggers_call_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fn_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: fn_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - core\n";
+    let default_tier = (
+        "ddl/function/core/default_tier.ddl",
+        "create or replace function core.default_tier() returns text\n\
+         language sql immutable as $$ select 'basic'::text $$;\n",
+    );
+    let touch = (
+        "ddl/function/core/touch.ddl",
+        "create or replace function core.touch() returns trigger\n\
+         language plpgsql as $$ begin new.touched_at := now(); return new; end $$;\n",
+    );
+    let accounts = (
+        "ddl/table/core/accounts.ddl",
+        "create table if not exists core.accounts (\n\
+           id   integer primary key\n\
+         , tier text    not null default core.default_tier()\n\
+         );\n",
+    );
+    let events = (
+        "ddl/table/core/events.ddl",
+        "create table if not exists core.events (\n\
+           id         integer primary key\n\
+         , touched_at timestamptz\n\
+         );\n\
+         create or replace trigger events_touch before insert or update on core.events\n\
+           for each row execute function core.touch();\n",
+    );
+
+    // ── Phase 1: a fresh database ──
+    let design = write_project(dir, yaml, &[default_tier, touch, accounts, events]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile on a fresh database must create the functions before the tables that call them");
+    adapter
+        .execute_script("INSERT INTO core.accounts (id) VALUES (1); INSERT INTO core.events (id) VALUES (1);")
+        .await
+        .expect("insert");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND tier = 'basic'",
+        "the default the function supplies",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.events WHERE id = 1 AND touched_at IS NOT NULL",
+        "the trigger's effect",
+    )
+    .await;
+
+    // ── Phase 2: a new column on an existing table, defaulting to a new function ──
+    let design = write_project(
+        dir,
+        yaml,
+        &[
+            (
+                "ddl/function/core/default_region.ddl",
+                "create or replace function core.default_region() returns text\n\
+                 language sql immutable as $$ select 'eu'::text $$;\n",
+            ),
+            (
+                "ddl/table/core/accounts.ddl",
+                "create table if not exists core.accounts (\n\
+                   id     integer primary key\n\
+                 , tier   text    not null default core.default_tier()\n\
+                 , region text    not null default core.default_region()\n\
+                 );\n",
+            ),
+        ],
+    );
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the ALTER adding the column must run after the function its default calls");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND region = 'eu'",
+        "the new column's default on the existing row",
+    )
+    .await;
+}
