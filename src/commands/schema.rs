@@ -827,14 +827,17 @@ pub async fn cmd_apply(
     warn_if_no_authored_ddl(&design, project_dir);
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
+    // Named for the run as for its preview: the preview said what it narrowed
+    // to, and the run it previewed did not.
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+
     if dry_run {
         // The real apply's own gate, not a copy of it: the scope's gaps and
         // closure, its `extensions:` allowlist, and the refusal of a file that
         // did not parse. A preview that filters for itself lists what the run
         // will not do and passes what the run refuses.
         let entities = design.entities_to_apply(name, Some(&resolved))?;
-        let (kept, total) = design.scope_counts(&resolved)?;
-        output::scope_filtered(&resolved, kept, total);
 
         for entity in &entities {
             let detail = match &entity.file {
@@ -1046,6 +1049,8 @@ pub async fn cmd_policies(
     // does not have reported `schema "…" does not exist` on every run.
     let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let policy_ws = policy_working_set(&design, &resolved)?;
 
     if dry_run {
