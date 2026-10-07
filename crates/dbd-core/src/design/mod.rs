@@ -2736,6 +2736,45 @@ import:
         );
     }
 
+    /// The drop a snapshot writes is the drop apply runs. `dbd snapshot` writes a
+    /// dropped table's statement to `<schema>/<table>.sql`; apply looked for
+    /// `<table>.drop.sql`, found nothing, and still counted the drop and
+    /// recorded the migration — the table outlived its removal from the design
+    /// on every database. Driven through the real snapshot, not a hand-written
+    /// file, so the two sides cannot disagree about the name again.
+    #[tokio::test]
+    async fn a_table_removed_from_the_design_is_dropped_by_the_next_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        let config = dir.join("design.yaml");
+        std::fs::write(&config, "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        for t in ["users", "legacy"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let load = || Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "baseline").unwrap();
+        std::fs::remove_file(dir.join("ddl/table/app/legacy.ddl")).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "drop legacy").unwrap();
+
+        let design = load();
+        assert_eq!(design.config().project.version, Some(2), "the second snapshot is v2");
+        let mock = MockAdapter::new()
+            .with_meta("dev", 1)
+            .with_known_entities(["app.legacy"]);
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("DROP TABLE"),
+            "the v2 drop of app.legacy runs: {scripts}"
+        );
+    }
+
     /// A migration's drop runs only where the table still exists. Generated
     /// drops are a bare `DROP TABLE … CASCADE`, so a database whose scope never
     /// had the table would fail on it now that a scope runs the drops in its
