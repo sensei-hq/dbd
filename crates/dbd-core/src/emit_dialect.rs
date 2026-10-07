@@ -86,8 +86,10 @@
 //! Functions, procedures and triggers. Their bodies are PL/pgSQL or SQL that
 //! does not translate, and dbd holds them as opaque text — emitting them would
 //! produce something that looks convertible and is not. They are reported as
-//! skipped so the omission is visible. So is anything whose file does not
-//! parse: there is no structure to translate, and the schema is missing it.
+//! skipped so the omission is visible — a trigger written beside its table too,
+//! which the model keeps only as an edge and is read back from the file. So is
+//! anything whose file does not parse: there is no structure to translate, and
+//! the schema is missing it.
 
 use crate::entity::{
     ColumnDef, Entity, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, IndexType, SortOrder, TableConstraint,
@@ -308,6 +310,7 @@ pub fn emit_schema(
                 out.push(emit_table(e, &script, &mut report));
                 out.extend(emit_indexes(e, &script, &mut report));
                 out.extend(descriptions(e, target));
+                out.extend(skipped_triggers(e, target, &mut report));
             }
             EntityType::View | EntityType::MaterializedView => {
                 if let Some(sql) = emit_view(e, target, &mut report) {
@@ -321,15 +324,17 @@ pub fn emit_schema(
                 }
             }
             EntityType::Function | EntityType::Procedure | EntityType::Trigger => {
-                report.push(Downgrade {
+                // Noted in the file as well as listed: a reader of the script
+                // alone otherwise has no sign the routine ever existed.
+                let d = Downgrade {
                     entity: e.name.clone(),
                     column: None,
                     from: format!("a {}", e.entity_type.tag()),
                     to: "nothing".to_string(),
-                    reason: "its body is PL/pgSQL or SQL that does not translate, and dbd holds \
-                             it as opaque text — emitting it would look convertible and not be"
-                        .to_string(),
-                });
+                    reason: UNTRANSLATED_ROUTINE.to_string(),
+                };
+                out.push(d.comment(target));
+                report.push(d);
             }
             // Schemas, extensions, enums and roles are handled where they are
             // used (a column's type) or have no target equivalent worth a
@@ -339,6 +344,44 @@ pub fn emit_schema(
     }
 
     Ok((join_script(&header, &out, target), report))
+}
+
+/// Why a routine — and a trigger, which only fires one — is not emitted.
+///
+/// One sentence for all of them: a trigger is skipped because of what it runs,
+/// and two entries saying the same thing in different words make a reader
+/// wonder whether they follow different rules.
+const UNTRANSLATED_ROUTINE: &str = "its body is PL/pgSQL or SQL that does not translate, and dbd holds it as \
+                                    opaque text — emitting it would look convertible and not be";
+
+/// The triggers declared in `e`'s table file, each reported as skipped and
+/// noted where the table is.
+///
+/// A trigger beside its table is not an entity of its own — the model keeps it
+/// only as an edge to the routine it fires — so leaving it out reported
+/// nothing at all. It is read back from the file, as a sequence's options are.
+fn skipped_triggers(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Vec<String> {
+    let names = e
+        .file
+        .as_deref()
+        .and_then(|f| crate::source_text::read_to_string(f).ok())
+        .map(|sql| crate::parser::pg::tables::trigger_names(&sql))
+        .unwrap_or_default();
+    names
+        .into_iter()
+        .map(|name| {
+            let d = Downgrade {
+                entity: e.name.clone(),
+                column: None,
+                from: format!("the trigger `{name}`"),
+                to: "nothing".to_string(),
+                reason: UNTRANSLATED_ROUTINE.to_string(),
+            };
+            let note = d.comment(target);
+            report.push(d);
+            note
+        })
+        .collect()
 }
 
 /// What the script as a whole holds. A statement naming something outside it —
