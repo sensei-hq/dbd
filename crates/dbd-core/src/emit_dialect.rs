@@ -27,7 +27,9 @@
 //! Every target has FOREIGN KEY, CHECK, CREATE INDEX and stored generated
 //! columns, so they are carried. A CHECK expression, a generated column's
 //! expression or an index predicate is PostgreSQL SQL that dbd does not
-//! translate, so it goes across verbatim and is reported, like a view body. An
+//! translate, so it goes across verbatim and is reported, like a view body —
+//! except a CHECK and a view body on SQLite, which are written again from the
+//! parse tree or left out (next section). An
 //! index the target would reject outright — an expression key on SQL Server, a
 //! key on an unbounded text column on MySQL or SQL Server — is left out and
 //! reported, so the script still applies. So is a foreign key to a table the
@@ -37,6 +39,19 @@
 //! is not left out: MySQL and SQL Server refuse it as it is, and dropping it
 //! would lose the key and every foreign key that points at it. The column is
 //! bounded instead (VARCHAR(255), nvarchar(450)) and the bound is reported.
+//!
+//! # View bodies and CHECKs on SQLite
+//!
+//! Copied verbatim, they failed the script: a view naming `core.cities` (the
+//! table is `core_cities` there), a CHECK using `POSITION(… IN …)` or `~`. So on
+//! SQLite each is written again from libpg_query's tree — table names resolved
+//! the way the file's `search_path` resolves them and flattened, functions and
+//! operators mapped — or, at the first construct SQLite has no form for, left
+//! out and reported, so the script applies. A view reading a table the script
+//! does not create (an `external:` one, one outside the scope, a view left out)
+//! is left out the same way. What is written is still reported: the SQL is
+//! SQLite's, and so are its semantics. `emit_dialect/sqlite.rs` says why both,
+//! and not one or the other.
 //!
 //! # Materialized views
 //!
@@ -106,6 +121,8 @@ use crate::entity::{
 use crate::error::{DbdError, Result};
 use crate::parser::Dialect;
 use std::collections::HashSet;
+
+mod sqlite;
 
 /// One thing the target could not express faithfully.
 ///
@@ -258,6 +275,17 @@ pub fn emit_schema(
             .filter(|e| e.entity_type == EntityType::External)
             .map(|e| e.name.clone())
             .collect(),
+        relations: design
+            .entities()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.entity_type,
+                    EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::External
+                )
+            })
+            .map(|e| e.name.clone())
+            .collect(),
         sequences: entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Sequence && e.errors.is_empty())
@@ -272,6 +300,9 @@ pub fn emit_schema(
     };
     let mut out: Vec<String> = Vec::new();
     let mut report = Vec::new();
+    // Every view the script has created so far — in dependency order, so a
+    // view reading one left out finds it missing.
+    let mut views: HashSet<String> = HashSet::new();
 
     // SQL Server keeps the schema in every name it is given (`[app].[orders]`),
     // and a schema that does not exist fails the first statement that names
@@ -327,7 +358,7 @@ pub fn emit_schema(
                 out.extend(skipped_triggers(e, target, &mut report));
             }
             EntityType::View | EntityType::MaterializedView => {
-                if let Some(sql) = emit_view(e, target, &mut report) {
+                if let Some(sql) = emit_view(e, &script, &mut views, &mut report) {
                     out.push(sql);
                     out.extend(descriptions(e, target));
                 }
@@ -542,6 +573,10 @@ struct Script {
     tables: HashSet<String>,
     /// `schema.name` of every table the design declares `external:`.
     externals: HashSet<String>,
+    /// `schema.name` of every table, view, materialized view and external
+    /// table in the whole design — what a bare name in a view body can
+    /// resolve to, whether or not the script creates it.
+    relations: HashSet<String>,
     /// `schema.name` of every sequence in the emitted set. Only SQL Server
     /// creates them; a default drawing from one outside it cannot apply.
     sequences: HashSet<String>,
@@ -556,6 +591,38 @@ impl Script {
     /// have reached it through its `search_path`.
     fn is_enum(&self, ty: &str) -> bool {
         self.enums.contains(ty) || (!ty.contains('.') && self.enums.iter().any(|n| n.rsplit('.').next() == Some(ty)))
+    }
+
+    /// What a table name in `e`'s body is in the script: `schema.name` as
+    /// written, or a bare `name` found the way PostgreSQL finds it — the first
+    /// schema on the file's `search_path` that has one, then `public`, which
+    /// dbd puts on every applied path. `views` is every view created so far.
+    fn relation(&self, e: &Entity, schema: Option<&str>, name: &str, views: &HashSet<String>) -> sqlite::Relation {
+        let found = match schema {
+            Some(s) => format!("{s}.{name}"),
+            None => e
+                .schema_path
+                .schemas()
+                .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
+                .map(|s| format!("{s}.{name}"))
+                .find(|q| self.relations.contains(q))
+                .unwrap_or_else(|| name.to_string()),
+        };
+        if self.tables.contains(&found) || views.contains(&found) {
+            let (schema, bare) = match found.split_once('.') {
+                Some((s, b)) => (Some(s), b),
+                None => (None, found.as_str()),
+            };
+            return sqlite::Relation::Created(qualified(schema, bare, self.target));
+        }
+        let why = if self.externals.contains(&found) {
+            "it is declared `external:`, someone else's to create"
+        } else if self.relations.contains(&found) {
+            "it is outside the scope, or was itself left out"
+        } else {
+            "nothing in the project declares it"
+        };
+        sqlite::Relation::Missing(format!("it reads `{found}`, which the script does not create — {why}"))
     }
 }
 
@@ -772,10 +839,50 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         }
     }
 
-    // CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd
-    // does not translate — so it goes across verbatim and is reported.
+    // CHECK exists everywhere, but its expression is PostgreSQL SQL. SQLite
+    // gets it written again from the parse tree, or not at all — a CHECK it
+    // cannot parse fails the CREATE TABLE and takes the table with it (see
+    // [`sqlite`]). The others get it verbatim, and reported.
     for con in &td.constraints {
         if let TableConstraint::Check { name, expression } = con {
+            let named = name
+                .as_ref()
+                .map(|n| format!("CONSTRAINT {} ", target.quote(n)))
+                .unwrap_or_default();
+            if target == Target::Sqlite {
+                let from = format!("a CHECK expression in PostgreSQL SQL (`{expression}`)");
+                let (d, check) = match sqlite::check(expression) {
+                    Ok(sql) => (
+                        Downgrade {
+                            entity: e.name.clone(),
+                            column: None,
+                            from,
+                            to: "the same check in SQLite's SQL".to_string(),
+                            reason: SQLITE_REWRITTEN.to_string(),
+                        },
+                        Some(sql),
+                    ),
+                    Err(sqlite::NoForm(why)) => (
+                        Downgrade {
+                            entity: e.name.clone(),
+                            column: None,
+                            from,
+                            to: "no CHECK".to_string(),
+                            reason: format!(
+                                "{why} — so the CHECK is left out and the table is still created; rows it \
+                                 refused are now accepted"
+                            ),
+                        },
+                        None,
+                    ),
+                };
+                lines.push(format!("  {}", d.comment(target)));
+                report.push(d);
+                if let Some(sql) = check {
+                    lines.push(format!("  {named}CHECK ({sql}),"));
+                }
+                continue;
+            }
             let d = Downgrade {
                 entity: e.name.clone(),
                 column: None,
@@ -787,10 +894,6 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
             };
             lines.push(format!("  {}", d.comment(target)));
             report.push(d);
-            let named = name
-                .as_ref()
-                .map(|n| format!("CONSTRAINT {} ", target.quote(n)))
-                .unwrap_or_default();
             lines.push(format!("  {named}CHECK ({expression}),"));
         }
     }
@@ -1467,7 +1570,14 @@ fn emit_index(
     Some(out.join("\n"))
 }
 
-fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<String> {
+/// A view — or a materialized view, as the plain view that is the nearest
+/// thing — with `views` gaining it once it is created.
+///
+/// On SQLite the body is written again from the parse tree, or the view is
+/// left out; see [`sqlite`] for why that and not a copy. Elsewhere it goes
+/// across as written, and is reported.
+fn emit_view(e: &Entity, script: &Script, views: &mut HashSet<String>, report: &mut Vec<Downgrade>) -> Option<String> {
+    let target = script.target;
     let lost = |from: String, to: &str, reason: String| Downgrade {
         entity: e.name.clone(),
         column: None,
@@ -1475,7 +1585,7 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
         to: to.to_string(),
         reason,
     };
-    let Some(body) = e.body.first() else {
+    let Some(written) = e.body.first() else {
         let d = lost(
             format!("a {} whose body dbd could not read", e.entity_type.tag()),
             "nothing",
@@ -1484,6 +1594,26 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
         let note = d.comment(target);
         report.push(d);
         return Some(note);
+    };
+    let body = match target {
+        Target::Sqlite => match sqlite::query(written, &|schema, name| script.relation(e, schema, name, views)) {
+            Ok(body) => body,
+            Err(sqlite::NoForm(why)) => {
+                let kind = match e.entity_type {
+                    EntityType::MaterializedView => "a materialized view",
+                    _ => "a view",
+                };
+                let d = lost(
+                    kind.to_string(),
+                    "nothing",
+                    format!("{why} — so it is left out and the script applies; anything that reads it is left out too"),
+                );
+                let note = d.comment(target);
+                report.push(d);
+                return Some(note);
+            }
+        },
+        Target::MySql | Target::TSql => written.clone(),
     };
     let name = table_name(e, target, report);
     let before = report.len();
@@ -1531,17 +1661,32 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
     {
         report.push(comment_lost(e, None, text, target));
     }
-    report.push(lost(
-        "a view body in PostgreSQL SQL".to_string(),
-        "the same text, untranslated",
-        "dbd translates types and structure, not expressions — anything PostgreSQL-specific inside \
-         the SELECT has to be checked by hand"
-            .to_string(),
-    ));
+    report.push(match target {
+        Target::Sqlite => lost(
+            "a view body in PostgreSQL SQL".to_string(),
+            "the same query in SQLite's SQL",
+            SQLITE_REWRITTEN.to_string(),
+        ),
+        Target::MySql | Target::TSql => lost(
+            "a view body in PostgreSQL SQL".to_string(),
+            "the same text, untranslated",
+            "dbd translates types and structure, not expressions — anything PostgreSQL-specific inside \
+             the SELECT has to be checked by hand"
+                .to_string(),
+        ),
+    });
     let mut out: Vec<String> = report[before..].iter().map(|d| d.comment(target)).collect();
     out.push(format!("CREATE VIEW {name} AS {body};"));
+    views.insert(e.name.clone());
     Some(out.join("\n"))
 }
+
+/// Why a view body or CHECK written again in SQLite's SQL is still reported:
+/// the text is SQLite's, and the engine under it is not PostgreSQL.
+const SQLITE_REWRITTEN: &str = "dbd wrote it again from PostgreSQL's parse tree — table names flattened, \
+     functions and operators mapped to SQLite's own — but the engines differ even where the SQL reads the \
+     same: LIKE ignores ASCII case, upper() and lower() change ASCII letters only, and values compare by \
+     column affinity — so the results are worth checking by hand";
 
 /// A sequence: `CREATE SEQUENCE` on SQL Server; everywhere else, a note where
 /// it would have been, and a report entry.
