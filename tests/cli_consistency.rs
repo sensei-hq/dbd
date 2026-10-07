@@ -436,3 +436,90 @@ fn every_command_counts_a_scope_the_same_way() {
         "and unscoped, what the design builds"
     );
 }
+
+// ── -n names an entity, or the command says why it cannot ───────────────────
+
+/// `two_schema_project` plus a materialized view in `app`, so `refresh` has
+/// something to be asked about.
+fn named_entity_project(dir: &Path) {
+    two_schema_project(dir);
+    write(
+        dir,
+        "ddl/materialized_view/app/user_counts.ddl",
+        "set search_path to app;\ncreate materialized view if not exists user_counts as \
+         select count(*) as n from app.users;\n",
+    );
+}
+
+/// A typo in `-n` selected nothing and every one of these reported success:
+/// "Everything looks ok", "0 entities — no issues", an empty graph, "No
+/// materialized views to refresh", "No tables to export". A selection that
+/// matches nothing is a mistake, and the command is the only thing that knows.
+#[test]
+fn an_unknown_name_is_an_error_on_every_command_that_takes_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    named_entity_project(tmp.path());
+
+    for args in [
+        &["inspect", "-n", "app.nope"][..],
+        &["apply", "--dry-run", "-n", "app.nope"],
+        &["graph", "-n", "app.nope"],
+        &["refresh", "-n", "app.nope"],
+        &["export", "-n", "app.nope"],
+    ] {
+        let out = dbd(tmp.path(), args);
+        assert!(!out.status.success(), "{args:?} must fail: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains("no entity named 'app.nope'"),
+            "{args:?} must say the name matches nothing: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// The same, for a name that exists but the scope does not build: the command
+/// would act on it on a plane that does not have it, or — as these did —
+/// silently act on nothing.
+#[test]
+fn a_name_outside_the_scope_is_an_error_on_every_command_that_takes_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    named_entity_project(tmp.path());
+
+    for (args, name) in [
+        (&["inspect", "-n", "app.users", "--scope", "hub"][..], "app.users"),
+        (
+            &["apply", "--dry-run", "-n", "app.users", "--scope", "hub"],
+            "app.users",
+        ),
+        (&["graph", "-n", "app.users", "--scope", "hub"], "app.users"),
+        (
+            &["refresh", "-n", "app.user_counts", "--scope", "hub"],
+            "app.user_counts",
+        ),
+        (&["export", "-n", "app.users", "--scope", "hub"], "app.users"),
+    ] {
+        let out = dbd(tmp.path(), args);
+        assert!(!out.status.success(), "{args:?} must fail: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains(&format!("{name} is outside scope 'hub'")),
+            "{args:?} must say the scope excludes it: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// The guard is about names that select nothing; a good name still works.
+#[test]
+fn a_name_the_scope_builds_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    named_entity_project(tmp.path());
+
+    for args in [
+        &["inspect", "-n", "hub.nodes", "--scope", "hub"][..],
+        &["apply", "--dry-run", "-n", "hub.nodes", "--scope", "hub"],
+        &["graph", "-n", "hub.nodes", "--scope", "hub"],
+    ] {
+        let out = dbd(tmp.path(), args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+}
