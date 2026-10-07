@@ -32,6 +32,14 @@
 //! reported, so the script still applies. So is a foreign key to a table the
 //! script does not create — one declared `external:`, or left out by `--scope`.
 //!
+//! # Identity columns
+//!
+//! An identity column — or `serial`, the same thing under an older name — is
+//! numbered by the target: MySQL `AUTO_INCREMENT`, SQL Server `IDENTITY(1,1)`,
+//! SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`. Where the target's numbering
+//! takes or refuses an explicit value differently from ALWAYS / BY DEFAULT, or
+//! cannot number the column at all, it is reported.
+//!
 //! # Defaults
 //!
 //! A default is read from libpg_query's tree. A literal goes across without
@@ -53,7 +61,8 @@
 //! skipped so the omission is visible.
 
 use crate::entity::{
-    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexDef, IndexType, SortOrder, TableConstraint,
+    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, IndexType, SortOrder, TableConstraint,
+    TableDef,
 };
 use crate::error::{DbdError, Result};
 use crate::parser::Dialect;
@@ -335,10 +344,29 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     };
     let name = table_name(e, target, report);
 
+    // A PARSED table carries its key on the column (`is_pk`/`is_unique`); only
+    // the reconcile path lifts those into constraints. Reading constraints
+    // alone emitted a table with no key — valid DDL, wrong schema, and a loss
+    // the report could not have caught because nothing knew it happened.
+    let inline_pk: Vec<String> = td.columns.iter().filter(|c| c.is_pk).map(|c| c.name.clone()).collect();
+    let pk: Vec<String> = if inline_pk.is_empty() {
+        td.constraints
+            .iter()
+            .find_map(|con| match con {
+                TableConstraint::PrimaryKey { columns, .. } => Some(columns.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        inline_pk.clone()
+    };
+    let numbered = numbered_column(td, &pk, target);
+
     let mut lines: Vec<String> = Vec::new();
     for c in &td.columns {
         let before = report.len();
         let ty = map_type(&c.data_type, target, e, c, report);
+        let numbering = numbering(e, c, numbered, target, report);
         let default = c
             .default_value
             .as_deref()
@@ -348,8 +376,21 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
             lines.push(format!("  {}", d.comment(target)));
         }
         let mut col = format!("  {} {ty}", target.quote(&c.name));
+        // `[id] bigint IDENTITY(1,1) NOT NULL`, `"id" INTEGER PRIMARY KEY
+        // AUTOINCREMENT NOT NULL`, `` `id` INT NOT NULL AUTO_INCREMENT `` —
+        // each engine's own documented order.
+        if let Some(clause) = numbering
+            && target != Target::MySql
+        {
+            col.push_str(&format!(" {clause}"));
+        }
         if !c.nullable {
             col.push_str(" NOT NULL");
+        }
+        if let Some(clause) = numbering
+            && target == Target::MySql
+        {
+            col.push_str(&format!(" {clause}"));
         }
         if let Some(default) = default {
             col.push_str(&format!(" DEFAULT {default}"));
@@ -357,12 +398,10 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         lines.push(format!("{col},"));
     }
 
-    // A PARSED table carries its key on the column (`is_pk`/`is_unique`); only
-    // the reconcile path lifts those into constraints. Reading constraints
-    // alone emitted a table with no key — valid DDL, wrong schema, and a loss
-    // the report could not have caught because nothing knew it happened.
-    let inline_pk: Vec<String> = td.columns.iter().filter(|c| c.is_pk).map(|c| c.name.clone()).collect();
-    if !inline_pk.is_empty() {
+    // SQLite's numbered column declares the key in place; a second, table-level
+    // PRIMARY KEY is refused.
+    let key_in_place = target == Target::Sqlite && numbered.is_some();
+    if !inline_pk.is_empty() && !key_in_place {
         lines.push(format!("  PRIMARY KEY ({}),", quote_all(&inline_pk, target)));
     }
     for c in td.columns.iter().filter(|c| c.is_unique && !c.is_pk) {
@@ -373,7 +412,9 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         match con {
             // Skipped when the columns already declared one inline — a table
             // with two PRIMARY KEY clauses is rejected by every target.
-            TableConstraint::PrimaryKey { columns, .. } if !columns.is_empty() && inline_pk.is_empty() => {
+            TableConstraint::PrimaryKey { columns, .. }
+                if !columns.is_empty() && inline_pk.is_empty() && !key_in_place =>
+            {
                 lines.push(format!("  PRIMARY KEY ({}),", quote_all(columns, target)));
             }
             TableConstraint::Unique { columns, .. } if !columns.is_empty() => {
@@ -446,6 +487,140 @@ fn table_body(lines: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// How column `c` draws its values from a sequence PostgreSQL keeps for it,
+/// if it does: an identity column, or `serial`, which takes an explicit value
+/// the way BY DEFAULT does.
+fn sequence_kind(c: &ColumnDef) -> Option<IdentityKind> {
+    if c.identity.is_some() {
+        return c.identity;
+    }
+    let t = c.data_type.trim().to_lowercase();
+    matches!(
+        t.as_str(),
+        "serial" | "bigserial" | "smallserial" | "serial2" | "serial4" | "serial8"
+    )
+    .then_some(IdentityKind::ByDefault)
+}
+
+/// Whether `column` leads one of the table's keys or indexes.
+fn leads_a_key(td: &TableDef, pk: &[String], column: &str) -> bool {
+    let leads = |cols: &[String]| cols.first().is_some_and(|c| c == column);
+    leads(pk)
+        || td.columns.iter().any(|c| c.name == column && c.is_unique)
+        || td.constraints.iter().any(|con| match con {
+            TableConstraint::Unique { columns, .. } => leads(columns),
+            _ => false,
+        })
+        || td
+            .indexes
+            .iter()
+            .any(|ix| ix.columns.first().is_some_and(|k| !k.is_expression && k.name == column))
+}
+
+/// The one column the target numbers itself, if any.
+///
+/// Every target numbers at most one column per table, and two of them only
+/// some columns: MySQL one that leads a key (InnoDB keeps the counter in that
+/// index), SQLite only a single-column INTEGER PRIMARY KEY, which is the
+/// rowid. The first sequence-backed column that qualifies gets it; the rest
+/// are reported where they are emitted.
+fn numbered_column<'a>(td: &'a TableDef, pk: &[String], target: Target) -> Option<&'a str> {
+    td.columns
+        .iter()
+        .filter(|c| sequence_kind(c).is_some())
+        .find(|c| match target {
+            Target::TSql => true,
+            Target::Sqlite => pk.len() == 1 && pk[0] == c.name,
+            Target::MySql => leads_a_key(td, pk, &c.name),
+        })
+        .map(|c| c.name.as_str())
+}
+
+/// The clause that has the target number column `c` — `AUTO_INCREMENT`,
+/// `IDENTITY(1,1)`, `PRIMARY KEY AUTOINCREMENT` — or `None` when it is not
+/// sequence-backed or the target cannot number it.
+///
+/// Reported when the numbering behaves differently: GENERATED ALWAYS refuses
+/// an explicit value and BY DEFAULT (and `serial`) takes one. MySQL's and
+/// SQLite's counters take one, so ALWAYS loses its guard there; SQL Server's
+/// IDENTITY refuses one, so BY DEFAULT is what loses there. A column the target
+/// cannot number at all is a plain column, and reported, since inserts must now
+/// supply it.
+fn numbering(
+    e: &Entity,
+    c: &ColumnDef,
+    numbered: Option<&str>,
+    target: Target,
+    report: &mut Vec<Downgrade>,
+) -> Option<&'static str> {
+    let kind = sequence_kind(c)?;
+    let from = match c.identity {
+        Some(IdentityKind::Always) => "`GENERATED ALWAYS AS IDENTITY`".to_string(),
+        Some(IdentityKind::ByDefault) => "`GENERATED BY DEFAULT AS IDENTITY`".to_string(),
+        None => format!("`{}`, numbered by a sequence of its own", c.data_type),
+    };
+    let mut lose = |to: &str, reason: String| {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: Some(c.name.clone()),
+            from: from.clone(),
+            to: to.to_string(),
+            reason,
+        });
+    };
+
+    if numbered != Some(c.name.as_str()) {
+        let reason = match (numbered, target) {
+            (Some(other), _) => format!(
+                "{} numbers one column per table and `{other}` has it — inserts must now supply this one",
+                target.label()
+            ),
+            (None, Target::MySql) => {
+                "MySQL numbers only a column that leads a key, which this one does not — inserts must \
+                 now supply it"
+                    .to_string()
+            }
+            (None, Target::Sqlite) => {
+                "SQLite numbers only a single-column INTEGER PRIMARY KEY, which this is not — inserts \
+                 must now supply it"
+                    .to_string()
+            }
+            // SQL Server numbers the first sequence-backed column of any table,
+            // so this is `numbered` disagreeing with itself; say what is lost
+            // rather than assert it cannot happen.
+            (None, Target::TSql) => {
+                "SQL Server was not given an IDENTITY for it — inserts must now supply it".to_string()
+            }
+        };
+        lose("a plain column", reason);
+        return None;
+    }
+
+    let clause = match target {
+        Target::MySql => "AUTO_INCREMENT",
+        Target::TSql => "IDENTITY(1,1)",
+        Target::Sqlite => "PRIMARY KEY AUTOINCREMENT",
+    };
+    match (kind, target) {
+        (IdentityKind::Always, Target::MySql | Target::Sqlite) => lose(
+            clause,
+            format!(
+                "{} takes an explicit value for it where ALWAYS refused one, so the column no longer \
+                 guards against ids written by hand",
+                target.label()
+            ),
+        ),
+        (IdentityKind::ByDefault, Target::TSql) => lose(
+            clause,
+            "SQL Server refuses an explicit value for an IDENTITY column unless SET IDENTITY_INSERT is \
+             ON, where PostgreSQL took one — an insert or a data load that supplies the id now fails"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    Some(clause)
 }
 
 /// One `FOREIGN KEY … REFERENCES …` clause. An unqualified parent resolves to
@@ -817,17 +992,19 @@ fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Ve
         ("varchar" | "character varying", Target::TSql) => format!("nvarchar{}", args_or(args, "(255)")),
         ("varchar" | "character varying", Target::Sqlite) => "TEXT".to_string(),
 
-        ("integer" | "int" | "int4" | "serial", Target::MySql) => "INT".to_string(),
-        ("integer" | "int" | "int4" | "serial", Target::TSql) => "int".to_string(),
-        ("integer" | "int" | "int4" | "serial", Target::Sqlite) => "INTEGER".to_string(),
+        // The serial types are integers numbered by a sequence; the numbering is
+        // the column's, and `numbering` carries it.
+        ("integer" | "int" | "int4" | "serial" | "serial4", Target::MySql) => "INT".to_string(),
+        ("integer" | "int" | "int4" | "serial" | "serial4", Target::TSql) => "int".to_string(),
+        ("integer" | "int" | "int4" | "serial" | "serial4", Target::Sqlite) => "INTEGER".to_string(),
 
-        ("bigint" | "int8" | "bigserial", Target::MySql) => "BIGINT".to_string(),
-        ("bigint" | "int8" | "bigserial", Target::TSql) => "bigint".to_string(),
-        ("bigint" | "int8" | "bigserial", Target::Sqlite) => "INTEGER".to_string(),
+        ("bigint" | "int8" | "bigserial" | "serial8", Target::MySql) => "BIGINT".to_string(),
+        ("bigint" | "int8" | "bigserial" | "serial8", Target::TSql) => "bigint".to_string(),
+        ("bigint" | "int8" | "bigserial" | "serial8", Target::Sqlite) => "INTEGER".to_string(),
 
-        ("smallint" | "int2", Target::MySql) => "SMALLINT".to_string(),
-        ("smallint" | "int2", Target::TSql) => "smallint".to_string(),
-        ("smallint" | "int2", Target::Sqlite) => "INTEGER".to_string(),
+        ("smallint" | "int2" | "smallserial" | "serial2", Target::MySql) => "SMALLINT".to_string(),
+        ("smallint" | "int2" | "smallserial" | "serial2", Target::TSql) => "smallint".to_string(),
+        ("smallint" | "int2" | "smallserial" | "serial2", Target::Sqlite) => "INTEGER".to_string(),
 
         ("boolean" | "bool", Target::MySql) => "TINYINT(1)".to_string(),
         ("boolean" | "bool", Target::TSql) => "bit".to_string(),
