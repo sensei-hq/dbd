@@ -33,6 +33,11 @@
 //! reported, so the script still applies. So is a foreign key to a table the
 //! script does not create — one declared `external:`, or left out by `--scope`.
 //!
+//! A *constraint* on unbounded text — a primary key, UNIQUE, a foreign key —
+//! is not left out: MySQL and SQL Server refuse it as it is, and dropping it
+//! would lose the key and every foreign key that points at it. The column is
+//! bounded instead (VARCHAR(255), nvarchar(450)) and the bound is reported.
+//!
 //! # Materialized views
 //!
 //! None of the three has them. A materialized view becomes a plain view — the
@@ -273,7 +278,7 @@ pub fn emit_schema(
         match e.entity_type {
             EntityType::Table => {
                 out.push(emit_table(e, &script, &mut report));
-                out.extend(emit_indexes(e, target, &mut report));
+                out.extend(emit_indexes(e, &script, &mut report));
                 out.extend(descriptions(e, target));
             }
             EntityType::View | EntityType::MaterializedView => {
@@ -403,11 +408,27 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         inline_pk.clone()
     };
     let numbered = numbered_column(td, &pk, target, e.schema.as_deref());
+    let bounded = bounded_key_columns(e, td, script);
 
     let mut lines: Vec<String> = Vec::new();
     for c in &td.columns {
         let before = report.len();
-        let ty = map_type(&c.data_type, target, e, c, report);
+        let mut ty = map_type(&c.data_type, target, e, c, report);
+        if bounded.contains(&c.name) {
+            let to = key_bound(&c.data_type, target);
+            report.push(Downgrade {
+                entity: e.name.clone(),
+                column: Some(c.name.clone()),
+                from: format!("`{}` in a key", c.data_type),
+                to: to.to_string(),
+                reason: format!(
+                    "{} — so the column is bounded to {to} instead, which keeps the key; a longer value \
+                     is now refused",
+                    unindexable(&c.data_type, target).unwrap_or("the target cannot key it as it is")
+                ),
+            });
+            ty = to.to_string();
+        }
         let numbering = numbering(e, c, numbered, target, report);
         let default = c
             .default_value
@@ -851,6 +872,73 @@ fn numbering(
     Some(clause)
 }
 
+/// The `schema.name` a foreign key points at. An unqualified parent resolves to
+/// the child's own schema, as `search_path` would have.
+fn parent_of(e: &Entity, fk: &ForeignKey) -> String {
+    match fk.ref_schema.as_deref().or(e.schema.as_deref()) {
+        Some(s) => format!("{s}.{}", fk.ref_table),
+        None => fk.ref_table.clone(),
+    }
+}
+
+/// The columns of `e` that sit in a key the target refuses on their emitted
+/// type — unbounded text or binary — and so must be bounded.
+///
+/// A key is the primary key, a UNIQUE constraint or index, or a foreign key
+/// the script keeps. Bounding keeps more than the alternative: leaving the
+/// constraint out would lose the key and every foreign key that points at it,
+/// where a bound only refuses a value longer than it. A foreign key's own
+/// columns take the same bound as the key they point at, so the two sides
+/// still match. An ordinary index is not a reason to change a column's type;
+/// one on unbounded text is left out instead ([`emit_index`]).
+fn bounded_key_columns(e: &Entity, td: &TableDef, script: &Script) -> HashSet<String> {
+    let mut keyed: HashSet<&str> = td
+        .columns
+        .iter()
+        .filter(|c| c.is_pk || c.is_unique)
+        .map(|c| c.name.as_str())
+        .collect();
+    let kept = |fk: &ForeignKey| script.tables.contains(&parent_of(e, fk));
+    for con in &td.constraints {
+        match con {
+            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
+                keyed.extend(columns.iter().map(String::as_str));
+            }
+            TableConstraint::ForeignKey(fk) if kept(fk) => keyed.extend(fk.columns.iter().map(String::as_str)),
+            _ => {}
+        }
+    }
+    for fk in td
+        .columns
+        .iter()
+        .filter_map(|c| c.inline_fk.as_ref())
+        .filter(|fk| kept(fk))
+    {
+        keyed.extend(fk.columns.iter().map(String::as_str));
+    }
+    for idx in td.indexes.iter().filter(|i| i.unique) {
+        keyed.extend(idx.columns.iter().filter(|k| !k.is_expression).map(|k| k.name.as_str()));
+    }
+    td.columns
+        .iter()
+        .filter(|c| keyed.contains(c.name.as_str()) && unindexable(&c.data_type, script.target).is_some())
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// The bounded type a key column of PostgreSQL type `pg` gets. SQL Server keys
+/// at most 900 bytes — 450 nvarchar characters; MySQL's 255 characters fit a
+/// utf8mb4 key three columns wide.
+fn key_bound(pg: &str, target: Target) -> &'static str {
+    let binary = pg.trim().eq_ignore_ascii_case("bytea");
+    match (target, binary) {
+        (Target::MySql, true) => "VARBINARY(255)",
+        (Target::MySql, false) => "VARCHAR(255)",
+        (Target::TSql | Target::Sqlite, true) => "varbinary(900)",
+        (Target::TSql | Target::Sqlite, false) => "nvarchar(450)",
+    }
+}
+
 /// One `FOREIGN KEY … REFERENCES …` clause. An unqualified parent resolves to
 /// the child's own schema, as `search_path` would have.
 ///
@@ -861,10 +949,7 @@ fn numbering(
 fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Downgrade>) -> Option<String> {
     let target = script.target;
     let parent_schema = fk.ref_schema.as_deref().or(e.schema.as_deref());
-    let parent_name = match parent_schema {
-        Some(s) => format!("{s}.{}", fk.ref_table),
-        None => fk.ref_table.clone(),
-    };
+    let parent_name = parent_of(e, fk);
     if !script.tables.contains(&parent_name) {
         let why = if script.externals.contains(&parent_name) {
             format!(
@@ -956,13 +1041,15 @@ fn index_type_label(t: &IndexType) -> String {
 /// A `CREATE INDEX` for each of the table's indexes, with a note above each
 /// loss. An index the target would reject outright is left out — reported, so
 /// the omission is visible, and absent, so the script still applies.
-fn emit_indexes(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Vec<String> {
+fn emit_indexes(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Vec<String> {
+    let target = script.target;
     let Some(td) = &e.table_def else { return Vec::new() };
     let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
     let table = qualified(e.schema.as_deref(), bare, target);
+    let bounded = bounded_key_columns(e, td, script);
     td.indexes
         .iter()
-        .filter_map(|idx| emit_index(e, td, idx, bare, &table, target, report))
+        .filter_map(|idx| emit_index(e, td, idx, bare, &table, &bounded, target, report))
         .collect()
 }
 
@@ -973,6 +1060,7 @@ fn emit_index(
     idx: &IndexDef,
     bare: &str,
     table: &str,
+    bounded: &HashSet<String>,
     target: Target,
     report: &mut Vec<Downgrade>,
 ) -> Option<String> {
@@ -1005,6 +1093,8 @@ fn emit_index(
             .iter()
             .find(|c| c.name == col.name)
             .map(|c| c.data_type.as_str())
+            // A column bounded for a key is no longer unbounded.
+            && !bounded.contains(&col.name)
             && let Some(why) = unindexable(ty, target)
         {
             blockers.push(format!("{why} (`{}` is {ty})", col.name));
