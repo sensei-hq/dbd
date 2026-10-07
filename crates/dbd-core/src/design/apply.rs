@@ -1,6 +1,45 @@
 use super::*;
 
 impl Design {
+    /// The entities [`Design::apply`] would act on, after every gate it runs
+    /// before writing — and without a database.
+    ///
+    /// This is what a preview must list. `dbd apply --dry-run` used to filter
+    /// the entities itself, and the copy drifted from the real run twice: it
+    /// listed every target extension whatever the scope's `extensions:`
+    /// allowlist said, and it printed "no issues" over a file the real run
+    /// refused to read. Sharing the gate is what keeps the two from disagreeing
+    /// again.
+    ///
+    /// Errors exactly where `apply` would: a dependency gap under `report`, a
+    /// closure that needs what the scope excludes, or a file that did not parse.
+    pub fn entities_to_apply(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<&Entity>> {
+        Ok(self.gated_apply_set(name, scope)?.1)
+    }
+
+    /// The scope's working set and the entities an apply acts on, once every
+    /// pre-write gate has passed. Shared by [`Self::apply`] and
+    /// [`Self::entities_to_apply`] so a preview cannot pass what the run refuses.
+    #[allow(clippy::type_complexity)]
+    fn gated_apply_set(
+        &self,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(Option<std::collections::HashSet<String>>, Vec<&Entity>)> {
+        // Resolve scope → working set (gap-gated under `report`), then filter to
+        // the valid, in-scope, name-matching entities. The gate runs even under
+        // `dry_run`: a gappy scope is misconfigured regardless of writes.
+        let working_set = self.scope_working_set(scope)?;
+        // Refuse a design with a file dbd could not read, before any write.
+        // `entities_in_scope` drops those entities silently, which is how apply
+        // used to report success while never creating the object. Like the scope
+        // gate above, this runs under `dry_run` too: an incomplete design is
+        // incomplete whether or not we are about to write.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
+        let entities = self.entities_in_scope(scope, working_set.as_ref(), name);
+        Ok((working_set, entities))
+    }
+
     /// Apply all entities to the database via the adapter.
     ///
     /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
@@ -64,17 +103,7 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
-        // Resolve scope → working set (gap-gated under `report`), then filter to
-        // the valid, in-scope, name-matching entities. The gate runs even under
-        // `dry_run`: a gappy scope is misconfigured regardless of writes.
-        let working_set = self.scope_working_set(scope)?;
-        // Refuse a design with a file dbd could not read, before any write.
-        // `entities_in_scope` drops those entities silently, which is how apply
-        // used to report success while never creating the object. Like the scope
-        // gate above, this runs under `dry_run` too: an incomplete design is
-        // incomplete whether or not we are about to write.
-        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
-        let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
+        let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
