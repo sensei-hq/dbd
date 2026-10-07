@@ -1939,6 +1939,63 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// A table depends on the enum a column is typed with and on the sequence a
+    /// default draws from. Neither was recorded, so a scope could leave them out
+    /// with no gap reported, and apply failed on a type that did not exist.
+    /// A built-in type (`text`) names nothing in the project and is no warning.
+    #[test]
+    fn a_table_depends_on_its_column_enum_and_default_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/enum/core", "ddl/sequence/core", "ddl/table/sales"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - sales\n\
+             scopes:\n  orders_only:\n    includes: [sales.orders]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/core/order_status.ddl"),
+            "create type core.order_status as enum ('open', 'paid');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/sequence/core/invoice_seq.ddl"),
+            "create sequence if not exists core.invoice_seq;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/sales/orders.ddl"),
+            "set search_path to sales;\ncreate table if not exists orders (\n  id integer primary key\n\
+             , status core.order_status not null\n, invoice_no integer default nextval('core.invoice_seq'::regclass)\n\
+             , note text\n);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let orders = design
+            .entities()
+            .iter()
+            .find(|e| e.name == "sales.orders")
+            .expect("orders");
+        let refers: Vec<&str> = orders.refers().collect();
+        assert!(refers.contains(&"core.order_status"), "the column's enum: {refers:?}");
+        assert!(
+            refers.contains(&"core.invoice_seq"),
+            "the default's sequence: {refers:?}"
+        );
+        assert!(
+            orders.warnings.iter().all(|w| !w.contains("Unresolved")),
+            "a built-in type is not an unresolved reference: {:?}",
+            orders.warnings
+        );
+
+        let scope = design.resolve_scope(Some("orders_only"), None).unwrap();
+        let err = design.check_scope_gaps(&scope).unwrap_err().to_string();
+        assert!(err.contains("core.order_status"), "the missing enum is a gap: {err}");
+    }
+
     /// A sequence belongs to its schema like a table does. `is_scopable` left
     /// sequences out, so every scope dropped them — even one that only
     /// excludes another schema — and the table whose default draws from one
