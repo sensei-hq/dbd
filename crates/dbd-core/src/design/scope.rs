@@ -176,6 +176,21 @@ impl Design {
             .collect()
     }
 
+    /// The entities a command run under `scope` covers but dbd could not read
+    /// — what a document generated from the design leaves out.
+    ///
+    /// The same judgement [`Self::ensure_fully_parsed`] refuses on. A command
+    /// that writes documentation (`dbml`, `diagram`) names these instead and
+    /// writes what it can, as `emit` reports them: left out without a word, a
+    /// document missing a table reads exactly like a complete one.
+    pub fn unparsed(&self, scope: &ResolvedScope) -> Result<Vec<&Entity>> {
+        if scope.is_all {
+            return Ok(self.unparseable_in_scope(None, None, None));
+        }
+        let working = self.working_set(scope)?;
+        Ok(self.unparseable_in_scope(Some(scope), Some(&working), None))
+    }
+
     /// Refuse to act on a design dbd could not fully read.
     ///
     /// [`Self::entities_in_scope`] silently drops an entity that carries a parse

@@ -56,6 +56,7 @@ pub fn cmd_diagram(
     // No context added: a scope that cannot resolve fails here with exactly the
     // error `dbml`, `apply` and the rest give for it.
     let mut model = dbd_core::schema_model::build(&design, Some(&resolved))?;
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     // The changelog (#29), seen through the same scope as the diagram — which may
     // be a `default` scope with no --scope given. A scope is a set of entities, and

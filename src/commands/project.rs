@@ -66,6 +66,7 @@ pub fn cmd_dbml(
     let entities = design.scoped_entities(&resolved)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,

@@ -45,6 +45,22 @@ pub fn warn(msg: &str) {
     eprintln!("{}", style(format!("⚠ {msg}")).yellow());
 }
 
+/// Warn, per file, that a generated document leaves out what dbd could not
+/// parse — see `Design::unparsed`.
+pub fn left_out_unparsed(entities: &[&dbd_core::Entity]) {
+    for e in entities {
+        let file = e
+            .file
+            .as_ref()
+            .map_or_else(|| e.name.clone(), |f| f.display().to_string());
+        warn(&format!(
+            "{file} could not be parsed, so {} is left out: {}",
+            e.name,
+            e.errors.join("; ")
+        ));
+    }
+}
+
 /// Announce that output was narrowed to a scope, and by how much.
 ///
 /// Every command that filters by scope calls this, so a narrowed run always
