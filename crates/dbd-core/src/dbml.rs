@@ -1,5 +1,5 @@
 use crate::config::DbmlDocConfig;
-use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexDef, TableConstraint, TableDef};
+use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef};
 
 /// Parameters for DBML generation.
 pub struct DbmlParams<'a> {
@@ -304,8 +304,16 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
         lines.push(emit_column(col, &pk_columns));
     }
 
-    // Indexes block
-    let idx_block = emit_indexes(&table_def.indexes);
+    // Indexes block. A table-level UNIQUE is listed here first: DBML has no
+    // constraint syntax for it, and a named unique index is how DBML spells
+    // one. Leaving it out made `init --from-dbml` rebuild a table that accepts
+    // the duplicates the design refuses. It reads back as a unique index —
+    // DBML cannot tell the two apart — which enforces the same thing under the
+    // same name.
+    let indexes: Vec<IndexDef> = unique_constraint_indexes(table_def)
+        .chain(table_def.indexes.iter().cloned())
+        .collect();
+    let idx_block = emit_indexes(&indexes);
     if !idx_block.is_empty() {
         lines.push(String::new());
         lines.push("  indexes {".to_string());
@@ -323,6 +331,30 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
 
     lines.push("}\n".to_string());
     lines.join("\n")
+}
+
+/// Each table-level `UNIQUE` constraint as the unique index DBML writes it as.
+fn unique_constraint_indexes(table_def: &TableDef) -> impl Iterator<Item = IndexDef> + '_ {
+    table_def.constraints.iter().filter_map(|c| match c {
+        TableConstraint::Unique {
+            name,
+            columns,
+            nulls_not_distinct,
+        } => Some(IndexDef {
+            name: name.clone(),
+            columns: columns
+                .iter()
+                .map(|column| IndexColumn {
+                    name: column.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique: true,
+            nulls_not_distinct: *nulls_not_distinct,
+            ..Default::default()
+        }),
+        _ => None,
+    })
 }
 
 fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) -> String {
@@ -614,7 +646,7 @@ fn quote_dbml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{EnumValue, FkAction, IndexColumn, TableComments};
+    use crate::entity::{EnumValue, FkAction, TableComments};
 
     fn make_table_entity(name: &str, columns: Vec<ColumnDef>, constraints: Vec<TableConstraint>) -> Entity {
         let mut entity = Entity::new(EntityType::Table, name);
