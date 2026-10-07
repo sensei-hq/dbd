@@ -80,12 +80,21 @@ impl Design {
         scope: Option<&ResolvedScope>,
     ) -> Result<Option<String>> {
         // Roles aren't scope-selectable, so only a full reset drops them; a
-        // subset scope leaves shared roles intact.
+        // subset scope leaves shared roles intact. Every role the design
+        // declares counts — `ddl/role/` files as well as `target.roles`, which
+        // used to be the only ones dropped.
         let is_subset = matches!(scope, Some(s) if !s.is_all);
-        let roles: &[_] = if is_subset {
-            &[]
+        let roles: Vec<crate::config::RoleEntry> = if is_subset {
+            Vec::new()
         } else {
-            self.config.target.values().next().map(|t| &t.roles[..]).unwrap_or(&[])
+            self.entities
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Role)
+                .map(|e| crate::config::RoleEntry {
+                    name: e.name.clone(),
+                    refers: Vec::new(),
+                })
+                .collect()
         };
 
         // Data-model entities to drop individually (scope-filtered), in the
@@ -106,18 +115,30 @@ impl Design {
         // those the scope occupies.
         let schemas = self.reset_target_schemas(scope)?;
 
-        // The active target's extensions (by bare name) for the `--extensions` path.
+        // The active target's extensions (by bare name) for the `--extensions`
+        // path — only those the scope installs: a scope's `extensions:`
+        // allowlist bounds what reset drops as it bounds what apply creates.
+        let admitted = |name: &str| match scope {
+            Some(s) if !s.is_all => s.extensions.as_ref().is_none_or(|allow| allow.contains(name)),
+            _ => true,
+        };
         let extensions: Vec<String> = self
             .config
             .target
             .values()
             .next()
-            .map(|t| t.extensions.iter().map(|e| e.name().to_string()).collect())
+            .map(|t| {
+                t.extensions
+                    .iter()
+                    .map(|e| e.name().to_string())
+                    .filter(|n| admitted(n))
+                    .collect()
+            })
             .unwrap_or_default();
 
         script::build_reset_script(
             &entities,
-            roles,
+            &roles,
             &extensions,
             target,
             drop_schemas,
