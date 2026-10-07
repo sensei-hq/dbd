@@ -4491,3 +4491,144 @@ async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_trigge
     )
     .await;
 }
+
+// ── Enum value removal: only views are dropped ────────────────────────────────
+
+/// Removing an enum value recreates the type, and every view over a column of
+/// it has to go first. Every *entity* that transitively referenced the enum's
+/// table was emitted as `DROP VIEW`: the table with a foreign key to it, and the
+/// procedure and function whose bodies read it. The run failed with
+/// `"order_notes" is not a view`, so the value could not be removed from any
+/// enum whose table anything else referenced.
+///
+/// End to end: the tables keep their rows, the routines are not dropped, and
+/// the views — one over the column, one over that view — come back.
+#[tokio::test]
+async fn removing_an_enum_value_drops_only_the_views_over_its_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_dependents_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml =
+        "project:\n  name: enum_dependents_test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let enum_file = |values: &str| {
+        (
+            "ddl/enum/app/order_status.ddl",
+            format!("set search_path to app;\ncreate type order_status as enum ({values});\n"),
+        )
+    };
+    let rest: Vec<(&str, &str)> = vec![
+        (
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists orders (\n\
+               id     integer primary key\n\
+             , status order_status not null default 'new'\n\
+             );\n",
+        ),
+        (
+            "ddl/table/app/order_notes.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_notes (\n\
+               id       integer primary key\n\
+             , order_id integer not null references orders (id)\n\
+             , note     text\n\
+             );\n",
+        ),
+        (
+            "ddl/view/app/open_orders.ddl",
+            "set search_path to app;\n\
+             create or replace view open_orders as select id, status from orders where status <> 'void';\n",
+        ),
+        (
+            "ddl/view/app/open_order_ids.ddl",
+            "set search_path to app;\n\
+             create or replace view open_order_ids as select id from open_orders;\n",
+        ),
+        (
+            "ddl/procedure/app/void_order.ddl",
+            "set search_path to app;\n\
+             create or replace procedure void_order(p_id integer)\n\
+             language plpgsql as $$\n\
+             begin\n\
+               update orders set status = 'void' where id = p_id;\n\
+             end $$;\n",
+        ),
+        (
+            "ddl/function/app/order_count.ddl",
+            "set search_path to app;\n\
+             create or replace function order_count() returns bigint\n\
+             language sql stable as $$ select count(*) from orders $$;\n",
+        ),
+    ];
+    let load = |values: &str| {
+        let (path, sql) = enum_file(values);
+        let mut files = rest.clone();
+        files.push((path, sql.as_str()));
+        write_project(dir, yaml, &files)
+    };
+
+    // ── Phase 1: build it, with rows in both tables ──
+    load("'new', 'paid', 'void'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    adapter
+        .execute_script(
+            "INSERT INTO app.orders (id, status) VALUES (1, 'new'), (2, 'void'); \
+             INSERT INTO app.order_notes (id, order_id, note) VALUES (1, 1, 'keep me');",
+        )
+        .await
+        .expect("seed rows failed");
+
+    // ── Phase 2: remove the unused value ──
+    load("'new', 'void'")
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("removing an enum value must not drop the tables and routines that reference its table");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.order_status)::text) = '{new,void}'",
+        "enum app.order_status without paid",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.order_notes WHERE id = 1 AND note = 'keep me'",
+        "the row in app.order_notes",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.orders WHERE id = 2 AND status = 'void'",
+        "the rows in app.orders",
+    )
+    .await;
+    for routine in ["void_order", "order_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'app' AND p.proname = '{routine}'"
+            ),
+            &format!("routine app.{routine}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.open_order_ids WHERE id = 1",
+        "the views, recreated over the new type",
+    )
+    .await;
+    adapter
+        .execute_script("CALL app.void_order(1)")
+        .await
+        .expect("the procedure still runs against the recreated type");
+}

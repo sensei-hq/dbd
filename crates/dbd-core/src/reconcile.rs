@@ -4087,6 +4087,54 @@ mod enum_recreation_tests {
         );
     }
 
+    /// Only a view stands in the way of `ALTER COLUMN … TYPE`. A table with a
+    /// foreign key to the affected table, and a routine whose body reads it, do
+    /// not — Postgres records no dependency on the column for either — and they
+    /// must never be dropped: every dependent used to be emitted as `DROP VIEW`,
+    /// which failed with `"order_notes" is not a view` and would have destroyed a
+    /// table's rows had it been the right keyword. Nor does a view or matview
+    /// over such a table depend on the column, so neither is dropped or blocks.
+    #[test]
+    fn only_views_over_the_affected_table_are_dropped_never_tables_or_routines() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let entities = vec![
+            entity(EntityType::Table, "app.t", &[]),
+            entity(EntityType::Table, "app.notes", &["app.t"]),
+            entity(EntityType::Procedure, "app.p", &["app.t"]),
+            entity(EntityType::Function, "app.f", &["app.t"]),
+            entity(EntityType::View, "app.v", &["app.t"]),
+            entity(EntityType::View, "app.notes_v", &["app.notes"]),
+            entity(EntityType::MaterializedView, "app.notes_mv", &["app.notes"]),
+        ];
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &entities);
+
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("app.notes_mv")),
+            "a matview over a referencing table does not depend on the column: {:?}",
+            plan.warnings
+        );
+        let sql = &plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the recreation is planned")
+            .sql;
+        let drops: Vec<&str> = sql.lines().filter(|l| l.starts_with("DROP ")).collect();
+        assert_eq!(
+            drops,
+            vec!["DROP VIEW IF EXISTS app.v;", "DROP TYPE app.colour__dbd_old;"],
+            "only the view over the column may be dropped:\n{sql}"
+        );
+    }
+
     /// dbd never auto-drops a materialized view — a `DROP … CASCADE` would
     /// repopulate it and take its dependents with it. So a matview over the
     /// affected table is the one case recreation cannot do, and it must say so
