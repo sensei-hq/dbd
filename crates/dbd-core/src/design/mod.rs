@@ -1931,6 +1931,51 @@ import:
         assert_eq!(meta.version, 99);
     }
 
+    /// `reset --clean` drops what the project installs: every role the design
+    /// declares — `target.roles` and `ddl/role/` alike (only the first were
+    /// dropped) — and the extensions its scope admits. A scope whose
+    /// `extensions: []` installs none must drop none; every extension went.
+    #[test]
+    fn reset_drops_every_declared_role_and_only_the_scopes_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/role"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n\
+             \x20   roles:\n      - name: from_target\n    extensions:\n      - pgcrypto\n\
+             scopes:\n  hub:\n    includes: [app]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/role/from_file.ddl"), "create role from_file;\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let all = design.reset_script("postgres", true, true, None).unwrap().unwrap();
+        assert!(all.contains("DROP ROLE IF EXISTS \"from_target\""), "{all}");
+        assert!(
+            all.contains("DROP ROLE IF EXISTS \"from_file\""),
+            "a ddl/role role is the project's too: {all}"
+        );
+        assert!(all.contains("DROP EXTENSION IF EXISTS \"pgcrypto\""), "{all}");
+
+        let hub = design.resolve_scope(Some("hub"), None).unwrap();
+        let scoped = design
+            .reset_script("postgres", true, true, Some(&hub))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !scoped.contains("DROP EXTENSION"),
+            "hub installs no extension: {scoped}"
+        );
+    }
+
     #[tokio::test]
     async fn reset_blocked_in_prod() {
         let config_path = fixture_dir().join("design.yaml");
