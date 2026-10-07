@@ -40,13 +40,10 @@ apply:
       writes: [config.lookups]
 
 import:
-  staging: [staging]
   options:
     truncate: true
     null_value: ''
-    format: csv
   tables:
-    - staging.lookups
     - staging.lookup_values:
         truncate: false
   after:
@@ -65,6 +62,9 @@ dbml:
 ignore:
   - bfs
   - my_company.*
+
+format:
+  keyword_case: lower
 ```
 
 ## Sections
@@ -73,9 +73,16 @@ ignore:
 
 | Field  | Type   | Required | Description |
 |--------|--------|----------|-------------|
-| `name` | string | yes | Project display name (used in DBML, migration tracking) |
-| `note` | string | no | Project description |
-| `version` | u32 | no | Schema version (managed by `dbd snapshot`) |
+| `name` | string | yes | Project display name (used in DBML, migration tracking, the viewer) |
+| `note` | string | no | Project description — markdown; the viewer shows it on the overview |
+| `version` | u32 | no | Schema version — written by `dbd snapshot`, `dbd release`, `dbd init --from-db` and `dbd merge` |
+| `released` | bool | no | `true` once `dbd release` has cut v1. `dbd reconcile` refuses on a released project — changes go through `dbd snapshot` and `dbd apply` |
+
+`released` is set by `dbd release` and by nothing else. `dbd init --from-db`
+and `dbd merge` write snapshots without setting it, which leaves a project with
+snapshots that is not released: `reconcile` still runs, and `dbd release`
+refuses because snapshots exist. See
+[recommended workflows](06-recommended-workflows.md#snapshots-but-not-released).
 
 ### `source`
 
@@ -141,9 +148,12 @@ normally need it.
   `WITHOUT ROWID` and `STRICT` outright.
 
 **Only a structured reader can diff.** `diff` and `reconcile` compare columns
-and constraints, so they work on `pg_query` projects and refuse on `tsql` and
-`verbatim` ones, naming the reason. `apply`, `deploy`, `import` and `export`
-work everywhere.
+and constraints, and `emit` translates them, so all three work on `pg_query`
+projects and refuse on `tsql`, `mysql` and `verbatim` ones, naming the reason.
+`apply`, `deploy`, `import` and `export` need an adapter for the database:
+PostgreSQL, SQLite and Convex have one; MySQL and SQL Server do not, so a T-SQL
+or MySQL project is read — `inspect`, `graph`, `combine` — and not applied. See
+[other dialects](13-other-dialects.md).
 
 `dbd init --from-db sqlite://…` writes `dialect: sqlite` for you.
 
@@ -153,27 +163,31 @@ load with a message saying so.
 
 ### `target`
 
-Each key is a target name. **The first listed target is used** — it supplies the platform config (extensions, roles, grants, `skip_schemas`) and its `url`, unless the URL is overridden per run by `-d`/`--database` or `$DATABASE_URL`. Additional entries are not selectable at run time (there is no target-name selector), so a second target only documents intent. To deploy one design to several databases, keep a single target and pair `-d`/`--database` with [`scopes`](#scopes):
+Each key is a target name. **Only the first listed target is used** — it supplies the platform config (extensions, roles, grants, `skip_schemas`) and its `url`, unless the URL is overridden per run by `-d`/`--database` or `$DATABASE_URL`. Further entries are never read (there is no target-name selector), so declare one. To deploy one design to several databases, keep a single target and pair `-d`/`--database` with [`scopes`](#scopes):
 
 ```sh
 dbd deploy --scope hive -d $HIVE_URL    # the adapter is chosen by the URL scheme
 dbd deploy -d $MAIN_URL
 ```
 
-The adapter (PostgreSQL/SQLite/Convex) is selected from the **URL scheme** (`postgres://`, `sqlite://`/`file:`, `convex:`), not the target name — so the target key is just a label.
+The adapter (PostgreSQL/SQLite/Convex) is selected from the **URL scheme** (`postgres://`, `sqlite://`/`file:`, `convex:`), not the target name. The key still matters in one case: a target named **`supabase`** uses the same PostgreSQL adapter, but exposes `public` by default, keeps Supabase's own schemas out of `reconcile --prune` and `dbd reset`, and adds PostgREST `USAGE` to configured grants. See [targets and adapters](08-targets.md#what-the-supabase-key-changes).
+
+A `url` written as a whole `$VAR` is read from the environment. A variable that
+is not set is used literally, and the connection fails.
 
 **PostgreSQL / Supabase:**
 
 | Field        | Type   | Description |
 |--------------|--------|-------------|
-| `url`        | string | Connection URL (env var references like `$DATABASE_URL` are expanded) |
+| `url`        | string | Connection URL (a whole-value `$VAR` is expanded) |
 | `extensions` | list   | Extensions to install (string or `{name, schema}` object) |
 | `roles`      | list   | Roles to create (`{name, refers}` objects) |
-| `grants`     | object | Schema grants — Supabase only (`{schema: {role: [perms]}}`) |
-| `schemas`    | list   | PostgREST-exposed schemas — Supabase only |
-| `skip_schemas` | list | Schemas to exclude from entity scanning |
+| `grants`     | object | Schema grants, `{schema: {role: [perms]}}` — for any target key; see [`schemas`](#schemas) |
+| `skip_schemas` | list | Schemas whose entities are dropped from the design — the target owns them. The schema itself is still created if listed under `schemas:` |
+| `schemas`    | list   | Reserved — parsed, not used (`dbd doctor --fix` writes it when migrating an old config). Use [`exposed`](#exposed) |
+| `path`       | string | Reserved — parsed, not used |
 
-**Grants example (Supabase):**
+**Grants example:**
 
 ```yaml
 target:
@@ -193,7 +207,7 @@ target:
     url: sqlite://./app.db
 ```
 
-URL forms: `sqlite://relative/path.db`, `sqlite::memory:`, or `file:/abs/path.db`. The file is created on first connect. SQLite has no schemas — top-level `schemas:` entries still validate the design, but no `CREATE SCHEMA` is emitted. Enum/role/procedure/function/extension entities are rejected at apply time.
+URL forms: `sqlite://relative/path.db`, `sqlite::memory:`, or `file:/abs/path.db`. The file is created on first connect. SQLite has no schemas — top-level `schemas:` entries still validate the design, but no `CREATE SCHEMA` is emitted. Enum, role, sequence, procedure, function, extension and materialized-view entities are rejected at apply time.
 
 **Convex target:**
 
@@ -205,7 +219,7 @@ target:
     # url: convex://./generated?deploy=true    # also runs `npx convex deploy` after each apply
 ```
 
-The Convex adapter is a codegen target — it does not connect to a server. `dbd apply` parses each table's `TableDef`, maps SQL types to `v.*` validators (`int*`/`numeric` → `v.number()`, text-like → `v.string()`, `jsonb` → `v.any()`, `bytea` → `v.bytes()`, arrays → `v.array(...)`, nullable columns → `v.optional(...)`), and writes one `defineSchema({ ... })` file. Table names flatten from `schema.entity` to `schema_entity` because Convex forbids `.` in table names. Indexes render as `.index("name", ["col"])`.
+The Convex adapter is a codegen target — it does not connect to a server. It writes tables and enums only; other entity types are skipped. `dbd apply` parses each table's `TableDef`, maps SQL types to `v.*` validators (`int*`/`numeric` → `v.number()`, text-like → `v.string()`, `jsonb` → `v.any()`, `bytea` → `v.bytes()`, arrays → `v.array(...)`, nullable columns → `v.optional(...)`), and writes one `defineSchema({ ... })` file. Table names flatten from `schema.entity` to `schema_entity` because Convex forbids `.` in table names. Indexes render as `.index("name", ["col"])`.
 
 **Enums and foreign keys.** `Entity::Enum` (DDL `CREATE TYPE … AS ENUM (…)`) emits `export const <name> = v.union(v.literal("…"), …);` above `defineSchema`; columns whose type matches an enum reference the const. Single-column foreign keys (inline or table-level) emit `v.id("target_table")` instead of the scalar validator.
 
@@ -217,7 +231,7 @@ Append `?deploy=true` to the URL to run `npx convex deploy` automatically after 
 
 List of schema names. dbd runs `CREATE SCHEMA IF NOT EXISTS` for each. Schemas referenced in entity file paths are auto-added.
 
-A schema entry may also be an object carrying `grants:`, applied on **any Postgres/Supabase** target (unlike `target.grants`, above, which only takes effect on a Supabase target):
+A schema entry may also be an object carrying `grants:` (and [`exposed`](#exposed)). Schema grants and the first target's `grants:` both apply, whatever the target is named:
 
 ```yaml
 schemas:
@@ -228,7 +242,13 @@ schemas:
         app_admin: [usage, select, insert, update, delete]
 ```
 
-This emits `GRANT USAGE ON SCHEMA`, `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, overriding perms for roles present in both). Targets without a SQL grant model (SQLite, Convex) skip grant emission with a note rather than failing.
+This emits `GRANT USAGE ON SCHEMA` (for `usage`, written in lower case), `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role, then `NOTIFY pgrst, 'reload config'`. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, replacing the list for roles present in both). On a `supabase` target, configured grants also give `anon`, `authenticated` and `service_role` `USAGE` on every listed schema, for PostgREST.
+
+`dbd apply` and `dbd deploy` apply grants once the schema is in place — after
+the entities and the `apply.after` hooks, before import and policies. They are
+not applied by `--dry-run` and not filtered by `--scope`. Targets without a SQL
+grant model (SQLite, Convex) skip them with a note rather than failing. See
+[access control](09-access-control.md).
 
 #### `exposed`
 
@@ -268,7 +288,7 @@ touch; exposure decides what the internet can read.
 
 ### `external`
 
-FK stubs for tables managed outside the project (e.g., Supabase `auth.users`):
+Tables and functions managed outside the project (e.g., Supabase `auth.users`), so references to them resolve:
 
 ```yaml
 external:
@@ -276,26 +296,29 @@ external:
     note: Supabase managed authentication table
 ```
 
+A reference to an external entity is never an "Unresolved reference" warning
+and never a [scope](#scopes) dependency gap; `dbd dbml` draws it as a stub
+table. Only `name` is read — `note` documents it for people, and a `columns:`
+list is parsed but not used.
+
 ### `scopes`
 
-Named subsets of entities, so one design can deploy to multiple databases (e.g. a full primary DB and a smaller embedded-postgres "hub").
+Named subsets of entities, so one design can build several databases. The full
+guide is [scopes and multi-database deploys](07-scopes.md); this is the
+reference.
 
 ```yaml
 scopes:
   hub:
     includes: [config, app.users, app.sessions]   # whole schema or specific entity
     deps: report                                    # report (default) | include
+    extensions: []                                  # install no target extensions
   reporting:
     excludes: [staging.*, app.audit_log]           # wildcard drops a schema's entities
+  everything: all                                   # the full set under another name
+  default:
+    excludes: [hive]                                # what a run without --scope builds
 ```
-
-Each entry in `includes`/`excludes` is one of three forms:
-
-- **`schema`** — a bare schema token: every entity in the schema **plus the `CREATE SCHEMA` entity itself**.
-- **`schema.entity`** — one qualified entity (e.g. `app.users`).
-- **`schema.*`** — a wildcard matching every entity under the schema, using the same `prefix.*` syntax as the [`ignore`](#ignore) list. Unlike the bare schema token it does **not** carry the schema entity, so `excludes: [staging.*]` drops staging's tables while keeping the `staging` schema, whereas `excludes: [staging]` drops the schema too. For `includes`, `schema.*` and `schema` are equivalent (the schema entity is re-added because its entities are present).
-
-`includes` omitted means start from the full set; `excludes` removes from it. An unknown name or wildcard prefix that matches nothing is an error (typo protection).
 
 | Field        | Type   | Default  | Description |
 |--------------|--------|----------|-------------|
@@ -304,51 +327,15 @@ Each entry in `includes`/`excludes` is one of three forms:
 | `deps`       | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |
 | `extensions` | list   | (all)    | Per-scope extension allowlist. Omitted ⇒ all target extensions apply; a list ⇒ only those apply; `[]` ⇒ none |
 
-**`extensions`** restricts which of the `target.extensions` apply under this scope. Omit it for today's behavior (every target extension is installed). Set it to deploy a scope to a database that lacks one — e.g. a hub on embedded Postgres without `pgvector`:
-
-```yaml
-scopes:
-  hub:
-    includes: [config]
-    extensions: []          # install no extensions on the hub DB
-  search:
-    includes: [docs]
-    extensions: [vector]    # only pgvector, not the others
-```
-
-List each extension by its **bare name** (`vector`, `postgis`, `uuid-ossp`) — the same name dbd uses for the entity, even for extensions declared with a `schema:`. The allowlist is honored everywhere the scope is (apply/deploy and the read commands); roles and externals remain always-on regardless.
-
-**`deps: report`** — `dbd inspect --scope X` lists every in-scope entity that references a managed entity outside the scope (with dependency chain) and exits non-zero. `apply`/`import`/`deploy` refuse to proceed until gaps are resolved — including their `--dry-run` modes, so a dry-run surfaces the same error a real run would.
-
-**`deps: include`** — the working set silently expands to the full transitive dependency closure before the command runs. This applies to every scope-aware command (`apply`, `import`, `deploy`, `combine`, `dbml`, `graph`, `export`), not just `deploy`.
-
-`external:` entries are never considered gaps regardless of `deps` setting.
-
-Omit the `scopes:` block (or don't define `default:`) to deploy the full entity set. Define `default:` only if a bare `dbd deploy` should deploy a subset.
-
-#### Worked example: a schema as an optional add-on
-
-A common pattern is an optional schema (say `hive`) that ships to a dedicated database, while the main database deploys everything *except* it. Define one scope that includes the add-on and a `default` that excludes it:
-
-```yaml
-scopes:
-  hive:
-    includes: [hive]      # only the hive schema (its entities + the CREATE SCHEMA)
-    deps: include         # auto-pull any shared tables hive references
-  default:
-    excludes: [hive]      # the full set minus hive (the schema isn't even created)
-```
-
-```sh
-dbd deploy --scope hive -d $HIVE_URL   # the hive database: only hive
-dbd deploy -d $MAIN_URL                # no --scope ⇒ the `default` scope ⇒ everything except hive
-dbd deploy --scope all -d $MAIN_URL    # the true full set, including hive (bypasses `default`)
-```
-
-Two choices worth understanding:
-
-- **`excludes: [hive]` vs `excludes: [hive.*]`.** The bare token drops hive's entities *and* the `CREATE SCHEMA hive` statement, so the main DB never creates the schema — usually what you want. Use `hive.*` instead if the empty schema should still exist on the main DB.
-- **`deps: include` on `hive`.** If hive tables reference shared tables in other schemas, a `report`-policy `--scope hive` would fail with a dependency gap. `deps: include` expands the working set to pull those dependencies in automatically; alternatively list them in `includes` or declare them under [`external`](#external). Run `dbd inspect --scope hive` to see any gaps before deploying.
+- A bare `schema` selects its entities **and** its `CREATE SCHEMA`; `schema.*`
+  selects the entities only; `schema.entity` selects one entity. A name or
+  wildcard that matches nothing is an error.
+- A scope's value may be the bare string `all` — the full set. Any other string
+  is refused.
+- **`all`** and **`default`** are reserved: `--scope all` is always the full
+  design (so a scope you define named `all` is never used), and `default`, when
+  defined, is what a run without `--scope` builds.
+- An [`external`](#external) entry is never a dependency gap.
 
 ### `apply`
 
@@ -361,18 +348,33 @@ Lifecycle hooks around the DDL phase, for SQL dbd does not model — attaching a
 
 `apply.after` runs before `policies/` because publications and grants attach to objects that must already exist, while RLS policies are independent of them. A hook that needs a policy to exist will not find one.
 
-Unlike `import.after`, these run on `dbd apply` as well as `dbd deploy`. If you have post-DDL SQL living in `import.after` today, `apply.after` is where it belongs: `dbd apply` never runs the import phase, so an `import.after` hook silently does nothing on it.
+These run on `dbd apply` and `dbd deploy`. `import.after` runs with the import
+phase instead — on `dbd import` and `dbd deploy`, never on `dbd apply`. Post-DDL
+SQL that lives in `import.after` today (publications, grants) belongs in
+`apply.after`: on a plain `dbd apply` an `import.after` hook does nothing.
+
+The `grants:` declared in `design.yaml` are applied after `apply.after`, so a
+hook cannot rely on them yet; grants written *in* a hook script are the hook's
+own.
 
 See [Hook scripts](#hook-scripts) for the entry format and how scopes filter them.
 
 ### `import`
 
+Data files are found by convention — every `import/<schema>/<table>.<csv|tsv|json|jsonl>`
+loads into `<schema>.<table>` — so this section only tunes the load. The full
+guide is [import and export](10-data.md).
+
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `staging` | list   | Schemas allowed for import (import fails for other schemas) |
-| `options` | object | Default options: `truncate`, `null_value`, `format` |
-| `tables`  | list   | Explicit table list (string, or `{name: options}` for per-table overrides of `truncate`/`format`/`null_value`) |
-| `after`   | list   | SQL scripts run after data load — e.g. `import/loader.sql`. See [Hook scripts](#hook-scripts) |
+| `options` | object | `truncate` (default `true`: empty each table before loading it) and `null_value` (default `''`) |
+| `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — every data file loads |
+| `after`   | list   | SQL scripts run after the data is loaded and the import procedures have run — on `dbd import` and `dbd deploy`. See [Hook scripts](#hook-scripts) |
+| `staging` | list   | Reserved — parsed, not used |
+
+`options.format` and a per-table `env` are parsed but not used either: the
+format comes from the file's extension (or a per-table `format`), and the
+environment from the folder.
 
 `null_value` is the sentinel string that means SQL NULL in a CSV/TSV data file. It defaults to `''` (empty string), so by default an empty cell loads as NULL — this is unchanged unless you configure a sentinel. Set a non-empty sentinel (e.g. `\N`, Postgres's own COPY default) when your data files need to distinguish a genuine empty string from NULL: once configured, only a cell matching the sentinel exactly becomes NULL, and a plain empty cell loads as a literal empty string. A per-table `null_value` under `tables:` overrides the global `options.null_value` for that table only:
 
@@ -415,7 +417,24 @@ The run continues; a scoped run is a normal workflow, not an error. This exists 
 
 ### `export`
 
-List of tables to export (string or `{name: options}`). Writes to `export/<schema>/<name>.<format>`.
+Which tables `dbd export` writes, and in what format:
+
+```yaml
+export:
+  - config.lookups
+  - config.lookup_values:
+      format: jsonl        # always JSON Lines, whatever -f says
+```
+
+- **Omitted or empty** — `dbd export` writes every table in the design (within
+  the scope).
+- **Listed** — only these tables. `dbd export -n <table>` then has to name one
+  of them, or there is nothing to export.
+- Entries must be **tables**: a view listed here is skipped without a message.
+- A per-entry `format` (`csv`, `tsv` or `jsonl`) wins over `-f`.
+
+Files are written to `export/<schema>/<name>.<format>`, or flat into the
+directory `-o` names. See [import and export](10-data.md#export).
 
 ### `materialized_views`
 
@@ -472,7 +491,46 @@ Composite foreign keys (multi-column constraints) emit DBML tuple syntax automat
 
 ### `ignore`
 
-List of reference names or patterns to ignore during validation. Useful for functions from extensions or shared schemas that aren't part of the project.
+References dbd should not try to resolve — functions from extensions, objects in
+schemas the project does not manage:
+
+```yaml
+ignore:
+  - bfs              # an exact name
+  - my_company.*     # every name in a schema
+```
+
+Before references are resolved, any reference matching an entry is dropped:
+it raises no "Unresolved reference" warning, and it creates no dependency edge,
+so it plays no part in apply order or [scope](#scopes) gaps. Matching is
+case-insensitive, and there are two forms only — an exact name, and `prefix.*`,
+where the prefix is matched exactly (`supabase_*.*` matches nothing). `ignore`
+does not exclude files or entities; for that, use `target.skip_schemas`.
+
+### `format`
+
+Options for `dbd format` (and `dbd inspect --fix`). Every field is optional.
+
+```yaml
+format:
+  keyword_case: lower        # lower | upper | preserve
+  comma_style: leading       # leading | trailing
+  type_alignment: 27         # column where a column's type starts; 0 = off
+  indent: 2                  # spaces per level
+  query_style: river         # river | none — align SELECT bodies
+  gutter: 10                 # river: width of the right-aligned keyword column
+```
+
+| Field | Default | Values |
+|---|---|---|
+| `keyword_case` | `lower` | `lower`, `upper`, `preserve` |
+| `comma_style` | `leading` | `leading`, `trailing` |
+| `type_alignment` | `27` | a column number; `0` turns alignment off |
+| `indent` | `2` | spaces |
+| `query_style` | `river` | `river`, `none` |
+| `gutter` | `10` | the river's keyword width — wide enough for `inner join` |
+
+See [`dbd format`](04-commands.md#dbd-format) for what each style does.
 
 ## What you don't put in design.yaml
 

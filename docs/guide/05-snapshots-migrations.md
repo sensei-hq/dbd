@@ -4,6 +4,10 @@
 
 DDL files are always the final desired state. Snapshots capture the diff between versions. Migrations are the ALTER/DROP scripts that bridge environments from one version to the next.
 
+This is the workflow **after release**. Before `dbd release`, a project changes
+its database with `dbd reconcile` instead and writes no snapshots — see
+[recommended workflows](06-recommended-workflows.md).
+
 ## Creating a snapshot
 
 After changing DDL files:
@@ -32,6 +36,14 @@ This:
 | Fresh (no bookkeeping table) | Apply all DDL directly, mark latest version |
 | Behind (version < latest) | Run pending migrations, then apply DDL |
 | Current (version == latest) | Idempotent apply (CREATE IF NOT EXISTS) |
+
+On PostgreSQL every scenario runs in one transaction (unless `DBD_NO_TX` is
+set), so a migration that fails part-way leaves the database at the version it
+started from.
+
+Snapshots record tables and enums. A migration under `--scope` runs only the
+steps for the scope's entities while the database's version still advances —
+see [scopes](07-scopes.md#migrations-under-a-scope).
 
 ## Smart multi-snapshot
 

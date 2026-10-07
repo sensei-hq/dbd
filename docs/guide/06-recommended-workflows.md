@@ -32,7 +32,10 @@ schemas. Two kinds of destruction each need their own opt-in:
 - **`--allow-destructive`** — drop a *column* or constraint from a managed table, or remove a
   *value* from an enum (the type is recreated; dependent managed views are dropped and re-applied).
 - **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
-  design (an orphan). Without `--prune`, orphans are reported and left in place.
+  design (an orphan). Without `--prune`, orphans are reported and left in place. Under
+  `--scope`, a table the design declares outside the scope is not an orphan — a scope narrows
+  what is applied, not what the project owns. **Upgrade to 0.24.1 before a scoped prune:**
+  earlier releases dropped those tables ([#40](https://github.com/sensei-hq/dbd/issues/40)).
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 
@@ -63,6 +66,25 @@ dbd format         # normalize to your conventions (introspected column order is
 `init --from-db` writes a baseline snapshot, so the project is version-tracked from day one. It
 **refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
 use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
+
+Adopting a Supabase database? `init --from-db` names the target `postgres`; rename the key to
+`supabase` so Supabase's own schemas are protected (see
+[targets and adapters](08-targets.md#what-the-supabase-key-changes)).
+
+#### Snapshots, but not released
+
+`init --from-db` and `dbd merge` write snapshots, but only `dbd release` sets
+`project.released: true`. A project built this way is in between:
+
+- it **has snapshots**, so it is on the migration track — `dbd snapshot` then `dbd apply` is
+  the way to change it, as for a released project;
+- it is **not released**, so `dbd reconcile` still runs — reconcile checks the flag, nothing
+  else;
+- and `dbd release` **refuses**, because snapshots already exist.
+
+Treat it as released: change it with `dbd snapshot` and `dbd apply`. To have `reconcile`
+refuse as well, set `released: true` under `project:` in `design.yaml` yourself — that is the
+only thing `dbd release` would have added.
 
 ### Add a new database to an existing project
 
@@ -96,7 +118,7 @@ Someone changed the database out-of-band. Re-`merge` to pull the drift back as a
 version, then apply it everywhere:
 
 ```sh
-dbd merge -d $DATABASE_URL --dry-run     # preview create/skip/conflict + the snapshot version
+dbd merge -d $DATABASE_URL --dry-run     # preview created/unchanged/conflict + the snapshot version
 dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the diff (guarded)
 ```
 
@@ -104,7 +126,7 @@ dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the dif
 
 | Source | Captured |
 |--------|----------|
-| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, comments, `serial`/identity columns), views, functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: partial/expression indexes, triggers. |
+| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, comments, `serial`/identity columns), views, materialized views (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: partial/expression indexes, triggers. |
 | **SQLite** (`--from-db sqlite://…`) | tables, user indexes, and views — captured **verbatim** from `sqlite_master` (CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID` all survive). No schemas/enums/functions/sequences/roles; triggers skipped. Files land flat (`ddl/table/<name>.ddl`); `design.yaml` carries `schemas: []`. |
 | **DBML** (`--from-dbml <file>`) | schemas + enums + tables + foreign keys only — DBML can't express functions, procedures, views, standalone sequences, roles, or check constraints. `serial`/identity survive (dbd's DBML carries `bigserial`/`[increment]`). |
 
