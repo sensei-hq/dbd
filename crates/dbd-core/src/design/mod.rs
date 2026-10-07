@@ -1985,6 +1985,41 @@ import:
         );
     }
 
+    /// A trigger written in a table's file fires a function the table then
+    /// depends on. The parser skipped `CREATE TRIGGER`, so no edge existed:
+    /// `inspect` said all was well and apply ran the trigger before the
+    /// function it executes existed.
+    #[test]
+    fn a_trigger_in_a_table_file_makes_the_table_depend_on_its_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/function/core", "ddl/table/core"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - core\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/function/core/touch_updated_at.ddl"),
+            "create or replace function core.touch_updated_at() returns trigger language plpgsql as $$\n\
+             begin new.updated_at := now(); return new; end; $$;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/items.ddl"),
+            "set search_path to core;\n\
+             create table if not exists items (id integer primary key, updated_at timestamptz);\n\
+             create trigger items_touch before update on items for each row execute function core.touch_updated_at();\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let items = design
+            .entities()
+            .iter()
+            .find(|e| e.name == "core.items")
+            .expect("items");
+        let refers: Vec<&str> = items.refers().collect();
+        assert!(refers.contains(&"core.touch_updated_at"), "{refers:?}");
+    }
+
     /// A table depends on the enum a column is typed with and on the sequence a
     /// default draws from. Neither was recorded, so a scope could leave them out
     /// with no gap reported, and apply failed on a type that did not exist.
