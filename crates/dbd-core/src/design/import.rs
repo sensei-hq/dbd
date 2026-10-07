@@ -82,6 +82,54 @@ impl Design {
         ))
     }
 
+    /// The import plan under `scope`, plus why each left-out entry was left out.
+    ///
+    /// An entry loads its file into a staging table and a procedure moves the
+    /// rows into its targets, so it runs only where both can happen: every
+    /// table the procedure writes is in the working set, and so is the staging
+    /// table — when the design declares it (one it does not declare is not the
+    /// scope's to judge). A proc-less entry needs its own table. Checking the
+    /// targets alone kept an import whose staging table the scope never built.
+    ///
+    /// The one rule for `import`, `deploy`, and both commands' `--dry-run`.
+    /// `None` or the all-scope keeps the whole plan.
+    pub fn scoped_import_plan(
+        &self,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(Vec<ImportPlanEntry>, Vec<String>)> {
+        let plan = self.import_plan(name);
+        let Some(scope) = scope.filter(|s| !s.is_all) else {
+            return Ok((plan, Vec::new()));
+        };
+        let ws = self.working_set(scope)?;
+        let declared: std::collections::HashSet<&str> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Table)
+            .map(|e| e.name.as_str())
+            .collect();
+        let mut kept = Vec::new();
+        let mut skips = Vec::new();
+        for entry in plan {
+            let staging = &entry.table.name;
+            let staging_needed = entry.writes.is_empty() || declared.contains(staging.as_str());
+            let missing = if staging_needed && !ws.contains(staging) {
+                Some(staging.clone())
+            } else {
+                entry.writes.iter().find(|w| !ws.contains(*w)).cloned()
+            };
+            match missing {
+                Some(m) => skips.push(format!(
+                    "{staging} not imported — {m} is outside scope '{}'",
+                    scope.name
+                )),
+                None => kept.push(entry),
+            }
+        }
+        Ok((kept, skips))
+    }
+
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
     /// Procedure matching is based on reads/writes analysis, not naming convention:
@@ -227,21 +275,8 @@ impl Design {
             _ => None,
         };
 
-        let plan = self.import_plan(name);
-        let plan: Vec<ImportPlanEntry> = match &narrowed {
-            Some((scope_name, ws)) => {
-                let (kept, dropped): (Vec<_>, Vec<_>) =
-                    plan.into_iter().partition(|e| import_entry_in_scope(e, ws, false));
-                for entry in &dropped {
-                    warnings.push(format!(
-                        "staging table {} not imported — outside scope '{scope_name}'",
-                        entry.table.name
-                    ));
-                }
-                kept
-            }
-            None => plan,
-        };
+        let (plan, skips) = self.scoped_import_plan(name, scope)?;
+        warnings.extend(skips);
 
         // Ensure internal dbd procedures are present before any JSONL import runs.
         // Uses CREATE OR REPLACE so it self-heals and stays current with dbd's version.
