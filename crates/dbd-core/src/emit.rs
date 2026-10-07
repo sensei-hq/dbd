@@ -15,7 +15,7 @@ fn bare(name: &str) -> &str {
 }
 
 /// Whether a column type is one of the Postgres `serial` pseudo-types.
-fn is_serial_type(ty: &str) -> bool {
+pub(crate) fn is_serial_type(ty: &str) -> bool {
     matches!(
         ty.trim().to_ascii_lowercase().as_str(),
         "serial" | "bigserial" | "smallserial" | "serial2" | "serial4" | "serial8"
@@ -46,11 +46,18 @@ pub fn emit_enum(entity: &Entity) -> String {
 /// emitted as `"name" <type> GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` with
 /// any default dropped (identity columns are implicitly `NOT NULL`).
 ///
-/// # What is intentionally NOT re-emitted
+/// # Column-level keys
 ///
-/// Column-only `is_pk`/`is_unique` and `inline_fk` are not re-emitted: the Postgres
+/// Column-only `is_pk` and `inline_fk` are not re-emitted: the Postgres
 /// introspector decomposes these into table-level constraints, so re-emitting them
 /// here would produce duplicate DDL.
+///
+/// A column's own `is_unique` *is* emitted, as an inline `UNIQUE`, unless a
+/// single-column table-level `UNIQUE` on that column already says it. The
+/// introspector never sets the flag, so its output is unchanged; but the DBML
+/// parser carries a column's `[unique]` only there, and dropping it made
+/// `init --from-dbml` rebuild a table that accepted the duplicates the design
+/// refuses.
 pub fn emit_table(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -63,7 +70,8 @@ pub fn emit_table(entity: &Entity) -> String {
 
     // Columns
     for c in &def.columns {
-        lines.push(emit_column_line(c));
+        let unique = c.is_unique && !has_single_column_unique(&def.constraints, &c.name);
+        lines.push(emit_column_line(c, unique));
     }
 
     // Table-level constraints
@@ -110,8 +118,26 @@ pub fn emit_column_comment_sql(qname: &str, column: &str, comment: Option<&str>)
     }
 }
 
-/// Render one column definition line (indented, no trailing comma).
-fn emit_column_line(c: &crate::entity::ColumnDef) -> String {
+/// Whether a table-level `UNIQUE` covers exactly `column`.
+fn has_single_column_unique(constraints: &[crate::entity::TableConstraint], column: &str) -> bool {
+    constraints.iter().any(|con| {
+        matches!(con, crate::entity::TableConstraint::Unique { columns, .. }
+            if columns.len() == 1 && columns[0] == column)
+    })
+}
+
+/// Render one column definition line (indented, no trailing comma), with an
+/// inline `UNIQUE` when `unique`.
+fn emit_column_line(c: &crate::entity::ColumnDef, unique: bool) -> String {
+    let mut line = column_definition(c);
+    if unique {
+        line.push_str(" UNIQUE");
+    }
+    line
+}
+
+/// One column's name, type and generation/nullability/default clauses.
+fn column_definition(c: &crate::entity::ColumnDef) -> String {
     // Serial columns are sugar (int + owned sequence). Emit just the serial
     // type — the implied NOT NULL and DEFAULT nextval(...) are re-created by
     // Postgres on apply, so re-emitting them would be redundant/wrong.

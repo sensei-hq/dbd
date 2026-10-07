@@ -626,7 +626,16 @@ fn parse_column(line: &str, table: &str) -> Result<ColumnDef> {
                 "unique" => col.is_unique = true,
                 "not null" => col.nullable = false,
                 "null" => col.nullable = true,
-                "increment" => { /* type already carries serial/bigserial */ }
+                // DBML's auto-increment. A serial type already is one; any
+                // other type is an identity column — which is what dbd's
+                // exporter writes `increment` for. DBML cannot say ALWAYS or
+                // BY DEFAULT, so it reads as BY DEFAULT: generated unless a
+                // value is supplied, as serial behaves.
+                "increment" if !crate::emit::is_serial_type(&col.data_type) => {
+                    col.identity = Some(crate::entity::IdentityKind::ByDefault);
+                    col.nullable = false;
+                }
+                "increment" => {}
                 "default" => {
                     if let Some(v) = value {
                         col.default_value = Some(parse_default_value(&v));
