@@ -651,11 +651,30 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
                 // exporter writes `increment` for. DBML cannot say ALWAYS or
                 // BY DEFAULT, so it reads as BY DEFAULT: generated unless a
                 // value is supplied, as serial behaves.
+                // Settings apply in any order, so an explicit kind from the
+                // `generated as identity` property is never overwritten here.
                 "increment" if !crate::emit::is_serial_type(&col.data_type) => {
-                    col.identity = Some(crate::entity::IdentityKind::ByDefault);
+                    col.identity.get_or_insert(crate::entity::IdentityKind::ByDefault);
                     col.nullable = false;
                 }
                 "increment" => {}
+                // dbd's custom property naming the identity kind `increment`
+                // cannot. An unknown kind is refused: guessing would build a
+                // column that accepts, or refuses, what the design did not say.
+                key if key == crate::dbml::IDENTITY_PROPERTY && !crate::emit::is_serial_type(&col.data_type) => {
+                    let kind = value.as_deref().and_then(parse_single_line_string).unwrap_or_default();
+                    col.identity = Some(match kind.trim().to_ascii_lowercase().as_str() {
+                        "always" => crate::entity::IdentityKind::Always,
+                        "by default" => crate::entity::IdentityKind::ByDefault,
+                        _ => {
+                            return Err(parse_err(format!(
+                                "column `{}` in `{table}`: unknown identity kind `{kind}` (expected 'always' or 'by default')",
+                                col.name
+                            )));
+                        }
+                    });
+                    col.nullable = false;
+                }
                 "default" => {
                     if let Some(v) = value {
                         col.default_value = Some(parse_default_value(&v));
