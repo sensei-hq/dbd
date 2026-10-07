@@ -55,9 +55,18 @@ pub async fn cmd_inspect(
     let report = design.report(name, Some(&resolved));
 
     // Count what this run is actually about, the way every other command
-    // counts it: under a scope, the entities it builds (closure included).
-    let (run_entities, design_entities) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, run_entities, design_entities);
+    // counts it: under a scope, the entities it builds (closure included) —
+    // and with `-n`, the one entity named.
+    let (scope_entities, design_entities) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, scope_entities, design_entities);
+    let run_entities = if name.is_some() { 1 } else { scope_entities };
+    // What the advisory checks below run over: the scope's entities, narrowed
+    // to the named one. `-n` used to count and advise on the whole design.
+    let inspected: Vec<Entity> = scoped
+        .iter()
+        .filter(|e| name.is_none_or(|n| e.name == n))
+        .cloned()
+        .collect();
     report_scope_gaps(&resolved, &report, verbosity)?;
     let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
 
@@ -96,7 +105,7 @@ pub async fn cmd_inspect(
         .map(|e| e.name.clone())
         .collect();
     let matview_errors = dbd_core::design::validate_materialized_views(
-        &scoped,
+        &inspected,
         &design.config().materialized_views,
         &declared_extensions,
     );
@@ -104,14 +113,14 @@ pub async fn cmd_inspect(
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(&scoped, &design.config().source.dialect);
+    let enum_hints = dbd_core::design::suggest_enum_candidates(&inspected, &design.config().source.dialect);
     print_enum_hints(&enum_hints);
 
     // Advisory only, and the one with teeth: a table in a schema something
     // outside the database serves, with no RLS policy declared. On Supabase
     // that is readable by `anon` over HTTP. Report-only like the enum hints —
     // dbd cannot know the author did not mean it.
-    let in_scope: std::collections::HashSet<&str> = scoped.iter().map(|e| e.name.as_str()).collect();
+    let in_scope: std::collections::HashSet<&str> = inspected.iter().map(|e| e.name.as_str()).collect();
     let exposed: Vec<String> = design
         .unprotected_exposed_tables()
         .into_iter()
@@ -120,7 +129,7 @@ pub async fn cmd_inspect(
     let exposed_schemas: Vec<String> = design
         .exposed_schemas()
         .into_iter()
-        .filter(|s| scoped.iter().any(|e| e.schema.as_deref() == Some(s.as_str())))
+        .filter(|s| inspected.iter().any(|e| e.schema.as_deref() == Some(s.as_str())))
         .collect();
     print_exposed_tables(&exposed, &exposed_schemas);
 
