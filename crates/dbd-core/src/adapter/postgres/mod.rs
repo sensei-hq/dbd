@@ -1346,15 +1346,11 @@ impl DatabaseAdapter for PostgresAdapter {
                     .await?;
                 self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
 
-                // Insert each line as a JSONB row
-                for line in data.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
+                // Stage each record as a JSONB row.
+                for record in super::json_records(&data, format, file_path)? {
                     let insert = format!(
                         "INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ('{}'::jsonb)",
-                        line.replace('\'', "''")
+                        record.replace('\'', "''")
                     );
                     self.execute_script(&insert).await?;
                 }

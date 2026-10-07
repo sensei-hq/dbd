@@ -7,11 +7,13 @@ use dbd_core::{Design, Entity, EntityType};
 use super::{format_import_summary, get_adapter};
 use crate::output::{self, Verbosity};
 
-/// Infer the import/export data format from a file extension.
-/// `.jsonl` → "jsonl", `.tsv` → "tsv", everything else → "csv".
+/// Infer the import data format from a file extension.
+/// `.jsonl` → "jsonl", `.json` → "json" (a JSON array of records, or JSON
+/// lines), `.tsv` → "tsv", everything else → "csv".
 fn format_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("jsonl") => "jsonl",
+        Some(ext) if ext.eq_ignore_ascii_case("json") => "json",
         Some(ext) if ext.eq_ignore_ascii_case("tsv") => "tsv",
         _ => "csv",
     }

@@ -12,7 +12,9 @@ readme = "../../README.md"
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value` splits a JSON-array data file into records without parsing them —
+# see `adapter::json_records`.
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml.workspace = true
 thiserror.workspace = true
 
