@@ -112,7 +112,9 @@ pub async fn cmd_init_from_db(
     if roles {
         entities.extend(adapter.introspect_roles().await.context("role introspection failed")?);
     }
-    let entities_for_target = entities.clone();
+    // Decided before `entities` is consumed: the platform schemas that identify
+    // Supabase are usually filtered out of what gets written.
+    let target = init_target(&conn, &entities);
     init_with_entities(
         project_dir,
         config_path,
@@ -122,7 +124,7 @@ pub async fn cmd_init_from_db(
         version,
         sel,
         dry_run,
-        init_target(&conn, &entities_for_target),
+        target,
         "init from database",
     )
 }
@@ -140,6 +142,9 @@ pub fn cmd_init_from_dbml(
     env: &str,
     config_path: &Path,
     name: Option<&str>,
+    // `postgres` or `supabase`: DBML names no platform, so the caller's
+    // `--target` is the only source for it.
+    target: &str,
     version: u32,
     sel: SchemaSelect,
     dry_run: bool,
@@ -168,7 +173,7 @@ pub fn cmd_init_from_dbml(
         version,
         sel,
         dry_run,
-        "postgres", // DBML emits generic Postgres-style DDL
+        target,
         "init from dbml",
     )
 }
@@ -200,8 +205,16 @@ fn dialect_for_conn(conn: &str) -> &'static str {
 
 /// The `design.yaml` target for a project reverse-engineered from `conn`, whose
 /// introspection returned `entities`.
-fn init_target(conn: &str, _entities: &[dbd_core::Entity]) -> &'static str {
-    dialect_for_conn(conn)
+///
+/// The URL scheme separates SQLite from PostgreSQL, but a Supabase database is
+/// PostgreSQL behind a `postgres://` URL, so that alone named every Supabase
+/// project's target `postgres` — losing its protected schemas, PostgREST
+/// grants and exposed-`public` default. Its platform schemas identify it.
+fn init_target(conn: &str, entities: &[dbd_core::Entity]) -> &'static str {
+    match dialect_for_conn(conn) {
+        "postgres" if reverse::looks_like_supabase(entities) => "supabase",
+        dialect => dialect,
+    }
 }
 
 /// Shared `init` tail for both the DB and DBML sources: build the write-plan,
@@ -804,7 +817,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbml = write_dbml(tmp.path());
         let cfg = tmp.path().join("design.yaml");
-        cmd_init_from_dbml(tmp.path(), &dbml, "dev", &cfg, Some("proj"), 1, all_schemas(), false).unwrap();
+        cmd_init_from_dbml(
+            tmp.path(),
+            &dbml,
+            "dev",
+            &cfg,
+            Some("proj"),
+            "postgres",
+            1,
+            all_schemas(),
+            false,
+        )
+        .unwrap();
         assert!(cfg.exists());
     }
 
@@ -814,7 +838,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dbml = write_dbml(tmp.path());
         let cfg = tmp.path().join("design.yaml");
-        cmd_init_from_dbml(tmp.path(), &dbml, "dev", &cfg, Some("proj"), 1, all_schemas(), true).unwrap();
+        cmd_init_from_dbml(
+            tmp.path(),
+            &dbml,
+            "dev",
+            &cfg,
+            Some("proj"),
+            "postgres",
+            1,
+            all_schemas(),
+            true,
+        )
+        .unwrap();
         assert!(!cfg.exists(), "dry-run must not write design.yaml");
     }
 
@@ -824,7 +859,18 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let dbml = write_dbml(proj.path());
         let cfg = proj.path().join("design.yaml");
-        let err = cmd_init_from_dbml(proj.path(), &dbml, "dev", &cfg, None, 1, all_schemas(), false).unwrap_err();
+        let err = cmd_init_from_dbml(
+            proj.path(),
+            &dbml,
+            "dev",
+            &cfg,
+            None,
+            "postgres",
+            1,
+            all_schemas(),
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
     }
 

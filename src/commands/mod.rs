@@ -331,7 +331,10 @@ pub async fn run(
             dry_run,
         } => {
             if let Some(dbml_path) = from_dbml {
-                if target != "postgres" {
+                // DBML is PostgreSQL-shaped and names no platform, so both
+                // PostgreSQL targets are the caller's to choose. This used to
+                // accept `postgres` alone while saying Supabase was supported.
+                if !matches!(target.as_str(), "postgres" | "supabase") {
                     anyhow::bail!(
                         "--target {target} is not supported with --from-dbml; \
                          reverse-engineering supports Postgres/Supabase only"
@@ -348,15 +351,17 @@ pub async fn run(
                     env,
                     config,
                     name.as_deref(),
+                    target,
                     *version,
                     sel,
                     *dry_run,
                 );
             }
             if let Some(s) = from_db {
-                // The reverse dialect is derived from the connection URL scheme
-                // (postgres:// → postgres, sqlite://`/`file: → sqlite), so the
-                // `--target` flag does not gate `--from-db`.
+                // The reverse dialect is derived from the database itself — the
+                // URL scheme (sqlite://`/`file: → sqlite), then Supabase's own
+                // schemas (→ supabase, else postgres) — so the `--target` flag
+                // does not gate `--from-db`.
                 let _ = target;
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
