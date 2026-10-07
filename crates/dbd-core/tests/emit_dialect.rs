@@ -1681,3 +1681,151 @@ fn only_a_declared_enum_is_reported_as_one() {
         );
     }
 }
+
+// ── SQLite gets the views and checks it can run, and only those ────────────
+
+/// Two tables in `core` and the views and checks that broke the SQLite
+/// script: a view naming `core.cities` (SQLite: "view cannot reference objects
+/// in database core"), a view reading that view, a CHECK using
+/// `POSITION(… IN …)`, and two things SQLite has no form of — a regex CHECK
+/// and `DISTINCT ON`. Plus a view reading a table the script does not create.
+fn cities_project(dir: &Path) -> Design {
+    let file = |body: &str| format!("set search_path to core;\n{body}\n");
+    project_from(
+        dir,
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n\n\
+         external:\n  - name: auth.users\n",
+        &[
+            (
+                "ddl/table/core/regions.ddl",
+                &file("create table regions (id integer primary key, name text not null);"),
+            ),
+            (
+                "ddl/table/core/cities.ddl",
+                &file(
+                    "create table cities (\n  id integer primary key\n, name text not null\n, \
+                     region_id integer references regions (id)\n, \
+                     code text not null check (position('-' in code) > 0)\n, \
+                     slug text check (slug ~ '^[a-z]+$')\n);",
+                ),
+            ),
+            (
+                "ddl/view/core/city_names.ddl",
+                &file(
+                    "create view city_names as select cities.name, r.name as region \
+                     from core.cities join regions r on r.id = cities.region_id;",
+                ),
+            ),
+            (
+                "ddl/view/core/named_again.ddl",
+                &file("create view named_again as select name from city_names;"),
+            ),
+            (
+                "ddl/view/core/first_per_region.ddl",
+                &file(
+                    "create view first_per_region as select distinct on (region_id) name \
+                     from core.cities order by region_id, name;",
+                ),
+            ),
+            (
+                "ddl/view/core/user_cities.ddl",
+                &file("create view user_cities as select u.id from auth.users u;"),
+            ),
+        ],
+    )
+}
+
+fn emit_cities() -> (String, Vec<Downgrade>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = cities_project(tmp.path());
+    emit_schema(&design, Dialect::Sqlite, None).expect("emits")
+}
+
+const CITY_ROWS: &str = "insert into core_regions values (1, 'North');\n\
+     insert into core_cities (id, name, region_id, code) values (1, 'Oslo', 1, 'NO-OS');";
+
+/// A view names its tables the way PostgreSQL does — `core.cities`, or bare
+/// under `search_path` — and SQLite has neither: the tables are `core_cities`
+/// and `core_regions` there. Naming `core.cities` failed the whole script; a
+/// bare `regions` applied and failed on the first read. The view now reads the
+/// tables the script creates, and a view reading that view works too.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_sqlite_view_reads_the_tables_the_script_creates() {
+    let (sql, report) = emit_cities();
+    let got = on_sqlite(&sql, CITY_ROWS, "select name || '/' || region from core_city_names")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got, "Oslo/North");
+    let got = on_sqlite(&sql, CITY_ROWS, "select name from core_named_again").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got, "Oslo");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "core.city_names" && d.from.contains("view body") && d.to != "nothing"),
+        "a rewritten body is still reported — SQLite's semantics are not PostgreSQL's: {report:?}"
+    );
+}
+
+/// `DISTINCT ON` has no SQLite form, and a view reading a table the script
+/// does not create cannot be read. Either one left in failed the script or the
+/// first query, so each is left out — noted where it would have been, and
+/// reported — and the rest of the script applies.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_view_sqlite_cannot_run_is_left_out_and_reported() {
+    let (sql, report) = emit_cities();
+    on_sqlite(&sql, CITY_ROWS, "select 'ok'").unwrap_or_else(|e| panic!("{e}"));
+    for (view, emitted, why) in [
+        ("core.first_per_region", "core_first_per_region", "DISTINCT ON"),
+        ("core.user_cities", "core_user_cities", "auth.users"),
+    ] {
+        assert!(
+            !statements(&sql).contains(&format!("CREATE VIEW \"{emitted}\"")),
+            "`{view}` is left out: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == view && d.to == "nothing" && d.reason.contains(why)),
+            "`{view}` is reported, naming what SQLite cannot run ({why}): {report:?}"
+        );
+        assert!(
+            sql.lines()
+                .any(|l| l.starts_with("-- dbd:") && l.contains(view) && l.contains(why)),
+            "and noted in the file: {sql}"
+        );
+    }
+}
+
+/// `POSITION('-' IN code)` is SQLite's `instr(code, '-')`, so the CHECK is
+/// translated and still refuses what it refused. A regex has no SQLite form at
+/// all — left in, the CREATE TABLE failed and took the table with it — so that
+/// CHECK alone is left out and reported, and the rows it refused are accepted.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_check_is_translated_for_sqlite_or_left_out_and_reported() {
+    let (sql, report) = emit_cities();
+
+    let refused = on_sqlite(
+        &sql,
+        "insert into core_cities (id, name, code) values (2, 'Bergen', 'NOBG')",
+        "select 'inserted'",
+    );
+    assert!(
+        refused.as_ref().is_err_and(|e| e.contains("CHECK constraint failed")),
+        "the translated CHECK still refuses a code without '-': {refused:?}"
+    );
+
+    let accepted = on_sqlite(
+        &sql,
+        "insert into core_cities (id, name, code, slug) values (2, 'Bergen', 'NO-BG', 'NOT LOWER')",
+        "select slug from core_cities",
+    );
+    assert_eq!(accepted.as_deref(), Ok("NOT LOWER"), "the regex CHECK is gone: {sql}");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "core.cities" && d.from.contains("slug ~") && d.to == "no CHECK"),
+        "and leaving it out is reported: {report:?}"
+    );
+}
