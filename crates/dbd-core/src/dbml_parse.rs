@@ -706,17 +706,21 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     let (cols_part, settings_part) = split_trailing_settings(line);
     let cols_part = cols_part.trim();
 
-    let column_names: Vec<String> = if let Some(inner) = cols_part.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        inner
-            .split(',')
-            .map(|c| unquote(c.trim()))
-            .filter(|c| !c.is_empty())
+    // A tuple is split only at its top-level commas: a backticked expression
+    // key such as `coalesce(b, 'x, y')` carries commas of its own.
+    let raw_keys: Vec<String> = if let Some(inner) = cols_part.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        split_top_level_commas(inner)
+            .ok_or_else(|| parse_err(format!("malformed index in `{table}`: {line}")))?
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
             .collect()
     } else {
-        vec![unquote(cols_part)]
+        vec![cols_part.to_string()]
     };
+    let keys: Vec<IndexColumn> = raw_keys.iter().map(|k| parse_index_key(k)).collect();
 
-    if column_names.iter().any(|c| c.is_empty()) || column_names.is_empty() {
+    if keys.is_empty() || keys.iter().any(|k| k.name.is_empty()) {
         return Err(parse_err(format!("malformed index in `{table}`: {line}")));
     }
 
@@ -743,16 +747,28 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     // class, or storage parameters, so those stay at their defaults.
     Ok(IndexDef {
         name,
-        columns: column_names
-            .into_iter()
-            .map(|name| IndexColumn {
-                name,
-                ..Default::default()
-            })
-            .collect(),
+        columns: keys,
         unique,
         ..Default::default()
     })
+}
+
+/// One index key: DBML writes an expression in backticks and a column by
+/// (optionally quoted) name. Flagging the expression is what keeps the
+/// emitter from quoting `lower(email)` as an identifier.
+fn parse_index_key(key: &str) -> IndexColumn {
+    let key = key.trim();
+    match key.strip_prefix('`').and_then(|k| k.strip_suffix('`')) {
+        Some(expression) => IndexColumn {
+            name: expression.trim().to_string(),
+            is_expression: true,
+            ..Default::default()
+        },
+        None => IndexColumn {
+            name: unquote(key),
+            ..Default::default()
+        },
+    }
 }
 
 /// Parse the body of a standalone `Ref:` (everything after the `:`).

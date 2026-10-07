@@ -396,16 +396,9 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
 
     for idx in indexes {
         let cols = if idx.columns.len() == 1 {
-            idx.columns[0].name.clone()
+            index_key(&idx.columns[0])
         } else {
-            format!(
-                "({})",
-                idx.columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
         };
 
         let mut settings = Vec::new();
@@ -426,6 +419,17 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
     }
 
     lines
+}
+
+/// One index key as DBML writes it: a column by name, an expression in
+/// backticks. Written bare, an expression reads back as a column literally
+/// named `lower(email)`, and the DDL rebuilt from it quotes it as one.
+fn index_key(key: &IndexColumn) -> String {
+    if key.is_expression {
+        format!("`{}`", key.name)
+    } else {
+        key.name.clone()
+    }
 }
 
 fn emit_all_refs(entities: &[Entity]) -> String {
