@@ -955,26 +955,32 @@ pub async fn cmd_policies(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    if dry_run {
-        let files = dbd_core::scanner::scan_policies(project_dir)?;
-        if files.is_empty() {
-            output::info(verbosity, "No policy files found in policies/");
-            return Ok(());
-        }
-        output::info(verbosity, "[dry-run] Would apply policies:");
-        for file in &files {
-            output::info(verbosity, &format!("  {}", file.display()));
-        }
-        return Ok(());
-    }
-
-    let adapter = get_adapter(config, database_url).await?;
     // `dbd policies` takes the global --scope like every other command; before
     // this it silently applied every file, so a policy for a schema this plane
     // does not have reported `schema "…" does not exist` on every run.
     let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
     let policy_ws = policy_working_set(&design, &resolved)?;
+
+    if dry_run {
+        // The real run's filter, so the preview never lists a policy the scope
+        // skips — and says which ones it skips, as the real run does.
+        let plan = dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
+        if plan.applied.is_empty() && plan.skipped.is_empty() {
+            output::info(verbosity, "No policy files found in policies/");
+            return Ok(());
+        }
+        output::info(verbosity, "[dry-run] Would apply policies:");
+        for file in &plan.applied {
+            output::info(verbosity, &format!("  {}", file.display()));
+        }
+        for (file, why) in &plan.skipped {
+            output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+        }
+        return Ok(());
+    }
+
+    let adapter = get_adapter(config, database_url).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
