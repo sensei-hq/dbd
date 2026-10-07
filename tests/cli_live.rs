@@ -168,7 +168,8 @@ fn scope_line(o: &Output) -> Option<String> {
 
 /// Every other scoped command says what it narrowed to. `diff` and `reconcile`
 /// said nothing, so a scoped diff reporting no drift read exactly like a whole
-/// database in sync — and `apply`, `import` and `policies` said nothing either.
+/// database in sync — and `apply`, `deploy`, `import` and `policies` said
+/// nothing either.
 #[tokio::test]
 async fn the_connecting_commands_name_the_scope_they_ran_under() {
     let (_pg, url) = start_pg().await;
@@ -191,6 +192,7 @@ async fn the_connecting_commands_name_the_scope_they_ran_under() {
     // previews did not.
     for args in [
         &["apply", "--scope", "hub"][..],
+        &["deploy", "--scope", "hub"][..],
         &["import", "--scope", "hub"][..],
         &["policies", "--scope", "hub"][..],
     ] {
