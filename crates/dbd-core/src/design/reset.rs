@@ -136,6 +136,10 @@ impl Design {
             })
             .unwrap_or_default();
 
+        // What apply granted on the schemas, so the roles it granted to can be
+        // dropped: Postgres refuses to drop a role that still holds a grant.
+        let grants = self.config.effective_schema_grants();
+
         script::build_reset_script(
             &entities,
             &roles,
@@ -144,6 +148,7 @@ impl Design {
             drop_schemas,
             drop_extensions,
             &schemas,
+            &grants,
         )
         .map_err(DbdError::SafetyGuard)
     }
