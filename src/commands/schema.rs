@@ -466,7 +466,7 @@ fn policy_phase_exit_code(report: &dbd_core::design::PolicyReport) -> i32 {
 /// under `policies/` against the live database. Discarding a closure conflict
 /// would therefore widen the run instead of narrowing it — the opposite of what
 /// `--scope` was asked for, and visible only as a count with no baseline.
-fn policy_working_set(
+pub(super) fn policy_working_set(
     design: &Design,
     resolved: &dbd_core::ResolvedScope,
 ) -> Result<Option<(String, std::collections::HashSet<String>)>> {
