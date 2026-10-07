@@ -100,6 +100,10 @@ file evidence).
      `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
    - A `--scope` in the deploy command whose working set excludes the staging tables (or the
      tables the import procedures write to) — those entries are dropped from the import plan.
+   - A SQLite or Convex target without `import.options.truncate: false` — the default truncate
+     is SQL those targets reject, so the import fails before loading anything.
+   - An import loader written as a **function** — it is matched, then `CALL`ed, which
+     PostgreSQL refuses; it must be a procedure.
    - Evidence: the `import/` tree next to the actual deploy/install invocation.
 8. **RLS expected but never applied** — an install path that runs `dbd apply` (RLS is opt-in,
    needs `--with-policies`) while the project has a `policies/` directory, or docs claiming

@@ -108,6 +108,9 @@ gap under `report`): `inspect`/`apply`/`import`/`deploy`/`reconcile`/`diff`.
 `doctor`/`init`/`merge`/`format`/`install`. `all` and `default` are reserved
 scope names (`--scope all` = full set; `default` = what a run without `--scope`
 builds). One design → many DBs: `dbd deploy --scope hub --database $HUB_URL`.
+Two 0.24.1 limits: a scope never selects a standalone **sequence** (a named
+scope builds none, so a `DEFAULT nextval(…)` table fails there), and **grants**
+are not scope-filtered.
 
 **A scope narrows what is applied, not what the project owns.** From 0.24.1,
 `reconcile --prune --scope` never drops a table the design declares outside the
@@ -130,7 +133,8 @@ run under a different scope than the one the database is pinned to:
 `scope guard: this database is pinned to scope 'X', but you requested 'Y'.
 Applying a different scope would build a divergent schema.` Pass `--scope X` to
 match the pin, or `--allow-scope-change` to override — a successful write then
-re-pins the database to the new scope (`reset --force` also bypasses the check).
+re-pins the database to the new scope (`reset --force` also bypasses the check;
+a reset does not re-pin).
 Databases created before this feature are unpinned and aren't blocked until their
 next write pins them; a missing `--scope` resolves to the `default` scope (or
 `all`) and pins on first write. To legitimately host multiple modules in one
@@ -358,8 +362,9 @@ Key public types (re-exported at the crate root): `Design`, `DatabaseAdapter`,
 `Entity` / `EntityType`, `SchemaModel`, `ResolvedScope`, `ApplyComplete` /
 `DeployComplete` / `ImportComplete`, `DbdError` / `Result`. The free fn
 `dbd_core::design::apply_policies` remains available to apply policies alone.
-`Design::reconcile` does **not** check `project.released` — the CLI does, so an
-embedder must. The guide page https://dbd.sensei-hq.com/guide/embedding covers
+`Design::reconcile` does **not** check `project.released`, and
+`Design::apply`/`deploy`/`reconcile` do not run the scope guard — the CLI does
+both, so an embedder must (`Design::check_scope_guard(meta, &scope.name, false)`). The guide page https://dbd.sensei-hq.com/guide/embedding covers
 the whole API with compiled examples.
 
 ### The schema model as a wire format
@@ -553,7 +558,9 @@ and reported**: as a comment at the site in the emitted file, in the run
 summary, and as JSON with `--report`. A faithful mapping (`integer` → `INT`) is
 not reported, so the report stays worth reading. An enum column becomes plain
 text on every target (reported — the values are no longer enforced). Not yet
-reported: dropped non-literal defaults and lost serial/identity auto-increment.
+reported: dropped non-literal defaults (and `::casts` kept in literal ones), lost
+serial/identity auto-increment, a matview's indexes, and files dbd could not read
+(run `dbd inspect` first).
 
 ```rust
 use dbd_core::Design;

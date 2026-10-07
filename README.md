@@ -113,7 +113,7 @@ Where `apply` can write. See the table above for what dbd can *read*.
 | PostgreSQL | Working (sqlx, PG17+) | `postgres://user:pass@host:5432/db` |
 | Supabase | Working — the PostgreSQL adapter; a target named `supabase` exposes `public`, protects Supabase's schemas from prune and reset, and adds PostgREST grants | `postgres://...` (with `target: supabase`) |
 | SQLite | Working (sqlx-sqlite, batched multi-row CSV/TSV/JSONL import, trigger-aware splitter) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
-| Convex | Working (codegen `schema.ts` with enums + FK `v.id`, sidecar state, `?deploy=true` auto-deploy, per-table `npx convex import`) | `convex:` (default `./convex`), `convex://./out`, `convex://./out?deploy=true` |
+| Convex | Working (codegen `schema.ts` with enums + FK `v.id`, sidecar state, `?deploy=true` auto-deploy, per-table `npx convex import` with `import.options.truncate: false`) | `convex:` (default `./convex`), `convex://./out`, `convex://./out?deploy=true` |
 
 ### Adapter notes
 
@@ -121,7 +121,8 @@ Where `apply` can write. See the table above for what dbd can *read*.
   `Schema` entities are a no-op; `Enum` / `Function` / `Procedure` / `Role` /
   `Extension` / `Sequence` / `MaterializedView` entities error on apply. Entity names like `auth.users` are
   resolved as the bare table `users`. Imports use multi-row `INSERT … VALUES (?,?), …`
-  batches inside one transaction (≤500 rows or 32k binds per batch). The DDL
+  batches inside one transaction (≤500 rows or 32k binds per batch); set
+  `import.options.truncate: false`, since SQLite has no `TRUNCATE`. The DDL
   formatter knows about SQLite `CREATE TRIGGER … BEGIN … END;` blocks and
   keeps them whole. Offline `inspect` classifies ~150 built-in functions /
   types plus the `sqlite_*` prefix as Internal without touching the DB.
@@ -142,7 +143,8 @@ Where `apply` can write. See the table above for what dbd can *read*.
   (inline or single-column table-level) emit `v.id("target_table")`.
   Append `?deploy=true` to the URL (or call `with_auto_deploy(true)`) to
   run `npx convex deploy` automatically after each apply; `dbd import`
-  shells out to `npx convex import --table <flat_name> --replace -y <file>`.
+  shells out to `npx convex import --table <flat_name> --replace -y <file>`
+  (set `import.options.truncate: false` — the default truncate is SQL).
   Whole-deployment export remains the Convex CLI's job (`npx convex export`)
   because the CLI doesn't expose per-table dumps.
 

@@ -117,7 +117,7 @@ target:                              # ONLY the first entry is read
   # Other targets — use ONE of these as the first entry instead:
   # postgres: { url: $DATABASE_URL }
   # sqlite:   { url: sqlite://./local.db }    # or sqlite::memory:, file:/abs/path.db
-  # convex:   { url: convex: }                # writes ./convex/schema.ts; convex://./out?deploy=true
+  # convex:   { url: "convex:" }              # writes ./convex/schema.ts (quote it); convex://./out?deploy=true
 
 schemas:
   - config:
@@ -268,6 +268,9 @@ dbd deploy --scope hub --database $HUB_URL
   full set (a scope you name `all` is unreachable), and a run without `--scope`
   uses `default` when defined — and is pinned as `default`. A scope's value may
   be the bare string `all`.
+- Standalone sequences are never selectable in 0.24.1: any named scope
+  (including `default`) builds none, and naming one is an error.
+- Grants are not scope-filtered: every configured grant applies on every run.
 - Gaps come from recorded references (FKs; view/routine reads, writes, calls).
   A column typed with an out-of-scope enum is NOT detected as a gap in 0.24.1 —
   include the enum's schema yourself.
@@ -569,7 +572,7 @@ no grants).
 
 After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any materialized view it just created and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
-**Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in the bookkeeping table's `scope` column (`dbd.meta.scope` on Postgres/Supabase, `_dbd_meta.scope` on SQLite). A later `apply`/`deploy`/`reconcile`/`reset` that requests a *different* scope than the pin is refused ("scope guard: this database is pinned to scope 'X', but you requested 'Y'"), preventing a mistyped or forgotten `--scope` from building a divergent schema. Pass `--allow-scope-change` on the write command to re-point the database to the new scope (`reset --force` also bypasses). Databases created before this feature are unpinned and pin on their next write.
+**Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in the bookkeeping table's `scope` column (`dbd.meta.scope` on Postgres/Supabase, `_dbd_meta.scope` on SQLite). A later `apply`/`deploy`/`reconcile`/`reset` that requests a *different* scope than the pin is refused ("Error: Safety guard: scope guard: this database is pinned to scope 'X', but you requested 'Y'"), preventing a mistyped or forgotten `--scope` from building a divergent schema. Pass `--allow-scope-change` on `apply`/`deploy`/`reconcile` to re-point the database to the new scope; on `reset` it (and `--force`) only bypasses — reset does not re-pin. The guard is the CLI's: `Design::apply`/`deploy`/`reconcile` do not check it — embedders call `Design::check_scope_guard`. Databases created before this feature are unpinned and pin on their next write.
 
 ### dbd refresh
 
@@ -598,11 +601,14 @@ writes `<dir>/<name>.<fmt>` (default `export/<schema>/<name>.<fmt>`) — `-o` le
 straight into the `import/` tree for a round-trip.
 
 Execution: truncate → COPY data → call import procedures → run `import.after`.
-CSV/TSV: the header row is skipped and columns load by position. `.json` files are
-read as JSON Lines, like `.jsonl`; on PostgreSQL they go through
+CSV/TSV: on PostgreSQL the header row is skipped and columns load by position; on
+SQLite the header names the columns. `.json` files under `import/` are read as JSON
+Lines, like `.jsonl` (but `-f x.json` is read as CSV); on PostgreSQL they go through
 `staging.import_jsonb_to_table`, which dbd installs (creating `staging`). An import
-procedure is any procedure/function that reads the staging table (body analysis,
-not names; dynamic SQL is invisible); the plan is ordered by FK dependencies
+procedure is any procedure that reads the staging table (body analysis, not names;
+dynamic SQL is invisible; a function is matched too but `CALL`ed, which PostgreSQL
+refuses). SQLite and Convex need `import.options.truncate: false` — the default
+`TRUNCATE` is SQL they lack; the plan is ordered by FK dependencies
 between their write targets. `import.after` runs on every `dbd import` (with or
 without `-n`) and on `dbd deploy`, never on `apply`; `-f` skips truncate,
 procedures, `import.after` and scope. `import.tables` holds per-table overrides
@@ -634,7 +640,8 @@ the format (default `csv`) — note the asymmetry with `import`, where `-f` is a
 file path. `-o`/`--output <dir>` writes the selected tables flat as
 `<dir>/<name>.<fmt>`; without it, files land at `export/<schema>/<name>.<fmt>`.
 
-Pointing `-o` at `import/<schema>` produces a round-trip: what `export` writes,
+Export paths are relative to the current directory, not `--source` (SQLite:
+`export/<table>.<fmt>`, no schema folder). Pointing `-o` at `import/<schema>` produces a round-trip (CSV/TSV — a JSONL export doubles backslashes, so quotes and newlines do not load back): what `export` writes,
 `import` reads back under the `import/<schema>/<table>.<fmt>` convention (`-o` writes
 `<table>.<fmt>` without the schema).
 
@@ -918,9 +925,12 @@ schema.
 
 Tables — columns, `NOT NULL`, defaults, primary keys, unique constraints,
 foreign keys, `CHECK` constraints and indexes — and views/materialized views
-(as `CREATE VIEW`, body passed through untranslated and reported). A `CHECK`
-expression and an index expression or predicate are passed through untranslated
-and reported, like view bodies. Functions, procedures and triggers are skipped
+(as `CREATE VIEW`, body passed through untranslated and reported; a matview
+loses its materialization and indexes). A `CHECK` expression is passed through
+untranslated and reported, like view bodies; an index the target cannot express
+as written (expression, partial, or on an unindexable type) is reported and
+passed through, built without its predicate, or left out. A file dbd could not
+read is left out without a report — run `inspect` first. Functions, procedures and triggers are skipped
 and reported: their bodies are PL/pgSQL or SQL that does not translate. Schemas,
 extensions, roles, sequences and enum types produce no statement.
 
@@ -939,8 +949,10 @@ Mapping (⚠ = reported): `text[]`/any array → MySQL `JSON` ⚠, T-SQL
 `TEXT` ⚠ (MySQL `ENUM` is not used and no CHECK is added — the values are no
 longer enforced). MySQL and SQLite fold the schema into the name
 (`schema_table`) ⚠; T-SQL keeps `[schema].[table]`. Not reported in 0.24.1:
-defaults other than literals, `now()` and booleans are dropped; serial/identity
-columns lose auto-increment; generated columns lose their expression.
+defaults other than literals, `now()` and booleans are dropped (a literal keeps
+any `::cast`); serial/identity columns lose auto-increment, and a `serial` column
+joins the primary key; generated columns lose their expression; bare `varchar`
+/`numeric` get default precision.
 
 ```sql
 -- dbd: `tags` was `text[]` — emitted as JSON; no array type exists here, so
@@ -1224,12 +1236,12 @@ let graph = design.graph(None, None)?;
 | PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `dbd.migrations` (dedicated `dbd` schema) |
 | Supabase | sqlx-postgres (same adapter; the `supabase` key exposes `public`, protects Supabase schemas from prune/reset, adds PostgREST grants) | `postgres://…` (with `target: supabase`) | yes | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
 | SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
-| Convex | codegen | `convex:` (→ `./convex`), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>`; whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
+| Convex | codegen | `convex:` (→ `./convex`; quote it in YAML), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>` (needs `import.options.truncate: false`); whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
 | MySQL / SQL Server | **none** — `mysql://`, `mariadb://`, `sqlserver://`, `mssql://` refused by name | — | — | — | — | — | — |
 
 ### Adapter quirks
 
-- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension`/`Sequence`/`MaterializedView` are rejected at apply time. No transactional apply; grants skipped; policy files fail; a SQLite project (`verbatim` reader) cannot `diff`/`reconcile`/`emit`.
+- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension`/`Sequence`/`MaterializedView` are rejected at apply time. No transactional apply; grants skipped; policy files fail; import needs `truncate: false` (no `TRUNCATE`); a SQLite project (`verbatim` reader) cannot `diff`/`reconcile`/`emit`; export writes `export/<table>.<fmt>`.
     - **Offline ref classifier** — `classify_reference` checks an alphabetically sorted table of ~150 built-ins (aggregates, window/math/date/JSON1/scalar functions, type names) via `binary_search`, plus a `sqlite_*` prefix rule that catches all reserved system tables/views (`sqlite_master`, `sqlite_sequence`, `sqlite_stat1`, …). Everything else falls through to `UserDefined`.
     - **Trigger-aware DDL splitter** — `dbd format`'s statement splitter recognises SQLite `CREATE TRIGGER … BEGIN <stmts;> END;` blocks and keeps them atomic. `BEGIN` is only treated as trigger-body when the in-flight block already contains the `TRIGGER` keyword, so bare `BEGIN; … COMMIT;` transactions still split correctly. `CASE … END` inside the body doesn't trip the close detector — only `END` immediately followed by `;` at a word boundary closes the block.
     - **Batched imports** — `import_delimited` and `import_jsonl` flush rows in multi-row `INSERT … VALUES (?,?),(?,?), …` batches sized by `batch_row_size(col_count) = min(500, 32000 / col_count)`. CSV uses a fixed header; JSONL detects per-line column-set changes and flushes the previous group before starting a new one. All inside a single transaction per import.
