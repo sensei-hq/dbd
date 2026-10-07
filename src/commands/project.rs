@@ -117,9 +117,10 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
     let total_issues = auto_fixable + mismatches.len();
 
+    // doctor counts issues, not entities: the shared entity summary printed
+    // "0 entities — no issues" here on a project full of tables.
     if total_issues == 0 {
         output::info(verbosity, "No issues found — project is up to date.");
-        output::summary(0, 0, 0);
         return Ok(());
     }
 
@@ -132,7 +133,7 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         if !mismatches.is_empty() {
             output::always("Misfiled DDL files must be moved manually (see above).");
         }
-        output::summary(total_issues, 0, 0);
+        output::always(&format!("\n{} found.", issues(total_issues)));
         return Ok(());
     }
 
@@ -159,9 +160,18 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
         }
     }
-    output::summary(mismatches.len(), 0, fixed);
+    output::always(&format!(
+        "\n{} fixed, {} left to move by hand.",
+        issues(fixed),
+        mismatches.len()
+    ));
 
     Ok(())
+}
+
+/// `1 issue` / `N issues`.
+fn issues(n: usize) -> String {
+    format!("{n} issue{}", if n == 1 { "" } else { "s" })
 }
 
 /// Print the config / stale-file / plural-folder issues doctor detected.
@@ -365,14 +375,7 @@ pub async fn cmd_deploy(
         output::scope_filtered(&resolved, kept, total);
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
-            for gap in &report.gaps {
-                output::always(&format!(
-                    "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-                    gap.required_by,
-                    gap.missing,
-                    gap.chain.join(" → ")
-                ));
-            }
+            output::scope_gaps(&resolved, &report.gaps);
         }
         output::info(verbosity, &format!("{to_apply} entities would be applied."));
 
