@@ -237,9 +237,12 @@ pub async fn run(
             clear_cache,
             allow_scope_change,
         } => {
+            // `config` is `--source` joined with `-c`; deploy resolves the source
+            // itself (it may be a GitHub ref), so it takes `-c` back off.
+            let config_name = config.strip_prefix(source).unwrap_or(config);
             project::cmd_deploy(
                 source,
-                config,
+                config_name,
                 env,
                 database_url,
                 *dry_run,

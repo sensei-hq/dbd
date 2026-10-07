@@ -317,7 +317,7 @@ pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosi
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_deploy(
     source: &str,
-    _config_name: &Path,
+    config_name: &Path,
     env: &str,
     database_url: Option<&str>,
     dry_run: bool,
@@ -339,9 +339,11 @@ pub async fn cmd_deploy(
         .await
         .context("Failed to resolve source")?;
 
-    let config_path = project_dir.join("design.yaml");
+    // `config_name` is `-c` relative to the source, so it names the same file
+    // in a downloaded GitHub tree as in a local one.
+    let config_path = project_dir.join(config_name);
     if !config_path.exists() {
-        anyhow::bail!("No design.yaml found in {}", project_dir.display());
+        anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
     let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
@@ -739,7 +741,7 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -762,10 +764,9 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
-        let cfg = proj.path().join("design.yaml");
         cmd_deploy(
             proj.path().to_str().unwrap(),
-            &cfg,
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -858,7 +859,7 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -903,7 +904,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = cmd_deploy(
             empty.path().to_str().unwrap(),
-            &testutil::fixture_config(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -928,7 +929,7 @@ mod tests {
         let src = testutil::fixtures();
         cmd_deploy(
             src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
