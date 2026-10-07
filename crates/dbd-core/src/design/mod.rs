@@ -3233,6 +3233,49 @@ import:
         assert!(scripts.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"app\" TO \"app_user\""));
     }
 
+    /// Grants follow the scope: a scoped deploy grants only on the schemas it
+    /// builds. Granting on all of them failed on a schema the scope never
+    /// created — after the entities were applied and the database pinned.
+    #[tokio::test]
+    async fn a_scoped_deploy_grants_only_on_the_schemas_it_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/core", "ddl/table/staging"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - core:\n      grants:\n        reader: [usage]\n\
+             \x20 - staging:\n      grants:\n        loader: [usage]\n\
+             scopes:\n  staging_only:\n    includes: [staging]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/raw.ddl"),
+            "set search_path to staging;\ncreate table if not exists raw (line text);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let scope = design.resolve_scope(Some("staging_only"), None).unwrap();
+        let mock = MockAdapter::new().with_schema_grants();
+        design.deploy(&mock, false, Some(&scope), |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("ON SCHEMA \"staging\""),
+            "the scope's schema is granted: {scripts}"
+        );
+        assert!(
+            !scripts.contains("\"core\""),
+            "a schema the scope did not build is not: {scripts}"
+        );
+    }
+
     /// A target with no grant model is skipped, not fed SQL it cannot run.
     #[tokio::test]
     async fn deploy_skips_grants_on_a_target_without_a_grant_model() {
