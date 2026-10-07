@@ -1591,9 +1591,16 @@ mod tests {
             doc.content.contains("Table \"auth\".\"users\""),
             "should have stub table for auth.users"
         );
+        // Typed like the column that references it: nothing declares an
+        // external's columns, and the `varchar` guess made `dbml2sql` write a
+        // `uuid` foreign key to a `varchar` key, which Postgres refuses.
+        let start = doc.content.find("Table \"auth\".\"users\" {").unwrap();
+        let stub = &doc.content[start..];
+        let stub = &stub[..stub.find('}').unwrap()];
         assert!(
-            doc.content.contains("\"id\" varchar"),
-            "stub should contain referenced column"
+            stub.contains("\"id\" UUID"),
+            "stub should type the referenced column like its foreign key:\n{}",
+            doc.content
         );
         assert!(
             doc.content.contains("External entity"),
