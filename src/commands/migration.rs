@@ -298,14 +298,29 @@ mod tests {
         assert_eq!(reset_target(None, &bare), "postgres");
     }
 
-    /// `--dry-run` builds the reset script and returns before any DB adapter is
-    /// constructed, so it runs without a live connection.
+    /// With no database configured — no `-d`, and a target with no `url` — the
+    /// dry run builds the reset script without a connection. The project names
+    /// no URL rather than `$DATABASE_URL`, so a variable set in the shell running
+    /// the tests cannot point it at a database.
     #[tokio::test]
     async fn reset_dry_run_needs_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: t\ntarget:\n  postgres: {}\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
         cmd_reset(
-            &testutil::fixture_config(),
+            &config,
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
             None,
             None,
             ResetOptions {

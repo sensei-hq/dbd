@@ -1093,11 +1093,20 @@ mod tests {
         .unwrap();
     }
 
-    /// `dbd reset --dry-run` likewise returns before any adapter is built.
+    /// `dbd reset --dry-run` likewise needs no database when none is configured.
+    /// The copy's `url: $DATABASE_URL` is removed so a variable set in the shell
+    /// running the tests cannot give it one.
     #[tokio::test]
     async fn run_dispatches_reset_dry_run_without_a_database() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         run_in_copy(
             &Commands::Reset {
                 target: None,
