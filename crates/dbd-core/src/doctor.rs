@@ -750,6 +750,39 @@ schemas:
         filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0)).unwrap();
     }
 
+    /// Every non-canonical folder name the scanner accepts is one `doctor --fix`
+    /// migrates. `materialized_views`, `matview(s)` and `sequences` scanned
+    /// fine and were never moved to their canonical folder.
+    #[test]
+    fn every_folder_alias_the_scanner_accepts_is_migrated() {
+        let aliases = [
+            "tables",
+            "views",
+            "materialized_views",
+            "matview",
+            "matviews",
+            "functions",
+            "procedures",
+            "enums",
+            "roles",
+            "sequences",
+        ];
+        for alias in aliases {
+            let canonical = crate::entity::EntityType::from_folder_name(alias)
+                .unwrap_or_else(|| panic!("the scanner accepts `{alias}`"))
+                .folder_name();
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("ddl").join(alias)).unwrap();
+            let found = detect_plural_ddl_dirs(tmp.path());
+            assert_eq!(found.len(), 1, "`ddl/{alias}` must be detected");
+            assert!(
+                found[0].singular.ends_with(format!("ddl/{canonical}")),
+                "`ddl/{alias}` migrates to `ddl/{canonical}`, not {:?}",
+                found[0].singular
+            );
+        }
+    }
+
     #[test]
     fn detect_plural_ddl_dirs_finds_plural_only() {
         let tmp = tempfile::tempdir().unwrap();
