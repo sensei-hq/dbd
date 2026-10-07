@@ -17,13 +17,21 @@ pub(crate) struct ResetOptions {
     pub allow_scope_change: bool,
 }
 
+/// The platform whose own schemas reset must leave alone: `--target` when
+/// given, otherwise the design's target (its first `target:` key), otherwise
+/// plain `postgres`. Defaulting to `postgres` regardless of the design let a
+/// Supabase project's `reset --schemas` drop `public`.
+fn reset_target<'a>(flag: Option<&'a str>, design: &'a Design) -> &'a str {
+    flag.or_else(|| design.config().default_target()).unwrap_or("postgres")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
-    target: &str,
+    target: Option<&str>,
     opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
@@ -38,6 +46,7 @@ pub async fn cmd_reset(
     } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let target = reset_target(target, &design);
 
     if dry_run {
         let sql = design
@@ -273,8 +282,14 @@ mod tests {
         let target = reset_target(None, &design);
         assert_eq!(target, "supabase");
         let sql = design.reset_script(target, true, false, None).unwrap().unwrap();
-        assert!(!sql.contains("DROP SCHEMA IF EXISTS \"public\""), "public must survive: {sql}");
-        assert!(sql.contains("DROP SCHEMA IF EXISTS \"app\""), "the project's own schema still drops: {sql}");
+        assert!(
+            !sql.contains("DROP SCHEMA IF EXISTS \"public\""),
+            "public must survive: {sql}"
+        );
+        assert!(
+            sql.contains("DROP SCHEMA IF EXISTS \"app\""),
+            "the project's own schema still drops: {sql}"
+        );
 
         // The flag still wins, and a design with no target falls back to postgres.
         assert_eq!(reset_target(Some("postgres"), &design), "postgres");
@@ -292,7 +307,7 @@ mod tests {
             "dev",
             &testutil::fixtures(),
             None,
-            "dev",
+            None,
             ResetOptions {
                 dry_run: true,
                 force: false,

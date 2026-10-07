@@ -202,7 +202,7 @@ pub async fn run(
                 env,
                 project_dir,
                 database_url,
-                target,
+                target.as_deref(),
                 opts,
                 scope,
                 deps,
@@ -993,7 +993,7 @@ mod tests {
         let tmp = testutil::copy_fixture_project();
         run_in_copy(
             &Commands::Reset {
-                target: "dev".to_string(),
+                target: None,
                 dry_run: true,
                 force: false,
                 schemas: false,
