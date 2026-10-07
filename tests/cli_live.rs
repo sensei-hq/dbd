@@ -141,6 +141,267 @@ async fn the_connecting_commands_run_against_a_real_database() {
     assert!(o.status.success(), "refresh failed: {}", combined(&o));
 }
 
+/// Two schemas and a scope that builds one of them.
+fn scoped_project(dir: &Path) {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: scoped\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - app\n  - hub\n\n\
+         scopes:\n  hub:\n    includes:\n      - hub\n",
+    )
+    .unwrap();
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        let t = dir.join(format!("ddl/table/{schema}"));
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join(format!("{table}.ddl")),
+            format!("set search_path to {schema};\ncreate table if not exists {table} (id integer primary key);\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// The `scope 'X': N of M entities` line, wherever a command prints it.
+fn scope_line(o: &Output) -> Option<String> {
+    stdout(o).lines().find(|l| l.starts_with("scope '")).map(str::to_string)
+}
+
+/// Every other scoped command says what it narrowed to. `diff` and `reconcile`
+/// said nothing, so a scoped diff reporting no drift read exactly like a whole
+/// database in sync — and `apply`, `deploy`, `import` and `policies` said
+/// nothing either.
+#[tokio::test]
+async fn the_connecting_commands_name_the_scope_they_ran_under() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+
+    let expected = scope_line(&dbd(dir, &url, &["apply", "--dry-run", "--scope", "hub"]))
+        .expect("apply --dry-run names the scope");
+    for args in [
+        &["diff", "--scope", "hub"][..],
+        &["reconcile", "--dry-run", "--scope", "hub"][..],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
+    }
+
+    // The runs that write: `apply --dry-run` named the scope and the run it
+    // previews did not.
+    for args in [
+        &["apply", "--scope", "hub"][..],
+        &["deploy", "--scope", "hub"][..],
+        &["import", "--scope", "hub"][..],
+        &["policies", "--scope", "hub"][..],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
+    }
+
+    // `--json` keeps stdout a JSON document; the scope goes to stderr.
+    let o = dbd(dir, &url, &["diff", "--json", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    serde_json::from_slice::<serde_json::Value>(&o.stdout).expect("stdout is JSON alone");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains(&expected),
+        "{}",
+        combined(&o)
+    );
+}
+
+/// `export:` lists a table, a view and a table in another schema, and a scope
+/// builds only the first schema.
+fn listed_export_project(dir: &Path) {
+    scoped_project(dir);
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: exported\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - app\n  - hub\n\n\
+         export:\n  - app.users\n  - app.user_ids\n  - hub.nodes\n\n\
+         scopes:\n  app_only:\n    includes:\n      - app\n",
+    )
+    .unwrap();
+    let v = dir.join("ddl/view/app");
+    std::fs::create_dir_all(&v).unwrap();
+    std::fs::write(
+        v.join("user_ids.ddl"),
+        "set search_path to app;\ncreate or replace view user_ids as select id from users;\n",
+    )
+    .unwrap();
+}
+
+/// A table and a view were announced as "Exporting 2 table(s)", and an
+/// `export:` entry the scope left out was not mentioned at all — the export
+/// simply had one file fewer than the list.
+#[tokio::test]
+async fn export_counts_what_it_writes_and_names_what_the_scope_left_out() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    listed_export_project(dir);
+    assert!(dbd(dir, &url, &["apply"]).status.success());
+
+    let out = dir.join("out");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "--scope", "app_only", "-o", out.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    let text = combined(&o);
+    assert!(
+        text.contains("Exporting 1 table(s) and 1 view(s)"),
+        "a view is counted as a view:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("hub.nodes") && l.contains("outside scope 'app_only'")),
+        "the listed entry the scope left out is named:\n{text}"
+    );
+}
+
+/// Run `dbd <args>` with stderr folded into stdout, in the order it was
+/// written — what a terminal shows, and the only way to see whether a warning
+/// came before or after a line.
+fn dbd_interleaved(dir: &Path, url: &str, args: &[&str]) -> (bool, String) {
+    let bin = assert_cmd::cargo::cargo_bin("dbd");
+    let config = dir.join("design.yaml");
+    let o = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("\"$0\" \"$@\" 2>&1")
+        .arg(bin)
+        .args(args)
+        .args(["-c", config.to_str().unwrap(), "-d", url])
+        .current_dir(dir)
+        .output()
+        .expect("sh failed to run");
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// A deploy runs schema, then data, then policies. It reported "Applied 1
+/// policy file(s)" first and the import's warnings after it, so the output
+/// read as if the import ran last — or that a policy applied before a load it
+/// was written to protect.
+#[tokio::test]
+async fn deploy_reports_each_phase_in_the_order_it_ran() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let p = dir.join("policies/app");
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(
+        p.join("widgets.sql"),
+        "alter table app.widgets enable row level security;\n",
+    )
+    .unwrap();
+
+    let (ok, text) = dbd_interleaved(dir, &url, &["deploy"]);
+    assert!(ok, "{text}");
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`:\n{text}"));
+    assert!(
+        at("no import/ directory") < at("Applied 1 policy file(s)"),
+        "the import's warning comes before the policy phase:\n{text}"
+    );
+}
+
+/// A project built before its release has a database with no recorded
+/// version. After `release` made it v1, `migrate --status` printed "000" and
+/// "001" and then "Database is up to date", and the next `apply` said "Fresh
+/// install at v1" over a database that was already built. Each now says what
+/// is known: no version is recorded, and the apply recorded one on a database
+/// that already held the design.
+#[tokio::test]
+async fn an_unversioned_database_is_neither_up_to_date_nor_freshly_installed_after_release() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml.replace("  version: 1\n", "")).unwrap();
+
+    assert!(dbd(dir, &url, &["apply"]).status.success(), "the pre-release build");
+    let o = dbd(dir, &url, &["release"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    let status = combined(&o);
+    assert!(o.status.success(), "{status}");
+    assert!(!status.contains("up to date"), "v1 is not recorded yet:\n{status}");
+    assert!(
+        status.contains("records v001"),
+        "and the next apply is what records it:\n{status}"
+    );
+
+    let o = dbd(dir, &url, &["apply"]);
+    let applied = combined(&o);
+    assert!(o.status.success(), "{applied}");
+    assert!(
+        !applied.contains("Fresh install"),
+        "the database was already built:\n{applied}"
+    );
+    assert!(applied.contains("v1 recorded"), "{applied}");
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    assert!(combined(&o).contains("up to date"), "now it is:\n{}", combined(&o));
+}
+
+/// The other side of the check above: an empty database is still a fresh
+/// install. Asking whether the design is already there must not find dbd's own
+/// bookkeeping, or every first apply would read as an adoption.
+#[tokio::test]
+async fn an_empty_database_is_still_a_fresh_install() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("Fresh install at v1"), "{}", combined(&o));
+}
+
+/// `apply`, `deploy`, `reconcile` and `reset` refuse to run another scope on a
+/// database pinned to one. `policies` did not: unscoped, on a database built
+/// as `hub`, it applied every schema's policies — onto tables this database
+/// does not have, or, where they existed, securing a plane it does not serve.
+#[tokio::test]
+async fn policies_refuse_another_scope_on_a_pinned_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        let p = dir.join(format!("policies/{schema}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(
+            p.join(format!("{table}.sql")),
+            format!("alter table {schema}.{table} enable row level security;\n"),
+        )
+        .unwrap();
+    }
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["policies"]);
+    assert!(
+        !o.status.success(),
+        "unscoped policies on a hub database: {}",
+        combined(&o)
+    );
+    assert!(
+        combined(&o).contains("pinned to scope 'hub'"),
+        "refused by the scope guard, naming the pin: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["policies", "--scope", "hub"]);
+    assert!(o.status.success(), "its own scope still runs: {}", combined(&o));
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
@@ -307,7 +568,7 @@ async fn an_ad_hoc_json_file_is_imported_as_json() {
 
 /// An unversioned project with a scope, so neither the applied-migrations guard
 /// nor an unknown scope gets in the way of the guard under test.
-fn scoped_project(dir: &Path) {
+fn unversioned_scoped_project(dir: &Path) {
     project(dir);
     std::fs::write(
         dir.join("design.yaml"),
@@ -329,7 +590,7 @@ async fn reset_dry_run_refuses_where_the_real_reset_would() {
     let (_pg, url) = start_pg().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    scoped_project(dir);
+    unversioned_scoped_project(dir);
 
     // ── A prod database ──
     let o = dbd(dir, &url, &["apply", "-e", "prod"]);

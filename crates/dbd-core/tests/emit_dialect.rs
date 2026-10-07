@@ -1328,3 +1328,552 @@ fn an_entity_whose_file_does_not_parse_is_reported_as_missing() {
         );
     }
 }
+
+// ── What is not emitted is reported, in the file and in the list ───────────
+
+/// A trigger kept beside its table — where most projects keep one — fires a
+/// routine whose body does not translate, so it is skipped like the routine.
+/// It was skipped without a word: no note in the file, no report entry, exit 0
+/// — while the same trigger in a file of its own would have been reported.
+///
+/// The routine it fires is in the project too, and the two must be reported
+/// the same way: one reason, written at the site in the file and in the list.
+#[test]
+fn a_trigger_written_in_a_table_file_is_reported_as_skipped_like_a_function() {
+    let files = [
+        (
+            "table/app/orders.ddl",
+            "create table orders (id integer primary key, updated timestamptz);\n\
+             create trigger orders_touch before update on orders\n  \
+               for each row execute function app.touch();",
+        ),
+        (
+            "function/app/touch.ddl",
+            "create or replace function touch() returns trigger language plpgsql as $$\n\
+             begin new.updated := now(); return new; end $$;",
+        ),
+    ];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert!(
+            !statements(&sql).to_uppercase().contains("TRIGGER"),
+            "{dialect:?}: a trigger is not emitted: {sql}"
+        );
+        let trigger = report
+            .iter()
+            .find(|d| d.from.contains("orders_touch"))
+            .unwrap_or_else(|| panic!("{dialect:?}: the trigger is reported: {report:?}"));
+        assert_eq!(trigger.entity, "app.orders", "{dialect:?}: on the table it fires on");
+        assert_eq!(trigger.to, "nothing", "{dialect:?}");
+        let function = report
+            .iter()
+            .find(|d| d.entity == "app.touch")
+            .unwrap_or_else(|| panic!("{dialect:?}: the function is reported: {report:?}"));
+        assert_eq!(
+            trigger.reason, function.reason,
+            "{dialect:?}: skipped like a function, so said the same way"
+        );
+        for skipped in ["orders_touch", "app.touch"] {
+            assert!(
+                sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains(skipped)),
+                "{dialect:?}: `{skipped}` is noted in the file too: {sql}"
+            );
+        }
+    }
+}
+
+/// A project of `files` (each `(path under the project, contents)`) with
+/// `design.yaml` written verbatim — for the tests that need a `schemas:` or
+/// `target:` block [`project_with`] does not write.
+fn project_from(dir: &Path, design_yaml: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(dir.join("design.yaml"), design_yaml).unwrap();
+    for (path, body) in files {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, body).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+/// Two schemas, each with a table, grants and an RLS policy file; an extension
+/// and a role from `target:`, a second role from `ddl/role/`; and a scope that
+/// builds `hub` alone.
+fn secured_project(dir: &Path) -> Design {
+    project_from(
+        dir,
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\n\
+         target:\n  postgres:\n    extensions:\n      - pgcrypto\n    roles:\n      - name: reader\n\n\
+         schemas:\n  - app:\n      grants:\n        reader: [usage, select]\n  \
+         - hub:\n      grants:\n        reader: [usage]\n\n\
+         scopes:\n  hub_only:\n    includes: [hub]\n",
+        &[
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table orders (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/hub/nodes.ddl",
+                "set search_path to hub;\ncreate table nodes (id integer primary key);\n",
+            ),
+            ("ddl/role/writer.ddl", "create role writer;\n"),
+            (
+                "policies/app/orders.sql",
+                "alter table app.orders enable row level security;\n",
+            ),
+            (
+                "policies/hub/nodes.sql",
+                "alter table hub.nodes enable row level security;\n",
+            ),
+        ],
+    )
+}
+
+/// Whether `report` has a "not emitted" entry for `entity` whose `from`
+/// mentions `what`, and the script a `-- dbd:` note naming `noted`.
+fn not_emitted(sql: &str, report: &[Downgrade], entity: &str, what: &str, noted: &str) -> bool {
+    report
+        .iter()
+        .any(|d| d.entity == entity && d.from.contains(what) && d.to == "nothing" && !d.reason.is_empty())
+        && sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains(noted))
+}
+
+/// Extensions, roles, grants and RLS policies are part of what a PostgreSQL
+/// project declares, and none of them reach the emitted script. They were
+/// missing from the report too — so a schema whose security rested on a policy
+/// came out with no sign anything was missing, and the report said the
+/// translation lost nothing it did not list.
+#[test]
+fn extensions_roles_grants_and_policies_are_reported_as_not_emitted() {
+    for dialect in ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let design = secured_project(tmp.path());
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+
+        let upper = statements(&sql).to_uppercase();
+        for absent in ["EXTENSION", "CREATE ROLE", "GRANT", "POLICY", "ROW LEVEL SECURITY"] {
+            assert!(!upper.contains(absent), "{dialect:?}: `{absent}` is not emitted: {sql}");
+        }
+
+        assert!(
+            not_emitted(&sql, &report, "pgcrypto", "extension", "pgcrypto"),
+            "{dialect:?}: the extension: {report:?}\n{sql}"
+        );
+        for role in ["reader", "writer"] {
+            assert!(
+                not_emitted(&sql, &report, role, "role", role),
+                "{dialect:?}: the role `{role}` — from `target:` or `ddl/role/`: {report:?}\n{sql}"
+            );
+        }
+        for schema in ["app", "hub"] {
+            assert!(
+                not_emitted(&sql, &report, schema, "grant", &format!("grants on schema `{schema}`")),
+                "{dialect:?}: the grants on `{schema}`, one entry per schema: {report:?}\n{sql}"
+            );
+        }
+        for (table, file) in [
+            ("app.orders", "policies/app/orders.sql"),
+            ("hub.nodes", "policies/hub/nodes.sql"),
+        ] {
+            assert!(
+                not_emitted(&sql, &report, table, file, file),
+                "{dialect:?}: the policy file for `{table}`, one entry per file: {report:?}\n{sql}"
+            );
+        }
+    }
+}
+
+/// A scope narrows what is reported missing the way it narrows what is
+/// emitted: the grants and the policy of a schema the scope does not build are
+/// not this script's loss.
+#[test]
+fn grants_and_policies_outside_the_scope_are_not_reported() {
+    for dialect in ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let design = secured_project(tmp.path());
+        let scope = design.resolve_scope(Some("hub_only"), None).expect("scope");
+        let (sql, report) = emit_schema(&design, dialect, Some(&scope)).expect("emits");
+
+        assert!(
+            not_emitted(&sql, &report, "hub", "grant", "grants on schema `hub`"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            not_emitted(
+                &sql,
+                &report,
+                "hub.nodes",
+                "policies/hub/nodes.sql",
+                "policies/hub/nodes.sql"
+            ),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            !report.iter().any(|d| d.entity == "app" || d.entity == "app.orders"),
+            "{dialect:?}: nothing of `app` is in this script, so none of it is its loss: {report:?}"
+        );
+    }
+}
+
+// ── A built-in type maps to the target's own; only an enum is called one ───
+
+/// The first word of the type `column` is declared with in the emitted
+/// `CREATE TABLE`.
+fn declared_type(sql: &str, dialect: Dialect, column: &str) -> String {
+    let quoted = match dialect {
+        Dialect::MySql => format!("`{column}` "),
+        Dialect::TSql => format!("[{column}] "),
+        _ => format!("\"{column}\" "),
+    };
+    sql.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(quoted.as_str()))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|ty| ty.trim_end_matches(',').to_string())
+        .unwrap_or_else(|| panic!("{dialect:?}: no column `{column}` in:\n{sql}"))
+}
+
+/// `char(n)`, `real`/`float4` and `time` have an equivalent on every target,
+/// and fell through to the catch-all meant for a user-defined type: emitted as
+/// VARCHAR(255) or nvarchar(255), and reported as "not a built-in type — if it
+/// is an enum, the allowed values are no longer enforced". Neither half was
+/// true. They are built in, none is an enum, and the mapping loses nothing —
+/// so it is the target's own type, and not reported.
+///
+/// PostgreSQL writes a precision before the zone — `timestamp (3) with time
+/// zone` — so reading the type up to its parenthesis took it for a plain
+/// `timestamp`, and SQL Server got a `datetime2` with no offset.
+#[test]
+fn a_built_in_type_with_an_equivalent_maps_faithfully() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, code char(3), letter character, ratio real, \
+         f4 float4, opens time, opens_ms time(3), closes time without time zone, \
+         stamped timestamp(3) with time zone);",
+    )];
+    let expected: [(Dialect, [(&str, &str); 8]); 3] = [
+        (
+            Dialect::MySql,
+            [
+                ("code", "CHAR(3)"),
+                ("letter", "CHAR(1)"),
+                ("ratio", "FLOAT"),
+                ("f4", "FLOAT"),
+                ("opens", "TIME"),
+                ("opens_ms", "TIME(3)"),
+                ("closes", "TIME"),
+                ("stamped", "DATETIME"),
+            ],
+        ),
+        (
+            Dialect::TSql,
+            [
+                ("code", "nchar(3)"),
+                ("letter", "nchar(1)"),
+                ("ratio", "real"),
+                ("f4", "real"),
+                ("opens", "time"),
+                ("opens_ms", "time(3)"),
+                ("closes", "time"),
+                ("stamped", "datetimeoffset"),
+            ],
+        ),
+        (
+            Dialect::Sqlite,
+            [
+                ("code", "TEXT"),
+                ("letter", "TEXT"),
+                ("ratio", "REAL"),
+                ("f4", "REAL"),
+                ("opens", "TEXT"),
+                ("opens_ms", "TEXT"),
+                ("closes", "TEXT"),
+                ("stamped", "TEXT"),
+            ],
+        ),
+    ];
+    for (dialect, columns) in expected {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        for (column, ty) in columns {
+            assert_eq!(
+                declared_type(&sql, dialect, column),
+                ty,
+                "{dialect:?} `{column}`:\n{sql}"
+            );
+            assert!(
+                about(&report, column).is_empty(),
+                "{dialect:?}: `{column}` maps faithfully, so it is not reported: {:?}",
+                about(&report, column)
+            );
+        }
+    }
+}
+
+/// `timetz`, `interval`, `inet` and `cidr` have no faithful equivalent here
+/// and do lose something — but what they lose is not an enum's labels, and the
+/// report said it was. Each is reported with what is actually lost.
+#[test]
+fn a_built_in_type_without_an_equivalent_is_reported_for_what_it_loses() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, opens_tz timetz, closes_tz time with time zone, \
+         opens_tz3 time(3) with time zone, wait interval, ip inet, net cidr);",
+    )];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        let mut lossy = vec![
+            ("wait", "interval type"),
+            ("ip", "network address"),
+            ("net", "network address"),
+        ];
+        // SQLite keeps every date and time as text, the offset included — the
+        // convention `timestamptz` → TEXT already follows unreported.
+        if dialect != Dialect::Sqlite {
+            lossy.extend([
+                ("opens_tz", "time zone"),
+                ("closes_tz", "time zone"),
+                ("opens_tz3", "time zone"),
+            ]);
+        }
+        for (column, loss) in lossy {
+            let entries = about(&report, column);
+            assert_eq!(
+                entries.len(),
+                1,
+                "{dialect:?}: `{column}` is reported once: {report:?}\n{sql}"
+            );
+            assert!(
+                entries[0].reason.contains(loss),
+                "{dialect:?}: `{column}` says it loses its {loss}: {:?}",
+                entries[0]
+            );
+            assert!(
+                !entries[0].reason.contains("enum"),
+                "{dialect:?}: `{column}` is not an enum, and must not be called one: {:?}",
+                entries[0]
+            );
+        }
+    }
+}
+
+/// The enum wording is kept for the one case it describes — a column whose type
+/// is an enum this project declares. A type dbd simply has no mapping for is
+/// reported as that, not as a possible enum.
+#[test]
+fn only_a_declared_enum_is_reported_as_one() {
+    let files = [
+        ("enum/app/status.ddl", "create type status as enum ('open', 'closed');"),
+        (
+            "table/app/t.ddl",
+            "create table t (id integer primary key, state status, cash money);",
+        ),
+    ];
+    for dialect in ALL {
+        let (_, report) = emit_with(dialect, "", &files, None);
+        let state = about(&report, "state");
+        assert!(
+            state.len() == 1 && state[0].reason.contains("enum") && state[0].reason.contains("allowed values"),
+            "{dialect:?}: a declared enum loses its labels, and says so: {report:?}"
+        );
+        let cash = about(&report, "cash");
+        assert!(
+            cash.len() == 1 && !cash[0].reason.contains("enum"),
+            "{dialect:?}: `money` is not an enum here, and is not called one: {report:?}"
+        );
+    }
+}
+
+// ── SQLite gets the views and checks it can run, and only those ────────────
+
+/// Two tables in `core` and the views and checks that broke the SQLite
+/// script: a view naming `core.cities` (SQLite: "view cannot reference objects
+/// in database core"), a view reading that view, a CHECK using
+/// `POSITION(… IN …)`, and two things SQLite has no form of — a regex CHECK
+/// and `DISTINCT ON`. Plus a view reading a table the script does not create.
+fn cities_project(dir: &Path) -> Design {
+    let file = |body: &str| format!("set search_path to core;\n{body}\n");
+    project_from(
+        dir,
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n\n\
+         external:\n  - name: auth.users\n",
+        &[
+            (
+                "ddl/table/core/regions.ddl",
+                &file("create table regions (id integer primary key, name text not null);"),
+            ),
+            (
+                "ddl/table/core/cities.ddl",
+                &file(
+                    "create table cities (\n  id integer primary key\n, name text not null\n, \
+                     region_id integer references regions (id)\n, \
+                     code text not null check (position('-' in code) > 0)\n, \
+                     slug text check (slug ~ '^[a-z]+$')\n);",
+                ),
+            ),
+            (
+                "ddl/view/core/city_names.ddl",
+                &file(
+                    "create view city_names as select cities.name, r.name as region \
+                     from core.cities join regions r on r.id = cities.region_id;",
+                ),
+            ),
+            (
+                "ddl/view/core/named_again.ddl",
+                &file("create view named_again as select name from city_names;"),
+            ),
+            (
+                "ddl/view/core/first_per_region.ddl",
+                &file(
+                    "create view first_per_region as select distinct on (region_id) name \
+                     from core.cities order by region_id, name;",
+                ),
+            ),
+            (
+                "ddl/view/core/user_cities.ddl",
+                &file("create view user_cities as select u.id from auth.users u;"),
+            ),
+        ],
+    )
+}
+
+fn emit_cities() -> (String, Vec<Downgrade>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = cities_project(tmp.path());
+    emit_schema(&design, Dialect::Sqlite, None).expect("emits")
+}
+
+const CITY_ROWS: &str = "insert into core_regions values (1, 'North');\n\
+     insert into core_cities (id, name, region_id, code) values (1, 'Oslo', 1, 'NO-OS');";
+
+/// A view names its tables the way PostgreSQL does — `core.cities`, or bare
+/// under `search_path` — and SQLite has neither: the tables are `core_cities`
+/// and `core_regions` there. Naming `core.cities` failed the whole script; a
+/// bare `regions` applied and failed on the first read. The view now reads the
+/// tables the script creates, and a view reading that view works too.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_sqlite_view_reads_the_tables_the_script_creates() {
+    let (sql, report) = emit_cities();
+    let got = on_sqlite(&sql, CITY_ROWS, "select name || '/' || region from core_city_names")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got, "Oslo/North");
+    let got = on_sqlite(&sql, CITY_ROWS, "select name from core_named_again").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got, "Oslo");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "core.city_names" && d.from.contains("view body") && d.to != "nothing"),
+        "a rewritten body is still reported — SQLite's semantics are not PostgreSQL's: {report:?}"
+    );
+}
+
+/// `DISTINCT ON` has no SQLite form, and a view reading a table the script
+/// does not create cannot be read. Either one left in failed the script or the
+/// first query, so each is left out — noted where it would have been, and
+/// reported — and the rest of the script applies.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_view_sqlite_cannot_run_is_left_out_and_reported() {
+    let (sql, report) = emit_cities();
+    on_sqlite(&sql, CITY_ROWS, "select 'ok'").unwrap_or_else(|e| panic!("{e}"));
+    for (view, emitted, why) in [
+        ("core.first_per_region", "core_first_per_region", "DISTINCT ON"),
+        ("core.user_cities", "core_user_cities", "auth.users"),
+    ] {
+        assert!(
+            !statements(&sql).contains(&format!("CREATE VIEW \"{emitted}\"")),
+            "`{view}` is left out: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == view && d.to == "nothing" && d.reason.contains(why)),
+            "`{view}` is reported, naming what SQLite cannot run ({why}): {report:?}"
+        );
+        assert!(
+            sql.lines()
+                .any(|l| l.starts_with("-- dbd:") && l.contains(view) && l.contains(why)),
+            "and noted in the file: {sql}"
+        );
+    }
+}
+
+/// `POSITION('-' IN code)` is SQLite's `instr(code, '-')`, so the CHECK is
+/// translated and still refuses what it refused. A regex has no SQLite form at
+/// all — left in, the CREATE TABLE failed and took the table with it — so that
+/// CHECK alone is left out and reported, and the rows it refused are accepted.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_check_is_translated_for_sqlite_or_left_out_and_reported() {
+    let (sql, report) = emit_cities();
+
+    let refused = on_sqlite(
+        &sql,
+        "insert into core_cities (id, name, code) values (2, 'Bergen', 'NOBG')",
+        "select 'inserted'",
+    );
+    assert!(
+        refused.as_ref().is_err_and(|e| e.contains("CHECK constraint failed")),
+        "the translated CHECK still refuses a code without '-': {refused:?}"
+    );
+
+    let accepted = on_sqlite(
+        &sql,
+        "insert into core_cities (id, name, code, slug) values (2, 'Bergen', 'NO-BG', 'NOT LOWER')",
+        "select slug from core_cities",
+    );
+    assert_eq!(accepted.as_deref(), Ok("NOT LOWER"), "the regex CHECK is gone: {sql}");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "core.cities" && d.from.contains("slug ~") && d.to == "no CHECK"),
+        "and leaving it out is reported: {report:?}"
+    );
+}
+
+/// A view written for SQLite returns what it returned on PostgreSQL where
+/// SQLite can say so. A column PostgreSQL names itself is called that — SQLite
+/// would call `count(*)` `count(*)`, and a view reading `count` found nothing.
+/// NULL sorts last going up, as in PostgreSQL, where SQLite puts it first. And
+/// LIKE's backslash escapes, as PostgreSQL's does and SQLite's does not.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_sqlite_view_keeps_postgres_column_names_null_order_and_like_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = |body: &str| format!("set search_path to core;\n{body}\n");
+    let design = project_from(
+        tmp.path(),
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n",
+        &[
+            (
+                "ddl/table/core/items.ddl",
+                &file("create table items (id integer primary key, name text, grp text not null);"),
+            ),
+            (
+                "ddl/view/core/counts.ddl",
+                &file("create view counts as select grp, count(*) from items group by grp;"),
+            ),
+            (
+                "ddl/view/core/busy.ddl",
+                &file("create view busy as select grp from counts where count > 1;"),
+            ),
+            (
+                "ddl/view/core/ordered.ddl",
+                &file("create view ordered as select name from items order by name;"),
+            ),
+            (
+                "ddl/view/core/underscored.ddl",
+                &file("create view underscored as select name from items where name like 'a\\_%';"),
+            ),
+        ],
+    );
+    let (sql, _) = emit_schema(&design, Dialect::Sqlite, None).expect("emits");
+    let rows = "insert into core_items values (1, 'a_x', 'g'), (2, 'abc', 'g'), (3, null, 'h');";
+    for (query, expected) in [
+        ("select group_concat(grp) from core_busy", "g"),
+        ("select coalesce(name, 'NULL') from core_ordered limit 1", "a_x"),
+        ("select group_concat(name) from core_underscored", "a_x"),
+    ] {
+        let got = on_sqlite(&sql, rows, query).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(got, expected, "`{query}`:\n{sql}");
+    }
+}

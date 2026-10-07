@@ -199,6 +199,7 @@ impl Design {
                 before_scripts: before.ran,
                 after_scripts: after.ran,
                 warnings: [before.warnings, after.warnings].concat(),
+                previously_built: false,
             });
             return Ok(());
         }
@@ -220,6 +221,15 @@ impl Design {
             &pending,
             working_set.as_ref(),
         );
+
+        // No recorded version does not mean an empty database: one built
+        // before the project had a version records none, and neither does one
+        // built by hand. Asked before the plan runs, since its SetVersion step
+        // writes the very record this looks for.
+        let previously_built = plan.strategy == ApplyStrategy::Fresh && {
+            let live: std::collections::HashSet<String> = adapter.list_entities().await?.into_iter().collect();
+            adapter.get_project_meta().await?.is_some() || valid_entities.iter().any(|e| live.contains(&e.name))
+        };
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();
@@ -353,6 +363,7 @@ impl Design {
             before_scripts: before.ran,
             after_scripts: after.ran,
             warnings: [before.warnings, after.warnings].concat(),
+            previously_built,
         });
         Ok(())
     }
@@ -470,6 +481,29 @@ impl Design {
         Ok(())
     }
 
+    /// The grants a run under `scope` applies: schema → role → privileges.
+    ///
+    /// Every `schemas:` entry's `grants:`, with the target's `grants:` merged
+    /// on top — per schema, a target role adds to or overrides the universal
+    /// entry for that role — narrowed to the schemas the scope builds.
+    ///
+    /// One definition for [`Self::apply_grants`], which runs them, and
+    /// `dbd emit`, which has to report the ones it does not translate; two
+    /// copies would let the report list grants the database never got. The
+    /// merge itself is [`crate::config::DesignConfig::effective_schema_grants`],
+    /// which `reset` revokes from too.
+    pub(crate) fn declared_grants(
+        &self,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>> {
+        let mut schema_grants = self.config.effective_schema_grants();
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            schema_grants.retain(|schema, _| ws.contains(schema));
+        }
+        Ok(schema_grants)
+    }
+
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
     /// target's `grants:` merged on top (per schema, a target role adds to or
     /// overrides the universal entry for that role), plus PostgREST's schema
@@ -485,21 +519,20 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<GrantsOutcome> {
-        let mut schema_grants = self.config.effective_schema_grants();
-        let mut supabase_schemas: Vec<String> = vec![];
-        // PostgREST USAGE grants ride along only when the user configured some
-        // grants, so a no-grants Supabase apply stays a no-op.
-        if self.config.default_target() == Some("supabase") && !schema_grants.is_empty() {
-            supabase_schemas = self.config.schema_names();
-        }
-        if let Some(s) = scope.filter(|s| !s.is_all) {
-            let ws = self.working_set(s)?;
-            schema_grants.retain(|schema, _| ws.contains(schema));
-            supabase_schemas.retain(|schema| ws.contains(schema));
-        }
-
+        let schema_grants = self.declared_grants(scope)?;
         if schema_grants.is_empty() {
             return Ok(GrantsOutcome::None);
+        }
+        // PostgREST USAGE grants ride along only when the user configured
+        // some grants, so a no-grants Supabase apply stays a no-op.
+        let mut supabase_schemas: Vec<String> = if self.config.default_target() == Some("supabase") {
+            self.config.schema_names()
+        } else {
+            Vec::new()
+        };
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            supabase_schemas.retain(|schema| ws.contains(schema));
         }
         // A cross-target design may declare schema grants yet apply to SQLite
         // or Convex, which have no grant model to run them against.

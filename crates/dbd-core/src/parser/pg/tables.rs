@@ -183,6 +183,28 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
     ))
 }
 
+/// The triggers a table file declares beside its table, by name.
+///
+/// The model keeps none — [`extract`] turns a trigger into a `Calls` edge to
+/// the routine it fires and nothing more, since apply only needs the order. A
+/// consumer that must account for every statement in the file, as `dbd emit`
+/// reports everything it leaves out, reads them back from the source here, the
+/// way it reads a sequence's options (`sequences::sequence_options`).
+pub(crate) fn trigger_names(sql: &str) -> Vec<String> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|s| match s.stmt.as_ref()?.node.as_ref()? {
+            NodeEnum::CreateTrigStmt(t) => Some(t.trigname.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
 fn qualified(rel: &protobuf::RangeVar, default_schema: &str) -> String {
     let schema = if rel.schemaname.is_empty() {

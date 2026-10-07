@@ -46,6 +46,12 @@ pub struct ApplyComplete {
     /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
     /// Realtime must say so, not report a clean success.
     pub warnings: Vec<String>,
+    /// For a [`ApplyStrategy::Fresh`] run: whether the database was already
+    /// built before it — dbd had applied it without a version, or the design's
+    /// objects were already there. A database with no recorded version is not
+    /// necessarily empty, and calling this run a fresh install said it was.
+    /// Always `false` for the other strategies.
+    pub previously_built: bool,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
@@ -109,19 +115,26 @@ impl DeployComplete {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.apply.warnings.clone();
         out.extend(self.import.warnings.iter().cloned());
-        out.extend(
-            self.policies
-                .failed
-                .iter()
-                .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
-        );
-        out.extend(
-            self.policies
-                .skipped
-                .iter()
-                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
-        );
+        out.extend(self.policy_warnings());
         out
+    }
+
+    /// The policy phase's share of [`Self::warnings`]: one line per failed
+    /// policy file, then one per policy a scope excluded. Apart, so a caller
+    /// reporting phase by phase can print them after the policy phase's own
+    /// line rather than before it.
+    pub fn policy_warnings(&self) -> Vec<String> {
+        let failed = self
+            .policies
+            .failed
+            .iter()
+            .map(|(file, err)| format!("policy not applied: {} — {err}", file.display()));
+        let skipped = self
+            .policies
+            .skipped
+            .iter()
+            .map(|(file, why)| format!("policy skipped: {} — {why}", file.display()));
+        failed.chain(skipped).collect()
     }
 }
 
@@ -293,7 +306,14 @@ pub struct Report {
     /// reported, because a file that no scope builds is how a broken file goes
     /// unnoticed. Always empty without a scope, or under `all`.
     pub out_of_scope_issues: Vec<Entity>,
+    /// Entities with warnings that the active scope builds — all of them
+    /// without a scope, or under `all`.
     pub warnings: Vec<Entity>,
+    /// Entities with warnings that the active scope excludes, kept apart like
+    /// [`Self::out_of_scope_issues`]: listed and counted as the scope's, a
+    /// warning in a file the scope never builds read as something to fix
+    /// before the scoped run.
+    pub out_of_scope_warnings: Vec<Entity>,
     pub gaps: Vec<crate::scope::ScopeGap>,
 }
 
@@ -1012,15 +1032,18 @@ impl Design {
         // report agrees with what a run would actually refuse on. Reporting an
         // out-of-scope parse error as blocking sends people to fix a file the
         // scoped run never reads.
-        let (issues, out_of_scope_issues) = match scope {
+        let ((issues, out_of_scope_issues), (warnings, out_of_scope_warnings)) = match scope {
             Some(s) if !s.is_all => match self.working_set(s) {
-                Ok(ws) => all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                Ok(ws) => (
+                    all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                    warnings.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                ),
                 // Working set unavailable: treat every error as blocking. The
                 // conservative direction — a spurious error is a nuisance, a
                 // hidden one is the failure this reporting exists to prevent.
-                Err(_) => (all_issues, Vec::new()),
+                Err(_) => ((all_issues, Vec::new()), (warnings, Vec::new())),
             },
-            _ => (all_issues, Vec::new()),
+            _ => ((all_issues, Vec::new()), (warnings, Vec::new())),
         };
 
         let gaps = match scope {
@@ -1033,6 +1056,7 @@ impl Design {
             issues,
             out_of_scope_issues,
             warnings,
+            out_of_scope_warnings,
             gaps,
         }
     }

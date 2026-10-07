@@ -106,6 +106,8 @@ pub fn cmd_import_dry_run(
     // Surface the same gap/closure errors a real import would (dry-run must
     // not hide a misconfigured scope).
     design.check_scope_gaps(&resolved).context("scope check failed")?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let (plan, skips) = design.scoped_import_plan(name, Some(&resolved))?;
 
     // Anything the scan, plan or scope left out, before listing what remains —
@@ -226,6 +228,8 @@ pub(crate) async fn import_with_adapter(
     }
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
@@ -322,6 +326,27 @@ fn export_selection<'a>(
     Ok(selected)
 }
 
+/// "1 table(s) and 1 view(s)": what an export writes, by kind. A view counted
+/// as a table promised a table that does not exist.
+fn export_tally(selected: &[&dbd_core::Entity]) -> String {
+    use dbd_core::EntityType;
+    let count = |t: EntityType| selected.iter().filter(|e| e.entity_type == t).count();
+    let parts: Vec<String> = [
+        (count(EntityType::Table), "table(s)"),
+        (count(EntityType::View), "view(s)"),
+        (count(EntityType::MaterializedView), "materialized view(s)"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    match parts.as_slice() {
+        [] => "nothing".to_string(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 /// What an `export:` entry may name: a table, or a view that reshapes one.
 fn is_exportable(e: &dbd_core::Entity) -> bool {
     matches!(
@@ -365,13 +390,29 @@ pub(crate) async fn export_with_adapter(
     // export" on a scoped run otherwise reads as an empty database.
     let (kept, total) = design.scope_counts(resolved)?;
     output::scope_filtered(resolved, kept, total);
+    // And name each `export:` entry the scope left out. The list is what the
+    // reader expects to find files for; one missing without a word looks like
+    // a failed export.
+    if !resolved.is_all && name.is_none() {
+        let in_scope: std::collections::HashSet<String> =
+            design.scoped_entities(resolved)?.into_iter().map(|e| e.name).collect();
+        for listed in design.config().export.iter().map(|e| e.name()) {
+            let exists = design.entities().iter().any(|e| e.name == listed && is_exportable(e));
+            if exists && !in_scope.contains(&listed) {
+                output::warn(&format!(
+                    "export: {listed} is outside scope '{}' — not exported",
+                    resolved.name
+                ));
+            }
+        }
+    }
 
     if tables.is_empty() {
         output::info(verbosity, "No tables to export.");
         return Ok(());
     }
 
-    output::info(verbosity, &format!("Exporting {} table(s)...", tables.len()));
+    output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".

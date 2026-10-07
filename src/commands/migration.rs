@@ -46,6 +46,8 @@ pub async fn cmd_reset(
     } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let target = reset_target(target, &design);
 
     if dry_run {
@@ -146,18 +148,41 @@ pub(crate) async fn migrate_status_with_adapter(
     let snapshots = dbd_core::snapshot::list_snapshots(project_dir);
     let latest_version = snapshots.last().map(|s| s.version).unwrap_or(0);
 
-    output::always(&format!(
-        "Database version: {}",
-        dbd_core::snapshot::pad_version(db_version)
-    ));
-    output::always(&format!(
-        "Latest snapshot:  {}",
-        dbd_core::snapshot::pad_version(latest_version)
-    ));
+    let pad = dbd_core::snapshot::pad_version;
+    // Version 0 is no version: a database built before the project had one.
+    let recorded = if db_version == 0 {
+        "none recorded".to_string()
+    } else {
+        pad(db_version)
+    };
+    output::always(&format!("Database version: {recorded}"));
+    output::always(&format!("Latest snapshot:  {}", pad(latest_version)));
 
+    // "Up to date" only when the versions agree. With no migration pending it
+    // was printed beside 000 and 001 alike, which is the one case where the
+    // next apply still has something to record.
     let pending = dbd_core::snapshot::pending_migrations(db_version, project_dir);
     if pending.is_empty() {
-        output::info(verbosity, "Database is up to date.");
+        let state = match db_version.cmp(&latest_version) {
+            std::cmp::Ordering::Equal => "Database is up to date.".to_string(),
+            std::cmp::Ordering::Greater => format!(
+                "The database is at v{}, ahead of the latest snapshot v{} — it was applied from a newer design.",
+                pad(db_version),
+                pad(latest_version)
+            ),
+            std::cmp::Ordering::Less if db_version == 0 => format!(
+                "No migration is pending — the next `dbd apply` applies the current DDL and records v{}.",
+                pad(latest_version)
+            ),
+            std::cmp::Ordering::Less => format!(
+                "No migration from v{} to v{} is under snapshots/ — `dbd apply` re-applies the current DDL \
+                 and leaves the recorded version at v{}.",
+                pad(db_version),
+                pad(latest_version),
+                pad(db_version)
+            ),
+        };
+        output::info(verbosity, &state);
     } else {
         output::always(&format!("{} pending migration(s):", pending.len()));
         for m in &pending {
