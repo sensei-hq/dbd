@@ -65,7 +65,7 @@ columns, so:
 
 | Works | Refused or empty |
 |---|---|
-| `inspect`, `graph`, `combine` — the files concatenated, after a PostgreSQL `CREATE SCHEMA IF NOT EXISTS` per schema, which you remove for SQL Server or SQLite | `diff`, `reconcile` — nothing to compare; they refuse and say why |
+| `inspect`, `graph`, `combine` — the files concatenated, with the schema statements in the project's dialect: a guarded `CREATE SCHEMA` and `GO` for T-SQL, none for MySQL and SQLite | `diff`, `reconcile` — nothing to compare; they refuse and say why |
 | `doctor` | `emit` — nothing to translate |
 | `apply`/`deploy` on SQLite | `dbml`, `diagram` — they run, but with no tables to draw |
 | | `snapshot` — it records tables from their structure, so it records none |
@@ -77,9 +77,12 @@ The refusal names the reason. For a SQLite project:
 diff needs a structured model, and this project's DDL is not read into one (source.dialect: sqlite) — its files give identity and references but no columns or constraints, so there is nothing to compare. `apply`, `deploy`, `import` and `export` work normally.
 ```
 
-For T-SQL and MySQL the CLI connects first, so the refusal you see is the
-missing adapter — `Error: Failed to connect to database: Config error: no
-adapter for SQL Server: …` — and the last sentence above does not apply.
+For a T-SQL or MySQL project the last sentence says what works instead —
+there is no adapter for SQL Server or MySQL, so it names `inspect`, `graph`,
+`combine`, `dbml` and `diagram`, which work offline. The CLI connects first,
+though, so with a `sqlserver://` or `mysql://` URL the refusal you see is the
+missing adapter: `Error: Failed to connect to database: Config error: no
+adapter for SQL Server: …`.
 
 From Rust, `parser::parse_sql_as(Dialect::TSql, sql)` reads one file in a stated
 dialect, and `project::survey` describes a directory without parsing it — see
@@ -99,9 +102,10 @@ read ./ddl/table/dbo/Orders.sql: not UTF-8, and it carries no byte-order mark sa
 A file with null bytes and no mark is reported as binary — which is also what a
 UTF-16 file saved *without* a byte-order mark looks like.
 
-> In 0.24.1, `apply`, `deploy` and `combine` read the SQL they execute without
-> that decoding, so a UTF-16 DDL file loads and validates but is **skipped when
-> applied**. Re-encode such files as UTF-8 before applying them.
+Every reader of a DDL file decodes it this way — `apply`, `deploy`, `combine`,
+`format`, `doctor`, `merge` and the migration readers as well as the scan — so a
+UTF-16 file applies like any other. Data files under `import/` are read as UTF-8
+only.
 
 ## `dbd emit`
 
@@ -129,30 +133,51 @@ scope's entities.
 ### What is emitted
 
 - **Tables**, with their columns, `NOT NULL`, defaults, primary keys, unique
-  constraints, foreign keys, `CHECK` constraints and indexes (`CREATE INDEX`).
+  constraints, foreign keys, `CHECK` constraints, indexes (`CREATE INDEX`) and
+  comments where the target keeps them. Identity and `serial` columns are
+  numbered by the target; generated columns are computed by it.
 - **Views** and **materialized views**, as `CREATE VIEW` with the `SELECT`
   passed through untranslated — and reported, since anything
   PostgreSQL-specific inside it has to be checked by hand. A materialized view
-  becomes a plain view, without its indexes.
+  becomes a plain view, which is reported, and each of its indexes is reported
+  and left out.
+- **Sequences.** SQL Server gets `CREATE SEQUENCE`, every bound resolved to
+  PostgreSQL's and spelled out (SQL Server's own defaults start at the type's
+  minimum), and a `nextval('s')` default becomes `NEXT VALUE FOR`. MySQL and
+  SQLite have no sequences: the sequence is reported, an integer key that drew
+  from it is numbered by the table instead, and any other column loses the
+  default — each reported.
+- **Schemas.** SQL Server gets a `CREATE SCHEMA` for every schema the script
+  uses, `dbo` aside; MySQL and SQLite fold the schema into the name.
 - **Functions, procedures and triggers** are skipped and reported: their bodies
   do not translate.
-- Schemas, extensions, roles, sequences and enum *types* produce no statement
-  of their own.
-- A file dbd could not read is left out without a report, so run
-  `dbd inspect` first — it exits 1 when something cannot be read.
+- Extensions, roles and enum *types* produce no statement of their own.
+- A file dbd could not parse is reported as missing — `a table whose file could
+  not be parsed -> nothing` — rather than left out without a word.
 
-A `CHECK` expression is passed through untranslated and reported, the same way
-a view body is. An index the target cannot express as written — an expression
-index, a partial (`WHERE`) index, or one on a column type the target cannot
-index — is reported, and passed through, built without its predicate, or left
-out, as the target allows.
+A `CHECK` expression, a generated column's expression and a partial index's
+predicate are passed through untranslated and reported, the same way a view
+body is. An index the target would reject outright is left out and reported, so
+the script still applies: an expression key on SQL Server, a key on an
+unbounded `text`/`bytea`/`json` column on MySQL or SQL Server. MySQL has no
+partial indexes, so there one becomes an index over every row (reported). A
+foreign key to a table the script does not create — declared `external:`, or
+left out by `--scope` — is left out and reported; the script has to apply on its
+own.
+
+**T-SQL batches.** SQL Server needs `CREATE SCHEMA` and `CREATE VIEW` each alone
+in a batch, so the T-SQL script ends every statement with `GO` — the batch
+separator `sqlcmd` and SSMS read. `GO` is not T-SQL: a driver that sends the
+script in one call must split it on the `GO` lines first.
 
 ### Downgrades
 
 A construct the target cannot express is emitted as the nearest thing it can,
-and the loss is reported: as a comment above the line it affects, in the run's
-summary, and with `--report` as JSON — except the losses listed below. A faithful mapping is not reported — a report padded with
-`integer → INT` is one nobody reads.
+and the loss is reported: as a one-line comment above the line it affects (one
+line even when what it quotes — a comment, an expression — spans several), in
+the run's summary, and with `--report` as JSON — except the losses listed below.
+A faithful mapping is not reported — a report padded with `integer → INT` is one
+nobody reads.
 
 | PostgreSQL | MySQL | T-SQL | SQLite |
 |---|---|---|---|
@@ -171,6 +196,18 @@ summary, and with `--report` as JSON — except the losses listed below. A faith
 | `text[]` (any array) | `JSON` ⚠ | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
 | an enum, or any other type | `VARCHAR(255)` ⚠ | `nvarchar(255)` ⚠ | `TEXT` ⚠ |
 | `schema.table` | `` `schema_table` `` ⚠ | `[schema].[table]` | `"schema_table"` ⚠ |
+| `text` in a key (primary, unique or foreign) | `VARCHAR(255)` ⚠ | `nvarchar(450)` ⚠ | `TEXT` |
+| identity, `serial` | `AUTO_INCREMENT` (⚠ for `ALWAYS`) | `IDENTITY(1,1)` (⚠ for `BY DEFAULT` and `serial`) | `INTEGER PRIMARY KEY AUTOINCREMENT` (⚠ for `ALWAYS`) |
+| a sequence | nothing ⚠ | `CREATE SEQUENCE` | nothing ⚠ |
+| `DEFAULT nextval('s')` | the table's `AUTO_INCREMENT` on its numbered key ⚠, else no default ⚠ | `NEXT VALUE FOR` (no default ⚠ when the sequence is not in the script) | `AUTOINCREMENT` on its integer key ⚠, else no default ⚠ |
+| a generated column | `GENERATED ALWAYS AS (…) STORED` ⚠ | `AS CAST((…) AS type) PERSISTED` ⚠ | `GENERATED ALWAYS AS (…) STORED` ⚠ |
+| `now()`, `current_date` | `CURRENT_TIMESTAMP`, `(CURRENT_DATE)` | `SYSDATETIMEOFFSET()`, `CONVERT(date, SYSDATETIME())` | `CURRENT_TIMESTAMP`, `CURRENT_DATE` |
+| `gen_random_uuid()` | `(UUID())` ⚠ — version 1, not random | `NEWID()` | a random v4 expression over `randomblob` |
+| a literal default | the literal, without its `::cast` | the same | the same |
+| any other default | left out ⚠ | left out ⚠ | left out ⚠ |
+| a materialized view | a view ⚠ | a view ⚠ | a view ⚠ |
+| comments | table and column `COMMENT`; a view's ⚠ | `MS_Description` on tables, columns and views | none ⚠ |
+| a foreign key to a table not in the script | left out ⚠ | left out ⚠ | left out ⚠ |
 
 ⚠ = reported. An **enum** column becomes plain text on every target — MySQL's
 `ENUM` is not used and no `CHECK` is added — and is reported as "if it is an
@@ -183,21 +220,23 @@ reference to the table has to be updated to match.
 `id` CHAR(36) NOT NULL,
 ```
 
-Some losses are **not** reported in 0.24.1, so check for them by hand:
+Each target numbers one column per table. MySQL numbers only a column that
+leads the primary key or a `UNIQUE`, and SQLite only a single-column `INTEGER
+PRIMARY KEY`; an identity or `serial` column they cannot number becomes a plain
+column, reported — inserts must then supply it.
 
-- **Defaults** — a literal is kept as written, including any PostgreSQL cast
-  (`'x'::text` stays, and is invalid on the target); `now()`/`current_timestamp`
-  and `true`/`false` are mapped; any other default (`gen_random_uuid()`,
-  `nextval(…)`) is left out.
-- **Identity** — `serial`, `bigserial` and `GENERATED … AS IDENTITY` columns
-  become plain integers, without `AUTO_INCREMENT` or `IDENTITY`; a `serial`
-  column is also added to the primary key. Generated columns lose their
-  expression.
+Some losses are still **not** reported, so check for them by hand:
+
+- **Identity options** — an identity column's `START WITH` and `INCREMENT BY`;
+  the target's numbering counts from 1 by 1.
 - **Precision and zones** — `timestamptz` loses its time zone on MySQL and
   SQLite, `varchar(n)` its length on SQLite; a bare `varchar` becomes
   `VARCHAR(255)`/`nvarchar(255)` and a bare `numeric` `DECIMAL(65,30)`/
   `decimal(38,10)`.
-- **Materialized views** — the materialization and the view's indexes.
+
+The MySQL and SQL Server output is written from those engines' documented
+syntax and has not been run against a server, so apply it to a scratch
+database before trusting it.
 
 The schema-name folds and the skipped routines appear in the summary and the
 report but not as comments in the file — they have no single line to sit on.

@@ -307,13 +307,17 @@ one script for its own target; `emit` rewrites the schema for a *different*
 engine.
 
 The source must be a **PostgreSQL** project — it is the only dialect dbd reads
-into columns and constraints. Tables are emitted with their columns, keys,
-foreign keys, `CHECK` constraints and indexes; views and materialized views as
-`CREATE VIEW` with the body passed through untranslated and reported;
-functions, procedures and triggers are skipped and reported, because their
-bodies do not translate. A `CHECK` expression is passed through untranslated
-and reported the same way, and so is an index the target cannot express
-faithfully. A file dbd could not read is left out, so run `dbd inspect` first.
+into columns and constraints. Tables come with their keys, foreign keys,
+`CHECK` constraints, indexes, identity and `serial` columns (numbered by the
+target), generated columns (computed by it), defaults and comments; views and
+materialized views as `CREATE VIEW`, the body passed through untranslated and
+reported — a materialized view becomes a plain view, also reported. T-SQL also
+gets `CREATE SCHEMA` and `CREATE SEQUENCE`; MySQL and SQLite, which have
+neither, report each sequence. Functions, procedures and triggers are skipped
+and reported, because their bodies do not translate. A `CHECK` expression, a
+generated column's expression and an index predicate are passed through
+untranslated and reported; an index the target would reject is left out and
+reported. A file dbd could not parse is reported as missing from the schema.
 `--scope` limits the output to the scope's entities.
 
 ### Downgrades
@@ -329,15 +333,31 @@ as a comment at the site, in the run summary, and as JSON with `--report`:
 | `uuid` | `CHAR(36)` ⚠ | `uniqueidentifier` | `TEXT` ⚠ |
 | `timestamptz` | `DATETIME` | `datetimeoffset` | `TEXT` |
 | an enum type | `VARCHAR(255)` ⚠ | `nvarchar(255)` ⚠ | `TEXT` ⚠ |
-| schemas | folded into the name ⚠ | native | folded into the name ⚠ |
+| schemas | folded into the name ⚠ | native, with `CREATE SCHEMA` | folded into the name ⚠ |
+| identity, `serial` | `AUTO_INCREMENT` (⚠ for `ALWAYS`) | `IDENTITY(1,1)` (⚠ for `BY DEFAULT`, `serial`) | `INTEGER PRIMARY KEY AUTOINCREMENT` (⚠ for `ALWAYS`) |
+| a sequence | nothing ⚠ | `CREATE SEQUENCE`, PostgreSQL's bounds | nothing ⚠ |
+| `DEFAULT nextval('s')` | the table's counter on its key ⚠, else none ⚠ | `NEXT VALUE FOR` | the table's counter on its key ⚠, else none ⚠ |
+| a generated column | stored, expression untranslated ⚠ | persisted, expression untranslated ⚠ | stored, expression untranslated ⚠ |
+| a materialized view | a view ⚠, indexes left out ⚠ | a view ⚠, indexes left out ⚠ | a view ⚠, indexes left out ⚠ |
+| comments | table and column `COMMENT`; a view's ⚠ | `MS_Description` | dropped ⚠ |
+| `text` in a key | `VARCHAR(255)` ⚠ | `nvarchar(450)` ⚠ | `TEXT` |
+| defaults | literal without its `::cast`; `now()`, `current_date`; `gen_random_uuid()` → `(UUID())` ⚠; any other left out ⚠ | literal; `now()`, `current_date`, `gen_random_uuid()` → `NEWID()`; any other left out ⚠ | literal; `now()`, `current_date`, `gen_random_uuid()`; any other left out ⚠ |
+| a foreign key to an `external:` or out-of-scope table | left out ⚠ | left out ⚠ | left out ⚠ |
 
 ⚠ = a real loss of meaning, and therefore reported. A faithful mapping is not
 reported — a report padded with `integer → INT` is one nobody reads. An enum
-column becomes plain text on every target, its values no longer enforced.
+column becomes plain text on every target, its values no longer enforced. Every
+note in the file is one line, even when what it quotes spans several.
 
-Some losses are not reported in 0.24.1: a default other than a literal,
-`now()` or a boolean is left out, and `serial`/identity columns lose their
-auto-increment. The full mapping and the report format are in
+**T-SQL output ends every statement with `GO`**, the batch separator `sqlcmd`
+and SSMS read — SQL Server needs `CREATE SCHEMA` and `CREATE VIEW` each alone in
+a batch. `GO` is not T-SQL, so split the script on it before sending it through
+a driver.
+
+Still not reported: an identity column's `START`/`INCREMENT` options, and lost
+precision or time zones (`timestamptz` → `DATETIME` on MySQL, `varchar(n)` →
+`TEXT` on SQLite). The MySQL and SQL Server output is written from documented
+syntax, not run against a server. The full mapping and the report format are in
 [other dialects](13-other-dialects.md#dbd-emit).
 
 Downgrades do not fail the run; assert on the `--report` count instead.
