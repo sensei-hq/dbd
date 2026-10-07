@@ -41,6 +41,12 @@ pub async fn cmd_inspect(
     resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    // Resolve the working set the way every run does, before reporting on it.
+    // Under `deps: include` that is the closure, and a closure that needs what
+    // the scope excludes is refused by apply, dbml and diagram — so inspect,
+    // which exists to vet a scope before a run, must refuse it too rather than
+    // promise to auto-include an entity the scope forbids.
+    design.working_set(&resolved)?;
     let report = design.report(name, Some(&resolved));
 
     report_scope_gaps(&resolved, &report, verbosity)?;
