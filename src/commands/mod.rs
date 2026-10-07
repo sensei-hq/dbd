@@ -58,15 +58,30 @@ fn command_honors_scope(command: &Commands) -> bool {
     }
 }
 
-/// Say so when `--scope` was passed to a command that ignores it.
-fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
-    let Some(name) = scope else { return };
+/// Say so when `--scope` or `--deps` was passed to a command that ignores it.
+///
+/// `--deps` only means anything to a scope — it decides whether a scope's
+/// dependency gaps are errors or are pulled in — so a command that ignores the
+/// scope ignores it too, and accepting it in silence reads the same way an
+/// ignored `--scope` did.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<dbd_core::config::DepsPolicy>) {
     if command_honors_scope(command) {
         return;
     }
-    output::warn(&format!(
-        "--scope {name} ignored: this command operates on the whole design, not a scope"
-    ));
+    if let Some(name) = scope {
+        output::warn(&format!(
+            "--scope {name} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
+    if let Some(policy) = deps {
+        let policy = match policy {
+            dbd_core::config::DepsPolicy::Report => "report",
+            dbd_core::config::DepsPolicy::Include => "include",
+        };
+        output::warn(&format!(
+            "--deps {policy} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +96,7 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    warn_if_scope_ignored(command, scope);
+    warn_if_scope_ignored(command, scope, deps);
     // `deploy` downloads a GitHub source; nothing else does. Several commands
     // write into the project (snapshot, release, format, inspect --fix), and a
     // downloaded tree is a cache — so the rest take a local path only.
@@ -316,7 +331,10 @@ pub async fn run(
             dry_run,
         } => {
             if let Some(dbml_path) = from_dbml {
-                if target != "postgres" {
+                // DBML is PostgreSQL-shaped and names no platform, so both
+                // PostgreSQL targets are the caller's to choose. This used to
+                // accept `postgres` alone while saying Supabase was supported.
+                if !matches!(target.as_str(), "postgres" | "supabase") {
                     anyhow::bail!(
                         "--target {target} is not supported with --from-dbml; \
                          reverse-engineering supports Postgres/Supabase only"
@@ -333,15 +351,17 @@ pub async fn run(
                     env,
                     config,
                     name.as_deref(),
+                    target,
                     *version,
                     sel,
                     *dry_run,
                 );
             }
             if let Some(s) = from_db {
-                // The reverse dialect is derived from the connection URL scheme
-                // (postgres:// → postgres, sqlite://`/`file: → sqlite), so the
-                // `--target` flag does not gate `--from-db`.
+                // The reverse dialect is derived from the database itself — the
+                // URL scheme (sqlite://`/`file: → sqlite), then Supabase's own
+                // schemas (→ supabase, else postgres) — so the `--target` flag
+                // does not gate `--from-db`.
                 let _ = target;
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
@@ -458,9 +478,20 @@ pub async fn run(
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
     let entities = match s.strategy {
+        // Version 0 is no version. A project without `project.version` plans
+        // every apply as `Fresh` (its database records version 0), so this
+        // said "Fresh install at v0" on every run — naming a version that does
+        // not exist, and a fresh install that usually was not one.
+        ApplyStrategy::Fresh if s.to_version == 0 => format!(
+            "{} entities applied (no project.version — the database is not versioned).",
+            s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
+        // A batch adapter reports version 0 whatever the project's version, so
+        // neither "up to date" nor a version can be claimed from it.
+        ApplyStrategy::Current if s.from_version == 0 => format!("{} entities applied.", s.applied),
         ApplyStrategy::Current => {
             format!(
                 "Already up to date (v{}) — {} entities applied.",
@@ -738,6 +769,27 @@ mod tests {
         assert!(migrate.contains("1 migrated"), "expected migrated count in: {migrate}");
         assert!(migrate.contains("2 created"), "expected created count in: {migrate}");
         assert!(migrate.contains("0 dropped"), "expected dropped count in: {migrate}");
+    }
+
+    /// A project with no `project.version` is not at "v0": it has no version.
+    /// Every apply of one is a `Fresh` plan (its database records version 0),
+    /// so every apply said "Fresh install at v0" — a version that does not exist.
+    #[test]
+    fn an_unversioned_apply_does_not_claim_a_version() {
+        let s = ApplyComplete {
+            strategy: ApplyStrategy::Fresh,
+            from_version: 0,
+            to_version: 0,
+            applied: 3,
+            ..Default::default()
+        };
+        let out = format_apply_summary(&s);
+        assert!(!out.contains("v0"), "there is no v0: {out}");
+        assert!(out.contains("3 entities"), "the count is still reported: {out}");
+        assert!(
+            out.contains("project.version"),
+            "and the reason there is no version: {out}"
+        );
     }
 
     #[test]
@@ -1227,6 +1279,51 @@ mod tests {
         assert!(
             !dir.join("design.yaml").exists(),
             "--dry-run must not write design.yaml"
+        );
+    }
+
+    /// The dispatcher's own refusal said reverse-engineering "supports
+    /// Postgres/Supabase", then refused `--target supabase`. DBML carries no
+    /// platform, so the target is the caller's to give, and it reaches
+    /// `design.yaml`.
+    #[tokio::test]
+    async fn init_from_dbml_accepts_a_supabase_target() {
+        use crate::cli::Commands;
+        let src = testutil::copy_fixture_project();
+        let dbml = src.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &src).await.unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let dir = dest.path();
+        run(
+            &Commands::Init {
+                name: Some("from_dbml".to_string()),
+                target: "supabase".to_string(),
+                from_db: None,
+                from_dbml: Some(dbml),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: false,
+            },
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("--target supabase is a target --from-dbml supports");
+
+        let written = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+        assert!(
+            written.contains("  supabase:\n"),
+            "the target reaches design.yaml: {written}"
         );
     }
 

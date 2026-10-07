@@ -60,6 +60,28 @@ pub fn scope_filtered(scope: &dbd_core::ResolvedScope, kept: usize, total: usize
     println!("scope '{}': {kept} of {total} entities", scope.name);
 }
 
+/// Print a scope's dependency gaps the way its `deps` policy treats them.
+///
+/// Under `report` a gap fails the run, so it carries the ✗ of an error. Under
+/// `include` the closure pulls it in — an expected step, not a failure — and
+/// marking it ✗ made a preview of a run that will succeed read as a list of
+/// failures.
+pub fn scope_gaps(scope: &dbd_core::ResolvedScope, gaps: &[dbd_core::ScopeGap]) {
+    for gap in gaps {
+        let chain = gap.chain.join(" → ");
+        match scope.deps {
+            dbd_core::config::DepsPolicy::Report => println!(
+                "✗ dependency gap: {} requires {} (out of scope)\n    chain: {chain}",
+                gap.required_by, gap.missing
+            ),
+            dbd_core::config::DepsPolicy::Include => println!(
+                "+ auto-included: {} (required by {})\n    chain: {chain}",
+                gap.missing, gap.required_by
+            ),
+        }
+    }
+}
+
 /// Print a summary line with counts.
 pub fn summary(errors: usize, warnings: usize, entities: usize) {
     if errors == 0 && warnings == 0 {

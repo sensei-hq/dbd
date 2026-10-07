@@ -432,11 +432,28 @@ impl Design {
     fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
         if !self.parser.produces_structure() {
             let dialect = &self.dialect;
+            // What still works depends on whether dbd can connect at all. SQLite
+            // has an adapter; T-SQL and MySQL are read-only — `connect` refuses
+            // them — so pointing those projects at `apply` sent people from
+            // this refusal straight into a "no adapter" one.
+            let what_works = match self.parser {
+                crate::parser::ParserChoice::TSql | crate::parser::ParserChoice::MySql => {
+                    let database = if self.parser == crate::parser::ParserChoice::TSql {
+                        "SQL Server"
+                    } else {
+                        "MySQL"
+                    };
+                    format!(
+                        "dbd has no adapter for {database} either, so nothing can connect to one; \
+                         `inspect`, `graph`, `combine`, `dbml` and `diagram` work offline."
+                    )
+                }
+                _ => "`apply`, `deploy`, `import` and `export` work normally.".to_string(),
+            };
             return Err(DbdError::Config(format!(
                 "{op} needs a structured model, and this project's DDL is not read into one \
                  (source.dialect: {dialect}) — its files give identity and references but no \
-                 columns or constraints, so there is nothing to compare. \
-                 `apply`, `deploy`, `import` and `export` work normally."
+                 columns or constraints, so there is nothing to compare. {what_works}"
             )));
         }
         Ok(())
