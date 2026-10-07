@@ -72,8 +72,11 @@ mod tests {
                     note: None,
                     fk: false,
                     uq: false,
+                    identity: None,
+                    generated: None,
                 }],
                 indexes: vec![],
+                checks: vec![],
             }],
             refs: vec![],
         }

@@ -6,14 +6,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::design::Design;
-use crate::entity::{EntityType, FkAction, SortOrder, TableConstraint};
+use crate::entity::{EntityType, FkAction, IdentityKind, SortOrder, TableConstraint};
 use crate::error::Result;
 use crate::scope::ResolvedScope;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SchemaModel {
     /// Wire-format version. `2` added [`Self::entities`], [`Self::deps`], and
-    /// `fk`/`uq` on [`Column`]; `3` added [`Self::history`] and [`Self::enums`].
+    /// `fk`/`uq` on [`Column`]; `3` added [`Self::history`] and [`Self::enums`],
+    /// then — optional, so every earlier v3 payload still reads — [`Self::stubs`],
+    /// sequences in [`Self::entities`], [`TableNode::checks`], [`Index::predicate`]
+    /// and [`Column::identity`] / [`Column::generated`].
     ///
     /// This type is read by dbd's own viewer, by a shared component package,
     /// and by external consumers, so it is a cross-repo contract rather than
@@ -42,7 +45,8 @@ pub struct SchemaModel {
     /// tables it does not own. Absent when every ref lands inside the model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stubs: Vec<TableNode>,
-    /// Views, materialized views, functions and procedures (v2).
+    /// Views, materialized views, functions, procedures and triggers (v2), and
+    /// sequences (v3, additive).
     ///
     /// Separate from [`Self::tables`] rather than folded in under `kind`,
     /// because folding would silently change what every existing consumer of
@@ -70,7 +74,8 @@ fn default_version() -> u32 {
     3
 }
 
-/// A non-table entity: a view, materialized view, function or procedure.
+/// A non-table entity: a view, materialized view, function, procedure, trigger
+/// or sequence.
 ///
 /// No columns. A parsed routine has none, and a view's are not read — what it
 /// has is a body and the things it depends on, which are in
@@ -79,7 +84,8 @@ fn default_version() -> u32 {
 pub struct EntityNode {
     pub schema: String,
     pub name: String,
-    /// `view` | `materialized_view` | `function` | `procedure`
+    /// `view` | `materialized_view` | `function` | `procedure` | `trigger` |
+    /// `sequence`
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -156,6 +162,19 @@ pub struct TableNode {
     /// Table-level UNIQUE constraints + explicit indexes. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indexes: Vec<Index>,
+    /// CHECK constraints, inline ones first as the parser lifts them onto the
+    /// table (v3, additive). Omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<Check>,
+}
+
+/// One CHECK constraint: what it requires, and its name when it was given one.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Check {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The boolean expression, as Postgres's own grammar renders it back.
+    pub expression: String,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -167,6 +186,10 @@ pub struct Index {
     pub unique: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A partial index's `WHERE` predicate, as authored (v3, additive) — which
+    /// rows the index covers, and for a UNIQUE one which rows it constrains.
+    #[serde(rename = "where", skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -194,6 +217,14 @@ pub struct Column {
     /// column is unique (v2) — inline `UNIQUE` or a single-column constraint
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub uq: bool,
+    /// `always` | `by default` — the column is `GENERATED … AS IDENTITY`
+    /// (v3, additive). Its values come from a sequence, not from `def`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The expression of a `GENERATED ALWAYS AS (…) STORED` column (v3,
+    /// additive). Not a default: the column cannot be written at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -397,6 +428,8 @@ fn stub_node(
         def: None,
         fk: false,
         uq: false,
+        identity: None,
+        generated: None,
         note: None,
     };
     // Each referenced column, typed from `known` where it is described there and
@@ -429,6 +462,7 @@ fn stub_node(
             note_md: ext.note.clone(),
             columns: pick(declared),
             indexes: Vec::new(),
+            checks: Vec::new(),
         };
     }
 
@@ -442,6 +476,7 @@ fn stub_node(
             kind: "out_of_scope".into(),
             columns: pick(full.columns),
             indexes: Vec::new(),
+            checks: Vec::new(),
             ..full
         },
         None => TableNode {
@@ -452,6 +487,7 @@ fn stub_node(
             note_md: None,
             columns: pick(Vec::new()),
             indexes: Vec::new(),
+            checks: Vec::new(),
         },
     }
 }
@@ -516,6 +552,14 @@ fn build_table_node(
             def: c.default_value.clone(),
             fk: fk_cols.contains(c.name.as_str()),
             uq: uq_cols.contains(c.name.as_str()),
+            identity: c.identity.map(|k| {
+                match k {
+                    IdentityKind::Always => "always",
+                    IdentityKind::ByDefault => "by default",
+                }
+                .to_string()
+            }),
+            generated: c.generated.clone(),
             note: c.comment.clone().or_else(|| def.comments.columns.get(&c.name).cloned()),
         })
         .collect();
@@ -528,6 +572,17 @@ fn build_table_node(
         note_md: def.comments.table.clone(),
         columns,
         indexes: collect_indexes(def),
+        checks: def
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::Check { name, expression } => Some(Check {
+                    name: name.clone(),
+                    expression: expression.clone(),
+                }),
+                _ => None,
+            })
+            .collect(),
     }
 }
 
@@ -587,6 +642,7 @@ fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
                 def: cols(columns),
                 unique: true,
                 name: name.clone(),
+                predicate: None,
             });
         }
     }
@@ -604,6 +660,7 @@ fn collect_indexes(def: &crate::entity::TableDef) -> Vec<Index> {
             def: format!("({spec})"),
             unique: ix.unique,
             name: ix.name.clone(),
+            predicate: ix.predicate.clone(),
         });
     }
     out
@@ -641,6 +698,7 @@ fn node_kind(t: EntityType) -> Option<&'static str> {
         EntityType::Function => Some("function"),
         EntityType::Procedure => Some("procedure"),
         EntityType::Trigger => Some("trigger"),
+        EntityType::Sequence => Some("sequence"),
         _ => None,
     }
 }
@@ -768,8 +826,11 @@ mod tests {
                     note: None,
                     fk: false,
                     uq: false,
+                    identity: None,
+                    generated: None,
                 }],
                 indexes: vec![],
+                checks: vec![],
             }],
             refs: vec![],
         };
