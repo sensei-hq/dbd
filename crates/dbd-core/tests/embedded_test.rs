@@ -257,6 +257,124 @@ async fn import_data_honors_null_value_sentinel() {
     .await;
 }
 
+// ── Test: a CSV/TSV loads by its header, not by position ──────────────────────
+
+/// Create `staging.countries (code text, name text)` and load `body` into it as
+/// a `format` data file.
+async fn load_countries(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    format: &str,
+    body: &str,
+) -> dbd_core::error::Result<()> {
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS staging; CREATE TABLE staging.countries (code text, name text)")
+        .await
+        .expect("create table failed");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("countries.{format}"));
+    std::fs::write(&path, body).unwrap();
+    let mut entity = Entity::new(EntityType::Table, "staging.countries");
+    entity.file = Some(path);
+    entity.format = Some(format.to_string());
+    adapter.import_data(&entity, "", false).await
+}
+
+/// COPY skipped the header (`HEADER true`) without reading it, so each value
+/// went into the column at its position: a file headed `name,code` loaded
+/// `Germany` into `code`. SQLite maps by header name, so the same file loaded
+/// differently on the two engines. The header is a column list, quoting and
+/// all.
+#[tokio::test]
+async fn a_csv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "\"name\",code\nGermany,DE\n\"Japan, Nippon\",JP\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'JP' AND name = 'Japan, Nippon'",
+        "a quoted value under the column its header names",
+    )
+    .await;
+}
+
+/// TSV is the same load with a tab between columns.
+#[tokio::test]
+async fn a_tsv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "tsv", "name\tcode\nGermany\tDE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header names a column as Postgres resolves an unquoted name: `Name` is
+/// `name`. A spreadsheet's capitalised header loaded before, by position; it
+/// must not be refused now that the header is read.
+#[tokio::test]
+async fn a_header_names_a_column_as_postgres_resolves_an_unquoted_name() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "Name,CODE\nGermany,DE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header column the table does not have is a file for another table, or a
+/// renamed column — loading the rest by position or dropping it would both
+/// load wrong data. Refused, naming the column and what the table has, before
+/// a row is loaded.
+#[tokio::test]
+async fn a_header_column_the_table_does_not_have_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let err = load_countries(&*adapter, "csv", "name,iso_code\nGermany,DE\n")
+        .await
+        .expect_err("an unknown header column must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("iso_code") && msg.contains("staging.countries") && msg.contains("code, name"),
+        "the column, the table, and the columns it has: {msg}"
+    );
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM staging.countries",
+        "a row loaded from a refused file",
+    )
+    .await;
+}
+
 // ── Test: the default import empties a staging table before loading it ────────
 
 /// `truncate: true` is the default. The step moved behind
