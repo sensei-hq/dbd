@@ -49,6 +49,13 @@ pub async fn cmd_reset(
     let target = reset_target(target, &design);
 
     if dry_run {
+        // A preview of a reset the real run would refuse is a false promise, so
+        // with a database to ask, ask it first. With none configured the plan
+        // is all there is to show, and the dry run stays database-free.
+        if let Some(url) = super::configured_database_url(config, database_url)? {
+            let adapter = get_adapter(config, Some(&url)).await?;
+            check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+        }
         let sql = design
             .reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?
             .unwrap_or_else(|| "-- nothing to drop".to_string());
@@ -87,11 +94,32 @@ pub(crate) async fn reset_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
 ) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
     design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
         .await?;
+    Ok(())
+}
+
+/// Every guard a reset checks before it drops anything, read-only: the scope
+/// pin (cleared by `--force` or `--allow-scope-change`), then prod and applied
+/// migrations (cleared by `--force` alone).
+///
+/// One function for both runs, so `--dry-run` refuses exactly where the real
+/// reset does. [`Design::reset`] checks the second guard again after it heals
+/// the bookkeeping; this read needs no heal, since meta is read under either
+/// layout.
+pub(crate) async fn check_reset_guards(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    resolved: &dbd_core::ResolvedScope,
+    force: bool,
+    allow_scope_change: bool,
+) -> Result<()> {
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    if !force {
+        Design::check_reset_guard(meta.as_ref())?;
+    }
     Ok(())
 }
 
@@ -298,14 +326,71 @@ mod tests {
         assert_eq!(reset_target(None, &bare), "postgres");
     }
 
-    /// `--dry-run` builds the reset script and returns before any DB adapter is
-    /// constructed, so it runs without a live connection.
+    /// With no database configured — no `-d`, and a target with no `url` — the
+    /// dry run builds the reset script without a connection. The project names
+    /// no URL rather than `$DATABASE_URL`, so a variable set in the shell running
+    /// the tests cannot point it at a database.
     #[tokio::test]
     async fn reset_dry_run_needs_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: t\ntarget:\n  postgres: {}\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
         cmd_reset(
-            &testutil::fixture_config(),
+            &config,
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
+            None,
+            ResetOptions {
+                dry_run: true,
+                force: false,
+                drop_schemas: false,
+                drop_extensions: false,
+                allow_scope_change: false,
+            },
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A target `url: $VAR` whose variable is unset names no database, so the
+    /// dry run stays the offline preview it always was. Most projects write
+    /// `url: $DATABASE_URL`; were the unresolved `$VAR` taken for a URL, every
+    /// dry run on a machine without the variable would fail to connect to it.
+    #[tokio::test]
+    async fn reset_dry_run_with_an_unset_url_variable_needs_no_database() {
+        const VAR: &str = "DBD_TEST_RESET_DRY_RUN_NEVER_SET";
+        assert!(std::env::var_os(VAR).is_none(), "{VAR} must be unset for this test");
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            format!("project:\n  name: t\ntarget:\n  postgres:\n    url: ${VAR}\nschemas:\n  - app\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
+        cmd_reset(
+            &config,
+            "dev",
+            tmp.path(),
             None,
             None,
             ResetOptions {

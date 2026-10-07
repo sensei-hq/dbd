@@ -1834,6 +1834,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.stamp_matview(guard.as_mut(), qualified, stamp).await
     }
 
+    async fn forget_matview_stamps(&self, qualified: &[String]) -> Result<()> {
+        self.bookkeeping.forget_matview_stamps(qualified).await
+    }
+
     async fn sync_refresh_jobs(&self, jobs: &[(String, ResolvedMatview)]) -> Result<()> {
         // Guard: never touch `cron.job` on a database without pg_cron (it would
         // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled

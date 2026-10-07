@@ -71,6 +71,25 @@ impl DesignConfig {
             })
             .collect()
     }
+
+    /// Every grant dbd makes on this design's schemas: the universal `schemas:`
+    /// grants with the default target's `grants:` merged on top — per schema, a
+    /// target role adds to the universal entry or replaces that role's list.
+    ///
+    /// One definition for the two sides of a grant. `apply` grants exactly this
+    /// and `reset` revokes exactly this before it drops a role, so the revoke
+    /// cannot drift from what was granted.
+    pub fn effective_schema_grants(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
+        let mut grants = self.schema_grants();
+        if let Some(target) = self.get_target(None)
+            && let Some(ref target_grants) = target.grants
+        {
+            for (schema, gc) in target_grants {
+                grants.entry(schema.clone()).or_default().extend(gc.roles.clone());
+            }
+        }
+        grants
+    }
 }
 
 // ── Scopes ──────────────────────────────────────────────

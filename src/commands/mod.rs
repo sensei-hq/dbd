@@ -573,6 +573,26 @@ pub(super) async fn get_adapter(
         .context("Failed to connect to database")
 }
 
+/// The database a connecting command would reach, or `None` when nothing
+/// names one: `-d`/`DATABASE_URL`, else the default target's `url` with a
+/// `$VAR` resolved from the environment — the URL [`get_adapter`] connects to.
+/// An unset `$VAR`, or an empty value, names nothing.
+///
+/// For the commands that work offline but must ask a database that exists:
+/// `reset --dry-run` previews without one, and checks its guards against one.
+pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>) -> Result<Option<String>> {
+    let usable = |u: &str| !u.is_empty() && !u.starts_with('$');
+    if let Some(u) = database_url.filter(|u| usable(u)) {
+        return Ok(Some(u.to_string()));
+    }
+    let design_config = dbd_core::config::read(config).context("Failed to read config")?;
+    Ok(design_config
+        .get_target(None)
+        .and_then(|t| t.url.as_deref())
+        .map(resolve_env_vars)
+        .filter(|u| usable(u)))
+}
+
 fn resolve_env_vars(s: &str) -> String {
     if let Some(var) = s.strip_prefix('$') {
         std::env::var(var).unwrap_or_else(|_| s.to_string())
@@ -1093,11 +1113,20 @@ mod tests {
         .unwrap();
     }
 
-    /// `dbd reset --dry-run` likewise returns before any adapter is built.
+    /// `dbd reset --dry-run` likewise needs no database when none is configured.
+    /// The copy's `url: $DATABASE_URL` is removed so a variable set in the shell
+    /// running the tests cannot give it one.
     #[tokio::test]
     async fn run_dispatches_reset_dry_run_without_a_database() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         run_in_copy(
             &Commands::Reset {
                 target: None,

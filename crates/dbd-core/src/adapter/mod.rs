@@ -138,6 +138,15 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Forget the drift stamps of the materialized views `qualified`
+    /// (`schema.name`), which the caller has just dropped. A stamp that outlives
+    /// its view describes nothing, and would vouch for a later view of the same
+    /// name that dbd never built. Default: no-op (targets without materialized
+    /// views).
+    async fn forget_matview_stamps(&self, _qualified: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     /// Sync pg_cron refresh jobs for the given (qualified_name, ResolvedMatview)
     /// set. Default: no-op (targets without pg_cron support).
     async fn sync_refresh_jobs(&self, _jobs: &[(String, crate::config::ResolvedMatview)]) -> Result<()> {

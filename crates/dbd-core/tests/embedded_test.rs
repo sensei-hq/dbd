@@ -3577,7 +3577,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     )
     .unwrap();
     // A view over the enum column: this is what blocks `ALTER … TYPE` and has to
-    // be dropped first, then restored by pass C.
+    // be dropped first, then restored when reconcile re-applies its views.
     std::fs::write(
         dir.join("ddl/view/app/t_v.ddl"),
         "set search_path to app;\n\
@@ -3629,7 +3629,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     .await;
 
     // The rows survive the rewrite, the default survives the drop/restore, and
-    // the view pass C re-applied is queryable again.
+    // the view reconcile re-applied is queryable again.
     assert_catalog(
         &*adapter,
         true,
@@ -4436,4 +4436,411 @@ async fn an_upgraded_database_keeps_its_matview_drift_stamp() {
         "the upgraded view is still tracked: {:?}",
         plan.warnings
     );
+}
+
+// ── Reconcile creates in the dependency order apply uses ──────────────────────
+
+/// Write `files` (path relative to `dir`, SQL) under a fresh project at `dir`
+/// whose `design.yaml` is `yaml`, and load it.
+fn write_project(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(dir.join("design.yaml"), yaml).unwrap();
+    for (rel, sql) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, sql).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// Reconcile ran every table create before any function, so
+/// on a fresh database a table whose default calls a project function failed
+/// with `function core.default_tier() does not exist`, and a trigger declared in
+/// a table file failed on its trigger function — leaving the tables created
+/// before it behind. `apply` has always created both in dependency order; the
+/// entity refs record the default's call and the trigger's function, so the
+/// order is there to follow.
+///
+/// The second phase is the same mistake on the ALTER path: a column added to an
+/// existing table with a default calling a function that is new in this run.
+#[tokio::test]
+async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_triggers_call_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fn_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: fn_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - core\n";
+    let default_tier = (
+        "ddl/function/core/default_tier.ddl",
+        "create or replace function core.default_tier() returns text\n\
+         language sql immutable as $$ select 'basic'::text $$;\n",
+    );
+    let touch = (
+        "ddl/function/core/touch.ddl",
+        "create or replace function core.touch() returns trigger\n\
+         language plpgsql as $$ begin new.touched_at := now(); return new; end $$;\n",
+    );
+    let accounts = (
+        "ddl/table/core/accounts.ddl",
+        "create table if not exists core.accounts (\n\
+           id   integer primary key\n\
+         , tier text    not null default core.default_tier()\n\
+         );\n",
+    );
+    let events = (
+        "ddl/table/core/events.ddl",
+        "create table if not exists core.events (\n\
+           id         integer primary key\n\
+         , touched_at timestamptz\n\
+         );\n\
+         create or replace trigger events_touch before insert or update on core.events\n\
+           for each row execute function core.touch();\n",
+    );
+
+    // ── Phase 1: a fresh database ──
+    let design = write_project(dir, yaml, &[default_tier, touch, accounts, events]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile on a fresh database must create the functions before the tables that call them");
+    adapter
+        .execute_script("INSERT INTO core.accounts (id) VALUES (1); INSERT INTO core.events (id) VALUES (1);")
+        .await
+        .expect("insert");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND tier = 'basic'",
+        "the default the function supplies",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.events WHERE id = 1 AND touched_at IS NOT NULL",
+        "touched_at set by the trigger",
+    )
+    .await;
+
+    // ── Phase 2: a new column on an existing table, defaulting to a new function ──
+    let design = write_project(
+        dir,
+        yaml,
+        &[
+            (
+                "ddl/function/core/default_region.ddl",
+                "create or replace function core.default_region() returns text\n\
+                 language sql immutable as $$ select 'eu'::text $$;\n",
+            ),
+            (
+                "ddl/table/core/accounts.ddl",
+                "create table if not exists core.accounts (\n\
+                   id     integer primary key\n\
+                 , tier   text    not null default core.default_tier()\n\
+                 , region text    not null default core.default_region()\n\
+                 );\n",
+            ),
+        ],
+    );
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the ALTER adding the column must run after the function its default calls");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND region = 'eu'",
+        "the new column default on the existing row",
+    )
+    .await;
+}
+
+// ── Enum value removal: only views are dropped ────────────────────────────────
+
+/// Removing an enum value recreates the type, and every view over a column of
+/// it has to go first. Every *entity* that transitively referenced the enum's
+/// table was emitted as `DROP VIEW`: the table with a foreign key to it, and the
+/// procedure and function whose bodies read it. The run failed with
+/// `"order_notes" is not a view`, so the value could not be removed from any
+/// enum whose table anything else referenced.
+///
+/// End to end: the tables keep their rows, the routines are not dropped, and
+/// the views — one over the column, one over that view — come back.
+#[tokio::test]
+async fn removing_an_enum_value_drops_only_the_views_over_its_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_dependents_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml =
+        "project:\n  name: enum_dependents_test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let enum_file = |values: &str| {
+        (
+            "ddl/enum/app/order_status.ddl",
+            format!("set search_path to app;\ncreate type order_status as enum ({values});\n"),
+        )
+    };
+    let rest: Vec<(&str, &str)> = vec![
+        (
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists orders (\n\
+               id     integer primary key\n\
+             , status order_status not null default 'new'\n\
+             );\n",
+        ),
+        (
+            "ddl/table/app/order_notes.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_notes (\n\
+               id       integer primary key\n\
+             , order_id integer not null references orders (id)\n\
+             , note     text\n\
+             );\n",
+        ),
+        (
+            "ddl/view/app/open_orders.ddl",
+            "set search_path to app;\n\
+             create or replace view open_orders as select id, status from orders where status <> 'void';\n",
+        ),
+        (
+            "ddl/view/app/open_order_ids.ddl",
+            "set search_path to app;\n\
+             create or replace view open_order_ids as select id from open_orders;\n",
+        ),
+        (
+            "ddl/procedure/app/void_order.ddl",
+            "set search_path to app;\n\
+             create or replace procedure void_order(p_id integer)\n\
+             language plpgsql as $$\n\
+             begin\n\
+               update orders set status = 'void' where id = p_id;\n\
+             end $$;\n",
+        ),
+        (
+            "ddl/function/app/order_count.ddl",
+            "set search_path to app;\n\
+             create or replace function order_count() returns bigint\n\
+             language sql stable as $$ select count(*) from orders $$;\n",
+        ),
+    ];
+    let load = |values: &str| {
+        let (path, sql) = enum_file(values);
+        let mut files = rest.clone();
+        files.push((path, sql.as_str()));
+        write_project(dir, yaml, &files)
+    };
+
+    // ── Phase 1: build it, with rows in both tables ──
+    load("'new', 'paid', 'void'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    adapter
+        .execute_script(
+            "INSERT INTO app.orders (id, status) VALUES (1, 'new'), (2, 'void'); \
+             INSERT INTO app.order_notes (id, order_id, note) VALUES (1, 1, 'keep me');",
+        )
+        .await
+        .expect("seed rows failed");
+
+    // ── Phase 2: remove the unused value ──
+    load("'new', 'void'")
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("removing an enum value must not drop the tables and routines that reference its table");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.order_status)::text) = '{new,void}'",
+        "enum app.order_status without paid",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.order_notes WHERE id = 1 AND note = 'keep me'",
+        "the row in app.order_notes",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.orders WHERE id = 2 AND status = 'void'",
+        "the rows in app.orders",
+    )
+    .await;
+    for routine in ["void_order", "order_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'app' AND p.proname = '{routine}'"
+            ),
+            &format!("routine app.{routine}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.open_order_ids WHERE id = 1",
+        "the views, recreated over the new type",
+    )
+    .await;
+    adapter
+        .execute_script("CALL app.void_order(1)")
+        .await
+        .expect("the procedure still runs against the recreated type");
+}
+
+// ── Reset with schema grants ──────────────────────────────────────────────────
+
+/// A design whose roles hold schema grants: one through `schemas:`, one through
+/// the target's `grants:`.
+const GRANTS_YAML: &str = "project:\n  name: grants_reset_test\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+    target:\n  postgres:\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+    \x20   grants:\n      app:\n        app_reader: [usage, select]\n";
+
+const GRANTS_TABLE: (&str, &str) = (
+    "ddl/table/app/t.ddl",
+    "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+);
+
+fn role_predicate(role: &str) -> String {
+    format!("SELECT 1 FROM pg_roles WHERE rolname = '{role}'")
+}
+
+/// The default `dbd reset` of any design with schema grants failed: it dropped
+/// the tables and then ran `DROP ROLE` on roles that still held USAGE on the
+/// surviving schema and the default privileges dbd set there, so Postgres
+/// refused and the whole reset rolled back. Only `--clean`, which drops the
+/// schema and its grants with it, worked.
+#[tokio::test]
+async fn the_default_reset_drops_roles_that_hold_the_designs_schema_grants() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "the default privileges deploy set on app",
+    )
+    .await;
+
+    design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect("the default reset must drop roles that hold the design's grants");
+
+    assert_table_absent(&*adapter, "app", "t").await;
+    assert_schema_exists(&*adapter, "app").await;
+    for role in ["app_writer", "app_reader"] {
+        assert_catalog(&*adapter, false, &role_predicate(role), &format!("role {role}")).await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "default privileges on app",
+    )
+    .await;
+
+    // The database is back to where apply starts from.
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("re-deploy after reset");
+    assert_table_exists(&*adapter, "app", "t").await;
+}
+
+/// Reset revokes only what dbd granted. A privilege someone else gave one of
+/// the design's roles still blocks `DROP ROLE` — dbd must not guess at it, nor
+/// reach for `DROP OWNED BY`, which would drop objects the project does not
+/// own — but the error has to say which role and what it still holds, where
+/// Postgres's own message names the role and leaves the reason in a DETAIL the
+/// driver does not show. And the reset is one transaction: nothing is dropped.
+#[tokio::test]
+async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the_role_and_privilege() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA other; CREATE TABLE other.x (id integer); GRANT SELECT ON other.x TO app_writer;",
+        )
+        .await
+        .expect("grant outside the design");
+
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect_err("a privilege dbd did not grant must still block the role drop")
+        .to_string();
+    assert!(err.contains("app_writer"), "the error must name the role: {err}");
+    assert!(
+        err.contains("privileges for table other.x"),
+        "the error must say what the role still holds: {err}"
+    );
+
+    assert_table_exists(&*adapter, "app", "t").await;
+    assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
+}
+
+// ── Reset forgets the stamps of the matviews it drops ─────────────────────────
+
+/// `reset --clean` dropped the materialized view and left its row in
+/// `dbd.matview_stamps`. A stamp outliving its view describes something that no
+/// longer exists — and a later view of the same name, built by hand, would read
+/// as one dbd created. Both resets that drop the view must forget its stamp:
+/// the default one, which drops it by name, and `--clean`, which drops its
+/// schema.
+#[tokio::test]
+async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_stamp_reset").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: mv_stamp_reset\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/materialized_view/app/mv.ddl",
+                "create materialized view if not exists app.mv as select id from app.items with data;\n",
+            ),
+        ],
+    );
+    let stamp = "SELECT 1 FROM dbd.matview_stamps WHERE project = 'mv_stamp_reset' AND matview = 'app.mv'";
+
+    for (drop_schemas, drop_extensions, label) in [(false, false, "the default reset"), (true, true, "reset --clean")] {
+        design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+        assert_catalog(&*adapter, true, stamp, "the stamp deploy recorded for app.mv").await;
+
+        design
+            .reset(&*adapter, "postgres", false, drop_schemas, drop_extensions, None)
+            .await
+            .unwrap_or_else(|e| panic!("{label} failed: {e}"));
+
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mv'",
+            "matview app.mv",
+        )
+        .await;
+        assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
+    }
 }

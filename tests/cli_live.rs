@@ -302,3 +302,112 @@ async fn an_ad_hoc_json_file_is_imported_as_json() {
         "rows not loaded: {csv}"
     );
 }
+
+// ── reset --dry-run refuses where the real run does ─────────────────────────
+
+/// An unversioned project with a scope, so neither the applied-migrations guard
+/// nor an unknown scope gets in the way of the guard under test.
+fn scoped_project(dir: &Path) {
+    project(dir);
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - app\n\n\
+         scopes:\n  hub:\n    includes: [app]\n",
+    )
+    .unwrap();
+}
+
+/// `reset --dry-run` never connected, so on a database the real run refuses — one
+/// marked prod, or pinned to another scope — it printed the full plan and exited
+/// 0. A preview that promises a reset the real command will not perform is
+/// worse than none. With a database to ask, it now asks, and refuses exactly
+/// where the real run does, `--force` and `--allow-scope-change` honoured the
+/// same way. Without one it stays a database-free preview.
+#[tokio::test]
+async fn reset_dry_run_refuses_where_the_real_reset_would() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+
+    // ── A prod database ──
+    let o = dbd(dir, &url, &["apply", "-e", "prod"]);
+    assert!(o.status.success(), "apply -e prod failed: {}", combined(&o));
+
+    let real = dbd(dir, &url, &["reset"]);
+    assert!(!real.status.success(), "the real reset refuses a prod database");
+    let o = dbd(dir, &url, &["reset", "--dry-run"]);
+    assert!(
+        !o.status.success(),
+        "the dry run must refuse a prod database too: {}",
+        combined(&o)
+    );
+    assert!(combined(&o).contains("prod"), "and say why: {}", combined(&o));
+    assert!(
+        !stdout(&o).contains("DROP TABLE"),
+        "a refused dry run prints no plan: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--force"]);
+    assert!(o.status.success(), "--force previews past the guard: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("DROP TABLE"),
+        "and prints the plan: {}",
+        combined(&o)
+    );
+
+    // ── A database pinned to another scope ──
+    // `-e dev`: `-e` defaults to prod, and the prod guard must not be what fires.
+    let o = dbd(
+        dir,
+        &url,
+        &["apply", "-e", "dev", "--scope", "hub", "--allow-scope-change"],
+    );
+    assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
+
+    let real = dbd(dir, &url, &["reset"]);
+    assert!(
+        !real.status.success(),
+        "the real reset refuses another scope's database"
+    );
+    let o = dbd(dir, &url, &["reset", "--dry-run"]);
+    assert!(
+        !o.status.success(),
+        "the dry run must refuse another scope's database too: {}",
+        combined(&o)
+    );
+    assert!(
+        combined(&o).contains("hub"),
+        "and name the pinned scope: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--allow-scope-change"]);
+    assert!(
+        o.status.success(),
+        "--allow-scope-change previews past the scope guard: {}",
+        combined(&o)
+    );
+    assert!(
+        stdout(&o).contains("DROP TABLE"),
+        "and prints the plan: {}",
+        combined(&o)
+    );
+
+    // ── No database configured: still a database-free preview ──
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["reset", "--dry-run", "-c", dir.join("design.yaml").to_str().unwrap()])
+        .env_remove("DATABASE_URL")
+        .current_dir(dir)
+        .output()
+        .expect("dbd failed to run");
+    assert!(o.status.success(), "no database, no guard to check: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("DROP TABLE"),
+        "the plan is printed: {}",
+        combined(&o)
+    );
+}

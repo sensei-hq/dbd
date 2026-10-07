@@ -2008,6 +2008,62 @@ import:
         );
     }
 
+    /// A role the design granted on a schema cannot be dropped while it holds
+    /// the grant: `role "app_writer" cannot be dropped because some objects
+    /// depend on it — privileges for schema app, default privileges …`, and the
+    /// whole default reset rolled back. Reset revokes what dbd granted — the
+    /// `schemas:` grants and the target's `grants:`, default privileges
+    /// included — on every schema that survives, before it drops the role. A
+    /// schema `--schemas` drops takes its grants with it, and a role the design
+    /// does not declare is not dropped, so neither needs a revoke.
+    #[test]
+    fn reset_revokes_the_designs_grants_on_surviving_schemas_before_dropping_its_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+             \x20       web_anon: [usage, select]\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+             \x20   grants:\n      app:\n        app_reader: [usage, select]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let sql = design.reset_script("postgres", false, false, None).unwrap().unwrap();
+        for (role, perms) in [("app_writer", "SELECT, INSERT"), ("app_reader", "SELECT")] {
+            let drop = sql
+                .find(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .unwrap_or_else(|| panic!("{role} is dropped: {sql}"));
+            for revoke in [
+                format!("REVOKE USAGE ON SCHEMA \"app\" FROM \"{role}\";"),
+                format!("REVOKE {perms} ON ALL TABLES IN SCHEMA \"app\" FROM \"{role}\";"),
+                format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"app\" REVOKE {perms} ON TABLES FROM \"{role}\";"),
+            ] {
+                let at = sql
+                    .find(&revoke)
+                    .unwrap_or_else(|| panic!("missing `{revoke}`:\n{sql}"));
+                assert!(at < drop, "`{revoke}` must run before {role} is dropped:\n{sql}");
+            }
+        }
+        assert!(
+            !sql.contains("FROM \"web_anon\""),
+            "a role the design does not declare is not dropped, so its grants stay:\n{sql}"
+        );
+
+        let clean = design.reset_script("postgres", true, false, None).unwrap().unwrap();
+        assert!(
+            !clean.contains("REVOKE"),
+            "`--schemas` drops app, and its grants with it:\n{clean}"
+        );
+    }
+
     #[tokio::test]
     async fn reset_blocked_in_prod() {
         let config_path = fixture_dir().join("design.yaml");

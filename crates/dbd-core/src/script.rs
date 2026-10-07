@@ -243,8 +243,16 @@ fn function_drop_block(schema: &str, name: &str) -> String {
 /// each schema in `schemas`, silently skipping protected ones (always the true
 /// system schemas; on a `supabase` target the full Supabase-managed set incl.
 /// `public`). `drop_extensions` additionally emits `DROP EXTENSION IF EXISTS
-/// "e" CASCADE;` for each name in `extensions`. Roles are dropped last (postgres
-/// target only). Never errors on protected schemas — it skips them.
+/// "e" CASCADE;` for each name in `extensions`. Never errors on protected
+/// schemas — it skips them.
+///
+/// Roles are dropped last (postgres target only). Before that, every grant in
+/// `grants` (schema → role → perms, as [`build_grants_script`] grants them)
+/// held by a role being dropped is revoked on each schema that survives the
+/// reset — default privileges included — because Postgres refuses to drop a
+/// role that still holds any. A schema this script drops takes its grants with
+/// it. Anything else the role holds still blocks the drop, and the error names
+/// the role and what it holds.
 #[allow(clippy::too_many_arguments)]
 pub fn build_reset_script(
     entities: &[&Entity],
@@ -254,16 +262,19 @@ pub fn build_reset_script(
     drop_schemas: bool,
     drop_extensions: bool,
     schemas: &[String],
+    grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<Option<String>, String> {
     let mut lines = entity_drop_lines(entities);
 
     // ── Optional schema DROPs (filtered by protected rules) ───
+    let mut dropped_schemas = std::collections::HashSet::new();
     if drop_schemas {
         for schema in schemas {
             if schema_is_protected(schema, target) {
                 continue;
             }
             lines.push(format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE;", quote_ident(schema)));
+            dropped_schemas.insert(schema.as_str());
         }
     }
 
@@ -276,8 +287,9 @@ pub fn build_reset_script(
 
     // ── Role DROPs (postgres only, reverse order) ─────────────
     if target == "postgres" {
+        lines.extend(revoke_grant_lines(roles, grants, &dropped_schemas));
         for role in roles.iter().rev() {
-            lines.push(format!("DROP ROLE IF EXISTS \"{}\";", quote_ident(&role.name)));
+            lines.push(role_drop_block(&role.name));
         }
     }
 
@@ -285,6 +297,106 @@ pub fn build_reset_script(
         return Ok(None);
     }
     Ok(Some(lines.join("\n")))
+}
+
+/// The privileges a grant entry's perms confer, split the way
+/// [`build_grants_script`] grants them: `usage` is schema USAGE, and everything
+/// else is a table privilege, upper-cased and joined. Shared so a revoke is the
+/// exact inverse of the grant it undoes.
+fn grant_privileges(perms: &[String]) -> (bool, Option<String>) {
+    let usage = perms.iter().any(|p| p == "usage");
+    let table: Vec<String> = perms
+        .iter()
+        .filter(|p| *p != "usage")
+        .map(|p| p.to_uppercase())
+        .collect();
+    (usage, (!table.is_empty()).then(|| table.join(", ")))
+}
+
+/// One guarded block per (surviving schema, dropped role) revoking what
+/// [`build_grants_script`] granted there: schema USAGE, the table privileges on
+/// every table in it, and the `ALTER DEFAULT PRIVILEGES` entry.
+///
+/// Guarded on both names existing, because REVOKE errors on a missing schema or
+/// role and a reset must run against a database apply never reached. Schemas
+/// and roles are sorted so the script is byte-stable run to run.
+///
+/// The default-privileges revoke undoes the entry of the role running the
+/// reset — the one `apply` set when run as the same user. An entry another user
+/// set is not this script's to touch; it still blocks the drop, and
+/// [`role_drop_block`] says so.
+fn revoke_grant_lines(
+    roles: &[RoleEntry],
+    grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    dropped_schemas: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    let dropped_roles: std::collections::HashSet<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+    let mut schema_names: Vec<&String> = grants
+        .keys()
+        .filter(|s| !dropped_schemas.contains(s.as_str()))
+        .collect();
+    schema_names.sort();
+
+    let mut lines = Vec::new();
+    for schema in schema_names {
+        let mut role_names: Vec<&String> = grants[schema]
+            .keys()
+            .filter(|r| dropped_roles.contains(r.as_str()))
+            .collect();
+        role_names.sort();
+        for role in role_names {
+            let (usage, table) = grant_privileges(&grants[schema][role]);
+            let (s, r) = (quote_ident(schema), quote_ident(role));
+            let mut revokes = Vec::new();
+            if usage {
+                revokes.push(format!("REVOKE USAGE ON SCHEMA \"{s}\" FROM \"{r}\";"));
+            }
+            if let Some(privs) = table {
+                revokes.push(format!("REVOKE {privs} ON ALL TABLES IN SCHEMA \"{s}\" FROM \"{r}\";"));
+                revokes.push(format!(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA \"{s}\" REVOKE {privs} ON TABLES FROM \"{r}\";"
+                ));
+            }
+            if revokes.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "DO $$ BEGIN\n  \
+                 IF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = '{}')\n     \
+                 AND EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{}') THEN\n    \
+                 {}\n  \
+                 END IF;\nEND $$;",
+                sql_quote_escape(schema),
+                sql_quote_escape(role),
+                revokes.join("\n    ")
+            ));
+        }
+    }
+    lines
+}
+
+/// `DROP ROLE IF EXISTS`, re-raising Postgres's refusal with the reason in the
+/// message.
+///
+/// A role that still holds a privilege or owns an object cannot be dropped, and
+/// Postgres says so as `role "x" cannot be dropped because some objects depend
+/// on it` — the *what* is only in the error's DETAIL, which the driver's
+/// message leaves out. The refusal stands (reset revokes only what dbd granted,
+/// and never `DROP OWNED BY`, which would drop objects the project does not
+/// own); this only makes it say which role and why.
+fn role_drop_block(role: &str) -> String {
+    format!(
+        "DO $$ DECLARE held text; BEGIN\n  \
+         DROP ROLE IF EXISTS \"{}\";\n\
+         EXCEPTION WHEN dependent_objects_still_exist THEN\n  \
+         GET STACKED DIAGNOSTICS held = PG_EXCEPTION_DETAIL;\n  \
+         RAISE EXCEPTION 'reset cannot drop role \"%\" — it still holds privileges dbd did not grant, \
+         or owns objects: %. Revoke or reassign them, then re-run reset.', '{}', \
+         replace(held, E'\\n', '; ') USING ERRCODE = 'dependent_objects_still_exist';\n\
+         END $$;",
+        quote_ident(role),
+        sql_quote_escape(role)
+    )
 }
 
 /// Entity DROPs in reverse dependency order:
@@ -367,16 +479,11 @@ pub fn build_grants_script(
     // Per-schema grants from config
     for (schema, role_perms) in schema_grants {
         for (role, perms) in role_perms {
-            if perms.contains(&"usage".to_string()) {
+            let (usage, table_perms) = grant_privileges(perms);
+            if usage {
                 lines.push(format!("GRANT USAGE ON SCHEMA \"{}\" TO \"{}\";", schema, role));
             }
-            let table_perms: Vec<&String> = perms.iter().filter(|p| *p != "usage").collect();
-            if !table_perms.is_empty() {
-                let perms_str = table_perms
-                    .iter()
-                    .map(|p| p.to_uppercase())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            if let Some(perms_str) = table_perms {
                 lines.push(format!(
                     "GRANT {} ON ALL TABLES IN SCHEMA \"{}\" TO \"{}\";",
                     perms_str, schema, role
@@ -475,9 +582,18 @@ mod tests {
     #[test]
     fn reset_default_drops_entities_not_schemas() {
         let entities = sample_entities();
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP TABLE IF EXISTS \"public\".\"users\" CASCADE"));
         assert!(script.contains("DROP TABLE IF EXISTS \"config\".\"lookups\" CASCADE"));
         assert!(script.contains("DROP VIEW IF EXISTS \"config\".\"genders\" CASCADE"));
@@ -498,9 +614,18 @@ mod tests {
         // whole reset. On the default path (no schema drops) a supabase project
         // with public.users must drop the table and never error.
         let entities = sample_entities();
-        let script = build_reset_script(&refs(&entities), &[], &[], "supabase", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "supabase",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP TABLE IF EXISTS \"public\".\"users\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA"));
     }
@@ -508,9 +633,18 @@ mod tests {
     #[test]
     fn reset_default_reverse_dependency_order() {
         let entities = sample_entities();
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         let func = script.find("DROP ROUTINE").unwrap();
         let view = script.find("DROP VIEW").unwrap();
         let table = script.find("DROP TABLE").unwrap();
@@ -528,9 +662,18 @@ mod tests {
         let mut entities = sample_entities();
         // A matview reads config.genders (a view) — it must be dropped first.
         entities.push(ent(EntityType::MaterializedView, "config.genders_mv"));
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             script.contains("DROP MATERIALIZED VIEW IF EXISTS \"config\".\"genders_mv\" CASCADE"),
             "reset must drop the materialized view; got:\n{script}"
@@ -551,9 +694,18 @@ mod tests {
             ent(EntityType::Function, "config.touch"),
             ent(EntityType::Function, "config.touch"),
         ];
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(script.matches("DO $$").count(), 1);
     }
 
@@ -561,9 +713,18 @@ mod tests {
     fn reset_drop_schemas_postgres_drops_public() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "public".to_string()];
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", true, false, &schemas)
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            true,
+            false,
+            &schemas,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(script.contains("DROP SCHEMA IF EXISTS \"public\" CASCADE"));
     }
@@ -572,9 +733,18 @@ mod tests {
     fn reset_drop_schemas_supabase_keeps_public_and_auth() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "public".to_string(), "auth".to_string()];
-        let script = build_reset_script(&refs(&entities), &[], &[], "supabase", true, false, &schemas)
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "supabase",
+            true,
+            false,
+            &schemas,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"public\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"auth\" CASCADE"));
@@ -584,9 +754,18 @@ mod tests {
     fn reset_drop_schemas_always_excludes_system() {
         let entities = sample_entities();
         let schemas = vec!["config".to_string(), "pg_catalog".to_string()];
-        let script = build_reset_script(&refs(&entities), &[], &[], "postgres", true, false, &schemas)
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &[],
+            "postgres",
+            true,
+            false,
+            &schemas,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(!script.contains("DROP SCHEMA IF EXISTS \"pg_catalog\" CASCADE"));
     }
@@ -595,9 +774,18 @@ mod tests {
     fn reset_drop_extensions() {
         let entities = sample_entities();
         let extensions = vec!["vector".to_string(), "uuid-ossp".to_string()];
-        let script = build_reset_script(&refs(&entities), &[], &extensions, "postgres", false, true, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &extensions,
+            "postgres",
+            false,
+            true,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP EXTENSION IF EXISTS \"vector\" CASCADE"));
         assert!(script.contains("DROP EXTENSION IF EXISTS \"uuid-ossp\" CASCADE"));
     }
@@ -608,9 +796,18 @@ mod tests {
         let schemas = vec!["config".to_string()];
         let extensions = vec!["vector".to_string()];
         // --clean ⇒ both drop_schemas and drop_extensions on.
-        let script = build_reset_script(&refs(&entities), &[], &extensions, "postgres", true, true, &schemas)
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &[],
+            &extensions,
+            "postgres",
+            true,
+            true,
+            &schemas,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(script.contains("DROP TABLE IF EXISTS \"public\".\"users\" CASCADE"));
         assert!(script.contains("DROP SCHEMA IF EXISTS \"config\" CASCADE"));
         assert!(script.contains("DROP EXTENSION IF EXISTS \"vector\" CASCADE"));
@@ -629,9 +826,18 @@ mod tests {
                 refers: vec!["basic".to_string()],
             },
         ];
-        let script = build_reset_script(&refs(&entities), &roles, &[], "postgres", false, false, &[])
-            .unwrap()
-            .unwrap();
+        let script = build_reset_script(
+            &refs(&entities),
+            &roles,
+            &[],
+            "postgres",
+            false,
+            false,
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
         let adv_pos = script.find("DROP ROLE IF EXISTS \"advanced\"").unwrap();
         let basic_pos = script.find("DROP ROLE IF EXISTS \"basic\"").unwrap();
         assert!(adv_pos < basic_pos);
@@ -639,7 +845,7 @@ mod tests {
 
     #[test]
     fn reset_script_returns_none_when_empty() {
-        let script = build_reset_script(&[], &[], &[], "postgres", false, false, &[]).unwrap();
+        let script = build_reset_script(&[], &[], &[], "postgres", false, false, &[], &HashMap::new()).unwrap();
         assert!(script.is_none());
     }
 

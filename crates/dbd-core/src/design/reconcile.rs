@@ -75,12 +75,25 @@ impl Design {
         Ok((mv_to_create, mv_to_restamp))
     }
 
-    /// Execute reconcile's write passes against the live database, in order:
-    /// A prerequisites + newly-added tables/enums, B ALTERs (with a `search_path`
-    /// prelude), C code objects (CREATE OR REPLACE), C-mv matview creates,
-    /// C-mv-restamp matview sentinel upgrades, and D prune (only when `prune`).
-    /// Returns the tallied summary. Factored out of [`Design::reconcile`] so its
-    /// body reads as setup → detect → write.
+    /// Execute reconcile's writes against the live database. One pass over the
+    /// design in dependency order creates, alters and re-applies each entity at
+    /// its place in that order; then matview sentinel upgrades, then prune (only
+    /// when `prune`). Returns the tallied summary. Factored out of
+    /// [`Design::reconcile`] so its body reads as setup → detect → write.
+    ///
+    /// The single pass is the point. Reconcile used to run every table create,
+    /// then every ALTER, then every function and view — so on a fresh database
+    /// a table whose `DEFAULT` called a project function, or whose file declared
+    /// a trigger on one, failed for want of a function the later pass would
+    /// have created. `desired_entities` is already in the order `apply` creates
+    /// in (see [`crate::dependency::sort_by_dependencies`]), which records a
+    /// default's call, a column's enum and a trigger's function as edges.
+    ///
+    /// These writes are NOT one transaction: each statement commits as it runs,
+    /// so a failure part-way leaves the entities before it in place. A batch
+    /// transaction is not a drop-in here — an enum value added by `ALTER TYPE …
+    /// ADD VALUE` cannot be used until its transaction commits, and a later
+    /// default or CHECK naming that value in the same batch would fail.
     #[allow(clippy::too_many_arguments)]
     async fn execute_reconcile_writes<S, D>(
         &self,
@@ -107,32 +120,12 @@ impl Design {
             .iter()
             .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
             .collect();
+        let mv_create: HashMap<&str, &str> = mv_to_create
+            .iter()
+            .map(|(e, want)| (e.name.as_str(), want.as_str()))
+            .collect();
 
         let mut summary = ReconcileComplete::default();
-
-        // Pass A — prerequisites + added tables/enums, in dependency order.
-        //   schema/extension/role/sequence: always (idempotent DDL);
-        //   enum/table: only when newly added (a full create).
-        for e in desired_entities {
-            let do_apply = match e.entity_type {
-                EntityType::Schema | EntityType::Extension | EntityType::Role | EntityType::Sequence => true,
-                EntityType::Enum | EntityType::Table => added.contains(qualified_entity_name(e).as_str()),
-                _ => false,
-            };
-            if !do_apply {
-                continue;
-            }
-            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            if is_created {
-                summary.created += 1;
-            } else {
-                summary.reapplied += 1;
-            }
-        }
 
         // Generated ALTERs carry no `set search_path`, unlike the project's DDL
         // files. Prepend one covering every managed schema (+ public) so bare
@@ -140,56 +133,68 @@ impl Design {
         // resolve the same way they do when the DDL file runs.
         let search_path = search_path_prelude(managed_schemas);
 
-        // Pass B — ALTER existing tables/enums, in dependency order.
         for e in desired_entities {
             let n = qualified_entity_name(e);
-            if let Some(sql) = alter_sql.get(n.as_str()) {
-                let desc = format!("alter {}:{n}", e.entity_type.tag());
-                on_start(&desc);
-                let script = format!("{search_path}{sql}");
-                let result = adapter.execute_script(&script).await;
-                report_step_result(&desc, on_done, result)?;
-                summary.altered += 1;
-            }
-        }
-
-        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
-        for e in desired_entities {
-            if !matches!(
-                e.entity_type,
-                EntityType::View | EntityType::Function | EntityType::Procedure
-            ) {
-                continue;
-            }
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass C-mv (WRITES) — CREATE the matviews detection found absent. Reuses
-        // the pre-computed `mv_to_create` (no second `matview_states()` fetch).
-        // Each CREATE carries the same `search_path` prelude the ALTERs use.
-        for (e, want) in mv_to_create {
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = match adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
-                .await
-            {
-                Ok(()) => {
-                    adapter
-                        .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
-                        .await
+            match e.entity_type {
+                // Prerequisites and code objects: idempotent DDL (`IF NOT
+                // EXISTS` / `CREATE OR REPLACE`), re-applied on every run.
+                EntityType::Schema
+                | EntityType::Extension
+                | EntityType::Role
+                | EntityType::Sequence
+                | EntityType::View
+                | EntityType::Function
+                | EntityType::Procedure => {
+                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                    on_start(&desc);
+                    let result = adapter.apply_entity(e).await;
+                    report_step_result(&desc, on_done, result)?;
+                    summary.reapplied += 1;
                 }
-                err => err,
-            };
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
+                // Tables and enums are diffed: a full create when new, the
+                // generated ALTERs when changed, nothing when in sync.
+                EntityType::Enum | EntityType::Table => {
+                    if added.contains(n.as_str()) {
+                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                        on_start(&desc);
+                        let result = adapter.apply_entity(e).await;
+                        report_step_result(&desc, on_done, result)?;
+                        summary.created += 1;
+                    }
+                    if let Some(sql) = alter_sql.get(n.as_str()) {
+                        let desc = format!("alter {}:{n}", e.entity_type.tag());
+                        on_start(&desc);
+                        let script = format!("{search_path}{sql}");
+                        let result = adapter.execute_script(&script).await;
+                        report_step_result(&desc, on_done, result)?;
+                        summary.altered += 1;
+                    }
+                }
+                // A matview detection found absent. Postgres has no `CREATE OR
+                // REPLACE MATERIALIZED VIEW`, so one that exists is left alone
+                // (see `detect_reconcile_matviews`). The CREATE carries the same
+                // `search_path` prelude the ALTERs use.
+                EntityType::MaterializedView => {
+                    let Some(want) = mv_create.get(e.name.as_str()) else {
+                        continue;
+                    };
+                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                    on_start(&desc);
+                    let result = match adapter
+                        .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                        .await
+                    {
+                        Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
+                        err => err,
+                    };
+                    report_step_result(&desc, on_done, result)?;
+                    summary.reapplied += 1;
+                }
+                _ => {}
+            }
         }
 
-        // Pass C-mv-restamp (WRITES) — upgrade the sentinel on matviews whose
+        // Matview restamp — upgrade the sentinel on matviews whose
         // live comment is a v1 (unversioned) stamp. This never runs under
         // `--dry-run`: `Design::reconcile` returns before this method is even
         // called in that case. A v1 hash covers a superseded body contract, so
@@ -205,7 +210,7 @@ impl Design {
             summary.restamped += 1;
         }
 
-        // Pass D — prune orphaned tables (in managed schemas, gone from the
+        // Prune orphaned tables (in managed schemas, gone from the
         // design), only when explicitly requested. Otherwise they are reported
         // via the returned plan and left untouched.
         if prune {
@@ -328,7 +333,8 @@ impl Design {
         // `0 altered` while `dbd diff` flagged the same drift forever. Plan the
         // type-swap that does converge. Needs the entity list, not just the
         // snapshots: the managed views to drop first come from the dependency
-        // graph, and pass C re-applies them afterwards.
+        // graph, and the write pass re-applies each one at its place in
+        // dependency order — after the enum whose ALTER dropped it.
         plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
@@ -360,7 +366,7 @@ impl Design {
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
-        // Write passes A–D (see `execute_reconcile_writes`).
+        // The writes, in dependency order (see `execute_reconcile_writes`).
         let summary = self
             .execute_reconcile_writes(
                 adapter,

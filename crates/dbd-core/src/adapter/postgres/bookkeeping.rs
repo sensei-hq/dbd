@@ -308,6 +308,22 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Delete this project's drift stamps for `matviews` (`schema.name`). The
+    /// only caller (`reset`) heals first, so `dbd.matview_stamps` exists here —
+    /// errors (permission/transient) are surfaced, not swallowed.
+    pub(super) async fn forget_matview_stamps(&self, matviews: &[String]) -> Result<()> {
+        if matviews.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM dbd.matview_stamps WHERE project = $1 AND matview = ANY($2)")
+            .bind(&self.project)
+            .bind(matviews)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("forget matview stamps failed: {e}")))?;
+        Ok(())
+    }
+
     /// Every drift stamp this project recorded, `schema.name` → stamp. Empty on
     /// a database not yet healed (no `dbd.matview_stamps`): read-only commands
     /// call this without healing, and must not fail for it.

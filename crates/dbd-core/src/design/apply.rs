@@ -485,22 +485,12 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<GrantsOutcome> {
-        let mut schema_grants = self.config.schema_grants();
+        let mut schema_grants = self.config.effective_schema_grants();
         let mut supabase_schemas: Vec<String> = vec![];
-        if let Some((target_name, target_config)) = self.config.target.iter().next() {
-            if let Some(ref grants) = target_config.grants {
-                for (schema, gc) in grants {
-                    schema_grants
-                        .entry(schema.clone())
-                        .or_default()
-                        .extend(gc.roles.clone());
-                }
-            }
-            // PostgREST USAGE grants ride along only when the user configured
-            // some grants, so a no-grants Supabase apply stays a no-op.
-            if target_name == "supabase" && !schema_grants.is_empty() {
-                supabase_schemas = self.config.schema_names();
-            }
+        // PostgREST USAGE grants ride along only when the user configured some
+        // grants, so a no-grants Supabase apply stays a no-op.
+        if self.config.default_target() == Some("supabase") && !schema_grants.is_empty() {
+            supabase_schemas = self.config.schema_names();
         }
         if let Some(s) = scope.filter(|s| !s.is_all) {
             let ws = self.working_set(s)?;
