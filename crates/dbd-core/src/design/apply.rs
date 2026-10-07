@@ -576,8 +576,8 @@ impl Design {
         C: FnMut(DeployComplete),
     {
         // The import phase's refusals (`Design::check_import_plan`) — a data
-        // file outside `import.staging`, say — are known before the first
-        // statement.
+        // file outside `import.staging`, a staging table whose loader dbd
+        // cannot pick — are known before the first statement.
         // Checked here, not when the import phase reaches them, so a refusal
         // never leaves the deploy half done: schema applied, data not loaded.
         self.check_import_plan(None)?;

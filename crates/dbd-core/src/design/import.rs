@@ -1,4 +1,39 @@
+use std::collections::{HashMap, HashSet};
+
 use super::*;
+
+/// The staging table → loader decision [`Design::import_loaders`] makes.
+#[derive(Default)]
+struct Loaders<'a> {
+    by_table: HashMap<&'a str, &'a Entity>,
+    /// Tables whose loader dbd cannot pick, with the candidates.
+    undecided: Vec<(&'a str, Vec<&'a Entity>)>,
+}
+
+impl<'a> Loaders<'a> {
+    /// Make `loader` the loader of `table`. A procedure loads one table — it
+    /// is CALLed once — so a second claim on it leaves `table` undecided.
+    fn claim(&mut self, table: &'a str, loader: &'a Entity) {
+        if self.loads_any(&loader.name) {
+            self.undecided(table, vec![loader]);
+        } else {
+            self.by_table.insert(table, loader);
+        }
+    }
+
+    fn undecided(&mut self, table: &'a str, candidates: Vec<&'a Entity>) {
+        self.undecided.push((table, candidates));
+    }
+
+    fn loads_any(&self, procedure: &str) -> bool {
+        self.by_table.values().any(|p| p.name == procedure)
+    }
+}
+
+/// `name` without its schema: `staging.items` → `items`.
+fn bare_name(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(_, bare)| bare)
+}
 
 impl Design {
     /// Staging data files excluded from the import plan because their entity
@@ -22,7 +57,8 @@ impl Design {
         if let Some(n) = name {
             self.check_import_name(n)?;
         }
-        self.check_import_staging(name)
+        self.check_import_staging(name)?;
+        self.check_import_loaders(name)
     }
 
     /// Whether `import.staging` lets an import load into `schema`.
@@ -183,6 +219,27 @@ impl Design {
             }
         }
 
+        // Each staging table has one loader (see `import_loaders`). Another
+        // procedure reading it is not run — said, because every reader after
+        // the first used to be dropped without a word, and one of them may
+        // have been a load.
+        let loaders = self.import_loaders();
+        for entry in self.import_plan(name) {
+            let Some(loader) = loaders.by_table.get(entry.table.name.as_str()) else {
+                continue;
+            };
+            for idle in self
+                .routines_reading(EntityType::Procedure, &entry.table.name)
+                .filter(|p| !loaders.loads_any(&p.name))
+            {
+                warnings.push(format!(
+                    "{} reads {} but is not called — {} is its loader; call {} from there, or run it \
+                     from import.after",
+                    idle.name, entry.table.name, loader.name, idle.name
+                ));
+            }
+        }
+
         warnings
     }
 
@@ -264,10 +321,12 @@ impl Design {
 
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
-    /// Procedure matching is based on reads/writes analysis, not naming convention:
-    /// - A procedure that *reads from* a staging table is its import procedure
-    /// - Procedures are ordered so that if proc A writes to table X, and proc B
-    ///   reads from table X (via FK), A runs before B
+    /// Each staging table's loader is picked by [`Design::import_loaders`]:
+    /// among the procedures that *read* it, the one named `import_<table>`,
+    /// else the only one that reads no other staging table, else the only one
+    /// no other table claimed. Procedures are then ordered so that if proc A
+    /// writes to table X, and proc B's target references X (via FK), A runs
+    /// before B.
     ///
     /// Example: import_lookups reads staging.lookups, writes config.lookups
     ///          import_lookup_values reads staging.lookup_values, writes config.lookup_values
@@ -280,9 +339,12 @@ impl Design {
     /// failed the whole import. Such a function is reported instead (see
     /// [`Design::import_warnings`]).
     ///
-    /// Staging tables that failed to parse are excluded here; they are reported
-    /// separately via [`Design::import_invalid_tables`].
+    /// A table whose loader dbd cannot pick has no procedure here; every import
+    /// path refuses it through [`Design::check_import_plan`]. Staging tables
+    /// that failed to parse are excluded here; they are reported separately
+    /// via [`Design::import_invalid_tables`].
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
+        let loaders = self.import_loaders();
         let tables: Vec<&Entity> = self
             .import_tables
             .iter()
@@ -290,16 +352,14 @@ impl Design {
             .filter(|t| name.is_none_or(|n| t.name == n))
             .collect();
 
-        // Build entries: match each staging table to the procedure that reads from it
         let mut entries: Vec<ImportPlanEntry> = tables
             .iter()
             .map(|table| {
-                let matched_proc = self.routines_reading(EntityType::Procedure, &table.name).next();
-
+                let loader = loaders.by_table.get(table.name.as_str());
                 ImportPlanEntry {
                     table: (*table).clone(),
-                    procedure: matched_proc.map(|p| p.name.clone()),
-                    writes: matched_proc
+                    procedure: loader.map(|p| p.name.clone()),
+                    writes: loader
                         .map(|p| p.writes().map(|r| r.name.clone()).collect())
                         .unwrap_or_default(),
                 }
@@ -312,6 +372,146 @@ impl Design {
         self.sort_import_plan(&mut entries);
 
         entries
+    }
+
+    /// Which procedure loads each staging table.
+    ///
+    /// Matching took the first procedure that read a staging table. A loader
+    /// that joins a second staging table — cities looking up their country —
+    /// was then matched to both: it ran twice, the second table's own loader
+    /// never ran, and the import reported every call as a success. Now, among
+    /// the procedures reading a table, in order:
+    ///
+    /// 1. the one named `import_<table>` — the name every doc example uses,
+    ///    and the way to settle anything the rules below cannot;
+    /// 2. the one that reads no other staging table;
+    /// 3. the one no other table claimed by 1 or 2 — and when that leaves
+    ///    several, the one writing a table of the same name.
+    ///
+    /// A procedure loads at most one table. One left as the only reader of
+    /// several (it joins them, and nothing else loads them) is called once,
+    /// for the table it writes a namesake of, else the first. Two or more
+    /// candidates still equal at the deciding rule is ambiguous: the table gets
+    /// no loader here and [`Design::check_import_plan`] refuses it, rather than
+    /// guess and drop the other's load in silence.
+    ///
+    /// Decided over every data file at once, so a `-n` run calls the loader a
+    /// full run would.
+    fn import_loaders(&self) -> Loaders<'_> {
+        let tables: Vec<&Entity> = self.import_tables.iter().filter(|t| t.errors.is_empty()).collect();
+        // "Another staging table" covers every data file's table and every
+        // table declared in a staging schema, loaded this run or not.
+        let staging: HashSet<&str> = tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .chain(
+                self.entities
+                    .iter()
+                    .filter(|e| e.entity_type == EntityType::Table)
+                    .filter(|e| {
+                        let schema = e.name.split_once('.').map(|(s, _)| s);
+                        schema.is_some_and(|s| self.config.import.staging.iter().any(|x| x == s))
+                    })
+                    .map(|e| e.name.as_str()),
+            )
+            .collect();
+        let reads_only = |p: &Entity, table: &str| {
+            p.reads()
+                .filter(|r| staging.contains(r.name.as_str()))
+                .all(|r| r.name == table)
+        };
+        let writes_namesake = |p: &Entity, table: &str| p.writes().any(|w| bare_name(&w.name) == bare_name(table));
+
+        let mut loaders = Loaders::default();
+        let mut pending: Vec<(&str, Vec<&Entity>)> = Vec::new();
+        for table in &tables {
+            let table = table.name.as_str();
+            let candidates: Vec<&Entity> = self.routines_reading(EntityType::Procedure, table).collect();
+            let conventional = format!("import_{}", bare_name(table));
+            let named: Vec<&Entity> = candidates
+                .iter()
+                .copied()
+                .filter(|p| bare_name(&p.name) == conventional)
+                .collect();
+            let exclusive: Vec<&Entity> = candidates.iter().copied().filter(|p| reads_only(p, table)).collect();
+            match (named.as_slice(), exclusive.as_slice()) {
+                ([loader], _) | ([], [loader]) => loaders.claim(table, loader),
+                ([_, _, ..], _) => loaders.undecided(table, named),
+                ([], [_, _, ..]) => loaders.undecided(table, exclusive),
+                ([], []) if candidates.is_empty() => {}
+                ([], []) => pending.push((table, candidates)),
+            }
+        }
+
+        // Rule 3, once rules 1 and 2 have claimed what they can. A table left
+        // with no unclaimed reader is data another table's loader joins, not
+        // a load of its own.
+        let mut picks: Vec<(&str, &Entity)> = Vec::new();
+        for (table, candidates) in pending {
+            let unclaimed: Vec<&Entity> = candidates.into_iter().filter(|p| !loaders.loads_any(&p.name)).collect();
+            match unclaimed.as_slice() {
+                [] => {}
+                [loader] => picks.push((table, *loader)),
+                _ => {
+                    let namesakes: Vec<&Entity> = unclaimed
+                        .iter()
+                        .copied()
+                        .filter(|p| writes_namesake(p, table))
+                        .collect();
+                    match namesakes.as_slice() {
+                        [loader] => picks.push((table, *loader)),
+                        _ => loaders.undecided(table, unclaimed),
+                    }
+                }
+            }
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (_, loader) in &picks {
+            if !seen.insert(loader.name.as_str()) {
+                continue;
+            }
+            let its: Vec<&str> = picks
+                .iter()
+                .filter(|(_, p)| p.name == loader.name)
+                .map(|(t, _)| *t)
+                .collect();
+            let table = its
+                .iter()
+                .copied()
+                .find(|t| writes_namesake(loader, t))
+                .unwrap_or(its[0]);
+            loaders.claim(table, loader);
+        }
+        loaders
+    }
+
+    /// Refuse every staging table this run loads whose loader dbd cannot pick
+    /// (see [`Design::import_loaders`]), naming the candidates and the way out.
+    fn check_import_loaders(&self, name: Option<&str>) -> Result<()> {
+        let loaders = self.import_loaders();
+        let mut refusals: Vec<String> = loaders
+            .undecided
+            .iter()
+            .filter(|(table, _)| name.is_none_or(|n| n == *table))
+            .map(|(table, candidates)| {
+                let mut names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
+                names.sort_unstable();
+                let why = match names.as_slice() {
+                    [one] => format!("{one} claims it but already loads another staging table"),
+                    _ => format!("{} have an equal claim", names.join(", ")),
+                };
+                format!(
+                    "cannot tell which procedure loads {table}: {why}. An import calls one loader per \
+                     staging table — name it import_{}, and call the others from it or from import.after",
+                    bare_name(table)
+                )
+            })
+            .collect();
+        if refusals.is_empty() {
+            return Ok(());
+        }
+        refusals.sort();
+        Err(DbdError::Config(refusals.join("\n")))
     }
 
     /// The `kind` routines (procedures or functions) whose body reads `table`.
