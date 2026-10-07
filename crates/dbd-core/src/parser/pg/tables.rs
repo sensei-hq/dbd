@@ -368,7 +368,7 @@ fn extract_column(
             ConstrDefault => {
                 let rendered = constraint_expr(c, &name, "DEFAULT")?;
                 collect_function_refs(&rendered, default_schema, functions);
-                if let Some(sequence) = c.raw_expr.as_deref().and_then(nextval_sequence) {
+                if let Some(sequence) = c.raw_expr.as_deref().and_then(common::nextval_sequence) {
                     references.extend(uses_ref(&sequence, default_schema));
                 }
                 default_value = Some(rendered);
@@ -737,29 +737,6 @@ fn uses_ref(name: &str, default_schema: &str) -> Option<Ref> {
         schema_source,
         unresolved: false,
     })
-}
-
-/// The sequence a `nextval('…')` default draws from, read off the call's
-/// argument — a string literal, often cast `::regclass`. `None` for any other
-/// expression.
-fn nextval_sequence(expr: &protobuf::Node) -> Option<String> {
-    let NodeEnum::FuncCall(call) = expr.node.as_ref()? else {
-        return None;
-    };
-    if string_list(&call.funcname).last().map(String::as_str) != Some("nextval") || call.args.len() != 1 {
-        return None;
-    }
-    let mut arg = call.args.first()?;
-    if let Some(NodeEnum::TypeCast(cast)) = arg.node.as_ref() {
-        arg = cast.arg.as_deref()?;
-    }
-    match arg.node.as_ref()? {
-        NodeEnum::AConst(c) => match c.val.as_ref()? {
-            protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// The `String` values of a node list — key lists, comment object paths and
