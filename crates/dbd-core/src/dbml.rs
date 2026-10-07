@@ -513,9 +513,9 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
         settings.push(format!("{GENERATED_PROPERTY}: {}", dbml_string(expression)));
     }
     if let Some(ref comment) = col.comment {
-        // Inline notes must be single-line — collapse newlines
-        let inline = comment.trim().replace('\n', " ");
-        settings.push(format!("note: {}", dbml_string(&inline)));
+        // A setting stays on its column's line; `dbml_string` writes each line
+        // break as DBML's `\n` escape, which both parsers read back as one.
+        settings.push(format!("note: {}", dbml_string(comment.trim())));
     }
 
     let settings_str = if settings.is_empty() {
