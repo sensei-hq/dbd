@@ -60,14 +60,17 @@ pub fn cmd_diagram(
     // The changelog (#29), seen through the same scope as the diagram — which may
     // be a `default` scope with no --scope given. A scope is a set of entities, and
     // the history names tables that no longer exist, so each is asked of the scope's
-    // definition rather than of today's model; see `scope::admits`.
+    // definition rather than of today's model; see `scope::admits`. The set is the
+    // working set the model was built from, so under `deps: include` the changelog
+    // covers every table the diagram draws.
     let history = if resolved.is_all {
         dbd_core::history::load(project_dir)
     } else {
+        let working = design.working_set(&resolved)?;
         let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
         let scopes = &design.config().scopes;
         dbd_core::history::load_scoped(project_dir, |schema, name| {
-            dbd_core::scope::admits(scopes, &resolved, &existing, &format!("{schema}.{name}"))
+            dbd_core::scope::admits(scopes, &resolved, &working, &existing, &format!("{schema}.{name}"))
         })
     };
     match history {
