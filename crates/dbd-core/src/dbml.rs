@@ -1540,6 +1540,64 @@ mod tests {
         );
     }
 
+    /// An enum column's type is written the way the table's own `search_path`
+    /// resolves it. Written bare, `init --from-dbml` built `mood` unqualified,
+    /// and the apply failed with `type "mood" does not exist` — the enum lives
+    /// in `types`, which nothing on the new file's path names.
+    #[test]
+    fn an_enum_column_round_trips_with_the_schema_its_search_path_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/enum/types")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - types\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/types/mood.ddl"),
+            "set search_path to types;\ncreate type mood as enum ('calm', 'busy');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app, types;\n\
+             create table if not exists t (id int primary key, m mood not null, ms mood[]);\n",
+        )
+        .unwrap();
+        let design = crate::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let doc = generate_dbml(&DbmlParams {
+            entities: design.entities(),
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let table = parsed.iter().find(|e| e.name == "app.t").expect("table read back");
+        let types: Vec<(&str, &str)> = table
+            .table_def
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            [("id", "int"), ("m", "types.mood"), ("ms", "types.mood[]")],
+            "{}",
+            doc.content
+        );
+    }
+
     /// A filter that leaves a referenced table out of the document must still
     /// stub it — a Ref to an undefined table is a DBML error — and, since the
     /// table is in the design, the stub keeps the referenced column's type.
