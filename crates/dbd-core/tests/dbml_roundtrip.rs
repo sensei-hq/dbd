@@ -274,3 +274,33 @@ fn a_check_constraint_survives_dbml_and_back() {
     assert_eq!(checks(&original).len(), 3, "the test needs all three checks parsed");
     assert_eq!(checks(table(&reversed, "shop.orders")), checks(&original), "\n{dbml}");
 }
+
+/// DBML has no generated-column syntax, so `total_eur` came back from
+/// `init --from-dbml` as a plain writable column: the computed value was gone
+/// and nothing stopped a write from contradicting `total_cents`.
+#[test]
+fn a_generated_column_survives_dbml_and_back() {
+    let orders = parse(
+        "ddl/table/shop/orders.ddl",
+        "create table shop.orders (\n\
+           id uuid primary key,\n\
+           total_cents integer not null,\n\
+           total_eur numeric generated always as (total_cents / 100.0) stored,\n\
+           label text generated always as (coalesce(note, 'n/a')) stored,\n\
+           note text\n\
+         );",
+    );
+    let original = orders.table_def.clone().unwrap();
+    let dbml = document(&[orders]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "shop.orders");
+    let generated = |td: &TableDef, name: &str| td.columns.iter().find(|c| c.name == name).unwrap().generated.clone();
+
+    for name in ["total_eur", "label"] {
+        assert!(
+            generated(&original, name).is_some(),
+            "{name} must be generated for this test to mean anything"
+        );
+        assert_eq!(generated(td, name), generated(&original, name), "{name}:\n{dbml}");
+    }
+}

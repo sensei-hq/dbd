@@ -1295,6 +1295,18 @@ mod tests {
         assert_eq!(td.columns[1].identity, None, "bigserial carries its own sequence");
     }
 
+    /// The `generated always as` custom property is a generated column's
+    /// expression; a user's own custom property is metadata and changes nothing.
+    #[test]
+    fn the_generated_always_as_property_makes_a_generated_column() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" numeric [generated always as: 'a / 100.0', not null]\n  \"c\" text [generated: \"by-etl\", pii: 'true']\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[1].generated.as_deref(), Some("a / 100.0"));
+        assert!(!td.columns[1].nullable, "the other settings still apply");
+        assert_eq!(td.columns[2].generated, None, "a user's tag is not dbd's convention");
+    }
+
     #[test]
     fn parse_indexes_block_bare_and_parenthesized() {
         let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" int\n\n  indexes {\n    a [unique, name: 'idx_a']\n    (a, b) [name: 'idx_ab']\n  }\n}\n";
