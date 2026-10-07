@@ -1147,6 +1147,24 @@ mod tests {
         assert_eq!(cols, vec!["a", "b"]);
     }
 
+    /// A backticked index key is an expression, and a comma inside one does
+    /// not split the key list.
+    #[test]
+    fn a_backticked_index_key_is_an_expression() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" text\n\n  indexes {\n    `lower(b)` [name: 'idx_lower']\n    (a, `coalesce(b, 'x, y')`) [name: 'idx_mixed']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let keys = |i: usize| -> Vec<(&str, bool)> {
+            td.indexes[i]
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.is_expression))
+                .collect()
+        };
+        assert_eq!(keys(0), vec![("lower(b)", true)]);
+        assert_eq!(keys(1), vec![("a", false), ("coalesce(b, 'x, y')", true)]);
+    }
+
     #[test]
     fn parse_multiline_triple_quoted_note() {
         let dbml = "Table \"app\".\"t\" {\n  \"id\" int\n\n  Note: '''\nLine one.\nLine two.\n'''\n}\n";
