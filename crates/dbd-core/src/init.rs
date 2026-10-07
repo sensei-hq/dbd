@@ -113,8 +113,20 @@ create table if not exists example (
     .to_string()
 }
 
+/// The targets `dbd init` has a scaffold for.
+pub const SCAFFOLD_TARGETS: &[&str] = &["postgres", "supabase"];
+
 /// Write init files to the project directory.
 pub fn create_project(project_dir: &std::path::Path, name: &str, target: &str) -> crate::error::Result<Vec<InitFile>> {
+    // Refuse rather than fall through: an unknown target used to get the
+    // postgres scaffold, so `--target convex` (or a typo) looked like it worked.
+    if !SCAFFOLD_TARGETS.contains(&target) {
+        return Err(crate::error::DbdError::Config(format!(
+            "dbd init has no scaffold for `{target}` — it scaffolds {} projects",
+            SCAFFOLD_TARGETS.join(" or ")
+        )));
+    }
+
     // Check if already initialized
     if project_dir.join("design.yaml").exists() {
         return Err(crate::error::DbdError::Config(
