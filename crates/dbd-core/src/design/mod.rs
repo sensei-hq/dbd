@@ -109,19 +109,26 @@ impl DeployComplete {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.apply.warnings.clone();
         out.extend(self.import.warnings.iter().cloned());
-        out.extend(
-            self.policies
-                .failed
-                .iter()
-                .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
-        );
-        out.extend(
-            self.policies
-                .skipped
-                .iter()
-                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
-        );
+        out.extend(self.policy_warnings());
         out
+    }
+
+    /// The policy phase's share of [`Self::warnings`]: one line per failed
+    /// policy file, then one per policy a scope excluded. Apart, so a caller
+    /// reporting phase by phase can print them after the policy phase's own
+    /// line rather than before it.
+    pub fn policy_warnings(&self) -> Vec<String> {
+        let failed = self
+            .policies
+            .failed
+            .iter()
+            .map(|(file, err)| format!("policy not applied: {} — {err}", file.display()));
+        let skipped = self
+            .policies
+            .skipped
+            .iter()
+            .map(|(file, why)| format!("policy skipped: {} — {why}", file.display()));
+        failed.chain(skipped).collect()
     }
 }
 

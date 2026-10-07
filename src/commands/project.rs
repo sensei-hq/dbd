@@ -440,16 +440,21 @@ pub async fn cmd_deploy(
     }
 
     let summary = summary.unwrap_or_default();
+    // Non-fatal diagnostics — skipped imports and failed policy files — are
+    // always surfaced, regardless of verbosity. A deploy that quietly loaded
+    // nothing is the failure mode this reporting exists to prevent. Each in the
+    // order its phase ran — schema, data, policies — so nothing reads as having
+    // happened before what it followed.
+    for warning in summary.apply.warnings.iter().chain(&summary.import.warnings) {
+        output::warn(warning);
+    }
     if !summary.policies.applied.is_empty() {
         output::info(
             verbosity,
             &format!("Applied {} policy file(s).", summary.policies.applied.len()),
         );
     }
-    // Non-fatal diagnostics — skipped imports and failed policy files — are
-    // always surfaced, regardless of verbosity. A deploy that quietly loaded
-    // nothing is the failure mode this reporting exists to prevent.
-    for warning in summary.warnings() {
+    for warning in summary.policy_warnings() {
         output::warn(&warning);
     }
     output::info(verbosity, &format_deploy_summary(&summary));
