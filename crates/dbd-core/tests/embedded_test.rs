@@ -351,6 +351,90 @@ async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
     .await;
 }
 
+// ── Test: each staging table's own loader runs ────────────────────────────────
+
+/// The audit's repro on a real database. `load_cities` joins the staged
+/// countries to find each city's country, and loader matching took the first
+/// procedure reading a staging table — so both staged tables got
+/// `load_cities`, it ran twice, `load_countries` never ran, and both targets
+/// stayed empty under a summary of "2 procedure(s) called".
+#[tokio::test]
+async fn each_staging_table_is_loaded_by_its_own_loader() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+    );
+    write(
+        "ddl/table/staging/countries.ddl",
+        "set search_path to staging;\ncreate table if not exists countries (code text, name text);\n",
+    );
+    write(
+        "ddl/table/staging/cities.ddl",
+        "set search_path to staging;\ncreate table if not exists cities (name text, country text);\n",
+    );
+    write(
+        "ddl/table/app/countries.ddl",
+        "set search_path to app;\ncreate table if not exists countries (code text primary key, name text);\n",
+    );
+    write(
+        "ddl/table/app/cities.ddl",
+        "set search_path to app;\n\
+         create table if not exists cities (name text, country_code text references app.countries (code));\n",
+    );
+    write(
+        "ddl/procedure/staging/load_countries.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_countries() language sql\n\
+         as $$ insert into app.countries (code, name) select code, name from staging.countries $$;\n",
+    );
+    write(
+        "ddl/procedure/staging/load_cities.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_cities() language sql\n\
+         as $$ insert into app.cities (name, country_code)\n\
+               select c.name, k.code from staging.cities c\n\
+               join staging.countries s on s.name = c.country\n\
+               join app.countries k on k.code = s.code $$;\n",
+    );
+    write("import/staging/countries.csv", "code,name\nDE,Germany\n");
+    write("import/staging/cities.csv", "name,country\nBerlin,Germany\n");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.countries WHERE code = 'DE' AND name = 'Germany'",
+        "the country load_countries moves",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.cities WHERE name = 'Berlin' AND country_code = 'DE'",
+        "the city load_cities moves",
+    )
+    .await;
+}
+
 // ── Test: a `.json` file may hold a JSON array ────────────────────────────────
 
 /// A `.json` file is what most tools mean by one: a JSON array of records. The

@@ -755,4 +755,240 @@ mod tests {
             design.import_warnings(None)
         );
     }
+
+    // ── Which procedure loads which staging table ─────────────────────────────
+
+    /// A project from `(path, body)` pairs, `design.yaml` included.
+    fn project_from(files: &[(&str, &str)]) -> (tempfile::TempDir, Design) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        (tmp, design)
+    }
+
+    /// The audit's project: countries and cities staged, each with a live
+    /// target (`app.cities` references `app.countries`), and a city loader that
+    /// joins the staged countries to find each city's country.
+    const CITIES_PROJECT: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+        ),
+        (
+            "ddl/table/staging/countries.ddl",
+            "set search_path to staging;\ncreate table if not exists countries (code text, name text);\n",
+        ),
+        (
+            "ddl/table/staging/cities.ddl",
+            "set search_path to staging;\ncreate table if not exists cities (name text, country text);\n",
+        ),
+        (
+            "ddl/table/staging/languages.ddl",
+            "set search_path to staging;\ncreate table if not exists languages (code text);\n",
+        ),
+        (
+            "ddl/table/app/countries.ddl",
+            "set search_path to app;\ncreate table if not exists countries (code text primary key, name text);\n",
+        ),
+        (
+            "ddl/table/app/cities.ddl",
+            "set search_path to app;\ncreate table if not exists cities (\n  name text\n, country_code text references app.countries (code)\n);\n",
+        ),
+        (
+            "ddl/procedure/staging/load_countries.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure load_countries() language sql\n\
+             as $$ insert into app.countries (code, name) select code, name from staging.countries $$;\n",
+        ),
+        (
+            "ddl/procedure/staging/load_cities.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure load_cities() language sql\n\
+             as $$ insert into app.cities (name, country_code)\n\
+                   select c.name, k.code from staging.cities c\n\
+                   join staging.countries s on s.name = c.country\n\
+                   join app.countries k on k.code = s.code $$;\n",
+        ),
+        ("import/staging/countries.csv", "code,name\nDE,Germany\n"),
+        ("import/staging/cities.csv", "name,country\nBerlin,Germany\n"),
+        ("import/staging/languages.csv", "code\nde\n"),
+    ];
+
+    fn loader_of<'a>(plan: &'a [ImportPlanEntry], table: &str) -> Option<&'a str> {
+        plan.iter()
+            .find(|e| e.table.name == table)
+            .unwrap_or_else(|| panic!("{table} is planned"))
+            .procedure
+            .as_deref()
+    }
+
+    /// `load_cities` reads `staging.countries` too — it joins it to find each
+    /// city's country — and loader matching took the first procedure reading a
+    /// staging table. Both staged tables got `load_cities`, so it ran twice,
+    /// `load_countries` never ran, and the import reported "2 procedure(s)
+    /// called" over two empty targets. A procedure that reads only one staging
+    /// table is that table's loader; a joining loader belongs to the table no
+    /// one else loads.
+    #[test]
+    fn a_loader_that_joins_another_staging_table_is_not_that_tables_loader() {
+        let (_tmp, design) = project_from(CITIES_PROJECT);
+        let plan = design.import_plan(None);
+        assert_eq!(loader_of(&plan, "staging.countries"), Some("staging.load_countries"));
+        assert_eq!(loader_of(&plan, "staging.cities"), Some("staging.load_cities"));
+        assert_eq!(loader_of(&plan, "staging.languages"), None);
+    }
+
+    /// The run calls each loader once, countries before the cities that
+    /// reference them.
+    #[tokio::test]
+    async fn the_import_calls_each_loader_once_in_dependency_order() {
+        let (_tmp, design) = project_from(CITIES_PROJECT);
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        let calls: Vec<String> = mock
+            .scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("CALL"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                "CALL staging.load_countries();".to_string(),
+                "CALL staging.load_cities();".to_string()
+            ]
+        );
+    }
+
+    /// `-n` picks the loader a full run would: the one decision, made over the
+    /// whole import set, then narrowed.
+    #[test]
+    fn a_named_import_calls_the_loader_a_full_run_would() {
+        let (_tmp, design) = project_from(CITIES_PROJECT);
+        let plan = design.import_plan(Some("staging.countries"));
+        assert_eq!(loader_of(&plan, "staging.countries"), Some("staging.load_countries"));
+    }
+
+    /// A single loader joining two staged tables that nothing else loads is
+    /// one load, so it is called once — it was matched to both tables and
+    /// called twice. It belongs to the table it writes (`app.cities`).
+    #[tokio::test]
+    async fn a_loader_reading_two_staging_tables_is_called_once() {
+        let files: Vec<(&str, &str)> = CITIES_PROJECT
+            .iter()
+            .filter(|(rel, _)| !rel.ends_with("load_countries.ddl"))
+            .copied()
+            .collect();
+        let (_tmp, design) = project_from(&files);
+        let plan = design.import_plan(None);
+        assert_eq!(loader_of(&plan, "staging.cities"), Some("staging.load_cities"));
+        assert_eq!(loader_of(&plan, "staging.countries"), None);
+
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        let calls = mock
+            .scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("CALL"))
+            .count();
+        assert_eq!(calls, 1, "{:?}", mock.scripts.lock().unwrap());
+    }
+
+    /// A project of one staged table and the procedures given, each reading it.
+    fn items_with_procedures(names: &[&str]) -> (tempfile::TempDir, Design) {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "design.yaml".into(),
+                "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n".into(),
+            ),
+            (
+                "ddl/table/staging/items.ddl".into(),
+                "set search_path to staging;\ncreate table if not exists items (id integer);\n".into(),
+            ),
+            ("import/staging/items.csv".into(), "id\n1\n".into()),
+        ];
+        for name in names {
+            files.push((
+                format!("ddl/table/app/{name}_out.ddl"),
+                format!("set search_path to app;\ncreate table if not exists {name}_out (id integer);\n"),
+            ));
+            files.push((
+                format!("ddl/procedure/staging/{name}.ddl"),
+                format!(
+                    "set search_path to staging;\n\
+                     create or replace procedure {name}() language sql\n\
+                     as $$ insert into app.{name}_out (id) select id from staging.items $$;\n"
+                ),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        project_from(&borrowed)
+    }
+
+    /// Every doc example names a loader `import_<table>`. When more than one
+    /// procedure reads a staging table, that name says which one loads it.
+    #[test]
+    fn a_procedure_named_import_table_is_that_tables_loader() {
+        let (_tmp, design) = items_with_procedures(&["audit_items", "import_items"]);
+        let plan = design.import_plan(None);
+        assert_eq!(loader_of(&plan, "staging.items"), Some("staging.import_items"));
+    }
+
+    /// The reader that lost is not run, and that is said: before, every reader
+    /// after the first was dropped without a word.
+    #[test]
+    fn a_procedure_reading_a_staging_table_it_does_not_load_is_reported() {
+        let (_tmp, design) = items_with_procedures(&["audit_items", "import_items"]);
+        let warnings = design.import_warnings(None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("staging.audit_items") && w.contains("staging.import_items")),
+            "the idle reader and the loader chosen over it are named: {warnings:?}"
+        );
+    }
+
+    /// Two procedures with an equal claim — each reads only this table, and
+    /// neither is named for it — leave nothing to decide by. Calling the first
+    /// was a guess that silently dropped the other's load; the import is
+    /// refused, naming both and how to settle it, before anything runs.
+    #[tokio::test]
+    async fn two_equal_candidate_loaders_are_refused_naming_both() {
+        let (_tmp, design) = items_with_procedures(&["sync_items", "copy_items"]);
+        let err = design
+            .scoped_import_plan(None, None)
+            .expect_err("an ambiguous loader must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staging.items")
+                && msg.contains("staging.sync_items")
+                && msg.contains("staging.copy_items")
+                && msg.contains("import_items"),
+            "the table, both candidates and the way out: {msg}"
+        );
+
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("the import refuses it too");
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "before anything runs"
+        );
+    }
 }
