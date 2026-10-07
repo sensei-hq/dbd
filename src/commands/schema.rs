@@ -46,7 +46,7 @@ pub async fn cmd_inspect(
     // the scope excludes is refused by apply, dbml and diagram — so inspect,
     // which exists to vet a scope before a run, must refuse it too rather than
     // promise to auto-include an entity the scope forbids.
-    design.working_set(&resolved)?;
+    let scoped = design.scoped_entities(&resolved)?;
     let report = design.report(name, Some(&resolved));
 
     report_scope_gaps(&resolved, &report, verbosity)?;
@@ -76,16 +76,21 @@ pub async fn cmd_inspect(
     let todos = design.data_sql_todos()?;
     print_data_sql_todos(&todos);
 
+    // The checks below run over what this run is about — the scope's entities,
+    // not the design's. Run over the whole design, `inspect --scope hub` advised
+    // on tables `hub` never builds, and failed on a matview it never creates.
+
     // Validate materialized-view refresh config (concurrently/unique-index,
-    // pg_cron presence, cron expression syntax) — offline, no DB required.
-    let declared_extensions: Vec<String> = design
-        .entities()
+    // pg_cron presence, cron expression syntax) — offline, no DB required. The
+    // extensions are the scope's too: an `extensions:` allowlist that leaves
+    // out pg_cron leaves a scheduled matview in the scope unschedulable.
+    let declared_extensions: Vec<String> = scoped
         .iter()
         .filter(|e| e.entity_type == dbd_core::EntityType::Extension)
         .map(|e| e.name.clone())
         .collect();
     let matview_errors = dbd_core::design::validate_materialized_views(
-        design.entities(),
+        &scoped,
         &design.config().materialized_views,
         &declared_extensions,
     );
@@ -93,15 +98,25 @@ pub async fn cmd_inspect(
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
+    let enum_hints = dbd_core::design::suggest_enum_candidates(&scoped, &design.config().source.dialect);
     print_enum_hints(&enum_hints);
 
     // Advisory only, and the one with teeth: a table in a schema something
     // outside the database serves, with no RLS policy declared. On Supabase
     // that is readable by `anon` over HTTP. Report-only like the enum hints —
     // dbd cannot know the author did not mean it.
-    let exposed = design.unprotected_exposed_tables();
-    print_exposed_tables(&exposed, &design.exposed_schemas());
+    let in_scope: std::collections::HashSet<&str> = scoped.iter().map(|e| e.name.as_str()).collect();
+    let exposed: Vec<String> = design
+        .unprotected_exposed_tables()
+        .into_iter()
+        .filter(|t| in_scope.contains(t.as_str()))
+        .collect();
+    let exposed_schemas: Vec<String> = design
+        .exposed_schemas()
+        .into_iter()
+        .filter(|s| scoped.iter().any(|e| e.schema.as_deref() == Some(s.as_str())))
+        .collect();
+    print_exposed_tables(&exposed, &exposed_schemas);
 
     // Summary last, so the counts are the final thing on screen. Printed before
     // the advisory section it would scroll away behind it, which is backwards:
