@@ -652,3 +652,41 @@ fn auto_included_dependencies_are_not_reported_as_failures() {
         assert!(!text.contains('✗'), "{args:?} must not mark it as a failure: {text}");
     }
 }
+
+// ── inspect reads the project the way the run does ──────────────────────────
+
+/// With `-s` a relative path other than `.`, inspect reported every DDL file
+/// "File not found" and exited 1, while apply read the same files without
+/// complaint: each path already starts with the project directory, and the
+/// existence check joined the project directory onto it a second time.
+#[test]
+fn inspect_finds_the_files_of_a_project_given_by_relative_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(&tmp.path().join("proj"));
+
+    let run = |args: &[&str]| {
+        Command::cargo_bin("dbd")
+            .unwrap()
+            .env_remove("DATABASE_URL")
+            .current_dir(tmp.path())
+            .args(["-s", "proj"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let apply = run(&["apply", "--dry-run"]);
+    assert!(
+        apply.status.success(),
+        "precondition: apply reads it: {}",
+        stderr(&apply)
+    );
+
+    let out = run(&["inspect"]);
+    assert!(
+        !stdout(&out).contains("File not found"),
+        "every file is where the scan found it: {}",
+        stdout(&out)
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+}
