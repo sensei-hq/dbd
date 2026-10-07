@@ -298,6 +298,78 @@ pub(crate) fn json_records(data: &str, format: &str, file: &Path) -> Result<Vec<
         .collect())
 }
 
+/// A CSV or TSV data file's header: the column names it loads, and the byte
+/// offset where its rows begin. `None` for a file with no header — no columns,
+/// nothing to load.
+///
+/// Read as CSV (RFC 4180) — a header may quote a name, and a TSV is the same
+/// format with a tab between fields, as Postgres's `COPY … (FORMAT csv,
+/// DELIMITER E'\t')` reads it. A UTF-8 byte-order mark is not part of the
+/// first name: spreadsheet exports start with one. The offset is into `data`,
+/// so the rows after the header can be handed on as written.
+pub(crate) fn delimited_header(data: &str, tab: bool, file: &Path) -> Result<Option<(Vec<String>, usize)>> {
+    let bom = if data.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(if tab { b'\t' } else { b',' })
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(&data.as_bytes()[bom..]);
+    let mut header = csv::StringRecord::new();
+    let read = reader
+        .read_record(&mut header)
+        .map_err(|e| crate::error::DbdError::Config(format!("{}: unreadable header: {e}", file.display())))?;
+    if !read {
+        return Ok(None);
+    }
+    let rows_at = bom + reader.position().byte() as usize;
+    Ok(Some((header.iter().map(str::to_string).collect(), rows_at)))
+}
+
+/// The columns of `table` a data file's header names, in the header's order —
+/// the column list its rows load into.
+///
+/// A name matches a column as Postgres resolves it: exactly, as a quoted
+/// identifier, or folded to lower case, as an unquoted one — so `Name` loads
+/// `name`. A name `columns` lacks is refused, as is a column named twice:
+/// loading the file anyway, by position or without that column, puts values
+/// where the file did not say. One reader for every SQL adapter, so a file
+/// loads into the same columns on each.
+pub(crate) fn header_columns(header: &[String], columns: &[String], table: &str, file: &Path) -> Result<Vec<String>> {
+    let mut matched: Vec<String> = Vec::with_capacity(header.len());
+    let mut unknown: Vec<String> = Vec::new();
+    for name in header {
+        let folded = name.to_ascii_lowercase();
+        match columns
+            .iter()
+            .find(|c| *c == name)
+            .or_else(|| columns.iter().find(|c| **c == folded))
+        {
+            Some(column) if matched.contains(column) => {
+                return Err(crate::error::DbdError::Config(format!(
+                    "{}: the header names column {column} of {table} twice",
+                    file.display()
+                )));
+            }
+            Some(column) => matched.push(column.clone()),
+            None => unknown.push(format!("'{name}'")),
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(matched);
+    }
+    Err(crate::error::DbdError::Config(format!(
+        "{}: the header names {} but {table} has no such column — its columns are {}. A data file's \
+         header names the columns its values load into",
+        file.display(),
+        unknown.join(", "),
+        columns.join(", ")
+    )))
+}
+
 pub mod convex;
 pub mod mock;
 #[cfg(feature = "postgres")]

@@ -248,6 +248,21 @@ impl PostgresAdapter {
         Ok(row.get::<bool, _>("present"))
     }
 
+    /// The columns of `table` (`schema.table`, or a bare name resolved through
+    /// the search_path), in table order. Empty when there is no such table:
+    /// `to_regclass` returns NULL for a missing relation instead of erroring.
+    async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT attname::text FROM pg_catalog.pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+        )
+        .bind(crate::sql_quote::qualified(table))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
+    }
+
     /// Static pattern matching for reference classification (offline fallback).
     fn matches_static_pattern(name: &str) -> bool {
         let lower = name.to_lowercase();
@@ -1297,12 +1312,32 @@ impl DatabaseAdapter for PostgresAdapter {
         };
 
         let format = entity.format.as_deref().unwrap_or("csv");
-        let qualified = entity.name.replace('.', "\".\"");
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
             "csv" | "tsv" => {
-                let delimiter = if format == "tsv" { ", DELIMITER E'\\t'" } else { "" };
+                // The header is a column list. `HEADER true` only skipped it,
+                // so each value loaded into the column at its position — a
+                // file headed `name,code` put the name into `code`. COPY now
+                // names the columns the header does, and gets only the rows.
+                let tab = format == "tsv";
+                let Some((header, rows_at)) = super::delimited_header(&data, tab, file_path)? else {
+                    return Ok(()); // An empty file: no columns, no rows.
+                };
+                let columns = self.table_columns(&entity.name).await?;
+                if columns.is_empty() {
+                    return Err(DbdError::Config(format!(
+                        "cannot import {} into {}: no such table",
+                        file_path.display(),
+                        entity.name
+                    )));
+                }
+                let column_list = super::header_columns(&header, &columns, &entity.name, file_path)?
+                    .iter()
+                    .map(|c| crate::sql_quote::ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let delimiter = if tab { ", DELIMITER E'\\t'" } else { "" };
                 // Postgres CSV COPY's default NULL is the empty unquoted string,
                 // which already matches today's behavior — only add the clause
                 // when a non-empty sentinel is configured.
@@ -1311,8 +1346,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 } else {
                     format!(", NULL '{}'", null_value.replace('\'', "''"))
                 };
-                let copy_sql =
-                    format!("COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})");
+                // Quoted part by part: replacing the dot left an embedded `"`
+                // free to close the quoting.
+                let copy_sql = format!(
+                    "COPY {} ({column_list}) FROM STDIN WITH (FORMAT csv{delimiter}{null_clause})",
+                    crate::sql_quote::qualified(&entity.name)
+                );
                 let mut conn = self
                     .pool
                     .acquire()
@@ -1322,7 +1361,7 @@ impl DatabaseAdapter for PostgresAdapter {
                     .copy_in_raw(&copy_sql)
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY failed: {e}")))?;
-                copy.send(data.as_bytes())
+                copy.send(&data.as_bytes()[rows_at..])
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY send failed: {e}")))?;
                 copy.finish()

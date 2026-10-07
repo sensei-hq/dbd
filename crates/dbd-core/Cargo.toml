@@ -17,6 +17,10 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml.workspace = true
 thiserror.workspace = true
+# CSV/TSV data files are read as CSV (RFC 4180): quoted fields, doubled quotes,
+# delimiters and newlines inside quotes. Splitting lines on the delimiter read
+# none of that — see `adapter::delimited_header`.
+csv = "1"
 
 # SQL Parsing
 sqlparser = { version = "0.62", features = ["visitor"] }
