@@ -75,6 +75,27 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     }
 }
 
+/// Ensure `public` is included in any SET search_path statement.
+/// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
+/// but omit `public`, which hides extensions installed in the public schema.
+///
+/// Shared by `apply` (the Postgres adapter runs every script through it) and
+/// `combine`, so the script `combine` writes runs the way `apply` does.
+pub(crate) fn ensure_public_in_search_path(sql: &str) -> String {
+    let re = regex::Regex::new(r"(?i)(set\s+search_path\s+to\s+)([^;]+)(;)").unwrap();
+    re.replace_all(sql, |caps: &regex::Captures| {
+        let prefix = &caps[1];
+        let schemas = &caps[2];
+        let suffix = &caps[3];
+        if schemas.to_lowercase().contains("public") {
+            format!("{prefix}{schemas}{suffix}")
+        } else {
+            format!("{prefix}{schemas}, public{suffix}")
+        }
+    })
+    .to_string()
+}
+
 /// The DDL `combine` writes for `entity` in a project whose SQL is `dialect`.
 ///
 /// The authored files are already in the project's dialect and are copied as
@@ -97,7 +118,9 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
 pub fn combined_ddl(entity: &Entity, dialect: crate::parser::Dialect) -> Option<String> {
     use crate::parser::Dialect;
     match (dialect, entity.entity_type) {
-        (Dialect::PostgreSql | Dialect::Unstated, _) => ddl_from_entity(entity),
+        (Dialect::PostgreSql | Dialect::Unstated, _) => {
+            ddl_from_entity(entity).map(|ddl| ensure_public_in_search_path(&ddl))
+        }
         (Dialect::TSql, EntityType::Schema) => {
             // `]` doubles inside a bracketed name, then `'` inside the N'…' literal.
             let bracketed = format!("[{}]", entity.name.replace(']', "]]"));

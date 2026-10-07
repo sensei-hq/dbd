@@ -11,27 +11,11 @@ use super::{CatalogData, DatabaseAdapter, ProjectMeta, ReferenceClass};
 mod bookkeeping;
 use bookkeeping::Bookkeeping;
 
-/// Ensure `public` is included in any SET search_path statement.
-/// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
-/// but omit `public`, which hides extensions installed in the public schema.
-fn ensure_public_in_search_path(sql: &str) -> String {
-    let re = regex::Regex::new(r"(?i)(set\s+search_path\s+to\s+)([^;]+)(;)").unwrap();
-    re.replace_all(sql, |caps: &regex::Captures| {
-        let prefix = &caps[1];
-        let schemas = &caps[2];
-        let suffix = &caps[3];
-        if schemas.to_lowercase().contains("public") {
-            format!("{prefix}{schemas}{suffix}")
-        } else {
-            format!("{prefix}{schemas}, public{suffix}")
-        }
-    })
-    .to_string()
-}
 use crate::config::ResolvedMatview;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
+use crate::script::ensure_public_in_search_path;
 
 /// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
 /// 'a' = NO ACTION (unspecified — return None so the emitter omits the clause),
