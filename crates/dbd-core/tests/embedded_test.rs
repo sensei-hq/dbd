@@ -4375,3 +4375,65 @@ async fn reconcile_without_a_version_records_none_applied() {
         .await
         .expect("a dev reset of an unversioned project is allowed");
 }
+
+/// A database a dbd before 0.25 stamped keeps its drift tracking on upgrade.
+/// That dbd kept the `dbd:hash` stamp in the matview's comment; 0.25 reads the
+/// comment only while no stamp row exists, and the first apply re-ran the
+/// file's own `COMMENT ON`, erasing the old stamp before anything recorded it.
+/// Every reconcile afterwards warned "not stamped by dbd".
+#[tokio::test]
+async fn an_upgraded_database_keeps_its_matview_drift_stamp() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_upgrade").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: mv_upgrade\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\ncreate table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view if not exists app.mv as select id from app.items with data;\n\
+         comment on materialized view app.mv is 'Revenue per day';\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    load()
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("first apply");
+
+    // Put the database back the way 0.24 left it: the stamp in the comment,
+    // no stamp row.
+    adapter
+        .execute_script(
+            "DO $$ DECLARE s text; BEGIN \
+               SELECT stamp INTO s FROM dbd.matview_stamps WHERE matview = 'app.mv'; \
+               EXECUTE format('COMMENT ON MATERIALIZED VIEW app.mv IS %L', s); \
+               DELETE FROM dbd.matview_stamps; END $$;",
+        )
+        .await
+        .expect("simulate a 0.24 stamp");
+
+    load()
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply with 0.25");
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("app.mv")),
+        "the upgraded view is still tracked: {:?}",
+        plan.warnings
+    );
+}
