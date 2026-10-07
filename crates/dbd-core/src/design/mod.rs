@@ -1939,6 +1939,49 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// An extension installed `WITH SCHEMA x` needs `x`. Every scope keeps the
+    /// extension (unless its `extensions:` allowlist says otherwise) but only
+    /// kept the schemas its own entities live in, so any scope without `x`
+    /// failed with `schema "x" does not exist`.
+    #[test]
+    fn a_scope_keeps_the_schema_its_extensions_install_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/core")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - extensions\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: pgcrypto\n        schema: extensions\n\
+             scopes:\n  core_only:\n    includes: [core]\n  bare:\n    includes: [core]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let names = |scope: &str| -> Vec<String> {
+            let s = design.resolve_scope(Some(scope), None).unwrap();
+            design
+                .scoped_entities(&s)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert!(
+            names("core_only").contains(&"extensions".to_string()),
+            "{:?}",
+            names("core_only")
+        );
+        assert!(
+            !names("bare").contains(&"extensions".to_string()),
+            "a scope installing no extension needs no extension schema: {:?}",
+            names("bare")
+        );
+    }
+
     /// A table depends on the enum a column is typed with and on the sequence a
     /// default draws from. Neither was recorded, so a scope could leave them out
     /// with no gap reported, and apply failed on a type that did not exist.
