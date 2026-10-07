@@ -596,3 +596,51 @@ impl Design {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::mock::MockAdapter;
+
+    /// A migration's `.sql` and `.data.sql` were read decoded — SSMS may have
+    /// re-saved them as UTF-16 — but its `.drop.sql` was read with
+    /// `read_to_string`, so the same edit failed the drop step with an encoding
+    /// error.
+    #[tokio::test]
+    async fn a_utf16_drop_script_runs() {
+        let design = Design::from_config(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml"),
+            "dev",
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let drop_sql = tmp.path().join("config.legacy.drop.sql");
+        std::fs::write(
+            &drop_sql,
+            crate::source_text::utf16le("DROP TABLE IF EXISTS config.legacy;\n"),
+        )
+        .unwrap();
+
+        let mock = MockAdapter::new();
+        let step = ExecutionStep::DropEntity {
+            entity_name: "config.legacy".to_string(),
+            drop_sql_path: drop_sql,
+            migration_version: 2,
+        };
+        design
+            .execute_plan_step(
+                &mock,
+                &step,
+                &std::collections::HashMap::new(),
+                None,
+                &mut ApplyCounts::default(),
+                &mut |_: &str| {},
+                &mut |_: &str, _: Option<&str>| {},
+            )
+            .await
+            .expect("a UTF-16 drop script must run");
+
+        let scripts = mock.scripts.lock().unwrap().clone();
+        assert_eq!(scripts, vec!["DROP TABLE IF EXISTS config.legacy;\n".to_string()]);
+    }
+}
