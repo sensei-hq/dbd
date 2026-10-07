@@ -19,8 +19,9 @@
 //!
 //! So both, decided per statement from the parse tree. The statement is
 //! written node by node from an allowlist of what SQLite has with the same
-//! meaning: table names become the names the script creates, and `POSITION(a
-//! IN b)` becomes `instr(b, a)`.
+//! meaning: table names become the names the script creates, `POSITION(a IN
+//! b)` becomes `instr(b, a)`, PostgreSQL's NULL ordering and LIKE escape are
+//! spelled out, and every result column is named the way PostgreSQL names it.
 //! The first node outside the allowlist refuses the whole statement, and the
 //! caller leaves it out and reports why. Everything emitted was written here,
 //! so nothing PostgreSQL-only can slip through in the text — which is the
@@ -152,6 +153,53 @@ fn unsupported(node: Option<&NodeEnum>) -> NoForm {
         None => "form for an empty node".to_string(),
     };
     none_for(what)
+}
+
+/// What a result column is called in PostgreSQL when the query does not name
+/// it — `FigureColname`, for the shapes this module writes. SQLite names such a
+/// column after its text (`count(*)`), so a query reading the view by
+/// PostgreSQL's name (`count`) found nothing.
+fn column_name(node: &pb::Node) -> String {
+    figure(node).unwrap_or_else(|| "?column?".to_string())
+}
+
+fn figure(node: &pb::Node) -> Option<String> {
+    use pb::SqlValueFunctionOp as Svf;
+    match node.node.as_ref()? {
+        NodeEnum::ColumnRef(c) => match c.fields.last()?.node.as_ref()? {
+            NodeEnum::String(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        NodeEnum::FuncCall(f) => strings(&f.funcname)?.last().map(|s| s.to_string()),
+        // The argument's name if it has one, else the type's: `x::text` is
+        // `x`, `'a'::text` is `text`.
+        NodeEnum::TypeCast(c) => c
+            .arg
+            .as_deref()
+            .and_then(figure)
+            .or_else(|| strings(&c.type_name.as_ref()?.names)?.last().map(|s| s.to_string())),
+        NodeEnum::CaseExpr(_) => Some("case".to_string()),
+        NodeEnum::CoalesceExpr(_) => Some("coalesce".to_string()),
+        NodeEnum::AExpr(a) if a.kind() == pb::AExprKind::AexprNullif => Some("nullif".to_string()),
+        NodeEnum::SqlvalueFunction(f) => match f.op() {
+            Svf::SvfopCurrentDate => Some("current_date".to_string()),
+            Svf::SvfopCurrentTimestamp => Some("current_timestamp".to_string()),
+            _ => None,
+        },
+        NodeEnum::SubLink(s) => match s.sub_link_type() {
+            pb::SubLinkType::ExistsSublink => Some("exists".to_string()),
+            pb::SubLinkType::ExprSublink => match s.subselect.as_deref()?.node.as_ref()? {
+                NodeEnum::SelectStmt(q) => match q.target_list.first()?.node.as_ref()? {
+                    NodeEnum::ResTarget(t) if !t.name.is_empty() => Some(t.name.clone()),
+                    NodeEnum::ResTarget(t) => figure(t.val.as_deref()?),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 struct Writer<'a> {
@@ -333,6 +381,8 @@ impl<'a> Writer<'a> {
         Ok(out)
     }
 
+    /// A result column, named the way PostgreSQL names it — see
+    /// [`column_name`].
     fn target(&mut self, t: &pb::ResTarget) -> Written {
         let Some(val) = t.val.as_deref() else {
             return Err(unsupported(None));
@@ -341,10 +391,17 @@ impl<'a> Writer<'a> {
             return Err(unsupported(Some(&NodeEnum::AIndirection(Box::default()))));
         }
         let written = self.expr(val)?;
-        if t.name.is_empty() {
+        let star = matches!(val.node.as_ref(), Some(NodeEnum::ColumnRef(c))
+            if matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_))));
+        if star {
             return Ok(written);
         }
-        Ok(format!("{written} AS {}", ident(&t.name)))
+        let name = if t.name.is_empty() {
+            column_name(val)
+        } else {
+            t.name.clone()
+        };
+        Ok(format!("{written} AS {}", ident(&name)))
     }
 
     fn source(&mut self, n: &pb::Node) -> Written {
@@ -431,7 +488,8 @@ impl<'a> Writer<'a> {
         Ok(out)
     }
 
-    /// ORDER BY keys.
+    /// ORDER BY keys. PostgreSQL sorts NULL above every value and SQLite below
+    /// it, so the order PostgreSQL gives is spelled out on every key.
     fn sort(&mut self, keys: &[pb::Node]) -> Written {
         use pb::{SortByDir as Dir, SortByNulls as Nulls};
         let keys = keys
@@ -451,7 +509,8 @@ impl<'a> Writer<'a> {
                 let nulls = match sb.sortby_nulls() {
                     Nulls::SortbyNullsFirst => " NULLS FIRST",
                     Nulls::SortbyNullsLast => " NULLS LAST",
-                    _ => "",
+                    _ if desc => " NULLS FIRST",
+                    _ => " NULLS LAST",
                 };
                 Ok(format!(
                     "{}{}{nulls}",
@@ -674,7 +733,13 @@ impl<'a> Writer<'a> {
                         let (pattern, escape) = (self.operand(&f.args[0])?, self.operand(&f.args[1])?);
                         Ok(format!("{l} {not}LIKE {pattern} ESCAPE {escape}"))
                     }
-                    _ => Ok(format!("{l} {not}LIKE {}", self.operand(right)?)),
+                    // PostgreSQL's LIKE escapes with a backslash unless told
+                    // otherwise; SQLite's escapes with nothing unless told.
+                    _ => Ok(format!(
+                        "{l} {not}LIKE {} ESCAPE {}",
+                        self.operand(right)?,
+                        literal("\\")
+                    )),
                 }
             }
             K::AexprBetween | K::AexprNotBetween => {
