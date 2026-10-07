@@ -523,3 +523,81 @@ fn a_name_the_scope_builds_still_works() {
         assert!(out.status.success(), "{args:?}: {}", stderr(&out));
     }
 }
+
+// ── a command that takes --scope honours all of it, or says what it ignores ──
+
+/// `inspect --fix --scope hub` reformatted every DDL file in the project, so
+/// a scoped inspect rewrote files the scope does not build.
+#[test]
+fn inspect_fix_under_a_scope_formats_only_the_scopes_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    let unformatted = |schema: &str, table: &str| {
+        format!(
+            "set search_path to {schema};\nCREATE TABLE IF NOT EXISTS {table} (id integer primary key, name text);\n"
+        )
+    };
+    write(tmp.path(), "ddl/table/app/users.ddl", &unformatted("app", "users"));
+    write(tmp.path(), "ddl/table/hub/nodes.ddl", &unformatted("hub", "nodes"));
+
+    let out = dbd(tmp.path(), &["inspect", "--fix", "--scope", "hub"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let read = |rel: &str| fs::read_to_string(tmp.path().join(rel)).unwrap();
+    assert_ne!(
+        read("ddl/table/hub/nodes.ddl"),
+        unformatted("hub", "nodes"),
+        "the scope's file is formatted"
+    );
+    assert_eq!(
+        read("ddl/table/app/users.ddl"),
+        unformatted("app", "users"),
+        "a file outside the scope is left alone"
+    );
+}
+
+/// `import -n <table> -f <file> --scope hub` loaded into a table the scope
+/// does not build, as if `--scope` had not been given.
+#[test]
+fn importing_a_file_into_a_table_outside_the_scope_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    write(tmp.path(), "users.csv", "id\n1\n");
+    let file = tmp.path().join("users.csv");
+
+    let out = dbd(
+        tmp.path(),
+        &[
+            "import",
+            "--dry-run",
+            "-n",
+            "app.users",
+            "-f",
+            file.to_str().unwrap(),
+            "--scope",
+            "hub",
+        ],
+    );
+    assert!(!out.status.success(), "must refuse: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("app.users is outside scope 'hub'"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// `--scope` given to a command that ignores it is warned about; `--deps`,
+/// which only means anything to a scope, was accepted in silence.
+#[test]
+fn deps_given_to_a_command_without_a_scope_is_warned_about() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["snapshot", "--list", "--deps", "include"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--deps include ignored"),
+        "the ignored flag is named: {}",
+        stderr(&out)
+    );
+}
