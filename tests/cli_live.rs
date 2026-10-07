@@ -168,9 +168,9 @@ fn scope_line(o: &Output) -> Option<String> {
 
 /// Every other scoped command says what it narrowed to. `diff` and `reconcile`
 /// said nothing, so a scoped diff reporting no drift read exactly like a whole
-/// database in sync.
+/// database in sync — and `apply`, `import` and `policies` said nothing either.
 #[tokio::test]
-async fn diff_and_reconcile_name_the_scope_they_ran_under() {
+async fn the_connecting_commands_name_the_scope_they_ran_under() {
     let (_pg, url) = start_pg().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -181,6 +181,18 @@ async fn diff_and_reconcile_name_the_scope_they_ran_under() {
     for args in [
         &["diff", "--scope", "hub"][..],
         &["reconcile", "--dry-run", "--scope", "hub"][..],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
+    }
+
+    // The runs that write: `apply --dry-run` named the scope and the run it
+    // previews did not.
+    for args in [
+        &["apply", "--scope", "hub"][..],
+        &["import", "--scope", "hub"][..],
+        &["policies", "--scope", "hub"][..],
     ] {
         let o = dbd(dir, &url, args);
         assert!(o.status.success(), "{args:?}: {}", combined(&o));
