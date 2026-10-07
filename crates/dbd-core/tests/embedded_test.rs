@@ -622,6 +622,71 @@ async fn a_json_array_file_imports_one_row_per_record() {
     .await;
 }
 
+// ── Test: a Postgres CSV/TSV export imports into SQLite unchanged ─────────────
+
+/// `dbd export` from Postgres and `dbd import` into SQLite is how data moves
+/// between the engines, so every value must arrive as it left. Postgres writes
+/// real CSV — a comma or a newline quoted, a quote doubled, NULL as an empty
+/// field and `''` as `""` — and SQLite split each line on the delimiter and
+/// trimmed: the comma was "too many columns", quotes stayed in the value.
+#[tokio::test]
+async fn a_postgres_export_imports_into_sqlite_unchanged() {
+    let (_pg, url) = start_pg().await;
+    let pg = connect(&url, "embedded_test").await.unwrap();
+    // Everything CSV quoting exists for, plus the NULL/'' distinction.
+    let expected: Vec<(i64, Option<String>)> = [
+        (1, Some("Japan, Nippon")),
+        (2, Some("say \"hi\"")),
+        (3, Some("two\nlines")),
+        (4, Some("a\ttab")),
+        (5, Some("  padded  ")),
+        (6, Some("")),
+        (7, None),
+    ]
+    .iter()
+    .map(|(id, v)| (*id, v.map(str::to_string)))
+    .collect();
+    pg.execute_script(
+        r#"CREATE SCHEMA app;
+           CREATE TABLE app.countries (id integer, name text);
+           INSERT INTO app.countries VALUES
+             (1, 'Japan, Nippon'), (2, 'say "hi"'), (3, E'two\nlines'), (4, E'a\ttab'),
+             (5, '  padded  '), (6, ''), (7, NULL);"#,
+    )
+    .await
+    .unwrap();
+
+    for format in ["csv", "tsv"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut export = Entity::new(EntityType::Table, "app.countries");
+        export.format = Some(format.to_string());
+        pg.export_data(&export, Some(out.path())).await.expect("export failed");
+
+        let db = out.path().join("target.db");
+        let sqlite_url = format!("sqlite://{}", db.display());
+        let sqlite = connect(&sqlite_url, "embedded_test").await.unwrap();
+        sqlite
+            .execute_script("CREATE TABLE countries (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let mut import = Entity::new(EntityType::Table, "app.countries");
+        import.file = Some(out.path().join(format!("countries.{format}")));
+        import.format = Some(format.to_string());
+        sqlite
+            .import_data(&import, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: SQLite import failed: {e}"));
+
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect(&sqlite_url).await.unwrap();
+        let got: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, name FROM countries ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(got, expected, "{format}: the values Postgres exported");
+    }
+}
+
 // ── Test: JSONL export → import is a round trip ───────────────────────────────
 
 /// `dbd export -f jsonl` is how data moves to a new database, so what it writes

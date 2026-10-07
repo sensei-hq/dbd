@@ -1276,6 +1276,118 @@ mod tests {
         assert_eq!(multi_row_placeholders(2, 3), "(?,?),(?,?),(?,?)");
     }
 
+    // ── CSV/TSV is read as CSV ───────────────────────────────────────────────
+
+    /// Load `body` as a `format` data file into `t (id INTEGER, v TEXT)`, and
+    /// read every row back in id order.
+    async fn load_delimited(format: &str, body: &str, null_value: &str) -> Result<Vec<(i64, Option<String>)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("t.{format}"));
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "staging.t");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+        a.import_data(&entity, null_value, false).await?;
+        Ok(
+            sqlx::query_as::<_, (i64, Option<String>)>("SELECT id, v FROM t ORDER BY id")
+                .fetch_all(&a.pool)
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn rows(expected: &[(i64, Option<&str>)]) -> Vec<(i64, Option<String>)> {
+        expected.iter().map(|(id, v)| (*id, v.map(str::to_string))).collect()
+    }
+
+    /// RFC 4180: a quoted field may hold the delimiter, a doubled quote and a
+    /// line break, and nothing is trimmed. Each line was split on commas and
+    /// every cell trimmed — a quoted comma was "too many columns", quotes were
+    /// kept in the value, and padding was lost — so a CSV Postgres exported
+    /// could not be imported here.
+    #[tokio::test]
+    async fn a_csv_is_read_as_rfc_4180() {
+        let got = load_delimited(
+            "csv",
+            "id,v\n1,\"Japan, Nippon\"\n2,\"say \"\"hi\"\"\"\n3,\"two\nlines\"\n4,  padded  \n",
+            "",
+        )
+        .await
+        .expect("import failed");
+        assert_eq!(
+            got,
+            rows(&[
+                (1, Some("Japan, Nippon")),
+                (2, Some("say \"hi\"")),
+                (3, Some("two\nlines")),
+                (4, Some("  padded  ")),
+            ])
+        );
+    }
+
+    /// RFC 4180 ends lines with CRLF; a `\r` is not part of the last value.
+    #[tokio::test]
+    async fn a_crlf_csv_loads_without_its_carriage_returns() {
+        let got = load_delimited("csv", "id,v\r\n1,a\r\n2,\"b\"\r\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a")), (2, Some("b"))]));
+    }
+
+    /// Quoting is how CSV tells an empty string from NULL: Postgres's COPY
+    /// writes NULL as an empty unquoted field and `''` as `""`, and reads them
+    /// back that way. An unquoted field matching `null_value` is NULL; a quoted
+    /// one is always a value — under the default sentinel and a configured one.
+    #[tokio::test]
+    async fn a_quoted_field_is_a_value_never_null() {
+        let got = load_delimited("csv", "id,v\n1,\n2,\"\"\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some(""))]));
+
+        let got = load_delimited("csv", "id,v\n1,\\N\n2,\"\\N\"\n3,\n", "\\N")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some("\\N")), (3, Some(""))]));
+    }
+
+    /// A TSV is the same format with a tab between fields, so a quoted field
+    /// may hold a tab.
+    #[tokio::test]
+    async fn a_tsv_field_may_quote_a_tab() {
+        let got = load_delimited("tsv", "id\tv\n1\t\"a\tb\"\n2\t c \n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a\tb")), (2, Some(" c "))]));
+    }
+
+    /// A quote left open runs to the end of the file: loading it would put
+    /// every row after it into one value. Refused, saying where it opened, and
+    /// nothing is loaded.
+    #[tokio::test]
+    async fn an_unterminated_quote_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,\"open\n3,c\n", "")
+            .await
+            .expect_err("an unterminated quote must be refused")
+            .to_string();
+        assert!(err.contains("quote") && err.contains("line 3"), "{err}");
+    }
+
+    /// A row with more or fewer fields than the header is refused, saying which.
+    #[tokio::test]
+    async fn a_row_with_the_wrong_field_count_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,b,c\n", "")
+            .await
+            .expect_err("a ragged row must be refused")
+            .to_string();
+        assert!(
+            err.contains("line 3") && err.contains('3') && err.contains('2'),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn s15_import_csv_multi_batch_path() {
         use tempfile::NamedTempFile;
