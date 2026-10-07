@@ -41,6 +41,11 @@ stop data loss:
 - **`reconcile` records version 0 for a project with no `project.version`**,
   as `apply` does. It recorded 1, after which a dev `reset` refused as though
   migrations had run.
+- **Only a procedure is matched as an import loader.** A function was matched
+  too and then run with `CALL`, which Postgres refuses for a function — and a
+  helper function reading the staging table could be picked ahead of the real
+  loader. A function that reads a staging table no procedure loads is now named
+  in a warning.
 - **`dbd emit --dialect tsql` ends every statement with `GO`**, the
   sqlcmd/SSMS batch separator — `CREATE SCHEMA` and `CREATE VIEW` must each be
   alone in a batch. Split on it before sending the script through a driver.
@@ -52,7 +57,11 @@ stop data loss:
   - `DbmlMultiParams` gains a required `design_entities` field.
   - `RefKind` gains `Uses` (a column's type, or the sequence its default draws
     from); an exhaustive `match` on `RefKind` needs an arm.
-  - `DatabaseAdapter` gains `stamp_matview`, with a no-op default.
+  - `DatabaseAdapter` gains `stamp_matview` (no-op default) and
+    `truncate_table` (default `TRUNCATE TABLE`).
+  - `ImportPlanEntry.procedure` names only a procedure, and `Design::import_data`
+    no longer calls `ensure_import_procedure` — the Postgres JSON load installs
+    its own.
   - `design::import_entry_in_scope` is deprecated in favour of
     `Design::scoped_import_plan`, which also requires a declared staging table
     and says why an entry was left out.
@@ -130,6 +139,26 @@ stop data loss:
   `materialized_views`, `matview`, `matviews` and `sequences`.
 - **`--help` for `--source` and `dbd diff`** is accurate.
 
+**Import and export**
+
+- **The default `truncate: true` works on SQLite and Convex.** Import issued
+  `TRUNCATE`, which SQLite does not have and Convex cannot run; truncation now
+  goes through the adapter (`DELETE FROM` on SQLite, `--replace` on Convex).
+- **A `.json` data file is read as JSON** — an array of records or JSON lines —
+  on Postgres, SQLite and `import -f`. It was read as CSV.
+- **A JSONL export imports back to the same values.** It was written from
+  `COPY` text, which doubled backslashes.
+- **`dbd export` refuses a format Postgres cannot write**, instead of writing
+  CSV under the requested name.
+- **An ad-hoc JSON import runs on a fresh database**: the Postgres JSON load
+  installs its own loader procedure.
+- **A JSON record mentioning `set search_path to …` imports unchanged.**
+  Records are staged as bound parameters, not spliced into SQL that the
+  search-path rewrite then edited.
+- **A UTF-16 DDL file applies, deploys and combines.** The scan decoded it, but
+  apply, deploy, combine, format, doctor, merge and the migration readers read
+  it as UTF-8 and silently skipped or garbled it.
+
 **`dbd emit`** — everything a target cannot take is now reported, inline and in
 `--report`; nothing is dropped silently.
 
@@ -181,6 +210,9 @@ stop data loss:
 
 ### Known limitations
 
+- On Convex, `truncate: false` has no effect (the import always replaces), and
+  a `.json` file must be a JSON array — Convex's importer reads no JSON lines.
+- Import data files are read as UTF-8; a UTF-16 CSV is not decoded.
 - `apply.before` hooks run outside apply's transaction, so their effects stay
   when the entity batch rolls back.
 - `dbd diff` does not compare table, view or enum comments.
