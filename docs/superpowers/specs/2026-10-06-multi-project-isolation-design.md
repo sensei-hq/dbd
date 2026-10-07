@@ -1,299 +1,379 @@
 # Multi-Project Isolation in One Database (#7)
 
-**Date:** 2026-10-06
+**Date:** 2026-10-06 (rev 2, 2026-10-07)
 **Status:** Proposed
-**Scope:** Make "several independently-maintained dbd projects in one Postgres
-database" a supported topology. Projects record which schemas they own in the
-shared `dbd` bookkeeping schema. Every mutating entry point refuses to act when
-the schemas overlap. Destructive paths never reach past what the project owns.
-SQLite gets the same rule in its one namespace; Convex is unchanged.
+**Scope:** Let several owners share one database safely: independent projects
+from different repositories, and modules of one workspace kept under
+`database/<module>/`. Ownership is per **entity**, recorded in the shared `dbd`
+bookkeeping schema. No schema is special, `public` included. A module may use
+another module's entities but never alter or drop them. Entities that several
+modules need live in a module of their own. Phase 1 fixes four existing bugs
+that are wrong even with a single project.
+
+**Rev 2 changes rev 1 (schema-level ownership)** in three ways:
+
+- Ownership moves from schemas to entities.
+- `public` is no longer a special case.
+- Modules get their own roots.
+
+Sensei is the motivating case. Its `dojo` scope pulls 31 entities out of the
+`sensei` and `staging` schemas, which it shares with the app's own tables.
+Schema-level ownership could not express that.
 
 ---
 
 ## Overview
 
-Isolation today rests on convention. `project.name` keys the bookkeeping rows.
-`reconcile --prune` is bounded by `managed_schemas`, which is recomputed from the
-design on every run. Nothing records what a project owns, and nothing checks one
-project against another. Issue #7's line numbers are out of date: bookkeeping
-moved to `dbd.meta` / `dbd.migrations` in the 2026-08-18 bookkeeping-schema spec.
-The gaps it describes are all still there, plus five it did not list.
+### Hazards today (unchanged from rev 1, and still the target)
 
 | # | Hazard | Where | Effect on a co-tenant |
 |---|---|---|---|
-| H1 | Overlapping schemas | `managed_schemas` (`design/scope.rs`) | `reconcile --prune` drops their tables as orphans; `reset --schemas` drops their schema |
-| H2 | `public` enters `managed_schemas` undeclared | a target **role**, or an **extension** without `schema:`, has `schema = None`, which maps to `public` | any project with a role prunes the `public` tables of whichever project owns `public` |
-| H3 | Same `project.name` | `ON CONFLICT (project) DO UPDATE` in `Bookkeeping::set_meta` | silent takeover of their version row and migration history |
-| H4 | pg_cron refresh jobs | `sync_refresh_jobs` unschedules every `dbd:refresh:%` job not in *this* project's list, on every apply, deploy and reconcile | all their matview refresh jobs are unscheduled |
-| H5 | Legacy heal | `Bookkeeping::heal` folds **and drops** `_dbd_meta` / `_dbd_migrations` in every schema, whoever wrote them | a co-tenant still on an older dbd loses its bookkeeping table |
-| H6 | `reset` reach | per-entity `DROP … CASCADE`; `DROP EXTENSION … CASCADE`; `DROP ROLE` | their views and FKs on our tables, their extension-typed columns, and shared roles all go |
-| H7 | Shared import staging | `staging._dbd_import_tmp` is created, truncated and dropped by every jsonl import | concurrent imports corrupt each other |
-| H8 | `reset` guard sees one row | prod/version guard reads only this project's meta | a project with no row resets freely on a DB holding another project's prod data |
-| H9 | Onboarding | `init --from-db` refuses on *any* bookkeeping; `merge` introspects every schema | a second project cannot onboard, and `merge` absorbs the first project's schemas |
+| H1 | Prune by schema membership | `managed_schemas` + `restrict_snapshot_to_schemas` | `reconcile --prune` drops another owner's tables in any schema both touch |
+| H2 | `public` enters undeclared | a target role, or an extension without `schema:`, maps to `public` | a project with a role prunes `public` |
+| H3 | Same `project.name` | `ON CONFLICT (project) DO UPDATE` in `Bookkeeping::set_meta` | silent takeover of version and history |
+| H4 | pg_cron refresh jobs | `sync_refresh_jobs` unschedules every `dbd:refresh:%` job not its own | another owner's refresh jobs disappear |
+| H5 | Legacy heal | folds and drops `_dbd_*` tables whoever wrote them | an owner on an older dbd loses its bookkeeping |
+| H6 | `reset` reach | `DROP … CASCADE`, `DROP SCHEMA/EXTENSION … CASCADE`, `DROP ROLE` | another owner's views, FKs, columns, schemas and roles |
+| H7 | Shared import staging | `staging._dbd_import_tmp` | concurrent imports corrupt each other |
+| H8 | `reset` guard sees one row | prod/version guard reads only this owner's meta | resets freely beside another owner's prod data |
+| H9 | Onboarding | `init --from-db` refuses on any bookkeeping; `merge` reads every schema | a second owner cannot onboard; `merge` absorbs the first |
 
-### Model: a project owns schemas, exclusively
+### Concepts
 
-A **schema** is the unit of ownership. A project owns every schema its **whole
-design** declares. That means its `Schema` entities, which already include every
-schema an entity file lives in, plus `public` if it has unqualified
-schema-scoped entities. Ownership is computed from the full design and **never
-from the scope**; #40 established that a scope narrows what is applied, not what
-the project owns.
+| Term | Meaning |
+|---|---|
+| **Owner** | Whatever deploys into the database and holds ownership: a single-root project (today's layout) or one module of a workspace. Its identity is `project.name` or `<project>/<module>`. |
+| **Entity ownership** | Each entity has exactly one owner per database. Only the owner creates, alters or drops it. |
+| **Use** | An owner may reference another owner's entity (FK, view, join, function body) but not change it. dbd records each use, and the entity's owner cannot break it. |
+| **Workspace** | `database/design.yaml` plus module roots `database/<module>/`. A project without modules is a workspace of one, so today's layout is unchanged. |
+| **Module** | A partition: entities never overlap between modules. Modules declare `depends_on`. |
+| **Scope** | A selection that may overlap. In a workspace, a scope selects modules (and can still select entities). |
 
-Roles and extensions are not schema-scoped and own no schema. They are
-**shared** resources. A project records that it *uses* them, so `reset` can
-refuse to drop one that another project also uses.
-
-Schema ownership is exclusive, and the database enforces it with a unique index.
-The CLI check alone is not enough: two concurrent first runs must not both
-succeed. `public` follows the same rule. At most one project on a shared
-database may own `public`, and every other project must use named schemas. That
-answers #7's open question about `public` without adding a special case.
-
-### Why not per-object ownership
-
-Tracking ownership per table would let two projects share `public`. It needs an
-ownership marker on every object, a backfill of every object in every existing
-database, and a prune planner that consults it per object. Exclusive schemas
-meet every acceptance criterion in #7 with one small table. Per-object ownership
-can be layered on later if a real need appears.
-
-### Why not a per-project bookkeeping schema (issue option 5)
-
-Option 5 was motivated by bookkeeping being forced into `public`, which the
-`dbd` schema move already fixed. Once ownership is enforced, isolating the
-bookkeeping rows adds no safety. Close it as superseded.
-
-### "One design + scopes" vs separate projects
-
-These are complementary, not alternatives. After #40, scopes are the right tool
-for **one** team deploying modules of **one** design. Separate projects are for
-designs maintained independently, with different repos, owners and release
-cadences. The guide will say which to use when. #7 covers the second case.
+Modules partition and scopes select. That is why scopes could never carry
+ownership (they share entities by design) and modules can.
 
 ---
 
-## Changes
+## 1. Ownership at the entity level
 
-### Phase 1: stop the bleeding (no new tables; patch release)
+### Registry
 
-Each of these is a standalone fix that is wrong even on a single-project
-database. They ship first, whatever happens to the rest.
-
-**1a. Roles and extensions stop contributing to `managed_schemas`** (H2).
-`Design::managed_schemas` skips `EntityType::Role` and `EntityType::Extension`.
-The search-path prelude still appends `public`, so name resolution does not
-change. Only the prune and diff boundary does.
-
-**1b. pg_cron jobs carry the project** (H4). The job name becomes
-`dbd:refresh:<project>:<schema>.<name>`, and the unschedule filter becomes
-`jobname LIKE 'dbd:refresh:<project>:%'`, with the project name escaped for both
-`LIKE` and quotes. Untagged legacy jobs (`dbd:refresh:<schema>.<name>`) are
-unscheduled only if `<schema>` is one this design declares. That migrates this
-project's old jobs and leaves everyone else's alone.
-
-**1c. Heal folds only this project's legacy rows** (H5). For each legacy
-`_dbd_meta` / `_dbd_migrations`, heal copies and deletes the rows
-`WHERE project = $1`, then drops the table only if it is now empty. Other
-projects' rows stay where their own (possibly older) binary reads them, and
-they fold when that project upgrades. The current fold-all copies a row with
-`DO NOTHING`, which would freeze a stale copy in `dbd.meta` the moment the older
-binary writes again. Folding per project avoids that.
-
-**1d. Import staging moves into `dbd`, one table per project** (H7).
-`staging.import_jsonb_to_table` becomes `dbd.import_jsonb_to_table`. The staging
-table becomes `dbd."import_tmp:<project>"`, with a hash suffix when the name
-would pass 63 bytes. Imports run through the pool (`execute_script`), so a
-session `TEMP` table is not an option. `staging` reverts to being an ordinary
-user schema, which finishes the `staging` item the bookkeeping spec deferred.
-Stale `staging.import_jsonb_to_table` procedures in existing databases are left
-in place, since an older co-tenant binary may still call them.
-
-### Phase 2: the ownership registry (minor release)
-
-**2a. `dbd.ownership`**, added to `LAYOUT_DDL` (so heal creates it on every
-existing database):
+Two tables are added to `LAYOUT_DDL`, so heal creates them on every existing
+database:
 
 ```sql
-CREATE TABLE IF NOT EXISTS dbd.ownership (
-  project    varchar     NOT NULL,
-  kind       varchar     NOT NULL CHECK (kind IN ('schema', 'extension', 'role')),
-  name       varchar     NOT NULL,
+-- One owner per entity. The key mirrors Postgres's own namespaces, so two
+-- owners can never both hold something that could collide.
+CREATE TABLE IF NOT EXISTS dbd.objects (
+  namespace  varchar NOT NULL CHECK (namespace IN ('relation', 'type', 'routine')),
+  schema     varchar NOT NULL,
+  name       varchar NOT NULL,
+  kind       varchar NOT NULL,   -- table, view, materialized view, sequence, enum, function, procedure, ...
+  owner      varchar NOT NULL,
   claimed_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (project, kind, name)
+  PRIMARY KEY (namespace, schema, name)
 );
--- A schema has exactly one owner; extensions and roles are shared.
-CREATE UNIQUE INDEX IF NOT EXISTS ownership_schema_exclusive
-  ON dbd.ownership (name) WHERE kind = 'schema';
+-- Non-exclusive relationships: an owner uses a schema, an extension, a role,
+-- or another owner's entity (and through which of its own entities).
+CREATE TABLE IF NOT EXISTS dbd.uses (
+  owner   varchar NOT NULL,
+  kind    varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity')),
+  target  varchar NOT NULL,        -- 'app', 'vector', 'basic', 'relation:identity.users'
+  via     varchar NOT NULL DEFAULT '',  -- 'view billing.v_invoices'
+  PRIMARY KEY (owner, kind, target, via)
+);
 ```
 
-**2b. `Design::owned()`** returns an `Ownership { schemas, extensions, roles }`
-computed from `entities_in_scope(None, None, None)`, the whole design.
-`declared_out_of_scope` (#40) stays as it is. It answers a different question:
-which tables to hide from a *scoped* prune.
+The `relation` namespace covers tables, views, materialized views, sequences
+and foreign tables, which all share `pg_class`. A table and a view of the same
+name cannot both exist, so they cannot have two owners. `type` covers enums,
+domains and composites. `routine` is per name: dbd already drops every overload
+of a name together. Indexes, constraints, triggers, policies and comments
+belong to their table.
 
-**2c. Adapter trait** gains three methods. Convex and other adapters get no-op
-defaults.
+**Schemas, extensions and roles are shared containers**, recorded in
+`dbd.uses`. No schema is special. An owner never "owns" `public`, `app`, or any
+other schema; it owns the entities it puts there.
 
-- `ownership(&self) -> Result<Vec<OwnershipRow>>` reads every project's rows. It
-  is read-only and returns empty if the table does not exist yet.
-- `claim(&self, owned: &Ownership) -> Result<()>` inserts this project's missing
-  rows. A unique violation on `ownership_schema_exclusive` maps to
-  `DbdError::Ownership { schema, owner }`.
-- `release_unowned(&self, owned: &Ownership) -> Result<Vec<String>>` deletes
-  this project's rows that the design no longer declares, and returns the
-  released schema names.
+### Rules
 
-**2d. One preflight, in core, for every mutating entry point.** The check lives
-in core so library embedders get it too. There is no single choke point today,
-so each entry calls one function:
+**Claim (apply, deploy, reconcile, reset).** Before any DDL, the owner claims
+every entity its whole design declares. "Whole design" means the full design,
+never the scope (#40). A claim on an entity held by another owner fails with no
+DDL executed:
+
+`relation app.orders is owned by "shop/billing"; owners sharing a database must not declare the same entity`
+
+The primary key makes this atomic: of two concurrent first runs, exactly one
+wins.
+
+**Prune.** `reconcile --prune` drops a live entity only when one of these holds:
+
+- (a) this owner owns it and no longer declares it; or
+- (b) nobody owns it, and its schema is used by no other owner.
+
+Rule (b) keeps today's drift clean-up for a database with one owner. In a
+schema that another owner also uses, unowned entities are reported and never
+dropped:
+
+`unowned: public.tmp_report — not dropped because public is shared with "billing"`
+
+Entities owned by someone else are never candidates. This replaces
+`managed_schemas` as the prune boundary. `restrict_snapshot_to_schemas` stays
+as a second lock.
+
+**Release.** An entity is released when its owner's successful run no longer
+declares it and the entity no longer exists: it was pruned, or a migration's
+`.drop.sql` dropped it. An entity removed from the design but left in the
+database stays owned. So a later run of the same owner prunes it under rule (a),
+and nobody else can claim it by accident.
+
+**Transfer** (moving an entity between owners):
+
+- Within one workspace deploy, dbd sees both sides. The entity leaves module A's
+  folder and appears in module B's, and ownership moves with no prune.
+- Between independent repositories, the receiver runs with
+  `--adopt-from <owner>`, which is explicit and printed. The giver's next run
+  sees it no longer owns the entity and does not prune it.
+
+**Uses are guarded.** At deploy time an owner records every reference its
+design makes to another owner's entity, from dbd's parsed references, the same
+ones scopes and the dependency graph use. Parsed references see into function
+bodies, which `pg_depend` does not. Before an owner drops or destructively
+alters an entity, dbd checks both `dbd.uses` and `pg_depend`. If another owner
+depends on it, dbd refuses:
+
+`identity.users.email is used by "billing" (view billing.v_invoices); remove that use first`
+
+This is the contract between owners. It plays the role an API plays between
+services.
+
+**Reset.** Reset drops only entities this owner owns. On top of that:
+
+- `--schemas` drops a schema only when it holds no entity owned by anyone else
+  and no unowned entity.
+- `--extensions` and `DROP ROLE` skip anything another owner uses.
+- `CASCADE` stays, after the same uses guard: Postgres's cascade cannot reach
+  another owner's entity, because the guard refused first.
+- The prod guard refuses while any owner's row is `env = 'prod'`, unless
+  `--force` is given.
+
+**Name reuse** (H3) is detected at claim time. Suppose a design arrives under an
+owner name that already owns entities in this database, and it declares none of
+them. dbd refuses with `owner "app" here owns 42 entities; this design declares
+none of them`. `--allow-ownership-change` overrides it.
+
+**Backfill.** The first upgraded run of each owner claims the declared entities
+that already exist and nobody owns. Undeclared live entities stay unowned. On a
+database with one owner, rule (b) keeps pruning them exactly as today. No
+migration step is needed.
+
+Rule (b) is suspended while any owner in `dbd.meta` has not upgraded yet (a
+meta row with no `dbd.uses` rows). That owner's schema uses are unknown, so an
+unowned entity might be its own. The prune report names the owners still to
+upgrade.
+
+**SQLite** uses the same model in its single namespace (`_dbd_objects`,
+`_dbd_uses`), with no special case. **Convex** is one deployment per project and
+is unchanged.
+
+### Where it runs
+
+There is one core function, so library embedders are protected too:
 
 ```rust
-// design/ownership.rs
 pub(crate) async fn preflight(&self, adapter: &dyn Adapter, mode: Preflight) -> Result<()>
-// Preflight::Claim  — apply, deploy (via apply), reconcile, reset: heal → check → claim
-// Preflight::Check  — import, policies, refresh, reconcile --dry-run, diff: check only, no writes
+// Claim — apply, deploy, reconcile, reset: heal → claim → record uses
+// Check — import, policies, refresh, --dry-run, diff: read-only, same refusals, no writes
 ```
-
-The check refuses, with no DDL executed, when either of these holds:
-
-1. **Overlap:** a schema in `owned.schemas` is owned by another project:
-   `schema "billing" is owned by project "billing-svc"; projects sharing a
-   database must use disjoint schemas`.
-2. **Name reuse:** this project already owns schemas and the design declares
-   none of them: `project "app" here owns {app, audit}; this design declares
-   {shop}. If this is a different project, give it its own project.name; if the
-   project moved its schemas, re-run with --allow-ownership-change`.
-
-If the `ownership` table does not exist yet, check mode passes. Claim mode
-re-checks atomically through the unique index, so
-a concurrent loser gets the same error as a sequential one. After a successful
-apply or reconcile, `release_unowned` runs and prints `released schema "x" — it
-still exists in the database` for each schema released. `reset` keeps its
-ownership, so nobody can take the schemas between a reset and the apply that
-follows it.
-
-**2e. Destructive paths consult ownership** (the issue's belt-and-braces, H1/H6/H8):
-
-- `reset --schemas` emits `DROP SCHEMA` only for schemas this project owns.
-- `reset --extensions` and the unscoped `DROP ROLE` skip any extension or role
-  that another project also uses, and print a notice for each one skipped.
-- Before any reset on a database with other registered projects, a `pg_depend`
-  probe lists the objects outside this project's schemas that depend on
-  something reset would drop. If there are any, reset refuses (`view
-  billing.v_orders (project billing-svc) depends on app.orders`). `CASCADE`
-  stays for the project's own objects.
-- reset's prod guard also refuses when any **other** project's row is
-  `env = 'prod'`, unless `--force` is given.
-- `reconcile --prune` restricts the live snapshot to `managed ∩ owned-by-me`.
-  After 2d this is redundant by construction; it is kept as the second lock.
-
-**2f. Onboarding** (H9). `init --from-db` refuses only when **this**
-`project.name` already has a row. On a shared database it introspects only
-schemas no project owns, and notes the ones it skipped. `merge` excludes
-schemas owned by other projects in the same way.
-
-**2g. `dbd inspect --shared`** (read-only, needs `-d`). It lists each project
-with its env, version, owned schemas and used extensions and roles, then flags:
-
-- overlaps with the current design
-- projects registered in `dbd.meta` that have no ownership rows yet (not upgraded)
-- schemas that exist in the database but no project owns
-
-It is the diagnosis step before a first deploy to a shared database.
-
-**2h. Backfill.** No migration step is needed. The first upgraded mutating run
-of each project claims its owned set, so existing single-project databases
-upgrade on their next apply or reconcile. On a database that is already shared,
-upgrades are first come, first served. A project whose schemas overlap one
-already claimed gets the overlap error. That is the silent hazard #7 is about,
-now made loud. `inspect --shared` shows it before anyone runs.
-
-**2i. SQLite.** It has one namespace (`main`), so a SQLite project owns `main`.
-`_dbd_ownership` mirrors the table, and the same overlap check refuses a second
-project in the same file. Convex is one deployment per project and is unchanged.
-
-### Phase 3: docs (with phase 2)
-
-- A new guide section, "Sharing a database between projects": the disjoint
-  schemas rule, `public`, `inspect --shared`, the upgrade order, and when to use
-  scopes instead.
-- `docs/design/architecture.md`: update the "No schema_prefix" rationale to say
-  a shared database is supported when schemas are disjoint.
-- Update guide 04 (`--allow-ownership-change`, `inspect --shared`), `llms.txt`,
-  `llms-full.txt`, both `SKILL.md` copies, and the website mirrors. The
-  `dbd-pattern-verifier` agent learns to flag unqualified entities in a project
-  that targets a shared database.
 
 ---
 
-## Files Modified
+## 2. Workspaces and module roots
 
-| File | Change |
-|---|---|
-| `crates/dbd-core/src/design/scope.rs` | 1a: `managed_schemas` skips Role/Extension |
-| `crates/dbd-core/src/adapter/postgres/mod.rs` | 1b: cron job naming and filter; 1d: import staging in `dbd` |
-| `crates/dbd-core/src/internal/import_jsonb_to_table.ddl` | 1d: procedure moves to `dbd` |
-| `crates/dbd-core/src/adapter/postgres/bookkeeping.rs` | 1c: per-project fold; 2a: `dbd.ownership`; 2c: `ownership` / `claim` / `release_unowned` |
-| `crates/dbd-core/src/adapter/mod.rs` | 2c: trait methods with no-op defaults; `OwnershipRow` |
-| `crates/dbd-core/src/adapter/sqlite.rs` | 2i: `_dbd_ownership`, owner of `main` |
-| `crates/dbd-core/src/design/ownership.rs` (new) | 2b/2d: `owned()`, `preflight()` |
-| `crates/dbd-core/src/design/{apply,reconcile,reset,import}.rs`, `design/mod.rs` (`apply_policies`) | 2d: call `preflight` |
-| `crates/dbd-core/src/script.rs`, `design/reset.rs` | 2e: ownership-aware schema, extension and role drops; dependency probe; prod guard |
-| `crates/dbd-core/src/error.rs` | `DbdError::Ownership` |
-| `src/commands/reverse.rs` | 2f: `init --from-db` and `merge` |
-| `src/commands/schema.rs`, `src/cli.rs` | 2g: `inspect --shared`; `--allow-ownership-change` on apply, deploy, reconcile and reset |
+### Layout
+
+```
+database/
+  design.yaml          # workspace: project, target (url, extensions, roles), scopes, defaults
+  shared/
+    module.yaml        # optional; name defaults to the folder
+    ddl/ import/ policies/ snapshots/ migrations/
+  core/
+    module.yaml        # depends_on: [shared]
+    ddl/ import/ policies/ snapshots/ migrations/
+  dojo/
+    module.yaml        # depends_on: [shared]
+    ddl/ ...
+```
+
+Each `database/<module>/` has exactly the layout a project root has today. A
+module can therefore be lifted into its own repository unchanged and become an
+independent project. The registry treats both cases the same way.
+
+`module.yaml` holds what is per-module:
+
+- `depends_on`
+- `import`, `apply` hooks, `export`, `materialized_views`, `ignore`
+- the module's own `scopes`, for entity-level selection inside it
+
+The workspace `design.yaml` holds what is per-database:
+
+- `project`, `source`, `target` (extensions, roles), `schemas` (exposure,
+  grants), `external`, `format`
+- the workspace `scopes`
+
+A module's `module.yaml` may override `source.search_path`.
+
+A project with no `module.yaml` anywhere and a `ddl/` at the root is a workspace
+of one module. Its identity stays `project.name`, so nothing changes for
+existing projects.
+
+### Behaviour
+
+- **Static overlap check.** `dbd inspect` refuses when two modules declare the
+  same entity. This is the workspace version of the claim rule, caught before
+  any database is involved.
+- **Cross-module references** must follow `depends_on`. A reference into a
+  module that is not a dependency is a gap, reported with the same machinery
+  and wording as scope gaps. Within a workspace dbd knows the real definition,
+  so a dependency's entities are full FK targets, not `external:` stubs.
+- **Deploy order** is topological by `depends_on`: shared, then core, then dojo.
+  Each module claims, applies and records its own meta row
+  (`<project>/<module>`). Each module also has its own version, `snapshots/`
+  and `migrations/`, so modules release independently.
+- **Selecting what to run.** `--module core` selects one module, plus its
+  dependencies under `deps: include`. Workspace scopes select modules:
+
+  ```yaml
+  scopes:
+    dojo:    { modules: [dojo] }           # + shared, via depends_on
+    default: { modules: [core] }           # + shared
+  ```
+
+  Sensei's 32-entry `dojo` includes list becomes this one line.
+- **Running inside a module folder** finds the workspace root by walking up, as
+  Cargo does, and selects that module.
+- **The viewer** groups the diagram and sidebar by module, alongside the schema
+  tint.
+
+---
+
+## 3. Shared entities and keeping them in sync
+
+Ownership is always single. "Shared" means one owner and many users. Three
+patterns cover the cases, ordered by how tightly they couple modules:
+
+| Pattern | Use when | How | Sync |
+|---|---|---|---|
+| **Shared module** | Several modules need the same reference data or types: sensei's rule packs, reason codes and metric types | A `shared` module owns them; others `depends_on: [shared]` | Same database: nothing to sync. Other databases: the same module deploys to each, so the definition comes from one source. Data comes from the module's seed imports (as sensei does today) |
+| **Direct use** | A module reads or joins another module's live data and performance matters | FK, join or view straight onto the owner's entity | None. One copy, always current; the uses guard protects it |
+| **Projection** | The consumer needs its own shape, indexes or isolation, or the modules may later split into separate databases | The consumer owns a view or materialized view over the owner's entity | A view is live. A materialized view refreshes on the existing `refresh_every` and pg_cron schedule |
+
+Data that changes at runtime and must reach **another database** needs logical
+replication: a publication in the owner's database and a subscription in the
+consumer's. dbd's part would be generating the subscriber's table from the
+owner's definition and managing the publication and subscription as entities.
+That is Phase 4: real, but no current project needs it.
+
+Deliberately not supported: two modules each declaring the same entity and
+"syncing definitions". That is co-ownership. It is what turns into
+last-writer-wins today, and the shared-module pattern covers the need.
+
+---
+
+## 4. Phase 1: four standalone fixes (patch release)
+
+These are carried over from rev 1. Each is wrong today even with one project:
+
+- **1a. Roles and extensions stop pulling in `public`** (H2). They stop
+  contributing to `managed_schemas`, and later to `dbd.uses` schemas.
+- **1b. pg_cron job names carry the owner** (H4). The name becomes
+  `dbd:refresh:<owner>:<schema>.<name>`, and only this owner's jobs are
+  unscheduled. Legacy untagged jobs are unscheduled only for entities this
+  owner declares.
+- **1c. Heal folds only this owner's legacy rows** (H5). It drops a legacy table
+  only once it is empty.
+- **1d. Import staging moves into `dbd`, one table per owner** (H7).
+  `dbd.import_jsonb_to_table` and `dbd."import_tmp:<owner>"` are used, with a
+  hashed name past 63 bytes. Imports run through the pool, so `TEMP` tables
+  cannot work.
+
+---
+
+## Phasing
+
+| Phase | Ships | Closes |
+|---|---|---|
+| 1 | The four fixes above (patch) | H2, H4, H5, H7 |
+| 2 | Entity ownership for single-root projects: `dbd.objects` and `dbd.uses`, `preflight`, prune and release rules, uses guard, reset rules, backfill, `--adopt-from`, `--allow-ownership-change`, `dbd inspect --shared`, `init --from-db` and `merge` skipping other owners' entities, SQLite (minor) | H1, H3, H6, H8, H9; all of #7's acceptance criteria |
+| 3 | Workspaces: `database/<module>/`, `module.yaml`, `depends_on`, static overlap check, per-module bookkeeping, snapshots and migrations, `--module`, module-selecting scopes, viewer grouping, and converting sensei as the proving case (minor) | the clutter, plus scopes standing in for modules |
+| 4 | Logical replication: publication and subscription entities, subscriber tables generated from the owner's definition | runtime cross-database sync |
+
+Docs ship with each phase:
+
+- guide 03 (`module.yaml`, workspace `scopes`)
+- guide 04 (new flags, `inspect --shared`)
+- a new guide, "Sharing a database: projects, modules and shared entities"
+- `llms.txt`, `llms-full.txt`, both `SKILL.md` copies, the site mirrors
+- `dbd-pattern-verifier`
 
 ---
 
 ## Test Scenarios
 
-All Postgres scenarios are embedded-PG tests (`--features embedded-tests`). Each
-is written first and seen failing before the change it covers.
+These are embedded-PG unless marked unit. Each is written first and seen
+failing.
 
 | # | Phase | Scenario | Asserts |
 |---|---|---|---|
-| T1 | 1a | Project B declares a target role and an extension without a schema; A owns `public.items` | `B reconcile --prune` leaves `public.items` |
-| T2 | 1b | Job SQL for projects `a` and `b` | `b`'s unschedule filter cannot match `a`'s job names; legacy jobs are filtered by declared schema |
-| T3 | 1c | Legacy `public._dbd_meta` holds rows for `a` and `b`; `a` heals | `a` is folded and deleted; `b`'s legacy row is untouched; the table survives |
-| T4 | 1d | Two projects run jsonl imports | each uses its own staging table; neither truncates the other's |
-| T5 | 2 | A owns `app`, B owns `billing`; both apply, reconcile `--prune` and reset | no cross-drop: every table in both schemas survives |
-| T6 | 2 | B declares `app` | apply, reconcile and reset error with `DbdError::Ownership`; the catalog is unchanged and B has no ownership rows |
-| T7 | 2 | Same name, disjoint schemas | refused; `--allow-ownership-change` proceeds and moves ownership |
-| T8 | 2 | Two concurrent first claims on one schema | exactly one succeeds |
-| T9 | 2 | Existing DB with `dbd.meta` rows but no ownership; A runs, then B overlaps | A claims; B gets the overlap error |
-| T10 | 2 | `reset --clean` on a shared DB; A and B both use `vector`; B has a view on A's table | A's reset keeps `vector` and refuses with the dependency named |
-| T11 | 2 | A's design drops schema `old` | after reconcile A no longer owns `old`; `old` still exists; a notice is printed |
-| T12 | 2 | `init --from-db` as project C on A's database | succeeds; the design omits A's schemas |
-| T13 | 2 | `inspect --shared` | lists projects with their owned schemas; flags the overlap, the unupgraded project and the unowned schema |
-| T14 | 2 | SQLite file holding project `a`; project `b` applies | refused |
-| T15 | 2 | Scoped run of A (scope covers `app` only; design also declares `audit`) | A owns both `app` and `audit` |
+| T1 | 1 | B declares a role and an extension without a schema; A has `public.items` | B's `reconcile --prune` keeps `public.items` |
+| T2 | 1 | (unit) cron SQL for owners `a`, `b` | `b`'s unschedule filter cannot match `a`'s jobs |
+| T3 | 1 | Legacy `public._dbd_meta` holds `a` and `b`; `a` heals | `b`'s row and the table survive |
+| T4 | 1 | Two owners import jsonl | separate staging tables |
+| T5 | 2 | A and B both use `public` and `app`, with disjoint entities; each applies, then `reconcile --prune`, then `reset` | every entity of the other survives |
+| T6 | 2 | B declares `app.orders`, owned by A | apply, reconcile and reset refuse; the catalog is unchanged; B has no rows |
+| T7 | 2 | Two concurrent first claims on one entity | exactly one succeeds |
+| T8 | 2 | A drops `orders.note`; B's view reads it | A refuses and names B's view |
+| T9 | 2 | A's function body reads B's table; B drops that table | refused (`dbd.uses`, not `pg_depend`) |
+| T10 | 2 | Single owner, hand-made `app.tmp` | still pruned (rule b) |
+| T11 | 2 | Shared `public`, hand-made `public.tmp` | reported, not pruned |
+| T12 | 2 | Backfill: two pre-registry owners share `public`; A upgrades and runs `reconcile --prune` before B | A claims only its own entities; B's `public` tables survive (rule (b) suspended, B named as not upgraded) |
+| T13 | 2 | A removes `app.old` from its design without pruning | still owned by A; B's claim on it refused |
+| T14 | 2 | `--adopt-from` transfer between repositories | B owns the entity; A's next prune leaves it |
+| T15 | 2 | Same owner name, all-new entities | refused; `--allow-ownership-change` proceeds |
+| T16 | 2 | Scoped run of A | claims the whole design, not the scope |
+| T17 | 2 | `reset --clean` beside another owner using `vector` and schema `app` | `vector` and `app` survive |
+| T18 | 2 | SQLite, second owner declares an existing table | refused |
+| T19 | 3 | Two modules declare the same entity | `dbd inspect` fails before any database work |
+| T20 | 3 | `core` references `dojo` without `depends_on` | gap error |
+| T21 | 3 | Workspace deploy of shared, core and dojo into one database | three meta rows; ownership by module |
+| T22 | 3 | An entity file moves from `core/` to `shared/` | ownership transfers; nothing is pruned |
+| T23 | 3 | Sensei converted; `--scope dojo` and default deploys | the same entities deploy to each database as with today's scopes |
 
 ---
 
 ## Decisions to confirm
 
-1. **Exclusive schemas, `public` included.** At most one project per database
-   may own `public`. Recommended: it is the simplest rule that closes H1 and H2,
-   and it needs no per-object tracking.
-2. **Detect name reuse from disjoint ownership, with no new `project.id`
-   field.** Recommended. A UUID in `design.yaml` would also catch two
-   independent projects that pick the same name *and* the same schema names.
-   That is rare, and copying a repository copies the id anyway, so the UUID
-   cannot tell two checkouts apart. It can be added later without changing
-   anything here.
-3. **Release a schema when the design stops declaring it** rather than holding
-   it until an explicit release command. Recommended: the design is the source
-   of truth everywhere else in dbd, and this adds no new command.
+1. **No exports list.** What a module protects is derived from what other
+   owners actually use. An optional `exports:` could restrict the surface
+   later. Recommended: no ceremony until a real need appears.
+2. **Per-module versions, snapshots and migrations.** Recommended, because
+   modules exist to evolve independently. The alternative is one workspace
+   version.
+3. **Owner identity `<project>/<module>`.** Recommended, because two workspaces
+   may both have a `shared` module. The alternative is bare module names.
+4. **Unowned entities in a shared schema are reported, never pruned.** An
+   explicit `dbd adopt <entity>` can come later if reports pile up.
 
 ## Open / Deferred
 
-- The scope guard (`check_scope_guard`) is still CLI-only and reads meta before
-  heal. Folding it into `preflight` would give embedders the same protection.
-  That is a separate change.
-- Roles are cluster-wide. Ownership sees only the projects in **this** database,
-  so a role shared with another database in the cluster is still Postgres's to
-  protect: `DROP ROLE` fails while the role owns objects there.
-- Two projects declaring the same qualified function in *different* schemas is
-  fine. In the *same* schema it is now impossible, because the schema has one
-  owner.
+- Owner roles: making each module's entities `OWNER TO` a per-module role would
+  let Postgres itself refuse cross-owner drops. That is strong, but it needs
+  `CREATEROLE`, ownership reassignment on backfill, and Supabase's `postgres`
+  role complicates it. It can be layered on later.
+- The scope guard is still CLI-only, and could fold into `preflight`.
+- Roles are cluster-wide. The registry sees only this database, so a role used
+  by another database is protected only by Postgres's own `DROP ROLE` checks.
+- Objects created by hook scripts are not entities. They stay unowned, and
+  under rule (b) they are pruned only where a single owner uses the schema.
