@@ -1191,4 +1191,60 @@ mod tests {
             "before anything runs"
         );
     }
+
+    /// Shared seed data in `import/staging/` and dev-only rows in
+    /// `import/dev/staging/` are two data files for one table. Both load, and
+    /// then the table's loader runs — once, over both. It ran once per file,
+    /// so a loader that inserts moved the shared rows twice; and the second
+    /// file must not read as a second table claiming the same loader.
+    #[tokio::test]
+    async fn a_table_with_two_data_files_calls_its_loader_once() {
+        let (_tmp, design) = project_from(&[
+            (
+                "design.yaml",
+                "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+            ),
+            (
+                "ddl/table/staging/items.ddl",
+                "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+            ),
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id integer);\n",
+            ),
+            (
+                "ddl/procedure/staging/import_items.ddl",
+                "set search_path to staging;\n\
+                 create or replace procedure import_items() language sql\n\
+                 as $$ insert into app.items (id) select id from staging.items $$;\n",
+            ),
+            ("import/staging/items.csv", "id\n1\n"),
+            ("import/dev/staging/items.csv", "id\n2\n"),
+        ]);
+
+        let (plan, _) = design.scoped_import_plan(None, None).expect("not refused");
+        assert_eq!(plan.len(), 2, "both files load");
+        assert_eq!(
+            plan.iter().filter(|e| e.procedure.is_some()).count(),
+            1,
+            "the plan (and so the dry run) lists the call once: {:?}",
+            plan.iter().map(|e| (&e.table.name, &e.procedure)).collect::<Vec<_>>()
+        );
+
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        let calls: Vec<String> = mock
+            .scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("CALL"))
+            .cloned()
+            .collect();
+        assert_eq!(calls, vec!["CALL staging.import_items();".to_string()]);
+        assert_eq!(mock.imported.lock().unwrap().len(), 2, "both files load first");
+    }
 }
