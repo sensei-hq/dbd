@@ -260,8 +260,9 @@ pub trait DatabaseAdapter: Send + Sync {
     // ── Internal dbd procedures ────────────────────────
 
     /// Ensure the internal `staging.import_jsonb_to_table` procedure exists.
-    /// Called automatically before any JSONL import. The procedure is embedded
-    /// in the dbd binary — users do not own or manage it.
+    /// An adapter whose JSON import needs it calls this from `import_data`
+    /// itself, so no caller has to know the precondition. The procedure is
+    /// embedded in the dbd binary — users do not own or manage it.
     async fn ensure_import_procedure(&self) -> Result<()>;
 
     // ── Meta tracking (environment, safety guards) ─────

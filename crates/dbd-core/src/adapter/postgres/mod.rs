@@ -1336,6 +1336,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 // connections don't share `search_path`, so unqualified names (a bare
                 // `_temp`, or a CALL qualified with the target's own schema) resolve
                 // nondeterministically and fail. See sensei-hq/dbd#6.
+                //
+                // The procedure is installed here, by the load that needs it, rather
+                // than left to the caller: only the full import plan used to, so an
+                // ad-hoc `dbd import -n … -f rows.jsonl` against a database that had
+                // never run one failed for want of a procedure the user never wrote.
+                self.ensure_import_procedure().await?;
                 self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
                     .await?;
                 self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
