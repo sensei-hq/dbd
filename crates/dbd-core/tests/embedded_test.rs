@@ -399,6 +399,64 @@ async fn a_json_array_file_imports_one_row_per_record() {
     .await;
 }
 
+// ── Test: JSONL export → import is a round trip ───────────────────────────────
+
+/// `dbd export -f jsonl` is how data moves to a new database, so what it writes
+/// must import back to the same values. It wrote `COPY … TO STDOUT` in text
+/// format, which escapes every backslash in the JSON a second time: a newline
+/// came back as the two characters `\n`, a quote as `\"`.
+#[tokio::test]
+async fn a_jsonl_export_imports_back_to_the_same_values() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    // A backslash, both quotes, a newline and a tab — everything an escaping
+    // layer could touch. Kept beside the table as the expected value.
+    adapter
+        .execute_script(
+            r#"CREATE SCHEMA app;
+               CREATE TABLE app.notes (id integer, body text);
+               INSERT INTO app.notes VALUES (1, E'C:\\temp "double" ''single''\nsecond line\tend');
+               CREATE TABLE app.expected AS SELECT * FROM app.notes;"#,
+        )
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.format = Some("jsonl".to_string());
+    adapter
+        .export_data(&entity, Some(out.path()))
+        .await
+        .expect("export failed");
+
+    // The file itself must hold the value, not an escaped rendering of it.
+    let written = std::fs::read_to_string(out.path().join("notes.jsonl")).unwrap();
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines.len(), 1, "one row, one line: {written:?}");
+    let row: serde_json::Value =
+        serde_json::from_str(lines[0]).unwrap_or_else(|e| panic!("each line must be JSON ({e}): {written:?}"));
+    assert_eq!(
+        row["body"], "C:\\temp \"double\" 'single'\nsecond line\tend",
+        "the exported value: {written:?}"
+    );
+
+    // And it imports back to exactly what was exported.
+    adapter.execute_script("TRUNCATE app.notes").await.unwrap();
+    let mut import = Entity::new(EntityType::Table, "app.notes");
+    import.file = Some(out.path().join("notes.jsonl"));
+    import.format = Some("jsonl".to_string());
+    adapter.import_data(&import, "", false).await.expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "(SELECT * FROM app.notes EXCEPT ALL SELECT * FROM app.expected) \
+         UNION ALL (SELECT * FROM app.expected EXCEPT ALL SELECT * FROM app.notes)",
+        "a row that differs after the round trip",
+    )
+    .await;
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
