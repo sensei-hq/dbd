@@ -351,8 +351,20 @@ pub async fn cmd_deploy(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        // Surface the same gap/closure errors a real deploy would.
-        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        // The real deploy's own gate (it runs `Design::apply`): scope gaps and
+        // closure, the extension allowlist, and the refusal of a file that did
+        // not parse. The preview used to tally "1 errors" and exit 0 over a
+        // design the deploy refuses.
+        let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+
+        // What the scope builds, not what the design declares: a scoped deploy
+        // never touches the rest, so the whole-design tally described a run
+        // that does not happen.
+        output::scope_filtered(
+            &resolved,
+            design.scoped_entities(&resolved)?.len(),
+            design.entities().len(),
+        );
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
             for gap in &report.gaps {
@@ -364,15 +376,7 @@ pub async fn cmd_deploy(
                 ));
             }
         }
-        output::info(
-            verbosity,
-            &format!(
-                "{} entities found, {} errors, {} warnings",
-                design.entities().len(),
-                report.issues.len(),
-                report.warnings.len(),
-            ),
-        );
+        output::info(verbosity, &format!("{to_apply} entities would be applied."));
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
@@ -385,10 +389,21 @@ pub async fn cmd_deploy(
             output::warn(&warning);
         }
 
-        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
+        // The policy phase's own scope filter, counted the way the real
+        // deploy's summary counts it.
+        let policy_ws = super::schema::policy_working_set(&design, &resolved)?;
+        let policies =
+            dbd_core::design::plan_policies(&project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         output::info(
             verbosity,
-            &format!("{} policy file(s) would be applied.", policy_files.len()),
+            &format!(
+                "{} policy file(s) would be applied{}.",
+                policies.applied.len(),
+                match policies.skipped.len() {
+                    0 => String::new(),
+                    n => format!(", {n} skipped (out of scope)"),
+                }
+            ),
         );
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
