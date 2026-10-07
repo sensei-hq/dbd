@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
-use super::{format_apply_summary, get_adapter, safe_read_ddl, safe_write};
+use super::{format_apply_summary, get_adapter, safe_canonicalize_within, safe_read_ddl, safe_write};
 use crate::output::{self, Verbosity};
 
 /// Warn when the config loaded but no authored DDL was scanned under the
@@ -745,13 +745,17 @@ pub fn cmd_emit(
 ) -> Result<()> {
     let target = dbd_core::parser::Dialect::from_label(dialect)
         .ok_or_else(|| anyhow::anyhow!("unknown dialect {dialect:?} — expected mysql, tsql or sqlite"))?;
+    // Both destinations checked before either is written, so a refused report
+    // path does not leave the script behind. See `cmd_combine` for the rule.
+    let dest = safe_canonicalize_within(project_dir, file)?;
+    let report_dest = report.map(|r| safe_canonicalize_within(project_dir, r)).transpose()?;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
 
     let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
-    std::fs::write(file, sql).with_context(|| format!("Failed to write {}", file.display()))?;
+    std::fs::write(&dest, sql).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
 
     // Counted, not just listed: a summary someone can act on without reading
@@ -772,9 +776,9 @@ pub fn cmd_emit(
         }
     }
 
-    if let Some(path) = report {
+    if let (Some(path), Some(dest)) = (report, &report_dest) {
         let json = serde_json::to_string_pretty(&downgrades).context("Failed to serialize the report")?;
-        std::fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        std::fs::write(dest, json).with_context(|| format!("Failed to write {}", path.display()))?;
         output::info(verbosity, &format!("Wrote {}", path.display()));
     }
     Ok(())
@@ -789,11 +793,18 @@ pub fn cmd_combine(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    // One rule for every file a command writes: inside the project, or
+    // refused. `dbml` and `diagram` always held it and `combine` and `emit` did
+    // not; the stricter one is kept, because a `-f` that resolves elsewhere — a
+    // relative path run from the wrong directory, a `../` meant for another
+    // tree — overwrote a file dbd does not own without a word. Output wanted
+    // outside the project is written inside it and moved.
+    let dest = safe_canonicalize_within(project_dir, file)?;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    design.combine(file, Some(&resolved))?;
+    design.combine(&dest, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }
@@ -1634,16 +1645,17 @@ mod tests {
         .unwrap();
     }
 
-    /// `combine` writes a single concatenated SQL file (target may live outside
-    /// the project, per the core API).
+    /// `combine` writes a single concatenated SQL file — inside the project, as
+    /// every command's output is; the core API takes any path, the command does
+    /// not (see `every_command_that_writes_a_file_keeps_it_inside_the_project`).
     #[test]
     fn combine_writes_sql_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = testutil::copy_fixture_project();
         let out = tmp.path().join("combined.sql");
         cmd_combine(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
             &out,
             None,
             None,
