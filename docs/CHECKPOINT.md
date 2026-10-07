@@ -1,37 +1,37 @@
 # Checkpoint
 
-**Slice:** #7 multi-project isolation — design proposed, awaiting approval.
+**Slice:** #7 design at rev 3 (proposed). Website/docs audit done; fixes not started.
 Spec: `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`.
 
 ## Done
 
-- v0.24.1 released and verified against the crates.io artifact: 0.24.0 pruned
-  2 tables in the #40 repro (`orders` lost, FK gone), 0.24.1 pruned only `stray`.
-- #40 closed (PR #43 → `main` `d71fdd6`, every check green).
-- #7 design written: exclusive schema ownership in `dbd.ownership`, a core
-  `preflight` on every mutating entry point, and ownership-aware reset.
+- #7 rev 3: entity-level ownership (`dbd.objects`, `dbd.uses`), no special
+  schemas, workspaces with one root manifest (`modules:` block,
+  `database/<module>/` folders), `dbd split --from-scopes` for sensei.
+- Audit of the guides, llms files, SKILL.md and site pages against 0.24.1.
 
-## Remaining (once approved)
+## Remaining
 
-- Phase 1 (patch): roles and extensions leave `managed_schemas`; cron jobs
-  tagged by project; heal folds only its own legacy rows; import staging moves
-  into `dbd`, one table per project.
-- Phase 2 (minor): `dbd.ownership`, `preflight`, reset guards, `init --from-db`
-  and `merge` onboarding, `inspect --shared`, SQLite parity.
-- Phase 3: docs, skills, site mirrors, `dbd-pattern-verifier`.
+- #7: approval of the 5 decisions in the spec, then phase 1 (patch).
+- Audit, code bugs (each test-first): `-e production` passes the reset prod
+  guard; `reset --target` ignores the design's target; `deploy` skips grants
+  and ignores `-c`; `emit` drops FKs/CHECKs/indexes unreported;
+  `GITHUB_TOKEN` is never read.
+- Audit, docs: ~20 wrong statements; new guides (scopes, targets, access
+  control, import/export, viewer, embedding); home page cards.
 
 ## Next
 
-    # after approval: phase 1, test-first, starting with T1 (role/extension
-    # no longer pulls `public` into managed_schemas) on a fix/ branch off develop
+    # on approval: fix/reset-env-guard off develop, red test first
 
 ## Open questions
 
-- The spec's three "Decisions to confirm": `public` is exclusive; name reuse
-  is detected without a `project.id` field; a schema is released when the
-  design drops it.
+- Fix code or docs for each mismatch? Recommended: code for the 6 bugs above,
+  docs for the rest.
+- The release checklist cites `the_website_copies_match_the_docs`; no such
+  test exists (site content is gitignored and regenerated at build).
 
 ## Known-broken / upstream
 
+- The 6 code bugs above.
 - History has no views or routines: snapshots hold tables and enums only.
-- Snapshots cut before inline FKs were recorded show a one-time FK "change".
