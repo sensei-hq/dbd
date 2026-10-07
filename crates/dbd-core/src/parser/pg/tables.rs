@@ -116,6 +116,17 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
             }
             Some(NodeEnum::CommentStmt(c)) => record_comment(c, &mut comments),
             Some(NodeEnum::AlterTableStmt(alter)) => alters.push(alter),
+            // A trigger kept beside its table fires a function the table now
+            // depends on. Skipping the statement left no edge, so apply could
+            // run the trigger before that function existed.
+            Some(NodeEnum::CreateTrigStmt(trigger)) => {
+                if let Some(pair) =
+                    common::qualify_name_source(&string_list(&trigger.funcname).join("."), default_schema)
+                    && !functions.contains(&pair)
+                {
+                    functions.push(pair);
+                }
+            }
             _ => {}
         }
     }
