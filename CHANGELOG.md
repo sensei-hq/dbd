@@ -9,12 +9,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
-**Commands now do what the documentation says.** An audit of the guides
-against the code found the reverse cases too — behaviour the docs promised
-that the code never had — and those are fixed here, in the code. Two of them
-were destructive: a database deployed with `-e production` was not protected
-by reset's prod guard, and a Supabase project's `reset --schemas` dropped
-`public`.
+**Every command does what its documentation says, and every feature works the
+same under every command.** Two audits drove this release: the guides read
+against the code, and every feature run through every command with and
+without `--scope`, against a real database. They found behaviour the docs
+promised and the code never had, and features one command handled that
+another dropped — and fixed both in the code, test first.
+
+**Upgrade before your next `reconcile --prune` or `reset`.** Three of the fixes
+stop data loss:
+
+- `reconcile --prune` dropped tables in `public` that the design never
+  declared, whenever the design had a target role or an extension without
+  `schema:`.
+- `reset --schemas` on a Supabase project dropped `public`, unless
+  `--target supabase` was passed.
+- a database deployed with `-e production` was not protected by reset's prod
+  guard.
 
 ### Changed
 
@@ -24,46 +35,161 @@ by reset's prod guard, and a Supabase project's `reset --schemas` dropped
   `-e staging` used to be accepted and then matched no `import/<env>/` folder.
 - **`dbd reset --target` defaults to the design's target** — its first
   `target:` key — instead of `postgres`. Pass `--target` to override.
-- **Library: grants moved into core.** `Design::apply_grants` applies the
-  design's schema and target grants, and `Design::deploy` calls it;
-  `DeployComplete` gains a `grants: GrantsOutcome` field. Code that builds a
-  `DeployComplete` literal needs the field (or `..Default::default()`).
+- **A materialized view's drift stamp lives in `dbd.matview_stamps`**, not in
+  the view's comment, which is now the author's alone. A stamp an earlier dbd
+  wrote in a comment is still read until dbd writes a new one.
+- **`reconcile` records version 0 for a project with no `project.version`**,
+  as `apply` does. It recorded 1, after which a dev `reset` refused as though
+  migrations had run.
+- **`dbd emit --dialect tsql` ends every statement with `GO`**, the
+  sqlcmd/SSMS batch separator — `CREATE SCHEMA` and `CREATE VIEW` must each be
+  alone in a batch. Split on it before sending the script through a driver.
+- **Library API.** Embedders of `dbd-core` may need to change code:
+  - `DeployComplete` gains `grants: GrantsOutcome`; `Design::apply_grants`
+    (new) applies grants, scoped, and `Design::deploy` calls it.
+  - `schema_model::build` returns `Result<SchemaModel>` — it refuses a scope
+    whose `deps: include` closure needs something the scope excludes.
+  - `DbmlMultiParams` gains a required `design_entities` field.
+  - `RefKind` gains `Uses` (a column's type, or the sequence its default draws
+    from); an exhaustive `match` on `RefKind` needs an arm.
+  - `DatabaseAdapter` gains `stamp_matview`, with a no-op default.
+  - `design::import_entry_in_scope` is deprecated in favour of
+    `Design::scoped_import_plan`, which also requires a declared staging table
+    and says why an entry was left out.
 
 ### Fixed
 
-- **A database deployed with `-e production` is protected by reset's prod
-  guard.** The guard matched `prod` only, and `-e production` was recorded
-  verbatim, so `dbd reset` ran against it. Existing rows that say `production`
-  are now read as prod too.
+**Data safety**
+
+- **`reconcile --prune` no longer reaches into `public`** unless the design
+  puts something there. A role, or an extension with no `schema:`, made
+  `public` a managed schema, so prune dropped any table there it did not
+  declare.
 - **`dbd reset --schemas` on a Supabase project keeps `public`.** The protected
-  schema set came from `--target`, which defaulted to `postgres` whatever the
-  design targeted, so `public` was dropped `CASCADE` unless the flag was given.
-- **`dbd deploy` applies grants.** They ran only inside `dbd apply`'s handler,
-  so a deploy — and every embedder calling `Design::deploy` — got a schema with
-  no grants and no warning. They now run between the schema and the data.
-- **`dbd deploy` honours `-c`.** It read `design.yaml` whatever `-c` named.
-- **`dbd emit` carries foreign keys, CHECK constraints and indexes.** They were
-  dropped without a report entry, though the report is the only safeguard
-  `emit` offers. A CHECK expression or an index predicate passes through
-  untranslated and is reported; an index the target would reject — an
-  expression key on SQL Server, a key on an unbounded text column on MySQL or
-  SQL Server — is left out and reported, so the script still applies.
+  set came from `--target`, which defaulted to `postgres`.
+- **A database deployed with `-e production` is protected by reset's prod
+  guard**, and so is any existing row that says `production`.
+- **A scoped `apply`/`deploy` runs the drops of tables in its schemas.** A
+  dropped table is in no scope's working set, so a named scope skipped its drop
+  while recording the migration as applied. A drop now runs only where the
+  table still exists.
+- **A materialized view keeps its own `COMMENT`.** dbd's drift stamp shared it:
+  the first apply overwrote the author's text, and the next — re-running the
+  file's `COMMENT ON` — erased the stamp, after which every reconcile warned.
+
+**Scopes**
+
+- **A scope keeps the sequences of the schemas it keeps.** Sequences were
+  dropped from every scope, even an excludes-only one, so a table whose default
+  draws from one could not be applied under any scope.
+- **A table depends on the enum a column is typed with and the sequence its
+  default draws from.** Neither was recorded, so a scope could leave them out
+  with no gap reported, and apply failed on a type that did not exist.
+- **A trigger written in a table's file makes the table depend on the function
+  it executes**, so the function is applied first. The statement was skipped.
+- **A scope keeps the schema its extensions install into** (`schema:`), so a
+  scoped apply no longer fails with `schema "x" does not exist`.
+- **Grants follow the scope**: a scoped apply or deploy grants only on the
+  schemas it builds, instead of failing on the rest.
+- **A scoped import needs both its staging table and its targets.** It kept an
+  entry whose staging table the scope never built, and blamed the staging table
+  when a target was the one outside. `import --dry-run` and `deploy --dry-run`
+  now name the reason for every entry they leave out.
+- **`reset --clean` drops every role the design declares** — `ddl/role/` as
+  well as `target.roles` — **and only the extensions the scope installs**.
+
+**Convergence**
+
+- **A `serial` column is not a primary key unless declared one.** The model
+  claimed one; reconcile then planned `ADD PRIMARY KEY` beside the real key and
+  every real run failed, while `dbml`, the viewer and `emit` showed a key that
+  did not exist.
+- **A `nextval('s')` default converges.** Postgres reports it as
+  `nextval('s'::regclass)`, which read as a changed default on every run.
+
+**Commands**
+
+- **`dbd deploy` applies grants**, between the schema and the data. They ran
+  only inside `dbd apply`'s handler.
+- **`dbd deploy` honours `-c`.**
+- **`dbd export` writes the views listed under `export:`** — views that
+  dereference foreign keys so the files match the import staging tables, the
+  way a long-running system's data moves to a new database. A listed view was
+  filtered out as "not a table", silently; an entry naming nothing exportable is
+  now reported.
+- **`dbd snapshot` and `dbd release` edit `design.yaml` in place**, keeping its
+  comments, blank lines and flow-style lists. They re-serialised the file.
 - **`GITHUB_TOKEN` authenticates GitHub downloads**, so `dbd deploy` can fetch a
-  private repository. It was documented and never sent. It goes to
+  private repository. It was documented and never sent; it goes to
   `api.github.com` only.
-- **A GitHub `--source` outside `dbd deploy` is refused with the way out.**
-  Only `deploy` downloads a source; other commands failed trying to read
-  `owner/repo/design.yaml` from disk. They now say to clone the repository and
-  pass its path.
-- **`dbd init --target` refuses a target it has no scaffold for.** `convex`,
-  `sqlite` or a typo silently produced a PostgreSQL project.
+- **A GitHub `--source` outside `dbd deploy` is refused**, with the way out:
+  clone the repository and pass its path.
+- **`dbd init --target` refuses a target it has no scaffold for**, instead of
+  silently writing a PostgreSQL project.
 - **`dbd doctor --fix` migrates every folder alias the scanner reads**:
-  `materialized_views`, `matview`, `matviews` and `sequences` were scanned but
-  never moved to their canonical folder.
-- **The viewer refuses a schema model newer than it reads**, saying so, instead
-  of rendering it with whatever the new version added silently dropped.
-- **`--help` for `--source` and `dbd diff`** no longer claim a GitHub source
-  works everywhere, or that reconcile skips CHECKs and comments.
+  `materialized_views`, `matview`, `matviews` and `sequences`.
+- **`--help` for `--source` and `dbd diff`** is accurate.
+
+**`dbd emit`** — everything a target cannot take is now reported, inline and in
+`--report`; nothing is dropped silently.
+
+- Foreign keys, CHECK constraints and indexes are carried. A CHECK expression or
+  index predicate goes across untranslated and is reported; an index the target
+  would reject is left out and reported.
+- Identity and `serial` columns are numbered by the target (`AUTO_INCREMENT`,
+  `IDENTITY(1,1)`, `INTEGER PRIMARY KEY AUTOINCREMENT`).
+- Generated columns are computed by the target, their expression reported as
+  untranslated.
+- Defaults with an equivalent are translated (`now()`, `current_date`,
+  `gen_random_uuid()`); the rest are reported. A literal's `::cast` — a syntax
+  error on every target — is dropped.
+- SQL Server gets `CREATE SEQUENCE` with PostgreSQL's bounds, and
+  `NEXT VALUE FOR`; elsewhere a sequence and its `nextval` defaults are reported.
+- Comments are carried where the target keeps them (MySQL `COMMENT`, SQL
+  Server `MS_Description`) and reported elsewhere.
+- A materialized view's downgrade to a view, and each index it loses, are
+  reported. A key column on unbounded text is bounded, with a report entry,
+  rather than emitted as a key the target refuses. An FK to a table the script
+  does not create is left out and reported. A file that does not parse is
+  reported instead of vanishing. SQL Server gets `CREATE SCHEMA`.
+
+**`dbd dbml` and `init --from-dbml`** — the round trip keeps what DBML can say.
+
+- Table-level UNIQUE constraints (as named unique indexes), expression indexes
+  (backticked), CHECK constraints (a `checks` block), generated columns and an
+  ALWAYS identity (custom properties), and a column's `unique` and `increment`.
+- A partial index's predicate, key order and `NULLS NOT DISTINCT` travel in the
+  index note (`where:`, `order:`, `nulls not distinct` lines).
+- Every referenced table the document does not define gets a stub, typed from
+  the design. A `--scope` document did not parse at all: DBML rejects a Ref to
+  an undefined table.
+- Strings are escaped and read the way DBML's own lexer does, so a quote or
+  backslash in a note or default survives.
+
+**The schema viewer**
+
+- Every foreign key lands somewhere: on its table, or on a stub marked
+  external, out of scope or unresolved. It used to lead nowhere.
+- Tables show their CHECK constraints, index predicates, and identity and
+  generated columns; sequences have pages of their own.
+- A schema holding only views or routines is listed.
+- Under `--scope`, the changelog covers the same working set as the diagram.
+- `dbd diagram` refuses a scope that excludes its own dependency, as every
+  other command does, instead of drawing an empty model.
+- The viewer refuses a model newer than it reads, instead of rendering it with
+  whatever the new version added silently dropped.
+
+### Known limitations
+
+- `apply.before` hooks run outside apply's transaction, so their effects stay
+  when the entity batch rolls back.
+- `dbd diff` does not compare table, view or enum comments.
+- `emit` loses an identity column's `START`/`INCREMENT` options; its MySQL and
+  SQL Server output is written from documented syntax, not run against a server.
+- DBML cannot express an enum's comment.
+- How Postgres renders a name inside a live default depends on the reading
+  session's `search_path`, which a pooled connection can inherit from an
+  earlier DDL file; a bare `nextval('s')` in a file can still read as drift.
 
 ## [0.24.1] — 2026-10-06
 
