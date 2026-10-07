@@ -157,6 +157,18 @@ pub trait DatabaseAdapter: Send + Sync {
     /// maps to SQL NULL (empty string = the default, meaning an empty cell is NULL).
     async fn import_data(&self, entity: &Entity, null_value: &str, dry_run: bool) -> Result<()>;
 
+    /// Empty `table` (a `schema.name`) before an import reloads it — the
+    /// `import.options.truncate` step.
+    ///
+    /// Routed through the adapter because the statement is not portable: the
+    /// default is SQL's `TRUNCATE TABLE`, which Postgres runs, but SQLite has no
+    /// `TRUNCATE` and Convex runs no SQL at all. Sending the Postgres statement
+    /// to every target made the default import fail on both.
+    async fn truncate_table(&self, table: &str) -> Result<()> {
+        self.execute_script(&format!("TRUNCATE TABLE {}", crate::sql_quote::qualified(table)))
+            .await
+    }
+
     /// Export a table's data to a file.
     ///
     /// `out_dir`:
@@ -248,14 +260,42 @@ pub trait DatabaseAdapter: Send + Sync {
     // ── Internal dbd procedures ────────────────────────
 
     /// Ensure the internal `staging.import_jsonb_to_table` procedure exists.
-    /// Called automatically before any JSONL import. The procedure is embedded
-    /// in the dbd binary — users do not own or manage it.
+    /// An adapter whose JSON import needs it calls this from `import_data`
+    /// itself, so no caller has to know the precondition. The procedure is
+    /// embedded in the dbd binary — users do not own or manage it.
     async fn ensure_import_procedure(&self) -> Result<()>;
 
     // ── Meta tracking (environment, safety guards) ─────
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
+}
+
+/// The records of a JSON data file, each as its own JSON text.
+///
+/// `jsonl` is one record per line. A `json` file is read in either shape,
+/// decided by its first non-blank character: a JSON array of records — what
+/// `.json` means to most tools, Convex's importer among them — or JSON lines,
+/// which is how dbd has always read it. A JSON-lines record is an object, so a
+/// file of them never starts with `[`.
+///
+/// One reader for every SQL adapter, so a file that loads on one target loads
+/// on the others. Records come back as raw text rather than parsed values:
+/// Postgres parses each as `jsonb` itself, keeping numeric precision that a
+/// trip through `serde_json`'s `f64` would lose.
+pub(crate) fn json_records(data: &str, format: &str, file: &Path) -> Result<Vec<String>> {
+    if format == "json" && data.trim_start().starts_with('[') {
+        let records: Vec<&serde_json::value::RawValue> = serde_json::from_str(data).map_err(|e| {
+            crate::error::DbdError::Config(format!("{}: not a JSON array of records: {e}", file.display()))
+        })?;
+        return Ok(records.iter().map(|r| r.get().to_string()).collect());
+    }
+    Ok(data
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 pub mod convex;

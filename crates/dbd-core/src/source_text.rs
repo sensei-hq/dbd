@@ -100,6 +100,17 @@ pub fn read_to_string(path: &Path) -> Result<String> {
     }
 }
 
+/// `text` as SSMS saves it: UTF-16LE behind a byte-order mark. For the tests
+/// of every path that has to read such a file the way [`read_to_string`] does.
+#[cfg(test)]
+pub(crate) fn utf16le(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

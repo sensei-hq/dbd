@@ -343,9 +343,23 @@ impl DatabaseAdapter for SqliteAdapter {
 
         match format {
             "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
-            "jsonl" => self.import_jsonl(&data, table).await,
+            "json" | "jsonl" => {
+                let records = super::json_records(&data, format, file_path)?;
+                self.import_json_records(&records, table).await
+            }
             _ => Err(DbdError::Config(format!("Unsupported sqlite import format: {format}"))),
         }
+    }
+
+    async fn truncate_table(&self, table: &str) -> Result<()> {
+        // SQLite has no `TRUNCATE`; an unfiltered `DELETE` is its equivalent,
+        // and SQLite optimizes it to drop the table's pages wholesale. The
+        // schema is stripped as everywhere else here — SQLite has none.
+        self.execute_script(&format!(
+            "DELETE FROM {}",
+            crate::sql_quote::ident(Self::bare_name(table))
+        ))
+        .await
     }
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
@@ -708,29 +722,25 @@ impl SqliteAdapter {
         Ok(())
     }
 
-    async fn import_jsonl(&self, data: &str, table: &str) -> Result<()> {
+    async fn import_json_records(&self, records: &[String], table: &str) -> Result<()> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
-        // Group consecutive lines with identical column sets into batches so
+        // Group consecutive records with identical column sets into batches so
         // we can flush each group as a single multi-row INSERT. When the
         // column set changes, flush whatever we have and start a new batch.
         let mut current_cols: Option<Vec<String>> = None;
         let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
 
-        for line in data.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        for record in records {
             let value: serde_json::Value =
-                serde_json::from_str(line).map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
+                serde_json::from_str(record).map_err(|e| DbdError::Config(format!("json parse failed: {e}")))?;
             let obj = value
                 .as_object()
-                .ok_or_else(|| DbdError::Config("jsonl line must be a JSON object".into()))?;
+                .ok_or_else(|| DbdError::Config("a json record must be a JSON object".into()))?;
 
             let cols: Vec<String> = obj.keys().cloned().collect();
             let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();
@@ -1150,6 +1160,48 @@ mod tests {
         );
     }
 
+    /// `import.options.truncate` defaults to true, so a default import empties
+    /// each staging table before loading it. That step was issued as Postgres's
+    /// `TRUNCATE "schema"."table"`, which SQLite has no statement for — every
+    /// default import on SQLite failed before a single row loaded.
+    #[tokio::test]
+    async fn the_default_import_empties_a_staging_table_before_loading_it() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/staging")).unwrap();
+        std::fs::write(dir.path().join("import/staging/items.csv"), "id,name\n1,fresh\n").unwrap();
+        let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+        assert!(
+            design.config().import.table_truncate("staging.items"),
+            "precondition: truncate is the default"
+        );
+
+        let a = mem().await;
+        a.execute_script("CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (99, 'stale');")
+            .await
+            .unwrap();
+
+        design
+            .import_data(&a, None, false, None, Progress::none())
+            .await
+            .expect("the default import must run on SQLite");
+
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, "fresh".to_string())],
+            "the stale row must be gone and only the file's row loaded"
+        );
+    }
+
     #[tokio::test]
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
@@ -1309,6 +1361,47 @@ mod tests {
             .unwrap();
         let score: Option<f64> = r.try_get("score").unwrap();
         assert_eq!(score, None);
+    }
+
+    /// Load `body` as a `json`-format file into a fresh `people` table and
+    /// return its rows.
+    async fn import_json(body: &str) -> Result<Vec<(i64, String)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE people (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("people.json");
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.people");
+        entity.file = Some(path);
+        entity.format = Some("json".to_string());
+        a.import_data(&entity, "", false).await?;
+        Ok(sqlx::query_as("SELECT id, name FROM people ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap())
+    }
+
+    /// A `.json` file is what most tools mean by one — Convex's importer
+    /// included: a JSON array of records. The scanner has always picked `.json`
+    /// files out of `import/`, and SQLite refused every one of them.
+    #[tokio::test]
+    async fn a_json_array_file_imports_one_row_per_record() {
+        let rows = import_json("[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n")
+            .await
+            .expect("a JSON array must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
+    }
+
+    /// Postgres has always read a `.json` file as JSON lines; that shape must
+    /// keep working, and work the same here.
+    #[tokio::test]
+    async fn a_json_file_of_json_lines_still_imports() {
+        let rows = import_json("{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"name\": \"beta\"}\n")
+            .await
+            .expect("JSON lines in a .json file must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
     }
 
     #[tokio::test]

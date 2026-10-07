@@ -622,6 +622,13 @@ impl DatabaseAdapter for ConvexAdapter {
         self.run_npx(&args).await
     }
 
+    async fn truncate_table(&self, _table: &str) -> Result<()> {
+        // Nothing to run: `import_data` loads with `npx convex import --replace`,
+        // which empties the table before writing it — the truncate this step
+        // asks for. Convex has no SQL to send a separate statement through.
+        Ok(())
+    }
+
     async fn export_data(&self, _entity: &Entity, _out_dir: Option<&Path>) -> Result<()> {
         // Convex CLI exports the entire deployment as a zip, not per table.
         // Point the user at the CLI rather than implementing a partial story.
@@ -1067,6 +1074,44 @@ mod tests {
         e.file = Some(data_path);
         // dry_run = true should succeed without spawning npx.
         adapter.import_data(&e, "", true).await.unwrap();
+    }
+
+    /// A default import (`truncate: true`) empties each staging table before
+    /// loading it. That step was sent as SQL `TRUNCATE`, and Convex runs no SQL
+    /// at all — so every default import on Convex failed before `npx convex
+    /// import` was ever reached.
+    #[tokio::test]
+    async fn the_default_import_reaches_convex_import() {
+        use crate::design::{Design, Progress};
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("design.yaml"), "project:\n  name: t\n").unwrap();
+        std::fs::create_dir_all(project.join("import/staging")).unwrap();
+        std::fs::write(project.join("import/staging/users.jsonl"), "{\"email\":\"a@b.c\"}\n").unwrap();
+        let design = Design::from_config_with_dir(&project.join("design.yaml"), "dev", Some(project)).unwrap();
+        assert!(
+            design.config().import.table_truncate("staging.users"),
+            "precondition: truncate is the default"
+        );
+
+        // CLI dry-run: the `npx convex import` is logged, not spawned.
+        let adapter = ConvexAdapter::new(project.join("convex"), "test").with_cli_dry_run(true);
+        let mut loaded = 0;
+        design
+            .import_data(
+                &adapter,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s: crate::design::ImportComplete| loaded = s.tables,
+                },
+            )
+            .await
+            .expect("the default import must run on Convex");
+        assert_eq!(loaded, 1, "the staging file must have been handed to convex import");
     }
 
     #[tokio::test]
