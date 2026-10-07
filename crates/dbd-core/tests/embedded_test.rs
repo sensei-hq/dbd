@@ -489,6 +489,48 @@ async fn a_utf16_ddl_file_applies_to_postgres() {
     assert_table_exists(&*adapter, "app", "wide").await;
 }
 
+// ── Test: a JSON record is imported as written ────────────────────────────────
+
+/// Each staged JSON record was sent as an interpolated `INSERT` through
+/// `execute_script`, which rewrites every `set search_path to …;` it finds to
+/// append `, public` — inside a string value too. A note that quoted the
+/// statement came back altered.
+#[tokio::test]
+async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.notes (id integer, body text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.jsonl");
+    std::fs::write(
+        &path,
+        "{\"id\": 1, \"body\": \"first run set search_path to app; then load\"}\n",
+    )
+    .unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.file = Some(path);
+    entity.format = Some("jsonl".to_string());
+    adapter.import_data(&entity, "", false).await.expect("import failed");
+
+    // Read back through the export, not a SQL predicate: a predicate quoting
+    // the same text goes through `execute_script` too, and is rewritten to
+    // match the damage.
+    let out = tempfile::tempdir().unwrap();
+    let mut export = Entity::new(EntityType::Table, "app.notes");
+    export.format = Some("jsonl".to_string());
+    adapter
+        .export_data(&export, Some(out.path()))
+        .await
+        .expect("export failed");
+    let written = std::fs::read_to_string(out.path().join("notes.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    assert_eq!(row["body"], "first run set search_path to app; then load");
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
