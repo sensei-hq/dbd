@@ -4037,3 +4037,37 @@ async fn a_nextval_default_converges() {
         "the default is already what the design says: {touched:?}"
     );
 }
+
+/// A project with no `project.version` has applied no migration. Reconcile
+/// recorded version 1 for it (apply records 0), after which a dev `reset`
+/// refused with "database has applied migrations".
+#[tokio::test]
+async fn reconcile_without_a_version_records_none_applied() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "unversioned").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: unversioned\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+
+    let meta = adapter.get_project_meta().await.unwrap().expect("meta");
+    assert_eq!(meta.version, 0, "no migration has been applied");
+    design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect("a dev reset of an unversioned project is allowed");
+}
