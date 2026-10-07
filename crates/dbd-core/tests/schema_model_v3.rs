@@ -41,20 +41,20 @@ fn snapshot(dir: &Path) {
 #[test]
 fn the_model_is_version_3() {
     let tmp = tempfile::tempdir().unwrap();
-    assert_eq!(build(&project(tmp.path()), None).version, 3);
+    assert_eq!(build(&project(tmp.path()), None).unwrap().version, 3);
 }
 
 #[test]
 fn a_model_without_history_omits_the_field() {
     let tmp = tempfile::tempdir().unwrap();
-    let json = serde_json::to_value(build(&project(tmp.path()), None)).unwrap();
+    let json = serde_json::to_value(build(&project(tmp.path()), None).unwrap()).unwrap();
     assert!(json.get("history").is_none(), "an empty history is absent, not []");
 }
 
 #[test]
 fn a_model_carries_the_history_it_is_given() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut model = build(&project(tmp.path()), None);
+    let mut model = build(&project(tmp.path()), None).unwrap();
     snapshot(tmp.path());
     model.history = history::load(tmp.path()).unwrap();
     let json = serde_json::to_value(&model).unwrap();
@@ -64,7 +64,7 @@ fn a_model_carries_the_history_it_is_given() {
 #[test]
 fn a_v2_payload_still_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v2: Value = serde_json::to_value(build(&project(tmp.path()), None)).unwrap();
+    let mut v2: Value = serde_json::to_value(build(&project(tmp.path()), None).unwrap()).unwrap();
     v2["version"] = json!(2);
     let back: SchemaModel = serde_json::from_value(v2).unwrap();
     assert!(back.history.is_empty());
@@ -87,7 +87,7 @@ fn with_enum(dir: &Path) -> Design {
 #[test]
 fn the_model_carries_each_enum_with_its_values_in_order() {
     let tmp = tempfile::tempdir().unwrap();
-    let json = serde_json::to_value(build(&with_enum(tmp.path()), None)).unwrap();
+    let json = serde_json::to_value(build(&with_enum(tmp.path()), None).unwrap()).unwrap();
     assert_eq!(
         json["enums"],
         json!([{ "schema": "app", "name": "status", "values": ["active", "paused", "closed"],
@@ -99,6 +99,6 @@ fn the_model_carries_each_enum_with_its_values_in_order() {
 #[test]
 fn a_model_without_enums_omits_the_field() {
     let tmp = tempfile::tempdir().unwrap();
-    let json = serde_json::to_value(build(&project(tmp.path()), None)).unwrap();
+    let json = serde_json::to_value(build(&project(tmp.path()), None).unwrap()).unwrap();
     assert!(json.get("enums").is_none());
 }

@@ -75,7 +75,7 @@ fn project(dir: &Path) -> Design {
 }
 
 fn model(dir: &Path) -> dbd_core::schema_model::SchemaModel {
-    build(&project(dir), None)
+    build(&project(dir), None).unwrap()
 }
 
 // ── v1 is untouched ─────────────────────────────────────────────────────────
@@ -247,7 +247,8 @@ fn a_view_or_routine_carries_its_own_comment() {
     let m = build(
         &Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load"),
         None,
-    );
+    )
+    .unwrap();
     let note_of = |n: &str| m.entities.iter().find(|e| e.name == n).and_then(|e| e.note.clone());
     assert_eq!(note_of("recent").as_deref(), Some("Orders from the last 30 days"));
     assert_eq!(note_of("total").as_deref(), Some("How many orders there are"));

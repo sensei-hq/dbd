@@ -53,7 +53,9 @@ pub fn cmd_diagram(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let mut model = dbd_core::schema_model::build(&design, Some(&resolved));
+    // No context added: a scope that cannot resolve fails here with exactly the
+    // error `dbml`, `apply` and the rest give for it.
+    let mut model = dbd_core::schema_model::build(&design, Some(&resolved))?;
 
     // The changelog (#29), seen through the same scope as the diagram — which may
     // be a `default` scope with no --scope given. A scope is a set of entities, and
