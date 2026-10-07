@@ -418,10 +418,10 @@ fn extract_column(
         }
     }
 
-    // SERIAL is sugar for an integer plus an owned sequence; it is NOT an
-    // IDENTITY column, so it leaves `identity` alone.
+    // SERIAL is sugar for `integer NOT NULL DEFAULT nextval(…)` on an owned
+    // sequence. It is NOT an IDENTITY column, so it leaves `identity` alone —
+    // and it is not a primary key either: only a declared PRIMARY KEY is.
     if data_type.to_uppercase().contains("SERIAL") {
-        is_pk = true;
         nullable = false;
     }
 
@@ -997,15 +997,15 @@ mod tests {
     }
 
     /// SERIAL is sugar for an integer plus an owned sequence, not an IDENTITY
-    /// column — so it must not set `identity`. The `is_pk` it does set mirrors
-    /// the sqlparser incumbent, which reconcile's snapshot shape depends on.
+    /// column — so it must not set `identity`. Nor is it a key: see
+    /// `a_serial_column_is_not_a_primary_key_unless_declared_one`.
     #[test]
     fn serial_is_not_an_identity_column() {
         let d = def("create table t (a serial, b bigserial);");
         assert_eq!(d.columns[0].identity, None);
         assert!(!d.columns[0].nullable);
-        assert!(d.columns[0].is_pk);
-        assert!(d.columns[1].is_pk);
+        assert!(!d.columns[0].is_pk);
+        assert!(!d.columns[1].is_pk);
     }
 
     /// `GENERATED ALWAYS AS (expr) STORED` is a computed column, not an identity
