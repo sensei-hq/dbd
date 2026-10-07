@@ -481,15 +481,42 @@ pub async fn cmd_reconcile(
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let adapter = get_adapter(config, database_url).await?;
+    reconcile_with_adapter(
+        &*adapter,
+        &design,
+        &resolved,
+        dry_run,
+        allow_destructive,
+        prune,
+        allow_scope_change,
+        verbosity,
+    )
+    .await
+}
 
+/// The body of `dbd reconcile`, with the adapter supplied rather than connected.
+///
+/// Split out so what a run decides against a given database — the scope guard
+/// above all — is testable against a mock without a live one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+    dry_run: bool,
+    allow_destructive: bool,
+    prune: bool,
+    allow_scope_change: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
     if dry_run {
         let plan = design
             .reconcile(
-                &*adapter,
+                adapter,
                 true,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress::none(),
             )
             .await
@@ -508,11 +535,11 @@ pub async fn cmd_reconcile(
         let spinner = output::StepSpinner::new(verbosity);
         let result = design
             .reconcile(
-                &*adapter,
+                adapter,
                 false,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress {
                     on_start: |desc: &str| spinner.start(desc),
                     on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
@@ -860,6 +887,58 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("released"), "got: {err}");
+    }
+
+    /// A dry run that connects must refuse the way the real run does. On a
+    /// database pinned to `all`, `reconcile --dry-run --scope config_only`
+    /// printed a plan and exited 0 — a preview of a run that cannot happen,
+    /// since the real run refuses on the scope guard before planning.
+    #[tokio::test]
+    async fn reconcile_dry_run_refuses_a_database_pinned_to_another_scope() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        let err = reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ false,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("the dry run must refuse a database pinned to another scope");
+        assert!(
+            err.to_string().contains("pinned to scope 'all'"),
+            "with the real run's reason: {err}"
+        );
+    }
+
+    /// The guard's own escape hatch reaches the dry run too, so a re-point can
+    /// be previewed before it is made.
+    #[tokio::test]
+    async fn reconcile_dry_run_previews_a_re_point_when_allowed() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ true,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// `deploy --clear-cache` clears the local download cache before the rest
