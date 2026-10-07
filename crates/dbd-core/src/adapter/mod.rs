@@ -268,7 +268,7 @@ pub trait DatabaseAdapter: Send + Sync {
 
     // ── Internal dbd procedures ────────────────────────
 
-    /// Ensure the internal `staging.import_jsonb_to_table` procedure exists.
+    /// Ensure the internal `dbd.import_jsonb_to_table` procedure exists.
     /// An adapter whose JSON import needs it calls this from `import_data`
     /// itself, so no caller has to know the precondition. The procedure is
     /// embedded in the dbd binary — users do not own or manage it.

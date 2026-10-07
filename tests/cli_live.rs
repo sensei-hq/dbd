@@ -251,7 +251,7 @@ fn exported_widgets(dir: &Path, url: &str) -> String {
 
 /// `dbd import -n <table> -f <file>.jsonl` loads one file outside the import
 /// plan, and JSON rows reach their table through dbd's internal
-/// `staging.import_jsonb_to_table` procedure. Only the full import installed
+/// `dbd.import_jsonb_to_table` procedure. Only the full import installed
 /// it, so on a database that had never run one the ad-hoc load failed asking
 /// for a procedure the user never wrote.
 #[tokio::test]

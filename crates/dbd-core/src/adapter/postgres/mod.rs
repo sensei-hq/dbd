@@ -36,16 +36,21 @@ fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
 /// `import_jsonb_to_table` procedure is always created here (see
 /// [`PostgresAdapter::ensure_import_procedure`]), so the `CALL` is pinned to
 /// this schema — never the target table's schema, which has no such procedure.
-const JSONB_IMPORT_SCHEMA: &str = "staging";
+///
+/// dbd's own schema, beside its bookkeeping: it was `staging`, which a JSON
+/// import created in every project whatever its staging schemas are called —
+/// a schema the design never declared, visible to `diff` and `init --from-db`.
+/// `dbd` is excluded from introspection, so the machinery stays out of both.
+const JSONB_IMPORT_SCHEMA: &str = "dbd";
 
 /// Fully-qualified, dbd-owned staging table that jsonl rows are loaded into
 /// before `import_jsonb_to_table` moves them to the target. Schema-qualified so
-/// it resolves regardless of the session `search_path`, and `_dbd_`-prefixed so
-/// it never collides with a user table. Pooled connections don't share
+/// it resolves regardless of the session `search_path`, and in dbd's own schema
+/// so it never collides with a user table. Pooled connections don't share
 /// `search_path`, so an unqualified `_temp` resolves nondeterministically — the
 /// same failure mode fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]).
 /// See sensei-hq/dbd#6.
-const JSONB_IMPORT_TMP: &str = "staging._dbd_import_tmp";
+const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
 
 /// `CALL` that moves staged rows into `target` via the internal import
 /// procedure. Both the procedure schema and the source table are pinned and
@@ -1774,14 +1779,16 @@ impl DatabaseAdapter for PostgresAdapter {
     async fn ensure_import_procedure(&self) -> Result<()> {
         // Embedded at compile time — always up to date with this version of dbd.
         const DDL: &str = include_str!("../../internal/import_jsonb_to_table.ddl");
-        self.execute_script("CREATE SCHEMA IF NOT EXISTS staging").await?;
+        self.execute_script(&format!("CREATE SCHEMA IF NOT EXISTS {JSONB_IMPORT_SCHEMA}"))
+            .await?;
         // Use sqlx::query() instead of execute_script() — sqlx::raw_sql() splits on all
         // semicolons including those inside $$-quoted PL/pgSQL bodies, which mangles
         // CREATE PROCEDURE. sqlx::query() sends the statement as a single unit.
-        sqlx::query(DDL)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("ensure staging.import_jsonb_to_table failed: {e}")))?;
+        sqlx::query(DDL).execute(&self.pool).await.map_err(|e| {
+            DbdError::Config(format!(
+                "ensure {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table failed: {e}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1916,7 +1923,7 @@ mod tests {
         // there — not to `activity`, which has no such procedure (Defect A).
         let sql = jsonb_import_call_sql("activity.assistant_events");
         assert!(
-            sql.contains("CALL staging.import_jsonb_to_table("),
+            sql.contains("CALL dbd.import_jsonb_to_table("),
             "CALL must target the staging procedure, got: {sql}"
         );
         assert!(
@@ -1946,8 +1953,9 @@ mod tests {
             JSONB_IMPORT_TMP.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
             "temp table must be qualified with the import schema: {JSONB_IMPORT_TMP}"
         );
-        assert!(
-            JSONB_IMPORT_TMP.contains("_dbd_"),
+        // dbd's own schema holds no user table, so nothing can be clobbered.
+        assert_eq!(
+            JSONB_IMPORT_SCHEMA, "dbd",
             "temp table must be dbd-namespaced to avoid clobbering user tables: {JSONB_IMPORT_TMP}"
         );
     }
