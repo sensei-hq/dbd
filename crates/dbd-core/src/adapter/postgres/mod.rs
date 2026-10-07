@@ -1346,13 +1346,18 @@ impl DatabaseAdapter for PostgresAdapter {
                     .await?;
                 self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
 
-                // Stage each record as a JSONB row.
+                // Stage each record as a JSONB row — bound, not interpolated into
+                // `execute_script`, which rewrites every `set search_path to …;`
+                // in its text to add `public`. A record is data, and a value that
+                // quoted the statement was altered on the way in. On the pool, as
+                // the CSV `COPY` is: an import never runs inside an apply batch.
+                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::jsonb)");
                 for record in super::json_records(&data, format, file_path)? {
-                    let insert = format!(
-                        "INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ('{}'::jsonb)",
-                        record.replace('\'', "''")
-                    );
-                    self.execute_script(&insert).await?;
+                    sqlx::query(&insert)
+                        .bind(record)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| DbdError::Config(format!("staging a JSON record failed: {e}")))?;
                 }
 
                 // Move data from the temp table to the target. `entity.name` is the
