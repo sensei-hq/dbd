@@ -103,6 +103,23 @@ impl Bookkeeping {
             .await
             .map_err(|e| DbdError::Config(format!("heal: create dbd layout failed: {e}")))?;
 
+        // Lift each materialized view's legacy drift stamp — a dbd before 0.25
+        // kept it as the view's whole comment — into `dbd.matview_stamps`,
+        // before anything re-runs the view's file. That file's own
+        // `COMMENT ON` would erase the stamp, leaving the view untracked. A
+        // recorded stamp wins; the comment itself is left for its author.
+        sqlx::query(
+            "INSERT INTO dbd.matview_stamps (project, matview, stamp) \
+               SELECT $1, n.nspname || '.' || c.relname, obj_description(c.oid, 'pg_class') \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relkind = 'm' AND obj_description(c.oid, 'pg_class') LIKE 'dbd:hash=%' \
+             ON CONFLICT (project, matview) DO NOTHING",
+        )
+        .bind(&self.project)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("heal: lift matview stamps failed: {e}")))?;
+
         // Fold `_dbd_meta` → `dbd.meta` (canonical row wins on conflict).
         for s in meta_schemas {
             let q = s.replace('"', "\"\"");
