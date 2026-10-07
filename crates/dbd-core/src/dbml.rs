@@ -897,6 +897,58 @@ mod tests {
         );
     }
 
+    /// DBML's index settings stop at `type`, `name`, `unique`, `pk` and `note`,
+    /// so the partial predicate, key order and `NULLS NOT DISTINCT` ride in the
+    /// note, one fact per line.
+    #[test]
+    fn index_facts_dbml_cannot_express_are_written_into_the_note() {
+        let mut entity = make_table_entity(
+            "shop.orders",
+            vec![col("customer_id", "bigint"), col("created_at", "timestamptz")],
+            vec![],
+        );
+        let key = |name: &str| IndexColumn {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        entity.table_def.as_mut().unwrap().indexes = vec![
+            IndexDef {
+                name: Some("orders_one_open_per_customer".to_string()),
+                columns: vec![key("customer_id")],
+                unique: true,
+                predicate: Some("status = 'open'".to_string()),
+                ..Default::default()
+            },
+            IndexDef {
+                name: Some("orders_recent_idx".to_string()),
+                columns: vec![
+                    key("customer_id"),
+                    IndexColumn {
+                        order: Some(crate::entity::SortOrder::Desc),
+                        nulls_first: Some(false),
+                        ..key("created_at")
+                    },
+                ],
+                nulls_not_distinct: true,
+                ..Default::default()
+            },
+        ];
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains(
+                r"customer_id [unique, name: 'orders_one_open_per_customer', note: 'where: status = \'open\'']"
+            ),
+            "got:\n{block}"
+        );
+        assert!(
+            block.contains(
+                r"(customer_id, created_at) [name: 'orders_recent_idx', note: 'order: asc, desc nulls last\nnulls not distinct']"
+            ),
+            "got:\n{block}"
+        );
+    }
+
     /// DBML's lexer reads `\` in a quoted string as an escape, so a backslash
     /// is written `\\` and a quote `\'` — wherever dbd writes a string.
     #[test]

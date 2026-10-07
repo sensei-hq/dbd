@@ -1241,6 +1241,25 @@ mod tests {
         assert_eq!(keys(1), vec![("a", false), ("coalesce(b, 'x, y')", true)]);
     }
 
+    /// Only dbd's own note lines are read as index facts. A prose note from
+    /// dbdiagram.io, or an `order:` line that does not cover every key, leaves
+    /// the index as DBML's syntax describes it rather than half-applying.
+    #[test]
+    fn an_index_note_outside_the_convention_changes_nothing() {
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" int\n  \"b\" int\n\n  indexes {\n    (a, b) [name: 'idx_prose', note: 'Where the search page looks things up']\n    (a, b) [name: 'idx_short', note: 'order: desc']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        for ix in &td.indexes {
+            assert_eq!(ix.predicate, None, "{:?}", ix.name);
+            assert!(!ix.nulls_not_distinct, "{:?}", ix.name);
+            assert!(
+                ix.columns.iter().all(|c| c.order.is_none() && c.nulls_first.is_none()),
+                "{:?}",
+                ix.name
+            );
+        }
+    }
+
     #[test]
     fn parse_multiline_triple_quoted_note() {
         let dbml = "Table \"app\".\"t\" {\n  \"id\" int\n\n  Note: '''\nLine one.\nLine two.\n'''\n}\n";
