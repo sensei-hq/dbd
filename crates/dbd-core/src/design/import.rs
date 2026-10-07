@@ -456,6 +456,7 @@ impl Design {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::mock::MockAdapter;
 
     /// A project with one staging table and its data file, a target table, and
     /// whichever routines `routines` lays out (`(type folder, name, ddl)`).
@@ -535,6 +536,134 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("stage.items") && w.contains("stage.item_count") && w.contains("procedure")),
             "the unrun function must be named, with what to do about it: {warnings:?}"
+        );
+    }
+
+    /// A project whose `import.staging` is `staging` (or absent when `None`),
+    /// with a staging table and a live `app.order_notes`, and `files` written
+    /// under `import/`.
+    fn project_with_staging(staging: Option<&str>, files: &[(&str, &str)]) -> (tempfile::TempDir, Design) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let import = staging
+            .map(|s| format!("import:\n  staging: [{s}]\n"))
+            .unwrap_or_default();
+        write(
+            "design.yaml",
+            &format!("project:\n  name: t\nschemas:\n  - staging\n  - app\n{import}"),
+        );
+        write(
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer, name text);\n",
+        );
+        write(
+            "ddl/table/app/order_notes.ddl",
+            "set search_path to app;\ncreate table if not exists order_notes (id integer primary key, note text);\n",
+        );
+        for (rel, body) in files {
+            write(&format!("import/{rel}"), body);
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    }
+
+    const STAGED_ITEMS: (&str, &str) = ("staging/items.csv", "id,name\n1,a\n");
+    const LIVE_NOTES: (&str, &str) = ("app/order_notes.csv", "id,note\n1,replaced\n");
+
+    /// `import.staging` lists the schemas an import may load, and the docs say
+    /// the import fails for any other — but the list was parsed and never
+    /// read. A data file under `import/app/` was loaded like any staging file:
+    /// `app.order_notes` was TRUNCATEd and its rows replaced. It is refused,
+    /// naming the file, before anything — the staging file's truncate
+    /// included — touches the database.
+    #[tokio::test]
+    async fn a_data_file_outside_the_staging_schemas_is_refused_before_any_truncate() {
+        let (_tmp, design) = project_with_staging(Some("staging"), &[STAGED_ITEMS, LIVE_NOTES]);
+
+        let mock = MockAdapter::new();
+        let err = design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("a file loading app.order_notes must be refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/app/order_notes.csv") && msg.contains("app.order_notes"),
+            "the refusal names the file and the table it would load: {msg}"
+        );
+        assert!(msg.contains("import.staging"), "and the setting that refuses it: {msg}");
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "no TRUNCATE (of either table), no CALL, no hook: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing loads");
+    }
+
+    /// Every preview prints this plan, so a dry run refuses what the run
+    /// refuses rather than listing a load that will never happen.
+    #[test]
+    fn the_import_plan_refuses_a_data_file_outside_the_staging_schemas() {
+        let (_tmp, design) = project_with_staging(Some("staging"), &[STAGED_ITEMS, LIVE_NOTES]);
+        let err = design
+            .scoped_import_plan(None, None)
+            .expect_err("the plan must refuse it too");
+        assert!(err.to_string().contains("import/app/order_notes.csv"), "{err}");
+    }
+
+    /// `deploy` applies the schema, then imports. Refusing only at the import
+    /// would leave the schema applied and the deploy failed half way; the
+    /// import's refusals are checked before the first statement instead.
+    #[tokio::test]
+    async fn deploy_refuses_a_data_file_outside_the_staging_schemas_before_applying() {
+        let (_tmp, design) = project_with_staging(Some("staging"), &[STAGED_ITEMS, LIVE_NOTES]);
+        let mock = MockAdapter::new();
+        let err = design
+            .deploy(&mock, false, None, |_| {})
+            .await
+            .expect_err("deploy must refuse the misplaced file");
+        assert!(err.to_string().contains("import/app/order_notes.csv"), "{err}");
+        assert!(
+            mock.applied.lock().unwrap().is_empty(),
+            "nothing applied: {:?}",
+            mock.applied.lock().unwrap()
+        );
+        assert!(mock.scripts.lock().unwrap().is_empty(), "nothing run");
+    }
+
+    /// `-n` narrows the run to one file, and only what the run loads is
+    /// judged: a misplaced file elsewhere does not block loading a staging one.
+    #[tokio::test]
+    async fn a_named_staging_file_loads_though_another_file_is_misplaced() {
+        let (_tmp, design) = project_with_staging(Some("staging"), &[STAGED_ITEMS, LIVE_NOTES]);
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, Some("staging.items"), false, None, Progress::none())
+            .await
+            .expect("the named staging file is allowed");
+        assert_eq!(*mock.imported.lock().unwrap(), vec!["staging.items".to_string()]);
+    }
+
+    /// A project that never declared `import.staging` has nothing to enforce,
+    /// and loads every schema as it always has.
+    #[tokio::test]
+    async fn without_import_staging_every_schema_loads_as_before() {
+        let (_tmp, design) = project_with_staging(None, &[STAGED_ITEMS, LIVE_NOTES]);
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .expect("no staging list, no restriction");
+        let mut imported = mock.imported.lock().unwrap().clone();
+        imported.sort();
+        assert_eq!(
+            imported,
+            vec!["app.order_notes".to_string(), "staging.items".to_string()]
         );
     }
 
