@@ -10,13 +10,16 @@ export const brand = {
 };
 
 export const nav = {
+	// "Who it's for" moved to the footer to make room for the viewer and the
+	// changelog; it is still a section of the home page.
 	links: [
 		{ label: 'Overview', href: '/#overview' },
 		{ label: 'Concepts', href: '/#concepts' },
 		{ label: 'Targets', href: '/#targets' },
 		{ label: 'Commands', href: '/#commands' },
-		{ label: "Who it's for", href: '/#audience' },
 		{ label: 'Guide', href: '/guide' },
+		{ label: 'Viewer', href: '/diagram' },
+		{ label: 'Changelog', href: '/changelog' },
 		{ label: 'Projects', href: '/projects' }
 	],
 	cta: { label: 'Get started', href: '/#start' }
@@ -257,6 +260,15 @@ export const start = {
 	cta: { label: 'View on GitHub', href: REPO }
 };
 
+export const changelog = {
+	eyebrow: 'Release notes',
+	title: 'Changelog',
+	lede: 'What changed in the last five releases of dbd. Older releases are in the full changelog.',
+	description: 'Release notes for the last five versions of dbd, the schema-as-code CLI and Rust library.',
+	full: `${REPO}/blob/main/CHANGELOG.md`,
+	fullLabel: 'Read the full changelog on GitHub'
+};
+
 export const footer = {
 	tagline: 'Database schemas as code, built in Rust.',
 	columns: [
@@ -265,15 +277,20 @@ export const footer = {
 			links: [
 				{ label: 'Overview', href: '/#overview' },
 				{ label: 'Concepts', href: '/#concepts' },
-				{ label: 'Targets', href: '/#targets' }
+				{ label: 'Targets', href: '/#targets' },
+				{ label: 'Commands', href: '/#commands' },
+				{ label: "Who it's for", href: '/#audience' }
 			]
 		},
 		{
 			title: 'Resources',
 			links: [
 				{ label: 'Guide', href: '/guide' },
+				{ label: 'Schema viewer', href: '/diagram' },
+				{ label: 'Changelog', href: '/changelog' },
 				{ label: 'GitHub', href: REPO },
-				{ label: 'llms.txt', href: '/llms.txt' }
+				{ label: 'llms.txt', href: '/llms.txt' },
+				{ label: 'llms-full.txt', href: '/llms-full.txt' }
 			]
 		}
 	],

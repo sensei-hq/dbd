@@ -10,3 +10,10 @@ export function canonicalFor(pathname: string): string {
 	const p = pathname !== '/' ? pathname.replace(/\/+$/, '') : '/';
 	return SITE_URL + p;
 }
+
+/** Every page a crawler should index, for the sitemap. /projects is deliberately
+ *  absent: it is a personal, localStorage-backed workspace with nothing to crawl
+ *  (it is noindex, and robots.txt disallows it). */
+export function indexableRoutes(guideSlugs: string[]): string[] {
+	return ['/', '/guide', '/diagram', '/changelog', ...guideSlugs.map((slug) => `/guide/${slug}`)];
+}
