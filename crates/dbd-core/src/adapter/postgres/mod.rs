@@ -1376,6 +1376,15 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let format = entity.format.as_deref().unwrap_or("csv");
+        // Refused rather than defaulted: the file is named for the format asked
+        // for, so anything that fell through to CSV — `-f json` — wrote CSV into
+        // a `.json` file that the import then reads as JSON and rejects.
+        if !matches!(format, "csv" | "tsv" | "jsonl") {
+            return Err(DbdError::Config(format!(
+                "cannot export {} as {format}: Postgres exports csv, tsv or jsonl",
+                entity.name
+            )));
+        }
 
         // The file is named after the table (and, without `--out`, the directory
         // after its schema). A quoted identifier may hold path separators, and
@@ -1415,6 +1424,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 "tsv" => format!(
                     "COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
                 ),
+                // csv — the only format left once the guard above has run.
                 _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
             };
 
