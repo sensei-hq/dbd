@@ -859,7 +859,8 @@ mod tests {
             !lookups.contains("\"name\""),
             "a stub shows only the referenced columns:\n{dbml}"
         );
-        assert!(stub("\"config\".\"categories\"").contains("\"id\" varchar"), "{dbml}");
+        // Nothing defines it, so its key is typed like the column referencing it.
+        assert!(stub("\"config\".\"categories\"").contains("\"id\" uuid"), "{dbml}");
     }
 
     /// A missing config bails with an actionable "not found" error.

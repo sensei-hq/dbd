@@ -762,28 +762,48 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
 /// referenced columns' real types; an External, or a table the design never
 /// declares, has no types to give and gets `varchar`.
 fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &EnumTypes) -> String {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::collections::{BTreeMap, HashSet};
 
     let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
-    let mut targets: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    // Each target's referenced columns, with the type of the first column seen
+    // referencing it — what a stub falls back to when nothing declares one.
+    let mut targets: BTreeMap<String, BTreeMap<&str, String>> = BTreeMap::new();
     for entity in documented {
         let Some(table_def) = &entity.table_def else {
             continue;
         };
-        let inline = table_def.columns.iter().filter_map(|c| c.inline_fk.as_ref());
+        let type_of = |column: &str| {
+            table_def
+                .columns
+                .iter()
+                .find(|c| c.name == column)
+                .map(|c| enums.column_type(&c.data_type, &entity.schema_path))
+        };
+        // An inline FK's source is the column carrying it, whatever `columns` says.
+        let inline = table_def
+            .columns
+            .iter()
+            .filter_map(|c| c.inline_fk.as_ref().map(|fk| (fk, vec![type_of(&c.name)])));
         let table_level = table_def.constraints.iter().filter_map(|c| match c {
-            TableConstraint::ForeignKey(fk) => Some(fk),
+            TableConstraint::ForeignKey(fk) => Some((fk, fk.columns.iter().map(|col| type_of(col)).collect())),
             _ => None,
         });
-        for fk in inline.chain(table_level) {
+        for (fk, source_types) in inline.chain(table_level) {
             // Named exactly as `emit_ref` names the target, so the stub is the
             // table the Ref line points at.
             let target = format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table);
-            if !defined.contains(&target) {
-                targets
-                    .entry(target)
-                    .or_default()
-                    .extend(fk.ref_columns.iter().map(String::as_str));
+            if defined.contains(&target) {
+                continue;
+            }
+            let columns = targets.entry(target).or_default();
+            for (i, column) in fk.ref_columns.iter().enumerate() {
+                let source_type = source_types.get(i).cloned().flatten();
+                let entry = columns.entry(column.as_str()).or_default();
+                if entry.is_empty()
+                    && let Some(source_type) = source_type
+                {
+                    *entry = source_type;
+                }
             }
         }
     }
@@ -808,11 +828,17 @@ fn qualified_name(entity: &Entity) -> String {
     format!("{schema}.{base}")
 }
 
-/// One stub `Table` block: the referenced `columns` of `target`, typed from
-/// `known` when the design defines it, and a note saying why it is a stub.
+/// One stub `Table` block: the referenced `columns` of `target`, and a note
+/// saying why it is a stub.
+///
+/// A column is typed from `known` when the design defines the table, else
+/// like the column referencing it — an `external:` declares no types, and the
+/// `varchar` it used to get made `dbml2sql` write a `uuid` foreign key to a
+/// `varchar` key, which Postgres refuses. `varchar` is left for a column with
+/// neither.
 fn emit_stub_block(
     target: &str,
-    columns: &std::collections::BTreeSet<&str>,
+    columns: &std::collections::BTreeMap<&str, String>,
     known: Option<&Entity>,
     enums: &EnumTypes,
 ) -> String {
@@ -820,14 +846,16 @@ fn emit_stub_block(
     let known_columns = known.and_then(|e| e.table_def.as_ref().map(|td| (td.columns.as_slice(), &e.schema_path)));
 
     let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
-    for column in columns {
-        let data_type = known_columns
-            .and_then(|(cols, path)| cols.iter().find(|c| c.name == *column).map(|c| (c, path)))
-            .map_or_else(
-                || "varchar".to_string(),
-                |(c, path)| quote_type_if_needed(&enums.column_type(&c.data_type, path)),
-            );
-        lines.push(format!("  \"{column}\" {data_type}"));
+    for (column, referencing_type) in columns {
+        let known_type = known_columns.and_then(|(cols, path)| {
+            cols.iter()
+                .find(|c| c.name == *column)
+                .map(|c| enums.column_type(&c.data_type, path))
+        });
+        let data_type = known_type
+            .or_else(|| (!referencing_type.is_empty()).then(|| referencing_type.clone()))
+            .unwrap_or_else(|| "varchar".to_string());
+        lines.push(format!("  \"{column}\" {}", quote_type_if_needed(&data_type)));
     }
     let note = match known.map(|e| e.entity_type) {
         Some(EntityType::External) => "External entity — managed outside this project",
