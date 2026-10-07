@@ -217,6 +217,22 @@ mod tests {
         assert!(files.len() > 5);
     }
 
+    /// `init` scaffolds what it knows how to scaffold. Any other target —
+    /// `convex`, `sqlite`, a typo — wrote a postgres project without a word.
+    #[test]
+    fn create_project_refuses_a_target_it_cannot_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        for target in ["convex", "sqlite", "supbase"] {
+            let err = create_project(tmp.path(), "test", target).unwrap_err().to_string();
+            assert!(err.contains(target), "names what was asked for: {err}");
+            assert!(
+                err.contains("postgres") && err.contains("supabase"),
+                "and what works: {err}"
+            );
+            assert!(!tmp.path().join("design.yaml").exists(), "nothing written for {target}");
+        }
+    }
+
     #[test]
     fn create_project_fails_if_already_initialized() {
         let tmp = TempDir::new().unwrap();
