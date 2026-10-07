@@ -153,3 +153,26 @@ fn apply_dry_run_under_a_scope_is_not_blocked_by_a_file_outside_it() {
     );
     assert!(stdout(&out).contains("hub.nodes"), "{}", stdout(&out));
 }
+
+// ── policies --dry-run agrees with policies ─────────────────────────────────
+
+/// The real `policies` (and `deploy`) skip a policy whose table the scope does
+/// not build. The preview listed every file under `policies/`, so it promised a
+/// policy on a table the plane does not have.
+#[test]
+fn policies_dry_run_under_a_scope_lists_only_the_scopes_policies() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["policies", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("hub/nodes.sql"), "the scope's policy is listed: {text}");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("app/users.sql") && !l.contains("skipped")),
+        "a policy outside the scope is never listed as one that would apply: {text}"
+    );
+}
