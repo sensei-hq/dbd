@@ -79,9 +79,10 @@ On every target, `pg_catalog`, `information_schema`, `pg_toast` and dbd's own
 `source.dialect: supabase` is something else: a spelling of `postgresql` for
 the reader. It changes nothing about the target.
 
-`dbd init --from-db` names the target it writes `postgres` (or `sqlite`), even
-when the database is a Supabase one. Rename the key to `supabase` to get the
-behaviour above.
+`dbd init --from-db` names the target it writes `supabase` when the database
+has both an `auth` and a `storage` schema — Supabase's own — and `postgres` (or
+`sqlite`) otherwise. `dbd init --from-dbml --target supabase` does the same for a
+DBML source, which names no platform.
 
 ### `reset --target`
 
@@ -94,8 +95,9 @@ dbd reset --schemas --dry-run                    # protected set from the design
 dbd reset --schemas --target postgres --dry-run  # override: drop public too
 ```
 
-With `postgres`, `public` **is** dropped by `--schemas`, and roles are dropped
-on a full (unscoped) reset; with `supabase`, neither is.
+With `postgres`, `public` **is** dropped by `--schemas`, and every role the design
+declares (`ddl/role/` and `target.roles`) is dropped on a full (unscoped) reset;
+with `supabase`, neither is.
 
 ## PostgreSQL
 
@@ -110,8 +112,10 @@ The reference target: every feature works here.
   one — fails there; set `DBD_NO_TX` (to any value) to apply without the
   transaction.
 - **Bookkeeping** lives in a `dbd` schema: `dbd.meta` (project, environment,
-  version, pinned scope) and `dbd.migrations`. The schema is not in PostgREST's
-  default `db-schemas`, is never reverse-engineered, and is never dropped.
+  version, pinned scope), `dbd.migrations`, and `dbd.matview_stamps` (each
+  materialized view's drift stamp — kept out of the view's `COMMENT`, which is
+  the author's). The schema is not in PostgREST's default `db-schemas`, is never
+  reverse-engineered, and is never dropped.
 - **Legacy bookkeeping heals itself.** Databases written by older dbd versions
   kept `_dbd_meta`/`_dbd_migrations` in `public` (or, after a scoped apply, in
   other schemas). The next `apply`, `deploy`, `reconcile` or `reset` folds them
@@ -199,4 +203,4 @@ from the design's tables and enums:
 | grants, `policies` | yes | grants skipped; policies fail | no | no |
 | `refresh`, materialized views | yes | no | no | no |
 | `dbd emit` can write its DDL | — | `--dialect sqlite` | — | `--dialect mysql`, `--dialect tsql` |
-| Bookkeeping | `dbd.meta`, `dbd.migrations` | `_dbd_meta`, `_dbd_migrations` | `.dbd_state.json` | — |
+| Bookkeeping | `dbd.meta`, `dbd.migrations`, `dbd.matview_stamps` | `_dbd_meta`, `_dbd_migrations` | `.dbd_state.json` | — |

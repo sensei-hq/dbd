@@ -36,6 +36,9 @@ schemas. Two kinds of destruction each need their own opt-in:
   `--scope`, a table the design declares outside the scope is not an orphan — a scope narrows
   what is applied, not what the project owns. **Upgrade to 0.24.1 before a scoped prune:**
   earlier releases dropped those tables ([#40](https://github.com/sensei-hq/dbd/issues/40)).
+  `public` is managed only when the design puts something there — a role or an extension with
+  no `schema:` does not; **before 0.25 either did**, and prune dropped the undeclared tables in
+  `public`.
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 
@@ -67,8 +70,8 @@ dbd format         # normalize to your conventions (introspected column order is
 **refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
 use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
 
-Adopting a Supabase database? `init --from-db` names the target `postgres`; rename the key to
-`supabase` so Supabase's own schemas are protected (see
+Adopting a Supabase database? `init --from-db` recognises it by Supabase's `auth` and `storage`
+schemas and names the target `supabase`, so Supabase's own schemas are protected (see
 [targets and adapters](08-targets.md#what-the-supabase-key-changes)).
 
 #### Snapshots, but not released
@@ -79,12 +82,12 @@ Adopting a Supabase database? `init --from-db` names the target `postgres`; rena
 - it **has snapshots**, so it is on the migration track — `dbd snapshot` then `dbd apply` is
   the way to change it, as for a released project;
 - it is **not released**, so `dbd reconcile` still runs — reconcile checks the flag, nothing
-  else;
-- and `dbd release` **refuses**, because snapshots already exist.
+  else.
 
-Treat it as released: change it with `dbd snapshot` and `dbd apply`. To have `reconcile`
-refuse as well, set `released: true` under `project:` in `design.yaml` yourself — that is the
-only thing `dbd release` would have added.
+Treat it as released, and make it so with `dbd release`: on a project with snapshots it writes
+no second baseline — it releases at the version the latest snapshot reached and sets the flag,
+after which `reconcile` refuses. It refuses while the design has changes no snapshot records
+(run `dbd snapshot` first), and when `project.version` disagrees with the latest snapshot.
 
 ### Add a new database to an existing project
 

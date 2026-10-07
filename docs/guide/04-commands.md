@@ -74,8 +74,13 @@ dbd inspect -n config.lookups     # Inspect one entity
 dbd inspect -v                    # Verbose: show entity JSON
 dbd inspect --fix                 # Auto-fix DDL formatting (runs the formatter in place)
 dbd inspect --scope hub           # Validate scope + report dependency gaps
+dbd inspect --scope hub --fix     # Format only the files the 'hub' scope builds
 dbd inspect --from-db -d $DATABASE_URL    # Resolve references against the live catalog
 ```
+
+**`-n`** must name an entity the design has — `no entity named 'X'` otherwise — and, under
+`--scope`, one the scope builds (`X is outside scope 'S'`). `apply`, `graph`, `export` and
+`refresh` refuse a `-n` the same way, rather than succeed having selected nothing.
 
 **`--from-db`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums), using the `-d`/`--database` connection — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
 
@@ -121,7 +126,7 @@ broken:
 
 ```
 $ dbd inspect --scope daemon
-scope 'daemon': 2 entities
+scope 'daemon': 2 of 4 entities
 
 Out of scope — not blocking 'daemon':
 
@@ -129,9 +134,18 @@ Out of scope — not blocking 'daemon':
   Parse error: Invalid statement: syntax error at or near ","
 
   → these files are not built by 'daemon', so it can run. They will block a run whose scope includes them.
-2 entities — no issues
+
+Warnings:
+
+./ddl/table/svc/broken.ddl =>
+  ddl/table/svc/broken.ddl states no `SET search_path`; unqualified names resolved against PostgreSQL's session default ("$user", public) — set source.search_path to choose
+
+2 entities — 0 errors, 1 warning
 (1 error(s) outside scope 'daemon')
 ```
+
+(A file that does not parse cannot show the `SET search_path` it opens with, so
+it draws that warning too.)
 
 Exit code is **0** here, matching `apply --scope daemon`, which applies cleanly.
 Move the same broken file into a schema the scope *does* build and it becomes
@@ -139,7 +153,15 @@ Move the same broken file into a schema the scope *does* build and it becomes
 
 Out-of-scope errors are reported, never suppressed: a file that no scope builds
 is exactly how a broken file survives unnoticed. The entity count in the summary
-is also scope-aware, so it agrees with the `scope '…': N entities` line.
+is scope-aware — the first number of the `scope '…': N of M entities` line,
+which counts the working set (the `deps: include` closure too) against every
+entity the design declares, externals left out of both. Every command that
+announces a scope counts it this way.
+
+The advisory checks — materialized-view refresh config, enum suggestions, the
+RLS report — run over the scope too, not the whole design. A `deps: include`
+scope whose closure needs something the scope excludes is refused, as `apply`,
+`dbml` and `diagram` refuse it.
 
 ---
 
@@ -150,7 +172,7 @@ Apply DDL scripts to the database in dependency order.
 ```sh
 dbd apply                          # Apply all entities
 dbd apply -n config.lookups        # Apply one entity
-dbd apply --dry-run                # Print apply order (no DB needed)
+dbd apply --dry-run                # Print apply order (no DB needed; same gates as apply)
 dbd apply -v                       # Show entity list then execute
 dbd apply -d postgres://...        # Explicit database URL
 ```
@@ -161,7 +183,11 @@ enums, tables, views, materialized views, then functions and procedures — and
 a real dependency can move an entity later than its band: a view that calls a
 function is applied after the function, and a function whose body reads a view
 after the view. Entities in a dependency cycle get an error and go last.
-`--dry-run` prints the order without a database.
+`--dry-run` prints the order without a database, after the
+`scope 'X': N of M entities` line under a scope. It runs the real apply's gates
+— a file that does not parse, a dependency gap or closure conflict, a `-n` that
+names nothing — and refuses exactly where `apply` would, and it lists the
+extensions the scope's `extensions:` allowlist admits, not every one.
 
 **One transaction.** On PostgreSQL the entities, pending migrations and version
 stamp run in a single transaction, so an interrupted upgrade rolls back to the
@@ -172,13 +198,14 @@ value to apply without it. SQLite applies without a transaction.
 
 **Grants.** After the schema — entities, migrations and `apply.after` — `dbd apply`
 applies the `grants:` configured on schema entries and on the target (see
-[access control](09-access-control.md#grants)). `--dry-run` applies none and
-does not list hook scripts either.
+[access control](09-access-control.md#grants)); under `--scope`, only on the
+schemas the scope builds. `--dry-run` applies none and does not list hook
+scripts either.
 
 **Policies** are not applied unless you pass `--with-policies`; `dbd deploy`
 applies them always.
 
-**Materialized views.** After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any matview it just created and **syncs pg_cron refresh jobs** to match the `materialized_views:` config (jobs named `dbd:refresh:<schema>.<name>`; requires the `pg_cron` extension when a schedule is set). Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`) so a re-`apply` is safe.
+**Materialized views.** After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp for any matview it just created — in `dbd.matview_stamps`, not in the matview's comment, which stays the author's own `COMMENT ON MATERIALIZED VIEW` (a stamp an earlier dbd wrote in a comment is still read until a new one is recorded) — and **syncs pg_cron refresh jobs** to match the `materialized_views:` config (jobs named `dbd:refresh:<schema>.<name>`; requires the `pg_cron` extension when a schedule is set). Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`) so a re-`apply` is safe.
 
 **Scope guard.** `apply` (like `deploy`/`reconcile`) refuses to run under a different scope than the database is pinned to, and pins the scope on every successful run. Pass `--allow-scope-change` to re-point the database — see [Scope guard](#scope-guard).
 
@@ -197,7 +224,9 @@ dbd refresh --scope hub            # Only matviews the 'hub' scope builds
 
 Useful for the initial populate after a data load, or in CI — independent of the pg_cron schedule. Scheduled (recurring) refresh is managed in-database via pg_cron and configured under `materialized_views:` in design.yaml (see [design.yaml reference](03-design-yaml.md#materialized_views)). PostgreSQL/Supabase only.
 
-**`--scope` (honored from v0.12.0).** A matview the scope excludes was never built on that plane, so refreshing it failed with `schema "…" does not exist`. `refresh` now filters to the scope's working set like every other entity-selecting command, and announces the narrowing. Previously the flag was accepted and ignored.
+**`--scope` (honored from v0.12.0).** A matview the scope excludes was never built on that plane, so refreshing it failed with `schema "…" does not exist`. `refresh` now filters to the scope's working set like every other entity-selecting command, and announces the narrowing (`scope 'hub': N of M entities`). Previously the flag was accepted and ignored.
+
+A `-n` that selects nothing is an error: `no entity named 'X'`, `X is outside scope 'S'`, `X is not a materialized view`, or, for `<schema>.*`, no matview matching it or every one outside the scope.
 
 ---
 
@@ -324,7 +353,9 @@ dbd combine --scope hub -f hub.sql # Only the 'hub' scope's working set
 dbd combine --scope hub --deps include  # Expand to the dependency closure first
 ```
 
-**Scope-aware.** `--scope` filters the combined SQL to that scope's working set; `--deps include` (or a scope with `deps: include`) first expands to the dependency closure so the script is self-contained. Filter-only — `combine` does not gate on dependency gaps (use `inspect --scope` to surface them). Roles are kept in every scope; extensions are too, unless the scope sets an `extensions` allowlist (then only the listed extensions — `[]` for none).
+**Scope-aware.** `--scope` filters the combined SQL to that scope's working set and prints `scope 'hub': N of M entities`; `--deps include` (or a scope with `deps: include`) first expands to the dependency closure so the script is self-contained. Filter-only — `combine` does not gate on dependency gaps (use `inspect --scope` to surface them). Roles are kept in every scope; extensions are too, unless the scope sets an `extensions` allowlist (then only the listed extensions — `[]` for none).
+
+**In the project's dialect.** The files are concatenated as written, and the statements dbd generates around them follow `source.dialect`: `CREATE SCHEMA IF NOT EXISTS` for PostgreSQL; for T-SQL a guarded `IF SCHEMA_ID(N'x') IS NULL EXEC(N'CREATE SCHEMA [x]');` followed by `GO`; nothing for MySQL and SQLite, which have no schemas. Extensions and roles are PostgreSQL-only, so in a T-SQL, MySQL or SQLite script each becomes a comment saying it was not created. A file that does not parse is left out without a message — run `dbd inspect` first.
 
 ---
 
@@ -359,9 +390,9 @@ dbd graph --scope hub              # Only the 'hub' scope's working set
 
 Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`
 
-`--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose.
+`--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose; a `-n` that names nothing, or something outside the scope, is an error rather than an empty graph.
 
-**`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. The other scope-filtering commands (`dbml`, `combine`, `export`) print `scope '<name>': <kept> of <total> entities` instead; unscoped runs print nothing.
+**`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. The other scope-announcing commands (`inspect`, `apply --dry-run`, `deploy --dry-run`, `combine`, `dbml`, `export`, `refresh`) print `scope '<name>': <kept> of <total> entities` instead; unscoped runs print nothing.
 
 ---
 
@@ -433,14 +464,15 @@ reset is blocked — database has applied migrations. Use --force to override.
 **Opt-in wider drops:**
 
 - `--schemas` — also `DROP SCHEMA … CASCADE` for the project's managed schemas. Always skips the true system schemas (`pg_catalog`, `information_schema`, `pg_toast`) and dbd's own `dbd` bookkeeping schema; on a `supabase` target also skips the Supabase-managed set (`public`, `auth`, `storage`, `realtime`, `graphql_public`, `supabase_functions`, `pgbouncer`, `pgsodium`, `vault`, `extensions`, `supabase_migrations`). On a `postgres` target, `public` **is** dropped.
-- `--extensions` — also `DROP EXTENSION … CASCADE` for each extension in the target's `extensions:` config.
+- `--extensions` — also `DROP EXTENSION … CASCADE` for each extension in the target's `extensions:` config — under `--scope`, only those the scope's `extensions:` allowlist installs.
 - `--clean` — shorthand for `--schemas --extensions`.
 
 **`--target`** names the target whose protected set applies. It defaults to the
 design's target key — the first `target:` entry — so a Supabase project's
 schemas are protected without passing anything; pass `--target postgres` or
-`--target supabase` to override. Roles from the target's `roles:` are dropped on
-a full reset only when the target is `postgres`.
+`--target supabase` to override. Every role the design declares — `ddl/role/`
+files as well as the target's `roles:` — is dropped on a full reset, and only
+when the target is `postgres`.
 
 **Scope-aware.** `--scope` restricts the reset to the objects (and, with `--schemas`, the schemas) the scope's working set occupies. Roles are dropped only on a full reset; a subset scope leaves shared roles intact. A reset whose `--scope` differs from the database's pinned scope is refused unless you pass `--allow-scope-change` (or `--force`) — see [Scope guard](#scope-guard).
 
@@ -462,6 +494,8 @@ Smart multi-snapshot: When complex changes are detected (column rename, type cha
 - Enum value removal: 3 snapshots (data correction, TEXT intermediary, enum recreation)
 
 Data corrections (*.data.sql) are generated automatically where possible. Non-derivable corrections (enum value mapping) generate TODO comments.
+
+`dbd snapshot` sets `project.version` by editing `design.yaml` in place: its comments, blank lines and flow-style lists stay as you wrote them.
 
 ---
 
@@ -499,7 +533,9 @@ identical pipeline.
 
 Every phase reports its count, including zero. If nothing was imported, `deploy`
 says why — no `import/` directory, data files belonging to a different `--env`,
-a staging file that failed to parse, or entries cut by the active `--scope`.
+a staging file that failed to parse, entries cut by the active `--scope`, or a
+function reading a staging table that no procedure loads. Grants, like the rest,
+are narrowed to the schemas the scope builds.
 A policy file that fails is non-fatal: it is reported as a warning and counted
 in the summary, and the deploy still succeeds.
 
@@ -524,9 +560,26 @@ Downloads are cached in `~/.cache/dbd/` (macOS: `~/Library/Caches/dbd`), keyed b
 `--clear-cache` removes the entire cache directory before deploying. Both are no-ops for local path
 sources (`--clear-cache` still clears the cache).
 
-`--dry-run` checks the scope, reports errors and dependency gaps, and counts the
-data files and policy files a real run would use — the policy count is not
-narrowed by `--scope`.
+`--dry-run` runs the real deploy's gates without a database — it refuses a file
+that does not parse, a dependency gap or a closure conflict — and then reports
+what the run would do, after scope filtering: the `scope 'X': N of M entities`
+line, each `deps: include` gap as a `+ auto-included:` line rather than a
+failure, the entities that would be applied, the data files that would be
+imported with the reason for every one left out, and the policy files that would
+be applied and skipped:
+
+```
+$ dbd deploy --dry-run --scope hub        # hub: { includes: [app], deps: include }
+Deploying from source: .
+scope 'hub': 4 of 7 entities
++ auto-included: config.lookups (required by app.orders)
+    chain: app.orders → config.lookups
+4 entities would be applied.
+0 data file(s) would be imported.
+⚠ staging.lookups not imported — staging.lookups is outside scope 'hub'
+1 policy file(s) would be applied, 1 skipped (out of scope).
+[dry-run] No changes applied.
+```
 
 ---
 
@@ -561,13 +614,19 @@ schemas. Two kinds of destruction each need an explicit opt-in:
   declares outside the scope is never an orphan — a scope narrows what is applied, not what the
   project owns. **Before 0.24.1 it was:** a scoped prune dropped such tables
   ([#40](https://github.com/sensei-hq/dbd/issues/40)), so upgrade before running `reconcile --prune --scope`.
-  On a `supabase` target, Supabase's own schemas are never pruned.
+  On a `supabase` target, Supabase's own schemas are never pruned. `public` is a managed schema
+  only when the design puts something in it: a role, or an extension with no `schema:`, does not
+  make it one. **Before 0.25 it did**, and `--prune` dropped every table in `public` the design
+  never declared — upgrade before your next `reconcile --prune`.
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 Reconcile is **disabled once the project is released** (`project.released: true`) — see `dbd release`.
 It checks that flag only: a project with snapshots that was never released (see
 [recommended workflows](06-recommended-workflows.md#snapshots-but-not-released)) can still reconcile.
-`--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`).
+`--scope`/`--deps` restrict reconcile to a scope's working set (gap-gated, like `apply`), and
+`--dry-run` refuses a database pinned to another scope, as the real run does. Reconcile records
+the database at `project.version` — `0` when the design has none, as `apply` records — so a dev
+`reset` afterwards is not refused as though migrations had run.
 
 **What reconcile compares** (against the introspected live schema): columns
 (name, type, nullability, default, identity), primary-key / unique constraints, **foreign
@@ -636,7 +695,8 @@ dbd diff --scope hub -d $HUB_URL          # Restrict to a scope's working set
 The desired schema is parsed from your DDL; the live schema is introspected. dbd normalizes
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
-default casts, enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION` defaults and
+default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
+reports), enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
 Postgres stores in its place, casts on `ARRAY[…]` constructors, and `AND`/`OR` nesting.
@@ -646,18 +706,23 @@ by hand.
 Under `--scope`, `diff` compares the scope's working set and refuses on a dependency
 gap, like `apply`.
 
-**Coverage:** diff covers **tables and enums** (all their attributes) plus
-**materialized-view drift** — each matview is reported as `missing` (in the
-design, not the DB), `drifted` (deployed definition differs from the design, by
-`dbd:hash` sentinel), `unstamped` (in the DB but not managed by dbd), or `orphan`
-(in a managed schema, not in the design). Matview drift counts toward
+**Coverage:** diff covers **tables and enums** (their columns, keys, constraints,
+indexes, column comments and values) plus **materialized-view drift** — each
+matview is reported as `missing` (in the design, not the DB), `drifted` (deployed
+definition differs from the design, by the `dbd:hash` drift stamp dbd recorded
+in `dbd.matview_stamps`), `unstamped` (in the DB with no stamp dbd recorded), or
+`orphan` (in a managed schema, not in the design). Matview drift counts toward
 `--exit-code` and appears in `--json` (`matview_drift`). Views/functions/roles/
-sequences are not structurally diffed.
+sequences are not structurally diffed, and table, view and enum comments are not
+compared.
 
 **Best-effort edges** (reported, but may need a human glance): a foreign key that references a
 table in the *same non-public schema* without qualifying it can read as drift; a standalone
 index whose columns exactly match a PK/UNIQUE constraint is treated as that constraint's
-backing index and suppressed; an unparseable CHECK is shown with an `advisory`.
+backing index and suppressed; an unparseable CHECK is shown with an `advisory`. How Postgres
+renders a name inside a live default depends on the reading session's `search_path`, which a
+pooled connection can inherit from an earlier DDL file, so a bare `nextval('s')` in a file can
+still read as drift now and then.
 
 ---
 
@@ -672,13 +737,18 @@ dbd release --name "v1 GA"    # Baseline snapshot + released: true
 dbd baseline                  # Alias
 ```
 
-Refuses if the project is already released, if snapshots already exist (it's already on the
-migration track), or if the design has entity errors (run `dbd inspect` first). After release the
-flow is the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
+Refuses if the project is already released or the design has entity errors (run `dbd inspect`
+first). After release the flow is the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
 
-The snapshot refusal catches projects built by `dbd init --from-db` or `dbd merge`, which write
-snapshots without setting `released` — see
+**A project that already has snapshots** — one `dbd init --from-db` or `dbd merge` built, which
+write snapshots without setting `released` — is released at the version its latest snapshot
+reached, with no second baseline (`--name` is then unused, and says so). It refuses while the
+design has changes no snapshot records — capture them with `dbd snapshot`, then release — and
+when `project.version` disagrees with the latest snapshot. See
 [recommended workflows](06-recommended-workflows.md#snapshots-but-not-released).
+
+`dbd release` sets `released: true` by editing `design.yaml` in place, keeping its comments,
+blank lines and flow-style lists.
 
 ---
 
@@ -744,6 +814,9 @@ dbd init --name myproject               # Custom project name
 dbd init --target supabase              # Supabase target with externals + ignore patterns
 ```
 
+`--target` takes `postgres` (the default) or `supabase`, the two targets with a scaffold; any
+other is refused rather than given the PostgreSQL scaffold.
+
 Creates design.yaml, the ddl/ type folders (`table`, `view`, `materialized_view`,
 `function`, `procedure`, `enum`), an `import/` folder and a sample table DDL.
 The Supabase target adds a `config` schema, the Supabase objects you reference
@@ -798,8 +871,10 @@ that version, ready for `dbd snapshot`/`dbd apply`. `--dry-run` previews this
 `project.released` — see
 [snapshots but not released](06-recommended-workflows.md#snapshots-but-not-released).
 
-The target it writes is named `postgres` (or `sqlite`), even for a Supabase database;
-rename the key to `supabase` to get [Supabase's rules](08-targets.md#what-the-supabase-key-changes).
+The target it writes is named `supabase` when the database has both an `auth` and a `storage`
+schema — Supabase's own, so the project gets [Supabase's rules](08-targets.md#what-the-supabase-key-changes)
+— and `postgres` (or `sqlite`) otherwise. Supabase's platform schemas identify it even though
+they are left out of what is written.
 
 **Schema selection.** Postgres internals are always excluded. On Supabase, platform schemas
 (`auth`, `storage`, `realtime`, `extensions`, `graphql*`, `vault`, `pgsodium*`,
@@ -811,8 +886,9 @@ literal `$DATABASE_URL` env reference — never the connection string you passed
 
 `init --from-db` refuses to run in a directory that already has a `design.yaml` (use
 `merge` to sync into an existing project). It reads PostgreSQL/Supabase and SQLite
-connections — the URL decides, and `--target` is ignored. `--from-dbml` produces a
-PostgreSQL project and accepts no `--target` other than the default `postgres`.
+connections — the database decides, and `--target` is ignored. `--from-dbml` produces a
+PostgreSQL project; DBML names no platform, so `--target postgres` (the default) or
+`--target supabase` chooses the target, and any other is refused.
 
 **Managed databases & version safety.** `init --from-db` is for databases **not** managed by
 dbd. If it detects `dbd.meta` (or a legacy `_dbd_meta` in any schema — dbd tracks the applied
@@ -1071,7 +1147,7 @@ Detects and migrates old Node.js config format:
 - `project.extensionSchema` → a `schema` on each extension under `target`
 - `project.dbdocs` → top-level `dbml`
 
-Removes stale files that dbd now manages internally (`ddl/procedure/staging/import_jsonb_to_table.ddl`), and migrates **plural DDL type folders to singular** (`ddl/functions/` → `ddl/function/`, etc.). When a singular folder already exists the contents are merged; on a same-name collision the newer file is kept and the older is backed up as `<name>.ddl.bkp` (each backup is reported). See [DDL folder layout](02-getting-started.md#ddl-folder-layout).
+Removes stale files that dbd now manages internally (`ddl/procedure/staging/import_jsonb_to_table.ddl`), and migrates **every non-canonical DDL type folder the scanner reads** to its singular name — the plurals (`ddl/functions/` → `ddl/function/`, `ddl/sequences/` → `ddl/sequence/`, etc.) and the `materialized_views`, `matviews` and `matview` spellings of `ddl/materialized_view/`. When a singular folder already exists the contents are merged; on a same-name collision the newer file is kept and the older is backed up as `<name>.ddl.bkp` (each backup is reported). See [DDL folder layout](02-getting-started.md#ddl-folder-layout).
 
 **Misfiled view DDL.** dbd types an entity by its folder, so a `CREATE MATERIALIZED VIEW`
 under `ddl/view/` is treated as a plain view — and `dbd reset` then fails on it with

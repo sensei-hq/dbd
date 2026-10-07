@@ -80,9 +80,12 @@ format:
 
 `released` is set by `dbd release` and by nothing else. `dbd init --from-db`
 and `dbd merge` write snapshots without setting it, which leaves a project with
-snapshots that is not released: `reconcile` still runs, and `dbd release`
-refuses because snapshots exist. See
+snapshots that is not released: `reconcile` still runs until `dbd release`
+releases it at the version its latest snapshot reached. See
 [recommended workflows](06-recommended-workflows.md#snapshots-but-not-released).
+
+`dbd snapshot` and `dbd release` change these two keys by editing `design.yaml`
+in place — its comments, blank lines and flow-style lists stay as written.
 
 ### `source`
 
@@ -465,7 +468,7 @@ materialized_views:
 
 **Requirements & validation.** Scheduling requires the `pg_cron` extension in `target.postgres.extensions`; `concurrently: true` requires the matview to declare a unique index. `dbd inspect` reports both, offline. PostgreSQL/Supabase only.
 
-**Reconcile & diff.** `dbd reconcile` creates an absent matview (stamping a `dbd:hash` sentinel) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it. `reconcile --dry-run` previews these creates and drift warnings, and read-only `dbd diff` reports each matview as `missing`/`drifted`/`unstamped`/`orphan` (in `--json` and `--exit-code`).
+**Reconcile & diff.** `dbd reconcile` creates an absent matview (recording a `dbd:hash` drift stamp in `dbd.matview_stamps` — the matview's own `COMMENT` stays yours) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it. `reconcile --dry-run` previews these creates and drift warnings, and read-only `dbd diff` reports each matview as `missing`/`drifted`/`unstamped`/`orphan` (in `--json` and `--exit-code`).
 
 ### `dbml`
 

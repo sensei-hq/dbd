@@ -24,7 +24,8 @@ This:
 
 ## Version tracking
 
-- `design.yaml` version field tracks the latest snapshot version
+- `design.yaml` version field tracks the latest snapshot version — `dbd snapshot`
+  edits it in place, keeping the file's comments and layout
 - The bookkeeping table tracks the applied version in the database — `dbd.meta` in a dedicated
   `dbd` schema on Postgres/Supabase, `_dbd_meta` on SQLite
 - `dbd apply` compares these and runs pending migrations
