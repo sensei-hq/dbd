@@ -98,9 +98,7 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        use crate::reconcile::{
-            ReconcileComplete, matview_create_sql, matview_hash_comment_sql, qualified_entity_name,
-        };
+        use crate::reconcile::{ReconcileComplete, matview_create_sql, matview_stamp, qualified_entity_name};
         use std::collections::{HashMap, HashSet};
 
         let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
@@ -176,9 +174,17 @@ impl Design {
         for (e, want) in mv_to_create {
             let desc = format!("{}:{}", e.entity_type.tag(), e.name);
             on_start(&desc);
-            let result = adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
-                .await;
+            let result = match adapter
+                .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                .await
+            {
+                Ok(()) => {
+                    adapter
+                        .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
+                        .await
+                }
+                err => err,
+            };
             report_step_result(&desc, on_done, result)?;
             summary.reapplied += 1;
         }
@@ -192,8 +198,9 @@ impl Design {
         for (e, want) in mv_to_restamp {
             let desc = format!("{}:{} (restamp v1→v2)", e.entity_type.tag(), e.name);
             on_start(&desc);
-            let sql = matview_hash_comment_sql(&qualified_entity_name(e), want);
-            let result = adapter.execute_script(&format!("{search_path}{sql}")).await;
+            let result = adapter
+                .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
+                .await;
             report_step_result(&desc, on_done, result)?;
             summary.restamped += 1;
         }

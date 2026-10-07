@@ -35,7 +35,10 @@ impl Bookkeeping {
             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
          CREATE TABLE IF NOT EXISTS dbd.migrations ( \
             project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
-            description text, checksum text, PRIMARY KEY (project, version) );";
+            description text, checksum text, PRIMARY KEY (project, version) ); \
+         CREATE TABLE IF NOT EXISTS dbd.matview_stamps ( \
+            project varchar NOT NULL, matview varchar NOT NULL, stamp text NOT NULL, \
+            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
         Self { pool, project }
@@ -256,6 +259,56 @@ impl Bookkeeping {
         }
         .map_err(|e| DbdError::Config(format!("set dbd.meta failed: {e}")))?;
         Ok(())
+    }
+
+    /// Record `stamp` as the drift stamp of materialized view `matview`
+    /// (`schema.name`). `tx` routes through the caller's open batch, as
+    /// [`Self::set_meta`] does.
+    ///
+    /// The stamp lives here, not in the view's comment: that comment is the
+    /// author's (`COMMENT ON MATERIALIZED VIEW` in the DDL file), and sharing it
+    /// meant the first apply overwrote the author's text and the next erased the
+    /// stamp.
+    pub(super) async fn stamp_matview(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        matview: &str,
+        stamp: &str,
+    ) -> Result<()> {
+        self.ensure_dbd_layout().await?;
+        let q = sqlx::query(
+            "INSERT INTO dbd.matview_stamps (project, matview, stamp) VALUES ($1, $2, $3) \
+             ON CONFLICT (project, matview) DO UPDATE SET stamp = EXCLUDED.stamp, stamped_at = now()",
+        )
+        .bind(&self.project)
+        .bind(matview)
+        .bind(stamp);
+        match tx {
+            Some(tx) => q.execute(&mut **tx).await,
+            None => q.execute(&self.pool).await,
+        }
+        .map_err(|e| DbdError::Config(format!("stamp {matview} failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Every drift stamp this project recorded, `schema.name` → stamp. Empty on
+    /// a database not yet healed (no `dbd.matview_stamps`): read-only commands
+    /// call this without healing, and must not fail for it.
+    pub(super) async fn matview_stamps(&self) -> Result<std::collections::HashMap<String, String>> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.matview_stamps')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("matview stamps lookup failed: {e}")))?;
+        if exists.is_none() {
+            return Ok(Default::default());
+        }
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT matview, stamp FROM dbd.matview_stamps WHERE project = $1")
+                .bind(&self.project)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("matview stamps read failed: {e}")))?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Record a migration in `dbd.migrations`. `tx` is the caller's open batch
