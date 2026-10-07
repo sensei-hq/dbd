@@ -222,3 +222,52 @@ fn deploy_dry_run_under_a_scope_reports_the_scope_not_the_design() {
         "only the scope's policy would be applied: {text}"
     );
 }
+
+// ── inspect --scope agrees with the commands it vets ────────────────────────
+
+/// `hub.edges` references `hub.nodes`; the `edges_only` scope pulls in its
+/// dependencies (`deps: include`) yet excludes the one it needs.
+fn conflicting_scope_project(dir: &Path) {
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: closure\n\n\
+         source:\n  dialect: postgresql\n\n\
+         schemas:\n  - hub\n\n\
+         scopes:\n  edges_only:\n    includes:\n      - hub.edges\n    excludes:\n      - hub.nodes\n    deps: include\n",
+    );
+    write(
+        dir,
+        "ddl/table/hub/nodes.ddl",
+        "set search_path to hub;\ncreate table if not exists nodes (\n  id integer primary key\n);\n",
+    );
+    write(
+        dir,
+        "ddl/table/hub/edges.ddl",
+        "set search_path to hub;\ncreate table if not exists edges (\n  id integer primary key\n, node_id integer references nodes (id)\n);\n",
+    );
+}
+
+/// apply, dbml and diagram refuse a scope whose closure needs what it
+/// excludes. `inspect --scope` — the command meant to vet a scope before a run
+/// — printed "will be auto-included" and exited 0 over the same scope.
+#[test]
+fn inspect_refuses_a_scope_whose_closure_needs_what_it_excludes() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicting_scope_project(tmp.path());
+
+    let apply = dbd(tmp.path(), &["apply", "--dry-run", "--scope", "edges_only"]);
+    assert!(
+        !apply.status.success() && stderr(&apply).contains("excludes 'hub.nodes'"),
+        "precondition: apply refuses the scope: {}",
+        stderr(&apply)
+    );
+
+    let out = dbd(tmp.path(), &["inspect", "--scope", "edges_only"]);
+    assert!(!out.status.success(), "inspect must refuse too: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("excludes 'hub.nodes'"),
+        "for the same reason: {}",
+        stderr(&out)
+    );
+}
