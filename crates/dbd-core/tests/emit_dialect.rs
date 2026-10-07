@@ -106,6 +106,64 @@ fn postgres_types_become_the_targets_own() {
     assert!(sqlite.contains("TEXT"), "{sqlite}");
 }
 
+// ── SQL Server: schemas exist before they are used, one batch per statement ─
+
+/// The script split at its `GO` lines — what sqlcmd and SSMS send as batches.
+fn batches(sql: &str) -> Vec<String> {
+    sql.split("\nGO\n").map(str::to_string).collect()
+}
+
+/// A batch's statements, without the comment lines around them.
+fn statements(batch: &str) -> String {
+    batch
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// SQL Server keeps the schema — `[app].[orders]` — so `app` has to exist
+/// before the first table names it; without `CREATE SCHEMA` the script fails
+/// at its first statement. And `CREATE SCHEMA` and `CREATE VIEW` must each be
+/// the only statement in their batch, so the script is cut with `GO`.
+#[test]
+fn sql_server_creates_each_schema_it_names_in_a_batch_of_its_own() {
+    let (sql, _) = emit(Dialect::TSql);
+    let schema = sql
+        .find("CREATE SCHEMA [app];")
+        .unwrap_or_else(|| panic!("no CREATE SCHEMA:\n{sql}"));
+    let table = sql.find("CREATE TABLE [app].[orders]").expect("the table");
+    assert!(schema < table, "the schema must exist before the table:\n{sql}");
+
+    let batches = batches(&sql);
+    assert!(
+        batches.iter().any(|b| statements(b) == "CREATE SCHEMA [app];"),
+        "CREATE SCHEMA must be alone in its batch: {batches:#?}"
+    );
+    let view = batches
+        .iter()
+        .find(|b| b.contains("CREATE VIEW"))
+        .expect("the view's batch");
+    assert!(
+        statements(view).starts_with("CREATE VIEW") && statements(view).matches(';').count() == 1,
+        "CREATE VIEW must be alone in its batch: {view}"
+    );
+}
+
+/// `GO` is a SQL Server tool convention; MySQL and SQLite would read it as a
+/// statement and fail. Nor do they get a `CREATE SCHEMA` — their schema is
+/// folded into the name, and that fold is what gets reported.
+#[test]
+fn only_sql_server_gets_batches_and_schemas() {
+    for dialect in [Dialect::MySql, Dialect::Sqlite] {
+        let (sql, _) = emit(dialect);
+        assert!(!sql.lines().any(|l| l.trim() == "GO"), "{dialect:?}: {sql}");
+        assert!(!sql.contains("CREATE SCHEMA"), "{dialect:?}: {sql}");
+    }
+}
+
 // ── Lossy downgrades are reported; faithful ones are not ────────────────────
 
 /// An array has no equivalent in any of the three, so all three must report it.
