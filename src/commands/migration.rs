@@ -46,6 +46,8 @@ pub async fn cmd_reset(
     } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let target = reset_target(target, &design);
 
     if dry_run {

@@ -484,6 +484,8 @@ pub async fn cmd_reconcile(
     }
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let adapter = get_adapter(config, database_url).await?;
     reconcile_with_adapter(
         &*adapter,

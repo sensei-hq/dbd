@@ -731,6 +731,8 @@ pub fn cmd_emit(
         .ok_or_else(|| anyhow::anyhow!("unknown dialect {dialect:?} — expected mysql, tsql or sqlite"))?;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
     std::fs::write(file, sql).with_context(|| format!("Failed to write {}", file.display()))?;
