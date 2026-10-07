@@ -417,10 +417,53 @@ impl Design {
         Ok(())
     }
 
-    /// Deploy the full schema: apply DDL, import seed data, then apply RLS
-    /// policies.
+    /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
+    /// target's `grants:` merged on top (per schema, a target role adds to or
+    /// overrides the universal entry for that role), plus PostgREST's schema
+    /// USAGE and config reload on a `supabase` target.
     ///
-    /// This is the same three-phase pipeline `dbd deploy` runs, and the CLI
+    /// Run by `dbd apply` and by [`Design::deploy`]. It lived in the CLI's apply
+    /// handler alone, so a deploy — and every embedder — got no grants at all.
+    pub async fn apply_grants(&self, adapter: &dyn DatabaseAdapter) -> Result<GrantsOutcome> {
+        let mut schema_grants = self.config.schema_grants();
+        let mut supabase_schemas: Vec<String> = vec![];
+        if let Some((target_name, target_config)) = self.config.target.iter().next() {
+            if let Some(ref grants) = target_config.grants {
+                for (schema, gc) in grants {
+                    schema_grants
+                        .entry(schema.clone())
+                        .or_default()
+                        .extend(gc.roles.clone());
+                }
+            }
+            // PostgREST USAGE grants ride along only when the user configured
+            // some grants, so a no-grants Supabase apply stays a no-op.
+            if target_name == "supabase" && !schema_grants.is_empty() {
+                supabase_schemas = self.config.schema_names();
+            }
+        }
+
+        if schema_grants.is_empty() {
+            return Ok(GrantsOutcome::None);
+        }
+        // A cross-target design may declare schema grants yet apply to SQLite
+        // or Convex, which have no grant model to run them against.
+        if !adapter.supports_schema_grants() {
+            return Ok(GrantsOutcome::Unsupported);
+        }
+        match crate::script::build_grants_script(&schema_grants, &supabase_schemas) {
+            Some(sql) => {
+                adapter.execute_script(&sql).await?;
+                Ok(GrantsOutcome::Applied)
+            }
+            None => Ok(GrantsOutcome::None),
+        }
+    }
+
+    /// Deploy the full schema: apply DDL, apply grants, import seed data, then
+    /// apply RLS policies.
+    ///
+    /// This is the same pipeline `dbd deploy` runs, and the CLI
     /// delegates to it — one implementation, so the library and the command can
     /// not drift apart. dbd handles fresh / migrate / current strategy
     /// automatically, so this is safe to call on every bootstrap (idempotent
@@ -492,6 +535,14 @@ impl Design {
         )
         .await?;
 
+        // Grants attach to schemas and tables the apply just created, and the
+        // data loaded next may be read through them — so they go in between.
+        let grants = if dry_run {
+            GrantsOutcome::None
+        } else {
+            self.apply_grants(adapter).await?
+        };
+
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
@@ -526,6 +577,7 @@ impl Design {
 
         (progress.on_complete)(DeployComplete {
             apply: apply_summary.unwrap_or_default(),
+            grants,
             import: import_summary.unwrap_or_default(),
             policies,
         });

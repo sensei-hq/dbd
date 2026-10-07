@@ -849,45 +849,16 @@ pub async fn cmd_apply(
     // `Design::apply`, so `dbd apply` and `dbd deploy` both schedule refresh
     // jobs through the shared path (no CLI-side sync call needed here).
 
-    // Grants: universal `schemas:` `WithGrants` entries apply regardless of
-    // target; the chosen target's `grants:` config merges on top of them —
-    // per schema, target role entries add to / override the universal ones
-    // for that role.
-    let mut schema_grants = design.config().schema_grants();
-    let mut supabase_schemas: Vec<String> = vec![];
-    if let Some((target_name, target_config)) = design.config().target.iter().next() {
-        if let Some(ref grants) = target_config.grants {
-            for (schema, gc) in grants {
-                schema_grants
-                    .entry(schema.clone())
-                    .or_default()
-                    .extend(gc.roles.clone());
-            }
+    // Grants: shared with `Design::deploy`, so both commands grant alike.
+    match design.apply_grants(&*adapter).await.context("Failed to apply grants")? {
+        dbd_core::design::GrantsOutcome::Applied => {
+            output::info(verbosity, "Applied grants.");
+            output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
         }
-        // PostgREST USAGE grants ride along only when the user configured some
-        // grants, so a no-grants Supabase apply stays a no-op (as it was before
-        // universal `schemas:` grants existed).
-        if target_name == "supabase" && !schema_grants.is_empty() {
-            supabase_schemas = design.config().schema_names();
-        }
-    }
-
-    // Grants are Postgres/Supabase DDL. Skip cleanly on targets without a grant
-    // model (SQLite, Convex) rather than feeding them SQL they can't run — a
-    // cross-target design may declare schema grants yet apply to any target.
-    if !schema_grants.is_empty() {
-        if adapter.supports_schema_grants() {
-            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
-                output::info(verbosity, "Applying grants...");
-                adapter
-                    .execute_script(&grants_sql)
-                    .await
-                    .context("Failed to apply grants")?;
-                output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
-            }
-        } else {
+        dbd_core::design::GrantsOutcome::Unsupported => {
             output::info(verbosity, "Skipping schema grants (target has no grant model).");
         }
+        dbd_core::design::GrantsOutcome::None => {}
     }
 
     // Apply RLS policies if requested

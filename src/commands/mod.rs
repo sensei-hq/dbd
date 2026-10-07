@@ -496,7 +496,12 @@ pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> Str
             n => format!(", {n} skipped (out of scope)"),
         }
     );
-    format!("{apply_line} {import_line} {policy_line}")
+    let grants = match s.grants {
+        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
+        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
+        dbd_core::design::GrantsOutcome::None => "",
+    };
+    format!("{apply_line}{grants} {import_line} {policy_line}")
 }
 
 // ── Database adapter ──────────────────────────────────────────────────────────
@@ -741,6 +746,7 @@ mod tests {
     fn format_deploy_summary_combines_apply_import_and_policies() {
         let s = dbd_core::design::DeployComplete {
             apply: apply_complete(ApplyStrategy::Fresh),
+            grants: dbd_core::design::GrantsOutcome::Applied,
             import: ImportComplete {
                 tables: 2,
                 procedures: 1,
@@ -754,6 +760,7 @@ mod tests {
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("Fresh") && out.contains("table"));
+        assert!(out.contains("Grants applied"), "grants phase must be reported: {out}");
         assert!(
             out.contains("1 policy file(s) applied"),
             "policy phase must be reported: {out}"

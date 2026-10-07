@@ -73,10 +73,25 @@ pub struct ImportComplete {
     pub warnings: Vec<String>,
 }
 
+/// What [`Design::apply_grants`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GrantsOutcome {
+    /// The design declares no grants, so nothing ran.
+    #[default]
+    None,
+    /// The grant script ran.
+    Applied,
+    /// The design declares grants but the target has no SQL grant model
+    /// (SQLite, Convex), so they were skipped rather than fed SQL it cannot run.
+    Unsupported,
+}
+
 /// Combined summary passed to the `on_complete` callback of `deploy()`.
 #[derive(Debug, Clone, Default)]
 pub struct DeployComplete {
     pub apply: ApplyComplete,
+    /// Whether the design's grants ran, between the schema and the data.
+    pub grants: GrantsOutcome,
     pub import: ImportComplete,
     /// Outcome of the RLS policy phase. Failures here are non-fatal — they are
     /// reported as warnings and the deploy still succeeds.
