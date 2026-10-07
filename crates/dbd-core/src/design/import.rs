@@ -401,3 +401,105 @@ impl Design {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project with one staging table and its data file, a target table, and
+    /// whichever routines `routines` lays out (`(type folder, name, ddl)`).
+    fn project_with(routines: &[(&str, &str, &str)]) -> (tempfile::TempDir, Design) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("design.yaml", "project:\n  name: t\nschemas:\n  - stage\n  - app\n");
+        write(
+            "ddl/table/stage/items.ddl",
+            "set search_path to stage;\ncreate table if not exists items (id integer, name text);\n",
+        );
+        write(
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id integer primary key, name text);\n",
+        );
+        write("import/stage/items.csv", "id,name\n1,a\n");
+        for (folder, name, ddl) in routines {
+            write(&format!("ddl/{folder}/stage/{name}.ddl"), ddl);
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    }
+
+    const HELPER_FUNCTION: (&str, &str, &str) = (
+        "function",
+        "item_count",
+        "set search_path to stage;\n\
+         create or replace function item_count() returns bigint language sql\n\
+         as $$ select count(*) from stage.items $$;\n",
+    );
+
+    const LOADER_PROCEDURE: (&str, &str, &str) = (
+        "procedure",
+        "import_items",
+        "set search_path to stage;\n\
+         create or replace procedure import_items() language sql\n\
+         as $$ insert into app.items (id, name) select id, name from stage.items $$;\n",
+    );
+
+    /// The import runs each matched loader with `CALL`, which Postgres refuses
+    /// for a function ("is not a procedure"). Matching a function that merely
+    /// reads a staging table — a helper, a trigger function — failed the whole
+    /// import. Loaders are procedures, as the import docs have always said.
+    #[test]
+    fn a_function_that_reads_a_staging_table_is_not_matched_as_its_loader() {
+        let (_tmp, design) = project_with(&[HELPER_FUNCTION]);
+        let function = design
+            .entities()
+            .iter()
+            .find(|e| e.name == "stage.item_count")
+            .expect("the helper function loads");
+        assert!(
+            function.reads().any(|r| r.name == "stage.items"),
+            "precondition: the function reads the staging table"
+        );
+
+        let plan = design.import_plan(None);
+        let entry = plan.iter().find(|e| e.table.name == "stage.items").expect("planned");
+        assert_eq!(entry.procedure, None, "a function must not be run as a loader");
+        assert!(entry.writes.is_empty(), "{:?}", entry.writes);
+    }
+
+    /// Skipping a function is not allowed to be silent: someone who wrote their
+    /// loader as a function would otherwise see the staging table load and the
+    /// target stay empty, with nothing saying why.
+    #[test]
+    fn a_function_that_reads_an_unloaded_staging_table_is_reported() {
+        let (_tmp, design) = project_with(&[HELPER_FUNCTION]);
+        let warnings = design.import_warnings(None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("stage.items") && w.contains("stage.item_count") && w.contains("procedure")),
+            "the unrun function must be named, with what to do about it: {warnings:?}"
+        );
+    }
+
+    /// With a real loader procedure present, a helper function reading the same
+    /// table neither displaces it nor draws a warning.
+    #[test]
+    fn a_procedure_is_the_loader_even_when_a_function_also_reads_the_table() {
+        let (_tmp, design) = project_with(&[HELPER_FUNCTION, LOADER_PROCEDURE]);
+        let plan = design.import_plan(None);
+        let entry = plan.iter().find(|e| e.table.name == "stage.items").expect("planned");
+        assert_eq!(entry.procedure.as_deref(), Some("stage.import_items"));
+        assert_eq!(entry.writes, vec!["app.items".to_string()]);
+        assert!(
+            !design.import_warnings(None).iter().any(|w| w.contains("item_count")),
+            "{:?}",
+            design.import_warnings(None)
+        );
+    }
+}
