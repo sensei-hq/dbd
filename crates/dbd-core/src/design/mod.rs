@@ -2674,6 +2674,93 @@ import:
         assert!(!plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))));
     }
 
+    /// A table a migration drops is gone from the design, so it is in no
+    /// scope's working set — a named scope never ran its drop, while the
+    /// migration was still recorded as applied. It belongs to a scope that
+    /// occupies its schema, as it did while it existed.
+    #[test]
+    fn a_scoped_migrate_runs_the_drop_of_a_table_in_its_schema() {
+        let entities = vec![test_entity("app.users")];
+        let ws: std::collections::HashSet<String> = ["app", "app.users"].map(String::from).into();
+        let drops = |plan: &ExecutionPlan| -> Vec<String> {
+            plan.steps
+                .iter()
+                .filter_map(|s| match s {
+                    ExecutionStep::DropEntity { entity_name, .. } => Some(entity_name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let ours = vec![test_migration(1, 2, vec![], vec![], vec!["app.legacy"])];
+        let plan = build_execution_plan(&entities, 1, 2, &ours, Some(&ws));
+        assert_eq!(drops(&plan), vec!["app.legacy"]);
+
+        let theirs = vec![test_migration(1, 2, vec![], vec![], vec!["billing.old"])];
+        let plan = build_execution_plan(&entities, 1, 2, &theirs, Some(&ws));
+        assert!(
+            drops(&plan).is_empty(),
+            "a schema the scope does not occupy is not its to drop in"
+        );
+    }
+
+    /// A migration's drop runs only where the table still exists. Generated
+    /// drops are a bare `DROP TABLE … CASCADE`, so a database whose scope never
+    /// had the table would fail on it now that a scope runs the drops in its
+    /// schemas.
+    #[tokio::test]
+    async fn a_migration_drop_runs_only_where_the_table_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "migrations/002/app"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\n  version: 2\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/users.ddl"),
+            "set search_path to app;\ncreate table if not exists users (id integer primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":[],"dropped":["app.legacy"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("migrations/002/app/legacy.drop.sql"),
+            "DROP TABLE app.legacy CASCADE;\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let ran_drop = |mock: &MockAdapter| {
+            mock.scripts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("DROP TABLE app.legacy"))
+        };
+
+        let never_had_it = MockAdapter::new().with_meta("dev", 1);
+        design
+            .apply(&never_had_it, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        assert!(!ran_drop(&never_had_it), "no table, no drop");
+
+        let has_it = MockAdapter::new()
+            .with_meta("dev", 1)
+            .with_known_entities(["app.legacy"]);
+        design
+            .apply(&has_it, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        assert!(ran_drop(&has_it), "the table is there, so it is dropped");
+    }
+
     // ── A3: Behind by one version ─────────────────────────
 
     #[test]
