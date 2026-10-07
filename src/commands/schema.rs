@@ -214,14 +214,7 @@ fn report_scope_gaps(
         return Ok(());
     }
 
-    for gap in &report.gaps {
-        output::always(&format!(
-            "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-            gap.required_by,
-            gap.missing,
-            gap.chain.join(" → ")
-        ));
-    }
+    output::scope_gaps(resolved, &report.gaps);
     if report.gaps.is_empty() {
         return Ok(());
     }

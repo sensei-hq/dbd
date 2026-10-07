@@ -473,9 +473,20 @@ pub async fn run(
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
     let entities = match s.strategy {
+        // Version 0 is no version. A project without `project.version` plans
+        // every apply as `Fresh` (its database records version 0), so this
+        // said "Fresh install at v0" on every run — naming a version that does
+        // not exist, and a fresh install that usually was not one.
+        ApplyStrategy::Fresh if s.to_version == 0 => format!(
+            "{} entities applied (no project.version — the database is not versioned).",
+            s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
+        // A batch adapter reports version 0 whatever the project's version, so
+        // neither "up to date" nor a version can be claimed from it.
+        ApplyStrategy::Current if s.from_version == 0 => format!("{} entities applied.", s.applied),
         ApplyStrategy::Current => {
             format!(
                 "Already up to date (v{}) — {} entities applied.",
