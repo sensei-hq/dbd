@@ -61,7 +61,8 @@ pub struct Cli {
     #[arg(short, long, default_value = "prod", global = true, value_parser = parse_environment)]
     pub environment: String,
 
-    /// Source directory or GitHub repo (owner/repo/path)
+    /// Project directory. `dbd deploy` also takes a GitHub source:
+    /// owner/repo[/path][@ref] or a github.com URL (private repos via GITHUB_TOKEN)
     #[arg(short, long, default_value = ".", global = true)]
     pub source: String,
 
@@ -328,9 +329,11 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show the complete difference between the live database and the design
-    /// (read-only). Covers columns, PK/unique, foreign keys, CHECK constraints,
-    /// indexes, comments and enums — everything `reconcile --dry-run` omits.
+    /// Show every difference between the live database and the design
+    /// (read-only): columns, PK/unique, foreign keys, CHECK constraints,
+    /// indexes, comments and enums. Unlike `reconcile --dry-run` it does not
+    /// depend on --prune or --allow-destructive, and it works on a released
+    /// project, where reconcile is disabled.
     Diff {
         /// Emit the diff as JSON for tooling/CI
         #[arg(long)]

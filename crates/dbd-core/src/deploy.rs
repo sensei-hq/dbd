@@ -94,6 +94,18 @@ trait SourceFetcher: Send + Sync {
     async fn fetch(&self, url: &str, label: &str) -> Result<Vec<u8>>;
 }
 
+/// The `Authorization` value for a request to `url`: `GITHUB_TOKEN` as a bearer
+/// token, and only for GitHub's API over HTTPS — the host that serves a
+/// private repository's tarball. Every other URL gets nothing, so the token
+/// cannot leak to another host. (A redirect off the API host is safe too:
+/// reqwest drops `Authorization` when a redirect changes host.)
+#[cfg(feature = "deploy")]
+fn github_auth(url: &str, token: Option<&str>) -> Option<String> {
+    let token = token.filter(|t| !t.is_empty())?;
+    url.starts_with("https://api.github.com/")
+        .then(|| format!("Bearer {token}"))
+}
+
 /// Production fetcher: downloads the tarball from GitHub over HTTP.
 #[cfg(feature = "deploy")]
 struct HttpFetcher;
@@ -107,8 +119,11 @@ impl SourceFetcher for HttpFetcher {
             .build()
             .map_err(|e| DbdError::GitHubSource(format!("HTTP client error: {e}")))?;
 
-        let response = client
-            .get(url)
+        let mut request = client.get(url);
+        if let Some(auth) = github_auth(url, std::env::var("GITHUB_TOKEN").ok().as_deref()) {
+            request = request.header(reqwest::header::AUTHORIZATION, auth);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| DbdError::GitHubSource(format!("Failed to fetch {label}: {e}")))?;
@@ -216,6 +231,7 @@ mod tests {
     /// `GITHUB_TOKEN` reaches GitHub's API, which serves private tarballs to a
     /// bearer token — and nothing else. A token sent to whatever host a URL
     /// names would leak to the first non-GitHub source.
+    #[cfg(feature = "deploy")]
     #[test]
     fn the_token_goes_to_the_github_api_only() {
         let api = "https://api.github.com/repos/o/r/tarball/main";
