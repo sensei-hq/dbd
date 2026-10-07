@@ -622,6 +622,46 @@ async fn a_json_array_file_imports_one_row_per_record() {
     .await;
 }
 
+// ── Test: a JSON import leaves no schema the design did not declare ───────────
+
+/// dbd's JSON loader is its own machinery, and it was installed in a schema
+/// called `staging` whatever the project's staging schemas are called — so a
+/// JSON import created a schema the design never declared, which the next
+/// `reconcile --prune` or `diff` then had to account for.
+#[tokio::test]
+async fn a_json_import_creates_no_schema_the_design_does_not_declare() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.jsonl");
+    std::fs::write(&path, "{\"id\": 1, \"name\": \"alpha\"}\n").unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.people");
+    entity.file = Some(path);
+    entity.format = Some("jsonl".to_string());
+
+    adapter.import_data(&entity, "", false).await.expect("the import runs");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND name = 'alpha'",
+        "the imported record",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'staging'",
+        "a `staging` schema the design never declared",
+    )
+    .await;
+}
+
 // ── Test: a Postgres CSV/TSV export imports into SQLite unchanged ─────────────
 
 /// `dbd export` from Postgres and `dbd import` into SQLite is how data moves
