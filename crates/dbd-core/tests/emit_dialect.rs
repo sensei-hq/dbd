@@ -957,3 +957,43 @@ fn sqlite_numbers_a_column_that_drew_from_a_sequence() {
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(ids, "1,3", "{sql}");
 }
+
+/// PostgreSQL's defaults depend on direction: a descending sequence starts at
+/// -1 and runs down to the type's minimum. Every bound is resolved and spelled
+/// out, the type and CACHE/CYCLE carry, and an `OWNED BY` — which ties the
+/// sequence's life to a column, and has no SQL Server equivalent — is reported.
+#[test]
+fn sql_server_gets_a_sequence_with_postgres_bounds_spelled_out() {
+    let files = [
+        (
+            "sequence/app/countdown.ddl",
+            "create sequence countdown as integer increment by -1 cache 20 cycle;",
+        ),
+        (
+            "sequence/app/owned.ddl",
+            "create sequence owned as smallint owned by app.things.id;",
+        ),
+    ];
+    let (sql, report) = emit_with(Dialect::TSql, "", &files, None);
+    assert!(
+        sql.contains(
+            "CREATE SEQUENCE [app].[countdown] AS int START WITH -1 INCREMENT BY -1 \
+             MINVALUE -2147483648 MAXVALUE -1 CYCLE CACHE 20;"
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            "CREATE SEQUENCE [app].[owned] AS smallint START WITH 1 INCREMENT BY 1 \
+             MINVALUE 1 MAXVALUE 32767 NO CYCLE NO CACHE;"
+        ),
+        "{sql}"
+    );
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "app.owned" && d.from.contains("OWNED BY")),
+        "{report:?}"
+    );
+    assert!(!report.iter().any(|d| d.entity == "app.countdown"), "{report:?}");
+}
