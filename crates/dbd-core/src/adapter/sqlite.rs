@@ -1150,6 +1150,48 @@ mod tests {
         );
     }
 
+    /// `import.options.truncate` defaults to true, so a default import empties
+    /// each staging table before loading it. That step was issued as Postgres's
+    /// `TRUNCATE "schema"."table"`, which SQLite has no statement for — every
+    /// default import on SQLite failed before a single row loaded.
+    #[tokio::test]
+    async fn the_default_import_empties_a_staging_table_before_loading_it() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/staging")).unwrap();
+        std::fs::write(dir.path().join("import/staging/items.csv"), "id,name\n1,fresh\n").unwrap();
+        let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+        assert!(
+            design.config().import.table_truncate("staging.items"),
+            "precondition: truncate is the default"
+        );
+
+        let a = mem().await;
+        a.execute_script("CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (99, 'stale');")
+            .await
+            .unwrap();
+
+        design
+            .import_data(&a, None, false, None, Progress::none())
+            .await
+            .expect("the default import must run on SQLite");
+
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, "fresh".to_string())],
+            "the stale row must be gone and only the file's row loaded"
+        );
+    }
+
     #[tokio::test]
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
