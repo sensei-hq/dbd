@@ -135,6 +135,11 @@ fn resolve_entity_refers(
             resolved.push(r);
             continue;
         }
+        // A type or sequence that resolves to nothing is a built-in; unlike an
+        // unresolved call it is not kept at all — see `RefKind::Uses`.
+        if r.kind == crate::entity::RefKind::Uses {
+            continue;
+        }
         // A call that resolves to nothing is a built-in, not a broken edge —
         // see `RefKind::Calls`.
         if !r.kind.is_soft() {

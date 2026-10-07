@@ -522,6 +522,7 @@ fn dep_kind(k: crate::entity::RefKind) -> &'static str {
         RefKind::Writes => "writes",
         RefKind::Calls => "calls",
         RefKind::Member => "member",
+        RefKind::Uses => "uses",
     }
 }
 

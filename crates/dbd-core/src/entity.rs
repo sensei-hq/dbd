@@ -336,13 +336,21 @@ pub enum RefKind {
     /// Hard, like a read, but deliberately not one: a caller walking data flow
     /// through `reads()` must not find role memberships in it.
     Member,
+    /// The type a column is declared with, or the sequence its default draws
+    /// from (`nextval('s')`).
+    ///
+    /// Hard once it resolves — the enum or sequence must exist before the
+    /// table. But most column types are built-ins (`text`, `uuid`) that name
+    /// nothing in the project, so an unresolved one is **dropped**, not kept:
+    /// one dangling edge per built-in column would bury the dependency graph.
+    Uses,
 }
 
 impl RefKind {
     /// Whether an unresolved reference of this kind is dropped rather than
-    /// warned about. See [`Self::Calls`].
+    /// warned about. See [`Self::Calls`] and [`Self::Uses`].
     pub fn is_soft(self) -> bool {
-        self == Self::Calls
+        matches!(self, Self::Calls | Self::Uses)
     }
 }
 
