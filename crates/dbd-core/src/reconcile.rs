@@ -488,6 +488,13 @@ fn canonical_datetime(s: &str) -> Option<String> {
 /// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
 /// re-spelled, so the next diff reported the same change — forever.
 fn canonical_default(raw: &str, data_type: &str) -> String {
+    // Postgres keeps `nextval('s')`'s argument as an OID and reports it as
+    // `nextval('s'::regclass)`; a design without the cast read as a changed
+    // default on every run. Both sides take the reported form — valid SQL with
+    // the same meaning, as everything this returns must be (it is emitted).
+    if let Some(sequence) = crate::parser::pg::common::nextval_sequence_of(raw.trim()) {
+        return format!("nextval('{}'::regclass)", sequence.replace('\'', "''"));
+    }
     let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
     canonical_default_for_type(&base, data_type).unwrap_or(base)
 }

@@ -139,6 +139,50 @@ fn path_entry(name: String) -> PathEntry {
     }
 }
 
+/// The sequence a `nextval('…')` call draws from, read off its argument — a
+/// string literal, often cast `::regclass`. `None` for any other expression.
+pub(crate) fn nextval_sequence(expr: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::NodeEnum;
+    let NodeEnum::FuncCall(call) = expr.node.as_ref()? else {
+        return None;
+    };
+    let name = call.funcname.last().and_then(|n| match n.node.as_ref()? {
+        NodeEnum::String(s) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    if name != Some("nextval") || call.args.len() != 1 {
+        return None;
+    }
+    let mut arg = call.args.first()?;
+    if let Some(NodeEnum::TypeCast(cast)) = arg.node.as_ref() {
+        arg = cast.arg.as_deref()?;
+    }
+    match arg.node.as_ref()? {
+        NodeEnum::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`nextval_sequence`] for an expression held as text — a column default as
+/// the parser rendered it or as introspection reported it.
+pub(crate) fn nextval_sequence_of(expr: &str) -> Option<String> {
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
+    let pg_query::NodeEnum::SelectStmt(select) = stmt.node.as_ref()? else {
+        return None;
+    };
+    if select.target_list.len() != 1 {
+        return None;
+    }
+    let pg_query::NodeEnum::ResTarget(target) = select.target_list.first()?.node.as_ref()? else {
+        return None;
+    };
+    nextval_sequence(target.val.as_deref()?)
+}
+
 /// The string behind a `SET` argument node: a bare identifier arrives as a
 /// `ColumnRef` (`to app`), a quoted one as an `A_Const` string (`to 'app'`).
 fn const_str(node: &pg_query::protobuf::Node) -> Option<String> {
