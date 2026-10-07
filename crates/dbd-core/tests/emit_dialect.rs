@@ -1250,3 +1250,31 @@ fn a_key_on_unbounded_text_is_bounded_and_reported() {
         "SQLite keys TEXT as it is: {report:?}\n{sqlite}"
     );
 }
+
+/// Once a key column is bounded, an index on it is an index on a bounded
+/// column — emitted, not left out the way an index on unbounded text is.
+#[test]
+fn an_index_on_a_bounded_key_column_is_emitted() {
+    let mut files = TEXT_KEYS.to_vec();
+    files.push((
+        "table/app/visits.ddl",
+        "create table visits (id integer primary key, country text references countries (code), note text);\n\
+         create index visits_country_idx on visits (country);\n\
+         create index visits_note_idx on visits (note);",
+    ));
+    for dialect in [Dialect::MySql, Dialect::TSql] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        let stmts = statements(&sql);
+        assert!(stmts.contains("visits_country_idx"), "{dialect:?}: {sql}");
+        assert!(
+            !stmts.contains("visits_note_idx"),
+            "{dialect:?}: still unbounded: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.from.contains("visits_note_idx") && d.to == "no index"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
