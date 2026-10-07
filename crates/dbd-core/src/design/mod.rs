@@ -1939,6 +1939,36 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// A role, or an extension declared without `schema:`, lives in no schema.
+    /// `managed_schemas` mapped both to `public`, so a design with either made
+    /// `public` managed and `reconcile --prune` dropped tables there that the
+    /// design never declared.
+    #[test]
+    fn roles_and_schemaless_extensions_make_no_schema_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n    \
+             roles:\n      - name: r1\n    extensions:\n      - plpgsql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            "set search_path to app;\ncreate table if not exists items (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let desired = design.entities_in_scope(None, None, None);
+        let managed = Design::managed_schemas(&desired);
+        assert_eq!(
+            managed,
+            std::collections::HashSet::from(["app".to_string()]),
+            "only the schema the design declares is managed"
+        );
+    }
+
     /// `-e production` was recorded verbatim before the CLI normalised it, and
     /// such a row is still a prod database — it must not slip past the guard.
     #[tokio::test]
