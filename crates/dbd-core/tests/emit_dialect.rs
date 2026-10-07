@@ -284,7 +284,8 @@ fn keyed_project(dir: &Path) -> Design {
     std::fs::write(
         t.join("customers.ddl"),
         "set search_path to app;\n\
-         create table if not exists customers (\n  id integer primary key\n, email text not null\n);\n\
+         create table if not exists customers (\n  id integer primary key\n, code varchar(20) not null\n, email text not null\n);\n\
+         create unique index customers_code_key on customers (code);\n\
          create unique index customers_email_key on customers (lower(email));\n",
     )
     .unwrap();
@@ -354,7 +355,8 @@ fn checks_are_emitted_and_their_untranslated_expression_reported() {
 
 /// Indexes are part of the schema: a plain one is emitted as-is, and what a
 /// target cannot express — an expression key, a partial predicate — is
-/// reported rather than lost.
+/// reported rather than lost. One SQL Server cannot build at all (an
+/// expression key) is left out, and the report says so.
 #[test]
 fn indexes_are_emitted_and_what_cannot_carry_is_reported() {
     for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
@@ -379,4 +381,12 @@ fn indexes_are_emitted_and_what_cannot_carry_is_reported() {
             "{dialect:?}: a partial index predicate must be reported: {report:?}"
         );
     }
+    let (tsql, report) = emit_keyed(Dialect::TSql);
+    assert!(!tsql.contains("CREATE UNIQUE INDEX [customers_email_key]"), "{tsql}");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.from.contains("customers_email_key") && d.to == "no index"),
+        "SQL Server leaves the expression index out and says so: {report:?}"
+    );
 }
