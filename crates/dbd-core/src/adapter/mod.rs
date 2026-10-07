@@ -381,6 +381,107 @@ pub mod sqlite;
 mod tests {
     use super::*;
 
+    // ── Reading a CSV/TSV header ─────────────────────────────────────────────
+
+    fn header_of(data: &str) -> Option<(Vec<String>, String)> {
+        delimited_header(data, false, Path::new("t.csv"))
+            .unwrap()
+            .map(|(names, at)| (names, data[at..].to_string()))
+    }
+
+    /// The rows Postgres is handed start exactly after the header, whatever
+    /// ends its line — a CRLF header must not leave a `\n` row behind.
+    #[test]
+    fn the_rows_begin_right_after_the_header_line() {
+        let (names, rows) = header_of("a,b\r\n1,2\r\n").unwrap();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(rows, "1,2\r\n");
+        let (_, rows) = header_of("a,b").unwrap();
+        assert_eq!(rows, "", "a header-only file has no rows");
+    }
+
+    /// A quoted header name may hold the delimiter, and a doubled quote is one.
+    #[test]
+    fn a_header_name_is_read_as_csv() {
+        let (names, _) = header_of("\"a,b\",\"say \"\"hi\"\"\"\n1,2\n").unwrap();
+        assert_eq!(names, ["a,b", "say \"hi\""]);
+    }
+
+    /// Spreadsheet exports start with a byte-order mark; it is not part of the
+    /// first column's name.
+    #[test]
+    fn a_byte_order_mark_is_not_part_of_the_first_name() {
+        let (names, rows) = header_of("\u{feff}a,b\n1,2\n").unwrap();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(rows, "1,2\n");
+    }
+
+    #[test]
+    fn an_empty_file_has_no_header() {
+        assert!(header_of("").is_none());
+    }
+
+    #[test]
+    fn a_tsv_header_is_split_on_tabs() {
+        let (names, _) = delimited_header("a b\tc\n", true, Path::new("t.tsv")).unwrap().unwrap();
+        assert_eq!(names, ["a b", "c"]);
+    }
+
+    // ── Matching a header to the table's columns ─────────────────────────────
+
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_header_maps_to_columns_in_its_own_order() {
+        let got = header_columns(
+            &columns(&["name", "code"]),
+            &columns(&["code", "name"]),
+            "t",
+            Path::new("f"),
+        );
+        assert_eq!(got.unwrap(), ["name", "code"]);
+    }
+
+    /// `Name` resolves to `name`, as an unquoted identifier would; an exact
+    /// match wins over the folded one, as a quoted identifier would.
+    #[test]
+    fn a_header_name_matches_as_postgres_resolves_it() {
+        let got = header_columns(&columns(&["Name"]), &columns(&["name"]), "t", Path::new("f"));
+        assert_eq!(got.unwrap(), ["name"]);
+        let got = header_columns(&columns(&["Name"]), &columns(&["name", "Name"]), "t", Path::new("f"));
+        assert_eq!(got.unwrap(), ["Name"]);
+        // Folding is one way: a lower-case header cannot name a mixed-case column.
+        let got = header_columns(&columns(&["name"]), &columns(&["Name"]), "t", Path::new("f"));
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn a_column_named_twice_is_refused() {
+        let err = header_columns(&columns(&["code", "CODE"]), &columns(&["code"]), "t", Path::new("f"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("code") && err.contains("twice"), "{err}");
+    }
+
+    /// Every unknown name at once, quoted so a stray space shows.
+    #[test]
+    fn every_unknown_header_name_is_named() {
+        let err = header_columns(
+            &columns(&["code", " name", "iso"]),
+            &columns(&["code", "name"]),
+            "staging.c",
+            Path::new("f"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("' name'") && err.contains("'iso'") && err.contains("staging.c"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn reference_class_equality() {
         assert_eq!(ReferenceClass::Internal, ReferenceClass::Internal);

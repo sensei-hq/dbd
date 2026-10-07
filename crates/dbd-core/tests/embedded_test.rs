@@ -328,6 +328,27 @@ async fn a_tsv_loads_each_value_into_the_column_its_header_names() {
     .await;
 }
 
+/// Windows line endings: the rows are handed to COPY from just after the
+/// header's `\r\n`. Cut after the `\r`, they began with a stray `\n` that COPY
+/// reads as a row of its own.
+#[tokio::test]
+async fn a_csv_with_crlf_line_endings_loads() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "name,code\r\nGermany,DE\r\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
 /// A header names a column as Postgres resolves an unquoted name: `Name` is
 /// `name`. A spreadsheet's capitalised header loaded before, by position; it
 /// must not be refused now that the header is read.
