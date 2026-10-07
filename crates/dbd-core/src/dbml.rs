@@ -803,6 +803,50 @@ mod tests {
         assert!(block.contains("(customer_id, ref_code) [unique]"), "got:\n{block}");
     }
 
+    /// DBML writes an index expression in backticks — bare, `lower(email)`
+    /// reads as a column of that name.
+    #[test]
+    fn an_expression_index_key_is_written_in_backticks() {
+        let mut entity = make_table_entity(
+            "shop.customers",
+            vec![col("tenant_id", "bigint"), col("email", "text")],
+            vec![],
+        );
+        let expression = |name: &str| IndexColumn {
+            name: name.to_string(),
+            is_expression: true,
+            ..Default::default()
+        };
+        entity.table_def.as_mut().unwrap().indexes = vec![
+            IndexDef {
+                name: Some("customers_email_lower_idx".to_string()),
+                columns: vec![expression("lower(email)")],
+                ..Default::default()
+            },
+            IndexDef {
+                name: Some("customers_tenant_email_idx".to_string()),
+                columns: vec![
+                    IndexColumn {
+                        name: "tenant_id".to_string(),
+                        ..Default::default()
+                    },
+                    expression("lower(email)"),
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let block = emit_table("shop.customers", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("`lower(email)` [name: 'customers_email_lower_idx']"),
+            "got:\n{block}"
+        );
+        assert!(
+            block.contains("(tenant_id, `lower(email)`) [name: 'customers_tenant_email_idx']"),
+            "got:\n{block}"
+        );
+    }
+
     #[test]
     fn table_with_note() {
         let mut entity = make_table_entity("config.lookups", vec![col("id", "INT")], vec![]);

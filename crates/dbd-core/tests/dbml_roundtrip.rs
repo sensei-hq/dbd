@@ -102,3 +102,38 @@ fn a_table_level_unique_constraint_survives_dbml_and_back() {
     assert!(composite.unique, "uniqueness is the whole point:\n{dbml}");
     assert_eq!(key_names(composite), vec!["customer_id", "ref_code"]);
 }
+
+fn keys(ix: &IndexDef) -> Vec<(&str, bool)> {
+    ix.columns.iter().map(|c| (c.name.as_str(), c.is_expression)).collect()
+}
+
+/// An expression key written bare (`lower(email)`) reads back as a column
+/// literally named `lower(email)`, so `init --from-dbml` wrote
+/// `("lower(email)")` and apply failed. DBML spells an expression in backticks.
+#[test]
+fn an_expression_index_survives_dbml_and_back() {
+    let customers = parse(
+        "ddl/table/shop/customers.ddl",
+        "create table shop.customers (id bigint primary key, tenant_id bigint, email text, ctx jsonb);\n\
+         create index customers_email_lower_idx on shop.customers (lower(email));\n\
+         create index customers_tenant_email_idx on shop.customers (tenant_id, lower(email));\n\
+         create index customers_module_idx on shop.customers ((ctx ->> 'module'), coalesce(email, 'x, y'));",
+    );
+    let original = customers.table_def.clone().unwrap();
+    let dbml = document(&[customers]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "shop.customers");
+
+    for name in [
+        "customers_email_lower_idx",
+        "customers_tenant_email_idx",
+        "customers_module_idx",
+    ] {
+        let before = keys(index(&original, name));
+        assert!(
+            before.iter().any(|(_, is_expression)| *is_expression),
+            "{name} must have an expression key for this test to mean anything: {before:?}"
+        );
+        assert_eq!(keys(index(td, name)), before, "{name}:\n{dbml}");
+    }
+}
