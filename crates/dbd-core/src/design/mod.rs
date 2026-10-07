@@ -3013,6 +3013,49 @@ import:
         assert!(summary.policies.failed.is_empty());
     }
 
+    /// `Design::deploy` applies the schema grants `dbd apply` does. They lived
+    /// only in the CLI's apply handler, so `dbd deploy` — and every embedder —
+    /// got a schema with no grants and no warning.
+    #[tokio::test]
+    async fn deploy_applies_schema_grants_like_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - app:\n      grants:\n        app_user: [usage, select]\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let mock = MockAdapter::new().with_schema_grants();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("GRANT USAGE ON SCHEMA \"app\" TO \"app_user\""),
+            "deploy must apply the schema grants: {scripts}"
+        );
+        assert!(scripts.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"app\" TO \"app_user\""));
+    }
+
+    /// A target with no grant model is skipped, not fed SQL it cannot run.
+    #[tokio::test]
+    async fn deploy_skips_grants_on_a_target_without_a_grant_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - app:\n      grants:\n        app_user: [usage]\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let mock = MockAdapter::new();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            !scripts.contains("GRANT"),
+            "no grant SQL for a target without grants: {scripts}"
+        );
+    }
+
     /// A deploy with nothing to import must still report a summary — the zero
     /// count is the signal that the registry rows did not load.
     #[tokio::test]
