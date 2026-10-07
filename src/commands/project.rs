@@ -68,6 +68,9 @@ pub fn cmd_dbml(
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
+        // The whole design, not the scope: a stub for an out-of-scope parent
+        // takes its column types from here.
+        design_entities: design.entities(),
         project_name: &design.config().project.name,
         database_type: &design.config().source.dialect,
         project_note: design.config().project.note.as_deref(),
