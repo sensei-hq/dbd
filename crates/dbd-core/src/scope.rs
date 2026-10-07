@@ -218,15 +218,19 @@ fn traverse(
 /// Whether an entity named `qualified` (`schema.name`) — in today's design or long
 /// gone — falls in `resolved`.
 ///
-/// An entity the design still has is in scope exactly when resolution put it
-/// there, which accounts for excludes and the `deps` closure. A name the design no
-/// longer has cannot be resolved, so it is matched against the scope's own
-/// includes and excludes instead: the changelog of a table dropped three versions
-/// ago stays in the scope that table was in. `existing` is every entity name the
-/// design has now.
+/// An entity the design still has is in scope exactly when it is in
+/// `working_set` — the scope's working set (`Design::working_set`), which
+/// accounts for excludes and, under `deps: include`, the dependency closure.
+/// `resolved.entities` alone is the scope *before* that closure, and asking it
+/// left out every table `include` pulled in. A name the design no longer has
+/// cannot be resolved, so it is matched against the scope's own includes and
+/// excludes instead: the changelog of a table dropped three versions ago stays in
+/// the scope that table was in. `existing` is every entity name the design has
+/// now.
 pub fn admits(
     scopes: &IndexMap<String, ScopeEntry>,
     resolved: &ResolvedScope,
+    working_set: &HashSet<String>,
     existing: &HashSet<String>,
     qualified: &str,
 ) -> bool {
@@ -234,7 +238,7 @@ pub fn admits(
         return true;
     }
     if existing.contains(qualified) {
-        return resolved.entities.contains(qualified);
+        return working_set.contains(qualified);
     }
     let Some(ScopeEntry::Spec(spec)) = scopes.get(&resolved.name) else {
         return true;

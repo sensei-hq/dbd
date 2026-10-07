@@ -1,8 +1,8 @@
 //! Sequence DDL, parsed with libpg_query.
 //!
 //! A sequence carries no structure dbd models — no columns, no references — so
-//! this is the smallest native parser: validate, record the search path, and
-//! confirm the file actually declares a sequence.
+//! this is the smallest native parser: validate, record the search path and the
+//! sequence's own comment, and confirm the file actually declares a sequence.
 //!
 //! It is also a bug fix. sqlparser cannot parse `INCREMENT BY`, so an ordinary
 //! `create sequence … start with 1000 increment by 1;` produced a parse error,
@@ -35,6 +35,9 @@ pub(in crate::parser) fn parse_sequence(mut entity: Entity, sql: &str) -> Result
             .errors
             .push("this sequence file declares no `CREATE SEQUENCE`".to_string());
     }
+    // The schema model lists sequences beside views and routines, and the
+    // viewer describes each by its comment.
+    entity.comment = common::entity_comment(&parsed);
 
     Ok(entity)
 }

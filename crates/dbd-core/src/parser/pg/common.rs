@@ -77,7 +77,7 @@ pub(in crate::parser) fn resolve_schema_path(raw_sql: &str, seeded: &SchemaPath)
 /// The entity's own `COMMENT ON …`, for the kinds that are not tables.
 ///
 /// A table's comments land in `TableDef::comments`; a view, materialized view,
-/// routine or enum type has no `TableDef`, so `COMMENT ON VIEW recent IS '…'`
+/// routine, sequence or enum type has no `TableDef`, so `COMMENT ON VIEW recent IS '…'`
 /// parsed cleanly and was dropped on the floor — and `COMMENT ON TYPE` was, until
 /// #34, still dropped for enums. The diagram's entity description
 /// table is built from comments, so every one of those rows came out blank.
@@ -99,6 +99,7 @@ pub(super) fn entity_comment(parsed: &pg_query::ParseResult) -> Option<String> {
         matches!(
             c.objtype(),
             ObjectType::ObjectView
+                | ObjectType::ObjectSequence
                 | ObjectType::ObjectMatview
                 | ObjectType::ObjectFunction
                 | ObjectType::ObjectProcedure

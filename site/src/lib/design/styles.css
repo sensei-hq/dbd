@@ -217,6 +217,16 @@
   border-radius: var(--radius); padding: 4px; box-shadow: var(--shadow-card);
 }
 
+/* A stub (`SchemaModel.stubs`): a table the model's foreign keys land on but does not carry.
+   Dashed, so it reads as outside this model at a glance; the card's kind tag says which way.
+   The border's style only, never its colour or the card's opacity — those carry the schema
+   spine and the selection/dim states, which a stub takes part in like any other card. */
+.dbd-app [data-graph-node][data-node-kind='external'],
+.dbd-app [data-graph-node][data-node-kind='out_of_scope'],
+.dbd-app [data-graph-node][data-node-kind='unresolved'] {
+  border-style: dashed;
+}
+
 /* per-schema tint (hue arrives via inline --cl-h) */
 .dbd-app .tinted .dg-cluster {
   background: oklch(0.975 0.02 var(--cl-h, 245) / 0.7);
