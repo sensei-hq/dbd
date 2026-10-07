@@ -1103,3 +1103,94 @@ fn a_materialized_view_becomes_a_view_and_its_indexes_are_reported() {
         );
     }
 }
+
+// ── Comments are carried where the target keeps them ───────────────────────
+
+const COMMENTED: [(&str, &str); 2] = [
+    (
+        "table/app/people.ddl",
+        "create table people (id integer primary key, name text);\n\
+         comment on table people is 'Everyone we know';\n\
+         comment on column people.name is 'What they''re called\nin full';",
+    ),
+    (
+        "view/app/adults.ddl",
+        "create view adults as select id from people;\n\
+         comment on view adults is 'People over 18';",
+    ),
+];
+
+/// MySQL keeps a comment on a table and on a column, so both come across —
+/// escaped for MySQL, which reads a backslash in a string as an escape.
+#[test]
+fn mysql_carries_table_and_column_comments() {
+    let (sql, report) = emit_with(Dialect::MySql, "", &COMMENTED, None);
+    assert!(
+        sql.contains(r"`name` TEXT COMMENT 'What they''re called\nin full'"),
+        "{sql}"
+    );
+    assert!(sql.contains(") COMMENT='Everyone we know';"), "{sql}");
+    assert!(
+        !report
+            .iter()
+            .any(|d| d.entity == "app.people" && d.from.contains("comment")),
+        "carried faithfully: {report:?}"
+    );
+}
+
+/// SQL Server keeps comments as `MS_Description` extended properties — what
+/// SSMS shows — on the table, the column and the view.
+#[test]
+fn sql_server_carries_comments_as_ms_description_properties() {
+    let (sql, report) = emit_with(Dialect::TSql, "", &COMMENTED, None);
+    let property = |value: &str, level1: &str, name: &str, column: Option<&str>| {
+        let mut s = format!(
+            "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'{value}', \
+             @level0type = N'SCHEMA', @level0name = N'app', @level1type = N'{level1}', @level1name = N'{name}'"
+        );
+        if let Some(c) = column {
+            s.push_str(&format!(", @level2type = N'COLUMN', @level2name = N'{c}'"));
+        }
+        s + ";"
+    };
+    for expected in [
+        property("Everyone we know", "TABLE", "people", None),
+        property("What they''re called\nin full", "TABLE", "people", Some("name")),
+        property("People over 18", "VIEW", "adults", None),
+    ] {
+        assert!(sql.contains(&expected), "missing {expected}\n{sql}");
+    }
+    assert!(!report.iter().any(|d| d.from.contains("comment")), "{report:?}");
+}
+
+/// SQLite keeps no comments, and MySQL none on a view. Each one dropped is
+/// reported — it was documentation someone wrote, and it is gone.
+#[test]
+fn a_comment_the_target_cannot_keep_is_reported() {
+    let (_, sqlite) = emit_with(Dialect::Sqlite, "", &COMMENTED, None);
+    for (entity, column) in [("app.people", None), ("app.people", Some("name")), ("app.adults", None)] {
+        assert!(
+            sqlite.iter().any(|d| d.entity == entity
+                && d.column.as_deref() == column
+                && d.from.contains("comment")
+                && d.to == "nothing"),
+            "SQLite, {entity} {column:?}: {sqlite:?}"
+        );
+    }
+    let (_, mysql) = emit_with(Dialect::MySql, "", &COMMENTED, None);
+    assert!(
+        mysql
+            .iter()
+            .any(|d| d.entity == "app.adults" && d.from.contains("comment") && d.to == "nothing"),
+        "MySQL has no view comments: {mysql:?}"
+    );
+}
+
+/// A note quotes what was lost, and a comment can span lines. Every line of
+/// a note must still be a comment, or the script breaks at the second one.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_note_quoting_a_multi_line_comment_stays_a_comment() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &COMMENTED, None);
+    on_sqlite(&sql, "", "select 'ok'").unwrap_or_else(|e| panic!("{e}"));
+}
