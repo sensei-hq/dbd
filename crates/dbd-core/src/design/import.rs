@@ -30,6 +30,12 @@ impl<'a> Loaders<'a> {
     }
 }
 
+/// The names of `entities`, each once, in first-seen order.
+fn distinct_names<'a>(entities: impl Iterator<Item = &'a Entity>) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    entities.map(|e| e.name.as_str()).filter(|n| seen.insert(*n)).collect()
+}
+
 /// `name` without its schema: `staging.items` → `items`.
 fn bare_name(name: &str) -> &str {
     name.split_once('.').map_or(name, |(_, bare)| bare)
@@ -206,37 +212,40 @@ impl Design {
             ));
         }
 
-        // A function is never run as a loader (see `import_plan`). When one reads
-        // a staging table that no procedure loads, it is most likely a loader
-        // written as a function — say so, or the target stays empty in silence.
-        for entry in self.import_plan(name).iter().filter(|e| e.procedure.is_none()) {
-            for function in self.routines_reading(EntityType::Function, &entry.table.name) {
-                warnings.push(format!(
-                    "{} has no loader procedure — function {} reads it but is not run: loaders are \
-                     CALLed, so write it as a procedure, or run it from import.after",
-                    entry.table.name, function.name
-                ));
-            }
-        }
-
-        // Each staging table has one loader (see `import_loaders`). Another
-        // procedure reading it is not run — said, because every reader after
-        // the first used to be dropped without a word, and one of them may
-        // have been a load.
+        // Judged per table, not per data file: a table may have two (a shared
+        // one and an env's own), and saying everything twice says nothing more.
         let loaders = self.import_loaders();
-        for entry in self.import_plan(name) {
-            let Some(loader) = loaders.by_table.get(entry.table.name.as_str()) else {
-                continue;
-            };
-            for idle in self
-                .routines_reading(EntityType::Procedure, &entry.table.name)
-                .filter(|p| !loaders.loads_any(&p.name))
-            {
-                warnings.push(format!(
-                    "{} reads {} but is not called — {} is its loader; call {} from there, or run it \
-                     from import.after",
-                    idle.name, entry.table.name, loader.name, idle.name
-                ));
+        for table in distinct_names(self.loadable_tables(name)) {
+            match loaders.by_table.get(table) {
+                // A function is never run as a loader (see `import_plan`). When
+                // one reads a staging table that no procedure loads, it is most
+                // likely a loader written as a function — say so, or the target
+                // stays empty in silence.
+                None => {
+                    for function in self.routines_reading(EntityType::Function, table) {
+                        warnings.push(format!(
+                            "{table} has no loader procedure — function {} reads it but is not run: \
+                             loaders are CALLed, so write it as a procedure, or run it from import.after",
+                            function.name
+                        ));
+                    }
+                }
+                // Each staging table has one loader. Another procedure reading
+                // it is not run — said, because every reader after the first
+                // used to be dropped without a word, and one of them may have
+                // been a load.
+                Some(loader) => {
+                    for idle in self
+                        .routines_reading(EntityType::Procedure, table)
+                        .filter(|p| !loaders.loads_any(&p.name))
+                    {
+                        warnings.push(format!(
+                            "{} reads {table} but is not called — {} is its loader; call {} from there, \
+                             or run it from import.after",
+                            idle.name, loader.name, idle.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -345,19 +354,12 @@ impl Design {
     /// via [`Design::import_invalid_tables`].
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
         let loaders = self.import_loaders();
-        let tables: Vec<&Entity> = self
-            .import_tables
-            .iter()
-            .filter(|t| t.errors.is_empty())
-            .filter(|t| name.is_none_or(|n| t.name == n))
-            .collect();
-
-        let mut entries: Vec<ImportPlanEntry> = tables
-            .iter()
+        let mut entries: Vec<ImportPlanEntry> = self
+            .loadable_tables(name)
             .map(|table| {
                 let loader = loaders.by_table.get(table.name.as_str());
                 ImportPlanEntry {
-                    table: (*table).clone(),
+                    table: table.clone(),
                     procedure: loader.map(|p| p.name.clone()),
                     writes: loader
                         .map(|p| p.writes().map(|r| r.name.clone()).collect())
@@ -371,7 +373,28 @@ impl Design {
         // A must come before B.
         self.sort_import_plan(&mut entries);
 
+        // A table with two data files is two entries and one load: both files
+        // load, then its loader runs once over the rows of both. Every entry
+        // keeps the loader's `writes`, so a scope judges the two alike.
+        let mut called: HashSet<String> = HashSet::new();
+        for entry in &mut entries {
+            if let Some(procedure) = &entry.procedure
+                && !called.insert(procedure.clone())
+            {
+                entry.procedure = None;
+            }
+        }
+
         entries
+    }
+
+    /// The data files an import loads — every one dbd could read, or the ones
+    /// `name` selects.
+    fn loadable_tables<'a>(&'a self, name: Option<&'a str>) -> impl Iterator<Item = &'a Entity> + 'a {
+        self.import_tables
+            .iter()
+            .filter(|t| t.errors.is_empty())
+            .filter(move |t| name.is_none_or(|n| t.name == n))
     }
 
     /// Which procedure loads each staging table.
@@ -398,12 +421,15 @@ impl Design {
     /// Decided over every data file at once, so a `-n` run calls the loader a
     /// full run would.
     fn import_loaders(&self) -> Loaders<'_> {
-        let tables: Vec<&Entity> = self.import_tables.iter().filter(|t| t.errors.is_empty()).collect();
+        // Per table, not per data file: a table's second file (a shared one
+        // and an env's own) is the same load, not a second table claiming
+        // its loader.
+        let tables: Vec<&str> = distinct_names(self.loadable_tables(None));
         // "Another staging table" covers every data file's table and every
         // table declared in a staging schema, loaded this run or not.
         let staging: HashSet<&str> = tables
             .iter()
-            .map(|t| t.name.as_str())
+            .copied()
             .chain(
                 self.entities
                     .iter()
@@ -424,8 +450,7 @@ impl Design {
 
         let mut loaders = Loaders::default();
         let mut pending: Vec<(&str, Vec<&Entity>)> = Vec::new();
-        for table in &tables {
-            let table = table.name.as_str();
+        for &table in &tables {
             let candidates: Vec<&Entity> = self.routines_reading(EntityType::Procedure, table).collect();
             let conventional = format!("import_{}", bare_name(table));
             let named: Vec<&Entity> = candidates

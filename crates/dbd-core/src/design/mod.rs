@@ -301,9 +301,12 @@ pub struct Report {
 #[derive(Debug, Clone)]
 pub struct ImportPlanEntry {
     pub table: Entity,
-    /// Procedure that reads from this staging table (matched by reads analysis).
+    /// The loader CALLed once the data files are loaded (picked by
+    /// `Design::import_plan`). A table with two data files has it on its first
+    /// entry only — it is called once, over the rows of both.
     pub procedure: Option<String>,
-    /// Config tables the procedure writes to.
+    /// The tables the table's loader writes — on every entry of the table, so a
+    /// scope judges its data files alike.
     pub writes: Vec<String>,
 }
 
