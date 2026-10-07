@@ -305,7 +305,8 @@ pub(crate) async fn export_with_adapter(
 
     // Say the export was narrowed before reporting what it found: "No tables to
     // export" on a scoped run otherwise reads as an empty database.
-    output::scope_filtered(&resolved, in_scope.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     if tables.is_empty() {
         output::info(verbosity, "No tables to export.");

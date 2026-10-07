@@ -69,6 +69,27 @@ impl Design {
             .collect())
     }
 
+    /// `(kept, total)`: how many entities `scope` builds, and how many the
+    /// design declares.
+    ///
+    /// The one count every command reports for a scope. They used to count four
+    /// ways — `inspect` before the `deps: include` closure, `combine`/`dbml`
+    /// with every external and every extension an `extensions:` allowlist
+    /// drops, `deploy --dry-run` the whole design — so one scope had four sizes
+    /// depending on which command was asked.
+    ///
+    /// `kept` is the scope's working set (closure included) as
+    /// [`Self::scoped_entities`] resolves it. Externals are left out of both
+    /// numbers: they declare something outside the design that no command
+    /// builds, so counting them made the scope look bigger than what an apply
+    /// lists. For the all-scope `kept == total`.
+    pub fn scope_counts(&self, scope: &ResolvedScope) -> Result<(usize, usize)> {
+        let built = |e: &&Entity| e.entity_type != EntityType::External;
+        let total = self.entities.iter().filter(built).count();
+        let kept = self.scoped_entities(scope)?.iter().filter(built).count();
+        Ok((kept, total))
+    }
+
     /// Resolve a scope to its working set, running the `report`-policy gap gate
     /// first (aborts before any write). `None`/all-scope ⇒ `Ok(None)` (no
     /// filtering). Shared by `apply`, `reconcile`, and `diff_live`.
