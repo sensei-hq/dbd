@@ -641,8 +641,18 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
     lines
 }
 
-/// Release the current version: write a baseline snapshot and set the released
-/// flag, locking the project into the snapshot/migration workflow.
+/// Release the current version: set the released flag, locking the project into
+/// the snapshot/migration workflow — writing the baseline snapshot first when
+/// the project has none.
+///
+/// A greenfield project reaches release with no snapshots: it was iterated with
+/// `reconcile`, and release cuts its baseline. A brownfield one does not —
+/// `init --from-db` writes the baseline as it creates the project, and `merge`
+/// snapshots each import — but neither sets `released`. Release used to refuse
+/// any project with snapshots, so a brownfield project could never be released
+/// and `reconcile` stayed enabled on it for good. Its history is already the
+/// record, so it is released at the version that history reached; writing a
+/// second baseline over it would discard the versions it already has.
 pub fn cmd_release(
     config: &Path,
     env: &str,
@@ -655,16 +665,14 @@ pub fn cmd_release(
     if design.config().project.released {
         anyhow::bail!("Project is already released.");
     }
-    if dbd_core::snapshot::has_snapshots(project_dir) {
-        anyhow::bail!(
-            "Snapshots already exist — the project is already on the migration track. \
-             Use `dbd snapshot` for subsequent versions."
-        );
-    }
 
     let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
     if error_count > 0 {
         anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
+    }
+
+    if dbd_core::snapshot::has_snapshots(project_dir) {
+        return release_at_latest_snapshot(&design, config, project_dir, name, verbosity);
     }
 
     let version = design.config().project.version();
@@ -676,6 +684,60 @@ pub fn cmd_release(
     output::always(&format!(
         "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
     ));
+    output::info(
+        verbosity,
+        "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
+    );
+    Ok(())
+}
+
+/// Release a project whose snapshots already exist, at the version they reached.
+///
+/// Released at version N means the design *is* snapshot N, so a change no
+/// snapshot captured is refused rather than shipped unversioned: `dbd snapshot`
+/// records it, and the release then lands on that version.
+fn release_at_latest_snapshot(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let latest = dbd_core::snapshot::latest_snapshot(project_dir)
+        .context("Failed to read the latest snapshot")?
+        .context("snapshots/ lists a version but none could be read")?;
+    let version = latest.version;
+
+    // The version apply migrates to is `project.version`; releasing at a
+    // snapshot version it does not name would release one version and deploy
+    // another.
+    if let Some(declared) = design.config().project.version
+        && declared != version
+    {
+        anyhow::bail!(
+            "design.yaml says project.version {declared}, but the latest snapshot is v{version} — \
+             set project.version to {version} (or restore the missing snapshots) before releasing."
+        );
+    }
+
+    let pending = dbd_core::snapshot::prepare_multi_snapshot(design.entities(), Some(&latest), version + 1, "release");
+    let captured = pending.snapshots.len() == 1 && pending.snapshots[0].no_changes;
+    if !captured {
+        anyhow::bail!(
+            "the design has changes since snapshot v{version} that no snapshot records — \
+             capture them with `dbd snapshot`, then run `dbd release` again."
+        );
+    }
+
+    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
+    output::always(&format!(
+        "✓ Released v{version} — the existing snapshots are its history, so no baseline was written; \
+         `reconcile` is now disabled."
+    ));
+    if name.is_some() {
+        // `--name` describes the baseline snapshot, and there is none to write.
+        output::warn("--name not used: this project's baseline snapshot already exists.");
+    }
     output::info(
         verbosity,
         "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
