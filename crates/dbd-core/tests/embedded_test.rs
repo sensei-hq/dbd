@@ -393,7 +393,7 @@ async fn a_json_array_file_imports_one_row_per_record() {
     assert_catalog(
         &*adapter,
         false,
-        "SELECT 1 FROM app.people GROUP BY true HAVING count(*) <> 2",
+        "SELECT 1 WHERE (SELECT count(*) FROM app.people) <> 2",
         "a row count other than 2",
     )
     .await;

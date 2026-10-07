@@ -343,7 +343,10 @@ impl DatabaseAdapter for SqliteAdapter {
 
         match format {
             "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
-            "jsonl" => self.import_jsonl(&data, table).await,
+            "json" | "jsonl" => {
+                let records = super::json_records(&data, format, file_path)?;
+                self.import_json_records(&records, table).await
+            }
             _ => Err(DbdError::Config(format!("Unsupported sqlite import format: {format}"))),
         }
     }
@@ -719,29 +722,25 @@ impl SqliteAdapter {
         Ok(())
     }
 
-    async fn import_jsonl(&self, data: &str, table: &str) -> Result<()> {
+    async fn import_json_records(&self, records: &[String], table: &str) -> Result<()> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
-        // Group consecutive lines with identical column sets into batches so
+        // Group consecutive records with identical column sets into batches so
         // we can flush each group as a single multi-row INSERT. When the
         // column set changes, flush whatever we have and start a new batch.
         let mut current_cols: Option<Vec<String>> = None;
         let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
 
-        for line in data.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        for record in records {
             let value: serde_json::Value =
-                serde_json::from_str(line).map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
+                serde_json::from_str(record).map_err(|e| DbdError::Config(format!("json parse failed: {e}")))?;
             let obj = value
                 .as_object()
-                .ok_or_else(|| DbdError::Config("jsonl line must be a JSON object".into()))?;
+                .ok_or_else(|| DbdError::Config("a json record must be a JSON object".into()))?;
 
             let cols: Vec<String> = obj.keys().cloned().collect();
             let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();

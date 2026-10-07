@@ -271,6 +271,33 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
 }
 
+/// The records of a JSON data file, each as its own JSON text.
+///
+/// `jsonl` is one record per line. A `json` file is read in either shape,
+/// decided by its first non-blank character: a JSON array of records — what
+/// `.json` means to most tools, Convex's importer among them — or JSON lines,
+/// which is how dbd has always read it. A JSON-lines record is an object, so a
+/// file of them never starts with `[`.
+///
+/// One reader for every SQL adapter, so a file that loads on one target loads
+/// on the others. Records come back as raw text rather than parsed values:
+/// Postgres parses each as `jsonb` itself, keeping numeric precision that a
+/// trip through `serde_json`'s `f64` would lose.
+pub(crate) fn json_records(data: &str, format: &str, file: &Path) -> Result<Vec<String>> {
+    if format == "json" && data.trim_start().starts_with('[') {
+        let records: Vec<&serde_json::value::RawValue> = serde_json::from_str(data).map_err(|e| {
+            crate::error::DbdError::Config(format!("{}: not a JSON array of records: {e}", file.display()))
+        })?;
+        return Ok(records.iter().map(|r| r.get().to_string()).collect());
+    }
+    Ok(data
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 pub mod convex;
 pub mod mock;
 #[cfg(feature = "postgres")]
