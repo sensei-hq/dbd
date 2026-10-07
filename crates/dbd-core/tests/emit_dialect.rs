@@ -634,7 +634,10 @@ const DEFAULTS: [(&str, &str); 1] = [(
 fn a_default_nothing_translates_is_dropped_and_reported() {
     for dialect in ALL {
         let (sql, report) = emit_with(dialect, "", &DEFAULTS, None);
-        assert!(!sql.contains("md5"), "{dialect:?}: it is not emitted: {sql}");
+        assert!(
+            !statements(&sql).contains("md5"),
+            "{dialect:?}: it is not emitted: {sql}"
+        );
         assert!(
             report
                 .iter()

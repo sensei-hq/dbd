@@ -32,6 +32,13 @@
 //! reported, so the script still applies. So is a foreign key to a table the
 //! script does not create — one declared `external:`, or left out by `--scope`.
 //!
+//! # Defaults
+//!
+//! A default is read from libpg_query's tree. A literal goes across without
+//! PostgreSQL's cast; the clock and a random UUID become the target's own.
+//! Anything else is PostgreSQL SQL that dbd does not translate, so it is left
+//! out and reported — a row that omits the column gets NULL, or is refused.
+//!
 //! # SQL Server's schemas and batches
 //!
 //! SQL Server keeps the schema in a name, so the script creates every schema
@@ -332,6 +339,10 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     for c in &td.columns {
         let before = report.len();
         let ty = map_type(&c.data_type, target, e, c, report);
+        let default = c
+            .default_value
+            .as_deref()
+            .and_then(|d| column_default(d, e, c, &ty, target, report));
         // A note goes immediately above the column it explains.
         for d in &report[before..] {
             lines.push(format!("  {}", d.comment(target)));
@@ -340,10 +351,8 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         if !c.nullable {
             col.push_str(" NOT NULL");
         }
-        if let Some(d) = &c.default_value
-            && let Some(mapped) = map_default(d, target)
-        {
-            col.push_str(&format!(" DEFAULT {mapped}"));
+        if let Some(default) = default {
+            col.push_str(&format!(" DEFAULT {default}"));
         }
         lines.push(format!("{col},"));
     }
@@ -876,24 +885,242 @@ fn args_or(args: &str, fallback: &str) -> String {
     }
 }
 
-/// A default the target can take, or `None` to omit it.
+/// A column default, read from libpg_query's tree — its shape, not its
+/// spelling, which PostgreSQL decorates with casts no other engine reads.
+#[derive(Debug, PartialEq)]
+enum PgDefault {
+    /// A constant, with any cast around it removed: `'open'::text` means
+    /// `'open'`, and `::` is a syntax error everywhere else.
+    Literal(Literal),
+    /// The transaction's clock: `now()`, `current_timestamp`, `localtimestamp`.
+    Now,
+    /// `current_date`.
+    Today,
+    /// `gen_random_uuid()`, or `uuid_generate_v4()` from `uuid-ossp`.
+    RandomUuid,
+    /// Anything else — PostgreSQL SQL that dbd does not translate.
+    Other,
+}
+
+#[derive(Debug, PartialEq)]
+enum Literal {
+    Number(String),
+    Text(String),
+    Bool(bool),
+    Null,
+}
+
+/// What the default expression `expr` is, for a column of PostgreSQL type
+/// `pg_type`.
 ///
-/// Conservative on purpose: a default is an expression, and dbd does not
-/// translate expressions. A literal passes; a function call is dropped rather
-/// than emitted in a dialect that may not have it.
-fn map_default(pg: &str, target: Target) -> Option<String> {
-    let d = pg.trim();
-    if d.starts_with('\'') || d.parse::<f64>().is_ok() {
-        return Some(d.to_string());
+/// Parsed, not pattern-matched: a string literal can hold `::` or `(` and a
+/// function can be schema-qualified, and the tree settles both.
+fn read_default(expr: &str, pg_type: &str) -> PgDefault {
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::SqlValueFunctionOp as Svf;
+    use pg_query::protobuf::a_const::Val;
+
+    let Ok(parsed) = pg_query::parse(&format!("SELECT {expr}")) else {
+        return PgDefault::Other;
+    };
+    let Some(NodeEnum::SelectStmt(select)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|n| n.node.as_ref())
+    else {
+        return PgDefault::Other;
+    };
+    let Some(NodeEnum::ResTarget(res)) = select.target_list.first().and_then(|n| n.node.as_ref()) else {
+        return PgDefault::Other;
+    };
+    let Some(mut node) = res.val.as_deref() else {
+        return PgDefault::Other;
+    };
+
+    let base = pg_type.trim().to_lowercase();
+    let mut boolean = matches!(base.as_str(), "boolean" | "bool");
+    // A cast types a literal for PostgreSQL; the value is what the default
+    // means. An array cast is the exception — `'{a,b}'::text[]` is array
+    // syntax, not a value another engine can read.
+    while let Some(NodeEnum::TypeCast(cast)) = node.node.as_ref() {
+        let Some(ty) = &cast.type_name else {
+            return PgDefault::Other;
+        };
+        if !ty.array_bounds.is_empty() {
+            return PgDefault::Other;
+        }
+        let names: Vec<&str> = ty
+            .names
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.last().is_some_and(|n| matches!(*n, "bool" | "boolean")) {
+            boolean = true;
+        }
+        let Some(arg) = cast.arg.as_deref() else {
+            return PgDefault::Other;
+        };
+        node = arg;
     }
-    match (d.to_lowercase().as_str(), target) {
-        ("true", Target::MySql | Target::Sqlite) => Some("1".to_string()),
-        ("false", Target::MySql | Target::Sqlite) => Some("0".to_string()),
-        ("true", Target::TSql) => Some("1".to_string()),
-        ("false", Target::TSql) => Some("0".to_string()),
-        ("now()" | "current_timestamp", Target::MySql) => Some("CURRENT_TIMESTAMP".to_string()),
-        ("now()" | "current_timestamp", Target::TSql) => Some("SYSDATETIMEOFFSET()".to_string()),
-        ("now()" | "current_timestamp", Target::Sqlite) => Some("CURRENT_TIMESTAMP".to_string()),
-        _ => None,
+
+    match node.node.as_ref() {
+        Some(NodeEnum::AConst(c)) if c.isnull => PgDefault::Literal(Literal::Null),
+        Some(NodeEnum::AConst(c)) => match &c.val {
+            Some(Val::Ival(i)) => PgDefault::Literal(Literal::Number(i.ival.to_string())),
+            Some(Val::Fval(f)) => PgDefault::Literal(Literal::Number(f.fval.clone())),
+            Some(Val::Boolval(b)) => PgDefault::Literal(Literal::Bool(b.boolval)),
+            // A boolean column takes `'t'`, `'yes'`, `'on'` … as well as TRUE.
+            Some(Val::Sval(s)) if boolean => match s.sval.trim().to_lowercase().as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => PgDefault::Literal(Literal::Bool(true)),
+                "f" | "false" | "n" | "no" | "off" | "0" => PgDefault::Literal(Literal::Bool(false)),
+                _ => PgDefault::Other,
+            },
+            Some(Val::Sval(s)) => PgDefault::Literal(Literal::Text(s.sval.clone())),
+            _ => PgDefault::Other,
+        },
+        Some(NodeEnum::SqlvalueFunction(f)) => match f.op() {
+            Svf::SvfopCurrentTimestamp
+            | Svf::SvfopCurrentTimestampN
+            | Svf::SvfopLocaltimestamp
+            | Svf::SvfopLocaltimestampN => PgDefault::Now,
+            Svf::SvfopCurrentDate => PgDefault::Today,
+            _ => PgDefault::Other,
+        },
+        Some(NodeEnum::FuncCall(f)) if f.args.is_empty() => {
+            let name = f.funcname.last().and_then(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.to_lowercase()),
+                _ => None,
+            });
+            match name.as_deref() {
+                Some("now" | "transaction_timestamp") => PgDefault::Now,
+                Some("gen_random_uuid" | "uuid_generate_v4") => PgDefault::RandomUuid,
+                _ => PgDefault::Other,
+            }
+        }
+        _ => PgDefault::Other,
     }
+}
+
+/// A string literal in the target's syntax.
+///
+/// MySQL reads a backslash in a string as an escape, so `'a\b'` — a literal
+/// backslash in PostgreSQL — must be doubled there. SQL Server stores a plain
+/// `'…'` in the database's code page, so anything outside ASCII needs `N'…'`.
+fn string_literal(s: &str, target: Target) -> String {
+    let quoted = s.replace('\'', "''");
+    match target {
+        Target::MySql => format!("'{}'", quoted.replace('\\', "\\\\")),
+        Target::TSql if !s.is_ascii() => format!("N'{quoted}'"),
+        Target::TSql | Target::Sqlite => format!("'{quoted}'"),
+    }
+}
+
+/// A random version-4 UUID in SQLite, which has no UUID function: 128 random
+/// bits shaped `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`, the text form
+/// `gen_random_uuid()` produces.
+const SQLITE_RANDOM_UUID: &str = "(lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || \
+     substr(lower(hex(randomblob(2))), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || \
+     substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6))))";
+
+/// The `DEFAULT` for column `c` — emitted as `ty` — on the target, or `None`
+/// to leave it out. Leaving one out is a loss and is reported: a row that
+/// omits the column gets NULL instead, or is refused when it is `NOT NULL`.
+///
+/// A literal goes across; so do the clock and a random UUID, which every target
+/// can make. Anything else is PostgreSQL SQL that dbd does not translate.
+fn column_default(
+    pg: &str,
+    e: &Entity,
+    c: &ColumnDef,
+    ty: &str,
+    target: Target,
+    report: &mut Vec<Downgrade>,
+) -> Option<String> {
+    let pg_type = c.data_type.trim().to_lowercase();
+    let is_array = pg_type.ends_with("[]");
+    let base = pg_type.split('(').next().unwrap_or(&pg_type).trim().to_string();
+    let mut lose = |to: &str, reason: String| {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: Some(c.name.clone()),
+            from: format!("the default `{pg}`"),
+            to: to.to_string(),
+            reason,
+        });
+    };
+
+    let mapped = match read_default(pg, &c.data_type) {
+        // An array column is a JSON document here, so the empty array is
+        // `[]`; any other array literal is PostgreSQL's own syntax.
+        PgDefault::Literal(Literal::Text(t)) if is_array => {
+            if t.trim() == "{}" {
+                "'[]'".to_string()
+            } else {
+                lose(
+                    "no default",
+                    "it is a PostgreSQL array literal, and the column is a JSON document here".to_string(),
+                );
+                return None;
+            }
+        }
+        PgDefault::Literal(Literal::Number(n)) => n,
+        PgDefault::Literal(Literal::Text(t)) => string_literal(&t, target),
+        PgDefault::Literal(Literal::Bool(b)) => if b { "1" } else { "0" }.to_string(),
+        PgDefault::Literal(Literal::Null) => "NULL".to_string(),
+        // `now()` on a `date` column is today's date; MySQL refuses
+        // CURRENT_TIMESTAMP on a DATE column.
+        PgDefault::Now if base != "date" => match target {
+            Target::MySql | Target::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+            Target::TSql => "SYSDATETIMEOFFSET()".to_string(),
+        },
+        PgDefault::Now | PgDefault::Today => match target {
+            Target::MySql => "(CURRENT_DATE)".to_string(),
+            Target::TSql => "CONVERT(date, SYSDATETIME())".to_string(),
+            Target::Sqlite => "CURRENT_DATE".to_string(),
+        },
+        PgDefault::RandomUuid => match target {
+            // Both random version-4 UUIDs, as gen_random_uuid() makes.
+            Target::TSql => "NEWID()".to_string(),
+            Target::Sqlite => SQLITE_RANDOM_UUID.to_string(),
+            Target::MySql => {
+                lose(
+                    "`(UUID())`",
+                    "MySQL's UUID() is version 1 — built from the clock and the host, not random — \
+                     so new ids can be guessed and reveal when and where they were made"
+                        .to_string(),
+                );
+                "(UUID())".to_string()
+            }
+        },
+        PgDefault::Other => {
+            let consequence = if c.nullable {
+                "a row that omits the column now gets NULL"
+            } else {
+                "a row that omits the column is now refused, since it is NOT NULL"
+            };
+            lose(
+                "no default",
+                format!(
+                    "dbd translates types and structure, not expressions, and {} may not have what \
+                     it calls — {consequence}",
+                    target.label()
+                ),
+            );
+            return None;
+        }
+    };
+
+    // MySQL takes a default on a TEXT, BLOB or JSON column only as an
+    // expression (8.0.13 and later): `('open')`, never `'open'`.
+    let ty_base = ty.split('(').next().unwrap_or(ty).trim().to_uppercase();
+    let needs_expression = target == Target::MySql && matches!(ty_base.as_str(), "TEXT" | "BLOB" | "JSON");
+    if needs_expression && !mapped.starts_with('(') && mapped != "NULL" {
+        return Some(format!("({mapped})"));
+    }
+    Some(mapped)
 }
