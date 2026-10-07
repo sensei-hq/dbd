@@ -396,6 +396,56 @@ fn inspect_of_a_named_entity_counts_and_advises_on_that_entity_alone() {
     assert!(err.contains("No RLS policy on 1 table(s)"), "{err}");
 }
 
+/// A scope building `core`, and a materialized view outside it that reads a
+/// table nobody declares — a warning, in a file the scope never builds.
+fn warned_outside_core_project(dir: &Path) {
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: warned\n\nsource:\n  dialect: postgresql\n\n\
+         schemas:\n  - core\n  - other\n\nscopes:\n  coreonly:\n    includes:\n      - core\n",
+    );
+    write(
+        dir,
+        "ddl/table/core/customers.ddl",
+        "set search_path to core;\ncreate table if not exists customers (id integer primary key);\n",
+    );
+    write(
+        dir,
+        "ddl/materialized_view/other/thing_counts.ddl",
+        "set search_path to other;\ncreate materialized view if not exists thing_counts as \
+         select count(*) from missing_table;\n",
+    );
+}
+
+/// Errors outside a scope were already kept apart from the scope's own; the
+/// warnings were not, so `inspect --scope coreonly` listed and counted a
+/// warning for a matview `coreonly` never builds.
+#[test]
+fn inspect_under_a_scope_counts_only_the_scopes_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    warned_outside_core_project(tmp.path());
+
+    let whole = stdout(&dbd(tmp.path(), &["inspect"]));
+    assert!(
+        whole.contains("thing_counts.ddl") && whole.contains("1 warning"),
+        "precondition: unscoped, the matview's warning is the design's: {whole}"
+    );
+
+    let out = dbd(tmp.path(), &["inspect", "--scope", "coreonly"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!text.contains("thing_counts.ddl"), "not listed as the scope's: {text}");
+    assert!(
+        text.contains("2 entities — no issues"),
+        "nor counted as the scope's: {text}"
+    );
+    assert!(
+        text.contains("1 warning(s) outside scope 'coreonly'"),
+        "but not hidden either — tallied as outside the scope: {text}"
+    );
+}
+
 // ── one count for one scope ─────────────────────────────────────────────────
 
 /// A `deps: include` scope whose closure adds an entity, an `extensions: []`
