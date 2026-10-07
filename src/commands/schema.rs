@@ -146,6 +146,13 @@ pub async fn cmd_inspect(
             scope_name.unwrap_or("all"),
         ));
     }
+    if !report.out_of_scope_warnings.is_empty() {
+        output::always(&format!(
+            "({} warning(s) outside scope '{}')",
+            report.out_of_scope_warnings.len(),
+            scope_name.unwrap_or("all"),
+        ));
+    }
     // Named in the tally so a reader knows the advisory block was counted
     // separately rather than folded into the error count.
     if let Some(line) = enum_advisory_tally(&enum_hints) {
@@ -1890,6 +1897,7 @@ mod tests {
             issues: vec![broken],
             out_of_scope_issues: vec![],
             warnings: vec![],
+            out_of_scope_warnings: vec![],
             gaps: vec![],
         };
         // Exercises the issues-loop formatting (label fallback + per-error line).
@@ -1908,6 +1916,7 @@ mod tests {
             issues: vec![],
             out_of_scope_issues: vec![broken],
             warnings: vec![],
+            out_of_scope_warnings: vec![],
             gaps: vec![],
         };
         print_report_findings(&report, Some("daemon"), Verbosity::Normal);
