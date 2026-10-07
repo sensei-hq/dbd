@@ -350,6 +350,44 @@ async fn an_empty_database_is_still_a_fresh_install() {
     assert!(combined(&o).contains("Fresh install at v1"), "{}", combined(&o));
 }
 
+/// `apply`, `deploy`, `reconcile` and `reset` refuse to run another scope on a
+/// database pinned to one. `policies` did not: unscoped, on a database built
+/// as `hub`, it applied every schema's policies — onto tables this database
+/// does not have, or, where they existed, securing a plane it does not serve.
+#[tokio::test]
+async fn policies_refuse_another_scope_on_a_pinned_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        let p = dir.join(format!("policies/{schema}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(
+            p.join(format!("{table}.sql")),
+            format!("alter table {schema}.{table} enable row level security;\n"),
+        )
+        .unwrap();
+    }
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["policies"]);
+    assert!(
+        !o.status.success(),
+        "unscoped policies on a hub database: {}",
+        combined(&o)
+    );
+    assert!(
+        combined(&o).contains("pinned to scope 'hub'"),
+        "refused by the scope guard, naming the pin: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["policies", "--scope", "hub"]);
+    assert!(o.status.success(), "its own scope still runs: {}", combined(&o));
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
