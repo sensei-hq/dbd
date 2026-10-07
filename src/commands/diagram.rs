@@ -163,6 +163,35 @@ mod tests {
         assert!(out.exists());
     }
 
+    /// A `deps: include` scope whose closure needs an entity it also excludes is a
+    /// contradiction every other command refuses. The diagram drew it as an empty
+    /// project and exited 0, which reads as "this scope has nothing in it".
+    #[test]
+    fn a_scope_that_excludes_its_own_dependency_is_refused_with_the_error_every_command_gives() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("model.json");
+        let err = cmd_diagram(
+            &cfg,
+            "dev",
+            proj.path(),
+            true,
+            &out,
+            false,
+            None,
+            Some("conflicting"),
+            None,
+            Verbosity::Normal,
+        )
+        .expect_err("a contradictory scope must not produce a model");
+
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        let scope = design.resolve_scope(Some("conflicting"), None).unwrap();
+        let everyone_elses = design.working_set(&scope).unwrap_err().to_string();
+        assert_eq!(format!("{err:#}"), everyone_elses);
+        assert!(!out.exists(), "nothing is written for a scope that cannot resolve");
+    }
+
     fn write_snapshot(project: &std::path::Path, file: &str, body: &str) {
         let dir = project.join("snapshots");
         std::fs::create_dir_all(&dir).unwrap();
