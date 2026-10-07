@@ -1158,7 +1158,7 @@ const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// The convergent form is the type-swap Postgres does leave open:
 ///
 /// ```text
-/// DROP VIEW   … ;                 -- managed dependents, deepest first
+/// DROP VIEW   … ;                 -- managed views over the column, deepest first
 /// ALTER TABLE … DROP DEFAULT;     -- the default is typed against the old type
 /// ALTER TYPE  … RENAME TO x__dbd_old;
 /// CREATE TYPE … AS ENUM (…);      -- exactly the declared values, in order
@@ -1170,8 +1170,12 @@ const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// Every failure this can hit is a *loud* one, inside the single implicit
 /// transaction `execute_script` runs the batch in: a row holding a removed value
 /// fails the `USING` cast, a default naming a removed value fails the
-/// `SET DEFAULT`, and an unmanaged dependent view fails the `ALTER … TYPE`.
-/// None of them can half-apply, and all of them name the object.
+/// `SET DEFAULT`, an unmanaged dependent view fails the `ALTER … TYPE`, and a
+/// routine whose *signature* uses the type follows the rename and so fails the
+/// final `DROP TYPE` (`function app.p(app.x__dbd_old) depends on type …`).
+/// None of them can half-apply, and all of them name the object. Tables and
+/// routines that merely *reference* the enum's table are never dropped: only a
+/// view over the column stands in the way of the swap.
 ///
 /// The one case it declines is a dependent **materialized view**: dbd never
 /// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
@@ -1220,7 +1224,7 @@ pub fn plan_enum_recreation(
         // A matview over an affected table blocks the swap and dbd will not drop
         // it. Say so, and plan nothing — a partial script would fail mid-batch
         // with a Postgres message that names the view but not the cause.
-        let dependents = dependent_entities(desired_entities, &roots);
+        let dependents = dependent_views(desired_entities, &roots);
         let blocking: Vec<&str> = dependents
             .iter()
             .filter(|(_, e)| e.entity_type == EntityType::MaterializedView)
@@ -1249,7 +1253,8 @@ pub fn plan_enum_recreation(
         )];
 
         // Deepest dependents first: a view over a view has to go before the view
-        // it selects from.
+        // it selects from. A matview would have returned above, so every
+        // dependent left is a plain view and `DROP VIEW` is the right keyword.
         for (_, e) in &dependents {
             lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
         }
@@ -1349,13 +1354,27 @@ fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
     out
 }
 
-/// Managed entities that transitively depend on any of `roots`, deepest first.
+/// Managed views and materialized views over any of `roots` — directly, or
+/// through another such view — deepest first.
+///
+/// Only a view is a dependent here. `ALTER COLUMN … TYPE` is refused while a
+/// view (or rule) selects the column; nothing else dbd manages blocks it. A
+/// table with a foreign key to a root and a routine whose body reads one hold
+/// no dependency on the column, so they are neither returned nor walked
+/// through: every transitive referrer used to come back, and the caller
+/// emitted each as `DROP VIEW` — failing on the first table (`"order_notes" is
+/// not a view`), and naming tables and routines that must never be dropped.
 ///
 /// Depth is the longest path from a root, so a view over a view sorts ahead of
 /// the view it selects from — which is the order they have to be dropped in.
 /// The iteration is bounded by the entity count so a `refers` cycle terminates
 /// rather than spinning.
-fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+    let views: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| matches!(e.entity_type, EntityType::View | EntityType::MaterializedView))
+        .collect();
+
     // A `refers` entry may or may not be schema-qualified, so each entity is
     // reachable under both spellings — matching how `build_dependency_map`
     // compares refs against `Entity::name` verbatim.
@@ -1366,9 +1385,9 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
         }
     }
 
-    for _ in 0..entities.len() {
+    for _ in 0..views.len() {
         let mut changed = false;
-        for e in entities {
+        for e in &views {
             let qname = qualified_entity_name(e);
             let schema = e.schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
             let deepest = e
@@ -1388,8 +1407,8 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
         }
     }
 
-    let mut out: Vec<(usize, &Entity)> = entities
-        .iter()
+    let mut out: Vec<(usize, &Entity)> = views
+        .into_iter()
         .filter_map(|e| depth.get(&qualified_entity_name(e)).map(|d| (*d, e)))
         .filter(|(d, _)| *d > 0)
         .collect();
