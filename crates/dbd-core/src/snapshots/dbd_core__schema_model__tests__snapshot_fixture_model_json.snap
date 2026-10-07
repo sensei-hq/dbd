@@ -1,6 +1,6 @@
 ---
 source: crates/dbd-core/src/schema_model.rs
-assertion_line: 724
+assertion_line: 733
 expression: json
 ---
 {
@@ -15,6 +15,11 @@ expression: json
       "name": "config",
       "tables": 2,
       "enums": 1
+    },
+    {
+      "name": "staging",
+      "tables": 0,
+      "enums": 0
     }
   ],
   "tables": [
