@@ -1069,6 +1069,44 @@ mod tests {
         adapter.import_data(&e, "", true).await.unwrap();
     }
 
+    /// A default import (`truncate: true`) empties each staging table before
+    /// loading it. That step was sent as SQL `TRUNCATE`, and Convex runs no SQL
+    /// at all — so every default import on Convex failed before `npx convex
+    /// import` was ever reached.
+    #[tokio::test]
+    async fn the_default_import_reaches_convex_import() {
+        use crate::design::{Design, Progress};
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("design.yaml"), "project:\n  name: t\n").unwrap();
+        std::fs::create_dir_all(project.join("import/staging")).unwrap();
+        std::fs::write(project.join("import/staging/users.jsonl"), "{\"email\":\"a@b.c\"}\n").unwrap();
+        let design = Design::from_config_with_dir(&project.join("design.yaml"), "dev", Some(project)).unwrap();
+        assert!(
+            design.config().import.table_truncate("staging.users"),
+            "precondition: truncate is the default"
+        );
+
+        // CLI dry-run: the `npx convex import` is logged, not spawned.
+        let adapter = ConvexAdapter::new(project.join("convex"), "test").with_cli_dry_run(true);
+        let mut loaded = 0;
+        design
+            .import_data(
+                &adapter,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s: crate::design::ImportComplete| loaded = s.tables,
+                },
+            )
+            .await
+            .expect("the default import must run on Convex");
+        assert_eq!(loaded, 1, "the staging file must have been handed to convex import");
+    }
+
     #[tokio::test]
     async fn cv17_auto_deploy_runs_npx_in_dry_run_mode() {
         let tmp = tempdir().unwrap();
