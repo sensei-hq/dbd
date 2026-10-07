@@ -509,6 +509,13 @@ pub(crate) async fn reconcile_with_adapter(
     allow_scope_change: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
+    // Guarded before the dry run, not after it. The preview connects anyway, so
+    // it can see the pin, and a plan for a run the guard will refuse is a
+    // preview of something that cannot happen. (`reset --dry-run` is the
+    // deliberate exception: it needs no database, so it has no pin to read.)
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+
     if dry_run {
         let plan = design
             .reconcile(
@@ -525,9 +532,6 @@ pub(crate) async fn reconcile_with_adapter(
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
-
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
     output::info(verbosity, "Reconciling schema to design...");
     let mut summary = None;
