@@ -52,12 +52,12 @@ marked prod.
 The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite). Any later `apply`, `deploy`, `reconcile`, or `reset` that requests a *different* scope is refused:
 
 ```
-scope guard: this database is pinned to scope 'public', but you requested 'internal'.
+Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
 Applying a different scope would build a divergent schema.
 → re-run with --scope public, or pass --allow-scope-change to re-point this database to 'internal'.
 ```
 
-This stops a mistyped or forgotten `--scope` from building a half-formed, divergent schema in the wrong database. To legitimately re-point a database to a new scope, pass **`--allow-scope-change`** on the write command — the run then re-pins the database to the new scope (`reset --force` also bypasses the check). To host multiple modules in one database, define a scope in `design.yaml` that includes them rather than switching back and forth. Databases created before this feature are unpinned and pin on their next write.
+This stops a mistyped or forgotten `--scope` from building a half-formed, divergent schema in the wrong database. To legitimately re-point a database to a new scope, pass **`--allow-scope-change`** on `apply`, `deploy` or `reconcile` — the run then re-pins the database to the new scope. On `reset`, the flag (like `--force`) only bypasses the check; a reset does not re-pin. To host multiple modules in one database, define a scope in `design.yaml` that includes them rather than switching back and forth. Databases created before this feature are unpinned and pin on their next write.
 
 Which commands filter by `--scope`, which also refuse on a dependency gap, and
 which ignore it is set out in [scopes](07-scopes.md#which-commands-honour-scope).
@@ -226,14 +226,13 @@ The full guide is [import and export](10-data.md).
 
 **Dry-run output shows the full plan:**
 ```
-  import staging.models (jsonl) ← import/staging/models.jsonl
-  import staging.routers (jsonl) ← import/staging/routers.jsonl
+  import staging.lookups (csv) ← ./import/staging/lookups.csv
 
-  call staging.import_models()
-  call staging.import_routers()
+  call staging.import_lookups()
+1 entities — no issues
 ```
 
-Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention.
+Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention. Write loaders as procedures: a function is matched too, but run with `CALL`, which PostgreSQL refuses.
 
 **How reads/writes are derived.** Function and procedure bodies are parsed, not text-matched. `LANGUAGE sql` bodies are parsed as an AST; PL/pgSQL bodies are parsed by libpg_query (PostgreSQL's own parser), which sees through `SELECT … INTO`, `PERFORM`, `FOR … IN … LOOP`, `RETURN QUERY`, and `IF` conditions. Either way, reads and writes are detected precisely through sub-selects, joins, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and CTEs, and a write target (`INSERT`/`UPDATE`/`DELETE`) is distinguished from the tables it reads. A best-effort regex scan is used only if a body can't be parsed at all.
 
@@ -279,8 +278,9 @@ into columns and constraints. Tables are emitted with their columns, keys,
 foreign keys, `CHECK` constraints and indexes; views and materialized views as
 `CREATE VIEW` with the body passed through untranslated and reported;
 functions, procedures and triggers are skipped and reported, because their
-bodies do not translate. A `CHECK` expression and an index's expression or
-predicate are passed through untranslated and reported the same way.
+bodies do not translate. A `CHECK` expression is passed through untranslated
+and reported the same way, and so is an index the target cannot express
+faithfully. A file dbd could not read is left out, so run `dbd inspect` first.
 `--scope` limits the output to the scope's entities.
 
 ### Downgrades
@@ -691,7 +691,7 @@ dbd export -n activity.hook_events -f jsonl -o import/staging   # → import/sta
 dbd export --scope hub                  # Only tables in the 'hub' scope
 ```
 
-By default writes to `export/<schema>/<name>.<format>`. **`-o`/`--output <dir>`** changes the
+By default writes to `export/<schema>/<name>.<format>` (SQLite: `export/<name>.<format>`), relative to the current directory. **`-o`/`--output <dir>`** changes the
 destination directory — files are written flat as `<dir>/<name>.<format>` (so you can export
 straight into the `import/` tree for a round-trip). `-f`/`--format` stays the format
 (`csv`/`tsv`/`jsonl`, default `csv`); a per-table `format` under `export:` wins over it.

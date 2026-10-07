@@ -36,7 +36,8 @@ designs"). Opening a link or dropping a file saves that design in the browser's
 the link carries — so a later link for the same project replaces the earlier
 one. Each card on `/projects` has a remove button ("Remove from this browser").
 The only other thing stored is your light/dark choice (`dbd-theme`). Nothing is
-sent anywhere, and `/projects` is never indexed.
+sent anywhere, and `/projects` is excluded from crawling (robots.txt) and marked
+`noindex`.
 
 ## The root view
 
@@ -44,13 +45,13 @@ The viewer opens on the project, with four tabs:
 
 | Tab | Shows |
 |---|---|
-| **Overview** | The database, the model version, counts — schemas, tables, each kind of view and routine present, enums, references — the project note as markdown, the three most recent changes, and a table of schemas |
+| **Overview** | The database, the model version, counts — schemas, tables, each kind of view and routine present, enums, references — the rest of the project note as markdown, the three most recent changes, and a table of schemas |
 | **Diagram** | The ER diagram: tables and their foreign keys, tinted by schema, with a schema legend |
 | **Entities** | Every table, with its column and reference counts and its comment |
 | **Changelog** | What each snapshot changed — see [below](#the-changelog) |
 
-The project note is `project.note` in `design.yaml`; its first paragraph also
-heads every root tab.
+The project note is `project.note` in `design.yaml`; its first paragraph heads
+every root tab, and the Overview shows the rest.
 
 On the **Diagram** tab, drag the background to pan and use ctrl/⌘ + scroll to
 zoom. The controls choose the detail level (names, keys, or all columns) and
@@ -83,12 +84,15 @@ graph.
 **An enum** has Details — its values, in declaration order, and the columns
 that use it — and Changelog.
 
-Triggers appear for projects read by the T-SQL or MySQL reader. dbd has no
-`ddl/trigger/` folder, and in a PostgreSQL project a `CREATE TRIGGER` stays part
-of the file it is written in.
+Triggers appear only for projects read by the T-SQL or MySQL reader, and only
+when the trigger is the first statement of its own file (say, under
+`ddl/procedure/`). There is no `ddl/trigger/` folder — dbd refuses one — and a
+`CREATE TRIGGER` that follows a table in the same file stays part of that file,
+as it always does in a PostgreSQL project.
 
-The viewer keeps no URL per page: the address only ever holds the model, so a
-reload returns to the overview.
+The viewer keeps no URL per page: the address only ever holds the model, so
+reloading a link returns to its overview. A design you dropped as a file is not
+in the address at all — reopen it from `/projects`.
 
 ## The changelog
 
@@ -120,7 +124,7 @@ tables, and it states its own `version`, currently `3`:
 | --- | --- |
 | `version` | The model version — `3` |
 | `project` | Name, dialect and note |
-| `schemas` | Each schema, with its table and enum counts |
+| `schemas` | Each schema that holds a table or an enum, with those counts |
 | `tables` | Tables, with columns (`pk`, `nn`, `en`, `fk`, `uq`, type, default, comment) and indexes |
 | `refs` | Foreign keys — the ER edges, column-level, as `{s, t, c}` |
 | `entities` | Views, materialized views, functions, procedures and triggers |
@@ -132,8 +136,8 @@ tables, and it states its own `version`, currently `3`:
 renderer wants foreign keys, a call-graph renderer wants dependencies, and
 folding them together would change what every existing consumer of `tables`
 receives. A dependency whose target is not a project entity is marked
-`"unresolved": true` rather than dropped. Comments reach every kind: `note` is
-the first line, `noteMd` the full text.
+`"unresolved": true` rather than dropped. Comments reach every kind: for tables,
+views, routines and enums `note` is the first line and `noteMd` the full text; a
+column's `note` is its whole comment.
 
-The viewer accepts any model with that shape — version 1 and 2 models still
-open, with the panels their fields allow.
+Models of version 1 and 2 still open, with the panels their fields allow.

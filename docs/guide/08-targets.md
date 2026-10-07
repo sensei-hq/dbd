@@ -143,7 +143,11 @@ target:
 - **Grants are skipped** with `Skipping schema grants (target has no grant
   model).` **Policies** are PostgreSQL SQL, so each policy file fails.
 - **Import** writes multi-row `INSERT … VALUES (?,?),(?,?), …` batches of at most
-  500 rows (or 32,000 bound values) in one transaction.
+  500 rows (or 32,000 bound values) in one transaction, matching CSV columns to
+  the header's names. **In 0.24.1 it needs `import.options.truncate: false`:**
+  the default empties each table first with a `TRUNCATE`, which SQLite does not
+  have, so the import (and a `deploy` with data files) fails. With truncate off,
+  rows are appended, so empty the tables yourself before a re-import.
 - **Not available:** `diff`, `reconcile` and `emit` refuse a SQLite project,
   because the `verbatim` reader builds no structured model to compare or
   translate; `refresh` has no materialized views to refresh.
@@ -155,7 +159,7 @@ target:
 ```yaml
 target:
   convex:
-    url: convex:                              # writes ./convex/schema.ts
+    url: "convex:"                            # writes ./convex/schema.ts (quoted: a bare trailing colon is not valid YAML)
     # url: convex://./generated               # another output directory
     # url: convex://./generated?deploy=true   # also run `npx convex deploy`
 ```
@@ -175,8 +179,12 @@ from the design's tables and enums:
   without a message.
 - State lives in `<output>/.dbd_state.json`, not a table.
 - `dbd import` runs `npx convex import --table <name> --replace -y <file>` per
-  data file. `dbd export` is refused: the Convex CLI exports whole deployments
-  only (`npx convex export`).
+  data file — once `import.options.truncate` is `false`. In 0.24.1 the default
+  truncate is sent as SQL, which Convex refuses (`Convex adapter does not
+  execute SQL scripts`), so the import fails; an import *procedure* fails the
+  same way. (`--replace` already replaces each table's contents.) `dbd export`
+  is refused: the Convex CLI exports whole deployments only
+  (`npx convex export`).
 - Convex runs no SQL, so `reset`, `policies`, grants, `diff` and `reconcile` are
   not available.
 
@@ -185,7 +193,7 @@ from the design's tables and enums:
 | | PostgreSQL / Supabase | SQLite | Convex | MySQL / SQL Server |
 |---|---|---|---|---|
 | `apply`, `deploy` | yes, one transaction | yes | writes `schema.ts` | no adapter |
-| `import` | `COPY`, JSON via a procedure | batched `INSERT` | `npx convex import` | no adapter |
+| `import` | `COPY`, JSON via a procedure | batched `INSERT`, with `truncate: false` | `npx convex import`, with `truncate: false` | no adapter |
 | `export` | yes | yes | refused | no adapter |
 | `diff`, `reconcile` | yes | no (no structured model) | no | no |
 | grants, `policies` | yes | grants skipped; policies fail | no | no |

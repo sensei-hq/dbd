@@ -49,8 +49,11 @@ source:
   `WITHOUT ROWID` and `STRICT`.
 
 The `tsql` and `mysql` readers are the only ones that report **triggers**, as
-entities of their own; that is where the triggers in the
-[schema viewer](11-schema-viewer.md) come from.
+entities of their own — when the trigger is the first statement of its file
+(say, under `ddl/procedure/`; there is no `ddl/trigger/` folder). Inside a
+project, a file is one entity: a trigger written after its table stays part of
+the table's file. Those triggers are the ones the
+[schema viewer](11-schema-viewer.md) shows.
 
 `parser: sqlparser`, an earlier PostgreSQL parser, was removed in 0.14.0; a
 project still naming it fails to load and says why.
@@ -62,20 +65,21 @@ columns, so:
 
 | Works | Refused or empty |
 |---|---|
-| `inspect`, `graph`, `combine` (the files, concatenated) | `diff`, `reconcile` — nothing to compare; they refuse and say why |
+| `inspect`, `graph`, `combine` — the files concatenated, after a PostgreSQL `CREATE SCHEMA IF NOT EXISTS` per schema, which you remove for SQL Server or SQLite | `diff`, `reconcile` — nothing to compare; they refuse and say why |
 | `doctor` | `emit` — nothing to translate |
 | `apply`/`deploy` on SQLite | `dbml`, `diagram` — they run, but with no tables to draw |
 | | `snapshot` — it records tables from their structure, so it records none |
 | | `apply`/`deploy` for T-SQL or MySQL — there is no adapter; a `mysql://` or `sqlserver://` URL is refused by name |
 
-The refusal names the reason:
+The refusal names the reason. For a SQLite project:
 
 ```
-diff needs a structured model, and this project's DDL is not read into one (source.dialect: tsql) — its files give identity and references but no columns or constraints, so there is nothing to compare. `apply`, `deploy`, `import` and `export` work normally.
+diff needs a structured model, and this project's DDL is not read into one (source.dialect: sqlite) — its files give identity and references but no columns or constraints, so there is nothing to compare. `apply`, `deploy`, `import` and `export` work normally.
 ```
 
-That last sentence holds for SQLite; for T-SQL and MySQL there is no adapter to
-apply, import or export with.
+For T-SQL and MySQL the CLI connects first, so the refusal you see is the
+missing adapter — `Error: Failed to connect to database: Config error: no
+adapter for SQL Server: …` — and the last sentence above does not apply.
 
 From Rust, `parser::parse_sql_as(Dialect::TSql, sql)` reads one file in a stated
 dialect, and `project::survey` describes a directory without parsing it — see
@@ -128,22 +132,26 @@ scope's entities.
   constraints, foreign keys, `CHECK` constraints and indexes (`CREATE INDEX`).
 - **Views** and **materialized views**, as `CREATE VIEW` with the `SELECT`
   passed through untranslated — and reported, since anything
-  PostgreSQL-specific inside it has to be checked by hand.
+  PostgreSQL-specific inside it has to be checked by hand. A materialized view
+  becomes a plain view, without its indexes.
 - **Functions, procedures and triggers** are skipped and reported: their bodies
   do not translate.
 - Schemas, extensions, roles, sequences and enum *types* produce no statement
   of their own.
+- A file dbd could not read is left out without a report, so run
+  `dbd inspect` first — it exits 1 when something cannot be read.
 
-A `CHECK` expression and an index's expression or `WHERE` predicate are passed
-through untranslated and reported, the same way a view body is. Anything the
-target cannot express is reported, never dropped without a word.
+A `CHECK` expression is passed through untranslated and reported, the same way
+a view body is. An index the target cannot express as written — an expression
+index, a partial (`WHERE`) index, or one on a column type the target cannot
+index — is reported, and passed through, built without its predicate, or left
+out, as the target allows.
 
 ### Downgrades
 
 A construct the target cannot express is emitted as the nearest thing it can,
-so the output is always a complete schema, and every such loss is reported: as
-a comment above the line it affects, in the run's summary, and with `--report`
-as JSON. A faithful mapping is not reported — a report padded with
+and the loss is reported: as a comment above the line it affects, in the run's
+summary, and with `--report` as JSON — except the losses listed below. A faithful mapping is not reported — a report padded with
 `integer → INT` is one nobody reads.
 
 | PostgreSQL | MySQL | T-SQL | SQLite |
@@ -177,14 +185,19 @@ reference to the table has to be updated to match.
 
 Some losses are **not** reported in 0.24.1, so check for them by hand:
 
-- **Defaults** — a literal is kept, `now()`/`current_timestamp` and
-  `true`/`false` are mapped, and any other default (`gen_random_uuid()`,
+- **Defaults** — a literal is kept as written, including any PostgreSQL cast
+  (`'x'::text` stays, and is invalid on the target); `now()`/`current_timestamp`
+  and `true`/`false` are mapped; any other default (`gen_random_uuid()`,
   `nextval(…)`) is left out.
 - **Identity** — `serial`, `bigserial` and `GENERATED … AS IDENTITY` columns
-  become plain integers, without `AUTO_INCREMENT` or `IDENTITY`. Generated
-  columns lose their expression.
+  become plain integers, without `AUTO_INCREMENT` or `IDENTITY`; a `serial`
+  column is also added to the primary key. Generated columns lose their
+  expression.
 - **Precision and zones** — `timestamptz` loses its time zone on MySQL and
-  SQLite, and `varchar(n)` its length on SQLite.
+  SQLite, `varchar(n)` its length on SQLite; a bare `varchar` becomes
+  `VARCHAR(255)`/`nvarchar(255)` and a bare `numeric` `DECIMAL(65,30)`/
+  `decimal(38,10)`.
+- **Materialized views** — the materialization and the view's indexes.
 
 The schema-name folds and the skipped routines appear in the summary and the
 report but not as comments in the file — they have no single line to sit on.

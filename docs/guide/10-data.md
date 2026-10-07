@@ -22,9 +22,9 @@ extension picks the reader:
 
 | Extension | Read as |
 |---|---|
-| `.csv` | CSV. The first line is a header and is skipped; columns load **by position**, in the table's column order |
+| `.csv` | CSV with a header row. On PostgreSQL the header is skipped and columns load **by position**, in the table's column order; on SQLite the header names the columns |
 | `.tsv` | The same, tab-separated |
-| `.jsonl`, `.json` | JSON Lines — one JSON object per line (a `.json` file is read the same way) |
+| `.jsonl`, `.json` | JSON Lines — one JSON object per line (a `.json` file under `import/` is read the same way on PostgreSQL) |
 
 Anything else under `import/` — a `notes.txt`, a `README.md` — is ignored, and
 so is anything outside `import/`: data under `data/` or `seeds/` is never
@@ -45,8 +45,9 @@ dbd import            # -e prod is the default: import/prod/… loads, import/de
 dbd import -e dev     # import/dev/… loads as well as the shared files
 ```
 
-The environment is `dev` or `prod` (`development` and `production` are accepted
-and mean the same). A run that leaves files out says so —
+The environment is `dev` or `prod`, so the folders are `import/dev/` and
+`import/prod/` (`-e development` and `-e production` are accepted and select
+those same folders). A run that leaves files out says so —
 `3 data file(s) under import/dev/ skipped — this run's env is 'prod'` — so a
 deploy that seeded nothing is never mistaken for one that seeded everything.
 
@@ -56,22 +57,23 @@ deploy that seeded nothing is never mistaken for one that seeded everything.
 dbd import --dry-run
 ```
 ```
-  import staging.models (jsonl) ← import/staging/models.jsonl
-  import staging.routers (jsonl) ← import/staging/routers.jsonl
+  import staging.lookups (csv) ← ./import/staging/lookups.csv
 
-  call staging.import_models()
-  call staging.import_routers()
+  call staging.import_lookups()
+1 entities — no issues
 ```
 
 In order:
 
 1. **Truncate** every staging table in the plan (unless `truncate: false`).
 2. **Load** each data file into its table.
-3. **Call the import procedures.** A procedure or function that *reads* a
-   staging table is that table's import procedure, found by analysing its body —
-   which tables it reads and which it writes — not by its name. The plan is
-   ordered by dependencies, so a procedure that fills `config.lookups` runs
-   before one that fills `config.lookup_values`.
+3. **Call the import procedures.** A procedure that *reads* a staging table is
+   that table's import procedure, found by analysing its body — which tables it
+   reads and which it writes — not by its name. The plan is ordered by
+   dependencies, so a procedure that fills `config.lookups` runs before one that
+   fills `config.lookup_values`. Write loaders as **procedures**: a function is
+   matched the same way but run with `CALL`, which PostgreSQL refuses for a
+   function.
 4. **Run `import.after`** scripts.
 
 Dynamic SQL (`EXECUTE format(…)`) is invisible to that analysis; a procedure
@@ -109,6 +111,8 @@ import:
 - **`tables:`** holds per-table overrides of `truncate`, `null_value` and
   `format`. It is not a list of what to import — every data file under
   `import/` loads whether or not its table is listed.
+- **`truncate`** runs `TRUNCATE`, which only PostgreSQL has: on SQLite and
+  Convex, set `truncate: false` (see [targets](08-targets.md)).
 
 Three keys are parsed but not read in 0.24.1, so they change nothing:
 `import.staging`, `import.options.format` (the format comes from the file
@@ -124,8 +128,9 @@ dbd import -n activity.hook_events -f ~/data/events.jsonl    # one table, from a
 
 `-n` narrows the run to one table but otherwise runs it as usual —
 `import.after` included. `-f` loads exactly the file you name into the `-n`
-table, with the format taken from its extension, and nothing else: no
-truncate, no procedures, no `import.after`, no scope filtering. (On `export`, `-f` is the
+table, and nothing else: no truncate, no procedures, no `import.after`, no
+scope filtering. Its format comes from the extension — `.jsonl` or `.tsv`, and
+anything else (`.json` included) is read as CSV. (On `export`, `-f` is the
 *format*.)
 
 ## Nothing is skipped silently
@@ -143,7 +148,8 @@ reason for anything left out:
 
 Under `--scope`, an entry is dropped when its procedure writes to any table
 outside the scope — or, with no procedure, when the staging table itself is
-outside it.
+outside it. The real run warns about it; `import --dry-run` and
+`deploy --dry-run` leave such entries out of the preview without the warning.
 
 ## Export
 
@@ -169,7 +175,8 @@ export:
 ```
 
 A per-table `format` wins over `-f`. Files land at
-`export/<schema>/<table>.<fmt>`; with `-o <dir>` they land flat in that
+`export/<schema>/<table>.<fmt>` (on SQLite, `export/<table>.<fmt>`) — relative to
+the current directory, not to `--source`; with `-o <dir>` they land flat in that
 directory as `<dir>/<table>.<fmt>`. CSV and TSV carry a header row.
 
 **Export writes tables only.** A view named under `export:` is skipped without a
@@ -180,8 +187,8 @@ export`).
 
 ## Round trips
 
-What `export` writes, `import` reads. Exporting straight into the import tree
-makes the live data the seed data:
+What `export` writes as CSV or TSV, `import` reads back. Exporting straight
+into the import tree makes the live data the seed data:
 
 ```sh
 dbd export -n staging.lookups -o import/staging
@@ -190,6 +197,10 @@ dbd export -n staging.lookups -o import/staging
 
 `-o` writes `<table>.<fmt>` without the schema, so point it at the folder of
 the schema the file should load into.
+
+Prefer CSV or TSV for a round trip. In 0.24.1 a JSON Lines export doubles the
+backslashes in the JSON it writes, so a value containing a quote, a backslash or
+a newline does not load back as it was.
 
 ### Moving a long-lived system to a new database
 

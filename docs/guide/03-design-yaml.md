@@ -214,7 +214,7 @@ URL forms: `sqlite://relative/path.db`, `sqlite::memory:`, or `file:/abs/path.db
 ```yaml
 target:
   convex:
-    url: convex:                                # writes to ./convex/schema.ts
+    url: "convex:"                              # writes to ./convex/schema.ts (quote it: YAML)
     # url: convex://./generated                # custom output directory
     # url: convex://./generated?deploy=true    # also runs `npx convex deploy` after each apply
 ```
@@ -223,7 +223,7 @@ The Convex adapter is a codegen target — it does not connect to a server. It w
 
 **Enums and foreign keys.** `Entity::Enum` (DDL `CREATE TYPE … AS ENUM (…)`) emits `export const <name> = v.union(v.literal("…"), …);` above `defineSchema`; columns whose type matches an enum reference the const. Single-column foreign keys (inline or table-level) emit `v.id("target_table")` instead of the scalar validator.
 
-**Migration + data state.** Versioning lives in `<output>/.dbd_state.json` (no `_dbd_meta` table because Convex isn't a SQL store). `dbd import` shells out to `npx convex import --table <flat_name> --replace -y <file>` per import entity. Whole-deployment export remains the Convex CLI's job (`npx convex export`) — the CLI doesn't expose per-table dumps.
+**Migration + data state.** Versioning lives in `<output>/.dbd_state.json` (no `_dbd_meta` table because Convex isn't a SQL store). `dbd import` shells out to `npx convex import --table <flat_name> --replace -y <file>` per import entity — with `import.options.truncate: false`, since Convex runs no SQL and the default truncate is SQL. Whole-deployment export remains the Convex CLI's job (`npx convex export`) — the CLI doesn't expose per-table dumps.
 
 Append `?deploy=true` to the URL to run `npx convex deploy` automatically after each apply. The CLI must be on PATH (or accessible via `npx`); set `with_cli_dry_run(true)` programmatically (or use `dbd apply --dry-run`) to log commands without spawning.
 
@@ -329,7 +329,9 @@ scopes:
 
 - A bare `schema` selects its entities **and** its `CREATE SCHEMA`; `schema.*`
   selects the entities only; `schema.entity` selects one entity. A name or
-  wildcard that matches nothing is an error.
+  wildcard that matches nothing is an error. Standalone sequences are not
+  selectable in 0.24.1, so a named scope builds none — see
+  [scopes](07-scopes.md#defining-a-scope).
 - A scope's value may be the bare string `all` — the full set. Any other string
   is refused.
 - **`all`** and **`default`** are reserved: `--scope all` is always the full

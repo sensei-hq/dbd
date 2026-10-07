@@ -43,6 +43,13 @@ equivalent — a schema whose entities are present is added back.
 whatever `includes` produced. A name or wildcard that matches nothing is an
 error, so a typo cannot quietly select less than you meant.
 
+> **Sequences are not selectable in 0.24.1.** A scope selects tables, views,
+> materialized views, functions, procedures and enums — never a standalone
+> sequence, not even through a bare schema token, and naming one is an error.
+> So any named scope, `default` included, builds no `ddl/sequence/` entities: a
+> table whose `DEFAULT nextval(…)` uses one fails when the scope is applied,
+> and no gap is reported. Only `--scope all` (or no scopes) creates them.
+
 A scope may also be the bare string `all` (`everything: all` above): the full
 set under another name. Any other bare string is refused.
 
@@ -72,7 +79,8 @@ A database first built with no `--scope` while `default:` exists is pinned as
 
 An in-scope entity that references a managed entity *outside* the scope has a
 **dependency gap**: building the scope alone would fail at the database, or
-build a table whose foreign key points nowhere.
+build a table whose foreign key points nowhere. With a scope `hub` defined as
+`includes: [app]`, and `app.orders` referencing `config.lookup_values`:
 
 ```
 $ dbd inspect --scope hub
@@ -118,16 +126,26 @@ no "ignore gaps" mode.
 The ignoring commands print
 `⚠ --scope hub ignored: this command operates on the whole design, not a scope`.
 
-Commands that filter announce it — `scope 'hub': 2 of 7 entities` — except
-`emit` and `diagram`, which filter without the line, and `graph`, which records
-the scope in its JSON instead (`"scope": "hub"`) because its stdout is a
-contract.
+`combine`, `dbml`, `export` and `refresh` announce the narrowing —
+`scope 'hub': 2 of 7 entities` — and `inspect` prints `scope 'hub': 2 entities`.
+`graph` records the scope in its JSON instead (`"scope": "hub"`), because its
+stdout is a contract. The others filter without a line, so don't read its
+absence as "nothing was narrowed".
 
-Three paths do not filter, and say nothing about it:
+These paths do not filter, and say nothing about it:
 
+- **Grants.** Every grant configured in `design.yaml` is applied on every
+  `apply` and `deploy`, whatever the scope — and on a `supabase` target, the
+  PostgREST grants cover every listed schema. A grant on a schema the scope does
+  not build fails the run with `Failed to apply grants`, after the schema
+  changes have committed.
 - `dbd import -n <table> -f <file>` loads the one file you named, scope or not.
 - `dbd policies --dry-run` lists every policy file; the real run filters.
 - `dbd deploy --dry-run` counts every policy file the same way.
+- `dbd import --dry-run` and `dbd deploy --dry-run` leave out the import entries
+  a scope cuts without the warning the real run prints.
+- `dbd apply --dry-run` lists every extension, ignoring the scope's
+  `extensions:` allowlist; the real run honours it.
 
 ## Extensions per scope
 
@@ -144,8 +162,9 @@ scopes:
 Omitted, every `target.extensions` entry is installed under the scope; a list
 installs only those; `[]` installs none. Name each extension by its bare name
 (`vector`, `postgis`, `uuid-ossp`) even when it is declared with a `schema:`.
-The allowlist applies wherever the scope does. `reset --extensions` is the
-exception: it drops every extension the target lists. Roles and externals are
+The allowlist applies wherever the scope does, with two exceptions:
+`reset --extensions` drops every extension the target lists, and
+`apply --dry-run` lists them all. Roles and externals are
 never filtered by a scope.
 
 ## Migrations under a scope
@@ -190,14 +209,15 @@ PostgreSQL, `_dbd_meta` on SQLite). A later `apply`, `deploy`, `reconcile` or
 `reset` under a different scope is refused:
 
 ```
-scope guard: this database is pinned to scope 'public', but you requested 'internal'.
+Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
 Applying a different scope would build a divergent schema.
 → re-run with --scope public, or pass --allow-scope-change to re-point this database to 'internal'.
 ```
 
 That stops a forgotten or mistyped `--scope` from building half a schema in the
-wrong database. To re-point a database on purpose, pass `--allow-scope-change`;
-the run re-pins it. `reset --force` also bypasses the check. A database created
+wrong database. To re-point a database on purpose, pass `--allow-scope-change`:
+an `apply`, `deploy` or `reconcile` then re-pins it to the new scope. On `reset`
+the flag (like `--force`) only bypasses the check — a reset does not re-pin. A database created
 before scopes existed is unpinned and pins on its next write.
 
 To host several modules in one database, define one scope that includes them

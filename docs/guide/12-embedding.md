@@ -3,7 +3,9 @@
 Everything the `dbd` command does lives in the **`dbd-core`** library crate; the
 CLI is a thin layer over it. An application can load a design, validate it,
 apply it, deploy it, diff it against a live database or just parse SQL — with
-the same code path the CLI runs, so the two cannot drift.
+the same code path the CLI runs. A few safety checks live in the CLI's layer
+rather than the library; [What the CLI adds](#what-the-cli-adds) lists them, so
+an embedder can make the same checks.
 
 Every Rust example on this page is compiled by dbd's own test suite against the
 current crate.
@@ -141,8 +143,9 @@ arguments. `Progress::none()` is a silent run. `ApplyComplete` carries
 `strategy` (`Fresh`, `Migrate` or `Current`), `from_version`, `to_version`,
 `applied`, `migrated`, `created`, `dropped`, the hook counts and any warnings.
 
-`apply` does not apply RLS policies — call `design::apply_policies`, or use
-`deploy`.
+`apply` does not apply RLS policies or the configured grants — `dbd apply` adds
+the grants itself. Use `deploy` for both, or `design::apply_policies` for the
+policies alone.
 
 ## Deploy
 
@@ -223,15 +226,8 @@ for stmt in &plan.altered {
 `reconcile` returns the `ReconcilePlan` and, unless `dry_run`, executes it.
 
 Both refuse a project whose reader builds no structured model (T-SQL, MySQL,
-SQLite) and a Convex adapter. **`reconcile` does not check
-`project.released`** — the CLI does, and an embedder should too:
-
-```rust
-let design = dbd_core::Design::from_config(path, "prod")?;
-if design.config().project.released {
-    // released: change the schema with snapshots and apply, not reconcile
-}
-```
+SQLite) and a Convex adapter. **`reconcile` does not check `project.released`**
+— the CLI does; see [What the CLI adds](#what-the-cli-adds).
 
 ## Documentation output
 
@@ -263,8 +259,10 @@ let design = dbd_core::Design::from_config(path, "prod")?;
 let history = dbd_core::history::load_scoped(design.project_dir(), |schema, _name| schema == "app")?;
 ```
 
-DBML comes from `dbml::generate_dbml` and `dbml::generate_all`, which take the
-entities to document — `design.entities()`, or `design.scoped_entities(&scope)?`.
+DBML comes from `dbml::generate_dbml(&DbmlParams)` and
+`dbml::generate_all(&DbmlMultiParams)`: parameter structs carrying the entities
+to document (`design.entities()`, or `design.scoped_entities(&scope)?`), the
+project name, the database type and the filters. Each returns `DbmlDocument`s.
 
 ## Translate to another engine
 
@@ -292,6 +290,9 @@ their references, not a deploy:
 use dbd_core::parser::{parse_sql, parse_sql_as, Dialect};
 
 let parsed = parse_sql(sql)?; // PostgreSQL
+for err in &parsed.errors {
+    eprintln!("not read: {err}"); // SQL the reader rejected still returns Ok
+}
 for e in &parsed.entities {
     println!("{:?} {}", e.entity_type, e.name);
     for r in e.reads() {
@@ -310,10 +311,12 @@ println!("the file itself reads {:?}", tsql.references.reads);
 takes identity from a `ddl/<type>/<schema>/<name>.ddl` path, which is right
 inside a dbd project and wrong outside one.
 
-- `ParsedFile` holds `entities`, the file's own `references` (reads, writes and
-  calls made outside any declaration — only the T-SQL and MySQL readers fill
-  it), the `dialect` it was read as, its `kind` (`Declaration`, `Migration`,
-  `Data`, `Mixed`, `Empty`) and its `schema_path`.
+- `ParsedFile` holds `entities`; `errors` — check it, because SQL the reader
+  rejects comes back as `Ok` with no entities and the reason here; the file's
+  own `references` (reads, writes and calls made outside any declaration — only
+  the T-SQL and MySQL readers fill it); the `dialect` it was read as; its `kind`
+  (`Declaration`, `Migration`, `Data`, `Mixed`, `Empty`); and its
+  `schema_path`.
 - Each `Entity` keeps every reference in one list, `refs`, each with a `kind`
   (`Reads`, `Writes`, `Calls`, `Member`), a `schema_source` (stated, inferred or
   resolved) and an `unresolved` flag. `reads()`, `writes()`, `calls()` and
@@ -335,17 +338,49 @@ if let Some(survey) = dbd_core::survey(project_dir)? {
 }
 ```
 
+## What the CLI adds
+
+These checks are made by the `dbd` command, not by the `Design` methods. An
+embedder that wants them makes them itself:
+
+- **The scope guard.** `dbd apply`, `deploy`, `reconcile` and `reset` refuse to
+  write under a scope other than the one the database is pinned to.
+  `Design::apply`, `deploy` and `reconcile` do not check — and they re-pin the
+  database to whatever scope they are given.
+- **The release check.** `dbd reconcile` refuses on a released project;
+  `Design::reconcile` does not.
+- **Grants on apply.** `dbd apply` applies the configured grants after
+  `Design::apply`; `Design::deploy` includes them.
+
+```rust
+use dbd_core::Design;
+
+let design = Design::from_config(path, "prod")?;
+let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+let scope = design.resolve_scope(None, None)?;
+
+// What `dbd apply` checks before it writes. `true` would be --allow-scope-change.
+let meta = adapter.get_project_meta().await?;
+Design::check_scope_guard(meta.as_ref(), &scope.name, false)?;
+
+if design.config().project.released {
+    // released: change the schema with snapshots and apply, not reconcile
+}
+```
+
 ## Errors
 
-Every fallible call returns `dbd_core::Result<T>`, whose error is `DbdError`:
-`Config`, `Parse { file, message }`, `SafetyGuard` (the `reset` guards and the
-scope guard), `GitHubSource`, `Migration`, and wrapped `Io`, `Yaml` and `Json`
-errors.
+Almost every fallible call returns `dbd_core::Result<T>`, whose error is
+`DbdError`: `Config`, `Parse { file, message }`, `SafetyGuard` (the `reset`
+guards and `check_scope_guard`), `GitHubSource`, `Migration`, and wrapped `Io`,
+`Yaml` and `Json` errors. (`diagram::encode_payload` and `diagram::fragment_url`
+return `serde_json`'s error directly.)
 
 ```rust
 match dbd_core::Design::from_config(path, "prod") {
     Ok(design) => println!("{} entities", design.entities().len()),
-    Err(dbd_core::DbdError::Config(message)) => eprintln!("design.yaml: {message}"),
+    Err(dbd_core::DbdError::Yaml(e)) => eprintln!("design.yaml is not valid YAML: {e}"),
+    Err(dbd_core::DbdError::Config(message)) => eprintln!("could not load the project: {message}"),
     Err(other) => return Err(other),
 }
 ```

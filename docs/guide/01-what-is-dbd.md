@@ -93,6 +93,7 @@ picks the adapter:
   v.union(v.literal(…))`, and `v.id("table")` for single-column FKs; names
   flatten from `schema.entity` to `schema_entity`; migration state lives
   in `.dbd_state.json`; `dbd import` shells out to `npx convex import`
+  (with `import.options.truncate: false`)
 
 dbd also *reads* T-SQL and MySQL DDL, and `dbd emit` writes the schema out for
 MySQL, T-SQL or SQLite — but there is no adapter that applies to MySQL or SQL
