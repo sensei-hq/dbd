@@ -376,6 +376,10 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // The hooks the run would skip, decided as the run decides them.
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
 
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
@@ -418,6 +422,12 @@ pub async fn cmd_deploy(
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
+    // Said before the run, not in its summary: a deploy that fails never
+    // prints one, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(&resolved))? {
+        output::warn(&skip);
+    }
+
     // Delegate to the library's `Design::deploy` — apply + import + policies —
     // so `dbd deploy` and an embedder calling the crate run the same pipeline.
     output::info(verbosity, "Applying schema...");
@@ -446,7 +456,8 @@ pub async fn cmd_deploy(
     // nothing is the failure mode this reporting exists to prevent. Each in the
     // order its phase ran — schema, data, policies — so nothing reads as having
     // happened before what it followed.
-    for warning in summary.apply.warnings.iter().chain(&summary.import.warnings) {
+    // The apply phase's warnings are the hook skips, already said before it.
+    for warning in &summary.import.warnings {
         output::warn(warning);
     }
     if !summary.policies.applied.is_empty() {

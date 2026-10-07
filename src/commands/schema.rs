@@ -843,6 +843,10 @@ pub async fn cmd_apply(
             };
             output::info(verbosity, &detail);
         }
+        // The hooks the run would skip, decided as the run decides them.
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
         output::summary(0, 0, entities.len());
         return Ok(());
     }
@@ -853,6 +857,14 @@ pub async fn cmd_apply(
     // pinned to (unless the operator opted in to re-point it).
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+
+    // Said before the run, not in its summary: a run that fails never prints
+    // one, and a skipped hook is often why it failed. Always shown, whatever
+    // the verbosity — a hook a scope filtered out is the reason something the
+    // user expected to happen did not.
+    for skip in design.hook_skips(Some(&resolved))? {
+        output::warn(&skip);
+    }
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut apply_summary: Option<ApplyComplete> = None;
@@ -873,11 +885,7 @@ pub async fn cmd_apply(
     result?;
 
     if let Some(s) = apply_summary {
-        // Always reported, whatever the verbosity: a hook a scope filtered out
-        // is the reason something the user expected to happen did not.
-        for warning in &s.warnings {
-            output::warn(warning);
-        }
+        // `s.warnings` are the hook skips, already said before the run.
         output::info(verbosity, &format_apply_summary(&s));
     }
 

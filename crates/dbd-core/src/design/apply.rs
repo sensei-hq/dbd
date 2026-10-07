@@ -504,6 +504,32 @@ impl Design {
         Ok(schema_grants)
     }
 
+    /// The `apply.before` and `apply.after` hooks a run under `scope` skips,
+    /// one line each saying why — the run's own decision
+    /// ([`hooks::plan_hooks`]), made without running anything.
+    ///
+    /// The run reports these in [`ApplyComplete::warnings`], which only a run
+    /// that succeeds produces: a preview had no word of a skip, and neither
+    /// did a run that failed, though a skipped hook is often why it failed. So
+    /// a caller says them before the run. A hook file that is missing is an
+    /// error here, as it is in the run.
+    pub fn hook_skips(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let working_set = self.scope_working_set(scope)?;
+        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
+        let hook_scope = match (scope, outside.as_ref()) {
+            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
+            _ => None,
+        };
+        let mut skips = Vec::new();
+        for (entries, kind) in [
+            (&self.config.apply.before, hooks::HookKind::Before),
+            (&self.config.apply.after, hooks::HookKind::After),
+        ] {
+            skips.extend(hooks::plan_hooks(&self.project_dir, entries, kind, hook_scope)?.warnings);
+        }
+        Ok(skips)
+    }
+
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
     /// target's `grants:` merged on top (per schema, a target role adds to or
     /// overrides the universal entry for that role), plus PostgREST's schema
