@@ -1062,6 +1062,32 @@ mod tests {
         );
     }
 
+    /// A table's CHECK constraints go in DBML's `checks { … }` block, each
+    /// expression in backticks, named when the constraint is.
+    #[test]
+    fn check_constraints_are_written_in_a_checks_block() {
+        let entity = make_table_entity(
+            "shop.orders",
+            vec![col("qty", "integer"), col("total_cents", "integer")],
+            vec![
+                TableConstraint::Check {
+                    name: Some("orders_total_positive".to_string()),
+                    expression: "total_cents >= 0".to_string(),
+                },
+                TableConstraint::Check {
+                    name: None,
+                    expression: "qty > 0".to_string(),
+                },
+            ],
+        );
+
+        let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
+        assert!(
+            block.contains("  checks {\n    `total_cents >= 0` [name: 'orders_total_positive']\n    `qty > 0`\n  }"),
+            "got:\n{block}"
+        );
+    }
+
     /// DBML's lexer reads `\` in a quoted string as an escape, so a backslash
     /// is written `\\` and a quote `\'` — wherever dbd writes a string.
     #[test]

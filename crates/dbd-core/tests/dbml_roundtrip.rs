@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use dbd_core::dbml::{DbmlParams, generate_dbml};
-use dbd_core::entity::{IdentityKind, IndexDef, SortOrder, TableDef};
+use dbd_core::entity::{IdentityKind, IndexDef, SortOrder, TableConstraint, TableDef};
 use dbd_core::{Entity, EntityType};
 
 /// Parse one DDL file exactly as a project scan does — identity from the path.
@@ -236,4 +236,41 @@ fn a_column_keeps_its_unique_and_identity_through_dbml_and_back() {
         assert!(column(&original, name).is_unique);
         assert!(column(td, name).is_unique, "{name}:\n{dbml}");
     }
+}
+
+fn checks(td: &TableDef) -> Vec<&str> {
+    let mut expressions: Vec<&str> = td
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Check { expression, .. } => Some(expression.as_str()),
+            _ => None,
+        })
+        .collect();
+    expressions.sort_unstable();
+    expressions
+}
+
+/// DBML has carried CHECK constraints since @dbml/core v5 (`checks { … }`),
+/// and dbd wrote none: every CHECK the design enforces was missing from the
+/// document and from the table `init --from-dbml` rebuilt.
+#[test]
+fn a_check_constraint_survives_dbml_and_back() {
+    let orders = parse(
+        "ddl/table/shop/orders.ddl",
+        "create table shop.orders (\n\
+           id uuid primary key,\n\
+           qty integer check (qty > 0),\n\
+           total_cents integer,\n\
+           status text,\n\
+           constraint orders_total_positive check (total_cents >= 0),\n\
+           constraint orders_status_known check (status in ('open', 'paid'))\n\
+         );",
+    );
+    let original = orders.table_def.clone().unwrap();
+    let dbml = document(&[orders]);
+    let reversed = reverse(&dbml);
+
+    assert_eq!(checks(&original).len(), 3, "the test needs all three checks parsed");
+    assert_eq!(checks(table(&reversed, "shop.orders")), checks(&original), "\n{dbml}");
 }

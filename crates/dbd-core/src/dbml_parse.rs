@@ -1290,6 +1290,35 @@ mod tests {
         }
     }
 
+    /// Both of DBML's CHECK spellings read as table CHECK constraints: the
+    /// `checks { … }` block (named or not) and a column's `check:` setting,
+    /// which may repeat.
+    #[test]
+    fn checks_blocks_and_column_checks_read_as_check_constraints() {
+        let dbml = "Table \"app\".\"t\" {\n  \"qty\" int [not null, check: `qty > 0`, check: `qty < 1000`]\n  \"total\" int\n\n  checks {\n    `total >= 0` [name: 't_total_positive']\n    `total <> 13`\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let mut found: Vec<(Option<&str>, &str)> = td
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::Check { name, expression } => Some((name.as_deref(), expression.as_str())),
+                _ => None,
+            })
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec![
+                (None, "qty < 1000"),
+                (None, "qty > 0"),
+                (None, "total <> 13"),
+                (Some("t_total_positive"), "total >= 0"),
+            ]
+        );
+        assert!(!td.columns[0].nullable, "the other settings still apply");
+    }
+
     #[test]
     fn parse_multiline_triple_quoted_note() {
         let dbml = "Table \"app\".\"t\" {\n  \"id\" int\n\n  Note: '''\nLine one.\nLine two.\n'''\n}\n";
