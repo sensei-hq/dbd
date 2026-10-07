@@ -426,6 +426,14 @@ fn unique_constraint_indexes(table_def: &TableDef) -> impl Iterator<Item = Index
 /// read as an expression would become a real `GENERATED` clause.
 pub(crate) const GENERATED_PROPERTY: &str = "generated always as";
 
+/// The custom-property key an identity column's kind travels under, beside
+/// `increment` — DBML's only identity vocabulary, which cannot tell ALWAYS
+/// from BY DEFAULT. A bare `increment` reads as BY DEFAULT, so only ALWAYS
+/// writes the property (`'always'`), and documents without one are unchanged.
+/// Without it an ALWAYS identity came back BY DEFAULT: a column that silently
+/// started accepting hand-written ids.
+pub(crate) const IDENTITY_PROPERTY: &str = "generated as identity";
+
 fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) -> String {
     let data_type = quote_type_if_needed(&col.data_type);
     let mut settings = Vec::new();
@@ -433,8 +441,11 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     if col.is_pk || pk_columns.contains(&col.name) {
         settings.push("pk".to_string());
     }
-    if col.identity.is_some() {
+    if let Some(kind) = col.identity {
         settings.push("increment".to_string());
+        if kind == crate::entity::IdentityKind::Always {
+            settings.push(format!("{IDENTITY_PROPERTY}: 'always'"));
+        }
     }
     if !col.nullable {
         settings.push("not null".to_string());
