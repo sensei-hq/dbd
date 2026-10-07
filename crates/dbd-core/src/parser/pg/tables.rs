@@ -324,6 +324,13 @@ fn extract_column(
         .ok_or_else(|| format!("column {name:?} has no type"))?;
     let data_type =
         type_text(type_name).ok_or_else(|| format!("column {name:?}: dbd could not render its type back to SQL"))?;
+    // The column's type is a dependency when the project declares it (an
+    // enum). `pg_catalog` spells a built-in outright; a bare built-in such as
+    // `text` is recorded too and dropped when it resolves to nothing.
+    let type_names = string_list(&type_name.names);
+    if type_names.first().map(String::as_str) != Some("pg_catalog") {
+        references.extend(uses_ref(&type_names.join("."), default_schema));
+    }
 
     let mut nullable = true;
     let mut is_pk = false;
@@ -350,6 +357,9 @@ fn extract_column(
             ConstrDefault => {
                 let rendered = constraint_expr(c, &name, "DEFAULT")?;
                 collect_function_refs(&rendered, default_schema, functions);
+                if let Some(sequence) = c.raw_expr.as_deref().and_then(nextval_sequence) {
+                    references.extend(uses_ref(&sequence, default_schema));
+                }
                 default_value = Some(rendered);
             }
             ConstrCheck => {
@@ -703,6 +713,40 @@ fn nulls_first(nulls_ordering: i32) -> Option<bool> {
     match nulls_ordering {
         x if x == SortByNulls::SortbyNullsFirst as i32 => Some(true),
         x if x == SortByNulls::SortbyNullsLast as i32 => Some(false),
+        _ => None,
+    }
+}
+
+/// A [`RefKind::Uses`] reference to `name`, qualified like every other.
+fn uses_ref(name: &str, default_schema: &str) -> Option<Ref> {
+    let (name, schema_source) = super::common::qualify_name_source(name, default_schema)?;
+    Some(Ref {
+        name,
+        kind: RefKind::Uses,
+        schema_source,
+        unresolved: false,
+    })
+}
+
+/// The sequence a `nextval('…')` default draws from, read off the call's
+/// argument — a string literal, often cast `::regclass`. `None` for any other
+/// expression.
+fn nextval_sequence(expr: &protobuf::Node) -> Option<String> {
+    let NodeEnum::FuncCall(call) = expr.node.as_ref()? else {
+        return None;
+    };
+    if string_list(&call.funcname).last().map(String::as_str) != Some("nextval") || call.args.len() != 1 {
+        return None;
+    }
+    let mut arg = call.args.first()?;
+    if let Some(NodeEnum::TypeCast(cast)) = arg.node.as_ref() {
+        arg = cast.arg.as_deref()?;
+    }
+    match arg.node.as_ref()? {
+        NodeEnum::AConst(c) => match c.val.as_ref()? {
+            protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
