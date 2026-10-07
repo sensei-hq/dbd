@@ -68,6 +68,6 @@ describe('a sequence', () => {
   });
 
   it('wears an icon the UnoCSS safelist can see', () => {
-    expect(Object.values(OVERVIEW_ICONS)).toContain(KIND_ICON['sequence' as keyof typeof KIND_ICON]);
+    expect(Object.values(OVERVIEW_ICONS)).toContain(KIND_ICON.sequence);
   });
 });

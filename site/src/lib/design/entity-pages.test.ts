@@ -98,7 +98,7 @@ describe('a sequence page', () => {
     const page = openSequence();
     expect(text(page.querySelector('h1'))).toBe('invoice_no');
     expect(text(page.querySelector('[data-kind-badge]'))).toBe('sequence');
-    expect(text(page.querySelector('[data-section="info"]'))).toBe('Invoice numbers.');
+    expect(text(page.querySelector('[data-section="info"] p'))).toBe('Invoice numbers.');
   });
 
   // A column default's `nextval('…')` is recorded as a call to `nextval`, not as a use of the

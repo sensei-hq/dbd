@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * A view, materialized view, function, procedure or trigger (#34): what it is, what it uses
+   * A view, materialized view, function, procedure, trigger or sequence (#34): what it is, what it uses
    * and what uses it — both from the v2 dependency graph — and its neighbourhood in that graph.
    * These kinds have no columns in the model, so there is no fields table; and snapshots hold
    * tables and enums only, so the changelog says why it is empty.
@@ -115,7 +115,15 @@
             <h2 class="font-mono text-label uppercase text-faint">
               Used by <span class="text-faint">· {usedBy.length}</span>
             </h2>
-            {@render depRows(usedBy, 'from', 'Nothing in this project uses it.')}
+            <!-- A column default's `nextval('…')` is recorded as a call to `nextval`, never as a use
+                 of the sequence, so for a sequence "nothing uses it" is not something the model knows. -->
+            {@render depRows(
+              usedBy,
+              'from',
+              item.kind === 'sequence'
+                ? 'No dependency in this model names it — a column default that calls nextval() is not traced.'
+                : 'Nothing in this project uses it.',
+            )}
           </section>
         </div>
       </div>
