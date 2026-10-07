@@ -3990,3 +3990,50 @@ async fn a_matview_keeps_its_own_comment_and_dbd_still_tracks_its_drift() {
         plan.warnings
     );
 }
+
+/// Postgres stores `nextval('core.invoice_seq')` as an OID and reports it back
+/// as `nextval('core.invoice_seq'::regclass)`, so a design that leaves the cast
+/// off read as a changed default on every run: diff always showed a SET DEFAULT
+/// and reconcile always reported one alteration.
+#[tokio::test]
+async fn a_nextval_default_converges() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nextval_converge").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/core", "ddl/table/sales"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_converge\nsource:\n  dialect: postgresql\nschemas:\n  - core\n  - sales\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/core/invoice_seq.ddl"),
+        "create sequence if not exists core.invoice_seq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/sales/orders.ddl"),
+        "set search_path to sales;\ncreate table if not exists orders (\n  id integer primary key\n\
+         , invoice_no integer default nextval('core.invoice_seq')\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(
+        touched.is_empty(),
+        "the default is already what the design says: {touched:?}"
+    );
+}
