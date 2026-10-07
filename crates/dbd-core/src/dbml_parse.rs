@@ -668,6 +668,10 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
                         col.comment = Some(s);
                     }
                 }
+                // dbd's custom property for a generated column's expression.
+                key if key == crate::dbml::GENERATED_PROPERTY => {
+                    col.generated = value.as_deref().and_then(parse_single_line_string);
+                }
                 // DBML's column-level CHECK; a column may carry several.
                 "check" => {
                     let expression = value.as_deref().and_then(backticked).ok_or_else(|| {

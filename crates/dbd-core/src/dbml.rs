@@ -413,6 +413,19 @@ fn unique_constraint_indexes(table_def: &TableDef) -> impl Iterator<Item = Index
     })
 }
 
+/// The custom-property key a generated column's expression travels under.
+///
+/// DBML has no generated-column syntax. Without one, `GENERATED ALWAYS AS
+/// (total_cents / 100.0) STORED` came back from `init --from-dbml` as a plain
+/// writable column. Since @dbml/core v9.1 a column may carry custom properties
+/// — string-valued `key: 'value'` settings DBML keeps as metadata — so the
+/// expression rides in one, read back by [`crate::dbml_parse`].
+///
+/// The key reads like the SQL it stands for and is spelled so a user's own
+/// tag (`generated: "by-etl"`, `pii: "true"`) cannot be mistaken for it: a tag
+/// read as an expression would become a real `GENERATED` clause.
+pub(crate) const GENERATED_PROPERTY: &str = "generated always as";
+
 fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) -> String {
     let data_type = quote_type_if_needed(&col.data_type);
     let mut settings = Vec::new();
@@ -431,6 +444,9 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     }
     if let Some(ref default) = col.default_value {
         settings.push(format!("default: {}", quote_default(default)));
+    }
+    if let Some(ref expression) = col.generated {
+        settings.push(format!("{GENERATED_PROPERTY}: {}", dbml_string(expression)));
     }
     if let Some(ref comment) = col.comment {
         // Inline notes must be single-line — collapse newlines
