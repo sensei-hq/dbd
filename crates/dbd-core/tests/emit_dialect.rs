@@ -106,6 +106,64 @@ fn postgres_types_become_the_targets_own() {
     assert!(sqlite.contains("TEXT"), "{sqlite}");
 }
 
+// ── SQL Server: schemas exist before they are used, one batch per statement ─
+
+/// The script split at its `GO` lines — what sqlcmd and SSMS send as batches.
+fn batches(sql: &str) -> Vec<String> {
+    sql.split("\nGO\n").map(str::to_string).collect()
+}
+
+/// A batch's statements, without the comment lines around them.
+fn statements(batch: &str) -> String {
+    batch
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// SQL Server keeps the schema — `[app].[orders]` — so `app` has to exist
+/// before the first table names it; without `CREATE SCHEMA` the script fails
+/// at its first statement. And `CREATE SCHEMA` and `CREATE VIEW` must each be
+/// the only statement in their batch, so the script is cut with `GO`.
+#[test]
+fn sql_server_creates_each_schema_it_names_in_a_batch_of_its_own() {
+    let (sql, _) = emit(Dialect::TSql);
+    let schema = sql
+        .find("CREATE SCHEMA [app];")
+        .unwrap_or_else(|| panic!("no CREATE SCHEMA:\n{sql}"));
+    let table = sql.find("CREATE TABLE [app].[orders]").expect("the table");
+    assert!(schema < table, "the schema must exist before the table:\n{sql}");
+
+    let batches = batches(&sql);
+    assert!(
+        batches.iter().any(|b| statements(b) == "CREATE SCHEMA [app];"),
+        "CREATE SCHEMA must be alone in its batch: {batches:#?}"
+    );
+    let view = batches
+        .iter()
+        .find(|b| b.contains("CREATE VIEW"))
+        .expect("the view's batch");
+    assert!(
+        statements(view).starts_with("CREATE VIEW") && statements(view).matches(';').count() == 1,
+        "CREATE VIEW must be alone in its batch: {view}"
+    );
+}
+
+/// `GO` is a SQL Server tool convention; MySQL and SQLite would read it as a
+/// statement and fail. Nor do they get a `CREATE SCHEMA` — their schema is
+/// folded into the name, and that fold is what gets reported.
+#[test]
+fn only_sql_server_gets_batches_and_schemas() {
+    for dialect in [Dialect::MySql, Dialect::Sqlite] {
+        let (sql, _) = emit(dialect);
+        assert!(!sql.lines().any(|l| l.trim() == "GO"), "{dialect:?}: {sql}");
+        assert!(!sql.contains("CREATE SCHEMA"), "{dialect:?}: {sql}");
+    }
+}
+
 // ── Lossy downgrades are reported; faithful ones are not ────────────────────
 
 /// An array has no equivalent in any of the three, so all three must report it.
@@ -389,4 +447,884 @@ fn indexes_are_emitted_and_what_cannot_carry_is_reported() {
             .any(|d| d.from.contains("customers_email_key") && d.to == "no index"),
         "SQL Server leaves the expression index out and says so: {report:?}"
     );
+}
+
+// ── Building blocks for the tests below ─────────────────────────────────────
+
+const ALL: [Dialect; 3] = [Dialect::MySql, Dialect::TSql, Dialect::Sqlite];
+
+/// A project of `files` — each `(path under ddl/, sql)`, read under
+/// `search_path app` — with `extra` appended to `design.yaml` (an `external:`
+/// or `scopes:` block).
+fn project_with(dir: &Path, extra: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!(
+            "project:\n  name: p\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\nschemas:\n  - app\n{extra}"
+        ),
+    )
+    .unwrap();
+    for (path, sql) in files {
+        let file = dir.join("ddl").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, format!("set search_path to app;\n{sql}\n")).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+/// [`project_with`], emitted — under `scope` when one is named.
+fn emit_with(dialect: Dialect, extra: &str, files: &[(&str, &str)], scope: Option<&str>) -> (String, Vec<Downgrade>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = project_with(tmp.path(), extra, files);
+    let resolved = scope.map(|s| design.resolve_scope(Some(s), None).expect("scope"));
+    emit_schema(&design, dialect, resolved.as_ref()).expect("emits")
+}
+
+// ── A key to a table the script does not create is left out ────────────────
+
+/// `auth.users` is someone else's table: declared `external:`, never emitted.
+/// A key to it is a statement the target refuses (SQL Server and MySQL check
+/// the parent exists), so the script would not apply on its own.
+#[test]
+fn a_foreign_key_to_an_external_table_is_left_out_and_reported() {
+    let files = [(
+        "table/app/profiles.ddl",
+        "create table profiles (id integer primary key, user_id uuid not null references auth.users (id));",
+    )];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "\nexternal:\n  - name: auth.users\n", &files, None);
+        assert!(
+            !statements(&sql).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: a key to an external table cannot apply: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.profiles" && d.from.contains("auth.users") && d.to == "no foreign key"),
+            "{dialect:?}: and leaving it out must be reported: {report:?}"
+        );
+    }
+}
+
+/// Under `--scope` the parent may simply not be in the script. The key comes
+/// out with it, and says so — the emitted script must apply on its own.
+#[test]
+fn a_foreign_key_to_a_table_outside_the_scope_is_left_out_and_reported() {
+    let files = [
+        (
+            "table/app/customers.ddl",
+            "create table customers (id integer primary key);",
+        ),
+        (
+            "table/app/orders.ddl",
+            "create table orders (id integer primary key, customer_id integer references customers (id));",
+        ),
+    ];
+    let scopes = "\nscopes:\n  just_orders:\n    includes: [app.orders]\n";
+    for dialect in ALL {
+        let (whole, _) = emit_with(dialect, scopes, &files, None);
+        assert!(
+            statements(&whole).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: with its parent in the script, the key stays: {whole}"
+        );
+
+        let (sql, report) = emit_with(dialect, scopes, &files, Some("just_orders"));
+        assert!(
+            !sql.lines()
+                .any(|l| l.starts_with("CREATE TABLE") && l.contains("customers")),
+            "{dialect:?}: the scope leaves the parent out: {sql}"
+        );
+        assert!(
+            !statements(&sql).to_uppercase().contains("FOREIGN KEY"),
+            "{dialect:?}: the parent is not in the script: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.orders" && d.from.contains("app.customers") && d.to == "no foreign key"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+// ── The emitted SQLite script applies ───────────────────────────────────────
+
+/// Apply `script` to a fresh in-memory SQLite database with foreign keys
+/// enforced, run `then`, and return the one text value `query` selects.
+///
+/// The end-to-end check the other targets cannot have here: the script either
+/// lands on a real engine or the error says which statement did not.
+#[cfg(feature = "sqlite")]
+fn on_sqlite(script: &str, then: &str, query: &str) -> Result<String, String> {
+    use sqlx::Connection;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::raw_sql("PRAGMA foreign_keys = ON;")
+            .execute(&mut db)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::raw_sql(script)
+            .execute(&mut db)
+            .await
+            .map_err(|e| format!("the script does not apply: {e}\n{script}"))?;
+        if !then.is_empty() {
+            sqlx::raw_sql(then)
+                .execute(&mut db)
+                .await
+                .map_err(|e| format!("`{then}` failed: {e}\n{script}"))?;
+        }
+        sqlx::query_scalar::<_, String>(query)
+            .fetch_one(&mut db)
+            .await
+            .map_err(|e| format!("`{query}` failed: {e}"))
+    })
+}
+
+/// Every fixture in this file, emitted for SQLite, is a script SQLite accepts.
+#[cfg(feature = "sqlite")]
+#[test]
+fn the_emitted_sqlite_script_applies() {
+    let external = [(
+        "table/app/profiles.ddl",
+        "create table profiles (id integer primary key, user_id uuid not null references auth.users (id));",
+    )];
+    for (label, sql) in [
+        ("orders", emit(Dialect::Sqlite).0),
+        ("keyed", emit_keyed(Dialect::Sqlite).0),
+        (
+            "external",
+            emit_with(Dialect::Sqlite, "\nexternal:\n  - name: auth.users\n", &external, None).0,
+        ),
+        ("defaults", emit_with(Dialect::Sqlite, "", &DEFAULTS, None).0),
+    ] {
+        if let Err(e) = on_sqlite(&sql, "", "select 'ok'") {
+            panic!("{label}: {e}");
+        }
+    }
+}
+
+// ── A default is translated, or reported ───────────────────────────────────
+
+/// Defaults of every shape: literals behind a cast, the clock, a random UUID,
+/// and a function call nothing translates.
+const DEFAULTS: [(&str, &str); 1] = [(
+    "table/app/things.ddl",
+    "create table things (\n  \
+       id      integer primary key\n, \
+       uid     uuid not null default gen_random_uuid()\n, \
+       status  text not null default 'open'::text\n, \
+       path    varchar(40) default 'a\\b'\n, \
+       made    date default current_date\n, \
+       at      timestamptz default now()\n, \
+       flag    boolean not null default true\n, \
+       digest  text default md5(random()::text)\n\
+     );",
+)];
+
+/// `md5(random()::text)` is PostgreSQL SQL, and dbd does not translate
+/// expressions. Dropping it was right — the target may not have the function —
+/// but dropping it without a word left a column that is silently NULL.
+#[test]
+fn a_default_nothing_translates_is_dropped_and_reported() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &DEFAULTS, None);
+        assert!(
+            !statements(&sql).contains("md5"),
+            "{dialect:?}: it is not emitted: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.column.as_deref() == Some("digest") && d.from.contains("md5") && d.to == "no default"),
+            "{dialect:?}: and dropping it is reported: {report:?}"
+        );
+    }
+}
+
+/// `'open'::text` is a literal behind a PostgreSQL cast. `::` is a syntax error
+/// on all three targets; the literal is what the default means.
+#[test]
+fn a_cast_literal_default_keeps_the_literal_and_drops_the_cast() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &DEFAULTS, None);
+        assert!(!statements(&sql).contains("::"), "{dialect:?}: {sql}");
+        assert!(sql.contains("'open'"), "{dialect:?}: {sql}");
+        assert!(
+            !report.iter().any(|d| d.column.as_deref() == Some("status")),
+            "{dialect:?}: a literal is faithful, not a downgrade: {report:?}"
+        );
+    }
+}
+
+/// The defaults with a faithful equivalent are translated, not dropped.
+#[test]
+fn the_clock_and_a_random_uuid_are_translated() {
+    let (tsql, report) = emit_with(Dialect::TSql, "", &DEFAULTS, None);
+    assert!(tsql.contains("DEFAULT NEWID()"), "gen_random_uuid() is NEWID(): {tsql}");
+    assert!(
+        tsql.contains("[made] date DEFAULT CONVERT(date, SYSDATETIME())"),
+        "{tsql}"
+    );
+    assert!(
+        !report
+            .iter()
+            .any(|d| d.column.as_deref() == Some("uid") || d.column.as_deref() == Some("made")),
+        "both are faithful on SQL Server: {report:?}"
+    );
+
+    let (mysql, report) = emit_with(Dialect::MySql, "", &DEFAULTS, None);
+    assert!(mysql.contains("DEFAULT (CURRENT_DATE)"), "{mysql}");
+    // MySQL's UUID() is version 1 — time and host, not random — so it is the
+    // nearest thing, and reported.
+    assert!(mysql.contains("DEFAULT (UUID())"), "{mysql}");
+    assert!(
+        report
+            .iter()
+            .any(|d| d.column.as_deref() == Some("uid") && d.from.contains("gen_random_uuid")),
+        "{report:?}"
+    );
+}
+
+/// MySQL takes a default on a TEXT column only as an expression — `('open')`,
+/// not `'open'` — and reads a backslash in a string as an escape, which a
+/// PostgreSQL literal does not.
+#[test]
+fn mysql_gets_a_text_default_as_an_expression_and_its_backslashes_escaped() {
+    let (mysql, _) = emit_with(Dialect::MySql, "", &DEFAULTS, None);
+    assert!(mysql.contains("`status` TEXT NOT NULL DEFAULT ('open')"), "{mysql}");
+    assert!(mysql.contains(r"DEFAULT 'a\\b'"), "{mysql}");
+}
+
+/// On SQLite the translated defaults are checked by the engine itself: a row
+/// given only its key gets a UUID-shaped id, the literal, today, and `1`.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_fills_the_translated_defaults() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &DEFAULTS, None);
+    let row = on_sqlite(
+        &sql,
+        "insert into app_things (id) values (1);",
+        "select length(uid) || '|' || substr(uid, 15, 1) || '|' || status || '|' || path || '|' \
+         || (made = date('now')) || '|' || flag from app_things",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(row, r"36|4|open|a\b|1|1", "{sql}");
+}
+
+// ── Identity columns keep generating their values ──────────────────────────
+
+const ALWAYS: [(&str, &str); 1] = [(
+    "table/app/events.ddl",
+    "create table events (id bigint generated always as identity primary key, name text);",
+)];
+const BY_DEFAULT: [(&str, &str); 1] = [(
+    "table/app/tags.ddl",
+    "create table tags (id integer generated by default as identity primary key, name text);",
+)];
+// Declared the key: `serial` alone is not one (Postgres makes it NOT NULL with a
+// default, nothing more), and MySQL numbers only a key column.
+const SERIAL: [(&str, &str); 1] = [(
+    "table/app/notes.ddl",
+    "create table notes (id serial primary key, body text);",
+)];
+
+/// The report entries about column `column`.
+fn about<'a>(report: &'a [Downgrade], column: &str) -> Vec<&'a Downgrade> {
+    report.iter().filter(|d| d.column.as_deref() == Some(column)).collect()
+}
+
+/// An identity column was emitted as a plain integer: valid DDL, and every
+/// insert that relied on the database to number the row now fails NOT NULL.
+/// Each target has its own way to generate the value.
+#[test]
+fn an_identity_column_is_generated_on_every_target() {
+    let (mysql, _) = emit_with(Dialect::MySql, "", &BY_DEFAULT, None);
+    assert!(mysql.contains("`id` INT NOT NULL AUTO_INCREMENT"), "{mysql}");
+
+    let (tsql, _) = emit_with(Dialect::TSql, "", &ALWAYS, None);
+    assert!(tsql.contains("[id] bigint IDENTITY(1,1) NOT NULL"), "{tsql}");
+
+    // SQLite generates a value only for a column declared INTEGER PRIMARY KEY
+    // in place — AUTOINCREMENT is refused on a table-level key — so the key
+    // moves onto the column and is not declared twice.
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &BY_DEFAULT, None);
+    assert!(sqlite.contains(r#""id" INTEGER PRIMARY KEY AUTOINCREMENT"#), "{sqlite}");
+    assert!(!sqlite.contains(r#"PRIMARY KEY ("id")"#), "{sqlite}");
+}
+
+/// ALWAYS refuses an explicit value and BY DEFAULT takes one. MySQL's and
+/// SQLite's counters take one, so ALWAYS loses its guard there; SQL Server's
+/// IDENTITY refuses one, so BY DEFAULT is what loses there. The mapping that
+/// keeps the meaning is not reported.
+#[test]
+fn always_and_by_default_are_reported_where_the_target_differs() {
+    for (dialect, files, reported) in [
+        (Dialect::MySql, ALWAYS, true),
+        (Dialect::MySql, BY_DEFAULT, false),
+        (Dialect::TSql, ALWAYS, false),
+        (Dialect::TSql, BY_DEFAULT, true),
+        (Dialect::Sqlite, ALWAYS, true),
+        (Dialect::Sqlite, BY_DEFAULT, false),
+    ] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        let entries = about(&report, "id");
+        assert_eq!(
+            !entries.is_empty(),
+            reported,
+            "{dialect:?} {}: {entries:?}\n{sql}",
+            files[0].1
+        );
+        if reported {
+            assert!(
+                entries.iter().any(|d| d.from.contains("IDENTITY")),
+                "{dialect:?}: names the identity: {entries:?}"
+            );
+        }
+    }
+}
+
+/// `serial` is an integer drawing from its own sequence — an identity by
+/// another name, taking explicit values like BY DEFAULT.
+#[test]
+fn a_serial_column_is_generated_like_a_by_default_identity() {
+    let (mysql, report) = emit_with(Dialect::MySql, "", &SERIAL, None);
+    assert!(mysql.contains("`id` INT NOT NULL AUTO_INCREMENT"), "{mysql}");
+    assert!(about(&report, "id").is_empty(), "{report:?}");
+
+    let (tsql, report) = emit_with(Dialect::TSql, "", &SERIAL, None);
+    assert!(tsql.contains("[id] int IDENTITY(1,1) NOT NULL"), "{tsql}");
+    assert!(
+        about(&report, "id").iter().any(|d| d.from.contains("serial")),
+        "{report:?}"
+    );
+
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &SERIAL, None);
+    assert!(sqlite.contains(r#""id" INTEGER PRIMARY KEY AUTOINCREMENT"#), "{sqlite}");
+}
+
+/// MySQL generates values only for a column that leads a key, and SQLite only
+/// for a single-column INTEGER PRIMARY KEY. An identity on any other column is
+/// a plain column there — and reported, since inserts must now supply it.
+#[test]
+fn an_identity_the_target_cannot_generate_is_reported() {
+    let files = [(
+        "table/app/logs.ddl",
+        "create table logs (id integer primary key, n bigint generated by default as identity);",
+    )];
+    for dialect in [Dialect::MySql, Dialect::Sqlite] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert!(!sql.contains("AUTO"), "{dialect:?}: {sql}");
+        assert!(
+            about(&report, "n").iter().any(|d| d.to == "a plain column"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+    let (tsql, _) = emit_with(Dialect::TSql, "", &files, None);
+    assert!(tsql.contains("[n] bigint IDENTITY(1,1) NOT NULL"), "{tsql}");
+}
+
+/// SQLite itself numbers the rows, and like a sequence never hands an id out
+/// twice. A bare INTEGER PRIMARY KEY numbers them too but reuses the top id
+/// once its row is deleted — which is why it takes AUTOINCREMENT.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_numbers_identity_and_serial_rows_without_reusing_an_id() {
+    for (files, table) in [(ALWAYS, "app_events"), (BY_DEFAULT, "app_tags"), (SERIAL, "app_notes")] {
+        let (sql, _) = emit_with(Dialect::Sqlite, "", &files, None);
+        let col = if table == "app_notes" { "body" } else { "name" };
+        let ids = on_sqlite(
+            &sql,
+            &format!(
+                "insert into {table} ({col}) values ('a'); insert into {table} ({col}) values ('b'); \
+                 delete from {table} where id = 2; insert into {table} ({col}) values ('c');"
+            ),
+            &format!("select group_concat(id, ',') from {table}"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ids, "1,3", "{sql}");
+    }
+}
+
+// ── Sequences, and the defaults that draw from them ────────────────────────
+
+const SEQUENCED: [(&str, &str); 2] = [
+    (
+        "sequence/app/counter.ddl",
+        "create sequence counter start with 1000 increment by 5;",
+    ),
+    (
+        "table/app/tickets.ddl",
+        "create table tickets (\n  \
+           id   bigint primary key default nextval('counter')\n, \
+           ref  bigint default nextval('app.counter')\n, \
+           note text\n\
+         );",
+    ),
+];
+
+/// SQL Server has CREATE SEQUENCE, so the sequence is emitted — with every
+/// bound spelled out, because SQL Server's defaults are not PostgreSQL's: its
+/// MINVALUE, and so its first value, is the type's minimum, -2^63 for bigint.
+/// A column that drew from it draws from it still.
+#[test]
+fn sql_server_gets_the_sequence_and_the_columns_that_draw_from_it() {
+    let (sql, report) = emit_with(Dialect::TSql, "", &SEQUENCED, None);
+    let seq = sql
+        .find("CREATE SEQUENCE [app].[counter] AS bigint")
+        .unwrap_or_else(|| panic!("no CREATE SEQUENCE:\n{sql}"));
+    let table = sql.find("CREATE TABLE [app].[tickets]").expect("the table");
+    assert!(seq < table, "the sequence must exist before its users:\n{sql}");
+    for part in [
+        "START WITH 1000",
+        "INCREMENT BY 5",
+        "MINVALUE 1 ",
+        "NO CYCLE",
+        "NO CACHE",
+    ] {
+        assert!(sql.contains(part), "missing `{part}`:\n{sql}");
+    }
+    assert!(
+        sql.contains("[id] bigint NOT NULL DEFAULT NEXT VALUE FOR [app].[counter]"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("[ref] bigint DEFAULT NEXT VALUE FOR [app].[counter]"),
+        "{sql}"
+    );
+    assert!(
+        report
+            .iter()
+            .all(|d| d.entity != "app.counter" && d.entity != "app.tickets"),
+        "all faithful: {report:?}"
+    );
+}
+
+/// MySQL and SQLite have no sequences. The sequence is reported; a key column
+/// that drew from it gets the table's own counter — the nearest thing, and
+/// reported — and any other column loses the default, reported.
+#[test]
+fn without_sequences_the_sequence_and_its_defaults_are_reported() {
+    for (dialect, counter) in [(Dialect::MySql, "AUTO_INCREMENT"), (Dialect::Sqlite, "AUTOINCREMENT")] {
+        let (sql, report) = emit_with(dialect, "", &SEQUENCED, None);
+        assert!(!statements(&sql).contains("SEQUENCE"), "{dialect:?}: {sql}");
+        assert!(!statements(&sql).contains("nextval"), "{dialect:?}: {sql}");
+        assert!(
+            report.iter().any(|d| d.entity == "app.counter" && d.to == "nothing"),
+            "{dialect:?}: the sequence: {report:?}"
+        );
+        assert!(sql.contains(counter), "{dialect:?}: the key is numbered: {sql}");
+        assert!(
+            about(&report, "id").iter().any(|d| d.from.contains("nextval")),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            about(&report, "ref")
+                .iter()
+                .any(|d| d.from.contains("nextval") && d.to == "no default"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+/// Under `--scope` the sequence may not be in the script; a default that names
+/// it cannot apply on its own.
+#[test]
+fn a_default_drawing_from_a_sequence_not_in_the_script_is_dropped_and_reported() {
+    let scopes = "\nscopes:\n  tickets:\n    includes: [app.tickets]\n";
+    let (sql, report) = emit_with(Dialect::TSql, scopes, &SEQUENCED, Some("tickets"));
+    assert!(!sql.contains("NEXT VALUE FOR"), "{sql}");
+    assert!(
+        about(&report, "ref")
+            .iter()
+            .any(|d| d.to == "no default" && d.reason.contains("app.counter")),
+        "{report:?}"
+    );
+}
+
+/// On SQLite the table applies and numbers its rows the way a sequence would —
+/// never handing an id out twice, even once the top row is deleted.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_numbers_a_column_that_drew_from_a_sequence() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &SEQUENCED, None);
+    let ids = on_sqlite(
+        &sql,
+        "insert into app_tickets (note) values ('a'); insert into app_tickets (note) values ('b'); \
+         delete from app_tickets where id = 2; insert into app_tickets (note) values ('c');",
+        "select group_concat(id, ',') from app_tickets",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(ids, "1,3", "{sql}");
+}
+
+/// PostgreSQL's defaults depend on direction: a descending sequence starts at
+/// -1 and runs down to the type's minimum. Every bound is resolved and spelled
+/// out, the type and CACHE/CYCLE carry, and an `OWNED BY` — which ties the
+/// sequence's life to a column, and has no SQL Server equivalent — is reported.
+#[test]
+fn sql_server_gets_a_sequence_with_postgres_bounds_spelled_out() {
+    let files = [
+        (
+            "sequence/app/countdown.ddl",
+            "create sequence countdown as integer increment by -1 cache 20 cycle;",
+        ),
+        (
+            "sequence/app/owned.ddl",
+            "create sequence owned as smallint owned by app.things.id;",
+        ),
+    ];
+    let (sql, report) = emit_with(Dialect::TSql, "", &files, None);
+    assert!(
+        sql.contains(
+            "CREATE SEQUENCE [app].[countdown] AS int START WITH -1 INCREMENT BY -1 \
+             MINVALUE -2147483648 MAXVALUE -1 CYCLE CACHE 20;"
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            "CREATE SEQUENCE [app].[owned] AS smallint START WITH 1 INCREMENT BY 1 \
+             MINVALUE 1 MAXVALUE 32767 NO CYCLE NO CACHE;"
+        ),
+        "{sql}"
+    );
+    assert!(
+        report
+            .iter()
+            .any(|d| d.entity == "app.owned" && d.from.contains("OWNED BY")),
+        "{report:?}"
+    );
+    assert!(!report.iter().any(|d| d.entity == "app.countdown"), "{report:?}");
+}
+
+// ── Generated columns stay generated ───────────────────────────────────────
+
+const GENERATED: [(&str, &str); 1] = [(
+    "table/app/lines.ddl",
+    "create table lines (\n  \
+       id    integer primary key\n, \
+       price numeric(10,2) not null\n, \
+       qty   integer not null\n, \
+       total numeric(12,2) generated always as (price * qty) stored\n\
+     );",
+)];
+
+/// A generated column was emitted as a plain one: it applied, and then held
+/// whatever an insert put there instead of the value it is defined as. All
+/// three targets compute stored columns, so it is carried — with its
+/// expression untranslated, and reported, like a CHECK.
+#[test]
+fn a_generated_column_is_computed_on_every_target_and_its_expression_reported() {
+    let (mysql, _) = emit_with(Dialect::MySql, "", &GENERATED, None);
+    assert!(
+        mysql.contains("`total` DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) STORED"),
+        "{mysql}"
+    );
+    // SQL Server's computed column takes its type from the expression, so the
+    // declared one is kept with a CAST.
+    let (tsql, _) = emit_with(Dialect::TSql, "", &GENERATED, None);
+    assert!(
+        tsql.contains("[total] AS CAST((price * qty) AS decimal(12,2)) PERSISTED"),
+        "{tsql}"
+    );
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &GENERATED, None);
+    assert!(
+        sqlite.contains(r#""total" NUMERIC GENERATED ALWAYS AS (price * qty) STORED"#),
+        "{sqlite}"
+    );
+
+    for dialect in ALL {
+        let (_, report) = emit_with(dialect, "", &GENERATED, None);
+        assert!(
+            about(&report, "total")
+                .iter()
+                .any(|d| d.from.contains("price * qty") && d.to == "the same text, untranslated"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+/// SQLite computes it: a row given a price and a quantity has their product.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_computes_a_generated_column() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &GENERATED, None);
+    let total = on_sqlite(
+        &sql,
+        "insert into app_lines (id, price, qty) values (1, 2.5, 4);",
+        "select cast(total as text) from app_lines",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(total, "10", "{sql}");
+}
+
+// ── A materialized view becomes a view, and says so ────────────────────────
+
+const MATVIEW: [(&str, &str); 2] = [
+    (
+        "table/app/orders.ddl",
+        "create table orders (id integer primary key, total numeric(10,2));",
+    ),
+    (
+        "materialized_view/app/order_totals.ddl",
+        "create materialized view order_totals as select id, total from orders with data;\n\
+         create unique index order_totals_id_idx on order_totals (id);",
+    ),
+];
+
+/// None of the three has materialized views, so one becomes a plain view —
+/// the query runs on every read instead of serving stored rows. That is a
+/// loss, reported. Its indexes (a unique one is what REFRESH CONCURRENTLY
+/// needs) cannot apply to a plain view: each is left out, and reported.
+#[test]
+fn a_materialized_view_becomes_a_view_and_its_indexes_are_reported() {
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &MATVIEW, None);
+        let stmts = statements(&sql);
+        assert!(stmts.contains("CREATE VIEW"), "{dialect:?}: {sql}");
+        assert!(!stmts.contains("INDEX"), "{dialect:?}: a view cannot be indexed: {sql}");
+        assert!(
+            report.iter().any(|d| d.entity == "app.order_totals"
+                && d.from.contains("materialized view")
+                && d.to == "a plain view"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            report.iter().any(|d| d.entity == "app.order_totals"
+                && d.from.contains("order_totals_id_idx")
+                && d.to == "no index"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            sql.lines()
+                .any(|l| l.starts_with("-- dbd:") && l.contains("order_totals_id_idx")),
+            "{dialect:?}: and the file says so: {sql}"
+        );
+    }
+}
+
+// ── Comments are carried where the target keeps them ───────────────────────
+
+const COMMENTED: [(&str, &str); 2] = [
+    (
+        "table/app/people.ddl",
+        "create table people (id integer primary key, name text);\n\
+         comment on table people is 'Everyone we know';\n\
+         comment on column people.name is 'What they''re called\nin full';",
+    ),
+    (
+        "view/app/adults.ddl",
+        "create view adults as select id from people;\n\
+         comment on view adults is 'People over 18';",
+    ),
+];
+
+/// MySQL keeps a comment on a table and on a column, so both come across —
+/// escaped for MySQL, which reads a backslash in a string as an escape.
+#[test]
+fn mysql_carries_table_and_column_comments() {
+    let (sql, report) = emit_with(Dialect::MySql, "", &COMMENTED, None);
+    assert!(
+        sql.contains(r"`name` TEXT COMMENT 'What they''re called\nin full'"),
+        "{sql}"
+    );
+    assert!(sql.contains(") COMMENT='Everyone we know';"), "{sql}");
+    assert!(
+        !report
+            .iter()
+            .any(|d| d.entity == "app.people" && d.from.contains("comment")),
+        "carried faithfully: {report:?}"
+    );
+}
+
+/// SQL Server keeps comments as `MS_Description` extended properties — what
+/// SSMS shows — on the table, the column and the view.
+#[test]
+fn sql_server_carries_comments_as_ms_description_properties() {
+    let (sql, report) = emit_with(Dialect::TSql, "", &COMMENTED, None);
+    let property = |value: &str, level1: &str, name: &str, column: Option<&str>| {
+        let mut s = format!(
+            "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'{value}', \
+             @level0type = N'SCHEMA', @level0name = N'app', @level1type = N'{level1}', @level1name = N'{name}'"
+        );
+        if let Some(c) = column {
+            s.push_str(&format!(", @level2type = N'COLUMN', @level2name = N'{c}'"));
+        }
+        s + ";"
+    };
+    for expected in [
+        property("Everyone we know", "TABLE", "people", None),
+        property("What they''re called\nin full", "TABLE", "people", Some("name")),
+        property("People over 18", "VIEW", "adults", None),
+    ] {
+        assert!(sql.contains(&expected), "missing {expected}\n{sql}");
+    }
+    assert!(!report.iter().any(|d| d.from.contains("comment")), "{report:?}");
+}
+
+/// SQLite keeps no comments, and MySQL none on a view. Each one dropped is
+/// reported — it was documentation someone wrote, and it is gone.
+#[test]
+fn a_comment_the_target_cannot_keep_is_reported() {
+    let (_, sqlite) = emit_with(Dialect::Sqlite, "", &COMMENTED, None);
+    for (entity, column) in [("app.people", None), ("app.people", Some("name")), ("app.adults", None)] {
+        assert!(
+            sqlite.iter().any(|d| d.entity == entity
+                && d.column.as_deref() == column
+                && d.from.contains("comment")
+                && d.to == "nothing"),
+            "SQLite, {entity} {column:?}: {sqlite:?}"
+        );
+    }
+    let (_, mysql) = emit_with(Dialect::MySql, "", &COMMENTED, None);
+    assert!(
+        mysql
+            .iter()
+            .any(|d| d.entity == "app.adults" && d.from.contains("comment") && d.to == "nothing"),
+        "MySQL has no view comments: {mysql:?}"
+    );
+}
+
+/// A note quotes what was lost, and a comment can span lines. Every line of
+/// a note must still be a comment, or the script breaks at the second one.
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_note_quoting_a_multi_line_comment_stays_a_comment() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &COMMENTED, None);
+    on_sqlite(&sql, "", "select 'ok'").unwrap_or_else(|e| panic!("{e}"));
+}
+
+// ── A key on unbounded text is bounded, not dropped ────────────────────────
+
+const TEXT_KEYS: [(&str, &str); 2] = [
+    (
+        "table/app/countries.ddl",
+        "create table countries (code text primary key, name text not null unique);",
+    ),
+    (
+        "table/app/cities.ddl",
+        "create table cities (\n  \
+           id      integer primary key\n, \
+           country text not null references countries (code)\n, \
+           note    text\n\
+         );",
+    ),
+];
+
+/// MySQL refuses a TEXT column in a PRIMARY KEY, UNIQUE or FOREIGN KEY without
+/// a prefix length, and SQL Server refuses nvarchar(max) in any key. Leaving
+/// the constraint out would lose the key and every foreign key that points at
+/// it, so the column is bounded instead — VARCHAR(255) / nvarchar(450), the
+/// most a 900-byte SQL Server key holds — and the bound is reported: a longer
+/// value is now refused. A foreign key's own column gets the same bound, so
+/// the two sides still match.
+#[test]
+fn a_key_on_unbounded_text_is_bounded_and_reported() {
+    for (dialect, bounded) in [(Dialect::MySql, "VARCHAR(255)"), (Dialect::TSql, "nvarchar(450)")] {
+        let (sql, report) = emit_with(dialect, "", &TEXT_KEYS, None);
+        let stmts = statements(&sql);
+        for key in ["PRIMARY KEY", "UNIQUE", "FOREIGN KEY"] {
+            assert!(stmts.contains(key), "{dialect:?}: the {key} stays: {sql}");
+        }
+        for (entity, column) in [
+            ("app.countries", "code"),
+            ("app.countries", "name"),
+            ("app.cities", "country"),
+        ] {
+            assert!(
+                report
+                    .iter()
+                    .any(|d| d.entity == entity && d.column.as_deref() == Some(column) && d.to == bounded),
+                "{dialect:?}: {entity}.{column} is bounded to {bounded} and reported: {report:?}"
+            );
+        }
+        assert!(
+            about(&report, "note").is_empty(),
+            "{dialect:?}: a column in no key keeps its type: {report:?}"
+        );
+    }
+    let (sqlite, report) = emit_with(Dialect::Sqlite, "", &TEXT_KEYS, None);
+    assert!(
+        report.iter().all(|d| d.column.is_none()),
+        "SQLite keys TEXT as it is: {report:?}\n{sqlite}"
+    );
+}
+
+/// Once a key column is bounded, an index on it is an index on a bounded
+/// column — emitted, not left out the way an index on unbounded text is.
+#[test]
+fn an_index_on_a_bounded_key_column_is_emitted() {
+    let mut files = TEXT_KEYS.to_vec();
+    files.push((
+        "table/app/visits.ddl",
+        "create table visits (id integer primary key, country text references countries (code), note text);\n\
+         create index visits_country_idx on visits (country);\n\
+         create index visits_note_idx on visits (note);",
+    ));
+    for dialect in [Dialect::MySql, Dialect::TSql] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        let stmts = statements(&sql);
+        assert!(stmts.contains("visits_country_idx"), "{dialect:?}: {sql}");
+        assert!(
+            !stmts.contains("visits_note_idx"),
+            "{dialect:?}: still unbounded: {sql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.from.contains("visits_note_idx") && d.to == "no index"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+/// MySQL checks that an AUTO_INCREMENT column leads a key when the table is
+/// created, and an index is a separate `CREATE INDEX` after it — too late. So
+/// only a key inside the CREATE TABLE (the primary key, a UNIQUE) qualifies.
+#[test]
+fn mysql_numbers_only_a_column_whose_key_is_inside_the_create_table() {
+    let files = [(
+        "table/app/runs.ddl",
+        "create table runs (id integer primary key, n bigint generated by default as identity);\n\
+         create index runs_n_idx on runs (n);",
+    )];
+    let (sql, report) = emit_with(Dialect::MySql, "", &files, None);
+    assert!(!sql.contains("AUTO_INCREMENT"), "{sql}");
+    assert!(
+        about(&report, "n").iter().any(|d| d.to == "a plain column"),
+        "{report:?}"
+    );
+}
+
+// ── A file dbd could not read is not silently missing ──────────────────────
+
+/// An entity whose file does not parse was filtered out of the script without
+/// a word: exit 0, an empty report, and a schema missing a table. It cannot be
+/// emitted — there is no structure to translate — but the omission is a loss
+/// like any other, and is reported.
+#[test]
+fn an_entity_whose_file_does_not_parse_is_reported_as_missing() {
+    let files = [
+        ("table/app/good.ddl", "create table good (id integer primary key);"),
+        ("table/app/bad.ddl", "create table bad (id integer primary key,, oops);"),
+    ];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == "app.bad" && d.to == "nothing" && d.reason.contains("syntax error")),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains("app.bad")),
+            "{dialect:?}: and the file says so: {sql}"
+        );
+    }
 }
