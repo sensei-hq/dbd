@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { nodeId, type Column, type Ref, type SchemaModel } from '$lib/design/model';
+  import { nodeId, stubAt, type Column, type Ref, type SchemaModel } from '$lib/design/model';
   import Tabs from './Tabs.svelte';
   import EntityDiagram from './EntityDiagram.svelte';
   import EntityChangelog from './EntityChangelog.svelte';
@@ -20,7 +20,13 @@
 
   const schema = $derived(entityKey.split('.')[0]);
   const name = $derived(entityKey.split('.')[1]);
-  const table = $derived(model.tables.find((t) => t.schema === schema && t.name === name) ?? null);
+  // A key can also name a stub — a table a foreign key lands on that the model does not carry.
+  // Its page is this one: it is table-shaped, and what references it is the point of opening it.
+  const own = $derived(model.tables.find((t) => t.schema === schema && t.name === name));
+  const stub = $derived(own ? undefined : stubAt(model, schema, name));
+  const table = $derived(own ?? stub ?? null);
+  const readable = (kind: string) => kind.replace(/_/g, ' ');
+  const stubKindOf = (r: Ref) => stubAt(model, r.to.s, r.to.t)?.kind;
 
   const outRefs = $derived(model.refs.filter((r) => r.from.s === schema && r.from.t === name));
   const inRefs = $derived(model.refs.filter((r) => r.to.s === schema && r.to.t === name));
@@ -78,7 +84,11 @@
             <span class="font-mono text-sm text-faint">{schema}.</span>
             <h1 class="font-display text-h3 font-semibold tracking-tight">{name}</h1>
           </div>
-          <span class="ds-badge">{table.columns.length} columns</span>
+          {#if stub}
+            <span data-stub-kind={stub.kind} class="ds-badge">{readable(stub.kind)}</span>
+          {:else}
+            <span class="ds-badge">{table.columns.length} columns</span>
+          {/if}
           {#if inRefs.length || outRefs.length}
             <span class="ds-badge">{outRefs.length} out · {inRefs.length} in</span>
           {/if}
@@ -103,9 +113,21 @@
           <section data-section="info">
             <h2 class="font-mono text-label uppercase text-faint">Table info</h2>
             <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
+              {#if stub}
+                <p data-stub-reason>
+                  {#if stub.kind === 'external'}Declared under <code
+                      class="rounded bg-code-bg px-1 font-mono text-accent-2"
+                      style="font-size: 0.85em;">external:</code> in design.yaml — this project references it but does
+                    not manage it.
+                  {:else if stub.kind === 'out_of_scope'}A table of this project that the scope this model was drawn
+                    for leaves out.
+                  {:else}Referenced by a foreign key, but defined nowhere in this project.{/if}
+                  Only the columns its foreign keys land on are shown.
+                </p>
+              {/if}
               {#if comment.length}
                 <Markdown blocks={comment} />
-              {:else}
+              {:else if !stub}
                 <p class="text-faint">No comment on this table — add one with <code
                     class="rounded bg-code-bg px-1 font-mono text-accent-2"
                     style="font-size: 0.85em;">COMMENT ON TABLE</code>.</p>
@@ -167,6 +189,7 @@
                       >
                       <td data-cell="refs" class="py-2.5 pr-4">
                         {#each rr as r (r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                          {@const sk = stubKindOf(r)}
                           <!-- Wraps rather than truncates: a cut-off target is a broken link label. -->
                           <button
                             type="button"
@@ -176,6 +199,7 @@
                           >
                             → {r.to.s}.{r.to.t}.{r.to.c}
                           </button>
+                          {#if sk}<span data-stub-target class="col-badge">{readable(sk)}</span>{/if}
                         {:else}
                           <span class="font-mono text-xs text-faint">—</span>
                         {/each}
@@ -201,6 +225,7 @@
             {#if outRefs.length || inRefs.length}
               <div class="mt-3 flex flex-col">
                 {#each outRefs as r (r.from.c + '>' + r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                  {@const sk = stubKindOf(r)}
                   <button
                     data-ref="out"
                     type="button"
@@ -213,6 +238,7 @@
                         >{r.to.s}.{r.to.t}</span
                       >.{r.to.c}</span
                     >
+                    {#if sk}<span data-stub-target class="col-badge">{readable(sk)}</span>{/if}
                     {#if r.action}<span class="col-badge ml-auto">{r.action}</span>{/if}
                   </button>
                 {/each}

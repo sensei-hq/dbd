@@ -5,9 +5,9 @@
    means the package never becomes a third definition to keep in step.
 
    v2 (2026-09-27) added `version`, `entities`, `deps`, and `fk`/`uq` on
-   `Column`; v3 (2026-10-01) added `history` and `enums`. Everything past v1 is optional
-   here, so a share link encoded before an upgrade still validates and still
-   renders. */
+   `Column`; v3 (2026-10-01) added `history` and `enums`, and later `stubs`. Everything
+   past v1 is optional here, so a share link encoded before an upgrade still validates and
+   still renders. */
 
 export type Column = {
   name: string;
@@ -26,6 +26,7 @@ export type Index = { def: string; unique?: boolean; name?: string };
 export type Table = {
   schema: string;
   name: string;
+  /** `table` in `SchemaModel.tables`; a `StubKind` in `SchemaModel.stubs`. */
   kind: string;
   note?: string;
   noteMd?: string;
@@ -34,6 +35,13 @@ export type Table = {
 };
 export type RefEnd = { s: string; t: string; c: string };
 export type Ref = { from: RefEnd; to: RefEnd; action?: string };
+
+/**
+ * v3. Why a table a foreign key lands on is a stub rather than one of the model's tables:
+ * declared under `external:` in design.yaml, a table of the project the scope leaves out, or
+ * defined nowhere in the project.
+ */
+export type StubKind = 'external' | 'out_of_scope' | 'unresolved';
 
 /** v2. One end of a dependency: schema and name, no column. */
 export type NodeRef = { s: string; n: string };
@@ -132,6 +140,13 @@ export type SchemaModel = {
   tables: Table[];
   /** Foreign keys only. The dependency graph is `deps`. */
   refs: Ref[];
+  /**
+   * v3. The tables `refs` land on that `tables` does not carry, each with only the columns the
+   * refs land on and a `StubKind` as its `kind`. Apart from `tables`, so nothing counting or
+   * listing the model's tables is handed one it does not own. Absent when every ref lands
+   * inside the model.
+   */
+  stubs?: Table[];
   /** v2. Views, materialized views, functions, procedures and triggers. */
   entities?: EntityNode[];
   /** v2. What reads, writes or calls what. */
@@ -167,11 +182,10 @@ export function validateModel(value: unknown): ValidationResult {
   if (!Array.isArray(v.schemas)) return { ok: false, error: 'missing schemas[]' };
   if (!Array.isArray(v.tables)) return { ok: false, error: 'missing tables[]' };
   if (!Array.isArray(v.refs)) return { ok: false, error: 'missing refs[]' };
-  for (const t of v.tables) {
-    const tt = t as Record<string, unknown>;
-    if (typeof tt.schema !== 'string' || typeof tt.name !== 'string' || !Array.isArray(tt.columns))
-      return { ok: false, error: 'malformed table entry' };
-  }
+  if (!v.tables.every(isTableShaped)) return { ok: false, error: 'malformed table entry' };
+  // Stubs become graph nodes beside the tables, so each is held to the same shape.
+  if (v.stubs !== undefined && !(Array.isArray(v.stubs) && v.stubs.every(isTableShaped)))
+    return { ok: false, error: 'stubs must be an array of table entries' };
   // v2 halves are optional, but a PRESENT one has to be the right shape — a payload carrying
   // `entities: {}` would otherwise reach the renderer and fail there instead of here.
   if (v.entities !== undefined && !Array.isArray(v.entities))
@@ -185,4 +199,26 @@ export function validateModel(value: unknown): ValidationResult {
   return { ok: true, model: value as SchemaModel };
 }
 
+function isTableShaped(t: unknown): boolean {
+  const tt = t as Record<string, unknown> | null;
+  return (
+    typeof tt === 'object' &&
+    tt !== null &&
+    typeof tt.schema === 'string' &&
+    typeof tt.name === 'string' &&
+    Array.isArray(tt.columns)
+  );
+}
+
 export const nodeId = (schema: string, name: string) => `${schema}.${name}`;
+
+/**
+ * The model the ER graph draws: the stubs beside the tables. `toGraphInput` makes nodes of
+ * `tables` alone, so without this every foreign key into a stub would be an unplaced edge.
+ */
+export const withStubs = (model: SchemaModel): SchemaModel =>
+  model.stubs?.length ? { ...model, tables: [...model.tables, ...model.stubs] } : model;
+
+/** The stub a `schema.name` key names, if it names one. */
+export const stubAt = (model: SchemaModel, schema: string, name: string): Table | undefined =>
+  model.stubs?.find((t) => t.schema === schema && t.name === name);
