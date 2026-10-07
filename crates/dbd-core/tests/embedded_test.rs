@@ -257,6 +257,145 @@ async fn import_data_honors_null_value_sentinel() {
     .await;
 }
 
+// ── Test: a CSV/TSV loads by its header, not by position ──────────────────────
+
+/// Create `staging.countries (code text, name text)` and load `body` into it as
+/// a `format` data file.
+async fn load_countries(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    format: &str,
+    body: &str,
+) -> dbd_core::error::Result<()> {
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS staging; CREATE TABLE staging.countries (code text, name text)")
+        .await
+        .expect("create table failed");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("countries.{format}"));
+    std::fs::write(&path, body).unwrap();
+    let mut entity = Entity::new(EntityType::Table, "staging.countries");
+    entity.file = Some(path);
+    entity.format = Some(format.to_string());
+    adapter.import_data(&entity, "", false).await
+}
+
+/// COPY skipped the header (`HEADER true`) without reading it, so each value
+/// went into the column at its position: a file headed `name,code` loaded
+/// `Germany` into `code`. SQLite maps by header name, so the same file loaded
+/// differently on the two engines. The header is a column list, quoting and
+/// all.
+#[tokio::test]
+async fn a_csv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "\"name\",code\nGermany,DE\n\"Japan, Nippon\",JP\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'JP' AND name = 'Japan, Nippon'",
+        "a quoted value under the column its header names",
+    )
+    .await;
+}
+
+/// TSV is the same load with a tab between columns.
+#[tokio::test]
+async fn a_tsv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "tsv", "name\tcode\nGermany\tDE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// Windows line endings: the rows are handed to COPY from just after the
+/// header's `\r\n`. Cut after the `\r`, they began with a stray `\n` that COPY
+/// reads as a row of its own.
+#[tokio::test]
+async fn a_csv_with_crlf_line_endings_loads() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "name,code\r\nGermany,DE\r\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header names a column as Postgres resolves an unquoted name: `Name` is
+/// `name`. A spreadsheet's capitalised header loaded before, by position; it
+/// must not be refused now that the header is read.
+#[tokio::test]
+async fn a_header_names_a_column_as_postgres_resolves_an_unquoted_name() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "Name,CODE\nGermany,DE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header column the table does not have is a file for another table, or a
+/// renamed column — loading the rest by position or dropping it would both
+/// load wrong data. Refused, naming the column and what the table has, before
+/// a row is loaded.
+#[tokio::test]
+async fn a_header_column_the_table_does_not_have_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let err = load_countries(&*adapter, "csv", "name,iso_code\nGermany,DE\n")
+        .await
+        .expect_err("an unknown header column must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("iso_code") && msg.contains("staging.countries") && msg.contains("code, name"),
+        "the column, the table, and the columns it has: {msg}"
+    );
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM staging.countries",
+        "a row loaded from a refused file",
+    )
+    .await;
+}
+
 // ── Test: the default import empties a staging table before loading it ────────
 
 /// `truncate: true` is the default. The step moved behind
@@ -351,6 +490,90 @@ async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
     .await;
 }
 
+// ── Test: each staging table's own loader runs ────────────────────────────────
+
+/// The audit's repro on a real database. `load_cities` joins the staged
+/// countries to find each city's country, and loader matching took the first
+/// procedure reading a staging table — so both staged tables got
+/// `load_cities`, it ran twice, `load_countries` never ran, and both targets
+/// stayed empty under a summary of "2 procedure(s) called".
+#[tokio::test]
+async fn each_staging_table_is_loaded_by_its_own_loader() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+    );
+    write(
+        "ddl/table/staging/countries.ddl",
+        "set search_path to staging;\ncreate table if not exists countries (code text, name text);\n",
+    );
+    write(
+        "ddl/table/staging/cities.ddl",
+        "set search_path to staging;\ncreate table if not exists cities (name text, country text);\n",
+    );
+    write(
+        "ddl/table/app/countries.ddl",
+        "set search_path to app;\ncreate table if not exists countries (code text primary key, name text);\n",
+    );
+    write(
+        "ddl/table/app/cities.ddl",
+        "set search_path to app;\n\
+         create table if not exists cities (name text, country_code text references app.countries (code));\n",
+    );
+    write(
+        "ddl/procedure/staging/load_countries.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_countries() language sql\n\
+         as $$ insert into app.countries (code, name) select code, name from staging.countries $$;\n",
+    );
+    write(
+        "ddl/procedure/staging/load_cities.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_cities() language sql\n\
+         as $$ insert into app.cities (name, country_code)\n\
+               select c.name, k.code from staging.cities c\n\
+               join staging.countries s on s.name = c.country\n\
+               join app.countries k on k.code = s.code $$;\n",
+    );
+    write("import/staging/countries.csv", "code,name\nDE,Germany\n");
+    write("import/staging/cities.csv", "name,country\nBerlin,Germany\n");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.countries WHERE code = 'DE' AND name = 'Germany'",
+        "the country load_countries moves",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.cities WHERE name = 'Berlin' AND country_code = 'DE'",
+        "the city load_cities moves",
+    )
+    .await;
+}
+
 // ── Test: a `.json` file may hold a JSON array ────────────────────────────────
 
 /// A `.json` file is what most tools mean by one: a JSON array of records. The
@@ -397,6 +620,71 @@ async fn a_json_array_file_imports_one_row_per_record() {
         "a row count other than 2",
     )
     .await;
+}
+
+// ── Test: a Postgres CSV/TSV export imports into SQLite unchanged ─────────────
+
+/// `dbd export` from Postgres and `dbd import` into SQLite is how data moves
+/// between the engines, so every value must arrive as it left. Postgres writes
+/// real CSV — a comma or a newline quoted, a quote doubled, NULL as an empty
+/// field and `''` as `""` — and SQLite split each line on the delimiter and
+/// trimmed: the comma was "too many columns", quotes stayed in the value.
+#[tokio::test]
+async fn a_postgres_export_imports_into_sqlite_unchanged() {
+    let (_pg, url) = start_pg().await;
+    let pg = connect(&url, "embedded_test").await.unwrap();
+    // Everything CSV quoting exists for, plus the NULL/'' distinction.
+    let expected: Vec<(i64, Option<String>)> = [
+        (1, Some("Japan, Nippon")),
+        (2, Some("say \"hi\"")),
+        (3, Some("two\nlines")),
+        (4, Some("a\ttab")),
+        (5, Some("  padded  ")),
+        (6, Some("")),
+        (7, None),
+    ]
+    .iter()
+    .map(|(id, v)| (*id, v.map(str::to_string)))
+    .collect();
+    pg.execute_script(
+        r#"CREATE SCHEMA app;
+           CREATE TABLE app.countries (id integer, name text);
+           INSERT INTO app.countries VALUES
+             (1, 'Japan, Nippon'), (2, 'say "hi"'), (3, E'two\nlines'), (4, E'a\ttab'),
+             (5, '  padded  '), (6, ''), (7, NULL);"#,
+    )
+    .await
+    .unwrap();
+
+    for format in ["csv", "tsv"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut export = Entity::new(EntityType::Table, "app.countries");
+        export.format = Some(format.to_string());
+        pg.export_data(&export, Some(out.path())).await.expect("export failed");
+
+        let db = out.path().join("target.db");
+        let sqlite_url = format!("sqlite://{}", db.display());
+        let sqlite = connect(&sqlite_url, "embedded_test").await.unwrap();
+        sqlite
+            .execute_script("CREATE TABLE countries (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let mut import = Entity::new(EntityType::Table, "app.countries");
+        import.file = Some(out.path().join(format!("countries.{format}")));
+        import.format = Some(format.to_string());
+        sqlite
+            .import_data(&import, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: SQLite import failed: {e}"));
+
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect(&sqlite_url).await.unwrap();
+        let got: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, name FROM countries ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(got, expected, "{format}: the values Postgres exported");
+    }
 }
 
 // ── Test: JSONL export → import is a round trip ───────────────────────────────

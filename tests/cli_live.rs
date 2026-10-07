@@ -411,3 +411,44 @@ async fn reset_dry_run_refuses_where_the_real_reset_would() {
         combined(&o)
     );
 }
+
+// ── import.staging is enforced ──────────────────────────────────────────────
+
+/// The audit's repro. `import.staging` lists `staging`, and a data file sits
+/// under `import/app/`: `dbd import` TRUNCATEd the live `app.widgets` and
+/// replaced its rows. The docs say the import fails for any schema the list
+/// leaves out — so it must exit non-zero, and the live row must survive.
+#[tokio::test]
+async fn an_import_refuses_a_data_file_outside_the_staging_schemas_and_keeps_the_live_rows() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    assert!(dbd(dir, &url, &["apply"]).status.success());
+
+    // A live row, loaded before the project declares its staging schemas.
+    std::fs::write(dir.join("live.jsonl"), "{\"id\":1,\"name\":\"live\"}\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-n", "app.widgets", "-f", "live.jsonl"]);
+    assert!(o.status.success(), "seeding the live row failed: {}", combined(&o));
+
+    let design = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{design}\nimport:\n  staging: [staging]\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("import/app")).unwrap();
+    std::fs::write(dir.join("import/app/widgets.csv"), "id,name\n2,replaced\n").unwrap();
+
+    let o = dbd(dir, &url, &["import"]);
+    assert!(!o.status.success(), "the import must be refused: {}", combined(&o));
+    assert!(
+        combined(&o).contains("import/app/widgets.csv"),
+        "and name the file it refused: {}",
+        combined(&o)
+    );
+
+    let csv = exported_widgets(dir, &url);
+    assert!(csv.contains("1,live"), "the live row must survive: {csv}");
+    assert!(!csv.contains("replaced"), "and nothing may replace it: {csv}");
+}
