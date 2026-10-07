@@ -4632,3 +4632,104 @@ async fn removing_an_enum_value_drops_only_the_views_over_its_column() {
         .await
         .expect("the procedure still runs against the recreated type");
 }
+
+// ── Reset with schema grants ──────────────────────────────────────────────────
+
+/// A design whose roles hold schema grants: one through `schemas:`, one through
+/// the target's `grants:`.
+const GRANTS_YAML: &str = "project:\n  name: grants_reset_test\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+    target:\n  postgres:\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+    \x20   grants:\n      app:\n        app_reader: [usage, select]\n";
+
+const GRANTS_TABLE: (&str, &str) = (
+    "ddl/table/app/t.ddl",
+    "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+);
+
+fn role_predicate(role: &str) -> String {
+    format!("SELECT 1 FROM pg_roles WHERE rolname = '{role}'")
+}
+
+/// The default `dbd reset` of any design with schema grants failed: it dropped
+/// the tables and then ran `DROP ROLE` on roles that still held USAGE on the
+/// surviving schema and the default privileges dbd set there, so Postgres
+/// refused and the whole reset rolled back. Only `--clean`, which drops the
+/// schema and its grants with it, worked.
+#[tokio::test]
+async fn the_default_reset_drops_roles_that_hold_the_designs_schema_grants() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "the default privileges deploy set on app",
+    )
+    .await;
+
+    design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect("the default reset must drop roles that hold the design's grants");
+
+    assert_table_absent(&*adapter, "app", "t").await;
+    assert_schema_exists(&*adapter, "app").await;
+    for role in ["app_writer", "app_reader"] {
+        assert_catalog(&*adapter, false, &role_predicate(role), &format!("role {role}")).await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "default privileges on app",
+    )
+    .await;
+
+    // The database is back to where apply starts from.
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("re-deploy after reset");
+    assert_table_exists(&*adapter, "app", "t").await;
+}
+
+/// Reset revokes only what dbd granted. A privilege someone else gave one of
+/// the design's roles still blocks `DROP ROLE` — dbd must not guess at it, nor
+/// reach for `DROP OWNED BY`, which would drop objects the project does not
+/// own — but the error has to say which role and what it still holds, where
+/// Postgres's own message names the role and leaves the reason in a DETAIL the
+/// driver does not show. And the reset is one transaction: nothing is dropped.
+#[tokio::test]
+async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the_role_and_privilege() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA other; CREATE TABLE other.x (id integer); GRANT SELECT ON other.x TO app_writer;",
+        )
+        .await
+        .expect("grant outside the design");
+
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect_err("a privilege dbd did not grant must still block the role drop")
+        .to_string();
+    assert!(err.contains("app_writer"), "the error must name the role: {err}");
+    assert!(
+        err.contains("privileges for table other.x"),
+        "the error must say what the role still holds: {err}"
+    );
+
+    assert_table_exists(&*adapter, "app", "t").await;
+    assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
+}
