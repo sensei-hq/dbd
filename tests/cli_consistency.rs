@@ -211,6 +211,68 @@ fn policies_dry_run_heads_what_would_apply_and_what_would_be_skipped_apart() {
     );
 }
 
+// ── a file a command writes stays in the project ───────────────────────────
+
+/// `dbml` and `diagram` refused a path outside the project; `combine` and
+/// `emit` wrote wherever `-f` pointed. One rule now, the safer of the two: a
+/// file a command writes lands inside the project, or the command refuses
+/// before writing anything.
+#[test]
+fn every_command_that_writes_a_file_keeps_it_inside_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    two_schema_project(&project);
+    let out = |name: &str| outside.join(name).to_str().unwrap().to_string();
+    let inside = project.join("emitted.sql").to_str().unwrap().to_string();
+
+    for args in [
+        vec!["combine".to_string(), "-f".into(), out("combined.sql")],
+        vec![
+            "emit".into(),
+            "--dialect".into(),
+            "sqlite".into(),
+            "-f".into(),
+            out("emitted.sql"),
+        ],
+        vec![
+            "emit".into(),
+            "--dialect".into(),
+            "sqlite".into(),
+            "-f".into(),
+            inside.clone(),
+            "--report".into(),
+            out("report.json"),
+        ],
+        vec!["dbml".into(), "-f".into(), out("schema.dbml")],
+        vec!["diagram".into(), "--json".into(), "-f".into(), out("schema.json")],
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = dbd(&project, &args);
+        assert!(
+            !run.status.success(),
+            "{args:?} wrote outside the project: {}",
+            stdout(&run)
+        );
+        assert!(
+            stderr(&run).contains("outside project root"),
+            "{args:?}: refused for that reason: {}",
+            stderr(&run)
+        );
+    }
+    assert_eq!(
+        fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing was written outside"
+    );
+    assert!(
+        !Path::new(&inside).exists(),
+        "nor half a run inside: emit checks both paths first"
+    );
+}
+
 // ── deploy --dry-run agrees with deploy ─────────────────────────────────────
 
 /// `deploy --dry-run` printed "1 errors" for an unparseable file and exited 0,
