@@ -177,6 +177,40 @@ fn policies_dry_run_under_a_scope_lists_only_the_scopes_policies() {
     );
 }
 
+/// "Would apply policies:" headed a list that, under a scope with no policy of
+/// its own, was nothing but skips — a preview announcing work above a list of
+/// work it will not do. The heading is printed only over what would apply;
+/// skips are listed under their own.
+#[test]
+fn policies_dry_run_heads_what_would_apply_and_what_would_be_skipped_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["policies", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`:\n{text}"));
+    assert!(
+        at("Would apply policies:") < at("hub/nodes.sql")
+            && at("hub/nodes.sql") < at("Would skip")
+            && at("Would skip") < at("app/users.sql"),
+        "the applied file under one heading, the skipped one under another:\n{text}"
+    );
+
+    std::fs::remove_file(tmp.path().join("policies/hub/nodes.sql")).unwrap();
+    let out = dbd(tmp.path(), &["policies", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !text.contains("Would apply policies:"),
+        "nothing would apply, so nothing is announced as applying:\n{text}"
+    );
+    assert!(
+        text.contains("Would skip") && text.contains("app/users.sql"),
+        "the skip is still listed, under its own heading:\n{text}"
+    );
+}
+
 // ── deploy --dry-run agrees with deploy ─────────────────────────────────────
 
 /// `deploy --dry-run` printed "1 errors" for an unparseable file and exited 0,
