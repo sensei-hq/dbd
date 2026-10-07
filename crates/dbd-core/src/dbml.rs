@@ -1,5 +1,7 @@
 use crate::config::DbmlDocConfig;
-use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef};
+use crate::entity::{
+    ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, SchemaPath, TableConstraint, TableDef,
+};
 
 /// Parameters for DBML generation.
 pub struct DbmlParams<'a> {
@@ -63,6 +65,8 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
         .filter(|e| is_included(e, params))
         .collect();
 
+    let enums = EnumTypes::of(design);
+
     // Enums
     for entity in &filtered {
         if entity.entity_type == EntityType::Enum && !entity.enum_values.is_empty() {
@@ -78,7 +82,7 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
             sections.push(emit_table(
                 &entity.name,
                 entity.schema.as_deref().unwrap_or("public"),
-                table_def,
+                &enums.qualify_columns(table_def, &entity.schema_path),
             ));
         }
     }
@@ -101,7 +105,7 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
     // define: a Ref to an undefined table is a DBML error, whether the target
     // is an External, a table a scope or filter left out, or one the design
     // never declares.
-    let stubs = emit_ref_target_stubs(&included_tables, design);
+    let stubs = emit_ref_target_stubs(&included_tables, design, &enums);
     if !stubs.is_empty() {
         sections.push(stubs);
     }
@@ -289,6 +293,55 @@ fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
     }
     block.push_str("\n}\n");
     block
+}
+
+/// The enums the design declares, by qualified name — what a column's type is
+/// checked against before it is written.
+///
+/// DBML finds a column's enum by name alone, while the SQL the column came from
+/// found it along its file's `search_path`. Written as the file spelled it,
+/// `mood` reached `init --from-dbml` with no path to resolve it on, and the
+/// rebuilt table's apply failed with `type "mood" does not exist`. So a type
+/// naming a declared enum is written qualified, as the table's own path
+/// resolves it; a built-in, or a name already qualified, is written as is.
+struct EnumTypes(std::collections::HashSet<String>);
+
+impl EnumTypes {
+    fn of(design: &[Entity]) -> Self {
+        Self(
+            design
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Enum)
+                .map(qualified_name)
+                .collect(),
+        )
+    }
+
+    /// `data_type`, qualified when it names a declared enum on `path`.
+    fn column_type(&self, data_type: &str, path: &SchemaPath) -> String {
+        // `mood[]` names the enum `mood`; the array suffix rides along.
+        let (base, suffix) = data_type.split_at(data_type.find('[').unwrap_or(data_type.len()));
+        if base.contains('.') {
+            return data_type.to_string();
+        }
+        // `public` is searched last: apply appends it to every path a file
+        // states (`ensure_public_in_search_path`), and a file stating none
+        // resolves there.
+        path.schemas()
+            .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
+            .map(|schema| format!("{schema}.{base}"))
+            .find(|name| self.0.contains(name))
+            .map_or_else(|| data_type.to_string(), |name| format!("{name}{suffix}"))
+    }
+
+    /// `table_def` with each column's type as [`Self::column_type`] writes it.
+    fn qualify_columns(&self, table_def: &TableDef, path: &SchemaPath) -> TableDef {
+        let mut table_def = table_def.clone();
+        for column in &mut table_def.columns {
+            column.data_type = self.column_type(&column.data_type, path);
+        }
+        table_def
+    }
 }
 
 fn emit_enum(entity: &Entity) -> String {
@@ -708,7 +761,7 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
 /// target is looked up in `design`: a table the design defines keeps the
 /// referenced columns' real types; an External, or a table the design never
 /// declares, has no types to give and gets `varchar`.
-fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity]) -> String {
+fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &EnumTypes) -> String {
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
@@ -741,7 +794,7 @@ fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity]) -> String {
             let known = design.iter().find(|e| {
                 matches!(e.entity_type, EntityType::Table | EntityType::External) && qualified_name(e) == *target
             });
-            emit_stub_block(target, columns, known)
+            emit_stub_block(target, columns, known, enums)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -757,15 +810,23 @@ fn qualified_name(entity: &Entity) -> String {
 
 /// One stub `Table` block: the referenced `columns` of `target`, typed from
 /// `known` when the design defines it, and a note saying why it is a stub.
-fn emit_stub_block(target: &str, columns: &std::collections::BTreeSet<&str>, known: Option<&Entity>) -> String {
+fn emit_stub_block(
+    target: &str,
+    columns: &std::collections::BTreeSet<&str>,
+    known: Option<&Entity>,
+    enums: &EnumTypes,
+) -> String {
     let (schema, table) = target.split_once('.').unwrap_or(("public", target));
-    let known_columns = known.and_then(|e| e.table_def.as_ref()).map(|td| td.columns.as_slice());
+    let known_columns = known.and_then(|e| e.table_def.as_ref().map(|td| (td.columns.as_slice(), &e.schema_path)));
 
     let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
     for column in columns {
         let data_type = known_columns
-            .and_then(|cols| cols.iter().find(|c| c.name == *column))
-            .map_or_else(|| "varchar".to_string(), |c| quote_type_if_needed(&c.data_type));
+            .and_then(|(cols, path)| cols.iter().find(|c| c.name == *column).map(|c| (c, path)))
+            .map_or_else(
+                || "varchar".to_string(),
+                |(c, path)| quote_type_if_needed(&enums.column_type(&c.data_type, path)),
+            );
         lines.push(format!("  \"{column}\" {data_type}"));
     }
     let note = match known.map(|e| e.entity_type) {
