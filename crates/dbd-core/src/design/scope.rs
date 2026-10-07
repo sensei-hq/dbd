@@ -69,6 +69,34 @@ impl Design {
             .collect())
     }
 
+    /// The entity a `-n <name>` selects, checked against the scope a run acts on.
+    ///
+    /// A name that matched nothing used to select nothing, and every command
+    /// that takes one reported that as success — "Everything looks ok", "0
+    /// entities — no issues", an empty graph. Selecting nothing is never what
+    /// the name was for, so it is an error here, said one way for every caller:
+    /// `no entity named 'X'`, or `X is outside scope 'S'` when the design has it
+    /// but the scope does not build it. Under `None` or the all-scope only
+    /// existence is checked.
+    ///
+    /// Searches the import staging tables too, since `inspect -n` reports on
+    /// them; callers that act only on DDL entities check what they got.
+    pub fn resolve_name(&self, name: &str, scope: Option<&ResolvedScope>) -> Result<&Entity> {
+        let entity = self
+            .entities
+            .iter()
+            .chain(self.import_tables.iter())
+            .find(|e| e.name == name)
+            .ok_or_else(|| DbdError::Config(format!("no entity named '{name}'")))?;
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            if !Self::entity_in_scope(entity, s, &ws) {
+                return Err(DbdError::Config(format!("{name} is outside scope '{}'", s.name)));
+            }
+        }
+        Ok(entity)
+    }
+
     /// `(kept, total)`: how many entities `scope` builds, and how many the
     /// design declares.
     ///

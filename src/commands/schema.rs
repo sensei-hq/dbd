@@ -47,6 +47,11 @@ pub async fn cmd_inspect(
     // which exists to vet a scope before a run, must refuse it too rather than
     // promise to auto-include an entity the scope forbids.
     let scoped = design.scoped_entities(&resolved)?;
+    // A `-n` that names nothing reported "Everything looks ok" on an empty
+    // selection; under a scope, a name the scope does not build did the same.
+    if let Some(n) = name {
+        design.resolve_name(n, Some(&resolved))?;
+    }
     let report = design.report(name, Some(&resolved));
 
     // Count what this run is actually about, the way every other command
@@ -915,6 +920,38 @@ fn select_matviews<'a>(entities: &'a [Entity], name: Option<&str>) -> Vec<&'a En
         .collect()
 }
 
+/// Refuse a `refresh -n` selection that names no materialized view this run
+/// can refresh, before connecting.
+///
+/// It used to print "No materialized views to refresh." and exit 0 — for a
+/// typo, for a table, and for a matview the scope does not build alike. An
+/// exact name is checked like every other `-n`; a `schema.*` wildcard must
+/// match a matview in the design, and one the scope keeps.
+fn check_refresh_selection(
+    design: &Design,
+    scope: &dbd_core::ResolvedScope,
+    scoped: &[Entity],
+    sel: &str,
+) -> Result<()> {
+    if sel.ends_with(".*") {
+        if select_matviews(design.entities(), Some(sel)).is_empty() {
+            anyhow::bail!("no materialized view matches '{sel}'");
+        }
+        if select_matviews(scoped, Some(sel)).is_empty() {
+            anyhow::bail!(
+                "every materialized view matching '{sel}' is outside scope '{}'",
+                scope.name
+            );
+        }
+        return Ok(());
+    }
+    let entity = design.resolve_name(sel, Some(scope))?;
+    if entity.entity_type != EntityType::MaterializedView {
+        anyhow::bail!("{sel} is not a materialized view — only materialized views can be refreshed");
+    }
+    Ok(())
+}
+
 /// Refresh materialized views: `REFRESH MATERIALIZED VIEW [CONCURRENTLY] …`,
 /// honoring each view's resolved `concurrently` setting, in dependency order.
 #[allow(clippy::too_many_arguments)]
@@ -938,6 +975,9 @@ pub async fn cmd_refresh(
     let (kept, total) = design.scope_counts(&resolved_scope)?;
     output::scope_filtered(&resolved_scope, kept, total);
 
+    if let Some(sel) = name {
+        check_refresh_selection(&design, &resolved_scope, &scoped, sel)?;
+    }
     let selected = select_matviews(&scoped, name);
     if selected.is_empty() {
         output::info(verbosity, "No materialized views to refresh.");

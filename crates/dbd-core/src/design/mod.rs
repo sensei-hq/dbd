@@ -1050,6 +1050,11 @@ impl Design {
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
+        // An unknown or out-of-scope name produced an empty graph — a valid
+        // document, indistinguishable from an entity with no dependencies.
+        if let Some(n) = name {
+            self.resolve_name(n, scope)?;
+        }
         let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
