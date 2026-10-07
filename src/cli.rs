@@ -216,9 +216,10 @@ pub enum Commands {
     },
     /// Drop the project's managed objects (with safety guards)
     Reset {
-        /// Target platform
-        #[arg(long, default_value = "postgres")]
-        target: String,
+        /// Target platform whose own schemas reset must never drop
+        /// (postgres or supabase). Default: the design's target.
+        #[arg(long)]
+        target: Option<String>,
         /// Print what would be dropped
         #[arg(long)]
         dry_run: bool,
