@@ -198,6 +198,57 @@ async fn diff_and_reconcile_name_the_scope_they_ran_under() {
     );
 }
 
+/// `export:` lists a table, a view and a table in another schema, and a scope
+/// builds only the first schema.
+fn listed_export_project(dir: &Path) {
+    scoped_project(dir);
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: exported\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - app\n  - hub\n\n\
+         export:\n  - app.users\n  - app.user_ids\n  - hub.nodes\n\n\
+         scopes:\n  app_only:\n    includes:\n      - app\n",
+    )
+    .unwrap();
+    let v = dir.join("ddl/view/app");
+    std::fs::create_dir_all(&v).unwrap();
+    std::fs::write(
+        v.join("user_ids.ddl"),
+        "set search_path to app;\ncreate or replace view user_ids as select id from users;\n",
+    )
+    .unwrap();
+}
+
+/// A table and a view were announced as "Exporting 2 table(s)", and an
+/// `export:` entry the scope left out was not mentioned at all — the export
+/// simply had one file fewer than the list.
+#[tokio::test]
+async fn export_counts_what_it_writes_and_names_what_the_scope_left_out() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    listed_export_project(dir);
+    assert!(dbd(dir, &url, &["apply"]).status.success());
+
+    let out = dir.join("out");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "--scope", "app_only", "-o", out.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    let text = combined(&o);
+    assert!(
+        text.contains("Exporting 1 table(s) and 1 view(s)"),
+        "a view is counted as a view:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("hub.nodes") && l.contains("outside scope 'app_only'")),
+        "the listed entry the scope left out is named:\n{text}"
+    );
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
