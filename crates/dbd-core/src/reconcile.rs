@@ -43,7 +43,7 @@ pub struct ReconcilePlan {
     /// Materialized views present in the design but absent from the DB. Reconcile
     /// CREATEs these (Postgres has no `CREATE OR REPLACE MATERIALIZED VIEW`);
     /// carried separately from `added` because they use a different code path
-    /// (`matview_create_sql` + hash sentinel) and are detected during `--dry-run`
+    /// (`matview_create_sql`, then its stamp) and are detected during `--dry-run`
     /// so the preview can list them.
     pub matview_creates: Vec<String>,
     /// Materialized views live with a `v1` (unversioned) hash sentinel — written
@@ -1641,10 +1641,11 @@ pub struct ReconcileComplete {
 // drops it deliberately, after which `apply`/reconcile recreates it (snapshots
 // exclude matviews, so migrations can't recreate one).
 //
-// Drift is detected by stamping a deterministic hash of the DESIGN onto the live
-// object as a `dbd:hash=…` comment sentinel (matview comments are otherwise
-// unused) at CREATE time, then comparing the stored hash to a freshly computed
-// one on later runs. The hash is over the design, not Postgres's deparsed
+// Drift is detected by recording a deterministic hash of the DESIGN as a
+// `dbd:hash=…` stamp for the live object at CREATE time — in the bookkeeping
+// schema (`DatabaseAdapter::stamp_matview`), not the view's comment, which is
+// its author's — then comparing the stored hash to a freshly computed one on
+// later runs. The hash is over the design, not Postgres's deparsed
 // `pg_matviews.definition`, so it is exact and deparser-independent.
 
 /// What a reconcile should do with one design materialized view.
@@ -1705,9 +1706,8 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=v2:<hash>';` for the
-/// sentinel. `qualified` is `schema.name` (unqualified → `public`); single
-/// quotes in the payload are doubled so the literal stays well-formed.
+/// The drift stamp for `hash`: `dbd:hash=v2:<hash>`, recorded through
+/// [`crate::adapter::DatabaseAdapter::stamp_matview`].
 ///
 /// Versioned (`v2:`) because the hash input is the matview's `writes[0]`, so
 /// any change to what that field holds changes every stamp already written.
@@ -1716,10 +1716,8 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
 /// tells users to `DROP … CASCADE`. See [`Sentinel`] and
 /// [`decide_matview_action`] for how an unversioned (`v1`) stamp is handled:
 /// re-stamped silently, never read as a drift signal.
-pub(crate) fn matview_hash_comment_sql(qualified: &str, hash: &str) -> String {
-    let (schema, name) = qualified.split_once('.').unwrap_or((DEFAULT_SCHEMA, qualified));
-    let payload = format!("dbd:hash=v2:{hash}").replace('\'', "''");
-    format!("COMMENT ON MATERIALIZED VIEW \"{schema}\".\"{name}\" IS '{payload}';")
+pub(crate) fn matview_stamp(hash: &str) -> String {
+    format!("dbd:hash=v2:{hash}")
 }
 
 /// A parsed `dbd:hash` stamp.
@@ -1741,7 +1739,7 @@ pub(crate) enum Sentinel {
 
 /// Extract the sentinel from a `dbd:hash=…` comment, or `None` when the
 /// comment is absent or carries no such sentinel. Inverse of
-/// [`matview_hash_comment_sql`]'s payload; tolerant of trailing text after the
+/// [`matview_stamp`]'s payload; tolerant of trailing text after the
 /// token.
 pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
     let rest = comment?.split("dbd:hash=").nth(1)?;
@@ -1763,18 +1761,9 @@ pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
 }
 
 /// `CREATE MATERIALIZED VIEW … WITH DATA;` (+ any index statements, via
-/// [`crate::emit::emit_entity`]) followed by the hash-sentinel comment.
-pub(crate) fn matview_create_sql(entity: &Entity, hash: &str) -> String {
-    let create = crate::emit::emit_entity(entity).unwrap_or_default();
-    let comment = matview_hash_comment_sql(&qualified_matview_name(entity), hash);
-    format!("{create}\n{comment}")
-}
-
-/// `schema.name` for an entity, defaulting the schema to `public`.
-fn qualified_matview_name(entity: &Entity) -> String {
-    let schema = entity.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
-    let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
-    format!("{schema}.{name}")
+/// [`crate::emit::emit_entity`]). The caller records its stamp separately.
+pub(crate) fn matview_create_sql(entity: &Entity) -> String {
+    crate::emit::emit_entity(entity).unwrap_or_default()
 }
 
 /// Normalize a matview's `SELECT` body for a stable hash input: first `body`
@@ -3796,11 +3785,10 @@ mod tests {
     /// hash.
     #[test]
     fn v2_stamp_round_trips() {
-        let sql = matview_hash_comment_sql("a.m", "deadbeefcafe0001");
-        assert!(sql.contains("dbd:hash=v2:deadbeefcafe0001"), "got: {sql}");
-        let payload = sql.split_once("IS '").unwrap().1.trim_end_matches("';");
+        let stamp = matview_stamp("deadbeefcafe0001");
+        assert_eq!(stamp, "dbd:hash=v2:deadbeefcafe0001");
         assert_eq!(
-            parse_dbd_hash(Some(payload)),
+            parse_dbd_hash(Some(&stamp)),
             Some(Sentinel::V2("deadbeefcafe0001".to_string()))
         );
     }
@@ -3829,13 +3817,13 @@ mod tests {
         assert_eq!(parse_dbd_hash(Some("dbd:hash=")), None, "empty hash → None");
     }
 
-    /// A create carries both the `CREATE MATERIALIZED VIEW … WITH DATA` and the
-    /// v2 hash sentinel comment.
+    /// A create is the `CREATE MATERIALIZED VIEW … WITH DATA` alone — the stamp
+    /// is recorded apart, and the view's comment is left to its author.
     #[test]
-    fn matview_create_sql_has_create_and_comment() {
-        let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
+    fn matview_create_sql_creates_and_leaves_the_comment_alone() {
+        let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"));
         assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
-        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=v2:abc123';"));
+        assert!(!sql.contains("COMMENT ON"), "{sql}");
     }
 
     /// A v1 stamp means "written by a dbd that hashed the old body contract",

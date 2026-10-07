@@ -268,10 +268,10 @@ impl Design {
         // that drift. Runs after commit, so the object exists for the COMMENT.
         for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
             adapter
-                .execute_script(&crate::reconcile::matview_hash_comment_sql(
-                    &e.name,
-                    &crate::reconcile::matview_hash(e),
-                ))
+                .stamp_matview(
+                    &crate::reconcile::qualified_entity_name(e),
+                    &crate::reconcile::matview_stamp(&crate::reconcile::matview_hash(e)),
+                )
                 .await?;
         }
 

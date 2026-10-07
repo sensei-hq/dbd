@@ -116,8 +116,10 @@ pub trait DatabaseAdapter: Send + Sync {
 
     // ── Materialized-view refresh scheduling ────────────
 
-    /// Live materialized-view drift state: `"schema.name"` → the object's raw
-    /// comment text (`None` when it carries no comment at all). An ABSENT key
+    /// Live materialized-view drift state: `"schema.name"` → the drift stamp
+    /// recorded for it (see [`Self::stamp_matview`]), or else the object's raw
+    /// comment text, where a dbd before 0.25 kept the stamp (`None` when there
+    /// is neither). An ABSENT key
     /// means the matview does not exist. Deliberately unparsed here — this
     /// trait is public crate API, while `reconcile::Sentinel` (the
     /// parsed `dbd:hash` stamp) is an internal reconcile detail; callers run it
@@ -126,6 +128,14 @@ pub trait DatabaseAdapter: Send + Sync {
     /// don't expose materialized views).
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         Ok(std::collections::HashMap::new())
+    }
+
+    /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
+    /// materialized view `qualified` (`schema.name`). Kept apart from the view's
+    /// own comment, which belongs to its author. Default: no-op (targets without
+    /// materialized views).
+    async fn stamp_matview(&self, _qualified: &str, _stamp: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Sync pg_cron refresh jobs for the given (qualified_name, ResolvedMatview)

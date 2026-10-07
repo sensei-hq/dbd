@@ -1799,14 +1799,24 @@ impl DatabaseAdapter for PostgresAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("matview_states failed: {e}")))?;
 
+        // A recorded stamp wins; a matview with none falls back to its comment,
+        // where a dbd before 0.25 kept the stamp.
+        let stamps = self.bookkeeping.matview_stamps().await?;
         let mut states = std::collections::HashMap::with_capacity(rows.len());
         for row in &rows {
             let schema: String = row.get("schema");
             let name: String = row.get("name");
             let comment: Option<String> = row.get("comment");
-            states.insert(format!("{schema}.{name}"), comment);
+            let key = format!("{schema}.{name}");
+            let state = stamps.get(&key).cloned().or(comment);
+            states.insert(key, state);
         }
         Ok(states)
+    }
+
+    async fn stamp_matview(&self, qualified: &str, stamp: &str) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.stamp_matview(guard.as_mut(), qualified, stamp).await
     }
 
     async fn sync_refresh_jobs(&self, jobs: &[(String, ResolvedMatview)]) -> Result<()> {

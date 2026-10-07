@@ -1681,12 +1681,13 @@ async fn reconcile_warns_on_matview_definition_change() {
     adapter
         .execute_script(
             "DO $$ BEGIN \
-               IF obj_description('app.mv'::regclass, 'pg_class') NOT LIKE 'dbd:hash=%' \
-               THEN RAISE EXCEPTION 'matview app.mv is missing its dbd:hash sentinel comment'; \
+               IF NOT EXISTS (SELECT 1 FROM dbd.matview_stamps \
+                              WHERE matview = 'app.mv' AND stamp LIKE 'dbd:hash=v2:%') \
+               THEN RAISE EXCEPTION 'matview app.mv has no dbd:hash stamp recorded'; \
                END IF; END $$;",
         )
         .await
-        .expect("sentinel-comment assertion failed");
+        .expect("stamp assertion failed");
 
     // ── Phase 2: SAME design → SKIP. No warning; oid unchanged. ──
     stash_oid(&*adapter).await;
@@ -2067,11 +2068,12 @@ async fn apply_stamps_matview_so_later_reconcile_does_not_warn() {
         "materialized view app.mv",
     )
     .await;
-    // apply must have stamped the dbd:hash sentinel onto the matview's comment.
+    // apply must have recorded the dbd:hash stamp in dbd's bookkeeping.
     adapter
         .execute_script(
             "DO $$ BEGIN \
-               IF obj_description('app.mv'::regclass, 'pg_class') NOT LIKE 'dbd:hash=%' \
+               IF NOT EXISTS (SELECT 1 FROM dbd.matview_stamps \
+                              WHERE matview = 'app.mv' AND stamp LIKE 'dbd:hash=v2:%') \
                THEN RAISE EXCEPTION 'apply did not stamp app.mv with a dbd:hash sentinel'; \
                END IF; END $$;",
         )
