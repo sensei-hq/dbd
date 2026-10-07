@@ -54,6 +54,19 @@ impl Design {
             ));
         }
 
+        // A function is never run as a loader (see `import_plan`). When one reads
+        // a staging table that no procedure loads, it is most likely a loader
+        // written as a function — say so, or the target stays empty in silence.
+        for entry in self.import_plan(name).iter().filter(|e| e.procedure.is_none()) {
+            for function in self.routines_reading(EntityType::Function, &entry.table.name) {
+                warnings.push(format!(
+                    "{} has no loader procedure — function {} reads it but is not run: loaders are \
+                     CALLed, so write it as a procedure, or run it from import.after",
+                    entry.table.name, function.name
+                ));
+            }
+        }
+
         warnings
     }
 
@@ -142,6 +155,12 @@ impl Design {
     ///          config.lookup_values has FK to config.lookups
     ///          → import_lookups must run before import_lookup_values
     ///
+    /// Only procedures are matched. The loader step is `CALL`, which Postgres
+    /// refuses for a function, and a function that reads a staging table is far
+    /// more often a helper or a trigger function than a loader — matching one
+    /// failed the whole import. Such a function is reported instead (see
+    /// [`Design::import_warnings`]).
+    ///
     /// Staging tables that failed to parse are excluded here; they are reported
     /// separately via [`Design::import_invalid_tables`].
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
@@ -152,21 +171,11 @@ impl Design {
             .filter(|t| name.is_none_or(|n| t.name == n))
             .collect();
 
-        // Collect all procedures that are candidates for import (in staging schemas)
-        let procedures: Vec<&Entity> = self
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == EntityType::Procedure || e.entity_type == EntityType::Function)
-            .filter(|e| e.reads().next().is_some() || e.writes().next().is_some())
-            .collect();
-
         // Build entries: match each staging table to the procedure that reads from it
         let mut entries: Vec<ImportPlanEntry> = tables
             .iter()
             .map(|table| {
-                let matched_proc = procedures
-                    .iter()
-                    .find(|proc| proc.reads().any(|r| r.name == table.name));
+                let matched_proc = self.routines_reading(EntityType::Procedure, &table.name).next();
 
                 ImportPlanEntry {
                     table: (*table).clone(),
@@ -184,6 +193,13 @@ impl Design {
         self.sort_import_plan(&mut entries);
 
         entries
+    }
+
+    /// The `kind` routines (procedures or functions) whose body reads `table`.
+    fn routines_reading<'a>(&'a self, kind: EntityType, table: &'a str) -> impl Iterator<Item = &'a Entity> + 'a {
+        self.entities
+            .iter()
+            .filter(move |e| e.entity_type == kind && e.reads().any(|r| r.name == table))
     }
 
     /// Sort import entries so that procedures writing to tables referenced by other
