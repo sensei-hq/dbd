@@ -1,5 +1,7 @@
 import { it, expect, describe } from 'vitest';
-import { allEntities, entityAt, kindCounts, KIND_ORDER } from './entities';
+import { allEntities, entityAt, kindCounts, KIND_ICON, KIND_ORDER } from './entities';
+import { OVERVIEW_ICONS } from './overview';
+import type { SchemaModel } from './model';
 import { sampleModel } from './data';
 
 // Every entity in one list (#34): tables, the v2 entities and the v3 enums, keyed `schema.name`
@@ -46,5 +48,26 @@ describe('kindCounts', () => {
       { kind: 'procedure', count: 1 },
       { kind: 'enum', count: 1 },
     ]);
+  });
+});
+
+// Sequences reach the model as entities of kind `sequence` (v3).
+describe('a sequence', () => {
+  const withSequence: SchemaModel = {
+    ...sampleModel,
+    entities: [...(sampleModel.entities ?? []), { schema: 'shop', name: 'invoice_no', kind: 'sequence' }],
+  };
+
+  it('is an entity like any other, counted under its own kind', () => {
+    expect(entityAt(withSequence, 'shop.invoice_no')?.kind).toBe('sequence');
+    expect(kindCounts(withSequence).find((k) => k.kind === 'sequence')).toEqual({ kind: 'sequence', count: 1 });
+  });
+
+  it('reads with the types tables use, just before the enums', () => {
+    expect(KIND_ORDER.slice(-2)).toEqual(['sequence', 'enum']);
+  });
+
+  it('wears an icon the UnoCSS safelist can see', () => {
+    expect(Object.values(OVERVIEW_ICONS)).toContain(KIND_ICON['sequence' as keyof typeof KIND_ICON]);
   });
 });
