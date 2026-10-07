@@ -667,6 +667,29 @@ mod tests {
         );
     }
 
+    /// A real table the `export:` list leaves out is refused by name too: it
+    /// would otherwise export nothing and say "No tables to export.".
+    #[tokio::test]
+    async fn export_name_absent_from_the_export_list_is_refused() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::write(
+            proj.path().join("ddl/table/config/unlisted.ddl"),
+            "set search_path to config;\ncreate table if not exists unlisted (id int primary key);\n",
+        )
+        .unwrap();
+        let mock = MockAdapter::new();
+        let err = export_project(
+            &mock,
+            &proj.path().join("design.yaml"),
+            proj.path(),
+            Some("config.unlisted"),
+            "csv",
+        )
+        .await
+        .expect_err("a table the export: list leaves out is not exported");
+        assert!(err.to_string().contains("not listed under export:"), "{err}");
+    }
+
     /// A full (non-ad-hoc) import runs the design's import plan through the
     /// adapter and loads the fixture's data files.
     #[tokio::test]
