@@ -271,3 +271,66 @@ fn inspect_refuses_a_scope_whose_closure_needs_what_it_excludes() {
         stderr(&out)
     );
 }
+
+/// Everything inspect advises on lives in `app`: a string-set CHECK (an enum
+/// candidate), a table in an exposed schema with no policy, and a matview whose
+/// refresh is scheduled without pg_cron. The `hub` scope builds none of it.
+fn advisory_outside_hub_project(dir: &Path) {
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: advisory\n\n\
+         source:\n  dialect: postgresql\n\n\
+         schemas:\n  - app:\n      exposed: true\n  - hub\n\n\
+         materialized_views:\n  options:\n    refresh: \"0 3 * * *\"\n\n\
+         scopes:\n  hub:\n    includes:\n      - hub\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+         state text not null constraint orders_state_chk check (state in ('pending', 'shipped'))\n);\n",
+    );
+    write(
+        dir,
+        "ddl/materialized_view/app/order_counts.ddl",
+        "set search_path to app;\ncreate materialized view if not exists order_counts as \
+         select state, count(*) as n from app.orders group by state;\n",
+    );
+    write(
+        dir,
+        "ddl/table/hub/nodes.ddl",
+        "set search_path to hub;\ncreate table if not exists nodes (\n  id integer primary key\n);\n",
+    );
+}
+
+/// Inspect's advisory checks ran over the whole design whatever the scope, so
+/// `inspect --scope hub` advised on — and, for the matview, failed on — entities
+/// `hub` never builds.
+#[test]
+fn inspect_under_a_scope_advises_only_on_what_the_scope_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    advisory_outside_hub_project(tmp.path());
+
+    let whole = dbd(tmp.path(), &["inspect"]);
+    let (whole_out, whole_err) = (stdout(&whole), stderr(&whole));
+    assert!(
+        whole_out.contains("Suggestions:")
+            && whole_err.contains("No RLS policy")
+            && whole_out.contains("Materialized view errors"),
+        "precondition: unscoped, the project trips every advisory check:\n{whole_out}\n{whole_err}"
+    );
+
+    let out = dbd(tmp.path(), &["inspect", "--scope", "hub"]);
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert!(
+        out.status.success(),
+        "nothing 'hub' builds is broken, so inspect passes it:\n{text}\n{err}"
+    );
+    assert!(!text.contains("Suggestions:"), "no enum advice for app.orders: {text}");
+    assert!(!err.contains("No RLS policy"), "no RLS advice for app.orders: {err}");
+    assert!(
+        !text.contains("Materialized view errors"),
+        "no matview error for app.order_counts: {text}"
+    );
+}
