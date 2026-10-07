@@ -86,7 +86,8 @@
 //! Functions, procedures and triggers. Their bodies are PL/pgSQL or SQL that
 //! does not translate, and dbd holds them as opaque text — emitting them would
 //! produce something that looks convertible and is not. They are reported as
-//! skipped so the omission is visible.
+//! skipped so the omission is visible. So is anything whose file does not
+//! parse: there is no structure to translate, and the schema is missing it.
 
 use crate::entity::{
     ColumnDef, Entity, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, IndexType, SortOrder, TableConstraint,
@@ -274,7 +275,34 @@ pub fn emit_schema(
         out.extend(schemas.iter().map(|s| format!("CREATE SCHEMA {};", target.quote(s))));
     }
 
-    for e in entities.iter().filter(|e| e.errors.is_empty()) {
+    for e in &entities {
+        // A file that does not parse has no structure to translate, so it
+        // cannot be emitted — but leaving it out without a word gave a schema
+        // missing a table, an exit of 0 and an empty report.
+        if !e.errors.is_empty() {
+            if !matches!(
+                e.entity_type,
+                EntityType::External
+                    | EntityType::Import
+                    | EntityType::Schema
+                    | EntityType::Extension
+                    | EntityType::Role
+            ) {
+                let d = Downgrade {
+                    entity: e.name.clone(),
+                    column: None,
+                    from: format!("a {} whose file could not be parsed", e.entity_type.tag()),
+                    to: "nothing".to_string(),
+                    reason: format!(
+                        "{} — the emitted schema is missing it until the file is fixed",
+                        e.errors.join("; ")
+                    ),
+                };
+                out.push(d.comment(target));
+                report.push(d);
+            }
+            continue;
+        }
         match e.entity_type {
             EntityType::Table => {
                 out.push(emit_table(e, &script, &mut report));
