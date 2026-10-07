@@ -234,3 +234,45 @@ async fn merge_reads_a_live_database_into_the_project() {
     // say so rather than invent a change.
     assert!(!combined(&o).is_empty(), "merge must report what it would do");
 }
+
+// ── Ad-hoc data files ───────────────────────────────────────────────────────
+
+/// Export `app.widgets` as CSV through the binary and return the file's text.
+fn exported_widgets(dir: &Path, url: &str) -> String {
+    let out = dir.join("out");
+    let o = dbd(
+        dir,
+        url,
+        &["export", "-n", "app.widgets", "-f", "csv", "-o", out.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "export failed: {}", combined(&o));
+    std::fs::read_to_string(out.join("widgets.csv")).expect("export wrote widgets.csv")
+}
+
+/// `dbd import -n <table> -f <file>.jsonl` loads one file outside the import
+/// plan, and JSON rows reach their table through dbd's internal
+/// `staging.import_jsonb_to_table` procedure. Only the full import installed
+/// it, so on a database that had never run one the ad-hoc load failed asking
+/// for a procedure the user never wrote.
+#[tokio::test]
+async fn an_ad_hoc_jsonl_import_loads_into_a_database_that_never_ran_a_full_import() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    assert!(dbd(dir, &url, &["apply"]).status.success());
+
+    std::fs::write(
+        dir.join("rows.jsonl"),
+        "{\"id\":1,\"name\":\"alpha\"}\n{\"id\":2,\"name\":\"beta\"}\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["import", "-n", "app.widgets", "-f", "rows.jsonl"]);
+    assert!(o.status.success(), "ad-hoc jsonl import failed: {}", combined(&o));
+
+    let csv = exported_widgets(dir, &url);
+    assert!(
+        csv.contains("1,alpha") && csv.contains("2,beta"),
+        "rows not loaded: {csv}"
+    );
+}
