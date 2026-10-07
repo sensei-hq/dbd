@@ -52,7 +52,10 @@ pub const SUPABASE_PROTECTED: &[&str] = &[
 /// Generate DDL SQL from an entity.
 ///
 /// For schema/extension/role: generates CREATE statements.
-/// For file-based entities (table, view, etc.): reads the DDL file.
+/// For file-based entities (table, view, etc.): reads the DDL file, decoded as
+/// the project scan decodes it (see [`crate::source_text`]). Reading it with
+/// the stdlib instead turned a UTF-16 file the scan had loaded into `None` —
+/// which `apply` and `combine` take to mean "no DDL", skipping the entity.
 pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     match entity.entity_type {
         EntityType::Schema => Some(format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", entity.name)),
@@ -65,7 +68,10 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
         }
         EntityType::Role => Some(generate_role_script(entity)),
         EntityType::External => None,
-        _ => entity.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()),
+        _ => entity
+            .file
+            .as_ref()
+            .and_then(|f| crate::source_text::read_to_string(f).ok()),
     }
 }
 
