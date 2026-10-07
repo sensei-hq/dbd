@@ -424,7 +424,14 @@ impl Design {
     ///
     /// Run by `dbd apply` and by [`Design::deploy`]. It lived in the CLI's apply
     /// handler alone, so a deploy — and every embedder — got no grants at all.
-    pub async fn apply_grants(&self, adapter: &dyn DatabaseAdapter) -> Result<GrantsOutcome> {
+    ///
+    /// Under a scope, only the schemas the scope builds are granted on: the
+    /// rest were never created, and a GRANT on one fails the run.
+    pub async fn apply_grants(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<GrantsOutcome> {
         let mut schema_grants = self.config.schema_grants();
         let mut supabase_schemas: Vec<String> = vec![];
         if let Some((target_name, target_config)) = self.config.target.iter().next() {
@@ -441,6 +448,11 @@ impl Design {
             if target_name == "supabase" && !schema_grants.is_empty() {
                 supabase_schemas = self.config.schema_names();
             }
+        }
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            schema_grants.retain(|schema, _| ws.contains(schema));
+            supabase_schemas.retain(|schema| ws.contains(schema));
         }
 
         if schema_grants.is_empty() {
@@ -540,7 +552,7 @@ impl Design {
         let grants = if dry_run {
             GrantsOutcome::None
         } else {
-            self.apply_grants(adapter).await?
+            self.apply_grants(adapter, scope).await?
         };
 
         // Always run the import phase, even when the plan is empty: it still

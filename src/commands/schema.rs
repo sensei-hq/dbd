@@ -850,7 +850,11 @@ pub async fn cmd_apply(
     // jobs through the shared path (no CLI-side sync call needed here).
 
     // Grants: shared with `Design::deploy`, so both commands grant alike.
-    match design.apply_grants(&*adapter).await.context("Failed to apply grants")? {
+    match design
+        .apply_grants(&*adapter, Some(&resolved))
+        .await
+        .context("Failed to apply grants")?
+    {
         dbd_core::design::GrantsOutcome::Applied => {
             output::info(verbosity, "Applied grants.");
             output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
