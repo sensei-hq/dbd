@@ -498,6 +498,32 @@ mod tests {
         );
     }
 
+    /// The real ad-hoc import honours `--scope` as its dry run does: a table the
+    /// scope does not build is refused, and nothing reaches the adapter.
+    #[tokio::test]
+    async fn import_adhoc_into_a_table_outside_the_scope_is_refused() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        // `incomplete` builds config.lookup_values, not config.lookups.
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("config.lookups"),
+            Some(Path::new("data/lookups.csv")),
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("a table outside the scope must not be loaded");
+
+        assert!(
+            err.to_string().contains("config.lookups is outside scope 'incomplete'"),
+            "{err}"
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
+
     /// An unknown name is passed through verbatim rather than silently dropped,
     /// so an ad-hoc COPY target can still be addressed by a bare name.
     #[tokio::test]
