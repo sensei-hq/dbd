@@ -95,6 +95,21 @@ pub struct SchemaSelect {
     pub all: bool,
 }
 
+/// Whether introspected `entities` come from a Supabase database.
+///
+/// Supabase is PostgreSQL behind an ordinary `postgres://` URL, so the scheme
+/// cannot tell them apart; its platform schemas can. Both `auth` and `storage`
+/// are required — a plain database with an `auth` schema of its own is common
+/// enough that one alone would misname it.
+pub fn looks_like_supabase(entities: &[Entity]) -> bool {
+    let has_schema = |name: &str| {
+        entities
+            .iter()
+            .any(|e| (e.entity_type == EntityType::Schema && e.name == name) || e.schema.as_deref() == Some(name))
+    };
+    has_schema("auth") && has_schema("storage")
+}
+
 /// Filter `db_schemas` (all schemas discovered in the DB) down to the set to emit.
 pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String> {
     db_schemas
@@ -353,8 +368,10 @@ pub fn plan_from_entities(
 /// - `target.<dialect-key>.url` — always `$DATABASE_URL`, never a literal connection string
 /// - `schemas` list populated from the discovered schema set
 ///
-/// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`;
-/// `"sqlite"` maps to the `sqlite` target key, everything else maps to `"postgres"`.
+/// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`, and names the
+/// target key; anything else maps to `"postgres"`. `supabase` is a target of its
+/// own rather than a spelling of `postgres`: it is what turns on Supabase's
+/// protected schemas, its PostgREST grants and its exposed-`public` default.
 ///
 /// A SQLite source also gets an explicit `source.dialect: sqlite`. Everything
 /// else is left to the `postgresql` default, so a Postgres project's generated
@@ -364,7 +381,11 @@ pub fn plan_from_entities(
 /// and `STRICT`, so a project dbd had just written refused to load (issue #20).
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
     let is_sqlite = dialect == "sqlite";
-    let target_key = if is_sqlite { "sqlite" } else { "postgres" };
+    let target_key = match dialect {
+        "sqlite" => "sqlite",
+        "supabase" => "supabase",
+        _ => "postgres",
+    };
     let source_block = if is_sqlite {
         "source:\n  dialect: sqlite\n\n"
     } else {

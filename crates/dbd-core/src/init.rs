@@ -91,7 +91,8 @@ ignore:
   - auth.*
   - storage.*
   - realtime.*
-  - supabase_*.*
+  - supabase_functions.*
+  - supabase_migrations.*
   - extensions.*
   - pgbouncer.*
   - pgsodium.*
