@@ -41,6 +41,24 @@ stop data loss:
 - **`reconcile` records version 0 for a project with no `project.version`**,
   as `apply` does. It recorded 1, after which a dev `reset` refused as though
   migrations had run.
+- **A `-n` that names nothing, or something the scope does not build, is an
+  error** — `no entity named 'X'` or `X is outside scope 'S'` — on `inspect`,
+  `apply`, `graph`, `export` and `refresh`. It used to succeed having done
+  nothing. `Design::apply` and `Design::graph` refuse it too.
+- **`dbd release` releases a brownfield project** — one `init --from-db` or
+  `merge` gave snapshots but no `released` flag — at the version its snapshots
+  reached, without a second baseline. It refuses while the design has changes
+  no snapshot records, or when `project.version` disagrees with the latest
+  snapshot.
+- **Every command counts a scope the same way**: `scope 'X': N of M entities`,
+  over the working set including the `deps: include` closure, with externals
+  left out — so the unscoped `inspect` count no longer includes them.
+- **`init --from-db` gives a Supabase database a `supabase` target** (one with
+  both an `auth` and a `storage` schema), and `init --from-dbml` accepts
+  `--target supabase`.
+- **`dbd combine` writes its generated statements in the project's dialect**: a
+  guarded `CREATE SCHEMA` and `GO` for T-SQL, nothing for MySQL and SQLite, and
+  PostgreSQL-only extensions and roles as a comment.
 - **Only a procedure is matched as an import loader.** A function was matched
   too and then run with `CALL`, which Postgres refuses for a function — and a
   helper function reading the staging table could be picked ahead of the real
@@ -139,6 +157,31 @@ stop data loss:
   `materialized_views`, `matview`, `matviews` and `sequences`.
 - **`--help` for `--source` and `dbd diff`** is accurate.
 
+**Dry runs and `inspect` agree with the real run**
+
+- **`apply --dry-run` refuses what `apply` refuses** — a file that does not
+  parse, a scope gap or closure conflict, an unknown `-n` — and honours the
+  scope's `extensions:` allowlist. It said "no issues" and exited 0.
+- **`deploy --dry-run` refuses a file that does not parse**, and reports the
+  scope it runs, its entity count and the policies it would apply, after scope
+  filtering. Under `deps: include`, auto-included gaps print as `+
+  auto-included:`, not as failures.
+- **`policies --dry-run --scope` lists only the policies the real run
+  applies.**
+- **`reconcile --dry-run` refuses a database pinned to another scope**, as the
+  real run does.
+- **`inspect --scope` refuses a scope whose `deps: include` closure needs what
+  it excludes**, as apply, `dbml` and `diagram` do, and runs its advisory checks
+  over the scope rather than the whole design.
+- **`inspect --fix --scope` formats only the scope's files**; `import -f
+  --scope` refuses a declared table outside the scope; `--deps` given to a
+  command that takes no scope is warned about, as `--scope` is.
+- **`inspect -s <relative path>` finds the project's files.**
+- An unversioned apply no longer says "Fresh install at v0"; `doctor` counts
+  what it checked; the refusal `diff`/`reconcile` give a T-SQL or MySQL project
+  no longer claims `apply` works there; the Supabase scaffold's `ignore`
+  patterns match Supabase's schemas.
+
 **Import and export**
 
 - **The default `truncate: true` works on SQLite and Convex.** Import issued
@@ -213,6 +256,10 @@ stop data loss:
 - On Convex, `truncate: false` has no effect (the import always replaces), and
   a `.json` file must be a JSON array — Convex's importer reads no JSON lines.
 - Import data files are read as UTF-8; a UTF-16 CSV is not decoded.
+- A scoped apply still syncs pg_cron refresh jobs for the whole design, so a
+  scope whose `extensions:` allowlist leaves out pg_cron fails if a
+  materialized view outside it has a schedule.
+- `dbd combine` leaves out an entity whose file does not parse, without saying.
 - `apply.before` hooks run outside apply's transaction, so their effects stay
   when the entity batch rolls back.
 - `dbd diff` does not compare table, view or enum comments.
