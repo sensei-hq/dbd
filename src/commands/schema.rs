@@ -1029,12 +1029,21 @@ pub async fn cmd_policies(
             output::info(verbosity, "No policy files found in policies/");
             return Ok(());
         }
-        output::info(verbosity, "[dry-run] Would apply policies:");
-        for file in &plan.applied {
-            output::info(verbosity, &format!("  {}", file.display()));
+        // Each list under its own heading: "Would apply" over a list of skips
+        // announced work the run will not do.
+        if plan.applied.is_empty() {
+            output::info(verbosity, "[dry-run] No policy file would be applied.");
+        } else {
+            output::info(verbosity, "[dry-run] Would apply policies:");
+            for file in &plan.applied {
+                output::info(verbosity, &format!("  {}", file.display()));
+            }
         }
-        for (file, why) in &plan.skipped {
-            output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+        if !plan.skipped.is_empty() {
+            output::info(verbosity, "[dry-run] Would skip policies:");
+            for (file, why) in &plan.skipped {
+                output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+            }
         }
         return Ok(());
     }
