@@ -49,15 +49,12 @@ pub async fn cmd_inspect(
     let scoped = design.scoped_entities(&resolved)?;
     let report = design.report(name, Some(&resolved));
 
+    // Count what this run is actually about, the way every other command
+    // counts it: under a scope, the entities it builds (closure included).
+    let (total_entities, design_entities) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, total_entities, design_entities);
     report_scope_gaps(&resolved, &report, verbosity)?;
-
-    // Count what this run is actually about. Under a scope the whole-project
-    // total contradicts the "scope 'X': N entities" line printed just above.
     let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
-    let total_entities = match scope_name {
-        Some(_) => resolved.entities.len(),
-        None => design.entities().len(),
-    };
 
     if verbosity.is_verbose()
         && let Some(entity) = &report.entity
@@ -208,10 +205,6 @@ fn report_scope_gaps(
         return Ok(());
     }
 
-    output::info(
-        verbosity,
-        &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()),
-    );
     for gap in &report.gaps {
         output::always(&format!(
             "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
@@ -772,11 +765,8 @@ pub fn cmd_combine(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
-    output::scope_filtered(
-        &resolved,
-        design.scoped_entities(&resolved)?.len(),
-        design.entities().len(),
-    );
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     design.combine(file, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
@@ -806,6 +796,8 @@ pub async fn cmd_apply(
         // did not parse. A preview that filters for itself lists what the run
         // will not do and passes what the run refuses.
         let entities = design.entities_to_apply(name, Some(&resolved))?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
 
         for entity in &entities {
             let detail = match &entity.file {
@@ -943,7 +935,8 @@ pub async fn cmd_refresh(
     // as an error, the same failure the policy phase used to produce.
     let resolved_scope = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let scoped = design.scoped_entities(&resolved_scope)?;
-    output::scope_filtered(&resolved_scope, scoped.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved_scope)?;
+    output::scope_filtered(&resolved_scope, kept, total);
 
     let selected = select_matviews(&scoped, name);
     if selected.is_empty() {

@@ -64,7 +64,8 @@ pub fn cmd_dbml(
     // entities that deploy under this scope. The all-scope keeps everything.
     let resolved = design.resolve_scope(scope, deps)?;
     let entities = design.scoped_entities(&resolved)?;
-    output::scope_filtered(&resolved, entities.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
@@ -360,11 +361,8 @@ pub async fn cmd_deploy(
         // What the scope builds, not what the design declares: a scoped deploy
         // never touches the rest, so the whole-design tally described a run
         // that does not happen.
-        output::scope_filtered(
-            &resolved,
-            design.scoped_entities(&resolved)?.len(),
-            design.entities().len(),
-        );
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
             for gap in &report.gaps {
