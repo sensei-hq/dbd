@@ -3918,6 +3918,72 @@ import:
         assert_eq!(report.gaps[0].required_by, "config.lookup_values");
     }
 
+    /// An import loads its file into a staging table, then a procedure moves the
+    /// rows into its targets — so under a scope it runs only where both exist.
+    /// The rule checked the targets alone, so a scope without the (declared)
+    /// staging table kept the import and failed on a table never created; and
+    /// a skip blamed the staging table even when a target was the one outside.
+    #[test]
+    fn a_scoped_import_needs_its_staging_table_and_its_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in [
+            "ddl/table/config",
+            "ddl/table/staging",
+            "ddl/procedure/staging",
+            "import/staging",
+        ] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - config\n  - staging\nimport:\n  staging: [staging]\n\
+             scopes:\n  targets_only:\n    includes: [config]\n  staging_only:\n    includes: [staging]\n\
+             \x20 both:\n    includes: [config, staging]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/config/lookups.ddl"),
+            "set search_path to config;\ncreate table if not exists lookups (name text primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/lookups.ddl"),
+            "set search_path to staging;\ncreate table if not exists lookups (name text);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/procedure/staging/import_lookups.ddl"),
+            "set search_path to staging;\ncreate or replace procedure import_lookups() language plpgsql as $$\n\
+             begin insert into config.lookups(name) select name from staging.lookups; end; $$;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("import/staging/lookups.csv"), "name\nalpha\n").unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let plan = |scope: &str| {
+            let s = design.resolve_scope(Some(scope), Some(DepsPolicy::Include)).unwrap();
+            design.scoped_import_plan(None, Some(&s)).unwrap()
+        };
+
+        let (kept, skips) = plan("targets_only");
+        assert!(kept.is_empty(), "no staging table, no import");
+        assert!(
+            skips.iter().any(|w| w.contains("staging.lookups is outside")),
+            "{skips:?}"
+        );
+
+        let (kept, skips) = plan("staging_only");
+        assert!(kept.is_empty(), "no target, no import");
+        assert!(
+            skips.iter().any(|w| w.contains("config.lookups is outside")),
+            "{skips:?}"
+        );
+
+        let (kept, skips) = plan("both");
+        assert_eq!(kept.len(), 1, "{skips:?}");
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
     #[test]
     fn import_entry_in_scope_predicate() {
         use std::collections::HashSet;
