@@ -2019,19 +2019,26 @@ mod tests {
         assert_ne!(formatted, "create table public.thing(id int,name text);");
     }
 
+    /// `text` as SSMS saves it: UTF-16LE behind a byte-order mark.
+    fn utf16le(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
     /// `format` read each DDL file with `read_to_string`, so one file saved by
     /// SSMS (UTF-16) failed the whole run — though the project load decodes it.
-    /// A file it rewrites is written back as UTF-8, as every file dbd writes is.
+    /// And a file it rewrites keeps the encoding it had: it was written back as
+    /// UTF-8, so formatting changed every byte of an SSMS project's files
+    /// without saying so.
     #[test]
-    fn format_reads_a_utf16_ddl_file() {
+    fn format_rewrites_a_utf16_ddl_file_in_utf16() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ddl/table/public/thing.ddl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut utf16 = vec![0xFF, 0xFE];
-        for unit in "create table public.thing(id int,name text);".encode_utf16() {
-            utf16.extend_from_slice(&unit.to_le_bytes());
-        }
-        std::fs::write(&path, utf16).unwrap();
+        std::fs::write(&path, utf16le("create table public.thing(id int,name text);")).unwrap();
 
         cmd_format(
             &tmp.path().join("design.yaml"),
@@ -2041,9 +2048,28 @@ mod tests {
         )
         .expect("a UTF-16 DDL file must be formatted, not fail the run");
 
-        let formatted = std::fs::read_to_string(&path).expect("rewritten as UTF-8");
-        assert!(formatted.contains("thing"), "{formatted:?}");
-        assert_ne!(formatted, "create table public.thing(id int,name text);");
+        let bytes = std::fs::read(&path).unwrap();
+        let text = dbd_core::source_text::read_to_string(&path).unwrap();
+        assert_eq!(bytes, utf16le(&text), "rewritten in UTF-16LE behind its BOM");
+        assert!(text.contains("thing"), "{text:?}");
+        assert_ne!(text, "create table public.thing(id int,name text);");
+    }
+
+    /// `inspect --fix` formats through the same rewrite, so it keeps a file's
+    /// encoding too.
+    #[test]
+    fn inspect_fix_rewrites_a_utf16_ddl_file_in_utf16() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/table/public/thing.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, utf16le("create table public.thing(id int,name text);")).unwrap();
+
+        fix_format_ddl(&tmp.path().join("design.yaml"), tmp.path(), None, Verbosity::Normal).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let text = dbd_core::source_text::read_to_string(&path).unwrap();
+        assert_ne!(text, "create table public.thing(id int,name text);");
+        assert_eq!(bytes, utf16le(&text), "rewritten in UTF-16LE behind its BOM");
     }
 
     /// Mixed fixture for `select_matviews`: two matviews in `analytics`, one
