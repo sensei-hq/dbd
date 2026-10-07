@@ -154,6 +154,46 @@ fn apply_dry_run_under_a_scope_is_not_blocked_by_a_file_outside_it() {
     assert!(stdout(&out).contains("hub.nodes"), "{}", stdout(&out));
 }
 
+// ── a document says what it leaves out ──────────────────────────────────────
+
+/// `dbml` and `diagram` cannot document a file dbd could not read, and both
+/// left it out with an exit of 0 and not a word — a document missing a table,
+/// indistinguishable from a complete one. `emit` already reports it; these
+/// now name it the same way, and still write what they can.
+#[test]
+fn dbml_and_diagram_name_a_file_they_leave_out_because_it_does_not_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    for args in [
+        &["dbml", "-f", "out.dbml"][..],
+        &["diagram", "--json", "-f", "out.json"][..],
+    ] {
+        let out = dbd(tmp.path(), args);
+        assert!(out.status.success(), "{args:?} still writes: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("broken.ddl") && stderr(&out).contains("could not be parsed"),
+            "{args:?} must name the file it leaves out: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// Like apply's refusal, the warning follows the scope: a file the scope does
+/// not document is not missing from it.
+#[test]
+fn dbml_under_a_scope_does_not_warn_about_a_file_outside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    let out = dbd(tmp.path(), &["dbml", "-f", "out.dbml", "--scope", "hub"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("broken.ddl"), "{}", stderr(&out));
+}
+
 // ── policies --dry-run agrees with policies ─────────────────────────────────
 
 /// The real `policies` (and `deploy`) skip a policy whose table the scope does
