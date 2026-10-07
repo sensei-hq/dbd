@@ -1,6 +1,6 @@
 ---
 source: crates/dbd-core/src/schema_model.rs
-assertion_line: 602
+assertion_line: 724
 expression: json
 ---
 {
@@ -180,6 +180,31 @@ expression: json
         "t": "lookups",
         "c": "id"
       }
+    },
+    {
+      "from": {
+        "s": "config",
+        "t": "lookup_values",
+        "c": "category_id"
+      },
+      "to": {
+        "s": "config",
+        "t": "categories",
+        "c": "id"
+      }
+    }
+  ],
+  "stubs": [
+    {
+      "schema": "config",
+      "name": "categories",
+      "kind": "unresolved",
+      "columns": [
+        {
+          "name": "id",
+          "type": ""
+        }
+      ]
     }
   ],
   "entities": [
