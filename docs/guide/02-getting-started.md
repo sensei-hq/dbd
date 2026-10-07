@@ -146,7 +146,7 @@ dbd apply --dry-run
 dbd import
 ```
 
-Loads CSV/TSV/JSONL files from `import/` into staging tables, then calls import procedures automatically. See [import and export](10-data.md).
+Loads CSV, TSV, JSON and JSONL files from `import/` into staging tables, then calls the procedures that read them. See [import and export](10-data.md).
 
 ## Evolve the schema
 

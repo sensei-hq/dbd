@@ -117,9 +117,10 @@ The reference target: every feature works here.
   other schemas). The next `apply`, `deploy`, `reconcile` or `reset` folds them
   into `dbd.meta`/`dbd.migrations` in one transaction and drops the originals.
   Read-only commands work on an unhealed database.
-- **Import** streams CSV and TSV through `COPY`; JSON Lines go through a
-  procedure dbd installs as `staging.import_jsonb_to_table` (creating the
-  `staging` schema if needed).
+- **Import** streams CSV and TSV through `COPY`. JSON and JSON Lines records are
+  staged as bound `jsonb` values and moved into the table by a procedure the
+  load installs as `staging.import_jsonb_to_table` (creating the `staging`
+  schema if needed). The truncate before a load is `TRUNCATE`.
 
 ## SQLite
 
@@ -144,10 +145,9 @@ target:
   model).` **Policies** are PostgreSQL SQL, so each policy file fails.
 - **Import** writes multi-row `INSERT … VALUES (?,?),(?,?), …` batches of at most
   500 rows (or 32,000 bound values) in one transaction, matching CSV columns to
-  the header's names. **In 0.24.1 it needs `import.options.truncate: false`:**
-  the default empties each table first with a `TRUNCATE`, which SQLite does not
-  have, so the import (and a `deploy` with data files) fails. With truncate off,
-  rows are appended, so empty the tables yourself before a re-import.
+  the header's names and JSON records to their keys. SQLite has no `TRUNCATE`,
+  so the default truncate runs `DELETE FROM` instead; with `truncate: false`,
+  rows are appended.
 - **Not available:** `diff`, `reconcile` and `emit` refuse a SQLite project,
   because the `verbatim` reader builds no structured model to compare or
   translate; `refresh` has no materialized views to refresh.
@@ -179,12 +179,12 @@ from the design's tables and enums:
   without a message.
 - State lives in `<output>/.dbd_state.json`, not a table.
 - `dbd import` runs `npx convex import --table <name> --replace -y <file>` per
-  data file — once `import.options.truncate` is `false`. In 0.24.1 the default
-  truncate is sent as SQL, which Convex refuses (`Convex adapter does not
-  execute SQL scripts`), so the import fails; an import *procedure* fails the
-  same way. (`--replace` already replaces each table's contents.) `dbd export`
-  is refused: the Convex CLI exports whole deployments only
-  (`npx convex export`).
+  data file. `--replace` empties the table first, so the truncate step sends
+  nothing and `truncate: false` has no effect — a Convex import always
+  replaces. A `.json` file must be a JSON array: Convex's importer reads no JSON
+  Lines from one. An import *procedure* fails, since Convex runs no SQL
+  (`Convex adapter does not execute SQL scripts`). `dbd export` is refused: the
+  Convex CLI exports whole deployments only (`npx convex export`).
 - Convex runs no SQL, so `reset`, `policies`, grants, `diff` and `reconcile` are
   not available.
 
@@ -193,7 +193,7 @@ from the design's tables and enums:
 | | PostgreSQL / Supabase | SQLite | Convex | MySQL / SQL Server |
 |---|---|---|---|---|
 | `apply`, `deploy` | yes, one transaction | yes | writes `schema.ts` | no adapter |
-| `import` | `COPY`, JSON via a procedure | batched `INSERT`, with `truncate: false` | `npx convex import`, with `truncate: false` | no adapter |
+| `import` | `COPY`, JSON via a procedure | batched `INSERT`; truncate is `DELETE FROM` | `npx convex import --replace` | no adapter |
 | `export` | yes | yes | refused | no adapter |
 | `diff`, `reconcile` | yes | no (no structured model) | no | no |
 | grants, `policies` | yes | grants skipped; policies fail | no | no |

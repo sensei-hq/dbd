@@ -223,7 +223,7 @@ The Convex adapter is a codegen target — it does not connect to a server. It w
 
 **Enums and foreign keys.** `Entity::Enum` (DDL `CREATE TYPE … AS ENUM (…)`) emits `export const <name> = v.union(v.literal("…"), …);` above `defineSchema`; columns whose type matches an enum reference the const. Single-column foreign keys (inline or table-level) emit `v.id("target_table")` instead of the scalar validator.
 
-**Migration + data state.** Versioning lives in `<output>/.dbd_state.json` (no `_dbd_meta` table because Convex isn't a SQL store). `dbd import` shells out to `npx convex import --table <flat_name> --replace -y <file>` per import entity — with `import.options.truncate: false`, since Convex runs no SQL and the default truncate is SQL. Whole-deployment export remains the Convex CLI's job (`npx convex export`) — the CLI doesn't expose per-table dumps.
+**Migration + data state.** Versioning lives in `<output>/.dbd_state.json` (no `_dbd_meta` table because Convex isn't a SQL store). `dbd import` shells out to `npx convex import --table <flat_name> --replace -y <file>` per import entity. `--replace` empties the table first, so the truncate step sends nothing and `import.options.truncate: false` has no effect on Convex; a `.json` file must be a JSON array, since Convex's importer reads no JSON Lines from one. Whole-deployment export remains the Convex CLI's job (`npx convex export`) — the CLI doesn't expose per-table dumps.
 
 Append `?deploy=true` to the URL to run `npx convex deploy` automatically after each apply. The CLI must be on PATH (or accessible via `npx`); set `with_cli_dry_run(true)` programmatically (or use `dbd apply --dry-run`) to log commands without spawning.
 
@@ -369,7 +369,7 @@ guide is [import and export](10-data.md).
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `options` | object | `truncate` (default `true`: empty each table before loading it) and `null_value` (default `''`) |
+| `options` | object | `truncate` (default `true`: empty each table before loading it — `TRUNCATE` on PostgreSQL, `DELETE FROM` on SQLite; a Convex import always replaces) and `null_value` (default `''`) |
 | `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — every data file loads |
 | `after`   | list   | SQL scripts run after the data is loaded and the import procedures have run — on `dbd import` and `dbd deploy`. See [Hook scripts](#hook-scripts) |
 | `staging` | list   | Reserved — parsed, not used |
@@ -419,7 +419,7 @@ The run continues; a scoped run is a normal workflow, not an error. This exists 
 
 ### `export`
 
-Which tables `dbd export` writes, and in what format:
+What `dbd export` writes, and in what format:
 
 ```yaml
 export:
@@ -430,9 +430,11 @@ export:
 
 - **Omitted or empty** — `dbd export` writes every table in the design (within
   the scope).
-- **Listed** — only these tables. `dbd export -n <table>` then has to name one
-  of them, or there is nothing to export.
-- Entries must be **tables**: a view listed here is skipped without a message.
+- **Listed** — only these. `dbd export -n <name>` then has to name one of them,
+  or the export refuses.
+- An entry may be a **table, view or materialized view**; a view exports the
+  rows its query returns. An entry that names none of those in the design is
+  reported, and the rest still export.
 - A per-entry `format` (`csv`, `tsv` or `jsonl`) wins over `-f`.
 
 Files are written to `export/<schema>/<name>.<format>`, or flat into the

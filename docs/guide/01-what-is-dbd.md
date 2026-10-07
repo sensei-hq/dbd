@@ -4,7 +4,7 @@ dbd (Database Designer) is a tool for managing database schemas as code. You wri
 
 - **Dependency ordering** — tables with foreign keys are applied after the tables they reference
 - **Schema migrations** — versioned snapshots with auto-generated ALTER scripts
-- **Data loading** — CSV/TSV/JSONL files loaded into staging tables with automatic procedure calls
+- **Data loading** — CSV, TSV, JSON and JSONL files loaded into staging tables, then moved into place by the procedures that read them
 - **Documentation** — DBML generation for dbdocs.io / dbdiagram.io, and a hosted schema viewer (`dbd diagram`)
 - **Multi-target deployment** — PostgreSQL, Supabase, SQLite, and Convex (TypeScript codegen)
 - **Scoped deployments** — deploy a subset of the schema (a named "scope") to different databases from one design, with dependency-gap checking
@@ -92,8 +92,8 @@ picks the adapter:
   writes `convex/schema.ts` with `v.*` validators, enum `export const … =
   v.union(v.literal(…))`, and `v.id("table")` for single-column FKs; names
   flatten from `schema.entity` to `schema_entity`; migration state lives
-  in `.dbd_state.json`; `dbd import` shells out to `npx convex import`
-  (with `import.options.truncate: false`)
+  in `.dbd_state.json`; `dbd import` shells out to `npx convex import
+  --replace`, which replaces each table's rows
 
 dbd also *reads* T-SQL and MySQL DDL, and `dbd emit` writes the schema out for
 MySQL, T-SQL or SQLite — but there is no adapter that applies to MySQL or SQL

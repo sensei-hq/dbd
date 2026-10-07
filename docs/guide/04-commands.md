@@ -203,7 +203,7 @@ Useful for the initial populate after a data load, or in CI — independent of t
 
 ## `dbd import`
 
-Load staging data from CSV/TSV/JSONL files.
+Load staging data from CSV, TSV, JSON and JSONL files.
 
 ```sh
 dbd import                         # Import all tables + call procedures
@@ -215,9 +215,12 @@ dbd import -e dev                  # Load dev-only data
 
 **`-f`/`--file`** loads one explicit file into the table named by `-n` (required with `-f`),
 instead of the `import/<schema>/<table>.<ext>` convention. The format is inferred from the file
-extension (`.jsonl`/`.tsv`/`.csv`). It loads that file and nothing else — no truncate, no
-procedures, no `import.after`, no scope filtering. (On `import`, `-f` is the *file*; on `export`
-it's the *format* — each is unambiguous within its command.)
+extension — `.jsonl`, `.json` (a JSON array of records, or JSON Lines), `.tsv`, and CSV for
+anything else. It loads that file and nothing else — no truncate, no procedures, no
+`import.after`. Under `--scope`, a table the design declares must be one the scope builds
+(`X is outside scope 'S'` otherwise); a table it does not declare loads, with a warning that the
+scope was not applied to it. (On `import`, `-f` is the *file*; on `export` it's the *format* —
+each is unambiguous within its command.)
 
 **`import.after`** scripts run after the procedures, on every `dbd import` (with or without
 `-n`) and on `dbd deploy` — not on `dbd apply`, and not with `-f`. `--dry-run` lists them.
@@ -232,7 +235,7 @@ The full guide is [import and export](10-data.md).
 1 entities — no issues
 ```
 
-Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention. Write loaders as procedures: a function is matched too, but run with `CALL`, which PostgreSQL refuses.
+Procedures are matched by reads/writes analysis (which procedure reads from which staging table), not by naming convention. Only a procedure is matched — the loader step is `CALL`, which PostgreSQL refuses for a function — so a function is never run; one that reads a staging table no procedure loads is named in a warning.
 
 **How reads/writes are derived.** Function and procedure bodies are parsed, not text-matched. `LANGUAGE sql` bodies are parsed as an AST; PL/pgSQL bodies are parsed by libpg_query (PostgreSQL's own parser), which sees through `SELECT … INTO`, `PERFORM`, `FOR … IN … LOOP`, `RETURN QUERY`, and `IF` conditions. Either way, reads and writes are detected precisely through sub-selects, joins, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and CTEs, and a write target (`INSERT`/`UPDATE`/`DELETE`) is distinguished from the tables it reads. A best-effort regex scan is used only if a body can't be parsed at all.
 
@@ -247,10 +250,11 @@ Procedures are matched by reads/writes analysis (which procedure reads from whic
 | No `import/` directory | `no import/ directory — nothing to import` |
 | File belongs to another env | `N data file(s) under import/<env>/ skipped — this run's env is '<env>'` |
 | Staging file failed to parse | `staging table X not imported — data file failed to parse` |
-| Entry cut by `--scope` | `staging table X not imported — outside scope '<name>'` |
+| Entry cut by `--scope` | `X not imported — T is outside scope '<name>'`, naming the staging table or target that is |
 | `-n` matched no staging file | `no staging data file matches --name <name>` |
+| A function reads a staging table no procedure loads | `X has no loader procedure — function F reads it but is not run` |
 
-This is what makes the wrong-`-e` trap visible: a run that seeds no rows now says so instead of reporting a clean, empty success.
+`import --dry-run` prints the same warnings. This is what makes the wrong-`-e` trap visible: a run that seeds no rows now says so instead of reporting a clean, empty success.
 
 ---
 
@@ -683,23 +687,26 @@ snapshots without setting `released` — see
 Export table data to files.
 
 ```sh
-dbd export                              # Every table (or the tables export: lists) as CSV
+dbd export                              # Every table (or what export: lists) as CSV
 dbd export --name config.lookups        # One table — it must be in export:, when export: is set
 dbd export --format tsv                 # TSV format
 dbd export --format jsonl               # JSONL format
 dbd export -n activity.hook_events -f jsonl -o import/staging   # → import/staging/hook_events.jsonl
-dbd export --scope hub                  # Only tables in the 'hub' scope
+dbd export --scope hub                  # Only what the 'hub' scope builds
 ```
 
 By default writes to `export/<schema>/<name>.<format>` (SQLite: `export/<name>.<format>`), relative to the current directory. **`-o`/`--output <dir>`** changes the
 destination directory — files are written flat as `<dir>/<name>.<format>` (so you can export
 straight into the `import/` tree for a round-trip). `-f`/`--format` stays the format
-(`csv`/`tsv`/`jsonl`, default `csv`); a per-table `format` under `export:` wins over it.
+(`csv`/`tsv`/`jsonl`, default `csv`; any other is refused rather than written as CSV); a
+per-table `format` under `export:` wins over it.
 
-With no `export:` list, every table is exported. With one, only the tables it lists — so
-`-n` naming a table the list leaves out prints `No tables to export.` Only **tables** are
-exported: a view listed under `export:` is skipped. `--scope`/`--deps` further restrict the
-export to the scope's working set. See [import and export](10-data.md#export).
+With no `export:` list, every table is exported. With one, only what it lists — tables, and
+views or materialized views, which export the rows their query returns. A `-n` that selects
+nothing is an error: not listed under `export:`, not a table when there is no list, no such
+entity, or outside the scope. A listed entry that names no table or view is warned about.
+`--scope`/`--deps` further restrict the export to the scope's working set. See
+[import and export](10-data.md#export).
 
 ---
 
