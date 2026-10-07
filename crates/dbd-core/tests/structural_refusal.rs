@@ -167,3 +167,52 @@ async fn a_postgres_url_still_routes_to_postgres() {
         "a postgres:// URL must still reach the Postgres adapter: {err}"
     );
 }
+
+// ── The refusal names what does work, and only that ─────────────────────────
+
+/// The refusal's error text for `dialect`, from both operations that raise it.
+async fn refusals(dialect: &str, ddl: &str) -> Vec<String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = project(tmp.path(), dialect, ddl);
+    let design = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).expect("load");
+    let target = dbd_core::connect("sqlite::memory:", "refusal").await.expect("connect");
+    let scope = design.resolve_scope(None, None).expect("scope");
+
+    let diff = design
+        .diff_live(&*target, Some(&scope))
+        .await
+        .expect_err("diff refuses");
+    let reconcile = design
+        .reconcile(&*target, true, true, false, None, dbd_core::design::Progress::none())
+        .await
+        .expect_err("reconcile refuses");
+    vec![diff.to_string(), reconcile.to_string()]
+}
+
+/// The refusal ended "`apply`, `deploy`, `import` and `export` work normally"
+/// for every dialect. True of SQLite, which has an adapter — false of T-SQL and
+/// MySQL, which have none: every one of those commands fails to connect. The
+/// message sent people from one refusal straight into another.
+#[tokio::test]
+async fn the_refusal_promises_no_command_a_dialect_has_no_adapter_for() {
+    for (dialect, ddl) in [
+        ("tsql", "CREATE TABLE dbo.Issues (Id int NOT NULL);"),
+        ("mysql", "CREATE TABLE `Issues` (`Id` INT NOT NULL);"),
+    ] {
+        for err in refusals(dialect, ddl).await {
+            assert!(
+                !err.contains("work normally") && !err.contains("`apply`"),
+                "{dialect}: must not send anyone to apply/deploy/import/export: {err}"
+            );
+            assert!(err.contains("no adapter"), "{dialect}: and must say why: {err}");
+        }
+    }
+}
+
+/// SQLite does have an adapter, so for it the old advice was right and stays.
+#[tokio::test]
+async fn the_sqlite_refusal_still_points_at_the_commands_that_work() {
+    for err in refusals("sqlite", "CREATE TABLE Issues (Id INTEGER NOT NULL);").await {
+        assert!(err.contains("`apply`"), "sqlite has an adapter: {err}");
+    }
+}
