@@ -69,3 +69,22 @@ describe('schemaRows', () => {
     ]);
   });
 });
+
+describe('a project with sequences', () => {
+  it('counts them beside the other entity kinds, before the enums', () => {
+    const m: SchemaModel = {
+      ...sampleModel,
+      entities: [...(sampleModel.entities ?? []), { schema: 'shop', name: 'invoice_no', kind: 'sequence' }],
+    };
+    expect(overviewCounts(m).map((c) => c.key)).toEqual([
+      'schemas',
+      'tables',
+      'view',
+      'procedure',
+      'sequence',
+      'enums',
+      'references',
+    ]);
+    expect(counts(m).sequence).toBe(1);
+  });
+});
