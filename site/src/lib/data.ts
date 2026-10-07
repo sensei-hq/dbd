@@ -36,15 +36,17 @@ export const hero = {
 	install: 'cargo install dbd-cli',
 	terminal: {
 		file: '~/my-project',
+		// dbd's own output, verbatim (blank lines dropped): a released project of
+		// five entities gains a column, from v1 to v2.
 		lines: [
+			{ type: 'cmd', text: 'dbd inspect' },
+			{ type: 'out', text: 'Everything looks ok' },
+			{ type: 'out', text: '5 entities — no issues' },
 			{ type: 'cmd', text: 'dbd snapshot --name "add notes column"' },
-			{ type: 'out', text: '✓ wrote snapshots/002.json' },
-			{ type: 'out', text: '✓ wrote migrations/002/config/lookup_values.sql' },
+			{ type: 'out', text: 'Snapshot v002 created — 0 added, 1 altered, 0 dropped.' },
+			{ type: 'out', text: 'design.yaml version updated to 2' },
 			{ type: 'cmd', text: 'dbd apply' },
-			{ type: 'out', text: '→ config.lookups        created' },
-			{ type: 'out', text: '→ config.genders        created' },
-			{ type: 'out', text: '→ migration 002         applied' },
-			{ type: 'ok', text: '✓ schema in sync' }
+			{ type: 'ok', text: 'Migrated v1 → v2 — 5 applied, 1 migrated, 0 created, 0 dropped.' }
 		] as TerminalLine[]
 	}
 };
@@ -84,23 +86,35 @@ export const overview = {
 		},
 		{
 			title: 'Row-level security',
-			body: 'Manage Postgres/Supabase RLS policies as code in policies/ and apply them with dbd policies.'
+			body: 'Manage Postgres/Supabase RLS policies as code in policies/. dbd deploy applies them, and so do dbd policies and dbd apply --with-policies.'
 		},
 		{
 			title: 'Reverse-engineer a database',
 			body: 'Run dbd init --from-db to generate a fresh project from an existing database, or dbd merge to sync live tables into a project you already have.'
 		},
 		{
-			title: 'Interactive schema diagram',
-			body: 'dbd diagram opens a live, explorable view of your schema — tables, columns and foreign-key relationships.'
+			title: 'Interactive schema viewer',
+			body: 'dbd diagram opens your schema in the browser: an overview, an ER diagram, a page for every table, view, routine, trigger and enum, and a changelog built from your snapshots.'
 		},
 		{
 			title: 'Deploy straight from GitHub',
-			body: 'dbd deploy fetches a schema from a directory or GitHub repo (-s owner/repo/path), then applies and imports it — no local checkout.'
+			body: 'dbd deploy fetches a schema from a directory or a GitHub repo (-s owner/repo/path, GITHUB_TOKEN for a private one), then applies it, grants, imports and applies policies — no local checkout.'
 		},
 		{
 			title: 'Environment-scoped data',
 			body: 'Seed data is environment-aware: files under import/<env>/<schema>/ load only when you pass -e <env>. Ship dev fixtures that never touch production.'
+		},
+		{
+			title: 'Materialized views',
+			body: 'A first-class entity type under ddl/materialized_view/, refreshed on a pg_cron schedule declared in design.yaml or now with dbd refresh. Drift is reported; a matview is never silently dropped and rebuilt.'
+		},
+		{
+			title: 'Lifecycle hooks',
+			body: 'apply.before, apply.after and import.after run your own SQL around the DDL and data phases — publications, grants, loaders — and a scope filters them like everything else.'
+		},
+		{
+			title: 'Drift, both ways',
+			body: 'dbd diff shows how the live database differs from the design, read-only, with an exit code for CI. dbd emit goes the other way and translates the schema for MySQL, T-SQL or SQLite.'
 		}
 	]
 };
@@ -115,7 +129,7 @@ export const concepts = {
 			id: 'ddl',
 			kicker: 'Source of truth',
 			title: 'DDL files are the schema',
-			body: 'Your schema is standard SQL under ddl/. One entity per file — table, view, function, procedure or enum. The file path determines the entity name. No DSL, no ORM.',
+			body: 'Your schema is standard SQL under ddl/. One entity per file — table, view, materialized view, function, procedure, enum, sequence or role. The file path determines the entity name. No DSL, no ORM.',
 			code: {
 				lang: 'text',
 				label: 'ddl/',
@@ -135,7 +149,7 @@ export const concepts = {
 				lang: 'yaml',
 				label: 'design.yaml',
 				source:
-					'project:\n  name: MyProject\n\nsource:\n  dialect: postgresql\n\ntarget:\n  postgres:\n    url: $DATABASE_URL\n    extensions: [uuid-ossp]\n\nschemas: [config, staging]\n\nimport:\n  staging: [staging]\n  options:\n    truncate: true'
+					'project:\n  name: MyProject\n\nsource:\n  dialect: postgresql\n\ntarget:\n  postgres:\n    url: $DATABASE_URL\n    extensions: [uuid-ossp]\n\nschemas: [config, staging]\n\nimport:\n  options:\n    truncate: true'
 			}
 		},
 		{
@@ -158,13 +172,13 @@ export const concepts = {
 			id: 'adapters',
 			kicker: 'Deployment',
 			title: 'Adapters handle the target',
-			body: 'The same parsed schema deploys to different databases. Pick a target by its connection string and dbd does the right thing for that engine.',
+			body: "The same parsed schema deploys to different databases. The connection URL picks the adapter; naming the target supabase layers Supabase's rules over PostgreSQL.",
 			code: {
 				lang: 'sh',
 				label: 'targets',
 				source:
 					'postgres://…        execute SQL directly via sqlx\n' +
-					'target: supabase    managed-infra filtering + grants\n' +
+					'target: supabase    same adapter + Supabase rules\n' +
 					'sqlite::memory:     bare-name catalog, batched INSERT\n' +
 					'convex:             codegen → convex/schema.ts'
 			}
@@ -198,8 +212,8 @@ export const targets = {
 		{
 			name: 'Supabase',
 			scheme: 'postgres:// + target: supabase',
-			body: 'PostgreSQL with managed-infrastructure filtering and automatic grant handling. Same connection string — the target flag in design.yaml switches the adapter.',
-			notes: ['Managed-infra filtering', 'Grant handling', 'Postgres-compatible']
+			body: "The PostgreSQL adapter, plus Supabase's rules when the target is named supabase: public is exposed, reconcile --prune and reset leave the platform's schemas alone, and configured grants add PostgREST access.",
+			notes: ['Same Postgres adapter', 'Platform schemas protected', 'PostgREST grants']
 		},
 		{
 			name: 'SQLite',
@@ -225,15 +239,44 @@ export const commands = {
 	items: [
 		{
 			cmd: 'dbd inspect',
-			body: 'Validate config and report unresolved references — works offline via a local refcache.'
+			body: 'Validate the design offline and report errors, warnings and scope gaps — exits 1 on a blocking error, so it gates CI.'
+		},
+		{
+			cmd: 'dbd diff',
+			body: 'Read-only: how the live database differs from the design, as a report, as JSON, or as an exit code.'
+		},
+		{
+			cmd: 'dbd release',
+			body: 'Cut v1: write a baseline snapshot and move from reconcile to versioned migrations.'
+		},
+		{
+			cmd: 'dbd import',
+			body: 'Load CSV, TSV and JSON Lines from import/ into staging tables, then call the procedures that read them.'
 		},
 		{ cmd: 'dbd export', body: 'Dump table data back out to CSV, TSV or JSONL.' },
-		{ cmd: 'dbd doctor', body: 'Audit design.yaml for stale entries.' },
+		{ cmd: 'dbd refresh', body: 'Refresh materialized views now, outside their pg_cron schedule.' },
+		{
+			cmd: 'dbd emit',
+			body: 'Translate a PostgreSQL schema into MySQL, T-SQL or SQLite DDL, reporting every downgrade.'
+		},
+		{ cmd: 'dbd dbml', body: 'Generate DBML for dbdocs.io and dbdiagram.io, one file per configured document.' },
+		{
+			cmd: 'dbd policies',
+			body: 'Apply the RLS policies in policies/<schema>/<table>.sql, skipping any the scope excludes.'
+		},
+		{
+			cmd: 'dbd doctor',
+			body: 'Audit the project: old config keys, stale files, plural type folders, misfiled view DDL.'
+		},
 		{ cmd: 'dbd reset', body: "Drop the project's managed objects, with safety guards." },
 		{ cmd: 'dbd combine', body: 'Combine all DDL into a single SQL file.' },
 		{ cmd: 'dbd graph', body: 'Output the dependency graph as JSON.' },
 		{ cmd: 'dbd migrate', body: 'Show migration status.' },
-		{ cmd: 'dbd diagram', body: 'Open the hosted schema viewer, with the schema encoded in the URL fragment.' }
+		{ cmd: 'dbd diagram', body: 'Open the hosted schema viewer, with the schema encoded in the URL fragment.' },
+		{
+			cmd: 'dbd install',
+			body: "Install dbd's Claude Code skill and review agent, so an AI assistant follows the conventions."
+		}
 	] as Command[]
 };
 
