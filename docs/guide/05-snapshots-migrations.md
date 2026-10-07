@@ -42,8 +42,10 @@ set), so a migration that fails part-way leaves the database at the version it
 started from.
 
 Snapshots record tables and enums. A migration under `--scope` runs only the
-steps for the scope's entities while the database's version still advances —
-see [scopes](07-scopes.md#migrations-under-a-scope).
+steps for the scope's entities while the database's version still advances; the
+drop of a table the design removed runs under a scope that occupies its schema,
+and only where the table still exists — see
+[scopes](07-scopes.md#migrations-under-a-scope).
 
 ## Smart multi-snapshot
 

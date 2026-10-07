@@ -43,12 +43,14 @@ equivalent — a schema whose entities are present is added back.
 whatever `includes` produced. A name or wildcard that matches nothing is an
 error, so a typo cannot quietly select less than you meant.
 
-> **Sequences are not selectable in 0.24.1.** A scope selects tables, views,
-> materialized views, functions, procedures and enums — never a standalone
-> sequence, not even through a bare schema token, and naming one is an error.
-> So any named scope, `default` included, builds no `ddl/sequence/` entities: a
-> table whose `DEFAULT nextval(…)` uses one fails when the scope is applied,
-> and no gap is reported. Only `--scope all` (or no scopes) creates them.
+A scope selects tables, views, materialized views, functions, procedures,
+enums and sequences. A sequence belongs to its schema the way a table does: a
+bare schema or `schema.*` takes the schema's sequences with it, and
+`schema.sequence` names one.
+
+A scope also keeps the `CREATE SCHEMA` of the schema each extension it installs
+goes into (the extension's `schema:`), so a scope that selects nothing in that
+schema still has it — unless the scope excludes the schema by name.
 
 A scope may also be the bare string `all` (`everything: all` above): the full
 set under another name. Any other bare string is refused.
@@ -84,7 +86,7 @@ build a table whose foreign key points nowhere. With a scope `hub` defined as
 
 ```
 $ dbd inspect --scope hub
-scope 'hub': 2 entities
+scope 'hub': 2 of 5 entities
 ✗ dependency gap: app.orders requires config.lookup_values (out of scope)
     chain: app.orders → config.lookup_values
 ✗ dependency gap: app.orders requires config.lookups (out of scope)
@@ -99,8 +101,22 @@ What happens next is the scope's `deps` policy:
   (see [the table below](#which-commands-honour-scope)) refuse — including
   their `--dry-run`, so a dry run shows the same failure the real run would.
 - **`deps: include`** — the working set is expanded to its transitive
-  dependency closure before the command runs, and `inspect` reports
-  `2 gap(s) will be auto-included (--deps include)`.
+  dependency closure before the command runs. `inspect` and `deploy --dry-run`
+  list each gap as the step it is, not a failure, and the count covers the
+  closure:
+
+  ```
+  $ dbd inspect --scope hub --deps include
+  scope 'hub': 5 of 5 entities
+  + auto-included: config.lookup_values (required by app.orders)
+      chain: app.orders → config.lookup_values
+  + auto-included: config.lookups (required by app.orders)
+      chain: app.orders → config.lookup_values → config.lookups
+  2 gap(s) will be auto-included (--deps include)
+  ```
+
+  A closure that needs something the scope *excludes* contradicts itself, and
+  every command refuses it — `inspect`, `apply`, `dbml` and `diagram` alike.
 
 `--deps report|include` overrides the scope's own setting for one run.
 
@@ -108,12 +124,12 @@ A reference to an [`external:`](03-design-yaml.md#external) entry is never a gap
 — declaring a table as external is how you say "this lives elsewhere". There is
 no "ignore gaps" mode.
 
-> **Gaps are found from the references dbd records**: foreign keys, and the
-> reads, writes and calls in views and routines. A column whose *type* is an
-> enum is not one of them in 0.24.1 — a table in scope whose column uses an
-> enum from an out-of-scope schema is not reported as a gap, and
-> `deps: include` does not pull the enum in. Include the enum's schema in the
-> scope yourself.
+Gaps are found from the references dbd records: foreign keys; the enum a
+column is typed with and the sequence its default draws from
+(`DEFAULT nextval('s')`); the function a trigger written in the table's file
+executes; and the reads, writes and calls in views and routines. A table whose
+enum or sequence lives in a schema the scope leaves out has a gap, and
+`deps: include` pulls the enum or sequence in.
 
 ## Which commands honour `--scope`
 
@@ -124,28 +140,41 @@ no "ignore gaps" mode.
 | **Ignore, with a warning** | `snapshot`, `release`, `migrate`, `doctor`, `init`, `merge`, `format`, `install` |
 
 The ignoring commands print
-`⚠ --scope hub ignored: this command operates on the whole design, not a scope`.
+`⚠ --scope hub ignored: this command operates on the whole design, not a scope`,
+and `--deps` given to one of them is warned about the same way.
 
-`combine`, `dbml`, `export` and `refresh` announce the narrowing —
-`scope 'hub': 2 of 7 entities` — and `inspect` prints `scope 'hub': 2 entities`.
+`inspect`, `apply --dry-run`, `deploy --dry-run`, `combine`, `dbml`, `export` and
+`refresh` announce the narrowing with one line, counted the same way by each —
+`scope 'hub': 2 of 7 entities`: the working set, `deps: include` closure
+included, out of every entity the design declares, externals left out of both.
 `graph` records the scope in its JSON instead (`"scope": "hub"`), because its
 stdout is a contract. The others filter without a line, so don't read its
 absence as "nothing was narrowed".
 
-These paths do not filter, and say nothing about it:
+A dry run filters exactly as its real run does: `apply --dry-run` honours the
+scope's `extensions:` allowlist and refuses what `apply` refuses;
+`import --dry-run` and `deploy --dry-run` name the reason for every import entry
+the scope leaves out; `policies --dry-run` and `deploy --dry-run` list and count
+only the policies the real run applies. A `-n` that names something the scope
+does not build is an error — `X is outside scope 'S'` — on `inspect`, `apply`,
+`graph`, `export`, `refresh` and `import -f`.
 
-- **Grants.** Every grant configured in `design.yaml` is applied on every
-  `apply` and `deploy`, whatever the scope — and on a `supabase` target, the
-  PostgREST grants cover every listed schema. A grant on a schema the scope does
-  not build fails the run with `Failed to apply grants`, after the schema
-  changes have committed.
-- `dbd import -n <table> -f <file>` loads the one file you named, scope or not.
-- `dbd policies --dry-run` lists every policy file; the real run filters.
-- `dbd deploy --dry-run` counts every policy file the same way.
-- `dbd import --dry-run` and `dbd deploy --dry-run` leave out the import entries
-  a scope cuts without the warning the real run prints.
-- `dbd apply --dry-run` lists every extension, ignoring the scope's
-  `extensions:` allowlist; the real run honours it.
+**Grants follow the scope.** A scoped `apply` or `deploy` grants only on the
+schemas the scope builds, and on a `supabase` target the PostgREST `USAGE`
+grants are narrowed the same way.
+
+What a scope does not narrow:
+
+- **Roles** are cluster-wide, so every scope creates them; `reset` drops them
+  only when it is not scoped.
+- **pg_cron refresh jobs.** A scoped apply syncs the jobs of every materialized
+  view in the design, because the sync unschedules any `dbd:refresh:` job
+  missing from the set it is given. A scope whose `extensions:` allowlist
+  leaves out `pg_cron` therefore fails when a materialized view outside it has
+  a schedule.
+- `dbd import -n <table> -f <file>` into a table the design does not declare —
+  no scope can contain it — loads, with a warning that the scope was not
+  applied.
 
 ## Extensions per scope
 
@@ -162,10 +191,10 @@ scopes:
 Omitted, every `target.extensions` entry is installed under the scope; a list
 installs only those; `[]` installs none. Name each extension by its bare name
 (`vector`, `postgis`, `uuid-ossp`) even when it is declared with a `schema:`.
-The allowlist applies wherever the scope does, with two exceptions:
-`reset --extensions` drops every extension the target lists, and
-`apply --dry-run` lists them all. Roles and externals are
-never filtered by a scope.
+The allowlist applies wherever the scope does — `apply` and its `--dry-run`,
+`deploy`, `combine`, and `reset --extensions`, which drops only the extensions
+the scope installs. An allowed extension's `schema:` comes with it (see
+[above](#defining-a-scope)). Roles and externals are never filtered by a scope.
 
 ## Migrations under a scope
 
@@ -179,10 +208,11 @@ released project, `dbd deploy --scope hub` applies the pending migration steps
 for entities in the hub's working set, skips the rest, and still advances the
 database to the latest version.
 
-One consequence to know: a table removed from the design is in no named
-scope's working set any more, so its drop step does not run under a named
-scope. The version advances and the table stays. Drop it by hand on those
-databases.
+A table removed from the design is in no working set any more, so its drop step
+belongs to the scopes that occupy its schema: a scoped `apply` or `deploy` runs
+the drop of a table in one of its schemas — and only where the table still
+exists, so a database whose scope never built it skips the step rather than
+fail on it.
 
 ## Hooks and policies under a scope
 
@@ -229,7 +259,9 @@ all, rather than switching a database back and forth between scopes.
 `dbd reconcile` (and `dbd diff`) hide what the design declares outside the
 scope from the live side, so those tables are neither altered nor pruned.
 Anything the design does not declare at all is still an orphan, and
-`--prune` still drops it.
+`--prune` still drops it — in the schemas the design manages. `public` is one of
+those only when the design puts something there: a role, or an extension with
+no `schema:`, does not make it managed.
 
 > **Upgrade to 0.24.1 or later before running `reconcile --prune --scope`.**
 > In every earlier release with `--scope`, a table the design declared outside

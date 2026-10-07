@@ -246,8 +246,9 @@ This emits `GRANT USAGE ON SCHEMA` (for `usage`, written in lower case), `GRANT 
 
 `dbd apply` and `dbd deploy` apply grants once the schema is in place — after
 the entities and the `apply.after` hooks, before import and policies. They are
-not applied by `--dry-run` and not filtered by `--scope`. Targets without a SQL
-grant model (SQLite, Convex) skip them with a note rather than failing. See
+not applied by `--dry-run`, and under `--scope` only the grants on schemas the
+scope builds are applied. Targets without a SQL grant model (SQLite, Convex)
+skip them with a note rather than failing. See
 [access control](09-access-control.md).
 
 #### `exposed`
@@ -328,9 +329,9 @@ scopes:
 | `extensions` | list   | (all)    | Per-scope extension allowlist. Omitted ⇒ all target extensions apply; a list ⇒ only those apply; `[]` ⇒ none |
 
 - A bare `schema` selects its entities **and** its `CREATE SCHEMA`; `schema.*`
-  selects the entities only; `schema.entity` selects one entity. A name or
-  wildcard that matches nothing is an error. Standalone sequences are not
-  selectable in 0.24.1, so a named scope builds none — see
+  selects the entities only; `schema.entity` selects one entity — a sequence
+  as well as a table. A name or wildcard that matches nothing is an error. An
+  installed extension's `schema:` is kept with it — see
   [scopes](07-scopes.md#defining-a-scope).
 - A scope's value may be the bare string `all` — the full set. Any other string
   is refused.

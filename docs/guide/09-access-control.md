@@ -67,10 +67,12 @@ anything else belong in an [`apply.after` hook](03-design-yaml.md#apply).
 `dbd apply` and `dbd deploy` both apply grants, once the schema is in place:
 after every entity, migration and `apply.after` hook, and before the import
 phase and the policies. An application embedding dbd gets them from
-`Design::deploy` the same way.
+`Design::deploy` the same way, or from `Design::apply_grants` on its own.
 
-They are not applied by `--dry-run`, and a scope does not filter them — every
-configured grant is applied on every run.
+They are not applied by `--dry-run`. Under `--scope`, only the grants on
+schemas the scope builds are applied — a grant on a schema that database was
+never given would fail the run — and on a `supabase` target the PostgREST
+`USAGE` grants below are narrowed the same way.
 
 ### PostgREST on Supabase
 
