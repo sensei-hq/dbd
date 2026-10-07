@@ -1065,6 +1065,22 @@ pub async fn cmd_policies(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+    // The scope guard every other writing command runs. Policies do not re-pin
+    // the database, so there is no `--allow-scope-change` to offer: the way
+    // through is the pinned scope, or re-pointing the database with `apply`.
+    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
+    if let Some(pinned) = pinned
+        && pinned != resolved.name
+    {
+        anyhow::bail!(
+            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
+             Applying another scope's policies would secure tables this database was not built with.\n\
+             → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
+             --allow-scope-change` first.",
+            resolved.name,
+            resolved.name
+        );
+    }
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
