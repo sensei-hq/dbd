@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use dbd_core::dbml::{DbmlParams, generate_dbml};
-use dbd_core::entity::{IndexDef, TableDef};
+use dbd_core::entity::{IndexDef, SortOrder, TableDef};
 use dbd_core::{Entity, EntityType};
 
 /// Parse one DDL file exactly as a project scan does — identity from the path.
@@ -136,4 +136,76 @@ fn an_expression_index_survives_dbml_and_back() {
         );
         assert_eq!(keys(index(td, name)), before, "{name}:\n{dbml}");
     }
+}
+
+/// DBML has no partial-index syntax, so the `WHERE` was dropped — and a
+/// partial UNIQUE index came back as a plain one. `one open order per
+/// customer` became `one order per customer, ever`.
+#[test]
+fn a_partial_index_keeps_its_predicate_through_dbml_and_back() {
+    let orders = parse(
+        "ddl/table/shop/orders.ddl",
+        r"create table shop.orders (id uuid primary key, customer_id bigint, status text, ref_code text);
+          create unique index orders_one_open_per_customer on shop.orders (customer_id) where status = 'open';
+          create index orders_numeric_ref_idx on shop.orders (ref_code) where ref_code ~ '^\d+$';",
+    );
+    let original = orders.table_def.clone().unwrap();
+    let dbml = document(&[orders]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "shop.orders");
+
+    for name in ["orders_one_open_per_customer", "orders_numeric_ref_idx"] {
+        let before = index(&original, name);
+        assert!(
+            before.predicate.is_some(),
+            "{name} must be partial for this test to mean anything"
+        );
+        let after = index(td, name);
+        assert_eq!(after.predicate, before.predicate, "{name}:\n{dbml}");
+        assert_eq!(after.unique, before.unique, "{name}:\n{dbml}");
+    }
+}
+
+/// DBML's index keys carry no sort order and DBML has no `NULLS NOT
+/// DISTINCT`; both change what the rebuilt index is, and the second changes
+/// what a unique one accepts.
+#[test]
+fn an_index_keeps_its_key_order_and_null_handling_through_dbml_and_back() {
+    let orders = parse(
+        "ddl/table/shop/orders.ddl",
+        "create table shop.orders (\n\
+           id uuid primary key,\n\
+           customer_id bigint,\n\
+           created_at timestamptz,\n\
+           ref_code text,\n\
+           ext_ref text,\n\
+           constraint orders_ref_code_uq unique nulls not distinct (ref_code)\n\
+         );\n\
+         create index orders_recent_idx on shop.orders (customer_id, created_at desc nulls last);\n\
+         create index orders_oldest_idx on shop.orders (created_at nulls first);\n\
+         create unique index orders_ext_ref_uq on shop.orders (ext_ref) nulls not distinct;",
+    );
+    let original = orders.table_def.clone().unwrap();
+    let dbml = document(&[orders]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "shop.orders");
+
+    let order = |ix: &IndexDef| -> Vec<(Option<SortOrder>, Option<bool>)> {
+        ix.columns.iter().map(|c| (c.order, c.nulls_first)).collect()
+    };
+    for name in ["orders_recent_idx", "orders_oldest_idx"] {
+        let before = index(&original, name);
+        assert!(
+            before
+                .columns
+                .iter()
+                .any(|c| c.order.is_some() || c.nulls_first.is_some()),
+            "{name} must order a key for this test to mean anything"
+        );
+        assert_eq!(order(index(td, name)), order(before), "{name}:\n{dbml}");
+    }
+
+    assert!(index(td, "orders_ext_ref_uq").nulls_not_distinct, "\n{dbml}");
+    let constraint = index(td, "orders_ref_code_uq");
+    assert!(constraint.unique && constraint.nulls_not_distinct, "\n{dbml}");
 }
