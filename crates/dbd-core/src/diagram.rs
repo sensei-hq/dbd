@@ -45,6 +45,7 @@ mod tests {
             deps: vec![],
             history: vec![],
             enums: vec![],
+            stubs: vec![],
             project: ProjectInfo {
                 name: "Acme".to_string(),
                 db: "postgres".to_string(),
@@ -71,8 +72,11 @@ mod tests {
                     note: None,
                     fk: false,
                     uq: false,
+                    identity: None,
+                    generated: None,
                 }],
                 indexes: vec![],
+                checks: vec![],
             }],
             refs: vec![],
         }

@@ -98,9 +98,7 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        use crate::reconcile::{
-            ReconcileComplete, matview_create_sql, matview_hash_comment_sql, qualified_entity_name,
-        };
+        use crate::reconcile::{ReconcileComplete, matview_create_sql, matview_stamp, qualified_entity_name};
         use std::collections::{HashMap, HashSet};
 
         let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
@@ -176,9 +174,17 @@ impl Design {
         for (e, want) in mv_to_create {
             let desc = format!("{}:{}", e.entity_type.tag(), e.name);
             on_start(&desc);
-            let result = adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
-                .await;
+            let result = match adapter
+                .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                .await
+            {
+                Ok(()) => {
+                    adapter
+                        .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
+                        .await
+                }
+                err => err,
+            };
             report_step_result(&desc, on_done, result)?;
             summary.reapplied += 1;
         }
@@ -192,8 +198,9 @@ impl Design {
         for (e, want) in mv_to_restamp {
             let desc = format!("{}:{} (restamp v1→v2)", e.entity_type.tag(), e.name);
             on_start(&desc);
-            let sql = matview_hash_comment_sql(&qualified_entity_name(e), want);
-            let result = adapter.execute_script(&format!("{search_path}{sql}")).await;
+            let result = adapter
+                .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
+                .await;
             report_step_result(&desc, on_done, result)?;
             summary.restamped += 1;
         }
@@ -377,7 +384,9 @@ impl Design {
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
-        let version = self.config.project.version.unwrap_or(1);
+        // No `project.version` means no migration applied — 0, as `apply`
+        // records. Recording 1 made a dev `reset` refuse as if migrations ran.
+        let version = self.config.project.version.unwrap_or(0);
         adapter
             .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
             .await?;
@@ -423,11 +432,28 @@ impl Design {
     fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
         if !self.parser.produces_structure() {
             let dialect = &self.dialect;
+            // What still works depends on whether dbd can connect at all. SQLite
+            // has an adapter; T-SQL and MySQL are read-only — `connect` refuses
+            // them — so pointing those projects at `apply` sent people from
+            // this refusal straight into a "no adapter" one.
+            let what_works = match self.parser {
+                crate::parser::ParserChoice::TSql | crate::parser::ParserChoice::MySql => {
+                    let database = if self.parser == crate::parser::ParserChoice::TSql {
+                        "SQL Server"
+                    } else {
+                        "MySQL"
+                    };
+                    format!(
+                        "dbd has no adapter for {database} either, so nothing can connect to one; \
+                         `inspect`, `graph`, `combine`, `dbml` and `diagram` work offline."
+                    )
+                }
+                _ => "`apply`, `deploy`, `import` and `export` work normally.".to_string(),
+            };
             return Err(DbdError::Config(format!(
                 "{op} needs a structured model, and this project's DDL is not read into one \
                  (source.dialect: {dialect}) — its files give identity and references but no \
-                 columns or constraints, so there is nothing to compare. \
-                 `apply`, `deploy`, `import` and `export` work normally."
+                 columns or constraints, so there is nothing to compare. {what_works}"
             )));
         }
         Ok(())

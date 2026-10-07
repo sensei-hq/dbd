@@ -342,16 +342,22 @@ fn migrate_import_section(
 
 // ── Plural DDL folder migration ────────────────────────────────────────────
 
-/// Plural DDL type folders and their canonical singular form. dbd accepts both
-/// when scanning, but singular is canonical; `dbd doctor --fix` migrates plural
-/// folders to singular.
+/// Non-canonical DDL type folders — plurals and the `matview` shorthand — and
+/// their canonical form. The scanner accepts all of them
+/// ([`crate::entity::EntityType::from_folder_name`]), but the singular is
+/// canonical; `dbd doctor --fix` migrates the rest to it. Keep the two lists in
+/// step: a name the scanner accepts and this omits is never migrated.
 const PLURAL_DDL_DIRS: &[(&str, &str)] = &[
     ("tables", "table"),
     ("views", "view"),
+    ("materialized_views", "materialized_view"),
+    ("matviews", "materialized_view"),
+    ("matview", "materialized_view"),
     ("functions", "function"),
     ("procedures", "procedure"),
     ("enums", "enum"),
     ("roles", "role"),
+    ("sequences", "sequence"),
 ];
 
 /// A `ddl/<plural>/` folder that should use the canonical singular name.
@@ -420,7 +426,9 @@ pub fn detect_ddl_type_mismatches(project_dir: &Path) -> Vec<DdlTypeMismatch> {
             if file.extension().and_then(|e| e.to_str()) != Some("ddl") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&file) else {
+            // Decoded as the project scan decodes it: a UTF-16 file the load
+            // reads must not be invisible to the check of where it is filed.
+            let Ok(content) = crate::source_text::read_to_string(&file) else {
                 continue;
             };
             let declared = if matview_re.is_match(&content) {
@@ -750,6 +758,39 @@ schemas:
         filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0)).unwrap();
     }
 
+    /// Every non-canonical folder name the scanner accepts is one `doctor --fix`
+    /// migrates. `materialized_views`, `matview(s)` and `sequences` scanned
+    /// fine and were never moved to their canonical folder.
+    #[test]
+    fn every_folder_alias_the_scanner_accepts_is_migrated() {
+        let aliases = [
+            "tables",
+            "views",
+            "materialized_views",
+            "matview",
+            "matviews",
+            "functions",
+            "procedures",
+            "enums",
+            "roles",
+            "sequences",
+        ];
+        for alias in aliases {
+            let canonical = crate::entity::EntityType::from_folder_name(alias)
+                .unwrap_or_else(|| panic!("the scanner accepts `{alias}`"))
+                .folder_name();
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("ddl").join(alias)).unwrap();
+            let found = detect_plural_ddl_dirs(tmp.path());
+            assert_eq!(found.len(), 1, "`ddl/{alias}` must be detected");
+            assert!(
+                found[0].singular.ends_with(format!("ddl/{canonical}")),
+                "`ddl/{alias}` migrates to `ddl/{canonical}`, not {:?}",
+                found[0].singular
+            );
+        }
+    }
+
     #[test]
     fn detect_plural_ddl_dirs_finds_plural_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -868,6 +909,24 @@ schemas:
             "got: {}",
             found[0].suggested_path.display()
         );
+    }
+
+    /// The check read each file with `read_to_string` and skipped any it could
+    /// not, so a misfiled view saved by SSMS (UTF-16) was never reported —
+    /// though the project load decodes it and `reset` drops it the wrong way.
+    #[test]
+    fn ddl_mismatch_flags_a_utf16_matview_under_view_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/view/analytics/daily.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            crate::source_text::utf16le("CREATE MATERIALIZED VIEW analytics.daily AS SELECT 1;"),
+        )
+        .unwrap();
+        let found = detect_ddl_type_mismatches(tmp.path());
+        assert_eq!(found.len(), 1, "the UTF-16 file must be read, not skipped");
+        assert_eq!(found[0].declared, "materialized_view");
     }
 
     #[test]

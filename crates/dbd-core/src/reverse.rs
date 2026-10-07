@@ -95,6 +95,21 @@ pub struct SchemaSelect {
     pub all: bool,
 }
 
+/// Whether introspected `entities` come from a Supabase database.
+///
+/// Supabase is PostgreSQL behind an ordinary `postgres://` URL, so the scheme
+/// cannot tell them apart; its platform schemas can. Both `auth` and `storage`
+/// are required — a plain database with an `auth` schema of its own is common
+/// enough that one alone would misname it.
+pub fn looks_like_supabase(entities: &[Entity]) -> bool {
+    let has_schema = |name: &str| {
+        entities
+            .iter()
+            .any(|e| (e.entity_type == EntityType::Schema && e.name == name) || e.schema.as_deref() == Some(name))
+    };
+    has_schema("auth") && has_schema("storage")
+}
+
 /// Filter `db_schemas` (all schemas discovered in the DB) down to the set to emit.
 pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String> {
     db_schemas
@@ -182,9 +197,14 @@ pub fn build_plan(root: &Path, generated: Vec<(PathBuf, String)>, selected_schem
 
     for (rel, content) in generated {
         let abs = root.join(&rel);
-        let action = match std::fs::read_to_string(&abs) {
+        // Compared by text, decoded as the project scan decodes it, so a file
+        // SSMS saved as UTF-16 is the file it is. A file that is there but
+        // cannot be read at all is still there: overwriting it is a conflict,
+        // not a create.
+        let action = match crate::source_text::read_to_string(&abs) {
             Ok(existing) if existing == content => FileAction::Skip,
             Ok(_) => FileAction::Conflict,
+            Err(_) if abs.exists() => FileAction::Conflict,
             Err(_) => FileAction::Create,
         };
         items.push(PlanItem {
@@ -353,8 +373,10 @@ pub fn plan_from_entities(
 /// - `target.<dialect-key>.url` — always `$DATABASE_URL`, never a literal connection string
 /// - `schemas` list populated from the discovered schema set
 ///
-/// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`;
-/// `"sqlite"` maps to the `sqlite` target key, everything else maps to `"postgres"`.
+/// `dialect` should be `"postgres"`, `"supabase"`, or `"sqlite"`, and names the
+/// target key; anything else maps to `"postgres"`. `supabase` is a target of its
+/// own rather than a spelling of `postgres`: it is what turns on Supabase's
+/// protected schemas, its PostgREST grants and its exposed-`public` default.
 ///
 /// A SQLite source also gets an explicit `source.dialect: sqlite`. Everything
 /// else is left to the `postgresql` default, so a Postgres project's generated
@@ -364,7 +386,11 @@ pub fn plan_from_entities(
 /// and `STRICT`, so a project dbd had just written refused to load (issue #20).
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
     let is_sqlite = dialect == "sqlite";
-    let target_key = if is_sqlite { "sqlite" } else { "postgres" };
+    let target_key = match dialect {
+        "sqlite" => "sqlite",
+        "supabase" => "supabase",
+        _ => "postgres",
+    };
     let source_block = if is_sqlite {
         "source:\n  dialect: sqlite\n\n"
     } else {
@@ -522,6 +548,34 @@ mod tests {
         );
         // trigger file is unmanaged → never an orphan
         assert!(!plan.orphans.iter().any(|p| p.to_string_lossy().contains("trigger")));
+    }
+
+    /// An existing DDL file is compared by its text, decoded as the project
+    /// scan decodes it. Read with `read_to_string`, a UTF-16 file failed and was
+    /// classified as absent — `Create` — so `merge` reported creating a file it
+    /// was overwriting, and rewrote one whose text it already matched.
+    #[test]
+    fn an_existing_utf16_file_is_compared_by_its_text() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("ddl/table/shop")).unwrap();
+        fs::write(
+            root.join("ddl/table/shop/same.ddl"),
+            crate::source_text::utf16le("SAME"),
+        )
+        .unwrap();
+        fs::write(root.join("ddl/table/shop/old.ddl"), crate::source_text::utf16le("OLD")).unwrap();
+
+        let generated = vec![
+            (PathBuf::from("ddl/table/shop/same.ddl"), "SAME".to_string()),
+            (PathBuf::from("ddl/table/shop/old.ddl"), "NEW".to_string()),
+        ];
+        let plan = build_plan(root, generated, &["shop".to_string()]);
+        let action = |p: &str| plan.items.iter().find(|i| i.path == Path::new(p)).unwrap().action;
+
+        assert_eq!(action("ddl/table/shop/same.ddl"), FileAction::Skip);
+        assert_eq!(action("ddl/table/shop/old.ddl"), FileAction::Conflict);
     }
 
     #[test]
@@ -738,6 +792,17 @@ mod tests {
         // must NOT contain the old `source: / dialect:` keys
         assert!(!yaml.contains("source:"));
         assert!(!yaml.contains("dialect:"));
+    }
+
+    /// `design_yaml` documented `"supabase"` as a dialect it accepts, then wrote
+    /// a `postgres:` target for it — so a project reverse-engineered from
+    /// Supabase lost the target that turns on Supabase's protected schemas,
+    /// PostgREST grants and exposed-`public` default.
+    #[test]
+    fn design_yaml_supabase_uses_the_supabase_key() {
+        let yaml = design_yaml("p", "supabase", &v(&["public"]), 1);
+        assert!(yaml.contains("target:\n  supabase:\n"), "{yaml}");
+        assert!(!yaml.contains("postgres:"), "{yaml}");
     }
 
     #[test]

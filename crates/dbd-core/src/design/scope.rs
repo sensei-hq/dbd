@@ -69,6 +69,55 @@ impl Design {
             .collect())
     }
 
+    /// The entity a `-n <name>` selects, checked against the scope a run acts on.
+    ///
+    /// A name that matched nothing used to select nothing, and every command
+    /// that takes one reported that as success — "Everything looks ok", "0
+    /// entities — no issues", an empty graph. Selecting nothing is never what
+    /// the name was for, so it is an error here, said one way for every caller:
+    /// `no entity named 'X'`, or `X is outside scope 'S'` when the design has it
+    /// but the scope does not build it. Under `None` or the all-scope only
+    /// existence is checked.
+    ///
+    /// Searches the import staging tables too, since `inspect -n` reports on
+    /// them; callers that act only on DDL entities check what they got.
+    pub fn resolve_name(&self, name: &str, scope: Option<&ResolvedScope>) -> Result<&Entity> {
+        let entity = self
+            .entities
+            .iter()
+            .chain(self.import_tables.iter())
+            .find(|e| e.name == name)
+            .ok_or_else(|| DbdError::Config(format!("no entity named '{name}'")))?;
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            if !Self::entity_in_scope(entity, s, &ws) {
+                return Err(DbdError::Config(format!("{name} is outside scope '{}'", s.name)));
+            }
+        }
+        Ok(entity)
+    }
+
+    /// `(kept, total)`: how many entities `scope` builds, and how many the
+    /// design declares.
+    ///
+    /// The one count every command reports for a scope. They used to count four
+    /// ways — `inspect` before the `deps: include` closure, `combine`/`dbml`
+    /// with every external and every extension an `extensions:` allowlist
+    /// drops, `deploy --dry-run` the whole design — so one scope had four sizes
+    /// depending on which command was asked.
+    ///
+    /// `kept` is the scope's working set (closure included) as
+    /// [`Self::scoped_entities`] resolves it. Externals are left out of both
+    /// numbers: they declare something outside the design that no command
+    /// builds, so counting them made the scope look bigger than what an apply
+    /// lists. For the all-scope `kept == total`.
+    pub fn scope_counts(&self, scope: &ResolvedScope) -> Result<(usize, usize)> {
+        let built = |e: &&Entity| e.entity_type != EntityType::External;
+        let total = self.entities.iter().filter(built).count();
+        let kept = self.scoped_entities(scope)?.iter().filter(built).count();
+        Ok((kept, total))
+    }
+
     /// Resolve a scope to its working set, running the `report`-policy gap gate
     /// first (aborts before any write). `None`/all-scope ⇒ `Ok(None)` (no
     /// filtering). Shared by `apply`, `reconcile`, and `diff_live`.
@@ -199,9 +248,16 @@ impl Design {
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
+    ///
+    /// Roles and extensions occupy no schema of the design's: a role is
+    /// cluster-wide, and an extension's objects are the extension's. Mapping
+    /// their empty `schema` to `public` made `public` managed for any design
+    /// with a role or a bare extension, and `reconcile --prune` then dropped
+    /// tables there that the design never declared.
     pub(in crate::design) fn managed_schemas(desired: &[&Entity]) -> std::collections::HashSet<String> {
         desired
             .iter()
+            .filter(|e| !matches!(e.entity_type, EntityType::Role | EntityType::Extension))
             .map(|e| match e.entity_type {
                 EntityType::Schema => e.name.clone(),
                 _ => {

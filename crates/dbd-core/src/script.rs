@@ -52,7 +52,10 @@ pub const SUPABASE_PROTECTED: &[&str] = &[
 /// Generate DDL SQL from an entity.
 ///
 /// For schema/extension/role: generates CREATE statements.
-/// For file-based entities (table, view, etc.): reads the DDL file.
+/// For file-based entities (table, view, etc.): reads the DDL file, decoded as
+/// the project scan decodes it (see [`crate::source_text`]). Reading it with
+/// the stdlib instead turned a UTF-16 file the scan had loaded into `None` —
+/// which `apply` and `combine` take to mean "no DDL", skipping the entity.
 pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     match entity.entity_type {
         EntityType::Schema => Some(format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", entity.name)),
@@ -65,7 +68,57 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
         }
         EntityType::Role => Some(generate_role_script(entity)),
         EntityType::External => None,
-        _ => entity.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()),
+        _ => entity
+            .file
+            .as_ref()
+            .and_then(|f| crate::source_text::read_to_string(f).ok()),
+    }
+}
+
+/// The DDL `combine` writes for `entity` in a project whose SQL is `dialect`.
+///
+/// The authored files are already in the project's dialect and are copied as
+/// they are. What dbd generates itself — schemas, extensions, roles — is
+/// written by [`ddl_from_entity`] in PostgreSQL, and was emitted that way into
+/// every project's script: a T-SQL, MySQL or SQLite script opened with
+/// `CREATE SCHEMA IF NOT EXISTS "x";`, which none of those engines accepts.
+///
+/// - SQL Server creates a schema with no `IF NOT EXISTS`, and only alone in its
+///   batch — so the idempotent form wraps it in `EXEC`, and a `GO` ends the
+///   batch before the next file's statements.
+/// - MySQL's "schema" is a database and SQLite has none, so neither gets a
+///   schema statement (as `emit` treats them, and as the SQLite adapter skips
+///   the schema on apply).
+/// - Extensions and roles exist only in PostgreSQL; another engine's script
+///   says so in a comment rather than carrying PostgreSQL SQL, or nothing.
+///
+/// Unrecognised and unstated dialects are read as PostgreSQL by the parser, so
+/// they are written as PostgreSQL here too.
+pub fn combined_ddl(entity: &Entity, dialect: crate::parser::Dialect) -> Option<String> {
+    use crate::parser::Dialect;
+    match (dialect, entity.entity_type) {
+        (Dialect::PostgreSql | Dialect::Unstated, _) => ddl_from_entity(entity),
+        (Dialect::TSql, EntityType::Schema) => {
+            // `]` doubles inside a bracketed name, then `'` inside the N'…' literal.
+            let bracketed = format!("[{}]", entity.name.replace(']', "]]"));
+            Some(format!(
+                "IF SCHEMA_ID(N'{}') IS NULL EXEC(N'CREATE SCHEMA {}');\nGO",
+                entity.name.replace('\'', "''"),
+                bracketed.replace('\'', "''")
+            ))
+        }
+        (Dialect::MySql | Dialect::Sqlite, EntityType::Schema) => None,
+        (_, EntityType::Extension | EntityType::Role) => Some(format!(
+            "-- {} {} is PostgreSQL-only, so this {} script does not create it",
+            if entity.entity_type == EntityType::Extension {
+                "extension"
+            } else {
+                "role"
+            },
+            entity.name.replace('\n', " "),
+            dialect.as_label()
+        )),
+        _ => ddl_from_entity(entity),
     }
 }
 

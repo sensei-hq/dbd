@@ -58,15 +58,30 @@ fn command_honors_scope(command: &Commands) -> bool {
     }
 }
 
-/// Say so when `--scope` was passed to a command that ignores it.
-fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
-    let Some(name) = scope else { return };
+/// Say so when `--scope` or `--deps` was passed to a command that ignores it.
+///
+/// `--deps` only means anything to a scope — it decides whether a scope's
+/// dependency gaps are errors or are pulled in — so a command that ignores the
+/// scope ignores it too, and accepting it in silence reads the same way an
+/// ignored `--scope` did.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<dbd_core::config::DepsPolicy>) {
     if command_honors_scope(command) {
         return;
     }
-    output::warn(&format!(
-        "--scope {name} ignored: this command operates on the whole design, not a scope"
-    ));
+    if let Some(name) = scope {
+        output::warn(&format!(
+            "--scope {name} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
+    if let Some(policy) = deps {
+        let policy = match policy {
+            dbd_core::config::DepsPolicy::Report => "report",
+            dbd_core::config::DepsPolicy::Include => "include",
+        };
+        output::warn(&format!(
+            "--deps {policy} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +96,16 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    warn_if_scope_ignored(command, scope);
+    warn_if_scope_ignored(command, scope, deps);
+    // `deploy` downloads a GitHub source; nothing else does. Several commands
+    // write into the project (snapshot, release, format, inspect --fix), and a
+    // downloaded tree is a cache — so the rest take a local path only.
+    if !matches!(command, Commands::Deploy { .. }) && dbd_core::github::is_github_source(source) {
+        anyhow::bail!(
+            "`{source}` looks like a GitHub source, and only `dbd deploy` fetches one. \
+             For other commands, clone the repository and pass its local path to --source."
+        );
+    }
     match command {
         Commands::Inspect { name, fix, from_db } => {
             schema::cmd_inspect(
@@ -202,7 +226,7 @@ pub async fn run(
                 env,
                 project_dir,
                 database_url,
-                target,
+                target.as_deref(),
                 opts,
                 scope,
                 deps,
@@ -237,9 +261,12 @@ pub async fn run(
             clear_cache,
             allow_scope_change,
         } => {
+            // `config` is `--source` joined with `-c`; deploy resolves the source
+            // itself (it may be a GitHub ref), so it takes `-c` back off.
+            let config_name = config.strip_prefix(source).unwrap_or(config);
             project::cmd_deploy(
                 source,
-                config,
+                config_name,
                 env,
                 database_url,
                 *dry_run,
@@ -304,7 +331,10 @@ pub async fn run(
             dry_run,
         } => {
             if let Some(dbml_path) = from_dbml {
-                if target != "postgres" {
+                // DBML is PostgreSQL-shaped and names no platform, so both
+                // PostgreSQL targets are the caller's to choose. This used to
+                // accept `postgres` alone while saying Supabase was supported.
+                if !matches!(target.as_str(), "postgres" | "supabase") {
                     anyhow::bail!(
                         "--target {target} is not supported with --from-dbml; \
                          reverse-engineering supports Postgres/Supabase only"
@@ -321,15 +351,17 @@ pub async fn run(
                     env,
                     config,
                     name.as_deref(),
+                    target,
                     *version,
                     sel,
                     *dry_run,
                 );
             }
             if let Some(s) = from_db {
-                // The reverse dialect is derived from the connection URL scheme
-                // (postgres:// → postgres, sqlite://`/`file: → sqlite), so the
-                // `--target` flag does not gate `--from-db`.
+                // The reverse dialect is derived from the database itself — the
+                // URL scheme (sqlite://`/`file: → sqlite), then Supabase's own
+                // schemas (→ supabase, else postgres) — so the `--target` flag
+                // does not gate `--from-db`.
                 let _ = target;
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
@@ -446,9 +478,20 @@ pub async fn run(
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
     let entities = match s.strategy {
+        // Version 0 is no version. A project without `project.version` plans
+        // every apply as `Fresh` (its database records version 0), so this
+        // said "Fresh install at v0" on every run — naming a version that does
+        // not exist, and a fresh install that usually was not one.
+        ApplyStrategy::Fresh if s.to_version == 0 => format!(
+            "{} entities applied (no project.version — the database is not versioned).",
+            s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
+        // A batch adapter reports version 0 whatever the project's version, so
+        // neither "up to date" nor a version can be claimed from it.
+        ApplyStrategy::Current if s.from_version == 0 => format!("{} entities applied.", s.applied),
         ApplyStrategy::Current => {
             format!(
                 "Already up to date (v{}) — {} entities applied.",
@@ -496,7 +539,12 @@ pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> Str
             n => format!(", {n} skipped (out of scope)"),
         }
     );
-    format!("{apply_line} {import_line} {policy_line}")
+    let grants = match s.grants {
+        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
+        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
+        dbd_core::design::GrantsOutcome::None => "",
+    };
+    format!("{apply_line}{grants} {import_line} {policy_line}")
 }
 
 // ── Database adapter ──────────────────────────────────────────────────────────
@@ -572,6 +620,14 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
     let canon = safe_canonicalize_within(root, file)?;
     std::fs::read_to_string(&canon) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("Failed to read {}", file.display()))
+}
+
+/// [`safe_read`] for a DDL file: decoded by `source_text` exactly as the
+/// project load decodes it (UTF-16 behind a BOM included), so a file the load
+/// reads is never one a command over the same tree cannot.
+pub(super) fn safe_read_ddl(root: &Path, file: &Path) -> Result<String> {
+    let canon = safe_canonicalize_within(root, file)?;
+    dbd_core::source_text::read_to_string(&canon).with_context(|| format!("Failed to read {}", file.display()))
 }
 
 pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {
@@ -715,6 +771,27 @@ mod tests {
         assert!(migrate.contains("0 dropped"), "expected dropped count in: {migrate}");
     }
 
+    /// A project with no `project.version` is not at "v0": it has no version.
+    /// Every apply of one is a `Fresh` plan (its database records version 0),
+    /// so every apply said "Fresh install at v0" — a version that does not exist.
+    #[test]
+    fn an_unversioned_apply_does_not_claim_a_version() {
+        let s = ApplyComplete {
+            strategy: ApplyStrategy::Fresh,
+            from_version: 0,
+            to_version: 0,
+            applied: 3,
+            ..Default::default()
+        };
+        let out = format_apply_summary(&s);
+        assert!(!out.contains("v0"), "there is no v0: {out}");
+        assert!(out.contains("3 entities"), "the count is still reported: {out}");
+        assert!(
+            out.contains("project.version"),
+            "and the reason there is no version: {out}"
+        );
+    }
+
     #[test]
     fn format_import_summary_reports_counts() {
         let s = ImportComplete {
@@ -741,6 +818,7 @@ mod tests {
     fn format_deploy_summary_combines_apply_import_and_policies() {
         let s = dbd_core::design::DeployComplete {
             apply: apply_complete(ApplyStrategy::Fresh),
+            grants: dbd_core::design::GrantsOutcome::Applied,
             import: ImportComplete {
                 tables: 2,
                 procedures: 1,
@@ -754,6 +832,7 @@ mod tests {
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("Fresh") && out.contains("table"));
+        assert!(out.contains("Grants applied"), "grants phase must be reported: {out}");
         assert!(
             out.contains("1 policy file(s) applied"),
             "policy phase must be reported: {out}"
@@ -847,6 +926,34 @@ mod tests {
     }
 
     /// The `run` dispatcher routes a non-DB command (Doctor) to its handler.
+    /// Only `deploy` downloads a GitHub source. Any other command given one
+    /// says so, instead of failing to read `owner/repo/design.yaml` from disk.
+    #[tokio::test]
+    async fn a_github_source_outside_deploy_is_refused_with_the_way_out() {
+        use crate::cli::Commands;
+        let source = "sensei-hq/no-such-local-dir/database";
+        let err = run(
+            &Commands::Inspect {
+                name: None,
+                fix: false,
+                from_db: false,
+            },
+            &Path::new(source).join("design.yaml"),
+            "dev",
+            None,
+            Path::new(source),
+            source,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dbd deploy"), "names the command that can: {err}");
+        assert!(err.contains("clone"), "and the way out: {err}");
+    }
+
     #[tokio::test]
     async fn run_dispatches_non_db_command() {
         use crate::cli::Commands;
@@ -993,7 +1100,7 @@ mod tests {
         let tmp = testutil::copy_fixture_project();
         run_in_copy(
             &Commands::Reset {
-                target: "dev".to_string(),
+                target: None,
                 dry_run: true,
                 force: false,
                 schemas: false,
@@ -1172,6 +1279,51 @@ mod tests {
         assert!(
             !dir.join("design.yaml").exists(),
             "--dry-run must not write design.yaml"
+        );
+    }
+
+    /// The dispatcher's own refusal said reverse-engineering "supports
+    /// Postgres/Supabase", then refused `--target supabase`. DBML carries no
+    /// platform, so the target is the caller's to give, and it reaches
+    /// `design.yaml`.
+    #[tokio::test]
+    async fn init_from_dbml_accepts_a_supabase_target() {
+        use crate::cli::Commands;
+        let src = testutil::copy_fixture_project();
+        let dbml = src.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &src).await.unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let dir = dest.path();
+        run(
+            &Commands::Init {
+                name: Some("from_dbml".to_string()),
+                target: "supabase".to_string(),
+                from_db: None,
+                from_dbml: Some(dbml),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: false,
+            },
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("--target supabase is a target --from-dbml supports");
+
+        let written = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+        assert!(
+            written.contains("  supabase:\n"),
+            "the target reaches design.yaml: {written}"
         );
     }
 

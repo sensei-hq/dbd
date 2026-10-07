@@ -1,6 +1,58 @@
 use super::*;
 
 impl Design {
+    /// The entities [`Design::apply`] would act on, after every gate it runs
+    /// before writing — and without a database.
+    ///
+    /// This is what a preview must list. `dbd apply --dry-run` used to filter
+    /// the entities itself, and the copy drifted from the real run twice: it
+    /// listed every target extension whatever the scope's `extensions:`
+    /// allowlist said, and it printed "no issues" over a file the real run
+    /// refused to read. Sharing the gate is what keeps the two from disagreeing
+    /// again.
+    ///
+    /// Errors exactly where `apply` would: a dependency gap under `report`, a
+    /// closure that needs what the scope excludes, or a file that did not parse.
+    pub fn entities_to_apply(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<&Entity>> {
+        Ok(self.gated_apply_set(name, scope)?.1)
+    }
+
+    /// The scope's working set and the entities an apply acts on, once every
+    /// pre-write gate has passed. Shared by [`Self::apply`] and
+    /// [`Self::entities_to_apply`] so a preview cannot pass what the run refuses.
+    #[allow(clippy::type_complexity)]
+    fn gated_apply_set(
+        &self,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(Option<std::collections::HashSet<String>>, Vec<&Entity>)> {
+        // Resolve scope → working set (gap-gated under `report`), then filter to
+        // the valid, in-scope, name-matching entities. The gate runs even under
+        // `dry_run`: a gappy scope is misconfigured regardless of writes.
+        let working_set = self.scope_working_set(scope)?;
+        // A `name` that selects nothing applied nothing and reported success.
+        if let Some(n) = name {
+            self.resolve_name(n, scope)?;
+        }
+        // Refuse a design with a file dbd could not read, before any write.
+        // `entities_in_scope` drops those entities silently, which is how apply
+        // used to report success while never creating the object. Like the scope
+        // gate above, this runs under `dry_run` too: an incomplete design is
+        // incomplete whether or not we are about to write.
+        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
+        let entities = self.entities_in_scope(scope, working_set.as_ref(), name);
+        // The name exists, but as something apply never builds: an `external:`
+        // declaration, or an import staging table with no DDL of its own.
+        if let Some(n) = name
+            && entities.is_empty()
+        {
+            return Err(DbdError::Config(format!(
+                "{n} has no DDL in this design for apply to run — it is declared external or is an import staging table"
+            )));
+        }
+        Ok((working_set, entities))
+    }
+
     /// Apply all entities to the database via the adapter.
     ///
     /// Uses `build_execution_plan()` to determine strategy (Fresh / Migrate / Current)
@@ -64,17 +116,7 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
-        // Resolve scope → working set (gap-gated under `report`), then filter to
-        // the valid, in-scope, name-matching entities. The gate runs even under
-        // `dry_run`: a gappy scope is misconfigured regardless of writes.
-        let working_set = self.scope_working_set(scope)?;
-        // Refuse a design with a file dbd could not read, before any write.
-        // `entities_in_scope` drops those entities silently, which is how apply
-        // used to report success while never creating the object. Like the scope
-        // gate above, this runs under `dry_run` too: an incomplete design is
-        // incomplete whether or not we are about to write.
-        self.ensure_fully_parsed(scope, working_set.as_ref(), name)?;
-        let valid_entities = self.entities_in_scope(scope, working_set.as_ref(), name);
+        let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
@@ -268,10 +310,10 @@ impl Design {
         // that drift. Runs after commit, so the object exists for the COMMENT.
         for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
             adapter
-                .execute_script(&crate::reconcile::matview_hash_comment_sql(
-                    &e.name,
-                    &crate::reconcile::matview_hash(e),
-                ))
+                .stamp_matview(
+                    &crate::reconcile::qualified_entity_name(e),
+                    &crate::reconcile::matview_stamp(&crate::reconcile::matview_hash(e)),
+                )
                 .await?;
         }
 
@@ -393,9 +435,13 @@ impl Design {
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
                 on_start(&desc);
+                // Only where the table still exists: a generated drop is a bare
+                // `DROP TABLE … CASCADE`, and a database whose scope never had
+                // the table would fail on it.
                 let result: Result<()> = async {
-                    if drop_sql_path.exists() {
-                        let sql = std::fs::read_to_string(drop_sql_path)?;
+                    if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
+                        // Decoded like the migration's `.sql` and `.data.sql`.
+                        let sql = crate::source_text::read_to_string(drop_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     Ok(())
@@ -417,10 +463,65 @@ impl Design {
         Ok(())
     }
 
-    /// Deploy the full schema: apply DDL, import seed data, then apply RLS
-    /// policies.
+    /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
+    /// target's `grants:` merged on top (per schema, a target role adds to or
+    /// overrides the universal entry for that role), plus PostgREST's schema
+    /// USAGE and config reload on a `supabase` target.
     ///
-    /// This is the same three-phase pipeline `dbd deploy` runs, and the CLI
+    /// Run by `dbd apply` and by [`Design::deploy`]. It lived in the CLI's apply
+    /// handler alone, so a deploy — and every embedder — got no grants at all.
+    ///
+    /// Under a scope, only the schemas the scope builds are granted on: the
+    /// rest were never created, and a GRANT on one fails the run.
+    pub async fn apply_grants(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<GrantsOutcome> {
+        let mut schema_grants = self.config.schema_grants();
+        let mut supabase_schemas: Vec<String> = vec![];
+        if let Some((target_name, target_config)) = self.config.target.iter().next() {
+            if let Some(ref grants) = target_config.grants {
+                for (schema, gc) in grants {
+                    schema_grants
+                        .entry(schema.clone())
+                        .or_default()
+                        .extend(gc.roles.clone());
+                }
+            }
+            // PostgREST USAGE grants ride along only when the user configured
+            // some grants, so a no-grants Supabase apply stays a no-op.
+            if target_name == "supabase" && !schema_grants.is_empty() {
+                supabase_schemas = self.config.schema_names();
+            }
+        }
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            schema_grants.retain(|schema, _| ws.contains(schema));
+            supabase_schemas.retain(|schema| ws.contains(schema));
+        }
+
+        if schema_grants.is_empty() {
+            return Ok(GrantsOutcome::None);
+        }
+        // A cross-target design may declare schema grants yet apply to SQLite
+        // or Convex, which have no grant model to run them against.
+        if !adapter.supports_schema_grants() {
+            return Ok(GrantsOutcome::Unsupported);
+        }
+        match crate::script::build_grants_script(&schema_grants, &supabase_schemas) {
+            Some(sql) => {
+                adapter.execute_script(&sql).await?;
+                Ok(GrantsOutcome::Applied)
+            }
+            None => Ok(GrantsOutcome::None),
+        }
+    }
+
+    /// Deploy the full schema: apply DDL, apply grants, import seed data, then
+    /// apply RLS policies.
+    ///
+    /// This is the same pipeline `dbd deploy` runs, and the CLI
     /// delegates to it — one implementation, so the library and the command can
     /// not drift apart. dbd handles fresh / migrate / current strategy
     /// automatically, so this is safe to call on every bootstrap (idempotent
@@ -492,6 +593,14 @@ impl Design {
         )
         .await?;
 
+        // Grants attach to schemas and tables the apply just created, and the
+        // data loaded next may be read through them — so they go in between.
+        let grants = if dry_run {
+            GrantsOutcome::None
+        } else {
+            self.apply_grants(adapter, scope).await?
+        };
+
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
@@ -526,9 +635,59 @@ impl Design {
 
         (progress.on_complete)(DeployComplete {
             apply: apply_summary.unwrap_or_default(),
+            grants,
             import: import_summary.unwrap_or_default(),
             policies,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::mock::MockAdapter;
+
+    /// A migration's `.sql` and `.data.sql` were read decoded — SSMS may have
+    /// re-saved them as UTF-16 — but its `.drop.sql` was read with
+    /// `read_to_string`, so the same edit failed the drop step with an encoding
+    /// error.
+    #[tokio::test]
+    async fn a_utf16_drop_script_runs() {
+        let design = Design::from_config(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml"),
+            "dev",
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let drop_sql = tmp.path().join("config.legacy.drop.sql");
+        std::fs::write(
+            &drop_sql,
+            crate::source_text::utf16le("DROP TABLE IF EXISTS config.legacy;\n"),
+        )
+        .unwrap();
+
+        // The table exists: a migration's drop runs only where it does.
+        let mock = MockAdapter::new().with_known_entities(["config.legacy"]);
+        let step = ExecutionStep::DropEntity {
+            entity_name: "config.legacy".to_string(),
+            drop_sql_path: drop_sql,
+            migration_version: 2,
+        };
+        design
+            .execute_plan_step(
+                &mock,
+                &step,
+                &std::collections::HashMap::new(),
+                None,
+                &mut ApplyCounts::default(),
+                &mut |_: &str| {},
+                &mut |_: &str, _: Option<&str>| {},
+            )
+            .await
+            .expect("a UTF-16 drop script must run");
+
+        let scripts = mock.scripts.lock().unwrap().clone();
+        assert_eq!(scripts, vec!["DROP TABLE IF EXISTS config.legacy;\n".to_string()]);
     }
 }

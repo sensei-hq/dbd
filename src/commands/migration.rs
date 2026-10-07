@@ -17,13 +17,21 @@ pub(crate) struct ResetOptions {
     pub allow_scope_change: bool,
 }
 
+/// The platform whose own schemas reset must leave alone: `--target` when
+/// given, otherwise the design's target (its first `target:` key), otherwise
+/// plain `postgres`. Defaulting to `postgres` regardless of the design let a
+/// Supabase project's `reset --schemas` drop `public`.
+fn reset_target<'a>(flag: Option<&'a str>, design: &'a Design) -> &'a str {
+    flag.or_else(|| design.config().default_target()).unwrap_or("postgres")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
-    target: &str,
+    target: Option<&str>,
     opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
@@ -38,6 +46,7 @@ pub async fn cmd_reset(
     } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let target = reset_target(target, &design);
 
     if dry_run {
         let sql = design
@@ -250,6 +259,45 @@ mod tests {
         cmd_snapshot_list(&testutil::fixtures(), Verbosity::Verbose);
     }
 
+    /// A Supabase project resets as a Supabase project without being told so:
+    /// the design already names its target. Before, `--target` defaulted to
+    /// `postgres`, and `reset --schemas` dropped `public` CASCADE.
+    #[test]
+    fn reset_protects_the_designs_platform_unless_told_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: t\ntarget:\n  supabase:\n    url: $DATABASE_URL\nschemas:\n  - public\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+
+        let target = reset_target(None, &design);
+        assert_eq!(target, "supabase");
+        let sql = design.reset_script(target, true, false, None).unwrap().unwrap();
+        assert!(
+            !sql.contains("DROP SCHEMA IF EXISTS \"public\""),
+            "public must survive: {sql}"
+        );
+        assert!(
+            sql.contains("DROP SCHEMA IF EXISTS \"app\""),
+            "the project's own schema still drops: {sql}"
+        );
+
+        // The flag still wins, and a design with no target falls back to postgres.
+        assert_eq!(reset_target(Some("postgres"), &design), "postgres");
+        std::fs::write(&config, "project:\n  name: t\n").unwrap();
+        let bare = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+        assert_eq!(reset_target(None, &bare), "postgres");
+    }
+
     /// `--dry-run` builds the reset script and returns before any DB adapter is
     /// constructed, so it runs without a live connection.
     #[tokio::test]
@@ -259,7 +307,7 @@ mod tests {
             "dev",
             &testutil::fixtures(),
             None,
-            "dev",
+            None,
             ResetOptions {
                 dry_run: true,
                 force: false,

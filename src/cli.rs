@@ -36,6 +36,13 @@ impl From<DepsArg> for dbd_core::config::DepsPolicy {
     }
 }
 
+/// `-e` as its canonical name. Aliases normalise here, at the boundary, so every
+/// command, the bookkeeping row and the `import/<env>/` folders see `dev` or
+/// `prod` — never `production`, which the reset guard would not recognise.
+fn parse_environment(value: &str) -> Result<String, String> {
+    dbd_core::config::normalize_env(Some(value)).map_err(|e| e.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "dbd", version, about = "Database schema management as code")]
 pub struct Cli {
@@ -50,11 +57,12 @@ pub struct Cli {
     #[arg(short, long, env = "DATABASE_URL", global = true, hide_env_values = true)]
     pub database: Option<String>,
 
-    /// Environment (dev or prod)
-    #[arg(short, long, default_value = "prod", global = true)]
+    /// Environment: dev or prod (development and production are accepted)
+    #[arg(short, long, default_value = "prod", global = true, value_parser = parse_environment)]
     pub environment: String,
 
-    /// Source directory or GitHub repo (owner/repo/path)
+    /// Project directory. `dbd deploy` also takes a GitHub source:
+    /// owner/repo[/path][@ref] or a github.com URL (private repos via GITHUB_TOKEN)
     #[arg(short, long, default_value = ".", global = true)]
     pub source: String,
 
@@ -209,9 +217,10 @@ pub enum Commands {
     },
     /// Drop the project's managed objects (with safety guards)
     Reset {
-        /// Target platform
-        #[arg(long, default_value = "postgres")]
-        target: String,
+        /// Target platform whose own schemas reset must never drop
+        /// (postgres or supabase). Default: the design's target.
+        #[arg(long)]
+        target: Option<String>,
         /// Print what would be dropped
         #[arg(long)]
         dry_run: bool,
@@ -320,9 +329,11 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show the complete difference between the live database and the design
-    /// (read-only). Covers columns, PK/unique, foreign keys, CHECK constraints,
-    /// indexes, comments and enums — everything `reconcile --dry-run` omits.
+    /// Show every difference between the live database and the design
+    /// (read-only): columns, PK/unique, foreign keys, CHECK constraints,
+    /// indexes, comments and enums. Unlike `reconcile --dry-run` it does not
+    /// depend on --prune or --allow-destructive, and it works on a released
+    /// project, where reconcile is disabled.
     Diff {
         /// Emit the diff as JSON for tooling/CI
         #[arg(long)]
@@ -465,6 +476,21 @@ mod tests {
             matches!(&cli.command, Commands::Merge { roles: false, .. }),
             "expected merge roles == false when absent"
         );
+    }
+
+    /// `-e` takes the documented names and nothing else. An alias is stored as
+    /// its canonical form, so `-e production` records `prod` — the value the
+    /// reset guard and the `import/<env>/` folders key on.
+    #[test]
+    fn environment_aliases_normalise_and_unknown_names_are_refused() {
+        let env = |v: &str| Cli::try_parse_from(["dbd", "-e", v, "inspect"]).map(|c| c.environment);
+        assert_eq!(env("production").unwrap(), "prod");
+        assert_eq!(env("prod").unwrap(), "prod");
+        assert_eq!(env("development").unwrap(), "dev");
+        assert_eq!(env("dev").unwrap(), "dev");
+        assert!(env("staging").is_err(), "an unknown environment must not parse");
+        let default = Cli::try_parse_from(["dbd", "inspect"]).unwrap();
+        assert_eq!(default.environment, "prod");
     }
 
     /// `dbd deploy` cache flags default to false and flip to true when present.

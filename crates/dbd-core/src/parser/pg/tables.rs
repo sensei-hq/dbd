@@ -116,6 +116,17 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
             }
             Some(NodeEnum::CommentStmt(c)) => record_comment(c, &mut comments),
             Some(NodeEnum::AlterTableStmt(alter)) => alters.push(alter),
+            // A trigger kept beside its table fires a function the table now
+            // depends on. Skipping the statement left no edge, so apply could
+            // run the trigger before that function existed.
+            Some(NodeEnum::CreateTrigStmt(trigger)) => {
+                if let Some(pair) =
+                    common::qualify_name_source(&string_list(&trigger.funcname).join("."), default_schema)
+                    && !functions.contains(&pair)
+                {
+                    functions.push(pair);
+                }
+            }
             _ => {}
         }
     }
@@ -324,6 +335,13 @@ fn extract_column(
         .ok_or_else(|| format!("column {name:?} has no type"))?;
     let data_type =
         type_text(type_name).ok_or_else(|| format!("column {name:?}: dbd could not render its type back to SQL"))?;
+    // The column's type is a dependency when the project declares it (an
+    // enum). `pg_catalog` spells a built-in outright; a bare built-in such as
+    // `text` is recorded too and dropped when it resolves to nothing.
+    let type_names = string_list(&type_name.names);
+    if type_names.first().map(String::as_str) != Some("pg_catalog") {
+        references.extend(uses_ref(&type_names.join("."), default_schema));
+    }
 
     let mut nullable = true;
     let mut is_pk = false;
@@ -350,6 +368,9 @@ fn extract_column(
             ConstrDefault => {
                 let rendered = constraint_expr(c, &name, "DEFAULT")?;
                 collect_function_refs(&rendered, default_schema, functions);
+                if let Some(sequence) = c.raw_expr.as_deref().and_then(common::nextval_sequence) {
+                    references.extend(uses_ref(&sequence, default_schema));
+                }
                 default_value = Some(rendered);
             }
             ConstrCheck => {
@@ -408,10 +429,10 @@ fn extract_column(
         }
     }
 
-    // SERIAL is sugar for an integer plus an owned sequence; it is NOT an
-    // IDENTITY column, so it leaves `identity` alone.
+    // SERIAL is sugar for `integer NOT NULL DEFAULT nextval(…)` on an owned
+    // sequence. It is NOT an IDENTITY column, so it leaves `identity` alone —
+    // and it is not a primary key either: only a declared PRIMARY KEY is.
     if data_type.to_uppercase().contains("SERIAL") {
-        is_pk = true;
         nullable = false;
     }
 
@@ -707,6 +728,17 @@ fn nulls_first(nulls_ordering: i32) -> Option<bool> {
     }
 }
 
+/// A [`RefKind::Uses`] reference to `name`, qualified like every other.
+fn uses_ref(name: &str, default_schema: &str) -> Option<Ref> {
+    let (name, schema_source) = super::common::qualify_name_source(name, default_schema)?;
+    Some(Ref {
+        name,
+        kind: RefKind::Uses,
+        schema_source,
+        unresolved: false,
+    })
+}
+
 /// The `String` values of a node list — key lists, comment object paths and
 /// operator-class names all arrive in this shape.
 fn string_list(nodes: &[protobuf::Node]) -> Vec<String> {
@@ -934,16 +966,34 @@ mod tests {
         assert_eq!(d.columns[2].identity, None);
     }
 
+    /// `serial` is `integer NOT NULL DEFAULT nextval(…)` — no primary key. Marking
+    /// it one put a key in the model that the database never has: reconcile then
+    /// planned `ADD PRIMARY KEY (seq_no)` beside the real one, and every real
+    /// run failed with "multiple primary keys"; DBML, the viewer and `emit`
+    /// showed a composite key that does not exist.
+    #[test]
+    fn a_serial_column_is_not_a_primary_key_unless_declared_one() {
+        let d = def("create table t (id uuid primary key, seq_no serial, label text);");
+        let seq_no = d.columns.iter().find(|c| c.name == "seq_no").expect("seq_no");
+        assert!(!seq_no.is_pk, "serial alone declares no key");
+        assert!(!seq_no.nullable, "serial is NOT NULL");
+        let pk: Vec<&str> = d.columns.iter().filter(|c| c.is_pk).map(|c| c.name.as_str()).collect();
+        assert_eq!(pk, vec!["id"]);
+
+        let declared = def("create table u (id serial primary key);");
+        assert!(declared.columns[0].is_pk, "a serial declared as the key still is one");
+    }
+
     /// SERIAL is sugar for an integer plus an owned sequence, not an IDENTITY
-    /// column — so it must not set `identity`. The `is_pk` it does set mirrors
-    /// the sqlparser incumbent, which reconcile's snapshot shape depends on.
+    /// column — so it must not set `identity`. Nor is it a key: see
+    /// `a_serial_column_is_not_a_primary_key_unless_declared_one`.
     #[test]
     fn serial_is_not_an_identity_column() {
         let d = def("create table t (a serial, b bigserial);");
         assert_eq!(d.columns[0].identity, None);
         assert!(!d.columns[0].nullable);
-        assert!(d.columns[0].is_pk);
-        assert!(d.columns[1].is_pk);
+        assert!(!d.columns[0].is_pk);
+        assert!(!d.columns[1].is_pk);
     }
 
     /// `GENERATED ALWAYS AS (expr) STORED` is a computed column, not an identity

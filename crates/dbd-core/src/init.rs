@@ -91,7 +91,8 @@ ignore:
   - auth.*
   - storage.*
   - realtime.*
-  - supabase_*.*
+  - supabase_functions.*
+  - supabase_migrations.*
   - extensions.*
   - pgbouncer.*
   - pgsodium.*
@@ -113,8 +114,20 @@ create table if not exists example (
     .to_string()
 }
 
+/// The targets `dbd init` has a scaffold for.
+pub const SCAFFOLD_TARGETS: &[&str] = &["postgres", "supabase"];
+
 /// Write init files to the project directory.
 pub fn create_project(project_dir: &std::path::Path, name: &str, target: &str) -> crate::error::Result<Vec<InitFile>> {
+    // Refuse rather than fall through: an unknown target used to get the
+    // postgres scaffold, so `--target convex` (or a typo) looked like it worked.
+    if !SCAFFOLD_TARGETS.contains(&target) {
+        return Err(crate::error::DbdError::Config(format!(
+            "dbd init has no scaffold for `{target}` — it scaffolds {} projects",
+            SCAFFOLD_TARGETS.join(" or ")
+        )));
+    }
+
     // Check if already initialized
     if project_dir.join("design.yaml").exists() {
         return Err(crate::error::DbdError::Config(
@@ -181,6 +194,30 @@ mod tests {
         );
     }
 
+    /// `supabase_*.*` reads as "every supabase_ schema", but `ignore` matches a
+    /// `prefix.*` pattern by its literal prefix — there is no glob inside it —
+    /// so the scaffold's pattern could only ever match a schema literally named
+    /// `supabase_*`, and a reference into Supabase's own schemas was reported
+    /// as unresolved on every scaffolded project.
+    #[test]
+    fn the_supabase_scaffold_ignores_supabases_own_schemas() {
+        let config: crate::config::DesignConfig = serde_yaml::from_str(&generate_supabase_config("p")).unwrap();
+        for target in [
+            "supabase_functions.http_request",
+            "supabase_migrations.schema_migrations",
+        ] {
+            let mut e = crate::entity::Entity::new(crate::entity::EntityType::Function, "public.notify");
+            e.refs = vec![crate::entity::Ref::stated(target, crate::entity::RefKind::Reads)];
+            let mut entities = vec![e];
+            crate::references::resolve_references(&mut entities, &[], &config.ignore);
+            assert!(
+                entities[0].warnings.is_empty(),
+                "{target} is Supabase's, and the scaffold must ignore it: {:?}",
+                entities[0].warnings
+            );
+        }
+    }
+
     #[test]
     fn generates_directory_gitkeeps() {
         let files = generate_init_files("test", "postgres");
@@ -215,6 +252,22 @@ mod tests {
                 .exists()
         );
         assert!(files.len() > 5);
+    }
+
+    /// `init` scaffolds what it knows how to scaffold. Any other target —
+    /// `convex`, `sqlite`, a typo — wrote a postgres project without a word.
+    #[test]
+    fn create_project_refuses_a_target_it_cannot_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        for target in ["convex", "sqlite", "supbase"] {
+            let err = create_project(tmp.path(), "test", target).unwrap_err().to_string();
+            assert!(err.contains(target), "names what was asked for: {err}");
+            assert!(
+                err.contains("postgres") && err.contains("supabase"),
+                "and what works: {err}"
+            );
+            assert!(!tmp.path().join("design.yaml").exists(), "nothing written for {target}");
+        }
     }
 
     #[test]

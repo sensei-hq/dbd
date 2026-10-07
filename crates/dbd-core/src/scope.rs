@@ -35,10 +35,15 @@ pub struct ScopeGap {
 }
 
 /// Entity types a scope can select (schemas handled separately via auto-add).
+///
+/// Sequences included: one belongs to its schema like a table does. Leaving
+/// them out dropped every sequence from every scope, so a table whose default
+/// draws from one could not be applied under any scope.
 pub(crate) fn is_scopable(e: &Entity) -> bool {
     matches!(
         e.entity_type,
         EntityType::Enum
+            | EntityType::Sequence
             | EntityType::Table
             | EntityType::View
             | EntityType::MaterializedView
@@ -141,6 +146,32 @@ fn add_present_schemas(set: &mut HashSet<String>, all_entities: &[Entity]) {
     }
 }
 
+/// Add the `CREATE SCHEMA` entity for the schema each kept extension installs
+/// into (`WITH SCHEMA x`). A scope keeps every extension its `extensions:`
+/// allowlist admits, but [`add_present_schemas`] only sees the schemas its own
+/// entities live in — so without this, any scope lacking `x` failed with
+/// `schema "x" does not exist`. A schema the scope excludes by name stays out.
+fn add_extension_schemas(
+    set: &mut HashSet<String>,
+    all_entities: &[Entity],
+    allow: Option<&HashSet<String>>,
+    excluded: &HashSet<String>,
+) {
+    for ext in all_entities.iter().filter(|e| e.entity_type == EntityType::Extension) {
+        if allow.is_some_and(|a| !a.contains(&ext.name)) {
+            continue;
+        }
+        let Some(sch) = ext.schema.as_ref() else { continue };
+        if !excluded.contains(sch)
+            && all_entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Schema && &e.name == sch)
+        {
+            set.insert(sch.clone());
+        }
+    }
+}
+
 /// BFS from the in-scope roots along `refers` edges into managed, non-external
 /// entities. Returns (visited, parent) where `parent` maps node → predecessor.
 /// Self-refs, externals, and unresolved (non-managed) targets are not traversed.
@@ -187,15 +218,19 @@ fn traverse(
 /// Whether an entity named `qualified` (`schema.name`) — in today's design or long
 /// gone — falls in `resolved`.
 ///
-/// An entity the design still has is in scope exactly when resolution put it
-/// there, which accounts for excludes and the `deps` closure. A name the design no
-/// longer has cannot be resolved, so it is matched against the scope's own
-/// includes and excludes instead: the changelog of a table dropped three versions
-/// ago stays in the scope that table was in. `existing` is every entity name the
-/// design has now.
+/// An entity the design still has is in scope exactly when it is in
+/// `working_set` — the scope's working set (`Design::working_set`), which
+/// accounts for excludes and, under `deps: include`, the dependency closure.
+/// `resolved.entities` alone is the scope *before* that closure, and asking it
+/// left out every table `include` pulled in. A name the design no longer has
+/// cannot be resolved, so it is matched against the scope's own includes and
+/// excludes instead: the changelog of a table dropped three versions ago stays in
+/// the scope that table was in. `existing` is every entity name the design has
+/// now.
 pub fn admits(
     scopes: &IndexMap<String, ScopeEntry>,
     resolved: &ResolvedScope,
+    working_set: &HashSet<String>,
     existing: &HashSet<String>,
     qualified: &str,
 ) -> bool {
@@ -203,7 +238,7 @@ pub fn admits(
         return true;
     }
     if existing.contains(qualified) {
-        return resolved.entities.contains(qualified);
+        return working_set.contains(qualified);
     }
     let Some(ScopeEntry::Spec(spec)) = scopes.get(&resolved.name) else {
         return true;
@@ -302,6 +337,8 @@ pub fn resolve(
     }
 
     add_present_schemas(&mut base, all_entities);
+    let extensions: Option<HashSet<String>> = spec.extensions.as_ref().map(|v| v.iter().cloned().collect());
+    add_extension_schemas(&mut base, all_entities, extensions.as_ref(), &excluded);
 
     Ok(ResolvedScope {
         name: scope_name,
@@ -309,7 +346,7 @@ pub fn resolve(
         excluded,
         deps: deps_override.unwrap_or(spec.deps),
         is_all: false,
-        extensions: spec.extensions.as_ref().map(|v| v.iter().cloned().collect()),
+        extensions,
     })
 }
 
@@ -379,6 +416,12 @@ pub fn closure(resolved: &ResolvedScope, all_entities: &[Entity], externals: &[S
     }
 
     add_present_schemas(&mut visited, all_entities);
+    add_extension_schemas(
+        &mut visited,
+        all_entities,
+        resolved.extensions.as_ref(),
+        &resolved.excluded,
+    );
     Ok(visited)
 }
 

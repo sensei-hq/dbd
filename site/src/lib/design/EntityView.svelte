@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { nodeId, type Column, type Ref, type SchemaModel } from '$lib/design/model';
+  import { nodeId, stubAt, type Column, type Ref, type SchemaModel } from '$lib/design/model';
   import Tabs from './Tabs.svelte';
   import EntityDiagram from './EntityDiagram.svelte';
   import EntityChangelog from './EntityChangelog.svelte';
@@ -20,7 +20,13 @@
 
   const schema = $derived(entityKey.split('.')[0]);
   const name = $derived(entityKey.split('.')[1]);
-  const table = $derived(model.tables.find((t) => t.schema === schema && t.name === name) ?? null);
+  // A key can also name a stub — a table a foreign key lands on that the model does not carry.
+  // Its page is this one: it is table-shaped, and what references it is the point of opening it.
+  const own = $derived(model.tables.find((t) => t.schema === schema && t.name === name));
+  const stub = $derived(own ? undefined : stubAt(model, schema, name));
+  const table = $derived(own ?? stub ?? null);
+  const readable = (kind: string) => kind.replace(/_/g, ' ');
+  const stubKindOf = (r: Ref) => stubAt(model, r.to.s, r.to.t)?.kind;
 
   const outRefs = $derived(model.refs.filter((r) => r.from.s === schema && r.from.t === name));
   const inRefs = $derived(model.refs.filter((r) => r.to.s === schema && r.to.t === name));
@@ -47,7 +53,17 @@
     if (c.nn) out.push({ label: 'NN', cls: '' });
     if (uniqueCols.has(c.name) && !c.pk) out.push({ label: 'UNIQUE', cls: '' });
     if (c.en) out.push({ label: 'ENUM', cls: '' });
+    if (c.identity) out.push({ label: 'IDENTITY', cls: '' });
+    if (c.generated) out.push({ label: 'GENERATED', cls: '' });
     return out;
+  }
+
+  // An identity or generated column has no default — Postgres refuses one — but it is where a
+  // reader looks for how the value arrives, so the Default column says, in the DDL's own words.
+  function valueSource(c: Column): string | undefined {
+    if (c.identity) return `generated ${c.identity} as identity`;
+    if (c.generated) return `generated always as (${c.generated}) stored`;
+    return c.def;
   }
 
   const comment = $derived(noteBlocks(table?.noteMd ?? table?.note));
@@ -78,7 +94,11 @@
             <span class="font-mono text-sm text-faint">{schema}.</span>
             <h1 class="font-display text-h3 font-semibold tracking-tight">{name}</h1>
           </div>
-          <span class="ds-badge">{table.columns.length} columns</span>
+          {#if stub}
+            <span data-stub-kind={stub.kind} class="ds-badge">{readable(stub.kind)}</span>
+          {:else}
+            <span class="ds-badge">{table.columns.length} columns</span>
+          {/if}
           {#if inRefs.length || outRefs.length}
             <span class="ds-badge">{outRefs.length} out · {inRefs.length} in</span>
           {/if}
@@ -103,9 +123,21 @@
           <section data-section="info">
             <h2 class="font-mono text-label uppercase text-faint">Table info</h2>
             <div class="mt-3 flex max-w-3xl flex-col gap-2 text-sm leading-relaxed text-muted">
+              {#if stub}
+                <p data-stub-reason>
+                  {#if stub.kind === 'external'}Declared under <code
+                      class="rounded bg-code-bg px-1 font-mono text-accent-2"
+                      style="font-size: 0.85em;">external:</code> in design.yaml — this project references it but does
+                    not manage it.
+                  {:else if stub.kind === 'out_of_scope'}A table of this project that the scope this model was drawn
+                    for leaves out.
+                  {:else}Referenced by a foreign key, but defined nowhere in this project.{/if}
+                  Only the columns its foreign keys land on are shown.
+                </p>
+              {/if}
               {#if comment.length}
                 <Markdown blocks={comment} />
-              {:else}
+              {:else if !stub}
                 <p class="text-faint">No comment on this table — add one with <code
                     class="rounded bg-code-bg px-1 font-mono text-accent-2"
                     style="font-size: 0.85em;">COMMENT ON TABLE</code>.</p>
@@ -142,6 +174,7 @@
                   {#each table.columns as c (c.name)}
                     {@const rr = refsForCol(c.name)}
                     {@const note = noteBlocks(c.note)}
+                    {@const source = valueSource(c)}
                     <tr data-col-row={c.name} class="border-b border-line-soft align-top">
                       <td
                         data-cell="name"
@@ -162,11 +195,12 @@
                       </td>
                       <td
                         data-cell="default"
-                        class="py-2.5 pr-4 font-mono text-xs {c.def ? 'text-muted' : 'text-faint'}"
-                        style="overflow-wrap: anywhere;">{c.def ?? '—'}</td
+                        class="py-2.5 pr-4 font-mono text-xs {source ? 'text-muted' : 'text-faint'}"
+                        style="overflow-wrap: anywhere;">{source ?? '—'}</td
                       >
                       <td data-cell="refs" class="py-2.5 pr-4">
                         {#each rr as r (r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                          {@const sk = stubKindOf(r)}
                           <!-- Wraps rather than truncates: a cut-off target is a broken link label. -->
                           <button
                             type="button"
@@ -176,6 +210,7 @@
                           >
                             → {r.to.s}.{r.to.t}.{r.to.c}
                           </button>
+                          {#if sk}<span data-stub-target class="col-badge">{readable(sk)}</span>{/if}
                         {:else}
                           <span class="font-mono text-xs text-faint">—</span>
                         {/each}
@@ -201,6 +236,7 @@
             {#if outRefs.length || inRefs.length}
               <div class="mt-3 flex flex-col">
                 {#each outRefs as r (r.from.c + '>' + r.to.s + '.' + r.to.t + '.' + r.to.c)}
+                  {@const sk = stubKindOf(r)}
                   <button
                     data-ref="out"
                     type="button"
@@ -213,6 +249,7 @@
                         >{r.to.s}.{r.to.t}</span
                       >.{r.to.c}</span
                     >
+                    {#if sk}<span data-stub-target class="col-badge">{readable(sk)}</span>{/if}
                     {#if r.action}<span class="col-badge ml-auto">{r.action}</span>{/if}
                   </button>
                 {/each}
@@ -265,16 +302,42 @@
           {/if}
 
           {#if table.indexes?.length}
-            <section data-section="indexes" class="mt-8 pb-6">
+            <section data-section="indexes" class="mt-8 {table.checks?.length ? '' : 'pb-6'}">
               <h2 class="font-mono text-label uppercase text-faint">
                 Indexes <span class="text-faint">· {table.indexes.length}</span>
               </h2>
               <div class="mt-3 flex flex-col gap-0">
                 {#each table.indexes as ix (ix.def)}
-                  <div class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0">
+                  <div
+                    data-index={ix.name ?? ix.def}
+                    class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0"
+                  >
                     <span class="font-mono text-xs text-fg">{ix.def}</span>
+                    {#if ix.where}<span data-index-where class="font-mono text-xs text-muted"
+                        >where {ix.where}</span
+                      >{/if}
                     {#if ix.unique}<span class="col-badge pk">UNIQUE</span>{/if}
                     {#if ix.name}<span class="ml-auto font-mono text-faint" style="font-size: 0.66rem;">{ix.name}</span>{/if}
+                  </div>
+                {/each}
+              </div>
+            </section>
+          {/if}
+
+          {#if table.checks?.length}
+            <section data-section="checks" class="mt-8 pb-6">
+              <h2 class="font-mono text-label uppercase text-faint">
+                Checks <span class="text-faint">· {table.checks.length}</span>
+              </h2>
+              <div class="mt-3 flex flex-col gap-0">
+                {#each table.checks as ck, i (i)}
+                  <div data-check class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0">
+                    <span data-check-expression class="font-mono text-xs text-fg" style="overflow-wrap: anywhere;"
+                      >{ck.expression}</span
+                    >
+                    {#if ck.name}<span data-check-name class="ml-auto font-mono text-faint" style="font-size: 0.66rem;"
+                        >{ck.name}</span
+                      >{/if}
                   </div>
                 {/each}
               </div>
