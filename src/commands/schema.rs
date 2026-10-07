@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
-use super::{format_apply_summary, get_adapter, safe_read, safe_write};
+use super::{format_apply_summary, get_adapter, safe_read_ddl, safe_write};
 use crate::output::{self, Verbosity};
 
 /// Warn when the config loaded but no authored DDL was scanned under the
@@ -305,7 +305,7 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
     let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
     for file in &files {
-        let content = safe_read(project_dir, file)?;
+        let content = safe_read_ddl(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
         if content != formatted {
             changed += 1;
@@ -1042,7 +1042,7 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
     let mut changed = 0;
 
     for file in &files {
-        let content = safe_read(project_dir, file)?;
+        let content = safe_read_ddl(project_dir, file)?;
         let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
 
         if content != formatted {

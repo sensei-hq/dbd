@@ -426,7 +426,9 @@ pub fn detect_ddl_type_mismatches(project_dir: &Path) -> Vec<DdlTypeMismatch> {
             if file.extension().and_then(|e| e.to_str()) != Some("ddl") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&file) else {
+            // Decoded as the project scan decodes it: a UTF-16 file the load
+            // reads must not be invisible to the check of where it is filed.
+            let Ok(content) = crate::source_text::read_to_string(&file) else {
                 continue;
             };
             let declared = if matview_re.is_match(&content) {

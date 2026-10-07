@@ -182,9 +182,14 @@ pub fn build_plan(root: &Path, generated: Vec<(PathBuf, String)>, selected_schem
 
     for (rel, content) in generated {
         let abs = root.join(&rel);
-        let action = match std::fs::read_to_string(&abs) {
+        // Compared by text, decoded as the project scan decodes it, so a file
+        // SSMS saved as UTF-16 is the file it is. A file that is there but
+        // cannot be read at all is still there: overwriting it is a conflict,
+        // not a create.
+        let action = match crate::source_text::read_to_string(&abs) {
             Ok(existing) if existing == content => FileAction::Skip,
             Ok(_) => FileAction::Conflict,
+            Err(_) if abs.exists() => FileAction::Conflict,
             Err(_) => FileAction::Create,
         };
         items.push(PlanItem {
