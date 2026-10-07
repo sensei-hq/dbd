@@ -26,8 +26,12 @@ myproject/
       lookup_values.ddl
     view/config/
       genders.ddl
+    materialized_view/analytics/
+      daily_sales.ddl
     enum/config/
       status.sql
+    sequence/config/
+      ticket_no.ddl
     procedure/staging/
       import_lookups.ddl
     role/
@@ -54,12 +58,14 @@ myproject/
 | `ddl/procedure/staging/import_lookups.ddl` | `staging.import_lookups` | procedure |
 | `ddl/function/config/get_user.ddl` | `config.get_user` | function |
 | `ddl/enum/config/status.sql` | `config.status` | enum |
+| `ddl/materialized_view/analytics/daily_sales.ddl` | `analytics.daily_sales` | materialized view |
+| `ddl/sequence/config/ticket_no.ddl` | `config.ticket_no` | sequence |
 | `ddl/role/admin.ddl` | `admin` | role |
 
 Schema-scoped types: `ddl/<type>/<schema>/<name>.<ext>`
 Non-schema types: `ddl/<type>/<name>.<ext>`
 
-`<type>` ∈ `table` | `view` | `materialized_view` | `function` | `procedure` | `enum` | `role`. Extensions: `.ddl` or `.sql`. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
+`<type>` ∈ `table` | `view` | `materialized_view` | `function` | `procedure` | `enum` | `sequence` | `role` (`matview` is accepted for `materialized_view`). Extensions: `.ddl` or `.sql`. There is no `trigger` folder. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
 
 ---
 
@@ -91,9 +97,10 @@ project:
 source:
   dialect: postgresql
 
-target:
-  postgres:
+target:                              # ONLY the first entry is read
+  supabase:                          # same Postgres adapter; the key adds Supabase rules
     url: $DATABASE_URL
+    skip_schemas: [auth, storage]      # Supabase owns these — dbd won't manage their entities
     extensions:
       - uuid-ossp
       - name: postgis
@@ -102,37 +109,27 @@ target:
       - name: advanced
         refers: [basic]
       - name: basic
-
-  supabase:
-    url: $SUPABASE_DB_URL
-    schemas: [public, config]
-    skip_schemas: [auth, storage]      # Supabase owns these — dbd won't manage their entities
-    extensions: [postgis]
-    grants:
+    grants:                            # any target key; merged with schemas[].grants
       config:
         anon: [usage, select]
         service_role: [usage, all]
 
-  convex:
-    url: convex:                       # writes ./convex/schema.ts
-    # url: convex://./generated       # custom output dir
-    # url: convex://./generated?deploy=true   # also runs `npx convex deploy` after apply
-
-  sqlite:
-    url: sqlite://./local.db
-    # url: sqlite::memory:        # ephemeral
-    # url: file:/abs/path.db
+  # Other targets — use ONE of these as the first entry instead:
+  # postgres: { url: $DATABASE_URL }
+  # sqlite:   { url: sqlite://./local.db }    # or sqlite::memory:, file:/abs/path.db
+  # convex:   { url: convex: }                # writes ./convex/schema.ts; convex://./out?deploy=true
 
 schemas:
-  - config
-  - staging
+  - config:
+      exposed: true                    # PostgREST serves it → inspect reports tables with no RLS policy
+  - staging:
+      grants:
+        app_user: [usage, select]
   - extensions
 
 external:
-  - name: auth.users
+  - name: auth.users                   # only `name` is read
     note: Supabase managed auth table
-    columns:
-      - id: uuid
 
 apply:                          # lifecycle hooks around the DDL phase
   before:
@@ -142,18 +139,15 @@ apply:                          # lifecycle hooks around the DDL phase
     - script: sql/grants.sql    # declare tables dbd cannot derive by parsing
       writes: [app.messages]
 
-import:
-  staging: [staging]
+import:                         # files found by convention; this only tunes the load
   options:
     truncate: true
     null_value: ''
-    format: csv
-  tables:
-    - staging.lookups
+  tables:                       # per-table overrides — not an allowlist
     - staging.lookup_values:
         truncate: false
   after:
-    - import/loader.sql         # runs on `deploy` only — NOT on `dbd apply`
+    - import/loader.sql         # runs on `dbd import` and `dbd deploy` — NOT on `dbd apply`
 
 export:
   - config.lookups
@@ -186,23 +180,35 @@ scopes:                         # named entity selections (deploy a subset)
     deps: report                    # report (default) | include
   reporting:
     excludes: [staging, app.audit_log]
+  everything: all                   # bare `all` = the full set
 
 ignore:
   - bfs
   - my_company.*
+
+format:
+  keyword_case: lower
+  query_style: river
 ```
+
+Parsed but never read — reserved, change nothing: `import.staging`,
+`import.options.format`, `import.tables[].env`, `target.schemas`, `target.path`,
+`external[].columns`, `external[].note` (documentation only). Only the first
+`target:` entry is read; a second one is ignored.
 
 ### Section reference
 
 | Section | Purpose | Required |
 |---------|---------|----------|
-| `project` | Name and description | yes |
+| `project` | Name, note, version, `released` | yes |
 | `source` | DDL file dialect (default: postgresql) | no |
 | `target` | Deploy targets with connection + target-specific config | yes |
 | `schemas` | Schema declarations (universal) | yes |
 | `external` | FK stubs for external tables | no |
-| `import` | Data import config (staging schemas, options, tables, after scripts) | no |
-| `export` | Tables to export | no |
+| `apply` | Lifecycle hooks `before`/`after` | no |
+| `import` | Data import tuning (options, per-table overrides, after scripts) | no |
+| `export` | Tables to export (empty ⇒ all tables) | no |
+| `materialized_views` | pg_cron refresh scheduling | no |
 | `dbml` | DBML generation filters | no |
 | `scopes` | Named entity selections for subset deploys | no |
 | `ignore` | Reference classification overrides | no |
@@ -212,11 +218,14 @@ ignore:
 
 | Universal (top-level) | Target-specific |
 |---|---|
-| `schemas` | `extensions` (Postgres/Supabase) |
+| `schemas` (+ `grants`, `exposed` per entry) | `extensions` (Postgres/Supabase) |
 | `external` | `roles` (Postgres/Supabase) |
-| `import` / `export` | `grants` (Supabase) |
+| `import` / `export` | `grants` (any target key; Postgres grant model) |
 | `dbml` / `scopes` | `url` (connection / output) |
-| `ignore` | `skip_schemas` (leave a target's own schemas unmanaged) |
+| `ignore` / `format` | `skip_schemas` (leave a target's own schemas unmanaged) |
+
+`project.released` is set by `dbd release` only. `dbd reconcile` refuses when it
+is `true` and checks nothing else.
 
 ### Scopes — subset deploys from one design
 
@@ -255,9 +264,17 @@ dbd deploy --scope hub --database $HUB_URL
   always-on regardless.
 - Omit `default` (or the whole `scopes:` block) ⇒ the full set is used. Define a
   `default:` scope only if a bare `dbd deploy` (no `--scope`) should itself
-  deploy a subset.
+  deploy a subset. `all` and `default` are reserved: `--scope all` is always the
+  full set (a scope you name `all` is unreachable), and a run without `--scope`
+  uses `default` when defined — and is pinned as `default`. A scope's value may
+  be the bare string `all`.
+- Gaps come from recorded references (FKs; view/routine reads, writes, calls).
+  A column typed with an out-of-scope enum is NOT detected as a gap in 0.24.1 —
+  include the enum's schema yourself.
 - Per-scope migrations fall out automatically: pending-migration steps for
   out-of-scope entities are skipped while the per-database version still advances.
+  A table removed from the design is in no named scope's working set, so its
+  drop step never runs under a named scope.
 
 `snapshot`, `release` and `migrate` deliberately ignore `--scope` and warn when
 given it. A snapshot records the *design*, not one database: a scoped baseline
@@ -267,17 +284,25 @@ decides which migration steps *run*, not which ones exist — `dbd deploy --scop
 daemon` on a released project applies only the in-scope migrations while the
 database's version still advances.
 
-Scopes are honored by every entity-selecting command. The write commands
-(`inspect`, `apply`, `import`, `deploy`) gate on dependency gaps. The
-documentation/read/destructive commands (`dbml`, `combine`, `graph`, `export`,
-`reset`) filter to the scope's working set without gating — `inspect --scope` is
-where gaps surface. `dbml`/`combine` emit external stub tables for out-of-scope FK
+Scopes are honored by every entity-selecting command. **Gap-gated** (filter, and
+refuse on a gap under `deps: report`, `--dry-run` included): `inspect`, `apply`,
+`import`, `deploy`, `reconcile`, `diff`. **Filter-only**: `dbml`, `combine`,
+`emit`, `graph`, `diagram`, `export`, `refresh`, `policies`, `reset` —
+`inspect --scope` is where gaps surface. **Ignored with a warning**: `snapshot`,
+`release`, `migrate`, `doctor`, `init`, `merge`, `format`, `install`. Unfiltered
+paths: `import -n X -f file`, `policies --dry-run` and `deploy --dry-run`'s policy
+count. `dbml`/`combine` emit external stub tables for out-of-scope FK
 targets (and `combine` keeps roles + the scope's allowed extensions); `reset` is
 entity-level (drops the scope's own objects individually; `--schemas` additionally
 restricts the dropped schemas to those the scope occupies, roles dropped only on a
 full reset). The shared primitive is
 `Design::scoped_entities(&ResolvedScope) -> Result<Vec<Entity>>` (closure under `include`,
 plain set under `report`, everything for the all-scope).
+
+**A scope narrows what is applied, not what the project owns.** Under a scope,
+`reconcile` and `diff` hide what the design declares outside the scope from the
+live side, so it is neither altered nor pruned. Before 0.24.1 a scoped
+`reconcile --prune` dropped such tables (#40) — upgrade before running one.
 
 Policies are scope-filtered too: a file's target is read from its path
 (`policies/<schema>/<table>.sql`), and a policy whose table is outside the
@@ -292,12 +317,13 @@ SQL dbd does not model — attaching a table to a publication (Supabase realtime
 | Hook | Runs on | Position |
 |---|---|---|
 | `apply.before` | `apply` **and** `deploy` | after design+scope checks, before the first entity |
-| `apply.after` | `apply` **and** `deploy` | after every entity applied + matview stamped, **before** `policies/` |
-| `import.after` | `deploy` **only** | after the data load |
+| `apply.after` | `apply` **and** `deploy` | after every entity applied + matview stamped, **before** the configured grants and `policies/` |
+| `import.after` | `import` **and** `deploy` | after the data load and the import procedures |
 
-**`import.after` never runs on `dbd apply`.** Only the deploy path reaches the
-import phase. Post-DDL SQL parked there — often because it was once the only
-hook available — silently does nothing on `dbd apply`. If the hook's job is
+**`import.after` never runs on `dbd apply`.** Only `dbd import` and `dbd deploy`
+reach the import phase (and `import -n X -f file` skips it). Post-DDL SQL parked
+there — often because it was once the only hook available — silently does
+nothing on `dbd apply`. If the hook's job is
 "run once every entity exists", it belongs in `apply.after`.
 
 `apply.after` runs before `policies/` because publications and grants attach to
@@ -336,15 +362,15 @@ to prevent a hook from running.
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--config` | `-c` | `design.yaml` | Config file path |
+| `--config` | `-c` | `design.yaml` | Config file name, inside the `--source` directory |
 | `--database` | `-d` | `$DATABASE_URL` | Database URL (overrides config) |
-| `--environment` | `-e` | `prod` | Environment (dev or prod) |
-| `--source` | `-s` | `.` | Source directory or GitHub repo |
+| `--environment` | `-e` | `prod` | `dev` or `prod`; `development`/`production` accepted as aliases, anything else is an error. Selects `import/<env>/`, recorded in bookkeeping (the reset guard reads it) |
+| `--source` | `-s` | `.` | Project directory; `dbd deploy` also accepts a GitHub repo |
 | `--verbose` | `-v` | | Verbose output (show all details) |
 | `--scope` | | full set | Scope name from design.yaml (entity subset) |
 | `--deps` | | scope's own | Gap policy override: `report` or `include` |
 
-The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL scheme**, not a target name; the first `target.<name>` block in design.yaml supplies the platform config and default `url`. There is no target-name selector — override the connection per run with `-d`/`$DATABASE_URL` (pair with `--scope` for multi-database deploys).
+The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL scheme**, not a target name (`mysql://`/`sqlserver://` are refused by name — there is no MySQL or SQL Server adapter); the first `target.<name>` block in design.yaml supplies the platform config and default `url`. There is no target-name selector — override the connection per run with `-d`/`$DATABASE_URL` (pair with `--scope` for multi-database deploys).
 
 ### dbd init
 
@@ -354,6 +380,11 @@ The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL schem
 dbd init -n myproject
 dbd init -n myproject --target supabase
 ```
+
+The scaffold: `design.yaml`, `ddl/{table,view,materialized_view,function,procedure,enum}/`,
+`ddl/table/public/example.ddl`, `import/`. `--target supabase` adds a `config` schema,
+`external:` entries (`auth.users`, `auth.uid`, `storage.objects`, `storage.buckets`) and
+`ignore:` patterns — no grants.
 
 **Reverse-engineer.** `dbd init --from-db <conn>` (or `$DATABASE_URL`/`-d` when no value) and
 `dbd init --from-dbml <file>` generate the whole project from an existing source instead of the
@@ -383,7 +414,10 @@ roles — DBML has none, so a no-op there), `--dry-run`. Postgres internals (`pg
 `cron`, `net`, …) are excluded unless `--all-schemas`.
 
 The target **dialect is taken from the connection URL scheme** (`postgres://` → `postgres`
-target; `sqlite://`/`file:`/`sqlite::memory:` → `sqlite` target). **SQLite** is captured verbatim
+target; `sqlite://`/`file:`/`sqlite::memory:` → `sqlite` target); `--target` is ignored with
+`--from-db`, and `--from-dbml` accepts only the default `postgres`. A Supabase database
+lands as a `postgres` target — rename the key to `supabase` for Supabase's rules. The
+baseline snapshot does not set `project.released`. **SQLite** is captured verbatim
 from `sqlite_master` — tables (CHECK, type affinity, AUTOINCREMENT, WITHOUT ROWID), user indexes,
 and views, losslessly; no schemas/enums/functions/sequences/roles, **triggers skipped**; files are
 flat (`ddl/table/<name>.ddl`) and `design.yaml` carries `schemas: []`. (`dbd inspect` on a SQLite
@@ -411,11 +445,14 @@ dbd merge --roles                        # also reverse-engineer roles (opt-in)
 
 Every merge that proceeds **overwrites the introspected DDL into the project (no `.bak`)** and
 **captures the delta as a new snapshot version** (a baseline if the project had none), bumping
-`design.yaml`'s `project.version`. Each generated file is classified: **create** (no file → written),
-**skip** (byte-identical → untouched; runs through the same formatter as `dbd format`, so a
-generated-then-formatted file stays a skip), **overwrite** (differs → replaced in place),
+`design.yaml`'s `project.version`. Each generated file is classified: **created** (no file → written),
+**unchanged** (byte-identical → untouched; runs through the same formatter as `dbd format`, so a
+generated-then-formatted file stays unchanged), **conflict** (differs from the DB → replaced in place),
 **orphan** (an existing managed `.ddl`/`.sql` with no matching DB entity — **reported, never
-deleted**). `--dry-run` previews the plan + the snapshot version that would be created.
+deleted**). `--dry-run` previews the plan + the snapshot version that would be created:
+`[dry-run] N created · N unchanged · N conflict(s) (would overwrite, no .bak)`; a real run prints
+`N file(s) written · snapshot vN created`. Like `init --from-db`, `merge` does not set
+`project.released`.
 
 `merge` requires an existing project (refuses if no `design.yaml` → use `init --from-db`). It never
 edits config, so files written for a schema not in `schemas:` produce a **warning**. Secrets never
@@ -467,6 +504,10 @@ only: never an error, never affects the exit code.
 
 Columns sharing a value set become one proposal. Where the plain column name would name two different files, the type is named `<table>_<column>` instead (and `_2`, `_3` if that still collides) — the footer says how many were renamed and why. An identifier that is not a single ordinary path segment gets no path at all, just the candidate; likewise values needing escaping are printed unquoted and flagged, since escaped text is not the literal it came from.
 
+**RLS report.** For every exposed schema (`exposed: true`, or `public` on a
+`supabase` target), `inspect` lists tables with no `policies/<schema>/<table>.sql`
+— advisory, never the exit code.
+
 **Exit code (changed in v0.12.0).** `inspect` exits **1** when the design carries
 a blocking error, 0 otherwise. It previously always exited 0, so a CI step
 running `dbd inspect` passed green on a file `dbd apply` refuses — while apply's
@@ -503,7 +544,28 @@ dbd apply -n config.lookups
 dbd apply --dry-run
 ```
 
-Apply order: schemas → extensions → roles → enums → tables (with interleaved migrations) → views → materialized views → functions → procedures.
+Apply order is ONE dependency sort across all entity types. Each type has a band
+it is never placed before — schema, extension, role, sequence, enum, table, view,
+materialized view, function/procedure — and a real dependency can push an entity
+later (a view calling a function goes after it; a function reading a view after
+the view). Cyclic entities get an error and go last. Migrations interleave with
+the tables they alter.
+
+**Transaction.** On PostgreSQL the plan (entities, migrations, version stamp) runs
+in ONE transaction; an interrupted upgrade rolls back. `apply.before` runs before
+it; matview stamping, pg_cron sync and `apply.after` after it commits. Set
+`DBD_NO_TX` (any value) for DDL that cannot run in a transaction (`CREATE INDEX
+CONCURRENTLY`). SQLite applies without a transaction.
+
+**Grants.** After the schema (entities, migrations, `apply.after`), `dbd apply`
+applies the configured grants: `schemas[].grants` merged with the first target's
+`grants` (target lists replace schema-entry lists per role). `usage` (lower case)
+→ `GRANT USAGE ON SCHEMA`; other perms → `GRANT … ON ALL TABLES IN SCHEMA` +
+`ALTER DEFAULT PRIVILEGES … ON TABLES`; then `NOTIFY pgrst, 'reload config'`. On a
+`supabase` target, configured grants also give `anon`/`authenticated`/`service_role`
+`USAGE` on every listed schema. Not under `--dry-run`, not filtered by `--scope`;
+skipped with a note on SQLite/Convex. `--dry-run` lists entities only (no hooks,
+no grants).
 
 After entities apply, `dbd apply` (and `dbd deploy`) stamps a `dbd:hash` sentinel comment on any materialized view it just created and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
@@ -535,7 +597,16 @@ from the extension (.jsonl/.tsv/.csv), bypassing the `import/` convention. Symme
 writes `<dir>/<name>.<fmt>` (default `export/<schema>/<name>.<fmt>`) — `-o` lets export write
 straight into the `import/` tree for a round-trip.
 
-Execution: truncate → COPY data → call import procedures → run after scripts.
+Execution: truncate → COPY data → call import procedures → run `import.after`.
+CSV/TSV: the header row is skipped and columns load by position. `.json` files are
+read as JSON Lines, like `.jsonl`; on PostgreSQL they go through
+`staging.import_jsonb_to_table`, which dbd installs (creating `staging`). An import
+procedure is any procedure/function that reads the staging table (body analysis,
+not names; dynamic SQL is invisible); the plan is ordered by FK dependencies
+between their write targets. `import.after` runs on every `dbd import` (with or
+without `-n`) and on `dbd deploy`, never on `apply`; `-f` skips truncate,
+procedures, `import.after` and scope. `import.tables` holds per-table overrides
+(`truncate`, `format`, `null_value`) — it is not an allowlist.
 
 Environment-specific data: files at `import/<schema>/file` load in every
 environment; files at `import/<env>/<schema>/file` load only when `-e <env>`
@@ -554,14 +625,26 @@ dbd export -o import/                 # write straight into the import/ tree
 
 Reads table data out of the live database into files — the inverse of `import`.
 
-`-n`/`--name <table>` exports one table; omitted, every table listed under
-`export:` in `design.yaml` is written. `-f`/`--format <csv|tsv|jsonl>` selects
+`-n`/`--name <table>` exports one table. With no `export:` list in `design.yaml`,
+every table (in scope) is exported; with one, only the listed tables — and `-n`
+naming a table the list leaves out prints `No tables to export.` Only **tables**
+are exported: a view under `export:` is skipped without a message. A per-entry
+`format` wins over `-f`. `-f`/`--format <csv|tsv|jsonl>` selects
 the format (default `csv`) — note the asymmetry with `import`, where `-f` is a
 file path. `-o`/`--output <dir>` writes the selected tables flat as
 `<dir>/<name>.<fmt>`; without it, files land at `export/<schema>/<name>.<fmt>`.
 
-Pointing `-o` at `import/` produces a round-trip: what `export` writes,
-`import` reads back under the `import/<schema>/<table>.<fmt>` convention.
+Pointing `-o` at `import/<schema>` produces a round-trip: what `export` writes,
+`import` reads back under the `import/<schema>/<table>.<fmt>` convention (`-o` writes
+`<table>.<fmt>` without the schema).
+
+**Moving a long-lived system.** The pattern: views that dereference each FK back to
+the natural key the import staging tables expect, listed under `export:`, so an
+export from the old database matches the staging tables and an import into the new
+one runs the same procedures as a fresh seed. In 0.24.1 `dbd export` skips views,
+so export them with `psql "\copy (select * from <view>) to 'import/<schema>/<table>.csv'
+with (format csv, header)"` until it can. Not needed when the import files are the
+well-managed source of truth.
 
 Per-table `export_data` is not available on Convex — `npx convex export` only
 supports whole-deployment dumps, so the command errors with that explanation
@@ -569,11 +652,19 @@ rather than writing a partial file.
 
 ### dbd deploy
 
-One-shot: fetch source → apply → import → policies → cleanup.
+One-shot: fetch source → apply → grants → import → policies → cleanup.
 
 `deploy` means "bring the database fully up from source", so RLS policies from
 `policies/` are applied **unconditionally** — unlike `dbd apply`, where they are
-opt-in behind `--with-policies`.
+opt-in behind `--with-policies`. Grants are the same `dbd apply` applies (schema +
+target grants, the PostgREST ride-along on `supabase`), right after the schema and
+before import and policies. `-c/--config` works as on every command.
+
+`deploy` is the only command that accepts a GitHub source; every other command
+refuses one with a message (clone the repo and pass its path). For a private
+repository set `GITHUB_TOKEN` — sent as a bearer token to `api.github.com` only.
+`--dry-run` checks the scope and counts data files and policy files (the policy
+count is not scope-filtered).
 
 ```sh
 dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
@@ -634,9 +725,12 @@ removes an enum **value** (see below);
 `--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
 design). Without `--prune`, orphans are reported and left in place. Under
 `--scope`, a table the design declares outside the scope is never an orphan — a
-scope narrows what is applied, not what the project owns. Orphaned
+scope narrows what is applied, not what the project owns (true from 0.24.1;
+earlier releases dropped those tables under `--scope --prune`, #40). On a
+`supabase` target Supabase's own schemas are never pruned. Orphaned
 enums are only warned about, never auto-dropped. Reconcile is **disabled once the
-project is released** (`project.released: true`) — see `dbd release`.
+project is released** (`project.released: true`) — see `dbd release`; it checks
+that flag only.
 
 Reconcile compares the introspected live schema against the design and
 canonicalizes the two representations first: it lifts inline PK/UNIQUE to
@@ -666,9 +760,11 @@ reconcile rolls back. Generated ALTERs run with the managed schemas on
 
 Read-only. Show the complete difference between the live database and the
 design — columns, PK/unique, foreign keys, CHECK constraints, indexes, column
-comments and enums: everything `reconcile --dry-run` omits (reconcile also now
-handles FKs; diff additionally covers CHECK, indexes, and comments). Never
-writes, and available even after `dbd release`.
+comments and enums, plus matview drift. It compares the same model `reconcile`
+converges (table comments are in neither); diff changes nothing, works after
+`dbd release`, and also shows what reconcile won't touch (orphans without
+`--prune`, orphan enums, drifted matviews). Under `--scope` it refuses on a
+dependency gap.
 
 ```sh
 dbd diff -d $DATABASE_URL              # human report (summary + SQL)
@@ -704,6 +800,11 @@ dbd baseline                 # alias
 Refuses if the project is already released or if snapshots already exist, and if
 the design has entity errors (run `dbd inspect` first). After release the flow is
 the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
+
+**Snapshots but not released.** `init --from-db` and `merge` write snapshots
+without setting `released`. Such a project is on the migration track (snapshot →
+apply), still allows `reconcile`, and `release` refuses on it ("Snapshots already
+exist"). Set `released: true` in `design.yaml` by hand to make reconcile refuse.
 
 ### dbd snapshot
 
@@ -760,8 +861,9 @@ Skipped ./policies/dojo/repository_metrics.sql — dojo.repository_metrics is ou
 This matters when one design serves several planes: without it, a policy for a
 schema a plane lacks runs anyway and reports `FAILED … schema dojo does not
 exist` on every deploy — an expected condition dressed as an error, which is how
-real failures stop being read. Runs without `--scope` apply every file, and
-`--dry-run` filters before previewing so the preview matches the run.
+real failures stop being read. Runs without `--scope` apply every file.
+`dbd policies --dry-run` lists every file without the scope filter; the real run
+filters.
 
 A file off the `policies/<schema>/<table>.sql` layout has no derivable target and
 always applies — scope filtering here is a correctness aid, not a security
@@ -814,14 +916,31 @@ the only dialect dbd reads into columns and constraints, so emitting from a
 T-SQL, MySQL or SQLite project is refused rather than producing an empty
 schema.
 
-Tables and views only. Functions, procedures and triggers are skipped and
-reported: their bodies are PL/pgSQL or SQL that does not translate.
+Tables — columns, `NOT NULL`, defaults, primary keys, unique constraints,
+foreign keys, `CHECK` constraints and indexes — and views/materialized views
+(as `CREATE VIEW`, body passed through untranslated and reported). A `CHECK`
+expression and an index expression or predicate are passed through untranslated
+and reported, like view bodies. Functions, procedures and triggers are skipped
+and reported: their bodies are PL/pgSQL or SQL that does not translate. Schemas,
+extensions, roles, sequences and enum types produce no statement.
 
 Anything the target cannot express is **downgraded to the nearest thing it
-can, and reported** — never silently dropped, and never a reason to refuse the
-whole schema. Each loss appears twice: as a comment at the site in the emitted
-file, and in the run's summary. `--report <file>` writes the same set as JSON
-so CI can assert on the count.
+can, and reported** — never a reason to refuse the whole schema. A loss appears
+as a comment at the site in the emitted file (schema folds and skipped routines
+have no site, so they are in the summary and report only) and in the run's
+summary. `--report <file>` writes the same set as a JSON array of
+`{entity, column, from, to, reason}` so CI can assert on the count.
+
+Mapping (⚠ = reported): `text[]`/any array → MySQL `JSON` ⚠, T-SQL
+`nvarchar(max)` ⚠, SQLite `TEXT` ⚠; `jsonb` → `JSON` / `nvarchar(max)` ⚠ /
+`TEXT` ⚠; `uuid` → `CHAR(36)` ⚠ / `uniqueidentifier` / `TEXT` ⚠; `timestamptz` →
+`DATETIME` / `datetimeoffset` / `TEXT`; `boolean` → `TINYINT(1)` / `bit` /
+`INTEGER`; an **enum** or any other type → `VARCHAR(255)` ⚠ / `nvarchar(255)` ⚠ /
+`TEXT` ⚠ (MySQL `ENUM` is not used and no CHECK is added — the values are no
+longer enforced). MySQL and SQLite fold the schema into the name
+(`schema_table`) ⚠; T-SQL keeps `[schema].[table]`. Not reported in 0.24.1:
+defaults other than literals, `now()` and booleans are dropped; serial/identity
+columns lose auto-increment; generated columns lose their expression.
 
 ```sql
 -- dbd: `tags` was `text[]` — emitted as JSON; no array type exists here, so
@@ -860,7 +979,7 @@ dbd diagram --scope hub            # scope-aware (only the scope's tables/refs)
 dbd diagram --json -f schema.json  # write the raw SchemaModel JSON for upload/tooling
 ```
 
-Opens the hosted interactive viewer at `https://dbd.sensei-hq.com/diagram` (project overview, pan/zoom ER diagram, entities list, snapshot changelog, and a sidebar of every entity filterable by type — tables with fields, references, dependencies, a relationship diagram and their own changelog; views and routines with what they use and what uses them; enums with their values). The dbd-native schema model (schemas/tables/columns/FK refs) is gzip-compressed into the URL fragment — client-side only, never sent to a server, so the link is private and self-contained. `--print-url` prints the link without opening a browser (useful on headless machines). `--site`/`$DBD_DIAGRAM_URL` overrides the base URL. `--json -f schema.json` writes the raw SchemaModel JSON; upload it on the site's `/diagram` page or feed it to other tooling. The model carries `version` (currently `3`) and, being JSON rather than DBML, covers more than tables: `tables` (columns with `pk`/`nn`/`en`/`fk`/`uq`, type, default, comment, plus indexes), `refs` (foreign keys — the ER edges, column-level as `{s,t,c}`), `entities` (views, materialized views, functions, procedures), `deps` (what reads/writes/calls what — the call graph), and `schemas`/`project`. `entities`/`deps` are deliberately separate from `tables`/`refs`: an ER renderer wants FKs, a call-graph renderer wants dependencies, and folding them would change what every existing consumer of `tables` receives. A dep edge whose target is not a project entity (a built-in like `now()`, or a dangling reference) is marked `"unresolved": true` rather than dropped — the edge is real, only the endpoint is unplaceable. Comments reach the model for every kind, not just tables: `note` is the first line, `noteMd` the full text. `history` (v3, omitted when there are no snapshots) is what each snapshot changed, oldest first: the first a `baseline` of table/enum counts, each later one the tables and enums it added, removed or modified with their column, index, constraint and enum-value edits; a multi-stage rename or type change is one entry spanning `version`..`through` and reads as the rename or type change; type spellings are canonicalised; views and routines have no history (snapshots hold tables and enums only); under `--scope` it covers the scope's entities only. `enums` (v3, omitted when there are none) carries each enum type with its values in declaration order and its comment.
+Opens the hosted interactive viewer at `https://dbd.sensei-hq.com/diagram` (root tabs Overview / Diagram / Entities (tables) / Changelog; per entity Details / Diagram / Changelog, enums Details / Changelog; a sidebar of every entity — tables, views, matviews, functions, procedures, triggers, enums — searchable and filterable by type — tables with fields, references, dependencies, a relationship diagram and their own changelog; views and routines with what they use and what uses them; enums with their values). The dbd-native schema model (schemas/tables/columns/FK refs) is gzip-compressed into the URL fragment — client-side only, never sent to a server, so the link is private and self-contained. `--print-url` prints the link without opening a browser (useful on headless machines). `--site`/`$DBD_DIAGRAM_URL` overrides the base URL. `--json -f schema.json` writes the raw SchemaModel JSON; drag the file onto the site's `/diagram` page (no file picker) or feed it to other tooling. The viewer keeps the designs you open in the browser's localStorage (`dbd:diagram:<project>`, listed and removable at `/projects`); nothing is sent to a server. The model carries `version` (currently `3`) and, being JSON rather than DBML, covers more than tables: `tables` (columns with `pk`/`nn`/`en`/`fk`/`uq`, type, default, comment, plus indexes), `refs` (foreign keys — the ER edges, column-level as `{s,t,c}`), `entities` (views, materialized views, functions, procedures, triggers — triggers come from the T-SQL/MySQL readers), `deps` (what reads/writes/calls what — the call graph), and `schemas`/`project`. `entities`/`deps` are deliberately separate from `tables`/`refs`: an ER renderer wants FKs, a call-graph renderer wants dependencies, and folding them would change what every existing consumer of `tables` receives. A dep edge whose target is not a project entity (a built-in like `now()`, or a dangling reference) is marked `"unresolved": true` rather than dropped — the edge is real, only the endpoint is unplaceable. Comments reach the model for every kind, not just tables: `note` is the first line, `noteMd` the full text. `history` (v3, omitted when there are no snapshots) is what each snapshot changed, oldest first: the first a `baseline` of table/enum counts, each later one the tables and enums it added, removed or modified with their column, index, constraint and enum-value edits; a multi-stage rename or type change is one entry spanning `version`..`through` and reads as the rename or type change; type spellings are canonicalised; views and routines have no history (snapshots hold tables and enums only); under `--scope` it covers the scope's entities only. `enums` (v3, omitted when there are none) carries each enum type with its values in declaration order and its comment.
 
 ### dbd dbml
 
@@ -964,13 +1083,18 @@ dbd reset --dry-run
 dbd reset --schemas          # also DROP SCHEMA for managed schemas
 dbd reset --extensions       # also DROP EXTENSION for configured extensions
 dbd reset --clean            # = --schemas --extensions
-dbd reset --target supabase  # protected-schema set for the target (default: postgres)
+dbd reset --target postgres  # protected-schema set (default: the design's target key)
 dbd reset --scope hub --dry-run   # only the objects the 'hub' scope occupies
 ```
 
-`--target <postgres|supabase>` (default `postgres`) selects which schemas are protected from
-`DROP SCHEMA` under `--schemas`: on `supabase` the managed set (`auth`, `storage`, …, `public`)
-is skipped; on `postgres` `public` is dropped.
+`--target <postgres|supabase>` selects which schemas are protected from `DROP SCHEMA` under
+`--schemas`. It defaults to the design's target key (the first `target:` entry), so a Supabase
+project is protected without the flag; on `supabase` the managed set (`public`, `auth`,
+`storage`, `realtime`, `graphql_public`, `supabase_functions`, `pgbouncer`, `pgsodium`, `vault`,
+`extensions`, `supabase_migrations`) is skipped; on `postgres` `public` is dropped, and the
+target's roles are dropped on a full reset. The guards read the database: refused when it is
+marked prod (rows written as `production` included) or at version ≥ 1, unless `--force`;
+`--dry-run` needs no connection and checks no guard.
 
 `--schemas` additionally `DROP SCHEMA … CASCADE`s the managed schemas, always skipping
 `pg_catalog`/`information_schema`/`pg_toast`; on a `supabase` target also skipping the
@@ -987,7 +1111,7 @@ dbd doctor
 dbd doctor --fix
 ```
 
-Audits + migrates: old Node.js `design.yaml` format → new format (`--fix` writes a `.yaml.bak`); removes stale internally-managed files; migrates plural DDL type folders to singular (`ddl/functions/` → `ddl/function/`, merging into an existing singular folder, backing up the older file on a same-name collision as `<name>.ddl.bkp`).
+Audits + migrates: old Node.js `design.yaml` format → new format (`--fix` writes a `.yaml.bak`); removes stale internally-managed files; migrates plural DDL type folders to singular (`ddl/functions/` → `ddl/function/`, merging into an existing singular folder, backing up the older file on a same-name collision as `<name>.ddl.bkp`). Also reports **misfiled view DDL** — a `CREATE MATERIALIZED VIEW` under `ddl/view/` (which makes `reset` emit `DROP VIEW` on it) or a plain view under `ddl/materialized_view/` — with a move hint; `--fix` does not move these. Always exits 0.
 
 ---
 
@@ -1007,15 +1131,18 @@ Two scopes, and neither is system-wide (all OS users): **global** (default) writ
 
 ## GitHub source
 
+`dbd deploy` is the only command that takes a GitHub source. Every other command
+refuses one with a message — clone the repository and pass its local path.
+
 ```sh
 # Shorthand
-dbd inspect --source sensei-hq/daemon/database
+dbd deploy --source sensei-hq/daemon/database -d $DATABASE_URL
 
 # With branch/tag
-dbd apply --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
+dbd deploy --source sensei-hq/daemon/database@v2.1 -d $DATABASE_URL
 
 # Full URL
-dbd inspect --source https://github.com/owner/repo/tree/main/database
+dbd deploy --source https://github.com/owner/repo/tree/main/database -d $DATABASE_URL
 
 # GitHub downloads are cached under ~/.cache/dbd (macOS: ~/Library/Caches/dbd),
 # keyed by owner-repo-ref and reused while a design.yaml is present.
@@ -1023,11 +1150,19 @@ dbd inspect --source https://github.com/owner/repo/tree/main/database
 # dbd deploy --clear-cache wipes the entire cache directory first.
 ```
 
-Set `GITHUB_TOKEN` for private repositories.
+For a private repository set `GITHUB_TOKEN`: dbd sends it as a bearer token to
+`api.github.com` and nowhere else.
 
 ---
 
 ## Library usage
+
+The guide page *Embedding dbd-core* (https://dbd.sensei-hq.com/guide/embedding)
+covers the whole API; every example there is compiled by the test suite.
+`Design::deploy` applies the configured grants like `dbd deploy`.
+`Design::reconcile` does not check `project.released` — callers must.
+`history::load_scoped(project_dir, keep)` takes a `keep(schema, name) -> bool`
+predicate.
 
 ```rust
 use dbd_core::{connect, ApplyComplete, Design};
@@ -1087,17 +1222,18 @@ let graph = design.graph(None, None)?;
 | Target | Adapter | URL form | Extensions | Roles | SQL exec | Import | Migrations |
 |--------|---------|----------|------------|-------|----------|--------|------------|
 | PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV/JSONL) | `dbd.migrations` (dedicated `dbd` schema) |
-| Supabase | sqlx-postgres | `postgres://…` (with `target: supabase`) | filtered (managed) | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
+| Supabase | sqlx-postgres (same adapter; the `supabase` key exposes `public`, protects Supabase schemas from prune/reset, adds PostgREST grants) | `postgres://…` (with `target: supabase`) | yes | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
 | SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSONL) | `_dbd_migrations` (SQLite syntax) |
 | Convex | codegen | `convex:` (→ `./convex`), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>`; whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
+| MySQL / SQL Server | **none** — `mysql://`, `mariadb://`, `sqlserver://`, `mssql://` refused by name | — | — | — | — | — | — |
 
 ### Adapter quirks
 
-- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension` are rejected at apply time.
+- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension`/`Sequence`/`MaterializedView` are rejected at apply time. No transactional apply; grants skipped; policy files fail; a SQLite project (`verbatim` reader) cannot `diff`/`reconcile`/`emit`.
     - **Offline ref classifier** — `classify_reference` checks an alphabetically sorted table of ~150 built-ins (aggregates, window/math/date/JSON1/scalar functions, type names) via `binary_search`, plus a `sqlite_*` prefix rule that catches all reserved system tables/views (`sqlite_master`, `sqlite_sequence`, `sqlite_stat1`, …). Everything else falls through to `UserDefined`.
     - **Trigger-aware DDL splitter** — `dbd format`'s statement splitter recognises SQLite `CREATE TRIGGER … BEGIN <stmts;> END;` blocks and keeps them atomic. `BEGIN` is only treated as trigger-body when the in-flight block already contains the `TRIGGER` keyword, so bare `BEGIN; … COMMIT;` transactions still split correctly. `CASE … END` inside the body doesn't trip the close detector — only `END` immediately followed by `;` at a word boundary closes the block.
     - **Batched imports** — `import_delimited` and `import_jsonl` flush rows in multi-row `INSERT … VALUES (?,?),(?,?), …` batches sized by `batch_row_size(col_count) = min(500, 32000 / col_count)`. CSV uses a fixed header; JSONL detects per-line column-set changes and flushes the previous group before starting a new one. All inside a single transaction per import.
-- **Convex**: codegen, not a SQL engine — `execute_script` returns an error; `apply_entities` is the canonical path (`prefers_batch_apply() = true`). Table names flatten `schema.entity` → `schema_entity` (Convex disallows `.`). SQL → Convex validator: `int*`/`numeric` → `v.number()`, text-like (`text`/`varchar`/`uuid`/`citext`) → `v.string()`, `boolean` → `v.boolean()`, timestamps → `v.number()` (epoch ms), `jsonb`/`json` → `v.any()`, `bytea`/`blob` → `v.bytes()`, `T[]` → `v.array(T)`, nullable → `v.optional(T)`. Indexes emit as `.index("name", ["col"])`. Convex platform columns `_id` / `_creationTime` are skipped if present.
+- **Convex**: codegen, not a SQL engine — `execute_script` returns an error (so `reset`, `policies`, grants, `diff` and `reconcile` are unavailable); only tables and enums are written, other entity types are skipped without a message; `apply_entities` is the canonical path (`prefers_batch_apply() = true`). Table names flatten `schema.entity` → `schema_entity` (Convex disallows `.`). SQL → Convex validator: `int*`/`numeric` → `v.number()`, text-like (`text`/`varchar`/`uuid`/`citext`) → `v.string()`, `boolean` → `v.boolean()`, timestamps → `v.number()` (epoch ms), `jsonb`/`json` → `v.any()`, `bytea`/`blob` → `v.bytes()`, `T[]` → `v.array(T)`, nullable → `v.optional(T)`. Indexes emit as `.index("name", ["col"])`. Convex platform columns `_id` / `_creationTime` are skipped if present.
     - **Enums** — an `Entity::Enum` named `config.status` with values `[active, inactive]` emits
       `export const config_status = v.union(v.literal("active"), v.literal("inactive"));` above
       `defineSchema`. Column whose `data_type` matches either the qualified name (`config.status`)
@@ -1155,8 +1291,11 @@ schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JS
 |-------|---------|-----------------|
 | dev, version 0 | allowed | allowed |
 | dev, version >= 1 | blocked | allowed |
-| prod, any version | blocked | allowed |
+| prod (or a legacy `production` row), any version | blocked | allowed |
 | fresh (no table) | allowed | allowed |
+
+The environment is the one recorded by the last write — `-e` defaults to `prod`,
+so a database applied without `-e dev` is prod.
 
 ---
 
@@ -1164,5 +1303,39 @@ schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JS
 
 | Variable | Used by |
 |----------|---------|
-| `DATABASE_URL` | Default database connection |
-| `GITHUB_TOKEN` | Private GitHub repository access |
+| `DATABASE_URL` | Default database connection — overrides `target.url`, overridden by `-d` |
+| `$NAME` in `target.url` | A whole-value `url: $NAME` is read from the environment (unset ⇒ used literally) |
+| `GITHUB_TOKEN` | `dbd deploy` from a private GitHub repo — sent as a bearer token to `api.github.com` only |
+| `DBD_DIAGRAM_URL` | Base URL `dbd diagram` opens (default `https://dbd.sensei-hq.com`); `--site` overrides |
+| `DBD_NO_TX` | Set (any value) to apply without the single transaction |
+| `CLAUDE_CONFIG_DIR` | Global install dir for `dbd install` (default `~/.claude`) |
+
+The GitHub download cache is the platform cache dir + `/dbd`
+(`$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS).
+
+---
+
+## Access control
+
+Grants come from `schemas[].grants` and the first target's `grants` (any key),
+merged per schema; applied by `dbd apply` and `dbd deploy` after the schema;
+`usage` → schema USAGE, other perms → `ON ALL TABLES` + default privileges; plus
+`NOTIFY pgrst`. Config grants cover schemas and tables — grant on functions or
+sequences in an `apply.after` hook. On a `supabase` target, configured grants add
+USAGE for `anon`/`authenticated`/`service_role` on every listed schema.
+`exposed:` grants nothing; it drives `inspect`'s advisory "No RLS policy on N
+table(s) in exposed schema(s)" report. RLS policies (`policies/<schema>/<table>.sql`):
+`deploy` always (failure = warning, exit 0), `dbd policies` and
+`apply --with-policies` (failure = exit 1), plain `apply` never.
+
+## Other dialects and encodings
+
+Readers: `pg_query` (PostgreSQL; structured), `tsql` and `mysql` (statement heads:
+identity + references, no columns; the only readers that report triggers),
+`verbatim` (SQLite: the file is the model). A T-SQL/MySQL project can `inspect`,
+`graph` and `combine`; `diff`/`reconcile`/`emit` refuse; `dbml`/`diagram` show no
+tables; `snapshot` records nothing; there is no adapter to apply to. DDL files
+are decoded from UTF-8, or UTF-8/UTF-16LE/UTF-16BE with a byte-order mark; no mark
+and not UTF-8 is an error naming the file. Caveat in 0.24.1: `apply`/`deploy`/
+`combine` read the SQL they execute without that decoding, so a UTF-16 file is
+skipped when applied — re-encode it as UTF-8.
