@@ -334,3 +334,105 @@ fn inspect_under_a_scope_advises_only_on_what_the_scope_builds() {
         "no matview error for app.order_counts: {text}"
     );
 }
+
+// ── one count for one scope ─────────────────────────────────────────────────
+
+/// A `deps: include` scope whose closure adds an entity, an `extensions: []`
+/// allowlist, and an external — every way the counts used to part company.
+fn counted_scope_project(dir: &Path) {
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: counts\n\n\
+         source:\n  dialect: postgresql\n\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - pgcrypto\n\n\
+         schemas:\n  - app\n  - hub\n\n\
+         external:\n  - name: auth.users\n\n\
+         scopes:\n  hub_edges:\n    includes:\n      - hub.edges\n    deps: include\n    extensions: []\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/users.ddl",
+        "set search_path to app;\ncreate table if not exists users (\n  id integer primary key\n);\n",
+    );
+    write(
+        dir,
+        "ddl/table/hub/nodes.ddl",
+        "set search_path to hub;\ncreate table if not exists nodes (\n  id integer primary key\n);\n",
+    );
+    write(
+        dir,
+        "ddl/table/hub/edges.ddl",
+        "set search_path to hub;\ncreate table if not exists edges (\n  id integer primary key\n, node_id integer references nodes (id)\n);\n",
+    );
+}
+
+/// The `scope 'X': N of M entities` line, wherever a command prints it.
+fn scope_line(text: &str) -> Option<String> {
+    text.lines().find(|l| l.starts_with("scope '")).map(str::to_string)
+}
+
+/// The `N` of a `N entities — …` summary line.
+fn summary_count(text: &str) -> Option<usize> {
+    text.lines()
+        .find(|l| l.contains(" entities — "))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+}
+
+/// inspect counted the scope before its dependency closure, apply did not
+/// print a scope line at all, combine and dbml counted externals and every
+/// extension the allowlist drops. Four numbers for one scope; there is one.
+#[test]
+fn every_command_counts_a_scope_the_same_way() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    counted_scope_project(dir);
+    let combined = dir.join("combined.sql");
+    let dbml = dir.join("schema.dbml");
+
+    let apply = dbd(dir, &["apply", "--dry-run", "--scope", "hub_edges"]);
+    let applied = summary_count(&stdout(&apply)).expect("apply --dry-run prints a summary");
+    let unscoped_applied = summary_count(&stdout(&dbd(dir, &["apply", "--dry-run"]))).unwrap();
+    let expected = format!("scope 'hub_edges': {applied} of {unscoped_applied} entities");
+
+    let runs = [
+        ("inspect", dbd(dir, &["inspect", "--scope", "hub_edges"])),
+        ("apply --dry-run", apply),
+        (
+            "combine",
+            dbd(
+                dir,
+                &["combine", "--scope", "hub_edges", "-f", combined.to_str().unwrap()],
+            ),
+        ),
+        (
+            "dbml",
+            dbd(dir, &["dbml", "--scope", "hub_edges", "-f", dbml.to_str().unwrap()]),
+        ),
+        (
+            "deploy --dry-run",
+            dbd(dir, &["deploy", "--dry-run", "--scope", "hub_edges"]),
+        ),
+    ];
+    for (cmd, out) in &runs {
+        assert!(out.status.success(), "{cmd}: {}", stderr(out));
+        assert_eq!(
+            scope_line(&stdout(out)).as_deref(),
+            Some(expected.as_str()),
+            "{cmd} must count the scope as apply builds it:\n{}",
+            stdout(out)
+        );
+    }
+    assert_eq!(
+        summary_count(&stdout(&runs[0].1)),
+        Some(applied),
+        "inspect's summary counts what the scope builds:\n{}",
+        stdout(&runs[0].1)
+    );
+    assert_eq!(
+        summary_count(&stdout(&dbd(dir, &["inspect"]))),
+        Some(unscoped_applied),
+        "and unscoped, what the design builds"
+    );
+}
