@@ -997,3 +997,64 @@ fn sql_server_gets_a_sequence_with_postgres_bounds_spelled_out() {
     );
     assert!(!report.iter().any(|d| d.entity == "app.countdown"), "{report:?}");
 }
+
+// ── Generated columns stay generated ───────────────────────────────────────
+
+const GENERATED: [(&str, &str); 1] = [(
+    "table/app/lines.ddl",
+    "create table lines (\n  \
+       id    integer primary key\n, \
+       price numeric(10,2) not null\n, \
+       qty   integer not null\n, \
+       total numeric(12,2) generated always as (price * qty) stored\n\
+     );",
+)];
+
+/// A generated column was emitted as a plain one: it applied, and then held
+/// whatever an insert put there instead of the value it is defined as. All
+/// three targets compute stored columns, so it is carried — with its
+/// expression untranslated, and reported, like a CHECK.
+#[test]
+fn a_generated_column_is_computed_on_every_target_and_its_expression_reported() {
+    let (mysql, _) = emit_with(Dialect::MySql, "", &GENERATED, None);
+    assert!(
+        mysql.contains("`total` DECIMAL(12,2) GENERATED ALWAYS AS (price * qty) STORED"),
+        "{mysql}"
+    );
+    // SQL Server's computed column takes its type from the expression, so the
+    // declared one is kept with a CAST.
+    let (tsql, _) = emit_with(Dialect::TSql, "", &GENERATED, None);
+    assert!(
+        tsql.contains("[total] AS CAST((price * qty) AS decimal(12,2)) PERSISTED"),
+        "{tsql}"
+    );
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &GENERATED, None);
+    assert!(
+        sqlite.contains(r#""total" NUMERIC GENERATED ALWAYS AS (price * qty) STORED"#),
+        "{sqlite}"
+    );
+
+    for dialect in ALL {
+        let (_, report) = emit_with(dialect, "", &GENERATED, None);
+        assert!(
+            about(&report, "total")
+                .iter()
+                .any(|d| d.from.contains("price * qty") && d.to == "the same text, untranslated"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+/// SQLite computes it: a row given a price and a quantity has their product.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_computes_a_generated_column() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &GENERATED, None);
+    let total = on_sqlite(
+        &sql,
+        "insert into app_lines (id, price, qty) values (1, 2.5, 4);",
+        "select cast(total as text) from app_lines",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(total, "10", "{sql}");
+}
