@@ -463,6 +463,37 @@ impl Design {
         Ok(())
     }
 
+    /// The grants a run under `scope` applies: schema → role → privileges.
+    ///
+    /// Every `schemas:` entry's `grants:`, with the target's `grants:` merged
+    /// on top — per schema, a target role adds to or overrides the universal
+    /// entry for that role — narrowed to the schemas the scope builds.
+    ///
+    /// One definition for [`Self::apply_grants`], which runs them, and
+    /// `dbd emit`, which has to report the ones it does not translate; two
+    /// copies would let the report list grants the database never got.
+    pub(crate) fn declared_grants(
+        &self,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>> {
+        let mut schema_grants = self.config.schema_grants();
+        if let Some(target_config) = self.config.target.values().next()
+            && let Some(ref grants) = target_config.grants
+        {
+            for (schema, gc) in grants {
+                schema_grants
+                    .entry(schema.clone())
+                    .or_default()
+                    .extend(gc.roles.clone());
+            }
+        }
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            schema_grants.retain(|schema, _| ws.contains(schema));
+        }
+        Ok(schema_grants)
+    }
+
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
     /// target's `grants:` merged on top (per schema, a target role adds to or
     /// overrides the universal entry for that role), plus PostgREST's schema
@@ -478,31 +509,19 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<GrantsOutcome> {
-        let mut schema_grants = self.config.schema_grants();
-        let mut supabase_schemas: Vec<String> = vec![];
-        if let Some((target_name, target_config)) = self.config.target.iter().next() {
-            if let Some(ref grants) = target_config.grants {
-                for (schema, gc) in grants {
-                    schema_grants
-                        .entry(schema.clone())
-                        .or_default()
-                        .extend(gc.roles.clone());
-                }
-            }
-            // PostgREST USAGE grants ride along only when the user configured
-            // some grants, so a no-grants Supabase apply stays a no-op.
-            if target_name == "supabase" && !schema_grants.is_empty() {
-                supabase_schemas = self.config.schema_names();
-            }
-        }
-        if let Some(s) = scope.filter(|s| !s.is_all) {
-            let ws = self.working_set(s)?;
-            schema_grants.retain(|schema, _| ws.contains(schema));
-            supabase_schemas.retain(|schema| ws.contains(schema));
-        }
-
+        let schema_grants = self.declared_grants(scope)?;
         if schema_grants.is_empty() {
             return Ok(GrantsOutcome::None);
+        }
+        // PostgREST USAGE grants ride along only when the user configured
+        // some grants, so a no-grants Supabase apply stays a no-op.
+        let mut supabase_schemas: Vec<String> = match self.config.target.keys().next() {
+            Some(target_name) if target_name == "supabase" => self.config.schema_names(),
+            _ => Vec::new(),
+        };
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            supabase_schemas.retain(|schema| ws.contains(schema));
         }
         // A cross-target design may declare schema grants yet apply to SQLite
         // or Convex, which have no grant model to run them against.

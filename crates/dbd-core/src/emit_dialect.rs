@@ -90,6 +90,14 @@
 //! which the model keeps only as an edge and is read back from the file. So is
 //! anything whose file does not parse: there is no structure to translate, and
 //! the schema is missing it.
+//!
+//! Extensions, roles, grants and RLS policies are not emitted either: none of
+//! the three loads PostgreSQL extensions, SQLite has no roles, permissions or
+//! row-level security at all, and the others model them differently enough
+//! that a translation would look right and grant the wrong thing. Each is
+//! reported — one entry per extension and role, per schema's grants, and per
+//! policy file — narrowed to the scope like everything else, so a script whose
+//! security rested on a policy does not read as complete.
 
 use crate::entity::{
     ColumnDef, Entity, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, IndexType, SortOrder, TableConstraint,
@@ -336,14 +344,150 @@ pub fn emit_schema(
                 out.push(d.comment(target));
                 report.push(d);
             }
-            // Schemas, extensions, enums and roles are handled where they are
-            // used (a column's type) or have no target equivalent worth a
-            // standalone statement.
+            EntityType::Extension | EntityType::Role => {
+                let d = not_carried(e, target);
+                out.push(d.comment(target));
+                report.push(d);
+            }
+            // A schema becomes `CREATE SCHEMA` on SQL Server and part of every
+            // name elsewhere (reported at each table); an enum becomes its
+            // columns' type. Neither is a statement of its own.
             _ => {}
         }
     }
 
+    // Last, where they would apply: after every object they name.
+    for d in grants_not_carried(design, scope, target)?
+        .into_iter()
+        .chain(policies_not_carried(design, scope, target)?)
+    {
+        out.push(d.comment(target));
+        report.push(d);
+    }
+
     Ok((join_script(&header, &out, target), report))
+}
+
+/// An extension or a role, which the script does not create.
+///
+/// Neither was mentioned anywhere — not in the file, not in the report — so a
+/// schema that needed `pgcrypto`, or a login its grants were written for, came
+/// out looking complete.
+fn not_carried(e: &Entity, target: Target) -> Downgrade {
+    let label = target.label();
+    let (from, reason) = match (e.entity_type, target) {
+        (EntityType::Extension, _) => (
+            "a PostgreSQL extension",
+            format!(
+                "{label} cannot load PostgreSQL extensions — whatever the schema took from it (a \
+                 function, a type, an operator) has to be replaced by hand"
+            ),
+        ),
+        (_, Target::Sqlite) => (
+            "a role",
+            "SQLite has no roles or permissions — anything that can open the file can read and \
+             write all of it"
+                .to_string(),
+        ),
+        (_, Target::MySql | Target::TSql) => (
+            "a role",
+            format!(
+                "a PostgreSQL role is a login and a group at once, with attributes {label} models \
+                 differently, so dbd does not translate it — create it by hand"
+            ),
+        ),
+    };
+    Downgrade {
+        entity: e.name.clone(),
+        column: None,
+        from: from.to_string(),
+        to: "nothing".to_string(),
+        reason,
+    }
+}
+
+/// One entry per schema whose grants a run under `scope` would apply — the
+/// same set `dbd apply` grants ([`crate::Design::declared_grants`]).
+fn grants_not_carried(
+    design: &crate::Design,
+    scope: Option<&crate::scope::ResolvedScope>,
+    target: Target,
+) -> Result<Vec<Downgrade>> {
+    let mut grants: Vec<(String, std::collections::HashMap<String, Vec<String>>)> =
+        design.declared_grants(scope)?.into_iter().collect();
+    grants.sort_by(|a, b| a.0.cmp(&b.0));
+    let reason = match target {
+        Target::Sqlite => {
+            "SQLite has no permissions — anything that can open the file can read and write all of it".to_string()
+        }
+        Target::MySql | Target::TSql => format!(
+            "dbd does not translate grants, and the roles they name are not emitted either — on {}, \
+             grant the same access by hand once the roles exist",
+            target.label()
+        ),
+    };
+    Ok(grants
+        .into_iter()
+        .map(|(schema, roles)| {
+            let mut roles: Vec<(String, Vec<String>)> = roles.into_iter().collect();
+            roles.sort();
+            let held: Vec<String> = roles
+                .iter()
+                .map(|(role, privileges)| format!("{role}: {}", privileges.join(", ")))
+                .collect();
+            Downgrade {
+                from: format!("grants on schema `{schema}` ({})", held.join("; ")),
+                entity: schema,
+                column: None,
+                to: "nothing".to_string(),
+                reason: reason.clone(),
+            }
+        })
+        .collect())
+}
+
+/// One entry per RLS policy file a run under `scope` would apply — the same
+/// filter `dbd policies` runs ([`crate::design::plan_policies`]).
+///
+/// A policy is what decides which rows a reader may see. Dropping one without
+/// a word left a script that applies cleanly and shows every row to anyone.
+fn policies_not_carried(
+    design: &crate::Design,
+    scope: Option<&crate::scope::ResolvedScope>,
+    target: Target,
+) -> Result<Vec<Downgrade>> {
+    let project_dir = design.project_dir();
+    let working_set = match scope.filter(|s| !s.is_all) {
+        Some(s) => Some((s.name.as_str(), design.working_set(s)?)),
+        None => None,
+    };
+    let plan = crate::design::plan_policies(project_dir, working_set.as_ref().map(|(n, ws)| (*n, ws)))?;
+    let reason = match target {
+        Target::MySql | Target::Sqlite => format!(
+            "{} has no row-level security, so every row is visible to anyone who can read the table",
+            target.label()
+        ),
+        Target::TSql => "SQL Server's row-level security is a security policy over an inline function, not \
+                         something these statements translate to — until one is written, every row is visible \
+                         to anyone who can read the table"
+            .to_string(),
+    };
+    Ok(plan
+        .applied
+        .iter()
+        .map(|file| {
+            let shown = file.strip_prefix(project_dir).unwrap_or(file).display().to_string();
+            Downgrade {
+                // A file outside the `policies/<schema>/<table>.sql` layout
+                // names no table; the file is then the only identity it has.
+                entity: crate::design::policy_target(file, project_dir).unwrap_or_else(|| shown.clone()),
+                column: None,
+                from: format!("the row-level security policies in `{shown}`"),
+                to: "nothing".to_string(),
+                reason: reason.clone(),
+            }
+        })
+        .collect())
 }
 
 /// Why a routine — and a trigger, which only fires one — is not emitted.
