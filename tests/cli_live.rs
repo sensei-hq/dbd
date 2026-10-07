@@ -141,6 +141,63 @@ async fn the_connecting_commands_run_against_a_real_database() {
     assert!(o.status.success(), "refresh failed: {}", combined(&o));
 }
 
+/// Two schemas and a scope that builds one of them.
+fn scoped_project(dir: &Path) {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: scoped\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - app\n  - hub\n\n\
+         scopes:\n  hub:\n    includes:\n      - hub\n",
+    )
+    .unwrap();
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        let t = dir.join(format!("ddl/table/{schema}"));
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join(format!("{table}.ddl")),
+            format!("set search_path to {schema};\ncreate table if not exists {table} (id integer primary key);\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// The `scope 'X': N of M entities` line, wherever a command prints it.
+fn scope_line(o: &Output) -> Option<String> {
+    stdout(o).lines().find(|l| l.starts_with("scope '")).map(str::to_string)
+}
+
+/// Every other scoped command says what it narrowed to. `diff` and `reconcile`
+/// said nothing, so a scoped diff reporting no drift read exactly like a whole
+/// database in sync.
+#[tokio::test]
+async fn diff_and_reconcile_name_the_scope_they_ran_under() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+
+    let expected = scope_line(&dbd(dir, &url, &["apply", "--dry-run", "--scope", "hub"]))
+        .expect("apply --dry-run names the scope");
+    for args in [
+        &["diff", "--scope", "hub"][..],
+        &["reconcile", "--dry-run", "--scope", "hub"][..],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
+    }
+
+    // `--json` keeps stdout a JSON document; the scope goes to stderr.
+    let o = dbd(dir, &url, &["diff", "--json", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    serde_json::from_slice::<serde_json::Value>(&o.stdout).expect("stdout is JSON alone");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains(&expected),
+        "{}",
+        combined(&o)
+    );
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {

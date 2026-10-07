@@ -383,6 +383,8 @@ fn summary_count(text: &str) -> Option<usize> {
 /// inspect counted the scope before its dependency closure, apply did not
 /// print a scope line at all, combine and dbml counted externals and every
 /// extension the allowlist drops. Four numbers for one scope; there is one.
+/// And `emit` and `reset` printed none, so a scoped script read exactly like
+/// the whole design's.
 #[test]
 fn every_command_counts_a_scope_the_same_way() {
     let tmp = tempfile::tempdir().unwrap();
@@ -390,6 +392,7 @@ fn every_command_counts_a_scope_the_same_way() {
     counted_scope_project(dir);
     let combined = dir.join("combined.sql");
     let dbml = dir.join("schema.dbml");
+    let emitted = dir.join("emitted.sql");
 
     let apply = dbd(dir, &["apply", "--dry-run", "--scope", "hub_edges"]);
     let applied = summary_count(&stdout(&apply)).expect("apply --dry-run prints a summary");
@@ -413,6 +416,25 @@ fn every_command_counts_a_scope_the_same_way() {
         (
             "deploy --dry-run",
             dbd(dir, &["deploy", "--dry-run", "--scope", "hub_edges"]),
+        ),
+        (
+            "emit",
+            dbd(
+                dir,
+                &[
+                    "emit",
+                    "--dialect",
+                    "sqlite",
+                    "--scope",
+                    "hub_edges",
+                    "-f",
+                    emitted.to_str().unwrap(),
+                ],
+            ),
+        ),
+        (
+            "reset --dry-run",
+            dbd(dir, &["reset", "--dry-run", "--scope", "hub_edges"]),
         ),
     ];
     for (cmd, out) in &runs {
