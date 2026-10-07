@@ -294,6 +294,47 @@ async fn deploy_reports_each_phase_in_the_order_it_ran() {
     );
 }
 
+/// A project built before its release has a database with no recorded
+/// version. After `release` made it v1, `migrate --status` printed "000" and
+/// "001" and then "Database is up to date", and the next `apply` said "Fresh
+/// install at v1" over a database that was already built. Each now says what
+/// is known: no version is recorded, and the apply recorded one on a database
+/// that already held the design.
+#[tokio::test]
+async fn an_unversioned_database_is_neither_up_to_date_nor_freshly_installed_after_release() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml.replace("  version: 1\n", "")).unwrap();
+
+    assert!(dbd(dir, &url, &["apply"]).status.success(), "the pre-release build");
+    let o = dbd(dir, &url, &["release"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    let status = combined(&o);
+    assert!(o.status.success(), "{status}");
+    assert!(!status.contains("up to date"), "v1 is not recorded yet:\n{status}");
+    assert!(
+        status.contains("records v001"),
+        "and the next apply is what records it:\n{status}"
+    );
+
+    let o = dbd(dir, &url, &["apply"]);
+    let applied = combined(&o);
+    assert!(o.status.success(), "{applied}");
+    assert!(
+        !applied.contains("Fresh install"),
+        "the database was already built:\n{applied}"
+    );
+    assert!(applied.contains("v1 recorded"), "{applied}");
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    assert!(combined(&o).contains("up to date"), "now it is:\n{}", combined(&o));
+}
+
 /// `apply` is idempotent: the second run must also succeed.
 #[tokio::test]
 async fn applying_twice_is_not_an_error() {
