@@ -264,12 +264,31 @@ pub(crate) async fn export_with_adapter(
 
     // Build export list: either from config export entries, or all tables.
     // The scope's working set filters either branch.
+    //
+    // A listed entry may be a view (or materialized view) as well as a table:
+    // views that dereference foreign keys are how the export comes to match the
+    // import staging tables, which is what moves a long-running system's data to
+    // a new database. Only listed views are exported — unlisted, the default is
+    // every table.
     let tables: Vec<&dbd_core::Entity> = if !design.config().export.is_empty() {
         let export_names: Vec<String> = design.config().export.iter().map(|e| e.name()).collect();
+        let exportable = |e: &dbd_core::Entity| {
+            matches!(
+                e.entity_type,
+                dbd_core::EntityType::Table | dbd_core::EntityType::View | dbd_core::EntityType::MaterializedView
+            )
+        };
+        for listed in &export_names {
+            if !design.entities().iter().any(|e| &e.name == listed && exportable(e)) {
+                output::warn(&format!(
+                    "export: {listed} is not a table or view in this design — nothing exported for it"
+                ));
+            }
+        }
         design
             .entities()
             .iter()
-            .filter(|e| e.entity_type == dbd_core::EntityType::Table)
+            .filter(|e| exportable(e))
             .filter(|e| export_names.contains(&e.name))
             .filter(|e| in_scope.contains(&e.name))
             .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
