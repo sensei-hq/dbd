@@ -112,6 +112,7 @@ pub async fn cmd_init_from_db(
     if roles {
         entities.extend(adapter.introspect_roles().await.context("role introspection failed")?);
     }
+    let entities_for_target = entities.clone();
     init_with_entities(
         project_dir,
         config_path,
@@ -121,7 +122,7 @@ pub async fn cmd_init_from_db(
         version,
         sel,
         dry_run,
-        dialect_for_conn(&conn),
+        init_target(&conn, &entities_for_target),
         "init from database",
     )
 }
@@ -195,6 +196,12 @@ fn dialect_for_conn(conn: &str) -> &'static str {
     } else {
         "postgres"
     }
+}
+
+/// The `design.yaml` target for a project reverse-engineered from `conn`, whose
+/// introspection returned `entities`.
+fn init_target(conn: &str, _entities: &[dbd_core::Entity]) -> &'static str {
+    dialect_for_conn(conn)
 }
 
 /// Shared `init` tail for both the DB and DBML sources: build the write-plan,
@@ -693,6 +700,30 @@ mod tests {
     // ── resolve_conn ──────────────────────────────────────────────────────────
 
     /// Explicit non-empty value is returned as-is.
+    /// Supabase is PostgreSQL with platform schemas of its own, and its
+    /// connection URL is an ordinary `postgres://` one — so the URL scheme
+    /// named every Supabase project's target `postgres`. The `auth` and
+    /// `storage` schemas are what identify it.
+    #[test]
+    fn a_database_with_supabases_schemas_gets_a_supabase_target() {
+        let supabase: Vec<dbd_core::Entity> = ["public", "auth", "storage"]
+            .iter()
+            .map(|s| dbd_core::Entity::schema(s))
+            .collect();
+        assert_eq!(
+            init_target("postgres://db.example.supabase.co/postgres", &supabase),
+            "supabase"
+        );
+
+        let plain: Vec<dbd_core::Entity> = ["public", "auth"].iter().map(|s| dbd_core::Entity::schema(s)).collect();
+        assert_eq!(
+            init_target("postgres://localhost/app", &plain),
+            "postgres",
+            "an `auth` schema alone is not Supabase"
+        );
+        assert_eq!(init_target("sqlite://./app.db", &supabase), "sqlite");
+    }
+
     #[test]
     fn resolve_conn_explicit_wins() {
         let got = resolve_conn(Some("postgres://explicit/db")).unwrap();

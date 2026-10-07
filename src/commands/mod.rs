@@ -1269,6 +1269,51 @@ mod tests {
         );
     }
 
+    /// The dispatcher's own refusal said reverse-engineering "supports
+    /// Postgres/Supabase", then refused `--target supabase`. DBML carries no
+    /// platform, so the target is the caller's to give, and it reaches
+    /// `design.yaml`.
+    #[tokio::test]
+    async fn init_from_dbml_accepts_a_supabase_target() {
+        use crate::cli::Commands;
+        let src = testutil::copy_fixture_project();
+        let dbml = src.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &src).await.unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let dir = dest.path();
+        run(
+            &Commands::Init {
+                name: Some("from_dbml".to_string()),
+                target: "supabase".to_string(),
+                from_db: None,
+                from_dbml: Some(dbml),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: false,
+            },
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("--target supabase is a target --from-dbml supports");
+
+        let written = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+        assert!(
+            written.contains("  supabase:\n"),
+            "the target reaches design.yaml: {written}"
+        );
+    }
+
     /// `dbd merge --from-dbml --dry-run` takes the no-connection merge branch.
     #[tokio::test]
     async fn run_dispatches_merge_from_dbml_dry_run() {

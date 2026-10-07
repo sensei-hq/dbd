@@ -740,6 +740,17 @@ mod tests {
         assert!(!yaml.contains("dialect:"));
     }
 
+    /// `design_yaml` documented `"supabase"` as a dialect it accepts, then wrote
+    /// a `postgres:` target for it — so a project reverse-engineered from
+    /// Supabase lost the target that turns on Supabase's protected schemas,
+    /// PostgREST grants and exposed-`public` default.
+    #[test]
+    fn design_yaml_supabase_uses_the_supabase_key() {
+        let yaml = design_yaml("p", "supabase", &v(&["public"]), 1);
+        assert!(yaml.contains("target:\n  supabase:\n"), "{yaml}");
+        assert!(!yaml.contains("postgres:"), "{yaml}");
+    }
+
     #[test]
     fn design_yaml_sqlite_uses_sqlite_key() {
         let yaml = design_yaml("localdb", "sqlite", &["main".into()], 2);
