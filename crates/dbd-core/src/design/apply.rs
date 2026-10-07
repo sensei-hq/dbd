@@ -395,7 +395,8 @@ impl Design {
                 on_start(&desc);
                 let result: Result<()> = async {
                     if drop_sql_path.exists() {
-                        let sql = std::fs::read_to_string(drop_sql_path)?;
+                        // Decoded like the migration's `.sql` and `.data.sql`.
+                        let sql = crate::source_text::read_to_string(drop_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
                     Ok(())

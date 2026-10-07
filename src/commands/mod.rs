@@ -591,6 +591,14 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read {}", file.display()))
 }
 
+/// [`safe_read`] for a DDL file: decoded by `source_text` exactly as the
+/// project load decodes it (UTF-16 behind a BOM included), so a file the load
+/// reads is never one a command over the same tree cannot.
+pub(super) fn safe_read_ddl(root: &Path, file: &Path) -> Result<String> {
+    let canon = safe_canonicalize_within(root, file)?;
+    dbd_core::source_text::read_to_string(&canon).with_context(|| format!("Failed to read {}", file.display()))
+}
+
 pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {
     let canon = safe_canonicalize_within(root, file)?;
     std::fs::write(&canon, contents) // nosemgrep: path validated by safe_canonicalize_within

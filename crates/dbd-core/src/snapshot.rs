@@ -133,8 +133,10 @@ fn todos_in_migration_dir(version: u32, dir: &Path) -> Result<Vec<DataSqlTodo>> 
         if !entry.path().to_string_lossy().ends_with(".data.sql") {
             continue;
         }
-        let content = std::fs::read_to_string(entry.path()) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            .map_err(|e| DbdError::Config(format!("read {}: {e}", entry.path().display())))?;
+        // Decoded as `apply` decodes the file it then runs, so a `.data.sql`
+        // re-saved by SSMS is checked rather than failing the gate on its
+        // encoding. Still fails closed on a file `source_text` cannot read.
+        let content = crate::source_text::read_to_string(entry.path())?;
         let todo_lines: Vec<String> = content
             .lines()
             .filter(|line| {
