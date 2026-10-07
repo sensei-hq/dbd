@@ -3929,3 +3929,62 @@ async fn reconcile_converges_on_a_serial_column_that_is_not_the_key() {
         .collect();
     assert!(touched.is_empty(), "nothing left to change: {touched:?}");
 }
+
+/// A materialized view's own `COMMENT ON` belongs to its author. dbd kept its
+/// `dbd:hash` drift stamp in that same comment: the first apply overwrote the
+/// author's text, and the next one — re-running the file's COMMENT — erased the
+/// stamp, after which every reconcile warned the view was "not stamped by dbd".
+#[tokio::test]
+async fn a_matview_keeps_its_own_comment_and_dbd_still_tracks_its_drift() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_comment").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: mv_comment\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\ncreate table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view if not exists app.mv as select id from app.items with data;\n\
+         comment on materialized view app.mv is 'Revenue per day';\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+
+    for _ in 0..2 {
+        load()
+            .apply(&*adapter, None, false, None, Progress::none())
+            .await
+            .expect("apply");
+    }
+
+    adapter
+        .execute_script(
+            "DO $$ BEGIN \
+               IF obj_description('app.mv'::regclass, 'pg_class') IS DISTINCT FROM 'Revenue per day' \
+               THEN RAISE EXCEPTION 'the author''s comment was replaced: %', \
+                    obj_description('app.mv'::regclass, 'pg_class'); \
+               END IF; END $$;",
+        )
+        .await
+        .expect("the matview keeps the comment its file sets");
+
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("app.mv")),
+        "dbd still recognises the view it created: {:?}",
+        plan.warnings
+    );
+}
