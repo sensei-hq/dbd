@@ -45,7 +45,9 @@ impl Design {
         adapter.heal_bookkeeping().await?;
 
         if !force && let Some(meta) = adapter.get_project_meta().await? {
-            if meta.env == "prod" {
+            // Compared through the alias table: rows written before the CLI
+            // normalised `-e` can say `production`.
+            if crate::config::normalize_env(Some(&meta.env)).is_ok_and(|env| env == "prod") {
                 return Err(DbdError::SafetyGuard(
                     "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
                 ));
