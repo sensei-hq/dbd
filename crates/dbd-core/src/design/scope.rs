@@ -199,9 +199,16 @@ impl Design {
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
+    ///
+    /// Roles and extensions occupy no schema of the design's: a role is
+    /// cluster-wide, and an extension's objects are the extension's. Mapping
+    /// their empty `schema` to `public` made `public` managed for any design
+    /// with a role or a bare extension, and `reconcile --prune` then dropped
+    /// tables there that the design never declared.
     pub(in crate::design) fn managed_schemas(desired: &[&Entity]) -> std::collections::HashSet<String> {
         desired
             .iter()
+            .filter(|e| !matches!(e.entity_type, EntityType::Role | EntityType::Extension))
             .map(|e| match e.entity_type {
                 EntityType::Schema => e.name.clone(),
                 _ => {
