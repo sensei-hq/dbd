@@ -589,7 +589,7 @@ async fn apply_single_entity_by_name() {
 #[test]
 fn diagram_model_json_round_trips() {
     let d = design(); // existing helper in this file
-    let model = dbd_core::schema_model::build(&d, None);
+    let model = dbd_core::schema_model::build(&d, None).unwrap();
     let json = serde_json::to_string(&model).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["project"]["name"].is_string());

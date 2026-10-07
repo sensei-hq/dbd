@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::design::Design;
 use crate::entity::{EntityType, FkAction, SortOrder, TableConstraint};
+use crate::error::Result;
 use crate::scope::ResolvedScope;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -205,10 +206,14 @@ pub struct RefEnd {
 }
 
 /// Build a `SchemaModel` from a loaded design, optionally filtered to a scope.
-/// v1 emits only tables + schemas + FK refs.
-pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
+///
+/// Fails when the scope cannot be resolved to a working set — a `deps: include`
+/// closure that needs an entity the scope excludes. Every other command refuses
+/// that scope, and a model drawn from it would be empty: a diagram that says the
+/// scope holds nothing, rather than that it contradicts itself.
+pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaModel> {
     let entities = match scope {
-        Some(s) => design.scoped_entities(s).unwrap_or_default(),
+        Some(s) => design.scoped_entities(s)?,
         None => design.entities().to_vec(),
     };
 
@@ -300,7 +305,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         }
     }
 
-    SchemaModel {
+    Ok(SchemaModel {
         version: default_version(),
         entities: entities_out,
         deps,
@@ -314,7 +319,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> SchemaModel {
         refs,
         history: Vec::new(),
         enums,
-    }
+    })
 }
 
 /// Build the diagram `TableNode` for one table entity (columns + indexes + notes).
@@ -554,7 +559,7 @@ mod tests {
     #[test]
     fn build_full_model_from_fixture() {
         let d = fixture_design();
-        let m = build(&d, None);
+        let m = build(&d, None).unwrap();
         assert_eq!(m.project.name, "example");
         assert_eq!(m.project.db, "postgresql");
         assert!(
@@ -585,7 +590,7 @@ mod tests {
     fn build_scoped_filters_tables_and_refs() {
         let d = fixture_design();
         let scope = d.resolve_scope(Some("config_only"), None).unwrap();
-        let m = build(&d, Some(&scope));
+        let m = build(&d, Some(&scope)).unwrap();
         assert!(m.tables.iter().all(|t| t.schema != "staging"), "staging dropped");
         assert!(m.tables.iter().any(|t| t.schema == "config"));
         assert!(
@@ -597,7 +602,7 @@ mod tests {
     #[test]
     fn snapshot_fixture_model_json() {
         let d = fixture_design();
-        let m = build(&d, None);
+        let m = build(&d, None).unwrap();
         let json = serde_json::to_string_pretty(&m).unwrap();
         insta::assert_snapshot!(json);
     }
