@@ -26,6 +26,9 @@ pub struct MockAdapter {
     pub txn: Arc<Mutex<Vec<String>>>,
     /// Whether this mock reports transactional-apply support.
     pub supports_txn: bool,
+    /// Whether this mock reports a SQL grant model (Postgres does; SQLite and
+    /// Convex do not).
+    pub supports_grants: bool,
     /// If set, `apply_entity` errors for this entity name (fault injection).
     pub fail_on: Arc<Mutex<Option<String>>>,
     /// If set, `execute_script` errors for any SQL containing this substring
@@ -54,6 +57,7 @@ impl MockAdapter {
             known_entities: Arc::new(Mutex::new(HashSet::new())),
             txn: Arc::new(Mutex::new(Vec::new())),
             supports_txn: false,
+            supports_grants: false,
             fail_on: Arc::new(Mutex::new(None)),
             fail_script_on: Arc::new(Mutex::new(None)),
             introspected: Arc::new(Mutex::new(Vec::new())),
@@ -68,6 +72,12 @@ impl MockAdapter {
 
     /// Make `execute_script` fail for any SQL containing `needle`, to exercise
     /// non-fatal failure paths such as a broken policy file.
+    /// Report a SQL grant model, as the Postgres adapter does.
+    pub fn with_schema_grants(mut self) -> Self {
+        self.supports_grants = true;
+        self
+    }
+
     pub fn fail_script_containing(self, needle: &str) -> Self {
         *self.fail_script_on.lock().unwrap() = Some(needle.to_string());
         self
@@ -160,6 +170,10 @@ impl DatabaseAdapter for MockAdapter {
 
     async fn test_connection(&self) -> Result<bool> {
         Ok(self.connected)
+    }
+
+    fn supports_schema_grants(&self) -> bool {
+        self.supports_grants
     }
 
     async fn execute_script(&self, sql: &str) -> Result<()> {
