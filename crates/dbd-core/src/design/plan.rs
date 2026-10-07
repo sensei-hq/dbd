@@ -140,10 +140,20 @@ fn plan_migrate(
         steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
     }
 
+    // A dropped table is gone from the design, so it is in no working set: it
+    // belongs to a scope that occupies its schema, as it did while it existed.
+    // Apply runs the drop only where the table still exists.
+    let drop_in_scope = |n: &str| {
+        in_scope(n)
+            || crate::entity::split_qualified_name(n)
+                .0
+                .is_some_and(|schema| scope_names.is_some_and(|s| s.contains(&schema)))
+    };
+
     // Handle dropped entities
     for migration in pending_migrations {
         for table_name in &migration.dropped {
-            if !in_scope(table_name) {
+            if !drop_in_scope(table_name) {
                 continue;
             }
             steps.push(ExecutionStep::DropEntity {
