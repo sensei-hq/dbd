@@ -176,3 +176,49 @@ fn policies_dry_run_under_a_scope_lists_only_the_scopes_policies() {
         "a policy outside the scope is never listed as one that would apply: {text}"
     );
 }
+
+// ── deploy --dry-run agrees with deploy ─────────────────────────────────────
+
+/// `deploy --dry-run` printed "1 errors" for an unparseable file and exited 0,
+/// while the real deploy refuses before writing anything.
+#[test]
+fn deploy_dry_run_refuses_an_unparseable_file_like_the_real_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    let out = dbd(tmp.path(), &["deploy", "--dry-run"]);
+
+    assert!(!out.status.success(), "the dry run must refuse: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("could not be parsed"),
+        "with the real run's reason: {}",
+        stderr(&out)
+    );
+}
+
+/// A scoped deploy builds the scope and applies the scope's policies. Its
+/// preview counted the whole design's entities and every policy file, so it
+/// described a deploy the scope never runs.
+#[test]
+fn deploy_dry_run_under_a_scope_reports_the_scope_not_the_design() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["deploy", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        text.contains("scope 'hub': 2 of 6 entities"),
+        "the scope is named and counted like every other command counts it: {text}"
+    );
+    assert!(
+        text.contains("2 entities would be applied"),
+        "the entity count is the scope's (schema hub + hub.nodes), not the design's: {text}"
+    );
+    assert!(
+        text.contains("1 policy file(s) would be applied"),
+        "only the scope's policy would be applied: {text}"
+    );
+}
