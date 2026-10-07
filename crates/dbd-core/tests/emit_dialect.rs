@@ -1381,3 +1381,135 @@ fn a_trigger_written_in_a_table_file_is_reported_as_skipped_like_a_function() {
         }
     }
 }
+
+/// A project of `files` (each `(path under the project, contents)`) with
+/// `design.yaml` written verbatim — for the tests that need a `schemas:` or
+/// `target:` block [`project_with`] does not write.
+fn project_from(dir: &Path, design_yaml: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(dir.join("design.yaml"), design_yaml).unwrap();
+    for (path, body) in files {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, body).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+/// Two schemas, each with a table, grants and an RLS policy file; an extension
+/// and a role from `target:`, a second role from `ddl/role/`; and a scope that
+/// builds `hub` alone.
+fn secured_project(dir: &Path) -> Design {
+    project_from(
+        dir,
+        "project:\n  name: p\n\nsource:\n  dialect: postgresql\n\n\
+         target:\n  postgres:\n    extensions:\n      - pgcrypto\n    roles:\n      - name: reader\n\n\
+         schemas:\n  - app:\n      grants:\n        reader: [usage, select]\n  \
+         - hub:\n      grants:\n        reader: [usage]\n\n\
+         scopes:\n  hub_only:\n    includes: [hub]\n",
+        &[
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table orders (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/hub/nodes.ddl",
+                "set search_path to hub;\ncreate table nodes (id integer primary key);\n",
+            ),
+            ("ddl/role/writer.ddl", "create role writer;\n"),
+            (
+                "policies/app/orders.sql",
+                "alter table app.orders enable row level security;\n",
+            ),
+            (
+                "policies/hub/nodes.sql",
+                "alter table hub.nodes enable row level security;\n",
+            ),
+        ],
+    )
+}
+
+/// Whether `report` has a "not emitted" entry for `entity` whose `from`
+/// mentions `what`, and the script a `-- dbd:` note naming `noted`.
+fn not_emitted(sql: &str, report: &[Downgrade], entity: &str, what: &str, noted: &str) -> bool {
+    report
+        .iter()
+        .any(|d| d.entity == entity && d.from.contains(what) && d.to == "nothing" && !d.reason.is_empty())
+        && sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains(noted))
+}
+
+/// Extensions, roles, grants and RLS policies are part of what a PostgreSQL
+/// project declares, and none of them reach the emitted script. They were
+/// missing from the report too — so a schema whose security rested on a policy
+/// came out with no sign anything was missing, and the report said the
+/// translation lost nothing it did not list.
+#[test]
+fn extensions_roles_grants_and_policies_are_reported_as_not_emitted() {
+    for dialect in ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let design = secured_project(tmp.path());
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+
+        let upper = statements(&sql).to_uppercase();
+        for absent in ["EXTENSION", "CREATE ROLE", "GRANT", "POLICY", "ROW LEVEL SECURITY"] {
+            assert!(!upper.contains(absent), "{dialect:?}: `{absent}` is not emitted: {sql}");
+        }
+
+        assert!(
+            not_emitted(&sql, &report, "pgcrypto", "extension", "pgcrypto"),
+            "{dialect:?}: the extension: {report:?}\n{sql}"
+        );
+        for role in ["reader", "writer"] {
+            assert!(
+                not_emitted(&sql, &report, role, "role", role),
+                "{dialect:?}: the role `{role}` — from `target:` or `ddl/role/`: {report:?}\n{sql}"
+            );
+        }
+        for schema in ["app", "hub"] {
+            assert!(
+                not_emitted(&sql, &report, schema, "grant", &format!("grants on schema `{schema}`")),
+                "{dialect:?}: the grants on `{schema}`, one entry per schema: {report:?}\n{sql}"
+            );
+        }
+        for (table, file) in [
+            ("app.orders", "policies/app/orders.sql"),
+            ("hub.nodes", "policies/hub/nodes.sql"),
+        ] {
+            assert!(
+                not_emitted(&sql, &report, table, file, file),
+                "{dialect:?}: the policy file for `{table}`, one entry per file: {report:?}\n{sql}"
+            );
+        }
+    }
+}
+
+/// A scope narrows what is reported missing the way it narrows what is
+/// emitted: the grants and the policy of a schema the scope does not build are
+/// not this script's loss.
+#[test]
+fn grants_and_policies_outside_the_scope_are_not_reported() {
+    for dialect in ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let design = secured_project(tmp.path());
+        let scope = design.resolve_scope(Some("hub_only"), None).expect("scope");
+        let (sql, report) = emit_schema(&design, dialect, Some(&scope)).expect("emits");
+
+        assert!(
+            not_emitted(&sql, &report, "hub", "grant", "grants on schema `hub`"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            not_emitted(
+                &sql,
+                &report,
+                "hub.nodes",
+                "policies/hub/nodes.sql",
+                "policies/hub/nodes.sql"
+            ),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            !report.iter().any(|d| d.entity == "app" || d.entity == "app.orders"),
+            "{dialect:?}: nothing of `app` is in this script, so none of it is its loss: {report:?}"
+        );
+    }
+}
