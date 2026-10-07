@@ -349,7 +349,7 @@ Lifecycle hooks around the DDL phase, for SQL dbd does not model — attaching a
 
 | Field    | Type | Description |
 |----------|------|-------------|
-| `before` | list | Scripts run after the design and scope checks pass, before the first entity is applied |
+| `before` | list | Scripts run after the design and scope checks pass, before the first entity is applied — outside apply's transaction, so their effects stay if the entity batch rolls back |
 | `after`  | list | Scripts run once every entity is applied and every matview stamped — and **before** `policies/` |
 
 `apply.after` runs before `policies/` because publications and grants attach to objects that must already exist, while RLS policies are independent of them. A hook that needs a policy to exist will not find one.

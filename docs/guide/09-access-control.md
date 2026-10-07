@@ -155,5 +155,6 @@ outside scope 'daemon'
 ```
 
 A file off that layout has no derivable table and always applies.
-`dbd policies --dry-run` lists every file without applying the scope; the real
-run filters. Scope filtering is a correctness aid, not a security boundary.
+`dbd policies --dry-run` applies the same filter, listing what would apply and
+what it would skip. Scope filtering is a correctness aid, not a security
+boundary.

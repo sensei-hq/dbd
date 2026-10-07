@@ -106,8 +106,9 @@ The reference target: every feature works here.
 - **One transaction per apply.** `dbd apply` (and the apply phase of
   `dbd deploy`) runs every entity, migration and version stamp in a single
   transaction, so an interrupted upgrade rolls back to the schema it started
-  from instead of leaving objects half-applied. `apply.before` runs before it,
-  and matview stamping, pg_cron sync and `apply.after` run after it commits.
+  from instead of leaving objects half-applied. `apply.before` runs before it
+  and outside it, so its effects stay if the batch rolls back; matview
+  stamping, pg_cron sync and `apply.after` run after it commits.
   DDL that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`, for
   one — fails there; set `DBD_NO_TX` (to any value) to apply without the
   transaction.

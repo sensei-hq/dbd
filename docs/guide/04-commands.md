@@ -191,7 +191,8 @@ extensions the scope's `extensions:` allowlist admits, not every one.
 
 **One transaction.** On PostgreSQL the entities, pending migrations and version
 stamp run in a single transaction, so an interrupted upgrade rolls back to the
-schema it started from. `apply.before` runs before it; matview stamping, pg_cron
+schema it started from. `apply.before` runs before it — outside it, so a batch
+that rolls back keeps whatever `apply.before` did; matview stamping, pg_cron
 sync and `apply.after` run once it has committed. DDL that cannot run inside a
 transaction (`CREATE INDEX CONCURRENTLY`) fails there — set `DBD_NO_TX` to any
 value to apply without it. SQLite applies without a transaction.
@@ -1158,7 +1159,8 @@ schema that a given plane does not have runs anyway and reports
 dressed as an error, which is how real failures stop being read.
 
 Runs without `--scope` are unaffected: every policy file applies. `dbd policies --dry-run`
-lists every policy file without applying the scope filter; the real run filters.
+applies the same filter as the real run, listing what would apply and each file it would skip.
+`dbd deploy --dry-run` counts them the same way.
 
 A file that is not in `policies/<schema>/<table>.sql` form has no derivable
 target and always applies — scope filtering is a correctness aid, not a
