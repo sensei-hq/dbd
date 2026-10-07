@@ -1328,3 +1328,56 @@ fn an_entity_whose_file_does_not_parse_is_reported_as_missing() {
         );
     }
 }
+
+// ── What is not emitted is reported, in the file and in the list ───────────
+
+/// A trigger kept beside its table — where most projects keep one — fires a
+/// routine whose body does not translate, so it is skipped like the routine.
+/// It was skipped without a word: no note in the file, no report entry, exit 0
+/// — while the same trigger in a file of its own would have been reported.
+///
+/// The routine it fires is in the project too, and the two must be reported
+/// the same way: one reason, written at the site in the file and in the list.
+#[test]
+fn a_trigger_written_in_a_table_file_is_reported_as_skipped_like_a_function() {
+    let files = [
+        (
+            "table/app/orders.ddl",
+            "create table orders (id integer primary key, updated timestamptz);\n\
+             create trigger orders_touch before update on orders\n  \
+               for each row execute function app.touch();",
+        ),
+        (
+            "function/app/touch.ddl",
+            "create or replace function touch() returns trigger language plpgsql as $$\n\
+             begin new.updated := now(); return new; end $$;",
+        ),
+    ];
+    for dialect in ALL {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert!(
+            !statements(&sql).to_uppercase().contains("TRIGGER"),
+            "{dialect:?}: a trigger is not emitted: {sql}"
+        );
+        let trigger = report
+            .iter()
+            .find(|d| d.from.contains("orders_touch"))
+            .unwrap_or_else(|| panic!("{dialect:?}: the trigger is reported: {report:?}"));
+        assert_eq!(trigger.entity, "app.orders", "{dialect:?}: on the table it fires on");
+        assert_eq!(trigger.to, "nothing", "{dialect:?}");
+        let function = report
+            .iter()
+            .find(|d| d.entity == "app.touch")
+            .unwrap_or_else(|| panic!("{dialect:?}: the function is reported: {report:?}"));
+        assert_eq!(
+            trigger.reason, function.reason,
+            "{dialect:?}: skipped like a function, so said the same way"
+        );
+        for skipped in ["orders_touch", "app.touch"] {
+            assert!(
+                sql.lines().any(|l| l.starts_with("-- dbd:") && l.contains(skipped)),
+                "{dialect:?}: `{skipped}` is noted in the file too: {sql}"
+            );
+        }
+    }
+}
