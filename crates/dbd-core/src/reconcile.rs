@@ -1177,8 +1177,9 @@ const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
 /// with it), so recreation is reported as blocked rather than attempted.
 ///
-/// Dropped views are not re-created here — reconcile's pass C re-applies every
-/// managed view on every run, which is exactly what restores them.
+/// Dropped views are not re-created here — reconcile re-applies every managed
+/// view on every run, after the enum and tables it depends on, which is exactly
+/// what restores them.
 pub fn plan_enum_recreation(
     plan: &mut ReconcilePlan,
     live: &Snapshot,
@@ -4052,8 +4053,8 @@ mod enum_recreation_tests {
 
     /// A view over the affected table blocks `ALTER TABLE … ALTER COLUMN … TYPE`
     /// ("cannot alter type of a column used by a view or rule"). Managed views are
-    /// dropped first and re-created by reconcile's pass C, which re-applies every
-    /// view on every run anyway. Transitive dependents count: a view over a view.
+    /// dropped first and re-created by reconcile's write pass, which re-applies
+    /// every view on every run anyway. Transitive dependents count: a view over a view.
     #[test]
     fn managed_views_over_the_affected_table_are_dropped_first() {
         let live = snap(

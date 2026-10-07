@@ -3577,7 +3577,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     )
     .unwrap();
     // A view over the enum column: this is what blocks `ALTER … TYPE` and has to
-    // be dropped first, then restored by pass C.
+    // be dropped first, then restored when reconcile re-applies its views.
     std::fs::write(
         dir.join("ddl/view/app/t_v.ddl"),
         "set search_path to app;\n\
@@ -3629,7 +3629,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     .await;
 
     // The rows survive the rewrite, the default survives the drop/restore, and
-    // the view pass C re-applied is queryable again.
+    // the view reconcile re-applied is queryable again.
     assert_catalog(
         &*adapter,
         true,
@@ -4390,7 +4390,7 @@ fn write_project(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)]) -> D
     Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
 }
 
-/// Reconcile ran every table create (pass A) before any function (pass C), so
+/// Reconcile ran every table create before any function, so
 /// on a fresh database a table whose default calls a project function failed
 /// with `function core.default_tier() does not exist`, and a trigger declared in
 /// a table file failed on its trigger function — leaving the tables created
@@ -4455,7 +4455,7 @@ async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_trigge
         &*adapter,
         true,
         "SELECT 1 FROM core.events WHERE id = 1 AND touched_at IS NOT NULL",
-        "the trigger's effect",
+        "touched_at set by the trigger",
     )
     .await;
 
@@ -4487,7 +4487,7 @@ async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_trigge
         &*adapter,
         true,
         "SELECT 1 FROM core.accounts WHERE id = 1 AND region = 'eu'",
-        "the new column's default on the existing row",
+        "the new column default on the existing row",
     )
     .await;
 }
