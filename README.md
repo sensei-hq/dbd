@@ -42,7 +42,7 @@ myproject/
       genders_mv.ddl
     procedure/staging/
       import_lookups.ddl
-  import/              # Staging data (CSV, TSV, JSONL)
+  import/              # Staging data (CSV, TSV, JSON, JSONL)
     staging/
       lookups.csv
   snapshots/           # Versioned schema captures (auto-generated)
@@ -55,22 +55,22 @@ myproject/
 
 | Command | Purpose |
 |---------|---------|
-| `dbd init` | Scaffold a new project (postgres or supabase), or reverse-engineer one from a live DB with `--from-db` |
+| `dbd init` | Scaffold a new project (postgres or supabase), or reverse-engineer one from a live DB with `--from-db` (a Supabase database gets a `supabase` target) or a DBML file with `--from-dbml` |
 | `dbd merge` | Sync an existing database into the current project (reverse-engineer + reconcile) |
 | `dbd inspect` | Validate configuration, report errors and warnings |
 | `dbd apply` | Apply schemas, entities, and pending migrations |
-| `dbd import` | Load staging data from CSV/TSV/JSONL files |
-| `dbd export` | Export table data to csv/tsv/jsonl files |
+| `dbd import` | Load staging data from CSV, TSV, JSON and JSONL files, then call the procedures that read it |
+| `dbd export` | Export table data — and the views `export:` lists — to csv/tsv/jsonl files |
 | `dbd refresh` | Refresh materialized views now (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`); `--name <entity>` or `<schema>.*` to target a subset. Scheduled refresh is managed via pg_cron |
 | `dbd deploy` | Fetch from GitHub or local path + apply + grants + import + RLS policies |
 | `dbd combine` | Combine all DDL into a single SQL file |
-| `dbd emit` | Translate the schema into another engine's DDL (MySQL, T-SQL, SQLite) |
+| `dbd emit` | Translate the schema into another engine's DDL (MySQL, T-SQL, SQLite), reporting every downgrade |
 | `dbd graph` | Output dependency graph as JSON |
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
 | `dbd reconcile` | Pre-release: diff the live DB against the design and apply ALTER/CREATE in place (no snapshots) |
 | `dbd diff` | Read-only: the complete difference between the live DB and the design — columns, keys, constraints, indexes, comments, enums, matview drift. Works after release; `--exit-code` for CI |
-| `dbd release` (alias `baseline`) | Write a baseline snapshot and lock in the snapshot/migration workflow (disables `reconcile`) |
+| `dbd release` (alias `baseline`) | Write a baseline snapshot — or, when snapshots exist, release at the latest — and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
 | `dbd format` | Format DDL files (river-style; `--check` for CI/pre-commit) |
@@ -112,8 +112,8 @@ Where `apply` can write. See the table above for what dbd can *read*.
 |--------|--------|----------|
 | PostgreSQL | Working (sqlx, PG17+) | `postgres://user:pass@host:5432/db` |
 | Supabase | Working — the PostgreSQL adapter; a target named `supabase` exposes `public`, protects Supabase's schemas from prune and reset, and adds PostgREST grants | `postgres://...` (with `target: supabase`) |
-| SQLite | Working (sqlx-sqlite, batched multi-row CSV/TSV/JSONL import, trigger-aware splitter) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
-| Convex | Working (codegen `schema.ts` with enums + FK `v.id`, sidecar state, `?deploy=true` auto-deploy, per-table `npx convex import` with `import.options.truncate: false`) | `convex:` (default `./convex`), `convex://./out`, `convex://./out?deploy=true` |
+| SQLite | Working (sqlx-sqlite, batched multi-row CSV/TSV/JSON/JSONL import, trigger-aware splitter) | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path.db` |
+| Convex | Working (codegen `schema.ts` with enums + FK `v.id`, sidecar state, `?deploy=true` auto-deploy, per-table `npx convex import --replace`) | `convex:` (default `./convex`), `convex://./out`, `convex://./out?deploy=true` |
 
 ### Adapter notes
 
@@ -121,8 +121,8 @@ Where `apply` can write. See the table above for what dbd can *read*.
   `Schema` entities are a no-op; `Enum` / `Function` / `Procedure` / `Role` /
   `Extension` / `Sequence` / `MaterializedView` entities error on apply. Entity names like `auth.users` are
   resolved as the bare table `users`. Imports use multi-row `INSERT … VALUES (?,?), …`
-  batches inside one transaction (≤500 rows or 32k binds per batch); set
-  `import.options.truncate: false`, since SQLite has no `TRUNCATE`. The DDL
+  batches inside one transaction (≤500 rows or 32k binds per batch); SQLite has
+  no `TRUNCATE`, so the import's truncate runs `DELETE FROM`. The DDL
   formatter knows about SQLite `CREATE TRIGGER … BEGIN … END;` blocks and
   keeps them whole. Offline `inspect` classifies ~150 built-in functions /
   types plus the `sqlite_*` prefix as Internal without touching the DB.
@@ -143,8 +143,9 @@ Where `apply` can write. See the table above for what dbd can *read*.
   (inline or single-column table-level) emit `v.id("target_table")`.
   Append `?deploy=true` to the URL (or call `with_auto_deploy(true)`) to
   run `npx convex deploy` automatically after each apply; `dbd import`
-  shells out to `npx convex import --table <flat_name> --replace -y <file>`
-  (set `import.options.truncate: false` — the default truncate is SQL).
+  shells out to `npx convex import --table <flat_name> --replace -y <file>`,
+  which replaces the table, so `import.options.truncate: false` has no effect
+  there; a `.json` data file must be a JSON array.
   Whole-deployment export remains the Convex CLI's job (`npx convex export`)
   because the CLI doesn't expose per-table dumps.
 
@@ -216,7 +217,8 @@ dbd inspect --scope hub
 - `external:` is the only sanctioned way to declare a dependency that lives outside the managed scope; references to `external:` entries are never counted as gaps.
 - Omit `default` (or omit `scopes:` entirely) to deploy the full set. Define `default:` only if a bare `dbd deploy` should itself deploy a subset. `--scope all` is always the full set.
 - **Scope guard.** The first `apply`/`deploy`/`reconcile` pins a database to its resolved scope (recorded in `dbd.meta.scope`, or `_dbd_meta.scope` on SQLite); a later `apply`/`deploy`/`reconcile`/`reset` under a *different* scope is refused unless you pass `--allow-scope-change` (which re-points the DB) — this stops a mistyped or forgotten `--scope` from building a divergent schema in the wrong database.
-- **A scope narrows what is applied, not what the project owns** — `reconcile --prune --scope` never drops a table the design declares outside the scope. Upgrade to 0.24.1 before running a scoped prune: earlier releases did ([#40](https://github.com/sensei-hq/dbd/issues/40)).
+- **A scope keeps what its entities need**: sequences are selected like tables, a table depends on the enum and sequence its columns use, the schema an allowed extension installs into comes with it, and grants are applied only on the schemas the scope builds.
+- **A scope narrows what is applied, not what the project owns** — `reconcile --prune --scope` never drops a table the design declares outside the scope. Upgrade to 0.24.1 before running a scoped prune: earlier releases did ([#40](https://github.com/sensei-hq/dbd/issues/40)). And upgrade to 0.25 before any `reconcile --prune` in a design with a role or an extension that has no `schema:`: earlier releases treated `public` as managed and dropped every undeclared table there.
 
 The full guide is [scopes and multi-database deploys](docs/guide/07-scopes.md).
 
@@ -224,7 +226,7 @@ The full guide is [scopes and multi-database deploys](docs/guide/07-scopes.md).
 
 ```
 $ dbd inspect --scope hub
-scope 'hub': 7 entities
+scope 'hub': 7 of 12 entities
 ✗ dependency gap: app.sessions requires app.tenants (out of scope)
     chain: app.sessions → app.tenants
 Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with --deps include
@@ -280,8 +282,9 @@ to declare a unique index (Postgres needs one for `REFRESH … CONCURRENTLY`).
 
 ### Reconcile
 
-`dbd reconcile` **creates** a matview that's missing, and stamps a content
-hash (`COMMENT ON MATERIALIZED VIEW … IS 'dbd:hash=…'`). When a matview's
+`dbd reconcile` **creates** a matview that's missing, and records a content
+hash (`dbd:hash=…`) in `dbd.matview_stamps` — the matview's own `COMMENT` stays
+yours. When a matview's
 definition later differs from the design, reconcile **warns** rather than
 auto-recreating — dropping a matview means `DROP … CASCADE` (losing the
 cached data, dependents, and grants), so applying a changed definition is
