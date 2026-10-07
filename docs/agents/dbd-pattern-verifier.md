@@ -11,8 +11,9 @@ description: >-
   enums, materialized-view drift misuse, seed data that can never load (an
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
   convention, or a `--scope` that drops them), RLS expected from `dbd apply`
-  without `--with-policies`, and post-DDL SQL parked in `import.after` (which
-  never runs on `dbd apply`) instead of `apply.after`. Reviews from the files
+  without `--with-policies`, post-DDL SQL parked in `import.after` (which
+  never runs on `dbd apply`) instead of `apply.after`, and a scoped
+  `reconcile --prune` on a dbd older than 0.24.1. Reviews from the files
   (no DB needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only
   if the binary is present.
 
@@ -47,15 +48,26 @@ You work **from the files** — no database and no network are required. If a `d
 
 ## First, determine the release state (it drives the #1 check)
 
-The project is **released** iff `design.yaml` has `project.released: true` **OR** a baseline
-snapshot exists under `snapshots/`. Otherwise it is **pre-release**. Establish this before
-judging the workflow, and state which one you concluded and why (the file evidence).
+Read `project.released` in `design.yaml` and look for `snapshots/`:
+
+- `project.released: true` → **released** (dbd refuses `reconcile`).
+- neither → **pre-release**.
+- snapshots but no `released` flag → **snapshots but not released** — what `dbd init --from-db`
+  and `dbd merge` leave. Judge it as released (changes go snapshot → apply), but note that dbd
+  checks only the flag: `reconcile` still runs there and `dbd release` refuses. Recommend
+  setting `released: true` by hand if reconcile must be blocked.
+
+Establish this before judging the workflow, and state which one you concluded and why (the
+file evidence).
 
 ## What you check (report most-severe first)
 
 1. **Wrong workflow for the release state** — the highest-value catch.
-   - **Released** project using or being advised to use **`dbd reconcile`** → violation (release
-     disables reconcile; changes must go through `dbd snapshot` → `dbd apply`).
+   - **Released** (or snapshots-but-not-released) project using or being advised to use
+     **`dbd reconcile`** → violation (changes must go through `dbd snapshot` → `dbd apply`).
+   - A **scoped prune** (`reconcile --prune --scope …`) in a script, CI job or advice where the
+     dbd in use is older than 0.24.1 → violation: those versions dropped the design's own tables
+     outside the scope (#40). Fix: upgrade first.
    - **Pre-release** project with hand-written migration files / snapshots being authored by hand,
      or someone hand-editing the live DB instead of `reconcile` → violation.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
@@ -105,9 +117,10 @@ judging the workflow, and state which one you concluded and why (the file eviden
 9. **Post-DDL SQL in the wrong hook** — an `import.after` entry whose job is schema-adjacent
    setup rather than data loading: attaching tables to a publication (Supabase realtime),
    `grant`s, or anything whose own comment says it must "run once every entity exists".
-   `import.after` runs **only on `dbd deploy`** — the import phase is the only thing that
-   executes it — so on `dbd apply` it silently does nothing. The fix is `apply.after`, which
-   runs on both and lands after every entity is applied and before `policies/`.
+   `import.after` runs **only with the import phase** — `dbd import` and `dbd deploy` — so on
+   `dbd apply` it silently does nothing. The fix is `apply.after`, which runs on `apply` and
+   `deploy` and lands after every entity is applied, before the configured grants and
+   `policies/`.
    - When moving such a hook, check whether it needs an explicit `writes:`. dbd derives a
      script's tables by parsing it; a realtime hook typically names its tables as *data* inside
      `array['a','b']` and `format('… %I', t)`, where derivation returns empty. A script with no

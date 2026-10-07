@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x505e0376c8d5f78a
+// docs-digest: 0x32bc233262b62232
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -101,7 +101,7 @@ async fn doc_docs_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
         )
         .await?;
 
-    // Or apply + import + policies in one call — the same pipeline `dbd deploy` runs:
+    // Or apply + grants + import + policies in one call — the same pipeline `dbd deploy` runs:
     design
         .deploy(&*adapter, false, Some(&scope), |s| {
             println!("deployed to v{}", s.apply.to_version);
@@ -135,8 +135,8 @@ async fn doc_docs_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
     let parsed = dbd_core::parser::parse_sql(sql)?; // ParsedFile
     for e in &parsed.entities {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
-        // e.refers, e.references             — typed edges (FK, view dep, function call)
-        // e.reads, e.writes                  — separated, for functions and procedures
+        // e.refs                             — every reference, each with its kind
+        // e.reads() / e.writes() / e.calls() — filtered views of e.refs
         // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
@@ -371,7 +371,7 @@ async fn doc_src_assets_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
         )
         .await?;
 
-    // Or apply + import + policies in one call — the same pipeline `dbd deploy` runs:
+    // Or apply + grants + import + policies in one call — the same pipeline `dbd deploy` runs:
     design
         .deploy(&*adapter, false, Some(&scope), |s| {
             println!("deployed to v{}", s.apply.to_version);
@@ -405,8 +405,8 @@ async fn doc_src_assets_skills_dbd_skill_md_1() -> dbd_core::Result<()> {
     let parsed = dbd_core::parser::parse_sql(sql)?; // ParsedFile
     for e in &parsed.entities {
         // e.entity_type / e.schema / e.name  — read off the CREATE statement
-        // e.refers, e.references             — typed edges (FK, view dep, function call)
-        // e.reads, e.writes                  — separated, for functions and procedures
+        // e.refs                             — every reference, each with its kind
+        // e.reads() / e.writes() / e.calls() — filtered views of e.refs
         // e.comment                          — its own COMMENT ON (non-tables)
     }
     Ok(())
