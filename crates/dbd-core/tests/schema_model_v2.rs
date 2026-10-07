@@ -139,6 +139,57 @@ fn views_and_routines_appear_with_their_kind() {
     assert_eq!(kind_of("total").as_deref(), Some("function"));
 }
 
+/// A schema the model draws only views, a materialized view or routines in is a
+/// schema of the model all the same. `schemas` counted tables and enums and
+/// skipped everything else, so a reporting schema vanished from the list while
+/// its views were drawn under it.
+#[test]
+fn a_schema_holding_no_tables_or_enums_is_still_one_of_the_models_schemas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    drop(project(dir));
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: m2\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\n\
+         schemas:\n  - app\n  - reporting\n  - cache\n  - api\n",
+    )
+    .unwrap();
+    for (rel, sql) in [
+        (
+            "ddl/view/reporting/order_codes.ddl",
+            "create or replace view reporting.order_codes as select code from app.orders;",
+        ),
+        (
+            "ddl/materialized_view/cache/order_count.ddl",
+            "create materialized view if not exists cache.order_count as select count(*) as n from app.orders;",
+        ),
+        (
+            "ddl/function/api/ping.ddl",
+            "create or replace function api.ping() returns int language sql as $$ select 1 $$;",
+        ),
+    ] {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, sql).unwrap();
+    }
+
+    let m = build(
+        &Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load"),
+        None,
+    )
+    .unwrap();
+    let schemas = serde_json::to_value(&m.schemas).unwrap();
+    assert_eq!(
+        schemas,
+        serde_json::json!([
+            { "name": "api", "tables": 0, "enums": 0 },
+            { "name": "app", "tables": 2, "enums": 0 },
+            { "name": "cache", "tables": 0, "enums": 0 },
+            { "name": "reporting", "tables": 0, "enums": 0 },
+        ])
+    );
+}
+
 /// Tables are not duplicated into `entities` — a consumer walking both must
 /// not see `orders` twice.
 #[test]
