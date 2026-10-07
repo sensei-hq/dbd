@@ -24,8 +24,9 @@
 //!
 //! # Keys, checks and indexes
 //!
-//! Every target has FOREIGN KEY, CHECK and CREATE INDEX, so they are carried.
-//! A CHECK expression or an index predicate is PostgreSQL SQL that dbd does not
+//! Every target has FOREIGN KEY, CHECK, CREATE INDEX and stored generated
+//! columns, so they are carried. A CHECK expression, a generated column's
+//! expression or an index predicate is PostgreSQL SQL that dbd does not
 //! translate, so it goes across verbatim and is reported, like a view body. An
 //! index the target would reject outright — an expression key on SQL Server, a
 //! key on an unbounded text column on MySQL or SQL Server — is left out and
@@ -393,11 +394,34 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
             .default_value
             .as_deref()
             .and_then(|d| column_default(d, e, c, &ty, numbered, script, report));
+        // All three compute a stored column, so a generated one stays
+        // generated — emitting it plain left a column holding whatever an
+        // insert put there. Its expression is PostgreSQL SQL dbd does not
+        // translate, so it goes across verbatim and is reported, like a CHECK.
+        if let Some(expr) = &c.generated {
+            report.push(Downgrade {
+                entity: e.name.clone(),
+                column: Some(c.name.clone()),
+                from: format!("a generated column's expression in PostgreSQL SQL (`{expr}`)"),
+                to: "the same text, untranslated".to_string(),
+                reason: "dbd translates types and structure, not expressions — anything \
+                         PostgreSQL-specific inside it has to be checked by hand"
+                    .to_string(),
+            });
+        }
         // A note goes immediately above the column it explains.
         for d in &report[before..] {
             lines.push(format!("  {}", d.comment(target)));
         }
-        let mut col = format!("  {} {ty}", target.quote(&c.name));
+        let mut col = match (&c.generated, target) {
+            // SQL Server's computed column takes its type from the expression;
+            // the CAST keeps the declared one.
+            (Some(expr), Target::TSql) => format!("  {} AS CAST(({expr}) AS {ty}) PERSISTED", target.quote(&c.name)),
+            (Some(expr), Target::MySql | Target::Sqlite) => {
+                format!("  {} {ty} GENERATED ALWAYS AS ({expr}) STORED", target.quote(&c.name))
+            }
+            (None, _) => format!("  {} {ty}", target.quote(&c.name)),
+        };
         // `[id] bigint IDENTITY(1,1) NOT NULL`, `"id" INTEGER PRIMARY KEY
         // AUTOINCREMENT NOT NULL`, `` `id` INT NOT NULL AUTO_INCREMENT `` —
         // each engine's own documented order.
