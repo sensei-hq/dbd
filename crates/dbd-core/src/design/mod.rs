@@ -338,6 +338,34 @@ pub(crate) fn policy_target(file: &Path, project_dir: &Path) -> Option<String> {
     Some(format!("{schema}.{table}"))
 }
 
+/// Which policy files a run under `scope` applies and which it skips, read from
+/// `policies/` without a database.
+///
+/// `applied` here means *would apply*: nothing is executed, so `failed` is
+/// always empty. This is the filter [`apply_policies`] itself runs, exposed so
+/// a preview lists what the run will do. `dbd policies --dry-run` used to list
+/// every file under `policies/` whatever the scope, promising a policy on a
+/// table the plane does not have.
+pub fn plan_policies(
+    project_dir: &Path,
+    scope: Option<(&str, &std::collections::HashSet<String>)>,
+) -> Result<PolicyReport> {
+    let mut report = PolicyReport::default();
+    for file in crate::scanner::scan_policies(project_dir)? {
+        if let Some((scope_name, working_set)) = scope
+            && let Some(target) = policy_target(&file, project_dir)
+            && !working_set.contains(&target)
+        {
+            report
+                .skipped
+                .push((file, format!("{target} is outside scope '{scope_name}'")));
+        } else {
+            report.applied.push(file);
+        }
+    }
+    Ok(report)
+}
+
 /// Apply RLS policy files from the policies/ directory.
 ///
 /// Files are executed in alphabetical order. Failed files are logged and skipped.
@@ -354,32 +382,20 @@ pub async fn apply_policies(
     dry_run: bool,
     scope: Option<(&str, &std::collections::HashSet<String>)>,
 ) -> Result<PolicyReport> {
-    let files = crate::scanner::scan_policies(project_dir)?;
+    let plan = plan_policies(project_dir, scope)?;
+    if dry_run {
+        return Ok(plan);
+    }
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
-        skipped: Vec::new(),
+        skipped: plan.skipped,
     };
 
     // Canonicalize the project root once so path-traversal checks are reliable.
     let canon_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
 
-    for file in &files {
-        if let Some((scope_name, working_set)) = scope
-            && let Some(target) = policy_target(file, project_dir)
-            && !working_set.contains(&target)
-        {
-            report
-                .skipped
-                .push((file.clone(), format!("{target} is outside scope '{scope_name}'")));
-            continue;
-        }
-
-        if dry_run {
-            report.applied.push(file.clone());
-            continue;
-        }
-
+    for file in &plan.applied {
         // Guard: every policy file must resolve within the project directory.
         let canon_file = match file.canonicalize() {
             Ok(p) => p,
@@ -945,9 +961,17 @@ impl Design {
             if entity.entity_type == EntityType::External {
                 continue;
             }
-            // Check file exists for file-based entities
+            // Check file exists for file-based entities. A scanned file's path
+            // already starts with the project directory (the scan is rooted
+            // there), so joining it on again doubled a relative `-s proj` into
+            // `proj/proj/ddl/…` and reported every file missing. Only a path
+            // not already under it is resolved against it.
             if let Some(ref file) = entity.file {
-                let full_path = self.project_dir.join(file);
+                let full_path = if file.starts_with(&self.project_dir) {
+                    file.clone()
+                } else {
+                    self.project_dir.join(file)
+                };
                 if !full_path.exists() {
                     entity.errors.push(format!("File not found: {}", file.display()));
                 }
@@ -1020,11 +1044,14 @@ impl Design {
             Some(s) => self.scoped_entities(s)?,
             None => self.entities.clone(),
         };
+        // The script is for this project's own engine, so dbd's generated
+        // statements are written in its dialect too (see `combined_ddl`).
+        let dialect = crate::parser::Dialect::from_label(&self.dialect).unwrap_or_default();
         let combined: Vec<String> = entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
-            .filter_map(script::ddl_from_entity)
+            .filter_map(|e| script::combined_ddl(e, dialect))
             .collect();
 
         std::fs::write(file, combined.join("\n"))?;
@@ -1034,6 +1061,11 @@ impl Design {
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
+        // An unknown or out-of-scope name produced an empty graph — a valid
+        // document, indistinguishable from an entity with no dependencies.
+        if let Some(n) = name {
+            self.resolve_name(n, scope)?;
+        }
         let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {

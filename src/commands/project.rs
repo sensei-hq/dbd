@@ -64,7 +64,8 @@ pub fn cmd_dbml(
     // entities that deploy under this scope. The all-scope keeps everything.
     let resolved = design.resolve_scope(scope, deps)?;
     let entities = design.scoped_entities(&resolved)?;
-    output::scope_filtered(&resolved, entities.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
@@ -119,9 +120,10 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
     let total_issues = auto_fixable + mismatches.len();
 
+    // doctor counts issues, not entities: the shared entity summary printed
+    // "0 entities — no issues" here on a project full of tables.
     if total_issues == 0 {
         output::info(verbosity, "No issues found — project is up to date.");
-        output::summary(0, 0, 0);
         return Ok(());
     }
 
@@ -134,7 +136,7 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         if !mismatches.is_empty() {
             output::always("Misfiled DDL files must be moved manually (see above).");
         }
-        output::summary(total_issues, 0, 0);
+        output::always(&format!("\n{} found.", issues(total_issues)));
         return Ok(());
     }
 
@@ -161,9 +163,18 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
         }
     }
-    output::summary(mismatches.len(), 0, fixed);
+    output::always(&format!(
+        "\n{} fixed, {} left to move by hand.",
+        issues(fixed),
+        mismatches.len()
+    ));
 
     Ok(())
+}
+
+/// `1 issue` / `N issues`.
+fn issues(n: usize) -> String {
+    format!("{n} issue{}", if n == 1 { "" } else { "s" })
 }
 
 /// Print the config / stale-file / plural-folder issues doctor detected.
@@ -354,28 +365,22 @@ pub async fn cmd_deploy(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     if dry_run {
-        // Surface the same gap/closure errors a real deploy would.
-        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        // The real deploy's own gate (it runs `Design::apply`): scope gaps and
+        // closure, the extension allowlist, and the refusal of a file that did
+        // not parse. The preview used to tally "1 errors" and exit 0 over a
+        // design the deploy refuses.
+        let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+
+        // What the scope builds, not what the design declares: a scoped deploy
+        // never touches the rest, so the whole-design tally described a run
+        // that does not happen.
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
-            for gap in &report.gaps {
-                output::always(&format!(
-                    "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-                    gap.required_by,
-                    gap.missing,
-                    gap.chain.join(" → ")
-                ));
-            }
+            output::scope_gaps(&resolved, &report.gaps);
         }
-        output::info(
-            verbosity,
-            &format!(
-                "{} entities found, {} errors, {} warnings",
-                design.entities().len(),
-                report.issues.len(),
-                report.warnings.len(),
-            ),
-        );
+        output::info(verbosity, &format!("{to_apply} entities would be applied."));
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
@@ -388,10 +393,21 @@ pub async fn cmd_deploy(
             output::warn(&warning);
         }
 
-        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
+        // The policy phase's own scope filter, counted the way the real
+        // deploy's summary counts it.
+        let policy_ws = super::schema::policy_working_set(&design, &resolved)?;
+        let policies =
+            dbd_core::design::plan_policies(&project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         output::info(
             verbosity,
-            &format!("{} policy file(s) would be applied.", policy_files.len()),
+            &format!(
+                "{} policy file(s) would be applied{}.",
+                policies.applied.len(),
+                match policies.skipped.len() {
+                    0 => String::new(),
+                    n => format!(", {n} skipped (out of scope)"),
+                }
+            ),
         );
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
@@ -469,15 +485,49 @@ pub async fn cmd_reconcile(
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let adapter = get_adapter(config, database_url).await?;
+    reconcile_with_adapter(
+        &*adapter,
+        &design,
+        &resolved,
+        dry_run,
+        allow_destructive,
+        prune,
+        allow_scope_change,
+        verbosity,
+    )
+    .await
+}
+
+/// The body of `dbd reconcile`, with the adapter supplied rather than connected.
+///
+/// Split out so what a run decides against a given database — the scope guard
+/// above all — is testable against a mock without a live one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+    dry_run: bool,
+    allow_destructive: bool,
+    prune: bool,
+    allow_scope_change: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // Guarded before the dry run, not after it. The preview connects anyway, so
+    // it can see the pin, and a plan for a run the guard will refuse is a
+    // preview of something that cannot happen. (`reset --dry-run` is the
+    // deliberate exception: it needs no database, so it has no pin to read.)
+    let meta = adapter.get_project_meta().await?;
+    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
     if dry_run {
         let plan = design
             .reconcile(
-                &*adapter,
+                adapter,
                 true,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress::none(),
             )
             .await
@@ -487,20 +537,17 @@ pub async fn cmd_reconcile(
         return Ok(());
     }
 
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
-
     output::info(verbosity, "Reconciling schema to design...");
     let mut summary = None;
     let plan = {
         let spinner = output::StepSpinner::new(verbosity);
         let result = design
             .reconcile(
-                &*adapter,
+                adapter,
                 false,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress {
                     on_start: |desc: &str| spinner.start(desc),
                     on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
@@ -597,8 +644,18 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
     lines
 }
 
-/// Release the current version: write a baseline snapshot and set the released
-/// flag, locking the project into the snapshot/migration workflow.
+/// Release the current version: set the released flag, locking the project into
+/// the snapshot/migration workflow — writing the baseline snapshot first when
+/// the project has none.
+///
+/// A greenfield project reaches release with no snapshots: it was iterated with
+/// `reconcile`, and release cuts its baseline. A brownfield one does not —
+/// `init --from-db` writes the baseline as it creates the project, and `merge`
+/// snapshots each import — but neither sets `released`. Release used to refuse
+/// any project with snapshots, so a brownfield project could never be released
+/// and `reconcile` stayed enabled on it for good. Its history is already the
+/// record, so it is released at the version that history reached; writing a
+/// second baseline over it would discard the versions it already has.
 pub fn cmd_release(
     config: &Path,
     env: &str,
@@ -611,16 +668,14 @@ pub fn cmd_release(
     if design.config().project.released {
         anyhow::bail!("Project is already released.");
     }
-    if dbd_core::snapshot::has_snapshots(project_dir) {
-        anyhow::bail!(
-            "Snapshots already exist — the project is already on the migration track. \
-             Use `dbd snapshot` for subsequent versions."
-        );
-    }
 
     let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
     if error_count > 0 {
         anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
+    }
+
+    if dbd_core::snapshot::has_snapshots(project_dir) {
+        return release_at_latest_snapshot(&design, config, project_dir, name, verbosity);
     }
 
     let version = design.config().project.version();
@@ -632,6 +687,60 @@ pub fn cmd_release(
     output::always(&format!(
         "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
     ));
+    output::info(
+        verbosity,
+        "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
+    );
+    Ok(())
+}
+
+/// Release a project whose snapshots already exist, at the version they reached.
+///
+/// Released at version N means the design *is* snapshot N, so a change no
+/// snapshot captured is refused rather than shipped unversioned: `dbd snapshot`
+/// records it, and the release then lands on that version.
+fn release_at_latest_snapshot(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let latest = dbd_core::snapshot::latest_snapshot(project_dir)
+        .context("Failed to read the latest snapshot")?
+        .context("snapshots/ lists a version but none could be read")?;
+    let version = latest.version;
+
+    // The version apply migrates to is `project.version`; releasing at a
+    // snapshot version it does not name would release one version and deploy
+    // another.
+    if let Some(declared) = design.config().project.version
+        && declared != version
+    {
+        anyhow::bail!(
+            "design.yaml says project.version {declared}, but the latest snapshot is v{version} — \
+             set project.version to {version} (or restore the missing snapshots) before releasing."
+        );
+    }
+
+    let pending = dbd_core::snapshot::prepare_multi_snapshot(design.entities(), Some(&latest), version + 1, "release");
+    let captured = pending.snapshots.len() == 1 && pending.snapshots[0].no_changes;
+    if !captured {
+        anyhow::bail!(
+            "the design has changes since snapshot v{version} that no snapshot records — \
+             capture them with `dbd snapshot`, then run `dbd release` again."
+        );
+    }
+
+    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
+    output::always(&format!(
+        "✓ Released v{version} — the existing snapshots are its history, so no baseline was written; \
+         `reconcile` is now disabled."
+    ));
+    if name.is_some() {
+        // `--name` describes the baseline snapshot, and there is none to write.
+        output::warn("--name not used: this project's baseline snapshot already exists.");
+    }
     output::info(
         verbosity,
         "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
@@ -837,18 +946,59 @@ mod tests {
         );
     }
 
-    /// A project with a `snapshots/` dir but no `released` flag set is already
-    /// on the migration track — `release` refuses even before checking for
-    /// entity errors.
-    #[test]
-    fn release_refuses_when_snapshots_exist_without_released_flag() {
+    /// A fixture copy shaped like `init --from-db` leaves it: a baseline
+    /// snapshot at v1 and `project.version: 1`, but no `released` flag.
+    fn brownfield_project() -> tempfile::TempDir {
         let proj = testutil::copy_fixture_project();
-        std::fs::create_dir_all(proj.path().join("snapshots")).unwrap();
-        std::fs::write(proj.path().join("snapshots").join("001.json"), "{}").unwrap();
+        let cfg = proj.path().join("design.yaml");
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        dbd_core::snapshot::create_baseline_snapshot(design.entities(), proj.path(), &cfg, "init from database", 1)
+            .unwrap();
+        proj
+    }
+
+    /// `init --from-db` and `merge` write snapshots without setting
+    /// `released`, and `release` refused any project with snapshots — so a
+    /// brownfield project could never be released, and `reconcile` stayed
+    /// enabled on it for good. Its baseline already exists: release marks the
+    /// project released at that version, and writes no second baseline.
+    #[test]
+    fn a_brownfield_project_is_released_at_its_snapshot_version() {
+        let proj = brownfield_project();
         let cfg = proj.path().join("design.yaml");
 
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
-        assert!(err.to_string().contains("Snapshots already exist"), "got: {err}");
+        cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).expect("a brownfield project can be released");
+
+        let config = dbd_core::config::read(&cfg).unwrap();
+        assert!(config.project.released, "the project is marked released");
+        assert_eq!(config.project.version, Some(1), "at the version its snapshots reached");
+        let versions: Vec<u32> = dbd_core::snapshot::list_snapshots(proj.path())
+            .iter()
+            .map(|s| s.version)
+            .collect();
+        assert_eq!(versions, vec![1], "no second baseline is written over the history");
+    }
+
+    /// Releasing at the snapshot version is only true if the snapshot is the
+    /// design. A change no snapshot captured would ship unversioned, so the
+    /// release refuses and says how to capture it.
+    #[test]
+    fn a_brownfield_release_refuses_changes_no_snapshot_captured() {
+        let proj = brownfield_project();
+        let cfg = proj.path().join("design.yaml");
+        std::fs::write(
+            proj.path().join("ddl/table/config/added_later.ddl"),
+            "set search_path to config;\ncreate table if not exists added_later (id integer primary key);\n",
+        )
+        .unwrap();
+
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal)
+            .expect_err("an uncaptured change must not be released as v1");
+        assert!(err.to_string().contains("dbd snapshot"), "names the way out: {err}");
+        assert!(
+            !dbd_core::config::read(&cfg).unwrap().project.released,
+            "and the project stays unreleased"
+        );
     }
 
     /// A design with an entity parse error refuses to release — releasing a
@@ -891,6 +1041,58 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("released"), "got: {err}");
+    }
+
+    /// A dry run that connects must refuse the way the real run does. On a
+    /// database pinned to `all`, `reconcile --dry-run --scope config_only`
+    /// printed a plan and exited 0 — a preview of a run that cannot happen,
+    /// since the real run refuses on the scope guard before planning.
+    #[tokio::test]
+    async fn reconcile_dry_run_refuses_a_database_pinned_to_another_scope() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        let err = reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ false,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("the dry run must refuse a database pinned to another scope");
+        assert!(
+            err.to_string().contains("pinned to scope 'all'"),
+            "with the real run's reason: {err}"
+        );
+    }
+
+    /// The guard's own escape hatch reaches the dry run too, so a re-point can
+    /// be previewed before it is made.
+    #[tokio::test]
+    async fn reconcile_dry_run_previews_a_re_point_when_allowed() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ true,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
     }
 
     /// `deploy --clear-cache` clears the local download cache before the rest
