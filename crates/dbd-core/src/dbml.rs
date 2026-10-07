@@ -1580,6 +1580,55 @@ mod tests {
 
     // ── External entity stub tests ───────────────────────
 
+    /// A stub's referenced columns are declared unique, once per distinct set
+    /// a foreign key names. Postgres requires a foreign key's target to be
+    /// unique, so the reference itself says they are; without it `dbml2sql`
+    /// wrote a foreign key Postgres refuses with "there is no unique constraint
+    /// matching given keys".
+    #[test]
+    fn a_stub_declares_each_referenced_column_set_unique() {
+        let fk = |columns: &[&str], ref_columns: &[&str]| {
+            TableConstraint::ForeignKey(ForeignKey {
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                ref_schema: Some("auth".to_string()),
+                ref_table: "users".to_string(),
+                ref_columns: ref_columns.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        let profiles = make_table_entity(
+            "app.profiles",
+            vec![pk_col("id", "int"), col("user_id", "uuid"), col("tenant", "int")],
+            vec![fk(&["user_id"], &["id"]), fk(&["tenant", "user_id"], &["tenant", "id"])],
+        );
+        let entities = vec![profiles, Entity::new(EntityType::External, "auth.users")];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let stub = parsed.iter().find(|e| e.name == "auth.users").expect("stub read back");
+        let unique: Vec<Vec<&str>> = stub
+            .table_def
+            .as_ref()
+            .unwrap()
+            .indexes
+            .iter()
+            .filter(|ix| ix.unique)
+            .map(|ix| ix.columns.iter().map(|c| c.name.as_str()).collect())
+            .collect();
+        assert_eq!(unique, [vec!["id"], vec!["tenant", "id"]], "{}", doc.content);
+    }
+
     #[test]
     fn external_entity_renders_as_stub_table() {
         let table_entity = make_table_entity(
