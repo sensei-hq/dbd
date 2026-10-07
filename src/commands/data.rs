@@ -346,6 +346,14 @@ mod tests {
         assert_eq!(format_from_ext(&PathBuf::from("data/users.csv")), "csv");
     }
 
+    /// A `.json` file is JSON. It fell through to the CSV default, so
+    /// `dbd import -n <table> -f rows.json` fed JSON to the CSV loader.
+    #[test]
+    fn a_json_file_is_read_as_json() {
+        assert_eq!(format_from_ext(&PathBuf::from("data/users.json")), "json");
+        assert_eq!(format_from_ext(&PathBuf::from("USERS.JSON")), "json");
+    }
+
     #[test]
     fn format_from_ext_unknown_and_missing_default_to_csv() {
         // Unknown extension → csv.
