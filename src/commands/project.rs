@@ -712,6 +712,49 @@ mod tests {
         cmd_dbml(&cfg, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
     }
 
+    /// Under `--scope`, a Ref to a table the scope leaves out still needs that
+    /// table in the document: a Ref to an undefined table is a DBML error, and
+    /// the guide promises a stub. The fixture's `incomplete` scope keeps only
+    /// `config.lookup_values`, which references `config.lookups` (in the design,
+    /// out of scope — so its stub carries the real `uuid`) and
+    /// `config.categories` (declared nowhere — so its type is unknown).
+    #[test]
+    fn dbml_under_a_scope_stubs_every_referenced_table_it_leaves_out() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("scoped.dbml");
+        cmd_dbml(
+            &cfg,
+            "dev",
+            proj.path(),
+            &out,
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        let dbml = std::fs::read_to_string(&out).unwrap();
+
+        let stub = |table: &str| -> String {
+            let header = format!("Table {table} {{");
+            let start = dbml
+                .find(&header)
+                .unwrap_or_else(|| panic!("no stub for {table}:\n{dbml}"));
+            let body = &dbml[start..];
+            body[..body.find('}').unwrap()].to_string()
+        };
+        let lookups = stub("\"config\".\"lookups\"");
+        assert!(
+            lookups.contains("\"id\" uuid"),
+            "an out-of-scope design table keeps its real type:\n{dbml}"
+        );
+        assert!(
+            !lookups.contains("\"name\""),
+            "a stub shows only the referenced columns:\n{dbml}"
+        );
+        assert!(stub("\"config\".\"categories\"").contains("\"id\" varchar"), "{dbml}");
+    }
+
     /// A missing config bails with an actionable "not found" error.
     #[test]
     fn doctor_bails_when_config_missing() {
