@@ -302,6 +302,55 @@ async fn the_default_import_truncates_a_staging_table_on_postgres() {
     .await;
 }
 
+// ── Test: a function reading a staging table does not fail the import ─────────
+
+/// The import runs each loader with `CALL`, and Postgres refuses `CALL` on a
+/// function ("is not a procedure"). A helper function that merely reads a
+/// staging table was matched as its loader, so the whole import failed.
+#[tokio::test]
+async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write("design.yaml", "project:\n  name: t\nschemas:\n  - stage\n");
+    write(
+        "ddl/table/stage/items.ddl",
+        "set search_path to stage;\ncreate table if not exists items (id integer, name text);\n",
+    );
+    write(
+        "ddl/function/stage/item_count.ddl",
+        "set search_path to stage;\n\
+         create or replace function item_count() returns bigint language sql\n\
+         as $$ select count(*) from stage.items $$;\n",
+    );
+    write("import/stage/items.csv", "id,name\n1,a\n");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("a helper function must not fail the import");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM stage.items WHERE id = 1",
+        "the staged row",
+    )
+    .await;
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
