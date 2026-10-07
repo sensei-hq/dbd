@@ -1126,6 +1126,26 @@ mod tests {
         );
     }
 
+    /// `increment` is DBML's whole vocabulary for identity; ALWAYS adds a
+    /// custom property, BY DEFAULT stays a bare `increment`.
+    #[test]
+    fn an_always_identity_says_so_in_a_custom_property() {
+        let identity = |kind| ColumnDef {
+            identity: Some(kind),
+            nullable: false,
+            ..col("id", "bigint")
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            emit_column(&identity(crate::entity::IdentityKind::Always), &none),
+            r#"  "id" bigint [increment, generated as identity: 'always', not null]"#
+        );
+        assert_eq!(
+            emit_column(&identity(crate::entity::IdentityKind::ByDefault), &none),
+            r#"  "id" bigint [increment, not null]"#
+        );
+    }
+
     /// A table's CHECK constraints go in DBML's `checks { … }` block, each
     /// expression in backticks, named when the constraint is.
     #[test]

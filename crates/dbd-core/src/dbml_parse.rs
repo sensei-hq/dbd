@@ -1299,6 +1299,22 @@ mod tests {
         assert_eq!(td.columns[1].identity, None, "bigserial carries its own sequence");
     }
 
+    /// The `generated as identity` custom property names the identity kind
+    /// `increment` cannot; an unknown kind is refused rather than guessed.
+    #[test]
+    fn the_generated_as_identity_property_names_the_identity_kind() {
+        use crate::entity::IdentityKind;
+        let dbml = "Table \"app\".\"t\" {\n  \"a\" bigint [increment, generated as identity: 'always']\n  \"b\" bigint [increment, generated as identity: 'by default']\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(td.columns[0].identity, Some(IdentityKind::Always));
+        assert_eq!(td.columns[1].identity, Some(IdentityKind::ByDefault));
+
+        let unknown = "Table \"app\".\"t\" {\n  \"a\" bigint [increment, generated as identity: 'sometimes']\n}\n";
+        let err = parse_dbml(unknown).unwrap_err();
+        assert!(err.to_string().contains("sometimes"), "got: {err}");
+    }
+
     /// The `generated always as` custom property is a generated column's
     /// expression; a user's own custom property is metadata and changes nothing.
     #[test]
