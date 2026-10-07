@@ -5,7 +5,8 @@
    means the package never becomes a third definition to keep in step.
 
    v2 (2026-09-27) added `version`, `entities`, `deps`, and `fk`/`uq` on
-   `Column`; v3 (2026-10-01) added `history` and `enums`, and later `stubs`. Everything
+   `Column`; v3 (2026-10-01) added `history` and `enums`, and later `stubs`, sequences in
+   `entities`, `Table.checks`, `Index.where` and `Column.identity`/`generated`. Everything
    past v1 is optional here, so a share link encoded before an upgrade still validates and
    still renders. */
 
@@ -21,8 +22,20 @@ export type Column = {
   fk?: boolean;
   /** v2. Previously only derivable from `Index.unique`. */
   uq?: boolean;
+  /** v3. The column is `GENERATED … AS IDENTITY`; its values come from a sequence, not `def`. */
+  identity?: 'always' | 'by default';
+  /** v3. The expression of a `GENERATED ALWAYS AS (…) STORED` column — not a default. */
+  generated?: string;
 };
-export type Index = { def: string; unique?: boolean; name?: string };
+export type Index = {
+  def: string;
+  unique?: boolean;
+  name?: string;
+  /** v3. A partial index's `WHERE` predicate, as authored. */
+  where?: string;
+};
+/** v3. A CHECK constraint, named when it was given a name. */
+export type Check = { name?: string; expression: string };
 export type Table = {
   schema: string;
   name: string;
@@ -32,6 +45,8 @@ export type Table = {
   noteMd?: string;
   columns: Column[];
   indexes?: Index[];
+  /** v3. CHECK constraints, inline ones first. */
+  checks?: Check[];
 };
 export type RefEnd = { s: string; t: string; c: string };
 export type Ref = { from: RefEnd; to: RefEnd; action?: string };
@@ -47,7 +62,8 @@ export type StubKind = 'external' | 'out_of_scope' | 'unresolved';
 export type NodeRef = { s: string; n: string };
 
 /**
- * v2. A non-table entity: a view, materialized view, function, procedure or trigger.
+ * v2. A non-table entity: a view, materialized view, function, procedure or trigger — and
+ * since v3 a sequence.
  *
  * No columns — a parsed routine has none and a view's are not read. What it has is a body
  * and the things it depends on, which are in `SchemaModel.deps`.
@@ -55,7 +71,7 @@ export type NodeRef = { s: string; n: string };
 export type EntityNode = {
   schema: string;
   name: string;
-  /** `view` | `materialized_view` | `function` | `procedure` | `trigger` */
+  /** `view` | `materialized_view` | `function` | `procedure` | `trigger` | `sequence` */
   kind: string;
   note?: string;
   noteMd?: string;
@@ -147,7 +163,7 @@ export type SchemaModel = {
    * inside the model.
    */
   stubs?: Table[];
-  /** v2. Views, materialized views, functions, procedures and triggers. */
+  /** v2. Views, materialized views, functions, procedures and triggers; v3 adds sequences. */
   entities?: EntityNode[];
   /** v2. What reads, writes or calls what. */
   deps?: DepEdge[];

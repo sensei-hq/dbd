@@ -53,7 +53,17 @@
     if (c.nn) out.push({ label: 'NN', cls: '' });
     if (uniqueCols.has(c.name) && !c.pk) out.push({ label: 'UNIQUE', cls: '' });
     if (c.en) out.push({ label: 'ENUM', cls: '' });
+    if (c.identity) out.push({ label: 'IDENTITY', cls: '' });
+    if (c.generated) out.push({ label: 'GENERATED', cls: '' });
     return out;
+  }
+
+  // An identity or generated column has no default — Postgres refuses one — but it is where a
+  // reader looks for how the value arrives, so the Default column says, in the DDL's own words.
+  function valueSource(c: Column): string | undefined {
+    if (c.identity) return `generated ${c.identity} as identity`;
+    if (c.generated) return `generated always as (${c.generated}) stored`;
+    return c.def;
   }
 
   const comment = $derived(noteBlocks(table?.noteMd ?? table?.note));
@@ -164,6 +174,7 @@
                   {#each table.columns as c (c.name)}
                     {@const rr = refsForCol(c.name)}
                     {@const note = noteBlocks(c.note)}
+                    {@const source = valueSource(c)}
                     <tr data-col-row={c.name} class="border-b border-line-soft align-top">
                       <td
                         data-cell="name"
@@ -184,8 +195,8 @@
                       </td>
                       <td
                         data-cell="default"
-                        class="py-2.5 pr-4 font-mono text-xs {c.def ? 'text-muted' : 'text-faint'}"
-                        style="overflow-wrap: anywhere;">{c.def ?? '—'}</td
+                        class="py-2.5 pr-4 font-mono text-xs {source ? 'text-muted' : 'text-faint'}"
+                        style="overflow-wrap: anywhere;">{source ?? '—'}</td
                       >
                       <td data-cell="refs" class="py-2.5 pr-4">
                         {#each rr as r (r.to.s + '.' + r.to.t + '.' + r.to.c)}
@@ -291,16 +302,42 @@
           {/if}
 
           {#if table.indexes?.length}
-            <section data-section="indexes" class="mt-8 pb-6">
+            <section data-section="indexes" class="mt-8 {table.checks?.length ? '' : 'pb-6'}">
               <h2 class="font-mono text-label uppercase text-faint">
                 Indexes <span class="text-faint">· {table.indexes.length}</span>
               </h2>
               <div class="mt-3 flex flex-col gap-0">
                 {#each table.indexes as ix (ix.def)}
-                  <div class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0">
+                  <div
+                    data-index={ix.name ?? ix.def}
+                    class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0"
+                  >
                     <span class="font-mono text-xs text-fg">{ix.def}</span>
+                    {#if ix.where}<span data-index-where class="font-mono text-xs text-muted"
+                        >where {ix.where}</span
+                      >{/if}
                     {#if ix.unique}<span class="col-badge pk">UNIQUE</span>{/if}
                     {#if ix.name}<span class="ml-auto font-mono text-faint" style="font-size: 0.66rem;">{ix.name}</span>{/if}
+                  </div>
+                {/each}
+              </div>
+            </section>
+          {/if}
+
+          {#if table.checks?.length}
+            <section data-section="checks" class="mt-8 pb-6">
+              <h2 class="font-mono text-label uppercase text-faint">
+                Checks <span class="text-faint">· {table.checks.length}</span>
+              </h2>
+              <div class="mt-3 flex flex-col gap-0">
+                {#each table.checks as ck, i (i)}
+                  <div data-check class="flex items-center gap-3 border-b border-line-soft py-2.5 last:border-0">
+                    <span data-check-expression class="font-mono text-xs text-fg" style="overflow-wrap: anywhere;"
+                      >{ck.expression}</span
+                    >
+                    {#if ck.name}<span data-check-name class="ml-auto font-mono text-faint" style="font-size: 0.66rem;"
+                        >{ck.name}</span
+                      >{/if}
                   </div>
                 {/each}
               </div>
