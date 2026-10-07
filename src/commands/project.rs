@@ -838,18 +838,59 @@ mod tests {
         );
     }
 
-    /// A project with a `snapshots/` dir but no `released` flag set is already
-    /// on the migration track — `release` refuses even before checking for
-    /// entity errors.
-    #[test]
-    fn release_refuses_when_snapshots_exist_without_released_flag() {
+    /// A fixture copy shaped like `init --from-db` leaves it: a baseline
+    /// snapshot at v1 and `project.version: 1`, but no `released` flag.
+    fn brownfield_project() -> tempfile::TempDir {
         let proj = testutil::copy_fixture_project();
-        std::fs::create_dir_all(proj.path().join("snapshots")).unwrap();
-        std::fs::write(proj.path().join("snapshots").join("001.json"), "{}").unwrap();
+        let cfg = proj.path().join("design.yaml");
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        dbd_core::snapshot::create_baseline_snapshot(design.entities(), proj.path(), &cfg, "init from database", 1)
+            .unwrap();
+        proj
+    }
+
+    /// `init --from-db` and `merge` write snapshots without setting
+    /// `released`, and `release` refused any project with snapshots — so a
+    /// brownfield project could never be released, and `reconcile` stayed
+    /// enabled on it for good. Its baseline already exists: release marks the
+    /// project released at that version, and writes no second baseline.
+    #[test]
+    fn a_brownfield_project_is_released_at_its_snapshot_version() {
+        let proj = brownfield_project();
         let cfg = proj.path().join("design.yaml");
 
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
-        assert!(err.to_string().contains("Snapshots already exist"), "got: {err}");
+        cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).expect("a brownfield project can be released");
+
+        let config = dbd_core::config::read(&cfg).unwrap();
+        assert!(config.project.released, "the project is marked released");
+        assert_eq!(config.project.version, Some(1), "at the version its snapshots reached");
+        let versions: Vec<u32> = dbd_core::snapshot::list_snapshots(proj.path())
+            .iter()
+            .map(|s| s.version)
+            .collect();
+        assert_eq!(versions, vec![1], "no second baseline is written over the history");
+    }
+
+    /// Releasing at the snapshot version is only true if the snapshot is the
+    /// design. A change no snapshot captured would ship unversioned, so the
+    /// release refuses and says how to capture it.
+    #[test]
+    fn a_brownfield_release_refuses_changes_no_snapshot_captured() {
+        let proj = brownfield_project();
+        let cfg = proj.path().join("design.yaml");
+        std::fs::write(
+            proj.path().join("ddl/table/config/added_later.ddl"),
+            "set search_path to config;\ncreate table if not exists added_later (id integer primary key);\n",
+        )
+        .unwrap();
+
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal)
+            .expect_err("an uncaptured change must not be released as v1");
+        assert!(err.to_string().contains("dbd snapshot"), "names the way out: {err}");
+        assert!(
+            !dbd_core::config::read(&cfg).unwrap().project.released,
+            "and the project stays unreleased"
+        );
     }
 
     /// A design with an entity parse error refuses to release — releasing a
