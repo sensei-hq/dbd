@@ -351,6 +351,54 @@ async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
     .await;
 }
 
+// ── Test: a `.json` file may hold a JSON array ────────────────────────────────
+
+/// A `.json` file is what most tools mean by one: a JSON array of records. The
+/// Postgres load split every file into lines and parsed each as a record, so a
+/// pretty-printed array failed on its opening `[`.
+#[tokio::test]
+async fn a_json_array_file_imports_one_row_per_record() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.json");
+    std::fs::write(
+        &path,
+        "[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n",
+    )
+    .unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.people");
+    entity.file = Some(path);
+    entity.format = Some("json".to_string());
+
+    adapter
+        .import_data(&entity, "", false)
+        .await
+        .expect("a JSON array must import");
+
+    for (id, name) in [(1, "alpha"), (2, "beta")] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM app.people WHERE id = {id} AND name = '{name}'"),
+            &format!("record {id}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.people GROUP BY true HAVING count(*) <> 2",
+        "a row count other than 2",
+    )
+    .await;
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]

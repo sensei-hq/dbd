@@ -1364,6 +1364,47 @@ mod tests {
         assert_eq!(score, None);
     }
 
+    /// Load `body` as a `json`-format file into a fresh `people` table and
+    /// return its rows.
+    async fn import_json(body: &str) -> Result<Vec<(i64, String)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE people (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("people.json");
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.people");
+        entity.file = Some(path);
+        entity.format = Some("json".to_string());
+        a.import_data(&entity, "", false).await?;
+        Ok(sqlx::query_as("SELECT id, name FROM people ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap())
+    }
+
+    /// A `.json` file is what most tools mean by one — Convex's importer
+    /// included: a JSON array of records. The scanner has always picked `.json`
+    /// files out of `import/`, and SQLite refused every one of them.
+    #[tokio::test]
+    async fn a_json_array_file_imports_one_row_per_record() {
+        let rows = import_json("[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n")
+            .await
+            .expect("a JSON array must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
+    }
+
+    /// Postgres has always read a `.json` file as JSON lines; that shape must
+    /// keep working, and work the same here.
+    #[tokio::test]
+    async fn a_json_file_of_json_lines_still_imports() {
+        let rows = import_json("{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"name\": \"beta\"}\n")
+            .await
+            .expect("JSON lines in a .json file must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
+    }
+
     #[tokio::test]
     async fn s12_classify_reference_covers_richer_offline_signals() {
         let adapter = SqliteAdapter::new("sqlite::memory:", "test").await.unwrap();

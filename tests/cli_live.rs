@@ -276,3 +276,29 @@ async fn an_ad_hoc_jsonl_import_loads_into_a_database_that_never_ran_a_full_impo
         "rows not loaded: {csv}"
     );
 }
+
+/// `-f rows.json` must be read as JSON. The format is inferred from the
+/// extension, and `.json` fell through to the CSV default — the JSON text was
+/// handed to `COPY … (FORMAT csv)`.
+#[tokio::test]
+async fn an_ad_hoc_json_file_is_imported_as_json() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    assert!(dbd(dir, &url, &["apply"]).status.success());
+
+    std::fs::write(
+        dir.join("rows.json"),
+        "[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["import", "-n", "app.widgets", "-f", "rows.json"]);
+    assert!(o.status.success(), "ad-hoc json import failed: {}", combined(&o));
+
+    let csv = exported_widgets(dir, &url);
+    assert!(
+        csv.contains("1,alpha") && csv.contains("2,beta"),
+        "rows not loaded: {csv}"
+    );
+}
