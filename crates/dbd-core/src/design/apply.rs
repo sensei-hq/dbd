@@ -393,8 +393,11 @@ impl Design {
                     .unwrap_or_else(|| "entity".to_string());
                 let desc = format!("drop {type_tag}:{entity_name} (v{migration_version})");
                 on_start(&desc);
+                // Only where the table still exists: a generated drop is a bare
+                // `DROP TABLE … CASCADE`, and a database whose scope never had
+                // the table would fail on it.
                 let result: Result<()> = async {
-                    if drop_sql_path.exists() {
+                    if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         let sql = std::fs::read_to_string(drop_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
