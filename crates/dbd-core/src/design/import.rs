@@ -336,8 +336,7 @@ impl Design {
         if !dry_run {
             for entry in plan {
                 if self.config.import.table_truncate(&entry.table.name) {
-                    let qualified = entry.table.name.replace('.', "\".\"");
-                    adapter.execute_script(&format!("TRUNCATE \"{qualified}\"")).await?;
+                    adapter.truncate_table(&entry.table.name).await?;
                 }
             }
         }
