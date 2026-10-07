@@ -77,3 +77,27 @@ fn a_postgres_script_still_creates_its_schema() {
     );
     assert!(out.contains(POSTGRES_CREATE_SCHEMA), "{out}");
 }
+
+/// An extension exists only in PostgreSQL. Another engine's script says so
+/// instead of carrying `CREATE EXTENSION`, which that engine would reject.
+#[test]
+fn another_engines_script_names_a_postgres_only_extension_instead_of_creating_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: combine\n\nsource:\n  dialect: tsql\n\n\
+         target:\n  postgres:\n    extensions:\n      - pgcrypto\n\nschemas:\n  - sales\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    let out = dir.join("combined.sql");
+    design.combine(&out, None).expect("combine");
+    let out = read(&out);
+
+    assert!(!out.contains("CREATE EXTENSION"), "{out}");
+    assert!(
+        out.contains("pgcrypto is PostgreSQL-only"),
+        "the omission is stated: {out}"
+    );
+}
