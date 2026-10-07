@@ -84,3 +84,13 @@ it('rejects a v2 half that is present but the wrong shape', () => {
 it('builds a node id from schema and name', () => {
   expect(nodeId('config', 'lookups')).toBe('config.lookups');
 });
+
+it('refuses a model newer than this viewer reads, instead of rendering it wrong', () => {
+  // A newer dbd can emit a model this viewer predates. Loading it would drop whatever the new
+  // version added without a word; saying so is the only honest outcome.
+  const newer = validateModel({ ...v2, version: 4 });
+  expect(newer.ok).toBe(false);
+  if (!newer.ok) expect(newer.error).toContain('version 4');
+  expect(validateModel({ ...v2, version: 3 }).ok).toBe(true);
+  expect(validateModel({ ...v2, version: 'three' }).ok).toBe(false);
+});
