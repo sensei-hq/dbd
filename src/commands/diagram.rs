@@ -308,6 +308,33 @@ mod tests {
         assert_eq!(model["history"][1]["changes"], serde_json::json!([]));
     }
 
+    /// Under `deps: include` the model draws the scope and everything it depends on,
+    /// so the changelog has to cover that same set. It was filtered by the scope as
+    /// written, before expansion, and a table the diagram drew had no history.
+    #[test]
+    fn a_scoped_changelog_covers_the_tables_deps_include_pulls_in() {
+        let proj = scoped_project();
+        let both = [
+            table_snapshot("config", "lookups"),
+            table_snapshot("config", "lookup_values"),
+        ];
+        write_snapshot(proj.path(), "001.json", &snapshot_json(1, &both));
+        // `incomplete_auto` names only lookup_values; its FK pulls lookups in.
+        let model = diagram_json_scoped(proj.path(), "incomplete_auto");
+        let drawn: Vec<&str> = model["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            drawn,
+            ["lookup_values", "lookups"],
+            "precondition: the closure is drawn"
+        );
+        assert_eq!(model["history"][0]["baseline"]["tables"], 2);
+    }
+
     /// A table dropped since is still in the scope it was in: the scope is matched by
     /// its own definition, not by what survives in today's design.
     #[test]
