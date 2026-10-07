@@ -214,9 +214,12 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
             }
             s
         }
-        TableConstraint::Check { expression, .. } => {
-            format!("  CHECK ({expression})")
-        }
+        // The name is the constraint's identity to anything that catches its
+        // violation; dropped, a fresh apply names it `<table>_<col>_check`.
+        TableConstraint::Check { name, expression } => match name {
+            Some(name) => format!("  CONSTRAINT {} CHECK ({expression})", q(name)),
+            None => format!("  CHECK ({expression})"),
+        },
     }
 }
 
