@@ -531,6 +531,36 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     assert_eq!(row["body"], "first run set search_path to app; then load");
 }
 
+// ── Test: an export format dbd cannot write is refused ────────────────────────
+
+/// Any format but `tsv` and `jsonl` fell through to CSV, and the file was still
+/// named for the format asked for: `-f json` wrote CSV into `notes.json`, which
+/// the import then reads as JSON and rejects. SQLite already refuses.
+#[tokio::test]
+async fn an_export_format_postgres_cannot_write_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.notes (id integer); INSERT INTO app.notes VALUES (1);")
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.notes");
+    entity.format = Some("json".to_string());
+    let err = adapter
+        .export_data(&entity, Some(out.path()))
+        .await
+        .expect_err("a format the export cannot write must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("json") && msg.contains("jsonl"),
+        "say what was asked and what works: {msg}"
+    );
+    assert!(!out.path().join("notes.json").exists(), "and write nothing");
+}
+
 // ── Test 4: Dry-run does not modify schema ────────────────────────────────────
 
 #[tokio::test]
