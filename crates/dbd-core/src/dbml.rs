@@ -1415,6 +1415,51 @@ mod tests {
         );
     }
 
+    /// A filter that leaves a referenced table out of the document must still
+    /// stub it — a Ref to an undefined table is a DBML error — and, since the
+    /// table is in the design, the stub keeps the referenced column's type.
+    #[test]
+    fn a_referenced_table_left_out_of_the_document_is_stubbed_with_its_real_types() {
+        let lookups = make_table_entity(
+            "config.lookups",
+            vec![pk_col("id", "uuid"), col("name", "text")],
+            vec![],
+        );
+        let values = make_table_entity(
+            "config.lookup_values",
+            vec![pk_col("id", "uuid"), col("lookup_id", "uuid")],
+            vec![TableConstraint::ForeignKey(ForeignKey {
+                columns: vec!["lookup_id".to_string()],
+                ref_schema: Some("config".to_string()),
+                ref_table: "lookups".to_string(),
+                ref_columns: vec!["id".to_string()],
+                ..Default::default()
+            })],
+        );
+        let entities = vec![lookups, values];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "Test",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec!["config.lookups".to_string()],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let start = doc
+            .content
+            .find("Table \"config\".\"lookups\" {")
+            .unwrap_or_else(|| panic!("no stub:\n{}", doc.content));
+        let stub = &doc.content[start..];
+        let stub = &stub[..stub.find('}').unwrap()];
+        assert!(stub.contains("\"id\" uuid"), "got:\n{}", doc.content);
+        assert!(!stub.contains("\"name\""), "got:\n{}", doc.content);
+    }
+
     #[test]
     fn external_entity_without_fk_refs_skipped() {
         let table_entity = make_table_entity("config.profiles", vec![pk_col("id", "UUID")], vec![]);
