@@ -338,6 +338,28 @@ pub fn resolve(
 
     add_present_schemas(&mut base, all_entities);
     let extensions: Option<HashSet<String>> = spec.extensions.as_ref().map(|v| v.iter().cloned().collect());
+
+    // A kept extension whose schema the scope excludes cannot be installed:
+    // the scope contradicts itself, and apply would fail on the missing
+    // schema. Say so here, where every command resolves the scope.
+    let contradictions: Vec<String> = all_entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Extension)
+        .filter(|e| extensions.as_ref().is_none_or(|allow| allow.contains(&e.name)))
+        .filter_map(|e| {
+            let schema = e.schema.as_ref()?;
+            excluded
+                .contains(schema)
+                .then(|| format!("'{}' (installs into '{schema}')", e.name))
+        })
+        .collect();
+    if !contradictions.is_empty() {
+        return Err(DbdError::Config(format!(
+            "scope '{scope_name}' excludes the schema its extension {} installs into — stop excluding \
+             that schema, or leave the extension out of the scope's `extensions:` allowlist",
+            contradictions.join(", ")
+        )));
+    }
     add_extension_schemas(&mut base, all_entities, extensions.as_ref(), &excluded);
 
     Ok(ResolvedScope {
