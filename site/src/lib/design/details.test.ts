@@ -183,3 +183,52 @@ describe('the Dependencies section', () => {
     expect(container.querySelector('[data-section="dependencies"]')).toBeNull();
   });
 });
+
+// A foreign key whose table is not in the model lands on a stub (`SchemaModel.stubs`): the ref
+// is real, so it is listed and followed like any other, and the stub's page says what it is.
+describe('a foreign key that leaves the model', () => {
+  const withStub = (kind: string): SchemaModel => ({
+    ...model,
+    tables: [
+      { ...model.tables[0], columns: [...model.tables[0].columns, { name: 'user_id', type: 'uuid', fk: true }] },
+      ...model.tables.slice(1),
+    ],
+    refs: [...model.refs, { from: { s: 'app', t: 'orders', c: 'user_id' }, to: { s: 'auth', t: 'users', c: 'id' } }],
+    stubs: [
+      { schema: 'auth', name: 'users', kind, noteMd: 'Supabase accounts', columns: [{ name: 'id', type: 'uuid' }] },
+    ],
+  });
+
+  it('says in the Fields table that its target is a stub, and why', () => {
+    const { container } = open(withStub('external'));
+    const refs = cell(container, 'user_id', 'refs');
+    expect(text(refs.querySelector('button'))).toBe('→ auth.users.id');
+    expect(text(refs.querySelector('[data-stub-target]'))).toBe('external');
+  });
+
+  it('marks the outgoing reference the same way', () => {
+    const { container } = open(withStub('out_of_scope'));
+    const out = [...container.querySelectorAll('[data-ref="out"]')].find((r) => text(r)?.includes('auth.users'));
+    expect(text(out?.querySelector('[data-stub-target]'))).toBe('out of scope');
+  });
+
+  it('opens the stub as a page that names it, says why it is a stub and what references it', () => {
+    const { container } = open(withStub('external'), 'auth.users');
+    expect(text(container.querySelector('h1'))).toBe('users');
+    expect(container.querySelector('[data-stub-kind]')?.getAttribute('data-stub-kind')).toBe('external');
+    const info = text(container.querySelector('[data-section="info"]'));
+    expect(info).toMatch(/external:/);
+    expect(info).toContain('Supabase accounts');
+    expect([...container.querySelectorAll('[data-ref="in"]')].map(text)).toEqual([
+      expect.stringContaining('app.orders.user_id → id'),
+    ]);
+  });
+
+  it('explains each reason a table can be a stub', () => {
+    const reason = (kind: string) =>
+      text(open(withStub(kind), 'auth.users').container.querySelector('[data-section="info"] [data-stub-reason]'));
+    expect(reason('external')).toMatch(/not manage/i);
+    expect(reason('out_of_scope')).toMatch(/scope/i);
+    expect(reason('unresolved')).toMatch(/nowhere/i);
+  });
+});

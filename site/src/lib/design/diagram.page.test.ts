@@ -46,6 +46,55 @@ it('renders a model decoded from the URL fragment', async () => {
   window.location.hash = '';
 });
 
+// A foreign key out of the model lands on a stub, drawn as a card of its own kind so it reads as
+// "not one of this model's tables" — rather than the edge being dropped.
+const stubbed: SchemaModel = {
+  version: 3,
+  project: { name: 'stubbed', db: 'postgresql' },
+  schemas: [{ name: 'app', tables: 1, enums: 0 }],
+  tables: [
+    {
+      schema: 'app',
+      name: 'profiles',
+      kind: 'table',
+      columns: [
+        { name: 'id', type: 'uuid', pk: true, nn: true },
+        { name: 'user_id', type: 'uuid', fk: true },
+      ],
+    },
+  ],
+  refs: [{ from: { s: 'app', t: 'profiles', c: 'user_id' }, to: { s: 'auth', t: 'users', c: 'id' } }],
+  stubs: [{ schema: 'auth', name: 'users', kind: 'external', columns: [{ name: 'id', type: 'uuid' }] }],
+};
+
+describe('a foreign key into a stub', () => {
+  it('is drawn to a card that carries the stub\'s kind', async () => {
+    window.location.hash = '#' + (await encodeFragment(stubbed));
+    const { container } = await openDiagram();
+    expect(q(container, '[data-graph-node="auth.users"]')?.getAttribute('data-node-kind')).toBe('external');
+    expect(q(container, '[data-graph-edge][data-edge-to="auth.users"]')).not.toBeNull();
+    window.location.hash = '';
+  });
+
+  it('appears in the neighbourhood of the table that references it', async () => {
+    window.location.hash = '#' + (await encodeFragment(stubbed));
+    const view = await openDiagram();
+    await fireEvent.click(q(view.container, '[data-graph-node="app.profiles"]')!);
+    await tick();
+    await fireEvent.click(await findByRole(view.container, 'button', { name: 'Diagram' }));
+    await tick();
+    expect(q(view.container, '[data-graph-node="auth.users"]')?.getAttribute('data-node-kind')).toBe('external');
+    window.location.hash = '';
+  });
+
+  it('is not listed in the sidebar as one of the model\'s tables', async () => {
+    window.location.hash = '#' + (await encodeFragment(stubbed));
+    const { container } = await openDiagram();
+    expect(q(container, 'aside [data-entity-key="auth.users"]')).toBeNull();
+    window.location.hash = '';
+  });
+});
+
 // @rokkit/graph 1.7 made `Graph` a bare canvas: no density bar, no zoom buttons, and a default
 // layout of `flow` instead of `cluster`. These pin what the viewer gets back by composing the
 // package's named diagrams instead — `ErDiagram` at the root, `Neighborhood` on an entity.
