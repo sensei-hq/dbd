@@ -58,15 +58,30 @@ fn command_honors_scope(command: &Commands) -> bool {
     }
 }
 
-/// Say so when `--scope` was passed to a command that ignores it.
-fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
-    let Some(name) = scope else { return };
+/// Say so when `--scope` or `--deps` was passed to a command that ignores it.
+///
+/// `--deps` only means anything to a scope — it decides whether a scope's
+/// dependency gaps are errors or are pulled in — so a command that ignores the
+/// scope ignores it too, and accepting it in silence reads the same way an
+/// ignored `--scope` did.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<dbd_core::config::DepsPolicy>) {
     if command_honors_scope(command) {
         return;
     }
-    output::warn(&format!(
-        "--scope {name} ignored: this command operates on the whole design, not a scope"
-    ));
+    if let Some(name) = scope {
+        output::warn(&format!(
+            "--scope {name} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
+    if let Some(policy) = deps {
+        let policy = match policy {
+            dbd_core::config::DepsPolicy::Report => "report",
+            dbd_core::config::DepsPolicy::Include => "include",
+        };
+        output::warn(&format!(
+            "--deps {policy} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +96,7 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    warn_if_scope_ignored(command, scope);
+    warn_if_scope_ignored(command, scope, deps);
     // `deploy` downloads a GitHub source; nothing else does. Several commands
     // write into the project (snapshot, release, format, inspect --fix), and a
     // downloaded tree is a cache — so the rest take a local path only.
