@@ -22,6 +22,15 @@
 //! `integer` is `INTEGER` everywhere; listing those would pad the report until
 //! nobody reads the entries that matter.
 //!
+//! # Keys, checks and indexes
+//!
+//! Every target has FOREIGN KEY, CHECK and CREATE INDEX, so they are carried.
+//! A CHECK expression or an index predicate is PostgreSQL SQL that dbd does not
+//! translate, so it goes across verbatim and is reported, like a view body. An
+//! index the target would reject outright — an expression key on SQL Server, a
+//! key on an unbounded text column on MySQL or SQL Server — is left out and
+//! reported, so the script still applies.
+//!
 //! # What is not emitted
 //!
 //! Functions, procedures and triggers. Their bodies are PL/pgSQL or SQL that
@@ -29,7 +38,9 @@
 //! produce something that looks convertible and is not. They are reported as
 //! skipped so the omission is visible.
 
-use crate::entity::{ColumnDef, Entity, EntityType, TableConstraint};
+use crate::entity::{
+    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexDef, IndexType, SortOrder, TableConstraint,
+};
 use crate::error::{DbdError, Result};
 use crate::parser::Dialect;
 
@@ -165,7 +176,10 @@ pub fn emit_schema(
 
     for e in entities.iter().filter(|e| e.errors.is_empty()) {
         match e.entity_type {
-            EntityType::Table => out.push(emit_table(e, target, &mut report)),
+            EntityType::Table => {
+                out.push(emit_table(e, target, &mut report));
+                out.extend(emit_indexes(e, target, &mut report));
+            }
             EntityType::View | EntityType::MaterializedView => {
                 if let Some(sql) = emit_view(e, target, &mut report) {
                     out.push(sql);
@@ -192,11 +206,21 @@ pub fn emit_schema(
     Ok((out.join("\n\n") + "\n", report))
 }
 
+/// `schema.name` in the target's form, without reporting: the flattening of a
+/// table is reported once, at the table itself, not at every reference to it.
+fn qualified(schema: Option<&str>, bare: &str, target: Target) -> String {
+    match (schema, target.has_schemas()) {
+        (Some(s), true) => format!("{}.{}", target.quote(s), target.quote(bare)),
+        (Some(s), false) => target.quote(&format!("{s}_{bare}")),
+        (None, _) => target.quote(bare),
+    }
+}
+
 /// `schema.name` flattened for a target without schemas.
 fn table_name(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String {
     let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
     match (&e.schema, target.has_schemas()) {
-        (Some(s), true) => format!("{}.{}", target.quote(s), target.quote(bare)),
+        (Some(_), true) | (None, _) => qualified(e.schema.as_deref(), bare, target),
         (Some(s), false) => {
             report.push(Downgrade {
                 entity: e.name.clone(),
@@ -209,9 +233,8 @@ fn table_name(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
                     target.label()
                 ),
             });
-            target.quote(&format!("{s}_{bare}"))
+            qualified(Some(s), bare, target)
         }
-        (None, _) => target.quote(bare),
     }
 }
 
@@ -267,9 +290,310 @@ fn emit_table(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
         }
     }
 
+    // Every target has FOREIGN KEY, so a key is carried: dropping one left a
+    // schema that applied cleanly and enforced nothing.
+    let inline = td.columns.iter().filter_map(|c| c.inline_fk.as_ref());
+    let declared = td.constraints.iter().filter_map(|c| match c {
+        TableConstraint::ForeignKey(fk) => Some(fk),
+        _ => None,
+    });
+    for fk in inline.chain(declared) {
+        let before = report.len();
+        let clause = foreign_key(e, fk, target, report);
+        for d in &report[before..] {
+            lines.push(format!("  {}", d.comment(target)));
+        }
+        lines.push(format!("  {clause},"));
+    }
+
+    // CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd
+    // does not translate — so it goes across verbatim and is reported.
+    for con in &td.constraints {
+        if let TableConstraint::Check { name, expression } = con {
+            let d = Downgrade {
+                entity: e.name.clone(),
+                column: None,
+                from: format!("a CHECK expression in PostgreSQL SQL (`{expression}`)"),
+                to: "the same text, untranslated".to_string(),
+                reason: "dbd translates types and structure, not expressions — anything \
+                         PostgreSQL-specific inside it has to be checked by hand"
+                    .to_string(),
+            };
+            lines.push(format!("  {}", d.comment(target)));
+            report.push(d);
+            let named = name
+                .as_ref()
+                .map(|n| format!("CONSTRAINT {} ", target.quote(n)))
+                .unwrap_or_default();
+            lines.push(format!("  {named}CHECK ({expression}),"));
+        }
+    }
+
     let body = lines.join("\n");
     let body = body.trim_end().trim_end_matches(',').to_string();
     format!("CREATE TABLE {name} (\n{body}\n);")
+}
+
+/// One `FOREIGN KEY … REFERENCES …` clause. An unqualified parent resolves to
+/// the child's own schema, as `search_path` would have.
+fn foreign_key(e: &Entity, fk: &ForeignKey, target: Target, report: &mut Vec<Downgrade>) -> String {
+    let parent = qualified(fk.ref_schema.as_deref().or(e.schema.as_deref()), &fk.ref_table, target);
+    let mut sql = match &fk.name {
+        Some(n) => format!("CONSTRAINT {} ", target.quote(n)),
+        None => String::new(),
+    };
+    sql.push_str(&format!(
+        "FOREIGN KEY ({}) REFERENCES {parent} ({})",
+        quote_all(&fk.columns, target),
+        quote_all(&fk.ref_columns, target)
+    ));
+    for (verb, action) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
+        let Some(action) = action else { continue };
+        match fk_action(action, target) {
+            Some(keyword) => sql.push_str(&format!(" ON {verb} {keyword}")),
+            None => report.push(Downgrade {
+                entity: e.name.clone(),
+                column: fk.columns.first().cloned(),
+                from: format!("`ON {verb} SET DEFAULT`"),
+                to: "the default action".to_string(),
+                reason: "MySQL's InnoDB rejects SET DEFAULT, so referencing rows are no longer \
+                         reset when the parent row changes"
+                    .to_string(),
+            }),
+        }
+    }
+    sql
+}
+
+/// The target's keyword for a referential action; `None` when it has none.
+fn fk_action(action: FkAction, target: Target) -> Option<&'static str> {
+    match (action, target) {
+        (FkAction::Cascade, _) => Some("CASCADE"),
+        (FkAction::SetNull, _) => Some("SET NULL"),
+        (FkAction::NoAction, _) => Some("NO ACTION"),
+        // SQL Server has no RESTRICT keyword, and its NO ACTION is checked at
+        // once — which is what RESTRICT means. Faithful, so not reported.
+        (FkAction::Restrict, Target::TSql) => Some("NO ACTION"),
+        (FkAction::Restrict, _) => Some("RESTRICT"),
+        (FkAction::SetDefault, Target::MySql) => None,
+        (FkAction::SetDefault, _) => Some("SET DEFAULT"),
+    }
+}
+
+/// Why the target cannot index a column of PostgreSQL type `pg` as it is
+/// emitted — the type maps to an unbounded text or binary column.
+fn unindexable(pg: &str, target: Target) -> Option<&'static str> {
+    let t = pg.trim().to_lowercase();
+    let base = t.split('(').next().unwrap_or(&t).trim();
+    let unbounded = t.ends_with("[]") || matches!(base, "text" | "json" | "jsonb" | "bytea");
+    match target {
+        Target::MySql if unbounded => Some("MySQL cannot index a TEXT, BLOB or JSON column without a prefix length"),
+        Target::TSql if unbounded => Some("SQL Server cannot index an nvarchar(max) or varbinary(max) column"),
+        _ => None,
+    }
+}
+
+fn index_type_label(t: &IndexType) -> String {
+    match t {
+        IndexType::Btree => "B-tree".to_string(),
+        IndexType::Hash => "hash".to_string(),
+        IndexType::Gin => "GIN".to_string(),
+        IndexType::Gist => "GiST".to_string(),
+        IndexType::Brin => "BRIN".to_string(),
+        IndexType::SpGist => "SP-GiST".to_string(),
+        IndexType::Other(m) => m.clone(),
+    }
+}
+
+/// A `CREATE INDEX` for each of the table's indexes, with a note above each
+/// loss. An index the target would reject outright is left out — reported, so
+/// the omission is visible, and absent, so the script still applies.
+fn emit_indexes(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Vec<String> {
+    let Some(td) = &e.table_def else { return Vec::new() };
+    let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
+    let table = qualified(e.schema.as_deref(), bare, target);
+    td.indexes
+        .iter()
+        .filter_map(|idx| emit_index(e, td, idx, bare, &table, target, report))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_index(
+    e: &Entity,
+    td: &crate::entity::TableDef,
+    idx: &IndexDef,
+    bare: &str,
+    table: &str,
+    target: Target,
+    report: &mut Vec<Downgrade>,
+) -> Option<String> {
+    let name = idx.name.clone().unwrap_or_else(|| {
+        let cols: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
+        format!("{bare}_{}_idx", cols.join("_"))
+    });
+    let partial = idx
+        .predicate
+        .as_ref()
+        .map(|p| format!(" WHERE {p}"))
+        .unwrap_or_default();
+    let loss = |from: String, to: &str, reason: String| Downgrade {
+        entity: e.name.clone(),
+        column: None,
+        from,
+        to: to.to_string(),
+        reason,
+    };
+
+    // What would make the target reject the statement.
+    let mut blockers: Vec<String> = Vec::new();
+    for col in &idx.columns {
+        if col.is_expression {
+            if target == Target::TSql {
+                blockers.push("SQL Server cannot key an index on an expression without a computed column".into());
+            }
+        } else if let Some(ty) = td
+            .columns
+            .iter()
+            .find(|c| c.name == col.name)
+            .map(|c| c.data_type.as_str())
+            && let Some(why) = unindexable(ty, target)
+        {
+            blockers.push(format!("{why} (`{}` is {ty})", col.name));
+        }
+    }
+    if !blockers.is_empty() {
+        let keys: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| {
+                if c.is_expression {
+                    format!("expression `{}`", c.name)
+                } else {
+                    c.name.clone()
+                }
+            })
+            .collect();
+        let d = loss(
+            format!("the index `{name}` on ({}){partial}", keys.join(", ")),
+            "no index",
+            format!("{} — it is left out so the script still applies", blockers.join("; ")),
+        );
+        let note = d.comment(target);
+        report.push(d);
+        return Some(note);
+    }
+
+    let before = report.len();
+    let mut keys = Vec::new();
+    for col in &idx.columns {
+        if col.is_expression {
+            report.push(loss(
+                format!("an index key expression `{}`", col.name),
+                "the same text, untranslated",
+                "dbd translates types and structure, not expressions — check it against the target \
+                 by hand (MySQL also rejects one that yields TEXT or BLOB)"
+                    .into(),
+            ));
+            keys.push(format!("({})", col.name));
+            continue;
+        }
+        let mut key = target.quote(&col.name);
+        if col.order == Some(SortOrder::Desc) {
+            key.push_str(" DESC");
+        }
+        if let Some(first) = col.nulls_first {
+            let spelled = if first { "NULLS FIRST" } else { "NULLS LAST" };
+            if target == Target::Sqlite {
+                key.push_str(&format!(" {spelled}"));
+            } else {
+                report.push(loss(
+                    format!("`{spelled}` on `{}`", col.name),
+                    "the engine's own NULL ordering",
+                    format!("{} has no NULLS FIRST/LAST in an index", target.label()),
+                ));
+            }
+        }
+        if let Some(op) = &col.opclass {
+            report.push(loss(
+                format!("the operator class `{op}` on `{}`", col.name),
+                "the default comparison",
+                "operator classes are PostgreSQL's; a lookup that relied on this one may not use the index".into(),
+            ));
+        }
+        keys.push(key);
+    }
+    if let Some(t) = &idx.index_type
+        && *t != IndexType::Btree
+    {
+        let label = index_type_label(t);
+        report.push(loss(
+            format!("a {label} index"),
+            "an ordinary index",
+            format!(
+                "{} has no {label} access method, so queries it served may not use this one",
+                target.label()
+            ),
+        ));
+    }
+    let mut tail = String::new();
+    if let Some(p) = &idx.predicate {
+        if target == Target::MySql {
+            report.push(loss(
+                format!("a partial index `WHERE {p}`"),
+                "an index over every row",
+                "MySQL has no partial indexes, so it grows with every row — and a UNIQUE one now \
+                 constrains rows it did not"
+                    .into(),
+            ));
+        } else {
+            report.push(loss(
+                format!("a partial index `WHERE {p}`"),
+                "the same predicate, untranslated",
+                "dbd translates types and structure, not expressions — check the predicate against \
+                 the target by hand"
+                    .into(),
+            ));
+            tail.push_str(&format!(" WHERE {p}"));
+        }
+    }
+    if !idx.include.is_empty() {
+        if target == Target::TSql {
+            tail = format!(" INCLUDE ({}){tail}", quote_all(&idx.include, target));
+        } else {
+            report.push(loss(
+                format!("`INCLUDE ({})`", idx.include.join(", ")),
+                "nothing",
+                format!("{} has no covering-index payload columns", target.label()),
+            ));
+        }
+    }
+    // SQL Server's unique index already lets only one NULL in; the other two
+    // treat NULLs as distinct, so two NULLs no longer collide.
+    if idx.nulls_not_distinct && target != Target::TSql {
+        report.push(loss(
+            "`NULLS NOT DISTINCT`".into(),
+            "NULLs that do not collide",
+            "the index now admits rows with NULL keys that it refused".into(),
+        ));
+    }
+    if !idx.with_options.is_empty() {
+        let opts: Vec<String> = idx.with_options.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+        report.push(loss(
+            format!("storage parameters `WITH ({})`", opts.join(", ")),
+            "none",
+            "they tune PostgreSQL's access method and mean nothing here".into(),
+        ));
+    }
+
+    let mut out: Vec<String> = report[before..].iter().map(|d| d.comment(target)).collect();
+    let unique = if idx.unique { "UNIQUE " } else { "" };
+    out.push(format!(
+        "CREATE {unique}INDEX {} ON {table} ({}){tail};",
+        target.quote(&name),
+        keys.join(", ")
+    ));
+    Some(out.join("\n"))
 }
 
 fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<String> {
