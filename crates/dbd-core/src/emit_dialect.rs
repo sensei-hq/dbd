@@ -33,6 +33,12 @@
 //! reported, so the script still applies. So is a foreign key to a table the
 //! script does not create — one declared `external:`, or left out by `--scope`.
 //!
+//! # Materialized views
+//!
+//! None of the three has them. A materialized view becomes a plain view — the
+//! same rows, computed on every read — and that is reported, as is each of its
+//! indexes, which a plain view cannot take and which are left out.
+//!
 //! # Identity columns
 //!
 //! An identity column — or `serial`, the same thing under an older name — is
@@ -1025,19 +1031,74 @@ fn emit_index(
 }
 
 fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<String> {
-    let body = e.body.first()?;
-    let name = table_name(e, target, report);
-    report.push(Downgrade {
+    let lost = |from: String, to: &str, reason: String| Downgrade {
         entity: e.name.clone(),
         column: None,
-        from: "a view body in PostgreSQL SQL".to_string(),
-        to: "the same text, untranslated".to_string(),
-        reason: "dbd translates types and structure, not expressions — anything \
-                 PostgreSQL-specific inside the SELECT has to be checked by hand"
+        from,
+        to: to.to_string(),
+        reason,
+    };
+    let Some(body) = e.body.first() else {
+        let d = lost(
+            format!("a {} whose body dbd could not read", e.entity_type.tag()),
+            "nothing",
+            "there is no SELECT to emit, so it is missing from the script".to_string(),
+        );
+        let note = d.comment(target);
+        report.push(d);
+        return Some(note);
+    };
+    let name = table_name(e, target, report);
+    let before = report.len();
+
+    // None of the three has materialized views. A plain view is the nearest
+    // thing — the same rows, computed on every read instead of stored at the
+    // last REFRESH — and its indexes have nothing to index.
+    if e.entity_type == EntityType::MaterializedView {
+        report.push(lost(
+            "a materialized view".to_string(),
+            "a plain view",
+            format!(
+                "{} has no materialized views, so the query runs on every read instead of serving \
+                 the rows stored at the last REFRESH — reads cost what the query costs, and there is \
+                 nothing to refresh",
+                target.label()
+            ),
+        ));
+        let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
+        for idx in e.table_def.iter().flat_map(|td| &td.indexes) {
+            let name = idx.name.clone().unwrap_or_else(|| {
+                let cols: Vec<&str> = idx.columns.iter().map(|c| c.name.as_str()).collect();
+                format!("{bare}_{}_idx", cols.join("_"))
+            });
+            let why = match target {
+                // SQL Server does index a view, but only one created WITH
+                // SCHEMABINDING over a body written for it — not an
+                // untranslated one.
+                Target::TSql => {
+                    "SQL Server indexes only a view created WITH SCHEMABINDING over a body \
+                                 written for it, which this untranslated one is not"
+                }
+                Target::MySql => "MySQL cannot index a view",
+                Target::Sqlite => "SQLite cannot index a view",
+            };
+            report.push(lost(
+                format!("the index `{name}` on the materialized view"),
+                "no index",
+                format!("{why} — it is left out so the script still applies"),
+            ));
+        }
+    }
+    report.push(lost(
+        "a view body in PostgreSQL SQL".to_string(),
+        "the same text, untranslated",
+        "dbd translates types and structure, not expressions — anything PostgreSQL-specific inside \
+         the SELECT has to be checked by hand"
             .to_string(),
-    });
-    let note = report.last().expect("just pushed").comment(target);
-    Some(format!("{note}\nCREATE VIEW {name} AS {body};"))
+    ));
+    let mut out: Vec<String> = report[before..].iter().map(|d| d.comment(target)).collect();
+    out.push(format!("CREATE VIEW {name} AS {body};"));
+    Some(out.join("\n"))
 }
 
 /// A sequence: `CREATE SEQUENCE` on SQL Server; everywhere else, a note where
