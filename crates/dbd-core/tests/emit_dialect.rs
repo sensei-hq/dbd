@@ -845,3 +845,115 @@ fn sqlite_numbers_identity_and_serial_rows_without_reusing_an_id() {
         assert_eq!(ids, "1,3", "{sql}");
     }
 }
+
+// ── Sequences, and the defaults that draw from them ────────────────────────
+
+const SEQUENCED: [(&str, &str); 2] = [
+    (
+        "sequence/app/counter.ddl",
+        "create sequence counter start with 1000 increment by 5;",
+    ),
+    (
+        "table/app/tickets.ddl",
+        "create table tickets (\n  \
+           id   bigint primary key default nextval('counter')\n, \
+           ref  bigint default nextval('app.counter')\n, \
+           note text\n\
+         );",
+    ),
+];
+
+/// SQL Server has CREATE SEQUENCE, so the sequence is emitted — with every
+/// bound spelled out, because SQL Server's defaults are not PostgreSQL's: its
+/// MINVALUE, and so its first value, is the type's minimum, -2^63 for bigint.
+/// A column that drew from it draws from it still.
+#[test]
+fn sql_server_gets_the_sequence_and_the_columns_that_draw_from_it() {
+    let (sql, report) = emit_with(Dialect::TSql, "", &SEQUENCED, None);
+    let seq = sql
+        .find("CREATE SEQUENCE [app].[counter] AS bigint")
+        .unwrap_or_else(|| panic!("no CREATE SEQUENCE:\n{sql}"));
+    let table = sql.find("CREATE TABLE [app].[tickets]").expect("the table");
+    assert!(seq < table, "the sequence must exist before its users:\n{sql}");
+    for part in [
+        "START WITH 1000",
+        "INCREMENT BY 5",
+        "MINVALUE 1 ",
+        "NO CYCLE",
+        "NO CACHE",
+    ] {
+        assert!(sql.contains(part), "missing `{part}`:\n{sql}");
+    }
+    assert!(
+        sql.contains("[id] bigint NOT NULL DEFAULT NEXT VALUE FOR [app].[counter]"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("[ref] bigint DEFAULT NEXT VALUE FOR [app].[counter]"),
+        "{sql}"
+    );
+    assert!(
+        report
+            .iter()
+            .all(|d| d.entity != "app.counter" && d.entity != "app.tickets"),
+        "all faithful: {report:?}"
+    );
+}
+
+/// MySQL and SQLite have no sequences. The sequence is reported; a key column
+/// that drew from it gets the table's own counter — the nearest thing, and
+/// reported — and any other column loses the default, reported.
+#[test]
+fn without_sequences_the_sequence_and_its_defaults_are_reported() {
+    for (dialect, counter) in [(Dialect::MySql, "AUTO_INCREMENT"), (Dialect::Sqlite, "AUTOINCREMENT")] {
+        let (sql, report) = emit_with(dialect, "", &SEQUENCED, None);
+        assert!(!statements(&sql).contains("SEQUENCE"), "{dialect:?}: {sql}");
+        assert!(!statements(&sql).contains("nextval"), "{dialect:?}: {sql}");
+        assert!(
+            report.iter().any(|d| d.entity == "app.counter" && d.to == "nothing"),
+            "{dialect:?}: the sequence: {report:?}"
+        );
+        assert!(sql.contains(counter), "{dialect:?}: the key is numbered: {sql}");
+        assert!(
+            about(&report, "id").iter().any(|d| d.from.contains("nextval")),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(
+            about(&report, "ref")
+                .iter()
+                .any(|d| d.from.contains("nextval") && d.to == "no default"),
+            "{dialect:?}: {report:?}"
+        );
+    }
+}
+
+/// Under `--scope` the sequence may not be in the script; a default that names
+/// it cannot apply on its own.
+#[test]
+fn a_default_drawing_from_a_sequence_not_in_the_script_is_dropped_and_reported() {
+    let scopes = "\nscopes:\n  tickets:\n    includes: [app.tickets]\n";
+    let (sql, report) = emit_with(Dialect::TSql, scopes, &SEQUENCED, Some("tickets"));
+    assert!(!sql.contains("NEXT VALUE FOR"), "{sql}");
+    assert!(
+        about(&report, "ref")
+            .iter()
+            .any(|d| d.to == "no default" && d.reason.contains("app.counter")),
+        "{report:?}"
+    );
+}
+
+/// On SQLite the table applies and numbers its rows the way a sequence would —
+/// never handing an id out twice, even once the top row is deleted.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_numbers_a_column_that_drew_from_a_sequence() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &SEQUENCED, None);
+    let ids = on_sqlite(
+        &sql,
+        "insert into app_tickets (note) values ('a'); insert into app_tickets (note) values ('b'); \
+         delete from app_tickets where id = 2; insert into app_tickets (note) values ('c');",
+        "select group_concat(id, ',') from app_tickets",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(ids, "1,3", "{sql}");
+}
