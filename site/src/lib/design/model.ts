@@ -144,12 +144,26 @@ export type SchemaModel = {
 
 export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
 
+/** The newest model version this viewer reads — `default_version()` in `schema_model.rs`. */
+export const MODEL_VERSION = 3;
+
 /** Shape-check arbitrary JSON before handing it to the viewer. */
 export function validateModel(value: unknown): ValidationResult {
   if (typeof value !== 'object' || value === null) return { ok: false, error: 'not a JSON object' };
   const v = value as Record<string, unknown>;
   const project = v.project as Record<string, unknown> | undefined;
   if (!project || typeof project.name !== 'string') return { ok: false, error: 'missing project.name' };
+  // Absent means v1. A version past this viewer's would render with whatever it added
+  // silently dropped, so it is refused with the reason instead.
+  if (v.version !== undefined) {
+    if (typeof v.version !== 'number' || !Number.isInteger(v.version))
+      return { ok: false, error: 'version must be an integer' };
+    if (v.version > MODEL_VERSION)
+      return {
+        ok: false,
+        error: `this model is version ${v.version}; this viewer reads up to version ${MODEL_VERSION} — open it on the current dbd site`,
+      };
+  }
   if (!Array.isArray(v.schemas)) return { ok: false, error: 'missing schemas[]' };
   if (!Array.isArray(v.tables)) return { ok: false, error: 'missing tables[]' };
   if (!Array.isArray(v.refs)) return { ok: false, error: 'missing refs[]' };
