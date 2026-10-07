@@ -483,6 +483,52 @@ mod tests {
         assert_eq!(*mock.imported.lock().unwrap(), vec!["not_a_fixture_table".to_string()]);
     }
 
+    /// `export:` is how a long-running system moves to a new database: it lists
+    /// views that dereference foreign keys, so the files match the import
+    /// staging tables. A listed view was filtered out as "not a table" — the
+    /// export wrote nothing for it and said nothing.
+    #[tokio::test]
+    async fn export_writes_a_view_listed_under_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/config", "ddl/view/config"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - config\nexport:\n  - config.lookups_export\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/config/lookups.ddl"),
+            "set search_path to config;\ncreate table if not exists lookups (id int primary key, name text);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/view/config/lookups_export.ddl"),
+            "set search_path to config;\ncreate or replace view lookups_export as select name from config.lookups;\n",
+        )
+        .unwrap();
+        let mock = MockAdapter::new();
+        export_with_adapter(
+            &mock,
+            &dir.join("design.yaml"),
+            "dev",
+            dir,
+            None,
+            "csv",
+            None,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        let exported = mock.exported.lock().unwrap().clone();
+        assert_eq!(exported, vec!["config.lookups_export (csv)".to_string()]);
+    }
+
     /// Format precedence: a per-table `format:` in `design.yaml`'s `export:`
     /// block beats the CLI `--format` flag; a table without one uses the flag.
     ///
