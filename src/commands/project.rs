@@ -621,8 +621,9 @@ pub(crate) async fn reconcile_with_adapter(
 ) -> Result<()> {
     // Guarded before the dry run, not after it. The preview connects anyway, so
     // it can see the pin, and a plan for a run the guard will refuse is a
-    // preview of something that cannot happen. (`reset --dry-run` is the
-    // deliberate exception: it needs no database, so it has no pin to read.)
+    // preview of something that cannot happen. (`reset --dry-run` asks the
+    // same of a configured database; with none configured it previews the
+    // plan alone, having no pin to read.)
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
