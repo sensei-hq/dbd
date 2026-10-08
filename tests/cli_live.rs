@@ -929,3 +929,34 @@ async fn init_from_db_names_every_schema_it_leaves_out_and_declares_what_a_forei
         combined(&o)
     );
 }
+
+// ── reset says what it did ──────────────────────────────────────────────────
+
+/// `dbd reset` printed nothing on success, so a reset that dropped the whole
+/// schema and one that found nothing to drop looked the same. It counts what
+/// it dropped, by kind — and says when there was nothing.
+#[tokio::test]
+async fn reset_reports_what_it_dropped() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    unversioned_scoped_project(dir);
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "reset failed: {}", combined(&o));
+    let said = stdout(&o);
+    assert!(
+        said.contains("dropped") && said.contains("1 table") && said.contains("1 view"),
+        "reset must count what it dropped: {said}"
+    );
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "a second reset failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("nothing"),
+        "a reset that finds nothing to drop says so: {}",
+        stdout(&o)
+    );
+}
