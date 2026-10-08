@@ -6252,12 +6252,14 @@ async fn a_reverse_engineered_enum_file_runs_twice_and_reads_back_the_same() {
         .execute_script(&file)
         .await
         .unwrap_or_else(|e| panic!("the enum file failed on a fresh schema: {e}\n{file}"));
+    // `chr(36)` is `$`: `assert_catalog` wraps its predicate in `DO $$ … $$`,
+    // which a literal `$$` would close.
     assert_catalog(
         &*adapter,
         true,
         "SELECT 1 FROM pg_type t WHERE t.oid = 'app.mood'::regtype \
            AND (SELECT array_agg(enumlabel ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid) \
-               = ARRAY['happy', 'it''s $$ fine', 'sad']::name[]",
+               = ARRAY['happy', 'it''s ' || repeat(chr(36), 2) || ' fine', 'sad']::name[]",
         "app.mood with its three labels in order",
     )
     .await;

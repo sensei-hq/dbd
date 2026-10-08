@@ -477,9 +477,12 @@ mod tests {
                 note: None,
             },
         ];
+        // Guarded: Postgres has no `CREATE TYPE … IF NOT EXISTS`, and a bare
+        // one fails the second time the file runs.
         assert_eq!(
             emit_enum(&e),
-            "CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');"
+            "DO $$ BEGIN\n  CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;"
         );
     }
 
@@ -791,7 +794,8 @@ mod tests {
         e.comment = Some("how a person's day went".into());
         assert_eq!(
             emit_enum(&e),
-            "CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+            "DO $$ BEGIN\n  CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;\n\
              COMMENT ON TYPE \"app\".\"mood\" IS 'how a person''s day went';"
         );
     }
