@@ -1254,6 +1254,73 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
 }
 
+// ── a dry run checks every guard its real run checks ────────────────────────
+
+/// The audit's repro. With a database to ask, `apply`, `deploy` and `import
+/// --dry-run -e dev` on a database marked prod said "no issues" and exited 0
+/// while the real runs refused; `import --dry-run` ignored the scope pin the
+/// real import refuses; and an ad-hoc `import -n -f` — which loads data into
+/// the database — skipped the environment guard altogether. Each must refuse
+/// where its real run does.
+#[tokio::test]
+async fn a_dry_run_checks_every_guard_its_real_run_checks() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        std::fs::create_dir_all(dir.join(format!("import/dev/{schema}"))).unwrap();
+        std::fs::write(dir.join(format!("import/dev/{schema}/{table}.csv")), "id\n7\n").unwrap();
+    }
+    std::fs::write(dir.join("users.csv"), "id\n8\n").unwrap();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // ── A database marked prod: the environment guard ──
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+    for args in [
+        &["-e", "dev", "apply", "--dry-run"][..],
+        &["-e", "dev", "deploy", "--dry-run"],
+        &["-e", "dev", "import", "--dry-run"],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv", "--dry-run"],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv"],
+    ] {
+        // Collected, so one run's failure does not hide another's.
+        let o = dbd(dir, &url, args);
+        if o.status.success() || !(combined(&o).contains("marked prod") && combined(&o).contains("-e prod")) {
+            failures.push(format!(
+                "{args:?} not refused by the environment guard: {}",
+                combined(&o)
+            ));
+        }
+    }
+    let rows = psql(&pg, &url, &["-tA", "-c", "select count(*) from app.users"]);
+    if stdout(&rows).trim() != "0" {
+        failures.push(format!("dev data loaded into the prod database: {}", stdout(&rows)));
+    }
+
+    // ── A database pinned to another scope: the scope pin ──
+    pg.create_database("pinned").await.unwrap();
+    let url = pg.settings().url("pinned");
+    let o = dbd(dir, &url, &["-e", "dev", "apply", "--scope", "hub"]);
+    assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
+    for args in [
+        &["-e", "dev", "import", "--dry-run"][..],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        if o.status.success() || !combined(&o).contains("pinned to scope 'hub'") {
+            failures.push(format!("{args:?} not refused by the scope guard: {}", combined(&o)));
+        }
+    }
+    let o = dbd(dir, &url, &["-e", "dev", "import", "--dry-run", "--scope", "hub"]);
+    if !o.status.success() {
+        failures.push(format!("its own scope does not preview: {}", combined(&o)));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 // ── a renamed project.name does not lift the guards ─────────────────────────
 
 /// The audit's repro, through the binary: a production database pinned to
