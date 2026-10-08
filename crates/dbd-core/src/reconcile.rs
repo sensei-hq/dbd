@@ -4070,6 +4070,68 @@ mod enum_recreation_tests {
         );
     }
 
+    /// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+    /// definition. One whose `WHERE` or expression key compares the column with
+    /// a literal of the enum — stored as `'bad'::app.mood` — is re-read after the
+    /// rename as a comparison with the *old* type, and the swap failed with
+    /// `operator does not exist: mood <> mood__dbd_old`, naming no index. Those
+    /// are dropped before the swap and created again after it; an index that
+    /// does not read the column is left alone.
+    #[test]
+    fn an_index_reading_the_column_is_rebuilt_around_the_swap() {
+        use crate::entity::{IndexColumn, IndexDef};
+        let index = |name: &str, key: &str, is_expression: bool, predicate: Option<&str>| IndexDef {
+            name: Some(name.to_string()),
+            columns: vec![IndexColumn {
+                name: key.to_string(),
+                is_expression,
+                ..Default::default()
+            }],
+            predicate: predicate.map(str::to_string),
+            ..Default::default()
+        };
+        let mut people = table(
+            "app",
+            "people",
+            vec![col("id", "integer", None), col("mood", "app.mood", None)],
+        );
+        // Spelled as introspection reports them (`pg_get_expr`, `pg_get_indexdef`).
+        people.indexes = vec![
+            index("people_not_bad", "id", false, Some("(mood <> 'bad'::app.mood)")),
+            index("people_is_ok", "(mood = 'ok'::app.mood)", true, None),
+            index("people_by_id", "id", false, Some("(id > 0)")),
+        ];
+        let live = snap(vec![people], vec![enum_snap("app", "mood", &["ok", "meh", "bad"])]);
+        let desired = snap(
+            vec![table(
+                "app",
+                "people",
+                vec![col("id", "integer", None), col("mood", "app.mood", None)],
+            )],
+            vec![enum_snap("app", "mood", &["ok", "bad"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        let sql = &plan.altered[0].sql;
+
+        let swap = sql
+            .find("ALTER TABLE app.people ALTER COLUMN mood TYPE")
+            .expect("type swap");
+        for name in ["people_not_bad", "people_is_ok"] {
+            let drop = sql
+                .find(&format!("DROP INDEX IF EXISTS \"app\".\"{name}\";"))
+                .unwrap_or_else(|| panic!("{name} is dropped:\n{sql}"));
+            let create = sql
+                .find(&format!("INDEX \"{name}\" ON \"app\".\"people\""))
+                .unwrap_or_else(|| panic!("{name} is created again:\n{sql}"));
+            assert!(drop < swap && swap < create, "{name} around the swap:\n{sql}");
+        }
+        assert!(
+            !sql.contains("people_by_id"),
+            "an index that does not read the column is left alone:\n{sql}"
+        );
+    }
+
     /// A view over the affected table blocks `ALTER TABLE … ALTER COLUMN … TYPE`
     /// ("cannot alter type of a column used by a view or rule"). Managed views are
     /// dropped first and re-created by reconcile's write pass, which re-applies

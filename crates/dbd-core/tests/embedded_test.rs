@@ -5335,3 +5335,75 @@ async fn a_scoped_migration_installs_its_new_extension_and_role() {
     )
     .await;
 }
+
+// ── Enum value removal: indexes that read the column ─────────────────────────
+
+/// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+/// definition. A partial index comparing the column with an enum literal —
+/// stored as `mood <> 'bad'::app.mood` — is re-read after the type swap's
+/// rename as a comparison with the old type, and reconcile failed with
+/// `operator does not exist: mood <> mood__dbd_old`, naming no index. An
+/// expression key comparing the column fails the same way.
+///
+/// The swap rebuilds both around it, the rows survive, and the design then
+/// diffs clean — the indexes included.
+#[tokio::test]
+async fn removing_an_enum_value_rebuilds_the_indexes_that_read_its_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_index_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: enum_index_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let people = (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\n\
+         create table if not exists people (\n  id integer primary key\n, mood mood not null default 'ok'\n);\n\
+         create index if not exists people_not_bad on people (id) where mood <> 'bad';\n\
+         create index if not exists people_is_ok on people ((mood = 'ok'));\n",
+    );
+    let load = |values: &str| {
+        let enum_sql = format!("set search_path to app;\ncreate type mood as enum ({values});\n");
+        write_project(dir, yaml, &[people, ("ddl/enum/app/mood.ddl", enum_sql.as_str())])
+    };
+
+    load("'ok', 'meh', 'bad'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("phase 1 builds the table and its indexes");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'ok'), (2, 'bad');")
+        .await
+        .expect("seed rows");
+
+    let design = load("'ok', 'bad'");
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("removing an enum value rebuilds the indexes over its column");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    for index in ["people_not_bad", "people_is_ok"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = '{index}'"),
+            &format!("index app.{index}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 2 AND mood = 'bad'",
+        "the rows in app.people",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the design diffs clean afterwards: {:?}", diff.changes);
+}
