@@ -1187,9 +1187,15 @@ mod tests {
     /// the whole point of `include`), but `deploy --dry-run` still surfaces the
     /// gap as an FYI — exercising the gap-reporting loop that a `Report`-policy
     /// gap never reaches (it bails earlier, in `check_scope_gaps`).
+    ///
+    /// Run on a copy without the staging data files: `incomplete_auto` builds
+    /// the loaders' targets but not the loaders, so a deploy that loads those
+    /// files is refused before it applies anything — not the path under test.
     #[tokio::test]
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
-        let src = testutil::fixtures();
+        let proj = testutil::copy_fixture_project();
+        std::fs::remove_dir_all(proj.path().join("import/staging")).unwrap();
+        let src = proj.path().to_path_buf();
         cmd_deploy(
             src.to_str().unwrap(),
             Path::new("design.yaml"),
