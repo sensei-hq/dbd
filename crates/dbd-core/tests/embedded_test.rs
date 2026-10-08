@@ -5327,3 +5327,70 @@ async fn a_database_marked_dev_may_be_promoted_to_prod() {
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod");
 }
+
+// ── A brownfield matview is adopted only when it is the design's ──────────────
+
+/// The brownfield path: `init --from-db` reads a materialized view dbd did not
+/// create, so the first apply finds it already there. Apply stamps only the
+/// matviews it creates, so this one stayed unstamped and every `dbd diff`
+/// reported it "not stamped by dbd" — the round trip never converged. Apply
+/// adopts a pre-existing, unstamped matview whose deployed definition is the
+/// design's, and only that one: a different deployed definition stays
+/// unstamped, since stamping it would vouch for a definition the design does
+/// not have.
+#[tokio::test]
+async fn apply_stamps_an_unstamped_matview_only_when_its_deployed_definition_is_the_designs() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "adopt_mv").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.items (id int PRIMARY KEY, name text); \
+             CREATE MATERIALIZED VIEW app.same AS SELECT id, name FROM app.items; \
+             CREATE INDEX same_id ON app.same (id); \
+             CREATE MATERIALIZED VIEW app.other AS SELECT id FROM app.items;",
+        )
+        .await
+        .expect("the brownfield database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: adopt_mv\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "create table if not exists app.items (id int primary key, name text);\n",
+            ),
+            // The same query as deployed, written the way a person (or the
+            // formatter) writes it rather than the way Postgres prints it.
+            (
+                "ddl/materialized_view/app/same.ddl",
+                "create materialized view if not exists app.same as\n  select id\n       , name\n    from app.items\n  with data;\n\
+                 create index if not exists same_id on app.same (id);\n",
+            ),
+            // Not what is deployed: the database has `select id` only.
+            (
+                "ddl/materialized_view/app/other.ddl",
+                "create materialized view if not exists app.other as select id, name from app.items with data;\n",
+            ),
+        ],
+    );
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let drift = design.diff_live(&*adapter, None).await.expect("diff").matview_drift;
+    let kind = |name: &str| drift.iter().find(|d| d.name == name).map(|d| d.kind);
+    assert_eq!(
+        kind("app.same"),
+        None,
+        "the deployed definition is the design's: {drift:?}"
+    );
+    assert_eq!(
+        kind("app.other"),
+        Some(dbd_core::schema_diff::MatviewDriftKind::Unstamped),
+        "a different deployed definition must stay unverified: {drift:?}"
+    );
+}
