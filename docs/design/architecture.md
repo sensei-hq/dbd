@@ -932,8 +932,10 @@ Import ordering is more complex than entity ordering. It combines two dependency
 
 ```
 1. For each staging import table:
-   - Find target config table (match by base name across schemas)
-   - Find import procedure (procedure that reads this staging table)
+   - Find its one loader among the procedures that read it:
+     the one named import_<table>; else the only one reading no other
+     staging table; else the only one no other table claimed (preferring
+     one that writes a same-named table). A tie is refused before the run.
    - Identify config tables the procedure writes to
 
 2. Build call-graph dependencies:
@@ -951,7 +953,18 @@ tables that procedure **writes** — which is what the ordering turns on. A
 staging table whose procedure writes a table another procedure reads must load
 first, and only the write set says so.
 
-> `build_import_plan` in `crates/dbd-core/src/design/import.rs`.
+A procedure loads at most one table and is called once per import: matching
+used to take the first procedure that read a staging table, so a loader that
+joined a second staging table was matched to both, ran twice, and the second
+table's own loader never ran. The loaders are decided over every data file at
+once, so a `-n` run calls the one a full run would; a table with two data files
+is two entries and one call. Only procedures are candidates — the step is
+`CALL`, which Postgres refuses for a function.
+
+> `Design::import_plan` and `Design::import_loaders` in
+> `crates/dbd-core/src/design/import.rs`; `Design::check_import_plan` holds the
+> refusals every import path makes first (a `-n` loading nothing,
+> `import.staging`, a loader tie).
 
 ### SQL parsing — `sqlparser-rs` (pure Rust, no regex fallback)
 
@@ -1823,6 +1836,20 @@ reset called
 
 **Prod is always protected:** Even at version 0, a prod database may have data loaded outside of dbd. Reset always requires `--force`.
 
+> **Current implementation note (0.25).** The guard is `Design::check_reset_guard(meta)`,
+> public so `dbd reset --dry-run` runs it too whenever a database is configured (`-d`,
+> `DATABASE_URL`, or a `target.url` that resolves) — a preview of a reset the real run
+> would refuse is a false promise; with no database configured the dry run stays an
+> offline preview. The scope pin is checked beside it by the CLI. Reset is
+> entity-level by default (`--schemas`/`--extensions` opt into `DROP SCHEMA`/`DROP
+> EXTENSION`), and its `--target` defaults to the design's first target key, not
+> `supabase` as the sketch below shows. Before dropping the design's roles it revokes
+> exactly what `apply` granted them — `DesignConfig::effective_schema_grants()`, the one
+> definition both sides read — on every schema that survives, because Postgres refuses
+> to drop a role that still holds a privilege; anything else the role holds fails the
+> reset with an error naming it, and dbd never runs `DROP OWNED BY`. It also deletes the
+> `dbd.matview_stamps` rows of the matviews it dropped.
+
 **Library API:**
 
 ```rust,ignore
@@ -2013,7 +2040,7 @@ compiles all three.
 
 The Node.js version shells out to `psql` for data import/export (`\copy`). The Rust version uses `sqlx` natively:
 
-- **Import:** `COPY table FROM STDIN WITH (FORMAT csv, HEADER true)` — stream file contents directly via `sqlx::raw_sql` + `PgCopyIn`
+- **Import:** `COPY table (cols…) FROM STDIN WITH (FORMAT csv)` — the header row is read first (RFC 4180, by the reader every SQL adapter shares) and turned into the column list, and only the rows after it are streamed via `PgCopyIn`. `HEADER true` only skipped the header, so a file loaded by position into whatever columns came first; a header column the table lacks is now refused instead.
 - **Export:** `COPY (SELECT * FROM table) TO STDOUT WITH (FORMAT csv, HEADER true)` — stream rows to file via `PgCopyOut`
 
 This eliminates the `psql` runtime dependency entirely. The binary is fully standalone.
