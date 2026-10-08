@@ -360,13 +360,14 @@ pub fn resolve(
             let schema = e.schema.as_ref()?;
             excluded
                 .contains(schema)
-                .then(|| format!("'{}' (installs into '{schema}')", e.name))
+                .then(|| format!("'{}' installs into '{schema}'", e.name))
         })
         .collect();
     if !contradictions.is_empty() {
         return Err(DbdError::Config(format!(
-            "scope '{scope_name}' excludes the schema its extension {} installs into — stop excluding \
-             that schema, or leave the extension out of the scope's `extensions:` allowlist",
+            "scope '{scope_name}' keeps an extension whose schema it excludes ({}) — stop \
+             excluding that schema, or leave the extension out of the scope's `extensions:` \
+             allowlist",
             contradictions.join(", ")
         )));
     }
