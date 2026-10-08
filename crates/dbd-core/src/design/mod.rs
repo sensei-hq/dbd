@@ -18,11 +18,13 @@ mod apply;
 mod env_guard;
 mod hooks;
 mod import;
+mod marks;
 mod plan;
 mod reconcile;
 mod reset;
 mod scope;
 
+pub use marks::DatabaseMarks;
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
 
@@ -1512,16 +1514,21 @@ mod tests {
         }
     }
 
+    /// The marks of a database whose only record is `m`, this project's.
+    fn own(m: &crate::adapter::ProjectMeta) -> DatabaseMarks {
+        DatabaseMarks::of_own("p", Some(m.clone()))
+    }
+
     #[test]
     fn scope_guard_allows_matching_scope() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "public", false).is_ok());
     }
 
     #[test]
     fn scope_guard_blocks_mismatch() {
         let m = meta_with_scope(Some("public"));
-        let err = Design::check_scope_guard(Some(&m), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&own(&m), "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
     }
@@ -1529,14 +1536,14 @@ mod tests {
     #[test]
     fn scope_guard_unpinned_never_blocks() {
         let m = meta_with_scope(None);
-        assert!(Design::check_scope_guard(Some(&m), "internal", false).is_ok());
-        assert!(Design::check_scope_guard(None, "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&DatabaseMarks::of_own("p", None), "internal", false).is_ok());
     }
 
     #[test]
     fn scope_guard_allow_scope_change_bypasses() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", true).is_ok());
     }
 
     #[test]

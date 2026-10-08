@@ -848,12 +848,9 @@ pub async fn cmd_apply(
         // With a database to ask, refuse where the run refuses — the scope pin.
         let adapter = super::dry_run_adapter(config, database_url).await?;
         if let Some(adapter) = &adapter {
-            let meta = adapter.get_project_meta().await?;
-            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
-            Design::check_version_guard(
-                adapter.get_db_version().await?,
-                design.config().project.version.unwrap_or(0),
-            )?;
+            let marks = design.database_marks(&**adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+            Design::check_version_guard(&marks, design.config().project.version.unwrap_or(0))?;
         }
 
         for entity in &entities {
@@ -885,8 +882,8 @@ pub async fn cmd_apply(
 
     // Scope guard: refuse an apply under a different scope than this DB was
     // pinned to (unless the operator opted in to re-point it).
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
     // Said before the run, not in its summary: a run that fails never prints
     // one, and a skipped hook is often why it failed. Always shown, whatever
@@ -1048,6 +1045,7 @@ pub async fn cmd_refresh(
     // exist. It never re-pins, so there is no `--allow-scope-change` here.
     super::check_pinned_scope(
         &*adapter,
+        &design,
         &resolved_scope,
         "Refreshing another scope's materialized views would read tables this database was not built with.",
     )
@@ -1093,7 +1091,7 @@ pub async fn cmd_policies(
         // The real run's guard, whenever there is a database to ask: a preview
         // of policies the run refuses to apply promised something it won't do.
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            super::check_pinned_scope(&*adapter, &resolved, POLICY_CONSEQUENCE).await?;
+            super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
         }
         // The real run's filter, so the preview never lists a policy the scope
         // skips — and says which ones it skips, as the real run does.
@@ -1124,7 +1122,7 @@ pub async fn cmd_policies(
     let adapter = get_adapter(config, database_url).await?;
     // The scope guard every other writing command runs. Policies do not re-pin
     // the database, so there is no `--allow-scope-change` to offer.
-    super::check_pinned_scope(&*adapter, &resolved, POLICY_CONSEQUENCE).await?;
+    super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,

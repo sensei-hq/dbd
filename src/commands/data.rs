@@ -74,34 +74,6 @@ fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope
     Ok(())
 }
 
-/// The scope guard `apply` and `deploy` run, for a command that loads or reads
-/// data under a scope: refuse a database pinned to another one.
-///
-/// `import` and `export` ran on such a database and failed partway — staging
-/// truncated and some loaders called, some files written — because the tables
-/// they touch are another scope's to build. Neither re-pins the database, so
-/// unlike `apply` there is no `--allow-scope-change` to offer: the way through
-/// is the pinned scope, or re-pointing the database with `apply` first. The
-/// decision is [`Design::check_scope_guard`]'s; only the way out differs.
-async fn check_pinned_scope(
-    adapter: &dyn dbd_core::DatabaseAdapter,
-    resolved: &dbd_core::ResolvedScope,
-    consequence: &str,
-) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    if Design::check_scope_guard(meta.as_ref(), &resolved.name, false).is_ok() {
-        return Ok(());
-    }
-    let pinned = meta.and_then(|m| m.scope).unwrap_or_default();
-    bail!(
-        "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
-         {consequence}\n\
-         → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {requested} \
-         --allow-scope-change` first.",
-        requested = resolved.name
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_import_dry_run(
     config: &Path,
@@ -252,7 +224,7 @@ pub(crate) async fn import_with_adapter(
         let (kept, total) = design.scope_counts(&resolved)?;
         output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(design, &resolved, &qualified)?;
-        check_pinned_scope(adapter, &resolved, PINNED).await?;
+        super::check_pinned_scope(adapter, design, &resolved, PINNED).await?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -270,7 +242,7 @@ pub(crate) async fn import_with_adapter(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    check_pinned_scope(adapter, &resolved, PINNED).await?;
+    super::check_pinned_scope(adapter, design, &resolved, PINNED).await?;
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
@@ -452,8 +424,9 @@ pub(crate) async fn export_with_adapter(
         output::info(verbosity, "No tables to export.");
         return Ok(());
     }
-    check_pinned_scope(
+    super::check_pinned_scope(
         adapter,
+        design,
         resolved,
         "Exporting under another scope would read tables this database was not built with.",
     )

@@ -342,56 +342,79 @@ impl Design {
     }
 
     /// Scope guard: refuse to operate under a scope different from the one this
-    /// database was pinned to. `meta` is the stored project meta (`None` on a
-    /// fresh database), `requested` is the resolved scope name for this run, and
-    /// `allow_scope_change` bypasses the guard (the next successful write re-pins
-    /// the DB). A database with no recorded scope (`meta.scope == None`) is
-    /// unpinned and never blocks — the current run pins it. Mirrors the prod
-    /// guard in [`Design::reset`]; invoked from the CLI write handlers.
-    pub fn check_scope_guard(
-        meta: Option<&crate::adapter::ProjectMeta>,
-        requested: &str,
-        allow_scope_change: bool,
-    ) -> Result<()> {
+    /// database was pinned to. `marks` are what the database records (one dbd
+    /// has never written to passes): this project's record or, after a rename,
+    /// the one its old `project.name` left (see [`DatabaseMarks`]).
+    /// `requested` is the resolved scope name for this run, and
+    /// `allow_scope_change` bypasses the guard (the next successful write
+    /// re-pins the DB). A record with no scope is unpinned and never blocks —
+    /// the current run pins it. Mirrors the prod guard in [`Design::reset`];
+    /// invoked from the CLI write handlers.
+    pub fn check_scope_guard(marks: &DatabaseMarks, requested: &str, allow_scope_change: bool) -> Result<()> {
         if allow_scope_change {
             return Ok(());
         }
-        if let Some(pinned) = meta.and_then(|m| m.scope.as_deref())
-            && pinned != requested
-        {
+        if let Some((pinned, by)) = Self::conflicting_pin(marks, requested) {
             return Err(DbdError::SafetyGuard(format!(
-                "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
+                "scope guard: this database is pinned to scope '{pinned}'{by}, but you requested '{requested}'.\n{}\
                  Applying a different scope would build a divergent schema.\n\
-                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'."
+                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'.",
+                marks.rename_note()
             )));
         }
         Ok(())
     }
 
+    /// The scope pin a run under `requested` contradicts, if any, and who set
+    /// it — `" by project 'x'"` for another project's mark, empty for this
+    /// project's own. The decision behind [`Self::check_scope_guard`], for a
+    /// command that words its own refusal.
+    pub fn conflicting_pin<'a>(marks: &'a DatabaseMarks, requested: &str) -> Option<(&'a str, String)> {
+        marks.rows().find_map(|row| {
+            let pinned = row.scope.as_deref().filter(|pinned| *pinned != requested)?;
+            let by = marks
+                .recorded_by(row)
+                .map(|p| format!(" by project '{p}'"))
+                .unwrap_or_default();
+            Some((pinned, by))
+        })
+    }
+
     /// Version guard: refuse to apply a project older than the database.
     ///
-    /// `db_version` is what the database records, `design_version` the
-    /// project's `project.version` (0 when it has none). A database ahead of
-    /// the design was built from a newer revision — typically a branch checked
-    /// out behind it. The plan then came out "current" and re-applied the older
-    /// DDL over the newer schema, reporting "Already up to date". Nothing short
-    /// of a newer revision makes that right, so there is no flag to pass it.
+    /// `marks` are what the database records — this project's record or,
+    /// after a rename, the one its old `project.name` left (see
+    /// [`DatabaseMarks`]) — and `design_version` the project's
+    /// `project.version` (0 when it has none). A database ahead of the design
+    /// was built from a newer revision — typically a branch checked out behind
+    /// it. The plan then came out "current" and re-applied the older DDL over
+    /// the newer schema, reporting "Already up to date". Nothing short of a
+    /// newer revision makes that right, so there is no flag to pass it.
     /// Shaped like [`Self::check_scope_guard`] and [`Self::check_reset_guard`];
     /// [`Self::apply`] runs it before anything it writes, and the CLI dry runs
     /// run it whenever they have a database to ask.
-    pub fn check_version_guard(db_version: u32, design_version: u32) -> Result<()> {
-        if db_version > design_version {
-            let project = match design_version {
-                0 => "this project records no version".to_string(),
-                v => format!("this project is at v{v}"),
-            };
-            return Err(DbdError::SafetyGuard(format!(
-                "version guard: the database is at v{db_version}, but {project}.\n\
-                 Applying an older project would re-apply its DDL over a newer schema.\n\
-                 → check out a newer revision of the project (at v{db_version} or later), or point it at \
-                 a database built from this one."
-            )));
-        }
-        Ok(())
+    pub fn check_version_guard(marks: &DatabaseMarks, design_version: u32) -> Result<()> {
+        let Some(row) = marks.rows().find(|m| m.version > design_version) else {
+            return Ok(());
+        };
+        let db_version = row.version;
+        let project = match design_version {
+            0 => "this project records no version".to_string(),
+            v => format!("this project is at v{v}"),
+        };
+        let (by, back) = match marks.recorded_by(row) {
+            None => (String::new(), ""),
+            Some(other) => (
+                format!(" (recorded by project '{other}')"),
+                "set project.name back, or ",
+            ),
+        };
+        Err(DbdError::SafetyGuard(format!(
+            "version guard: the database is at v{db_version}{by}, but {project}.\n{}\
+             Applying an older project would re-apply its DDL over a newer schema.\n\
+             → {back}check out a newer revision of the project (at v{db_version} or later), or point it at \
+             a database built from this one.",
+            marks.rename_note()
+        )))
     }
 }

@@ -440,12 +440,9 @@ pub async fn cmd_deploy(
         // With a database to ask, refuse where the deploy refuses — the scope pin.
         let adapter = super::dry_run_adapter(&config_path, database_url).await?;
         if let Some(adapter) = &adapter {
-            let meta = adapter.get_project_meta().await?;
-            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
-            Design::check_version_guard(
-                adapter.get_db_version().await?,
-                design.config().project.version.unwrap_or(0),
-            )?;
+            let marks = design.database_marks(&**adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+            Design::check_version_guard(&marks, design.config().project.version.unwrap_or(0))?;
         }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
@@ -506,8 +503,8 @@ pub async fn cmd_deploy(
     }
 
     let adapter = get_adapter(&config_path, database_url).await?;
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
     // Said before the run, not in its summary: a deploy that fails never
     // prints one, and a skipped hook is often why it failed.
@@ -623,8 +620,8 @@ pub(crate) async fn reconcile_with_adapter(
     // it can see the pin, and a plan for a run the guard will refuse is a
     // preview of something that cannot happen. (`reset --dry-run` is the
     // deliberate exception: it needs no database, so it has no pin to read.)
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
     // The hooks the run skips, said before it — a run that fails prints no
     // summary, and a skipped hook is often why it failed.

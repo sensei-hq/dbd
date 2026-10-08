@@ -2,9 +2,8 @@ use super::*;
 
 impl Design {
     /// The environment guard: refuse a run under any env other than prod
-    /// against a database marked prod. `meta` is the database's recorded meta
-    /// (`None` for one dbd has never written to, which passes) and `env` is the
-    /// run's `-e`.
+    /// against a database marked prod. `marks` are what the database records
+    /// (one dbd has never written to passes) and `env` is the run's `-e`.
     ///
     /// A run records its env in the bookkeeping row, and that row is what the
     /// prod guard on `reset` reads — so `apply -e dev` against a production
@@ -21,29 +20,48 @@ impl Design {
     /// the way out there is to rebuild it — `reset --force`, which forgets the
     /// mark with everything else, then a run with `-e dev` — not a flag that
     /// would also unguard a real production database.
-    pub fn check_env_guard(meta: Option<&crate::adapter::ProjectMeta>, env: &str) -> Result<()> {
-        let Some(meta) = meta else { return Ok(()) };
+    ///
+    /// The mark is this project's record or, after a rename, the one its old
+    /// `project.name` left (see [`DatabaseMarks`]).
+    pub fn check_env_guard(marks: &DatabaseMarks, env: &str) -> Result<()> {
         // Through the alias table, as the reset guard reads it: rows written
         // before the CLI normalised `-e` can say `production`.
         let is_prod = |value: &str| crate::config::normalize_env(Some(value)).is_ok_and(|e| e == "prod");
-        if is_prod(&meta.env) && !is_prod(env) {
-            return Err(DbdError::SafetyGuard(format!(
-                "environment guard: this database is marked prod, but this run is -e {env}.\n\
-                 A {env} run would re-mark it {env}, which lifts the prod guard on `dbd reset`, \
-                 and would load import/{env}/ data into it.\n\
-                 → re-run with -e prod (the default). dbd never re-marks a prod database: if this \
-                 is not production, a run without -e marked it prod — rebuild it: \
-                 `dbd reset --force`, then run with -e {env}."
-            )));
+        if is_prod(env) {
+            return Ok(());
         }
-        Ok(())
+        let Some(row) = marks.rows().find(|m| is_prod(&m.env)) else {
+            return Ok(());
+        };
+        // The rebuild is no way out from another name's mark: a forced reset
+        // forgets only this project's record, and the old name's stays.
+        let (by, way_out) = match marks.recorded_by(row) {
+            None => (
+                String::new(),
+                format!(
+                    "→ re-run with -e prod (the default). dbd never re-marks a prod database: if this \
+                     is not production, a run without -e marked it prod — rebuild it: \
+                     `dbd reset --force`, then run with -e {env}."
+                ),
+            ),
+            Some(other) => (
+                format!(" by project '{other}'"),
+                "→ set project.name back, or re-run with -e prod (the default).".to_string(),
+            ),
+        };
+        Err(DbdError::SafetyGuard(format!(
+            "environment guard: this database is marked prod{by}, but this run is -e {env}.\n{note}\
+             A {env} run would mark it {env}, which lifts the prod guard on `dbd reset`, \
+             and would load import/{env}/ data into it.\n{way_out}",
+            note = marks.rename_note()
+        )))
     }
 
     /// [`Self::check_env_guard`] against the database `adapter` reaches, for
     /// this design's env. Read-only, and read before any heal: the meta read
     /// resolves a legacy layout as well as the current one.
     pub(crate) async fn guard_env(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
-        Self::check_env_guard(adapter.get_project_meta().await?.as_ref(), &self.env)
+        Self::check_env_guard(&self.database_marks(adapter).await?, &self.env)
     }
 }
 
@@ -51,10 +69,15 @@ impl Design {
 mod tests {
     use crate::Design;
     use crate::adapter::ProjectMeta;
+    use crate::design::DatabaseMarks;
 
-    fn marked(env: &str) -> ProjectMeta {
+    fn marked(env: &str) -> DatabaseMarks {
+        DatabaseMarks::of_own("p", Some(row("p", env)))
+    }
+
+    fn row(project: &str, env: &str) -> ProjectMeta {
         ProjectMeta {
-            project: "p".into(),
+            project: project.into(),
             env: env.into(),
             version: 0,
             scope: None,
@@ -65,16 +88,31 @@ mod tests {
     #[test]
     fn a_dev_run_is_refused_on_a_database_marked_prod_or_production() {
         for recorded in ["prod", "production"] {
-            let err = Design::check_env_guard(Some(&marked(recorded)), "dev").unwrap_err();
+            let err = Design::check_env_guard(&marked(recorded), "dev").unwrap_err();
             assert!(err.to_string().contains("marked prod"), "{err}");
         }
     }
 
     #[test]
     fn a_prod_run_on_a_prod_database_and_any_run_on_a_dev_or_fresh_one_passes() {
-        assert!(Design::check_env_guard(Some(&marked("prod")), "prod").is_ok());
-        assert!(Design::check_env_guard(Some(&marked("dev")), "dev").is_ok());
-        assert!(Design::check_env_guard(Some(&marked("dev")), "prod").is_ok());
-        assert!(Design::check_env_guard(None, "dev").is_ok());
+        assert!(Design::check_env_guard(&marked("prod"), "prod").is_ok());
+        assert!(Design::check_env_guard(&marked("dev"), "dev").is_ok());
+        assert!(Design::check_env_guard(&marked("dev"), "prod").is_ok());
+        assert!(Design::check_env_guard(&DatabaseMarks::of_own("p", None), "dev").is_ok());
+    }
+
+    /// Another project's prod mark refuses as this project's would, naming it
+    /// — and the way out is the name, since a forced reset forgets only this
+    /// project's record.
+    #[test]
+    fn another_projects_prod_mark_refuses_a_dev_run_naming_it() {
+        let marks = DatabaseMarks {
+            project: "p2".into(),
+            own: None,
+            others: vec![row("p", "prod")],
+        };
+        let err = Design::check_env_guard(&marks, "dev").unwrap_err().to_string();
+        assert!(err.contains("marked prod by project 'p'"), "{err}");
+        assert!(err.contains("project.name") && !err.contains("reset --force"), "{err}");
     }
 }

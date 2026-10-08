@@ -647,25 +647,28 @@ pub(super) async fn dry_run_adapter(
     }
 }
 
-/// The scope guard for a command that never re-pins the database — `policies`
-/// and `refresh` — so it has no `--allow-scope-change` to offer: the way through
-/// is the pinned scope, or re-pointing the database with `apply` first.
-/// `consequence` says what running another scope here would do.
+/// The scope guard for a command that never re-pins the database — `policies`,
+/// `refresh`, `import` and `export` — so it has no `--allow-scope-change` to
+/// offer: the way through is the pinned scope, or re-pointing the database with
+/// `apply` first. `consequence` says what running another scope here would do.
+/// The decision is [`dbd_core::Design::check_scope_guard`]'s — the pin of this
+/// project's record, or of the one a renamed `project.name` left; only the
+/// way out differs.
 pub(super) async fn check_pinned_scope(
     adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
     resolved: &dbd_core::ResolvedScope,
     consequence: &str,
 ) -> Result<()> {
-    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
-    if let Some(pinned) = pinned
-        && pinned != resolved.name
-    {
+    let marks = design.database_marks(adapter).await?;
+    if let Some((pinned, by)) = dbd_core::Design::conflicting_pin(&marks, &resolved.name) {
         anyhow::bail!(
-            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
-             {consequence}\n\
+            "scope guard: this database is pinned to scope '{pinned}'{by}, but you requested '{}'.\n\
+             {}{consequence}\n\
              → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
              --allow-scope-change` first.",
             resolved.name,
+            marks.rename_note(),
             resolved.name
         );
     }

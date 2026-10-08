@@ -1948,6 +1948,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.get_meta().await
     }
 
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        self.bookkeeping.other_projects().await
+    }
+
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         let mut guard = self.batch.lock().await;
         self.bookkeeping.set_meta(guard.as_mut(), env, version, scope).await

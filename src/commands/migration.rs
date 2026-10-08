@@ -78,7 +78,7 @@ pub async fn cmd_reset(
         // preview does not list a `DROP ROLE` the run will not perform.
         let mut kept = Vec::new();
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+            check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
             kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
         }
         let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
@@ -194,7 +194,7 @@ pub(crate) async fn reset_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
 ) -> Result<dbd_core::ResetComplete> {
-    check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
+    check_reset_guards(adapter, design, resolved, force, allow_scope_change).await?;
     Ok(design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
         .await?)
@@ -210,14 +210,15 @@ pub(crate) async fn reset_with_adapter(
 /// layout.
 pub(crate) async fn check_reset_guards(
     adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
     resolved: &dbd_core::ResolvedScope,
     force: bool,
     allow_scope_change: bool,
 ) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
     if !force {
-        Design::check_reset_guard(meta.as_ref())?;
+        Design::check_reset_guard(&marks)?;
     }
     Ok(())
 }

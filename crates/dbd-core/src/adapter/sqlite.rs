@@ -653,35 +653,11 @@ impl DatabaseAdapter for SqliteAdapter {
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        // Inspect the table shape via pragma (which returns zero rows for a missing
-        // table — not an error), so we pick the right SELECT and let genuine read
-        // failures surface instead of masking them as "no meta", which would
-        // silently disable the scope AND prod guards.
-        let columns: Vec<String> = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
-        if columns.is_empty() {
-            return Ok(None); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
-        }
-        let has_scope = columns.iter().any(|c| c == "scope");
-        let sql = if has_scope {
-            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
-        } else {
-            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
-        };
-        let row = sqlx::query(sql)
-            .bind(&self.project)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
-        Ok(row.map(|row| ProjectMeta {
-            project: row.get("project"),
-            env: row.get("env"),
-            version: row.get::<i64, _>("version") as u32,
-            scope: if has_scope { row.try_get("scope").ok() } else { None },
-            applied_at: row.try_get("applied_at").ok(),
-        }))
+        Ok(self.read_meta("project = ?1").await?.into_iter().next())
+    }
+
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        self.read_meta("project <> ?1 ORDER BY project").await
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
@@ -706,6 +682,42 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
+    /// The `_dbd_meta` rows `filter` selects — a `WHERE` clause over
+    /// `project`, bound to this project's name as `?1`.
+    ///
+    /// The table's shape is read via pragma (zero rows for a missing table —
+    /// not an error), so the right SELECT is picked and a genuine read failure
+    /// surfaces instead of reading as "no meta", which would silently disable
+    /// the scope AND prod guards.
+    async fn read_meta(&self, filter: &str) -> Result<Vec<ProjectMeta>> {
+        let columns: Vec<String> = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
+        if columns.is_empty() {
+            return Ok(Vec::new()); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
+        }
+        let has_scope = columns.iter().any(|c| c == "scope");
+        let scope = if has_scope { "scope, " } else { "" };
+        let rows = sqlx::query(&format!(
+            "SELECT project, env, version, {scope}updated_at AS applied_at FROM _dbd_meta WHERE {filter}"
+        ))
+        .bind(&self.project)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| ProjectMeta {
+                project: row.get("project"),
+                env: row.get("env"),
+                version: row.get::<i64, _>("version") as u32,
+                scope: if has_scope { row.try_get("scope").ok() } else { None },
+                applied_at: row.try_get("applied_at").ok(),
+            })
+            .collect())
+    }
+
     /// Load a CSV/TSV file's rows into `table`, each value into the column its
     /// header names.
     ///
@@ -1094,15 +1106,16 @@ mod tests {
         a.set_project_meta("dev", 1, Some("public")).await.unwrap();
         let meta = a.get_project_meta().await.unwrap();
         assert_eq!(meta.as_ref().unwrap().scope.as_deref(), Some("public"));
+        let meta = crate::design::DatabaseMarks::of_own("test", meta);
 
         // Same scope → allowed.
-        assert!(Design::check_scope_guard(meta.as_ref(), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&meta, "public", false).is_ok());
         // Different scope → blocked, message names both scopes.
-        let err = Design::check_scope_guard(meta.as_ref(), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&meta, "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
         // Bypass → allowed.
-        assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&meta, "internal", true).is_ok());
     }
 
     /// `_dbd_meta` is keyed on `project.name` as `dbd.meta` is, and a renamed

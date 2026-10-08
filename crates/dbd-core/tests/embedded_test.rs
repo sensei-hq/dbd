@@ -5856,7 +5856,7 @@ async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod", "a refused dev run must not re-mark the database");
     assert!(
-        Design::check_reset_guard(Some(&meta)).is_err(),
+        Design::check_reset_guard(&prod.database_marks(&*adapter).await.unwrap()).is_err(),
         "reset must stay blocked on the prod database"
     );
     assert_catalog(

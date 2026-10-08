@@ -52,7 +52,7 @@ impl Design {
         adapter.heal_bookkeeping().await?;
 
         if !force {
-            Self::check_reset_guard(adapter.get_project_meta().await?.as_ref())?;
+            Self::check_reset_guard(&self.database_marks(adapter).await?)?;
         }
 
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
@@ -96,27 +96,37 @@ impl Design {
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,
-    /// or one with applied migrations, is not reset. `meta` is the database's
-    /// recorded meta (`None` for one dbd has never written to, which passes).
+    /// or one with applied migrations, is not reset. `marks` are what the
+    /// database records (one dbd has never written to passes): this project's
+    /// record or, after a rename, the one its old `project.name` left (see
+    /// [`DatabaseMarks`]) — `--force` overrides either alike.
     ///
     /// Public so a preview refuses exactly where the real run does: `reset
     /// --dry-run` printed the whole plan for a prod database, and exited 0,
     /// while the real run refused it.
-    pub fn check_reset_guard(meta: Option<&crate::adapter::ProjectMeta>) -> Result<()> {
-        let Some(meta) = meta else { return Ok(()) };
+    pub fn check_reset_guard(marks: &DatabaseMarks) -> Result<()> {
         // Compared through the alias table: rows written before the CLI
         // normalised `-e` can say `production`.
-        if crate::config::normalize_env(Some(&meta.env)).is_ok_and(|env| env == "prod") {
-            return Err(DbdError::SafetyGuard(
-                "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
-            ));
-        }
-        if meta.version >= 1 {
-            return Err(DbdError::SafetyGuard(
-                "reset is blocked — database has applied migrations. Use --force to override.".to_string(),
-            ));
-        }
-        Ok(())
+        let is_prod = |m: &&crate::adapter::ProjectMeta| {
+            crate::config::normalize_env(Some(&m.env)).is_ok_and(|env| env == "prod")
+        };
+        // (the row, why — as this project's mark, as another project's)
+        let (row, own, other) = match (marks.rows().find(is_prod), marks.rows().find(|m| m.version >= 1)) {
+            (Some(row), _) => (row, "database is marked as prod", "marked this database prod"),
+            (None, Some(row)) => (
+                row,
+                "database has applied migrations",
+                "applied migrations to this database",
+            ),
+            (None, None) => return Ok(()),
+        };
+        Err(DbdError::SafetyGuard(match marks.recorded_by(row) {
+            None => format!("reset is blocked — {own}. Use --force to override."),
+            Some(project) => format!(
+                "reset is blocked — project '{project}' {other}.\n{}Use --force to override.",
+                marks.rename_note()
+            ),
+        }))
     }
 
     /// Build the SQL a `reset` would run, without touching the database. Drops
