@@ -2233,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn b3_enum_removal_three_snapshots() {
+    fn b3_enum_removal_is_a_data_stage_then_a_swap_stage() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2272,8 +2272,29 @@ mod tests {
             make_enum_entity("public.status_type", vec!["active", "inactive"]),
         ];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "remove deleted");
-        assert_eq!(result.snapshots.len(), 3, "enum removal should produce 3 snapshots");
+        // Two stages: the rows are mapped off the removed value, then the type
+        // is swapped. A third stage re-pointed the column at a type the second
+        // had dropped, which apply — running each entity's migrations at its
+        // place in dependency order — never ran in that order.
+        assert_eq!(
+            result.snapshots.len(),
+            2,
+            "enum removal is a data stage and a swap stage"
+        );
         assert!(!result.todos.is_empty(), "should have TODO items for enum mapping");
+
+        // The data stage's mapping only runs if its table is in that stage's
+        // `altered` list: apply runs a `data.sql` as part of migrating the entity.
+        let stage1 = result.snapshots[0].graph.as_ref().unwrap();
+        assert!(
+            stage1.altered.iter().any(|t| t == "config.events"),
+            "the mapping of config.events runs: {:?}",
+            stage1.altered
+        );
+        // And the last stage is the design, so the next snapshot is empty.
+        let last = &result.snapshots[1].snapshot;
+        assert_eq!(last.enums[0].values, vec!["active", "inactive"]);
+        assert_eq!(last.tables[0].columns[1].data_type, "public.status_type");
     }
 
     #[test]
