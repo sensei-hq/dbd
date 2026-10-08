@@ -1508,6 +1508,37 @@ mod tests {
         assert_eq!(quote_default("'hello'"), "'hello'");
     }
 
+    /// SQL's value keywords are expressions, not text: `current_date` was
+    /// written as the string `'current_date'`, which `init --from-dbml` turned
+    /// into `DEFAULT 'current_date'` — refused on a date column, and on a text
+    /// column the literal text `current_user` in place of the user's name.
+    /// Each is written as DBML writes an expression, in backticks. A string
+    /// that only spells one stays a string.
+    #[test]
+    fn a_sql_value_keyword_default_is_an_expression_not_a_string() {
+        for keyword in [
+            "current_date",
+            "current_time",
+            "current_timestamp",
+            "localtime",
+            "localtimestamp",
+            "current_user",
+            "session_user",
+            "user",
+            "current_role",
+            "current_catalog",
+            "current_schema",
+            "CURRENT_TIMESTAMP(3)",
+        ] {
+            assert_eq!(quote_default(keyword), format!("`{keyword}`"));
+        }
+        assert_eq!(quote_default("'current_date'"), "'current_date'");
+        assert_eq!(quote_default("'it''s'"), r"'it\'s'");
+        assert_eq!(quote_default("-1"), "-1");
+        assert_eq!(quote_default("1.5"), "1.5");
+        assert_eq!(quote_default("'x'::text"), "`'x'::text`");
+    }
+
     #[test]
     fn types_with_spaces_are_quoted() {
         assert_eq!(quote_type_if_needed("INT"), "INT");

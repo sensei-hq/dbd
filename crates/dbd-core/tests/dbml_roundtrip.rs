@@ -324,3 +324,47 @@ fn an_always_identity_stays_always_through_dbml_and_back() {
         "\n{dbml}"
     );
 }
+
+/// A default that is one of SQL's value keywords came back from
+/// `init --from-dbml` as a string literal: `DEFAULT 'current_date'`, which
+/// Postgres refuses on a date column, and `DEFAULT 'current_user'` — the text,
+/// not the user — on a text column. Every keyword default reads back as itself.
+#[test]
+fn a_keyword_default_survives_dbml_and_back_as_the_keyword() {
+    let columns = [
+        ("a", "date", "current_date"),
+        ("b", "time with time zone", "current_time"),
+        ("c", "timestamptz", "current_timestamp"),
+        ("d", "time", "localtime"),
+        ("e", "timestamp", "localtimestamp"),
+        ("f", "text", "current_user"),
+        ("g", "text", "session_user"),
+        ("h", "text", "user"),
+        ("i", "text", "current_role"),
+        ("j", "text", "current_catalog"),
+        ("k", "text", "current_schema"),
+        ("l", "text", "'current_user'"),
+        ("m", "text", "'open'"),
+    ];
+    let body: Vec<String> = columns
+        .iter()
+        .map(|(name, ty, default)| format!("{name} {ty} default {default}"))
+        .collect();
+    let original = parse(
+        "ddl/table/app/t.ddl",
+        &format!("create table app.t (id int primary key, {});", body.join(", ")),
+    );
+    let dbml = document(std::slice::from_ref(&original));
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "app.t");
+    let before = original.table_def.as_ref().unwrap();
+    for (name, _, _) in columns {
+        let default = |td: &TableDef| {
+            td.columns
+                .iter()
+                .find(|c| c.name == name)
+                .and_then(|c| c.default_value.clone())
+        };
+        assert_eq!(default(td), default(before), "`{name}`'s default:\n{dbml}");
+    }
+}
