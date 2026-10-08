@@ -59,6 +59,8 @@ struct Parser<'a> {
     pos: usize,
     tables: Vec<Entity>,
     enums: Vec<Entity>,
+    /// The stubs `dbd dbml` wrote, read back as what they stand for.
+    externals: Vec<Entity>,
     refs: Vec<PendingRef>,
     /// Distinct schemas seen, in first-seen order.
     schemas: Vec<String>,
@@ -71,6 +73,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             tables: Vec::new(),
             enums: Vec::new(),
+            externals: Vec::new(),
             refs: Vec::new(),
             schemas: Vec::new(),
         }
@@ -128,6 +131,7 @@ impl<'a> Parser<'a> {
         }
         out.append(&mut self.enums);
         out.append(&mut self.tables);
+        out.append(&mut self.externals);
         Ok(out)
     }
 
@@ -213,6 +217,7 @@ impl<'a> Parser<'a> {
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk_cols: Vec<String> = Vec::new();
         let mut indexes: Vec<IndexDef> = Vec::new();
+        let mut uniques: Vec<TableConstraint> = Vec::new();
         let mut checks: Vec<TableConstraint> = Vec::new();
         let mut table_note: Option<String> = None;
 
@@ -236,7 +241,10 @@ impl<'a> Parser<'a> {
             match kw.as_str() {
                 "indexes" => {
                     for entry in self.block_entries(&line, "indexes", &qualified)? {
-                        indexes.push(parse_index_line(&entry, &qualified)?);
+                        match parse_index_line(&entry, &qualified)? {
+                            IndexEntry::Index(index) => indexes.push(index),
+                            IndexEntry::Unique(unique) => uniques.push(unique),
+                        }
                     }
                 }
                 // Only as a block opener: an unquoted column may well be named
@@ -273,7 +281,18 @@ impl<'a> Parser<'a> {
                 columns: pk_cols,
             });
         }
+        constraints.append(&mut uniques);
         constraints.append(&mut checks);
+
+        // A stub `dbd dbml` wrote stands in for a table this document does not
+        // define, and is declared, not built — its schema with it.
+        if table_note.as_deref().is_some_and(crate::dbml::is_stub_note) {
+            let mut external = Entity::new(EntityType::External, &qualified);
+            external.schema = Some(schema);
+            self.externals.push(external);
+            return Ok(());
+        }
+        self.note_schema(&schema);
 
         let comments = Self::table_comments_from(table_note, &columns);
 
@@ -290,16 +309,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a table header line into `(schema, base)`, stripping the leading
-    /// keyword, an inline `{`, and any trailing `[settings]`; notes the schema.
-    fn parse_table_header(&mut self, header: &str) -> Result<(String, String)> {
+    /// keyword, an inline `{`, and any trailing `[settings]`. The schema is
+    /// noted by the caller, once it knows the table is not a stub.
+    fn parse_table_header(&self, header: &str) -> Result<(String, String)> {
         let after_kw = header.get(first_word(header).len()..).unwrap_or("").trim();
         let name_part = after_kw.split('{').next().unwrap_or("").trim();
         // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
         // strip a trailing settings group from the name part.
         let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
-        let (schema, base) = parse_qualified_name(name_only)?;
-        self.note_schema(&schema);
-        Ok((schema, base))
+        parse_qualified_name(name_only)
     }
 
     /// Assemble a table's `TableComments` from its `note` plus per-column notes
@@ -393,8 +411,9 @@ impl<'a> Parser<'a> {
                 on_delete: p.on_delete,
                 on_update: p.on_update,
             });
-            self.note_schema(&p.src_schema);
-            self.note_schema(&p.tgt_schema);
+            // No schema is noted here: each end's table notes its own when the
+            // document defines it, and a schema only a Ref names holds a table
+            // the document does not define — not one the project builds.
         }
         self.pos += 1;
         Ok(())
@@ -792,8 +811,15 @@ fn parse_default_value(v: &str) -> String {
     v.to_string()
 }
 
+/// An entry of an `indexes { … }` block: an index, or the table-level UNIQUE
+/// constraint dbd wrote as one (see `crate::dbml::index_note`).
+enum IndexEntry {
+    Index(IndexDef),
+    Unique(TableConstraint),
+}
+
 /// Parse an index line: `(<cols>) [settings]` or `<col> [settings]`.
-fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
+fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
     let line = line.trim();
     let (cols_part, settings_part) = split_trailing_settings(line);
     let cols_part = cols_part.trim();
@@ -847,10 +873,27 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     // syntax; dbd carries them in the note (see `crate::dbml::index_note`).
     // An operator class, `INCLUDE` and storage parameters are not carried and
     // stay at their defaults.
+    let constraint = note.as_deref().is_some_and(crate::dbml::index_note::marks_a_constraint);
     if let Some(note) = note {
         crate::dbml::index_note::read(&note, &mut index);
     }
-    Ok(index)
+    // A UNIQUE constraint is a plain list of columns; an entry marked as one
+    // that holds an expression, a predicate or a key order is something a
+    // constraint cannot be, and stays the index it says it is.
+    let plain = index.unique
+        && index.predicate.is_none()
+        && index
+            .columns
+            .iter()
+            .all(|k| !k.is_expression && k.order.is_none() && k.nulls_first.is_none());
+    if constraint && plain {
+        return Ok(IndexEntry::Unique(TableConstraint::Unique {
+            name: index.name,
+            columns: index.columns.into_iter().map(|k| k.name).collect(),
+            nulls_not_distinct: index.nulls_not_distinct,
+        }));
+    }
+    Ok(IndexEntry::Index(index))
 }
 
 /// One index key: DBML writes an expression in backticks and a column by
@@ -1431,6 +1474,53 @@ mod tests {
             ]
         );
         assert!(!td.columns[0].nullable, "the other settings still apply");
+    }
+
+    /// A multi-line note written flush against its quotes — the form
+    /// @dbml/core reads back exactly — reads back exactly here too, a quote at
+    /// its end included.
+    #[test]
+    fn a_multi_line_note_reads_back_exactly() {
+        use crate::dbml::{DbmlParams, generate_dbml};
+        use crate::entity::TableComments;
+
+        for note in [
+            "line one\nline two",
+            "say\n'hi'",
+            "two\nquotes ''",
+            "a\n  indented\nnote",
+        ] {
+            let mut t = Entity::new(EntityType::Table, "app.t");
+            t.table_def = Some(TableDef {
+                columns: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments {
+                    table: Some(note.into()),
+                    ..Default::default()
+                },
+            });
+            let doc = generate_dbml(&DbmlParams {
+                entities: &[t],
+                project_name: "notes",
+                database_type: "PostgreSQL",
+                project_note: Some(note),
+                include_schemas: vec![],
+                exclude_schemas: vec![],
+                include_tables: vec![],
+                exclude_tables: vec![],
+                groups: vec![],
+                auto_group_by_schema: false,
+            });
+            assert!(
+                !doc.content.contains("Note: '''\n") && !doc.content.lines().any(|l| l.trim() == "'''"),
+                "flush against its quotes:\n{}",
+                doc.content
+            );
+            let parsed = parse_dbml(&doc.content).expect("DBML must parse");
+            let td = find_table(&parsed, "app.t").table_def.as_ref().unwrap();
+            assert_eq!(td.comments.table.as_deref(), Some(note), "\n{}", doc.content);
+        }
     }
 
     #[test]

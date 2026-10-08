@@ -256,20 +256,17 @@ impl Design {
     /// warning per hook it would skip.
     ///
     /// Public so `dbd import --dry-run` previews exactly what the real run does
-    /// without opening a connection — the same reason
-    /// [`import_entry_in_scope`] is
-    /// public. Both share `plan_hooks`, so the
-    /// preview cannot drift from the run.
+    /// without opening a connection. The preview and the run share both the
+    /// scope rule ([`Design::hook_scope`]) and the decision (`plan_hooks`), so
+    /// neither can drift from the other.
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
-        let narrowed = match scope {
-            Some(s) if !s.is_all => Some((s.name.as_str(), self.working_set(s)?)),
-            _ => None,
-        };
+        let working_set = self.scope_working_set(scope)?;
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let plan = hooks::plan_hooks(
             &self.project_dir,
             &self.config.import.after,
             hooks::HookKind::After,
-            narrowed.as_ref().map(|(name, ws)| (*name, ws)),
+            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
         )?;
         Ok((
             plan.runnable.into_iter().map(|(script, _)| script).collect(),
@@ -285,6 +282,10 @@ impl Design {
     /// table — when the design declares it (one it does not declare is not the
     /// scope's to judge). A proc-less entry needs its own table. Checking the
     /// targets alone kept an import whose staging table the scope never built.
+    ///
+    /// A kept entry whose loader the scope leaves out is refused: the scope's
+    /// database has no such procedure, and the run would truncate and load
+    /// staging, commit every loader before it, and then fail on the `CALL`.
     ///
     /// The one rule for `import`, `deploy`, and both commands' `--dry-run`.
     /// `None` or the all-scope keeps the whole plan. Refuses what
@@ -324,6 +325,21 @@ impl Design {
                 )),
                 None => kept.push(entry),
             }
+        }
+        let unbuilt: Vec<String> = kept
+            .iter()
+            .filter_map(|e| e.procedure.as_ref().map(|p| (&e.table.name, p)))
+            .filter(|(_, procedure)| !ws.contains(*procedure))
+            .map(|(table, procedure)| format!("  {table} → call {procedure}()"))
+            .collect();
+        if !unbuilt.is_empty() {
+            return Err(DbdError::Config(format!(
+                "import refused: scope '{}' leaves out the loader of these staging tables, so a database \
+                 built with it has no such procedure:\n{}\nAdd each loader to the scope, or leave its staging \
+                 table out of the scope too.",
+                scope.name,
+                unbuilt.join("\n")
+            )));
         }
         Ok((kept, skips))
     }
@@ -622,18 +638,17 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ImportComplete),
     {
+        // An import picks its data by `-e`: a dev import into a database
+        // marked prod would load `import/dev/` seed data into production.
+        self.guard_env(adapter).await?;
+
         let mut warnings = self.import_warnings(name);
 
-        // Resolve the scope once. The plan filter and the after-script hooks
-        // must agree on what "in scope" means — the two disagreeing is exactly
-        // how a loader came to run against half-loaded data.
-        let narrowed = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Some((s.name.as_str(), self.working_set(s)?))
-            }
-            _ => None,
-        };
+        // Resolve the scope once, gap-gated before any write. The plan filter
+        // and the after-script hooks must agree on what "in scope" means — the
+        // two disagreeing is exactly how a loader came to run against
+        // half-loaded data.
+        let working_set = self.scope_working_set(scope)?;
 
         let (plan, skips) = self.scoped_import_plan(name, scope)?;
         warnings.extend(skips);
@@ -645,14 +660,13 @@ impl Design {
         let procedures = self
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
-        let outside = narrowed.as_ref().map(|(name, ws)| (*name, self.managed_outside(ws)));
-        let hook_scope = outside.as_ref().map(|(name, out)| (*name, out));
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let after = hooks::run_hooks(
             adapter,
             &self.project_dir,
             &self.config.import.after,
             hooks::HookKind::After,
-            hook_scope,
+            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
             dry_run,
             &mut progress,
         )
@@ -670,7 +684,8 @@ impl Design {
 
     /// Import phase: truncate staging tables (per-table override wins over the
     /// global setting) then load each entry's data file. Returns the number of
-    /// tables loaded.
+    /// tables loaded — a table with two data files (a shared one and an env's
+    /// own) is one table, where counting files made three tables read as four.
     async fn import_load_staging<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -691,7 +706,7 @@ impl Design {
             }
         }
 
-        let mut count = 0;
+        let mut loaded: HashSet<&str> = HashSet::new();
         for entry in plan {
             // A per-table `format` override forces that parser regardless of the
             // file extension; clone the entity only when an override applies.
@@ -715,9 +730,9 @@ impl Design {
                 adapter.import_data(table, null_value, false).await
             };
             report_step_result(&desc, on_done, result)?;
-            count += 1;
+            loaded.insert(entry.table.name.as_str());
         }
-        Ok(count)
+        Ok(loaded.len() as u32)
     }
 
     /// Import phase: call each entry's import procedure. Returns the number
@@ -1218,6 +1233,218 @@ mod tests {
         );
     }
 
+    // ── A loader the scope leaves out ─────────────────────────────────────────
+
+    /// A staging table, its live target and its loader, with a scope that
+    /// keeps both tables and leaves the loader out.
+    const LOADER_SCOPED_OUT: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n\
+             scopes:\n  no_loader:\n    excludes: [staging.import_items]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id integer primary key);\n",
+        ),
+        (
+            "ddl/procedure/staging/import_items.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure import_items() language sql\n\
+             as $$ insert into app.items (id) select id from staging.items $$;\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+    ];
+
+    /// The scope builds `staging.items` and `app.items` but not the procedure
+    /// that moves rows between them, so the database has no such procedure.
+    /// The plan still listed `call staging.import_items()` and every preview
+    /// said "no issues"; the run truncated and loaded staging, committed the
+    /// other loaders, then failed on the CALL. Refused in the plan, naming
+    /// the loader and the scope — the plan every import path and preview runs.
+    #[test]
+    fn the_import_plan_refuses_a_loader_the_scope_leaves_out() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let err = design
+            .scoped_import_plan(None, Some(&resolved))
+            .expect_err("a loader the scope does not build must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staging.import_items") && msg.contains("no_loader") && msg.contains("staging.items"),
+            "the loader, the scope and the table it loads are named: {msg}"
+        );
+    }
+
+    /// The run refuses before anything touches the database: no TRUNCATE, no
+    /// load, no CALL.
+    #[tokio::test]
+    async fn a_scoped_import_refuses_a_loader_the_scope_leaves_out_before_any_write() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let mock = MockAdapter::new();
+        let err = design
+            .import_data(&mock, None, false, Some(&resolved), Progress::none())
+            .await
+            .expect_err("the run refuses it too");
+        assert!(err.to_string().contains("staging.import_items"), "{err}");
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "nothing truncated, loaded or called: {:?} {:?}",
+            mock.scripts.lock().unwrap(),
+            mock.imported.lock().unwrap()
+        );
+    }
+
+    /// `deploy` applies the schema and then imports, so a refusal at the
+    /// import would leave it half done. It refuses before applying anything.
+    #[tokio::test]
+    async fn a_scoped_deploy_refuses_a_loader_the_scope_leaves_out_before_applying() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let mock = MockAdapter::new();
+        let err = design
+            .deploy(&mock, false, Some(&resolved), |_| {})
+            .await
+            .expect_err("deploy refuses it");
+        assert!(err.to_string().contains("staging.import_items"), "{err}");
+        assert!(
+            mock.applied.lock().unwrap().is_empty() && mock.scripts.lock().unwrap().is_empty(),
+            "nothing applied: {:?}",
+            mock.applied.lock().unwrap()
+        );
+    }
+
+    // ── import.after under a scope: the preview and the run agree ────────────
+
+    /// A staging table, a live `core.items`, an `import.after` hook updating
+    /// `core.items`, and two scopes: `core_only` keeps the hook's table,
+    /// `no_core` leaves it out.
+    const HOOKED_PROJECT: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - core\nimport:\n  staging: [staging]\n  after:\n    - import/after.sql\n\
+             scopes:\n  core_only:\n    includes: [core]\n  no_core:\n    excludes: [core]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/core/items.ddl",
+            "set search_path to core;\ncreate table if not exists items (id integer primary key);\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+        ("import/after.sql", "update core.items set id = id;\n"),
+    ];
+
+    /// Whether the real import under `scope` runs the `import.after` hook.
+    async fn the_run_executes_the_hook(design: &Design, scope: &str) -> bool {
+        let resolved = design.resolve_scope(Some(scope), None).unwrap();
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, Some(&resolved), Progress::none())
+            .await
+            .unwrap();
+        mock.scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("update core.items"))
+    }
+
+    /// The hook touches `core.items`, which `core_only` builds: the run
+    /// executes it. The preview said it was skipped — it judged the hook
+    /// against the working set as though that were what the scope leaves out,
+    /// the reverse of the run's rule.
+    #[tokio::test]
+    async fn the_import_preview_runs_a_hook_the_scoped_run_runs() {
+        let (_tmp, design) = project_from(HOOKED_PROJECT);
+        assert!(
+            the_run_executes_the_hook(&design, "core_only").await,
+            "precondition: the run executes it"
+        );
+
+        let resolved = design.resolve_scope(Some("core_only"), None).unwrap();
+        let (runnable, skips) = design.import_after_preview(Some(&resolved)).unwrap();
+        assert_eq!(runnable, vec!["import/after.sql".to_string()], "skips: {skips:?}");
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
+    /// The other direction: `no_core` leaves `core.items` out, so the run
+    /// skips the hook — and the preview said it would run it.
+    #[tokio::test]
+    async fn the_import_preview_skips_a_hook_the_scoped_run_skips() {
+        let (_tmp, design) = project_from(HOOKED_PROJECT);
+        assert!(
+            !the_run_executes_the_hook(&design, "no_core").await,
+            "precondition: the run skips it"
+        );
+
+        let resolved = design.resolve_scope(Some("no_core"), None).unwrap();
+        let (runnable, skips) = design.import_after_preview(Some(&resolved)).unwrap();
+        assert!(runnable.is_empty(), "{runnable:?}");
+        assert!(
+            skips.len() == 1 && skips[0].contains("import/after.sql") && skips[0].contains("core.items"),
+            "the skip names the hook and the table the scope leaves out: {skips:?}"
+        );
+    }
+
+    /// `staging.items` with a shared data file and a dev-only one, and the
+    /// procedure loading it into `app.items`.
+    const TWO_FILES_ONE_TABLE: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/procedure/staging/import_items.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure import_items() language sql\n\
+             as $$ insert into app.items (id) select id from staging.items $$;\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+        ("import/dev/staging/items.csv", "id\n2\n"),
+    ];
+
+    /// The summary says "N table(s) loaded" and counted data files: a table
+    /// with a shared file and a dev-only one was two tables, so three tables
+    /// read as four.
+    #[tokio::test]
+    async fn the_import_summary_counts_tables_not_data_files() {
+        let (_tmp, design) = project_from(TWO_FILES_ONE_TABLE);
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .import_data(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.imported.lock().unwrap().len(), 2, "precondition: both files load");
+        assert_eq!(summary.expect("a summary").tables, 1, "one table");
+    }
+
     /// Shared seed data in `import/staging/` and dev-only rows in
     /// `import/dev/staging/` are two data files for one table. Both load, and
     /// then the table's loader runs — once, over both. It ran once per file,
@@ -1225,28 +1452,7 @@ mod tests {
     /// file must not read as a second table claiming the same loader.
     #[tokio::test]
     async fn a_table_with_two_data_files_calls_its_loader_once() {
-        let (_tmp, design) = project_from(&[
-            (
-                "design.yaml",
-                "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
-            ),
-            (
-                "ddl/table/staging/items.ddl",
-                "set search_path to staging;\ncreate table if not exists items (id integer);\n",
-            ),
-            (
-                "ddl/table/app/items.ddl",
-                "set search_path to app;\ncreate table if not exists items (id integer);\n",
-            ),
-            (
-                "ddl/procedure/staging/import_items.ddl",
-                "set search_path to staging;\n\
-                 create or replace procedure import_items() language sql\n\
-                 as $$ insert into app.items (id) select id from staging.items $$;\n",
-            ),
-            ("import/staging/items.csv", "id\n1\n"),
-            ("import/dev/staging/items.csv", "id\n2\n"),
-        ]);
+        let (_tmp, design) = project_from(TWO_FILES_ONE_TABLE);
 
         let (plan, _) = design.scoped_import_plan(None, None).expect("not refused");
         assert_eq!(plan.len(), 2, "both files load");

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityType};
 use crate::error::Result;
 
 /// Classification result for a reference name.
@@ -130,6 +130,14 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// The deployed materialized views, each with its definition as the
+    /// database prints it (`body[0]`) and its indexes — what `introspect`
+    /// returns for them, without the rest. Default: none (targets without
+    /// materialized views).
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
     /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
     /// materialized view `qualified` (`schema.name`). Kept apart from the view's
     /// own comment, which belongs to its author. Default: no-op (targets without
@@ -215,6 +223,39 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Which of `objects` — each a kind and a name: `schema.name` for a
+    /// schema-qualified kind, the bare name of a role, schema or extension —
+    /// exist now.
+    ///
+    /// `reset` asks before and after it drops, so it reports what it dropped
+    /// rather than what it ran: every drop is `IF EXISTS`. Default: tables and
+    /// views, from [`Self::list_entities`] — all a target without schemas,
+    /// roles or extensions (SQLite) has.
+    async fn existing_objects(&self, objects: &[(EntityType, String)]) -> Result<HashSet<(EntityType, String)>> {
+        let live: HashSet<String> = self.list_entities().await?.into_iter().collect();
+        Ok(objects
+            .iter()
+            .filter(|(kind, name)| {
+                let (_, bare) = crate::entity::split_qualified_name(name);
+                matches!(kind, EntityType::Table | EntityType::View) && (live.contains(name) || live.contains(&bare))
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// The other databases on this server where each of `roles` holds
+    /// anything — a privilege, a default privilege, an object, or the database
+    /// itself — as role → those databases' names, sorted. A role missing from
+    /// the map holds nothing elsewhere.
+    ///
+    /// Roles are server-wide, so a role this design declares is shared by
+    /// every database on the server built from it. `reset` keeps one another
+    /// database holds rather than break that database. Default: none (targets
+    /// without server-wide roles).
+    async fn roles_held_elsewhere(&self, _roles: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        Ok(HashMap::new())
+    }
+
     /// Introspect the live database and return a complete `Vec<Entity>` covering
     /// schemas, extensions, enums, tables (with columns, constraints, indexes,
     /// and comments), and views — in that order.
@@ -265,6 +306,9 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;
+    /// Forget the database's record of this project — its env, version and
+    /// scope pin — as a full `reset` leaves nothing of the project behind.
+    async fn forget_project_meta(&self) -> Result<()>;
 
     // ── Internal dbd procedures ────────────────────────
 
@@ -495,6 +539,78 @@ pub(crate) fn header_columns(header: &[String], columns: &[String], table: &str,
         file.display(),
         unknown.join(", "),
         columns.join(", ")
+    )))
+}
+
+/// The keys `records` hold, each once — refusing a JSON record holding a key
+/// `table` has no column for, naming each such key, the first record holding
+/// it, and the file — as [`header_columns`] refuses a CSV header naming one.
+///
+/// A key is a column name as written: the load matches keys to columns
+/// exactly. Postgres's JSON load moved only the keys matching a column and
+/// dropped the rest without a word, so a misspelled key left its column empty
+/// while the import reported success. A record that is not a JSON object is
+/// refused here too, before anything is staged.
+pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &str, file: &Path) -> Result<Vec<String>> {
+    let mut present: Vec<String> = Vec::new();
+    let mut unknown: Vec<(String, usize)> = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
+            serde_json::from_str(record).map_err(|e| {
+                crate::error::DbdError::Config(format!(
+                    "{}: record {} is not a JSON object: {e}",
+                    file.display(),
+                    at + 1
+                ))
+            })?;
+        for key in keys.into_keys() {
+            if !columns.contains(&key) {
+                if !unknown.iter().any(|(k, _)| *k == key) {
+                    unknown.push((key, at + 1));
+                }
+            } else if !present.contains(&key) {
+                present.push(key);
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(present);
+    }
+    let named: Vec<String> = unknown
+        .iter()
+        .map(|(key, record)| format!("'{key}' (record {record})"))
+        .collect();
+    Err(crate::error::DbdError::Config(format!(
+        "{}: the key {} names no column of {table} — its columns are {}. A JSON record's keys name the \
+         columns its values load into",
+        file.display(),
+        named.join(", "),
+        columns.join(", ")
+    )))
+}
+
+/// Refuse a data file that sets a generated column of `table` — any of
+/// `loaded` (the columns its header or keys name) that is in `generated`.
+///
+/// A generated column's value is computed from the row, so a file cannot set
+/// one. COPY refused it with "column is a generated column" and the JSON load
+/// dropped it without a word; both now say which column, and that the file
+/// should leave it out — as `dbd export` does.
+pub(crate) fn refuse_generated(loaded: &[String], generated: &[String], table: &str, file: &Path) -> Result<()> {
+    let set: Vec<&str> = loaded
+        .iter()
+        .filter(|c| generated.contains(c))
+        .map(String::as_str)
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::DbdError::Config(format!(
+        "{}: {} of {table} {} generated — computed from the row, so a data file cannot set it. Leave it \
+         out of the file; dbd export writes no generated column",
+        file.display(),
+        set.join(", "),
+        if set.len() == 1 { "is" } else { "are" }
     )))
 }
 

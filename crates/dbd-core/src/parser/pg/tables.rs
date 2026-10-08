@@ -838,7 +838,19 @@ fn type_text(type_name: &protobuf::TypeName) -> Option<String> {
     let rendered = rendered
         .strip_prefix(&format!("CREATE TABLE {FRAME} ({FRAME} "))?
         .strip_suffix(')')?;
-    Some(without_typmod_spaces(rendered))
+    Some(without_typmod_spaces(without_catalog(rendered)))
+}
+
+/// Postgres's grammar names every SQL-standard type through `pg_catalog`, and
+/// its deparser writes most of them back bare (`int`, `varchar(30)`) — but not
+/// `json`, `bit` or `bit varying`, which come out as `pg_catalog.json`,
+/// `pg_catalog.bit(3)` and `pg_catalog.varbit(5)`. Kept, the qualification made
+/// `emit` miss its `json` mapping (MySQL got `VARCHAR(255)`) and spelled the
+/// type that way in DBML. A type named through `pg_catalog` is the same type
+/// bare, as `reconcile::canonical_type` already treats it, so the comparisons
+/// that strip it there see no change.
+fn without_catalog(rendered: &str) -> &str {
+    rendered.strip_prefix("pg_catalog.").unwrap_or(rendered)
 }
 
 /// Postgres's deparser writes a type-modifier list as `numeric(10, 2)`, but
@@ -945,6 +957,19 @@ mod tests {
             Some("days <@ ARRAY[1, 2, 3]::smallint[]"),
             "the authored cast must survive into the stored predicate"
         );
+    }
+
+    /// Postgres's grammar names `json`, `bit` and `bit varying` through
+    /// `pg_catalog`, and its deparser — unlike for `int` or `varchar` — writes
+    /// the qualification back out. Kept, `json` reached `emit` as
+    /// `pg_catalog.json`, matched no mapping, and became `VARCHAR(255)` on
+    /// MySQL; the DBML document spelled it that way too. The same type reads
+    /// as its own name, as `jsonb` always did.
+    #[test]
+    fn a_type_postgres_names_through_pg_catalog_comes_back_unqualified() {
+        let d = def("create table t (a json, b json[], c JSON, d bit(3), e bit varying(5), f jsonb);");
+        let types: Vec<&str> = d.columns.iter().map(|c| c.data_type.as_str()).collect();
+        assert_eq!(types, vec!["json", "json[]", "json", "bit(3)", "varbit(5)", "jsonb"]);
     }
 
     /// `format_type` — what introspection reports — spells a type modifier list

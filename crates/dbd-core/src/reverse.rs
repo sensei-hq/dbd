@@ -93,6 +93,41 @@ pub struct SchemaSelect {
     pub exclude: Vec<String>,
     /// Bypass the Supabase denylist.
     pub all: bool,
+    /// The source is Supabase, so its platform schemas ([`SUPABASE_DENYLIST`])
+    /// are left out unless `all`. Set from the database itself
+    /// ([`looks_like_supabase`]) or, for DBML, which names no platform, from
+    /// the target. Off by default: on any other PostgreSQL `auth`,
+    /// `extensions`, `cron` and `net` are the project's own schemas, and
+    /// leaving them out dropped them — pgcrypto with them — without a word.
+    pub supabase: bool,
+}
+
+/// Why [`select_schemas`] left a schema out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftOut {
+    /// One of Supabase's platform schemas, on a Supabase source.
+    Platform,
+    /// Named by `--exclude-schema`.
+    Excluded,
+    /// Not among the `--schema` allowlist.
+    NotListed,
+}
+
+impl SchemaSelect {
+    /// Why `schema` is left out, or `None` when it is kept. Postgres internals
+    /// and dbd's own bookkeeping are never part of a project, and are never
+    /// reported (introspection does not even return them).
+    fn verdict(&self, schema: &str) -> Option<LeftOut> {
+        if self.supabase && !self.all && SUPABASE_DENYLIST.contains(&schema) {
+            Some(LeftOut::Platform)
+        } else if self.exclude.iter().any(|e| e == schema) {
+            Some(LeftOut::Excluded)
+        } else if !self.only.is_empty() && !self.only.iter().any(|o| o == schema) {
+            Some(LeftOut::NotListed)
+        } else {
+            None
+        }
+    }
 }
 
 /// Whether introspected `entities` come from a Supabase database.
@@ -114,11 +149,18 @@ pub fn looks_like_supabase(entities: &[Entity]) -> bool {
 pub fn select_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<String> {
     db_schemas
         .iter()
-        .filter(|s| !is_internal(s))
-        .filter(|s| opts.all || !SUPABASE_DENYLIST.contains(&s.as_str()))
-        .filter(|s| !opts.exclude.iter().any(|e| e == *s))
-        .filter(|s| opts.only.is_empty() || opts.only.iter().any(|o| o == *s))
+        .filter(|s| !is_internal(s) && opts.verdict(s).is_none())
         .cloned()
+        .collect()
+}
+
+/// The schemas of `db_schemas` that [`select_schemas`] leaves out, each with
+/// why — so a caller can name every one rather than drop it silently.
+pub fn left_out_schemas(db_schemas: &[String], opts: &SchemaSelect) -> Vec<(String, LeftOut)> {
+    db_schemas
+        .iter()
+        .filter(|s| !is_internal(s))
+        .filter_map(|s| opts.verdict(s).map(|why| (s.clone(), why)))
         .collect()
 }
 
@@ -147,10 +189,15 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
     p
 }
 
-/// The entity kinds this command generates (used to scope orphan detection).
+/// The entity kinds this command writes as DDL files (also the kinds orphan
+/// detection scans).
+///
+/// Not schemas or extensions: the project format declares both in
+/// design.yaml (`schemas:` and the target's `extensions:`), and the scanner
+/// reads no `ddl/schema/` or `ddl/extension/` folder. Written as files, an
+/// extension made `inspect` and `apply` refuse the project, and a schema file
+/// was never read at all. [`design_yaml_with`] writes them instead.
 pub const MANAGED_KINDS: &[EntityType] = &[
-    EntityType::Schema,
-    EntityType::Extension,
     EntityType::Role,
     EntityType::Sequence,
     EntityType::Enum,
@@ -218,7 +265,7 @@ pub fn build_plan(root: &Path, generated: Vec<(PathBuf, String)>, selected_schem
     let mut orphans = Vec::new();
     for kind in MANAGED_KINDS {
         if !kind.has_schema() {
-            continue; // schema/extension live flat; skip orphan scan for them in v1
+            continue; // roles live flat; skip orphan scan for them in v1
         }
         for schema in selected_schemas {
             let dir = root.join("ddl").join(kind.folder_name()).join(schema);
@@ -385,6 +432,85 @@ pub fn plan_from_entities(
 /// under the Postgres default — which rejects `AUTOINCREMENT`, `WITHOUT ROWID`
 /// and `STRICT`, so a project dbd had just written refused to load (issue #20).
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
+    design_yaml_with(project, dialect, schemas, version, &Declared::default())
+}
+
+/// What a reversed `design.yaml` declares beyond its schemas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// The database's extensions, as `(name, schema)` — `schema` is `None`
+    /// for `public`, which is where an entry without one installs.
+    pub extensions: Vec<(String, Option<String>)>,
+    /// Every table (`schema.name`) a foreign key references outside the
+    /// captured schemas: the project does not build it, so it is declared
+    /// `external:` for the reference to resolve — as the Supabase scaffold
+    /// declares `auth.users`.
+    pub externals: Vec<String>,
+}
+
+impl Declared {
+    /// The extensions among `entities`, and the tables their foreign keys
+    /// reference outside `selected` (the captured schemas), each sorted.
+    pub fn from_entities(entities: &[Entity], selected: &[String]) -> Self {
+        let mut extensions: Vec<(String, Option<String>)> = entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Extension)
+            .map(|e| (e.name.clone(), e.schema.clone().filter(|s| s != "public")))
+            .collect();
+        extensions.sort();
+        extensions.dedup();
+
+        let mut externals: Vec<String> = entities
+            .iter()
+            .filter_map(|e| e.table_def.as_ref())
+            .flat_map(|def| &def.constraints)
+            .filter_map(|c| match c {
+                crate::entity::TableConstraint::ForeignKey(fk) => fk.ref_schema.as_deref().map(|s| (s, &fk.ref_table)),
+                _ => None,
+            })
+            .filter(|(schema, _)| !selected.iter().any(|s| s == schema))
+            .map(|(schema, table)| format!("{schema}.{table}"))
+            // And what the source itself says is not the project's: a stub a
+            // DBML document stands in for, whatever schema it is in.
+            .chain(
+                entities
+                    .iter()
+                    .filter(|e| e.entity_type == EntityType::External)
+                    .map(|e| e.name.clone()),
+            )
+            .collect();
+        externals.sort();
+        externals.dedup();
+        Self { extensions, externals }
+    }
+}
+
+/// A YAML scalar for an identifier: plain when it is one YAML reads back as
+/// the same string, double-quoted otherwise.
+fn yaml_scalar(value: &str) -> String {
+    let plain = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "null"
+        );
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// [`design_yaml`], plus what the database holds that the project format
+/// declares in design.yaml rather than as DDL files: its extensions, in the
+/// target's `extensions:` list, and the tables its foreign keys reach outside
+/// the project, under `external:`.
+pub fn design_yaml_with(project: &str, dialect: &str, schemas: &[String], version: u32, declared: &Declared) -> String {
     let is_sqlite = dialect == "sqlite";
     let target_key = match dialect {
         "sqlite" => "sqlite",
@@ -408,11 +534,38 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
             .join("\n");
         format!("schemas:\n{lines}\n")
     };
+    let extensions_block = if declared.extensions.is_empty() {
+        String::new()
+    } else {
+        let entries: String = declared
+            .extensions
+            .iter()
+            .map(|(name, schema)| match schema {
+                None => format!("      - {}\n", yaml_scalar(name)),
+                Some(schema) => format!(
+                    "      - name: {}\n        schema: {}\n",
+                    yaml_scalar(name),
+                    yaml_scalar(schema)
+                ),
+            })
+            .collect();
+        format!("    extensions:\n{entries}")
+    };
+    let externals_block = if declared.externals.is_empty() {
+        String::new()
+    } else {
+        let entries: String = declared
+            .externals
+            .iter()
+            .map(|name| format!("  - name: {}\n", yaml_scalar(name)))
+            .collect();
+        format!("\nexternal:\n{entries}")
+    };
     format!(
         "project:\n  name: {project}\n  version: {version}\n\n\
          {source_block}\
-         target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
-         {schemas_block}"
+         target:\n  {target_key}:\n    url: $DATABASE_URL\n{extensions_block}\n\
+         {schemas_block}{externals_block}"
     )
 }
 
@@ -428,11 +581,24 @@ mod tests {
         assert!(is_internal("dbd"));
     }
 
+    /// Supabase's platform denylist is Supabase's: `auth`, `extensions`,
+    /// `cron` and `net` are ordinary schema names on any other PostgreSQL, and
+    /// were dropped from a plain database without a word. By default nothing
+    /// but the Postgres internals is left out.
     #[test]
-    fn excludes_internal_and_supabase_by_default() {
-        let db = v(&["public", "app", "pg_catalog", "auth", "storage", "pg_toast_x"]);
+    fn a_plain_database_keeps_the_schemas_the_supabase_denylist_names() {
+        let db = v(&[
+            "public",
+            "app",
+            "pg_catalog",
+            "auth",
+            "extensions",
+            "cron",
+            "net",
+            "pg_toast_x",
+        ]);
         let got = select_schemas(&db, &SchemaSelect::default());
-        assert_eq!(got, v(&["public", "app"]));
+        assert_eq!(got, v(&["public", "app", "auth", "extensions", "cron", "net"]));
     }
 
     #[test]
@@ -664,12 +830,35 @@ mod tests {
             &crate::config::FormatConfig::default(),
         );
         let paths: Vec<String> = plan.items.iter().map(|i| i.path.display().to_string()).collect();
-        assert!(paths.contains(&"ddl/schema/shop.ddl".to_string()));
         assert!(paths.contains(&"ddl/enum/shop/status.ddl".to_string()));
         // content was emitted (formatter lowercases keywords by default, so match
         // case-insensitively — the bytes are what `dbd format` would produce).
         let enum_item = plan.items.iter().find(|i| i.path.ends_with("status.ddl")).unwrap();
         assert!(enum_item.content.to_uppercase().contains("CREATE TYPE"));
+    }
+
+    /// Schemas and extensions are declared in design.yaml (`schemas:` and the
+    /// target's `extensions:`), and the scanner reads no `ddl/schema/` or
+    /// `ddl/extension/` folder. Written as files, an extension made `inspect`
+    /// and `apply` refuse the project, and a schema file did nothing at all.
+    #[test]
+    fn schemas_and_extensions_are_not_written_as_ddl_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext = Entity::new(EntityType::Extension, "citext");
+        ext.schema = Some("public".into());
+        let entities = vec![Entity::new(EntityType::Schema, "public"), ext];
+
+        let plan = plan_from_entities(
+            dir.path(),
+            &entities,
+            &["public".into()],
+            &crate::config::FormatConfig::default(),
+        );
+        assert!(
+            plan.items.is_empty(),
+            "no file for a schema or an extension: {:?}",
+            plan.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
     }
 
     /// End-to-end idempotency: a project generated by reverse and then run through

@@ -70,14 +70,36 @@ fn index<'a>(td: &'a TableDef, name: &str) -> &'a IndexDef {
         .unwrap_or_else(|| panic!("index {name} missing; indexes are {:#?}", td.indexes))
 }
 
-fn key_names(ix: &IndexDef) -> Vec<&str> {
-    ix.columns.iter().map(|c| c.name.as_str()).collect()
+/// The table-level UNIQUE constraints of `td`, as `(name, columns,
+/// nulls_not_distinct)`.
+fn uniques(td: &TableDef) -> Vec<(Option<&str>, Vec<&str>, bool)> {
+    td.constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } => Some((
+                name.as_deref(),
+                columns.iter().map(String::as_str).collect(),
+                *nulls_not_distinct,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A table-level `UNIQUE` is a constraint the design states, and DBML has no
 /// constraint syntax for it — only a unique index. Leaving it out of the
 /// document meant the table `init --from-dbml` rebuilt accepted duplicate
 /// order codes the original refused.
+///
+/// Read back as a unique *index*, it enforced the same thing and still read
+/// as drift: `diff` against the database the original built asked to drop the
+/// constraint and create the index. The document marks it as a constraint (in
+/// the index note, DBML's one free-text slot), so it comes back as one, under
+/// its own name.
 #[test]
 fn a_table_level_unique_constraint_survives_dbml_and_back() {
     let orders = parse(
@@ -94,13 +116,48 @@ fn a_table_level_unique_constraint_survives_dbml_and_back() {
     let reversed = reverse(&dbml);
     let td = table(&reversed, "shop.orders");
 
-    let single = index(td, "orders_ref_code_uq");
-    assert!(single.unique, "uniqueness is the whole point:\n{dbml}");
-    assert_eq!(key_names(single), vec!["ref_code"]);
+    assert_eq!(
+        uniques(td),
+        vec![
+            (Some("orders_ref_code_uq"), vec!["ref_code"], false),
+            (Some("orders_customer_ref_uq"), vec!["customer_id", "ref_code"], false),
+        ],
+        "both come back as the constraints they were:\n{dbml}"
+    );
+    assert!(
+        td.indexes.is_empty(),
+        "and not as unique indexes beside them: {:#?}\n{dbml}",
+        td.indexes
+    );
+}
 
-    let composite = index(td, "orders_customer_ref_uq");
-    assert!(composite.unique, "uniqueness is the whole point:\n{dbml}");
-    assert_eq!(key_names(composite), vec!["customer_id", "ref_code"]);
+/// An unnamed UNIQUE comes back unnamed, so Postgres names it the way it named
+/// the original (`t_r_s_key`) — the name reconcile's `ADD UNIQUE` gives it too
+/// — rather than the `t_idx` the unique index was given. `NULLS NOT DISTINCT`
+/// rides along. A unique index the design declared as an index stays an index.
+#[test]
+fn an_unnamed_unique_constraint_comes_back_unnamed_and_a_unique_index_stays_an_index() {
+    let t = parse(
+        "ddl/table/app/t.ddl",
+        "create table app.t (id int primary key, r text, s text, u text, unique (r, s), \
+         unique nulls not distinct (u));\n\
+         create unique index t_lower_r_idx on app.t (r) where s is not null;",
+    );
+    let dbml = document(&[t]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "app.t");
+
+    assert_eq!(
+        uniques(td),
+        vec![(None, vec!["r", "s"], false), (None, vec!["u"], true)],
+        "{dbml}"
+    );
+    let ix = index(td, "t_lower_r_idx");
+    assert!(
+        ix.unique && ix.predicate.is_some(),
+        "the unique index stays one: {ix:#?}\n{dbml}"
+    );
+    assert_eq!(td.indexes.len(), 1, "{:#?}", td.indexes);
 }
 
 fn keys(ix: &IndexDef) -> Vec<(&str, bool)> {
@@ -206,8 +263,10 @@ fn an_index_keeps_its_key_order_and_null_handling_through_dbml_and_back() {
     }
 
     assert!(index(td, "orders_ext_ref_uq").nulls_not_distinct, "\n{dbml}");
-    let constraint = index(td, "orders_ref_code_uq");
-    assert!(constraint.unique && constraint.nulls_not_distinct, "\n{dbml}");
+    assert!(
+        uniques(td).contains(&(Some("orders_ref_code_uq"), vec!["ref_code"], true)),
+        "the constraint comes back as one, NULLS NOT DISTINCT kept:\n{dbml}"
+    );
 }
 
 /// `[unique]` and `[increment]` were read and then lost: the parser threw
@@ -323,4 +382,48 @@ fn an_always_identity_stays_always_through_dbml_and_back() {
         Some(IdentityKind::Always),
         "\n{dbml}"
     );
+}
+
+/// A default that is one of SQL's value keywords came back from
+/// `init --from-dbml` as a string literal: `DEFAULT 'current_date'`, which
+/// Postgres refuses on a date column, and `DEFAULT 'current_user'` — the text,
+/// not the user — on a text column. Every keyword default reads back as itself.
+#[test]
+fn a_keyword_default_survives_dbml_and_back_as_the_keyword() {
+    let columns = [
+        ("a", "date", "current_date"),
+        ("b", "time with time zone", "current_time"),
+        ("c", "timestamptz", "current_timestamp"),
+        ("d", "time", "localtime"),
+        ("e", "timestamp", "localtimestamp"),
+        ("f", "text", "current_user"),
+        ("g", "text", "session_user"),
+        ("h", "text", "user"),
+        ("i", "text", "current_role"),
+        ("j", "text", "current_catalog"),
+        ("k", "text", "current_schema"),
+        ("l", "text", "'current_user'"),
+        ("m", "text", "'open'"),
+    ];
+    let body: Vec<String> = columns
+        .iter()
+        .map(|(name, ty, default)| format!("{name} {ty} default {default}"))
+        .collect();
+    let original = parse(
+        "ddl/table/app/t.ddl",
+        &format!("create table app.t (id int primary key, {});", body.join(", ")),
+    );
+    let dbml = document(std::slice::from_ref(&original));
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "app.t");
+    let before = original.table_def.as_ref().unwrap();
+    for (name, _, _) in columns {
+        let default = |td: &TableDef| {
+            td.columns
+                .iter()
+                .find(|c| c.name == name)
+                .and_then(|c| c.default_value.clone())
+        };
+        assert_eq!(default(td), default(before), "`{name}`'s default:\n{dbml}");
+    }
 }

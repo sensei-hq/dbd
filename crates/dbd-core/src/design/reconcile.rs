@@ -180,8 +180,14 @@ impl Design {
                     };
                     let desc = format!("{}:{}", e.entity_type.tag(), e.name);
                     on_start(&desc);
+                    // A file that states no path was read against
+                    // `source.search_path`, so its body is created on that path
+                    // — as `apply` runs the file — not on the managed-schema one.
+                    let prelude = crate::script::project_search_path(e)
+                        .map(|set| format!("{set}\n"))
+                        .unwrap_or_else(|| search_path.clone());
                     let result = match adapter
-                        .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                        .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
                         .await
                     {
                         Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
@@ -271,6 +277,10 @@ impl Design {
             ));
         }
         self.refuse_without_a_structured_model("reconcile")?;
+        // A dev reconcile of a database marked prod is refused before it plans
+        // anything, `dry_run` included: a plan for a run the guard refuses
+        // previews something that cannot happen.
+        self.guard_env(adapter).await?;
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
@@ -279,6 +289,11 @@ impl Design {
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
+
+        // A reconciled database is the one an apply builds, so reconcile runs
+        // the apply hooks, filtered by scope through apply's own rule.
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // Desired snapshot (tables + enums, schema-normalized).
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
@@ -334,8 +349,15 @@ impl Design {
         // type-swap that does converge. Needs the entity list, not just the
         // snapshots: the managed views to drop first come from the dependency
         // graph, and the write pass re-applies each one at its place in
-        // dependency order — after the enum whose ALTER dropped it.
-        plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
+        // dependency order — after the enum whose ALTER dropped it. The
+        // snapshots carry their raw indexes back in: the swap rebuilds the ones
+        // that read the column, and canonicalizing stripped them.
+        plan_enum_recreation(
+            &mut plan,
+            &crate::reconcile::with_indexes_of(&live, &live_raw),
+            &crate::reconcile::with_indexes_of(&desired, &desired_raw),
+            &desired_owned,
+        );
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates, restamps, AND drift warnings.
@@ -355,6 +377,23 @@ impl Design {
             .await?;
 
         if dry_run {
+            // Checked as the run checks them, executing none: a hook file that
+            // is missing is a misconfiguration whether or not we write.
+            for (entries, kind) in [
+                (&self.config.apply.before, hooks::HookKind::Before),
+                (&self.config.apply.after, hooks::HookKind::After),
+            ] {
+                hooks::run_hooks(
+                    adapter,
+                    &self.project_dir,
+                    entries,
+                    kind,
+                    hook_scope,
+                    true,
+                    &mut progress,
+                )
+                .await?;
+            }
             return Ok(plan);
         }
 
@@ -366,8 +405,22 @@ impl Design {
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
+        // `apply.before` where apply runs it: after every gate, so a refused
+        // reconcile fires no hook, and before the first write, so a hook can
+        // prepare the ground the DDL lands on.
+        let before = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+
         // The writes, in dependency order (see `execute_reconcile_writes`).
-        let summary = self
+        let mut summary = self
             .execute_reconcile_writes(
                 adapter,
                 &plan,
@@ -388,6 +441,20 @@ impl Design {
         // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
         // no-op on databases (and non-Postgres targets) without the extension.
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
+
+        // `apply.after`, once everything it may seed or adjust is in place.
+        let after = hooks::run_hooks(
+            adapter,
+            &self.project_dir,
+            &self.config.apply.after,
+            hooks::HookKind::After,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+        summary.before_scripts = before.ran;
+        summary.after_scripts = after.ran;
 
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
         // No `project.version` means no migration applied — 0, as `apply`

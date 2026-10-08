@@ -20,6 +20,10 @@ pub fn cmd_graph(
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
     let graph = design.graph(name, Some(&resolved))?;
+    // A file dbd could not parse is missing from the nodes, as it is from the
+    // DBML and the diagram, and is named the same way — on stderr, which
+    // `left_out_unparsed` writes to, so stdout stays the JSON document.
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let json = serde_json::json!({
         "nodes": graph.nodes.iter().map(|n| serde_json::json!({
@@ -37,15 +41,16 @@ pub fn cmd_graph(
     });
 
     output::always(&serde_json::to_string_pretty(&json)?);
-    output::detail(
-        verbosity,
-        &format!(
+    // On stderr: printed after the document on stdout, the count made
+    // `dbd graph -v | jq` fail to parse.
+    if verbosity.is_verbose() {
+        eprintln!(
             "{} nodes, {} edges, {} layers",
             graph.nodes.len(),
             graph.edges.len(),
             graph.layers.len()
-        ),
-    );
+        );
+    }
     Ok(())
 }
 
@@ -117,9 +122,14 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
     // Misfiled view/matview DDL — detection only; the fix is a manual move.
     let mismatches = dbd_core::doctor::detect_ddl_type_mismatches(project_dir);
+    // Extension/schema files the scanner does not read — detection only; the
+    // fix is a design.yaml entry, named for each.
+    let parsed_config = dbd_core::config::read(config).ok();
+    let declared_files = dbd_core::doctor::detect_declared_kind_files(project_dir, parsed_config.as_ref());
 
     let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
-    let total_issues = auto_fixable + mismatches.len();
+    let by_hand = mismatches.len() + declared_files.len();
+    let total_issues = auto_fixable + by_hand;
 
     // doctor counts issues, not entities: the shared entity summary printed
     // "0 entities — no issues" here on a project full of tables.
@@ -129,6 +139,7 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     }
 
     report_doctor_issues(&config_issues, &stale_files, &plural_dirs, &mismatches);
+    report_declared_kind_files(&declared_files);
 
     if !fix {
         if auto_fixable > 0 {
@@ -136,6 +147,9 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         }
         if !mismatches.is_empty() {
             output::always("Misfiled DDL files must be moved manually (see above).");
+        }
+        if !declared_files.is_empty() {
+            output::always("Extension and schema files must be replaced by hand (see above).");
         }
         output::always(&format!("\n{} found.", issues(total_issues)));
         return Ok(());
@@ -164,13 +178,53 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
         }
     }
-    output::always(&format!(
-        "\n{} fixed, {} left to move by hand.",
-        issues(fixed),
-        mismatches.len()
-    ));
+    if !declared_files.is_empty() {
+        output::always(&format!(
+            "\n{} left unchanged — replace by hand (see above).",
+            files(declared_files.len(), "extension/schema file")
+        ));
+    }
+    output::always(&format!("\n{} fixed, {by_hand} left to fix by hand.", issues(fixed)));
 
     Ok(())
+}
+
+/// `1 <what>` / `N <what>s`.
+fn files(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Print each `ddl/extension/` and `ddl/schema/` file with the design.yaml
+/// entry that replaces it.
+fn report_declared_kind_files(found: &[dbd_core::doctor::DeclaredKindFile]) {
+    use dbd_core::doctor::DeclaredKind;
+    if found.is_empty() {
+        return;
+    }
+    output::always(&format!(
+        "\nFound {} dbd does not read (design.yaml declares extensions and schemas):",
+        files(found.len(), "DDL file")
+    ));
+    for f in found {
+        let fix = match (f.kind, f.declared) {
+            (DeclaredKind::Extension, true) => format!(
+                "`{}` is already in the target's extensions: list — delete the file",
+                f.name
+            ),
+            (DeclaredKind::Extension, false) => {
+                let entry = match &f.schema {
+                    None => format!("`{}`", f.name),
+                    Some(schema) => format!("`{{ name: {}, schema: {schema} }}`", f.name),
+                };
+                format!("add {entry} to the target's extensions: list in design.yaml, then delete the file")
+            }
+            (DeclaredKind::Schema, true) => format!("`{}` is already listed under schemas: — delete the file", f.name),
+            (DeclaredKind::Schema, false) => {
+                format!("list `{}` under schemas: in design.yaml, then delete the file", f.name)
+            }
+        };
+        output::always(&format!("  - {} → {fix}", f.path.display()));
+    }
 }
 
 /// `1 issue` / `N issues`.
@@ -272,20 +326,24 @@ fn fix_stale_files(stale_files: &[dbd_core::doctor::StaleFile], verbosity: Verbo
 }
 
 /// Migrate plural DDL folders to their singular canonical form, returning how
-/// many moves succeeded.
+/// many folders were migrated in full.
+///
+/// A folder is one issue — that is how `doctor` finds and reports it — so it
+/// is one fixed, however many files moving it took. Counting the moves, doctor
+/// found "2 issues" and fixed "4". A folder any of whose files failed to move
+/// is not fixed.
 fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Verbosity) -> usize {
     use dbd_core::doctor::DdlMoveOutcome;
     let mut fixed = 0;
     for d in plural_dirs {
+        let mut all_moved = true;
         for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
             match outcome {
                 DdlMoveOutcome::RenamedDir { from, to } => {
                     output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::MovedFile { from, to } => {
                     output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::BackedUp {
                     winner,
@@ -300,12 +358,15 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
                         loser.display(),
                         backup.display()
                     ));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::Error { path, error } => {
                     output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                    all_moved = false;
                 }
             }
+        }
+        if all_moved {
+            fixed += 1;
         }
     }
     fixed
@@ -376,6 +437,16 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // With a database to ask, refuse where the deploy refuses — the scope pin.
+        let adapter = super::dry_run_adapter(&config_path, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let meta = adapter.get_project_meta().await?;
+            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+            Design::check_version_guard(
+                adapter.get_db_version().await?,
+                design.config().project.version.unwrap_or(0),
+            )?;
+        }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
             output::warn(&skip);
@@ -386,6 +457,16 @@ pub async fn cmd_deploy(
             output::scope_gaps(&resolved, &report.gaps);
         }
         output::info(verbosity, &format!("{to_apply} entities would be applied."));
+        // The migrations its apply phase executes first, as `apply --dry-run` lists them.
+        match &adapter {
+            Some(adapter) => super::print_migration_preview(
+                verbosity,
+                &design
+                    .pending_migration_preview(&**adapter, None, Some(&resolved))
+                    .await?,
+            ),
+            None => super::note_unlisted_migrations(verbosity, &project_dir),
+        }
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
@@ -395,6 +476,12 @@ pub async fn cmd_deploy(
             &format!("{} data file(s) would be imported.", import_plan.len()),
         );
         for warning in design.import_warnings(None).into_iter().chain(skips) {
+            output::warn(&warning);
+        }
+        // The import's `import.after` hooks, judged as `import --dry-run` and
+        // the real deploy judge them.
+        let (_, after_skips) = design.import_after_preview(Some(&resolved))?;
+        for warning in after_skips {
             output::warn(&warning);
         }
 
@@ -539,6 +626,12 @@ pub(crate) async fn reconcile_with_adapter(
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
+    // The hooks the run skips, said before it — a run that fails prints no
+    // summary, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(resolved))? {
+        output::warn(&skip);
+    }
+
     if dry_run {
         let plan = design
             .reconcile(
@@ -592,14 +685,22 @@ pub(crate) async fn reconcile_with_adapter(
         }
     }
     if let Some(s) = summary {
+        let hooks = match s.before_scripts + s.after_scripts {
+            0 => String::new(),
+            n => format!(", {n} hook script(s) run"),
+        };
         output::info(
             verbosity,
             &format!(
-                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned.",
+                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned{hooks}.",
                 s.created, s.altered, s.reapplied, s.restamped, s.dropped
             ),
         );
     }
+
+    // As after `dbd apply`: the design's grants are part of the database it
+    // describes, and a reconciled one had none.
+    super::apply_and_report_grants(design, adapter, resolved, verbosity).await?;
     Ok(())
 }
 
@@ -908,9 +1009,9 @@ mod tests {
     /// so it never opens a DB connection.
     #[tokio::test]
     async fn deploy_dry_run_from_local_source() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -931,7 +1032,7 @@ mod tests {
     /// error. Guards against the regression where deploy silently skipped RLS.
     #[tokio::test]
     async fn deploy_dry_run_includes_policies() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         cmd_deploy(
@@ -1119,9 +1220,9 @@ mod tests {
     /// of the (local, no-DB) dry-run flow proceeds.
     #[tokio::test]
     async fn deploy_clears_cache_before_dry_run() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -1187,11 +1288,17 @@ mod tests {
     /// the whole point of `include`), but `deploy --dry-run` still surfaces the
     /// gap as an FYI — exercising the gap-reporting loop that a `Report`-policy
     /// gap never reaches (it bails earlier, in `check_scope_gaps`).
+    ///
+    /// Run on a copy without the staging data files: `incomplete_auto` builds
+    /// the loaders' targets but not the loaders, so a deploy that loads those
+    /// files is refused before it applies anything — not the path under test.
     #[tokio::test]
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
-        let src = testutil::fixtures();
+        // Offline (no URL to reach), and without the staging data files.
+        let src = testutil::offline_fixture_project();
+        std::fs::remove_dir_all(src.path().join("import/staging")).unwrap();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,

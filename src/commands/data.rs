@@ -74,6 +74,34 @@ fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope
     Ok(())
 }
 
+/// The scope guard `apply` and `deploy` run, for a command that loads or reads
+/// data under a scope: refuse a database pinned to another one.
+///
+/// `import` and `export` ran on such a database and failed partway — staging
+/// truncated and some loaders called, some files written — because the tables
+/// they touch are another scope's to build. Neither re-pins the database, so
+/// unlike `apply` there is no `--allow-scope-change` to offer: the way through
+/// is the pinned scope, or re-pointing the database with `apply` first. The
+/// decision is [`Design::check_scope_guard`]'s; only the way out differs.
+async fn check_pinned_scope(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    resolved: &dbd_core::ResolvedScope,
+    consequence: &str,
+) -> Result<()> {
+    let meta = adapter.get_project_meta().await?;
+    if Design::check_scope_guard(meta.as_ref(), &resolved.name, false).is_ok() {
+        return Ok(());
+    }
+    let pinned = meta.and_then(|m| m.scope).unwrap_or_default();
+    bail!(
+        "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
+         {consequence}\n\
+         → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {requested} \
+         --allow-scope-change` first.",
+        requested = resolved.name
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_import_dry_run(
     config: &Path,
@@ -95,6 +123,8 @@ pub fn cmd_import_dry_run(
         };
         let qualified = resolve_table_name(&design, name);
         let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(&design, &resolved, &qualified)?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
@@ -156,7 +186,10 @@ pub fn cmd_import_dry_run(
         output::warn(warning);
     }
 
-    output::summary(0, 0, plan.len());
+    // Tables, as the run's summary counts them: a table with a shared data
+    // file and an env's own is two plan entries and one table.
+    let tables: std::collections::HashSet<&str> = plan.iter().map(|e| e.table.name.as_str()).collect();
+    output::summary(0, 0, tables.len());
     Ok(())
 }
 
@@ -204,6 +237,8 @@ pub(crate) async fn import_with_adapter(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
+
     // Ad-hoc single-file import: `dbd import -n <entity> -f <path>`.
     if let Some(path) = file {
         let name = match name {
@@ -212,7 +247,12 @@ pub(crate) async fn import_with_adapter(
         };
         let qualified = resolve_table_name(design, name);
         let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        // Said as every scoped run says it — the ad-hoc load is checked
+        // against the scope too, and was the one import path silent about it.
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(design, &resolved, &qualified)?;
+        check_pinned_scope(adapter, &resolved, PINNED).await?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -230,6 +270,7 @@ pub(crate) async fn import_with_adapter(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    check_pinned_scope(adapter, &resolved, PINNED).await?;
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
@@ -411,9 +452,17 @@ pub(crate) async fn export_with_adapter(
         output::info(verbosity, "No tables to export.");
         return Ok(());
     }
+    check_pinned_scope(
+        adapter,
+        resolved,
+        "Exporting under another scope would read tables this database was not built with.",
+    )
+    .await?;
 
     output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
+    // `-o` replaces the project's `export/`; the layout under it is the same.
+    let root = output.map_or_else(|| design.project_dir().join("export"), Path::to_path_buf);
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
         let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
@@ -421,17 +470,39 @@ pub(crate) async fn export_with_adapter(
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
         adapter
-            .export_data(&export_entity, output)
+            .export_data(&export_entity, Some(&export_dir(&root, &table.name)?))
             .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
     }
 
-    let dest = output
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "export/".to_string());
-    output::info(verbosity, &format!("Export complete. Files written to {dest}"));
+    output::info(
+        verbosity,
+        &format!("Export complete. Files written to {}", root.display()),
+    );
     Ok(())
+}
+
+/// The directory `table`'s file is written to: `<root>/<schema>/`, or `<root>/`
+/// for a table with no schema (SQLite's).
+///
+/// One layout for the default `export/` and for `-o`, and the
+/// `import/<schema>/<table>` layout an import reads — so `-o import` exports
+/// straight into the import tree. `-o` wrote every table flat into `<root>`,
+/// and the second of two same-named tables in different schemas overwrote the
+/// first while the summary counted both. The default `export/` was resolved
+/// against the directory dbd ran in rather than the project `-s` names.
+fn export_dir(root: &Path, table: &str) -> Result<std::path::PathBuf> {
+    match dbd_core::entity::split_qualified_name(table) {
+        (Some(schema), _) if dbd_core::path_safe::is_safe_segment(&schema) => Ok(root.join(schema)),
+        // A schema name is a directory name here, and a quoted identifier may
+        // hold a path separator — refused rather than joined.
+        (Some(_), _) => bail!(
+            "cannot export {table}: its schema name is not usable as a directory name (it contains a path \
+             separator, or is '.' or '..'). Rename the schema, or export the table by hand"
+        ),
+        (None, _) => Ok(root.to_path_buf()),
+    }
 }
 
 #[cfg(test)]
@@ -919,6 +990,91 @@ mod tests {
         .await
         .expect_err("a table the export: list leaves out is not exported");
         assert!(err.to_string().contains("not listed under export:"), "{err}");
+    }
+
+    // ── The scope guard ────────────────────────────────────────────────────────
+
+    /// `apply` and `deploy` refuse a database pinned to another scope; `import`
+    /// ran on one and failed partway — staging truncated, some loaders called
+    /// — because the tables it loads are another scope's to build. Refused
+    /// before anything is truncated or loaded.
+    #[tokio::test]
+    async fn an_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect_err("the database is pinned to config_only, and this run asks for all");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scope guard") && msg.contains("pinned to scope 'config_only'") && msg.contains("'all'"),
+            "{msg}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "nothing truncated, loaded or run: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+    }
+
+    /// An ad-hoc `-f` load is an import too.
+    #[tokio::test]
+    async fn an_adhoc_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("refused like the full import");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
+
+    /// `import` never re-pins the database, so there is no flag to override
+    /// the guard with; the refusal says how to get through instead.
+    #[tokio::test]
+    async fn the_import_scope_guard_names_the_way_through() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--scope config_only") && msg.contains("dbd apply --scope all --allow-scope-change"),
+            "the pinned scope to re-run with, or the re-pin: {msg}"
+        );
+    }
+
+    /// The pinned scope itself is let through.
+    #[tokio::test]
+    async fn an_import_under_the_pinned_scope_runs() {
+        let mock = MockAdapter::new().with_scope("all");
+        let design = fixture_design();
+        import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect("the requested scope is the pinned one");
+        assert!(!mock.imported.lock().unwrap().is_empty());
+    }
+
+    /// `export` read tables the pinned scope never built, and failed on the
+    /// first missing one with some files already written. Refused before
+    /// anything is written.
+    #[tokio::test]
+    async fn an_export_from_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let err = export_project(&mock, &testutil::fixture_config(), &testutil::fixtures(), None, "csv")
+            .await
+            .expect_err("pinned to config_only, and this run asks for all");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.exported.lock().unwrap().is_empty(), "nothing exported");
     }
 
     /// A full (non-ad-hoc) import runs the design's import plan through the

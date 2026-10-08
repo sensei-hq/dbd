@@ -260,12 +260,29 @@ impl Design {
         declared.difference(&wanted).cloned().collect()
     }
 
+    /// What a run's hooks are judged against under `scope`: the scope's name,
+    /// and what the design manages outside `working_set` (a hook touching any
+    /// of it is skipped). `None` for an unscoped or all-scope run, where every
+    /// hook runs.
+    ///
+    /// The one statement of the rule, for every run and every preview — the
+    /// `import --dry-run` preview once passed the working set itself where the
+    /// run passed what lies outside it, and so reported each hook the run
+    /// executes as skipped, and each one it skips as run.
+    pub(in crate::design) fn hook_scope<'s>(
+        &self,
+        scope: Option<&'s ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+    ) -> Option<(&'s str, std::collections::HashSet<String>)> {
+        match (scope, working_set) {
+            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), self.managed_outside(ws))),
+            _ => None,
+        }
+    }
+
     /// What the design manages that a working set leaves out — the names a
     /// scoped hook must not touch. Externals are not the design's to manage.
-    pub(in crate::design) fn managed_outside(
-        &self,
-        working_set: &std::collections::HashSet<String>,
-    ) -> std::collections::HashSet<String> {
+    fn managed_outside(&self, working_set: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
         self.entities
             .iter()
             .filter(|e| e.entity_type != EntityType::External && !working_set.contains(&e.name))
@@ -346,6 +363,33 @@ impl Design {
                 "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
                  Applying a different scope would build a divergent schema.\n\
                  → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Version guard: refuse to apply a project older than the database.
+    ///
+    /// `db_version` is what the database records, `design_version` the
+    /// project's `project.version` (0 when it has none). A database ahead of
+    /// the design was built from a newer revision — typically a branch checked
+    /// out behind it. The plan then came out "current" and re-applied the older
+    /// DDL over the newer schema, reporting "Already up to date". Nothing short
+    /// of a newer revision makes that right, so there is no flag to pass it.
+    /// Shaped like [`Self::check_scope_guard`] and [`Self::check_reset_guard`];
+    /// [`Self::apply`] runs it before anything it writes, and the CLI dry runs
+    /// run it whenever they have a database to ask.
+    pub fn check_version_guard(db_version: u32, design_version: u32) -> Result<()> {
+        if db_version > design_version {
+            let project = match design_version {
+                0 => "this project records no version".to_string(),
+                v => format!("this project is at v{v}"),
+            };
+            return Err(DbdError::SafetyGuard(format!(
+                "version guard: the database is at v{db_version}, but {project}.\n\
+                 Applying an older project would re-apply its DDL over a newer schema.\n\
+                 → check out a newer revision of the project (at v{db_version} or later), or point it at \
+                 a database built from this one."
             )));
         }
         Ok(())

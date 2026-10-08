@@ -40,6 +40,22 @@
 //! would lose the key and every foreign key that points at it. The column is
 //! bounded instead (VARCHAR(255), nvarchar(450)) and the bound is reported.
 //!
+//! # Lengths, precisions and row sizes
+//!
+//! A length or precision is carried only as far as the target's documented
+//! limit. Past it the target refuses the DDL (`nvarchar(5000)`,
+//! `DECIMAL(50,40)`, `VARCHAR(70000)`), so the column becomes the target's
+//! larger type — its long text, or its widest decimal, keeping the digits
+//! before the point first — and the change is reported. A type with no limit
+//! in PostgreSQL (`text`, an unbounded `varchar`, `bytea`) gets one with none
+//! on the target (LONGTEXT, nvarchar(max), TEXT), which is faithful and not
+//! reported; an unbounded `numeric` gets the widest decimal, which is not, and
+//! is. A table whose columns are each legal can still be refused for its row:
+//! MySQL's 65,535 bytes outside TEXT and BLOB, SQL Server's 8,060 of
+//! fixed-length columns. Its widest columns are moved to a type that does not
+//! count — TEXT, nvarchar — until it fits, and each is reported. Each limit is
+//! cited where it is defined.
+//!
 //! # View bodies and CHECKs on SQLite
 //!
 //! Copied verbatim, they failed the script: a view naming `core.cities` (the
@@ -708,27 +724,13 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         inline_pk.clone()
     };
     let numbered = numbered_column(td, &pk, target, e.schema.as_deref());
-    let bounded = bounded_key_columns(e, td, script);
+    let types = column_types(e, td, script);
 
     let mut lines: Vec<String> = Vec::new();
-    for c in &td.columns {
+    for (c, typed) in td.columns.iter().zip(types) {
         let before = report.len();
-        let mut ty = map_type(&c.data_type, script, e, c, report);
-        if bounded.contains(&c.name) {
-            let to = key_bound(&c.data_type, target);
-            report.push(Downgrade {
-                entity: e.name.clone(),
-                column: Some(c.name.clone()),
-                from: format!("`{}` in a key", c.data_type),
-                to: to.to_string(),
-                reason: format!(
-                    "{} — so the column is bounded to {to} instead, which keeps the key; a longer value \
-                     is now refused",
-                    unindexable(&c.data_type, target).unwrap_or("the target cannot key it as it is")
-                ),
-            });
-            ty = to.to_string();
-        }
+        report.extend(typed.notes);
+        let ty = typed.ty;
         let numbering = numbering(e, c, numbered, target, report);
         let default = c
             .default_value
@@ -1217,17 +1219,9 @@ fn parent_of(e: &Entity, fk: &ForeignKey) -> String {
     }
 }
 
-/// The columns of `e` that sit in a key the target refuses on their emitted
-/// type — unbounded text or binary — and so must be bounded.
-///
-/// A key is the primary key, a UNIQUE constraint or index, or a foreign key
-/// the script keeps. Bounding keeps more than the alternative: leaving the
-/// constraint out would lose the key and every foreign key that points at it,
-/// where a bound only refuses a value longer than it. A foreign key's own
-/// columns take the same bound as the key they point at, so the two sides
-/// still match. An ordinary index is not a reason to change a column's type;
-/// one on unbounded text is left out instead ([`emit_index`]).
-fn bounded_key_columns(e: &Entity, td: &TableDef, script: &Script) -> HashSet<String> {
+/// The columns of `e` that sit in a key: the primary key, a UNIQUE constraint
+/// or index, or a foreign key the script keeps.
+fn keyed_columns(e: &Entity, td: &TableDef, script: &Script) -> HashSet<String> {
     let mut keyed: HashSet<&str> = td
         .columns
         .iter()
@@ -1255,11 +1249,266 @@ fn bounded_key_columns(e: &Entity, td: &TableDef, script: &Script) -> HashSet<St
     for idx in td.indexes.iter().filter(|i| i.unique) {
         keyed.extend(idx.columns.iter().filter(|k| !k.is_expression).map(|k| k.name.as_str()));
     }
-    td.columns
+    keyed.into_iter().map(str::to_string).collect()
+}
+
+/// A column's emitted type, and what was lost choosing it.
+struct ColumnType {
+    ty: String,
+    notes: Vec<Downgrade>,
+}
+
+/// The type each of `td`'s columns is emitted as, in column order, with the
+/// losses found choosing it.
+///
+/// Three passes, because the last two need the first's answer for every
+/// column. Each column's type is mapped alone ([`map_type`]). A column in a
+/// key whose type the target cannot key — unbounded text or binary — is then
+/// bounded: leaving the constraint out would lose the key and every foreign
+/// key that points at it, where a bound only refuses a value longer than it. A
+/// foreign key's own columns take the same bound as the key they point at, so
+/// the two sides still match. An ordinary index is not a reason to change a
+/// column's type; one on unbounded text is left out instead ([`emit_index`]).
+/// Last, a row wider than the target allows gives up its widest columns'
+/// fixed widths ([`fit_row`]).
+fn column_types(e: &Entity, td: &TableDef, script: &Script) -> Vec<ColumnType> {
+    let target = script.target;
+    let keyed = keyed_columns(e, td, script);
+    let mut types: Vec<ColumnType> = td
+        .columns
         .iter()
-        .filter(|c| keyed.contains(c.name.as_str()) && unindexable(&c.data_type, script.target).is_some())
-        .map(|c| c.name.clone())
-        .collect()
+        .map(|c| {
+            let mut notes = Vec::new();
+            let ty = map_type(&c.data_type, script, e, c, &mut notes);
+            ColumnType { ty, notes }
+        })
+        .collect();
+    for (c, typed) in td.columns.iter().zip(types.iter_mut()) {
+        if !keyed.contains(&c.name) {
+            continue;
+        }
+        let Some(why) = unindexable(&typed.ty, target) else {
+            continue;
+        };
+        let to = key_bound(&c.data_type, target);
+        typed.notes.push(Downgrade {
+            entity: e.name.clone(),
+            column: Some(c.name.clone()),
+            from: format!("`{}` in a key", c.data_type),
+            to: to.to_string(),
+            reason: format!(
+                "{why} — so the column is bounded to {to} instead, which keeps the key; a longer value is now refused"
+            ),
+        });
+        typed.ty = to.to_string();
+    }
+    fit_row(e, td, &keyed, target, &mut types);
+    types
+}
+
+/// Give a row wider than the target allows the room it needs, widest column
+/// first.
+///
+/// Each column is legal alone and the CREATE TABLE is still refused: MySQL
+/// counts every VARCHAR and CHAR at four bytes a utf8mb4 character against
+/// 65,535 bytes a row, and SQL Server every fixed-length column — nchar among
+/// them — against 8,060. A MySQL string becomes TEXT, which counts ten bytes,
+/// and a SQL Server nchar becomes nvarchar, which may overflow the row, until
+/// the row fits. A key column keeps its type; a column an index reads is taken
+/// last, since TEXT would leave the index out. Each change is reported.
+fn fit_row(e: &Entity, td: &TableDef, keyed: &HashSet<String>, target: Target, types: &mut [ColumnType]) {
+    let limit = match target {
+        Target::MySql => MYSQL_ROW_MAX,
+        Target::TSql => TSQL_ROW_MAX,
+        Target::Sqlite => return,
+    };
+    let needed = row_bytes(td, types, target);
+    if needed <= limit {
+        return;
+    }
+    let indexed: HashSet<&str> = td
+        .indexes
+        .iter()
+        .flat_map(|i| i.columns.iter().filter(|k| !k.is_expression).map(|k| k.name.as_str()))
+        .collect();
+    let mut order: Vec<usize> = (0..types.len())
+        .filter(|&i| !keyed.contains(&td.columns[i].name) && freed(&types[i].ty, target).is_some())
+        .collect();
+    order.sort_by_key(|&i| {
+        (
+            indexed.contains(td.columns[i].name.as_str()),
+            std::cmp::Reverse(column_row_bytes(&types[i].ty, target)),
+            i,
+        )
+    });
+    for i in order {
+        if row_bytes(td, types, target) <= limit {
+            break;
+        }
+        let Some((to, n)) = freed(&types[i].ty, target) else {
+            continue;
+        };
+        let c = &td.columns[i];
+        let reason = match target {
+            Target::MySql => format!(
+                "MySQL keeps at most {} bytes of a row outside its TEXT and BLOB columns, counting four bytes a \
+                 utf8mb4 character, and this table's columns need {} — so its widest are stored as {to} instead: \
+                 a value longer than {} characters is no longer refused{}",
+                thousands(MYSQL_ROW_MAX),
+                thousands(needed),
+                thousands(n),
+                if types[i].ty.to_uppercase().starts_with("CHAR(") {
+                    ", and is no longer padded to its length"
+                } else {
+                    ""
+                }
+            ),
+            _ => format!(
+                "SQL Server keeps a row's fixed-length columns, nchar among them, within {} bytes, and this \
+                 table's need {} — so its widest nchar columns are nvarchar instead, which may overflow the \
+                 row: a value is no longer padded to its length",
+                thousands(TSQL_ROW_MAX),
+                thousands(needed)
+            ),
+        };
+        types[i].notes.push(Downgrade {
+            entity: e.name.clone(),
+            column: Some(c.name.clone()),
+            from: format!("`{}`", c.data_type),
+            to: to.clone(),
+            reason,
+        });
+        types[i].ty = to;
+    }
+}
+
+/// What a column emitted as `ty` becomes to stop counting against the row,
+/// and its length — `None` when it already does not count, or cannot stop.
+fn freed(ty: &str, target: Target) -> Option<(String, u64)> {
+    let lower = ty.trim().to_lowercase();
+    let base = lower.split('(').next().unwrap_or(&lower).trim();
+    let n = lower.find('(').and_then(|i| length_of(&lower[i..]))?;
+    match (target, base) {
+        (Target::MySql, "varchar" | "char") => Some((mysql_text_holding(n).to_string(), n)),
+        (Target::TSql, "nchar") => Some((format!("nvarchar({n})"), n)),
+        _ => None,
+    }
+}
+
+/// The bytes `td`'s row needs on the target, typed as `types`, against the
+/// limit [`fit_row`] holds it to.
+///
+/// MySQL counts each column's widest value and a bit per nullable column
+/// ("Limits on Table Column Count and Row Size": a `VARCHAR(65533) NOT NULL`
+/// latin1 column fits, a nullable one does not). SQL Server counts its
+/// fixed-length columns, and the row's own overhead: a 4-byte header, a 2-byte
+/// column count, the null bitmap, and 2 bytes per variable-length column plus
+/// 2 for their count.
+fn row_bytes(td: &TableDef, types: &[ColumnType], target: Target) -> u64 {
+    let data: u64 = types.iter().map(|t| column_row_bytes(&t.ty, target)).sum();
+    match target {
+        Target::MySql => data + (td.columns.iter().filter(|c| c.nullable).count() as u64).div_ceil(8),
+        Target::TSql => {
+            let variable = types.iter().filter(|t| tsql_fixed_bytes(&t.ty).is_none()).count() as u64;
+            let offsets = if variable > 0 { 2 + 2 * variable } else { 0 };
+            data + 4 + 2 + (types.len() as u64).div_ceil(8) + offsets
+        }
+        Target::Sqlite => 0,
+    }
+}
+
+/// What a column emitted as `ty` counts against the target's row limit.
+fn column_row_bytes(ty: &str, target: Target) -> u64 {
+    match target {
+        Target::MySql => mysql_row_bytes(ty),
+        Target::TSql => tsql_fixed_bytes(ty).unwrap_or(0),
+        Target::Sqlite => 0,
+    }
+}
+
+/// The bytes a column emitted as `ty` takes of a MySQL row, as MySQL counts
+/// them ("Data Type Storage Requirements"): a string at four bytes a utf8mb4
+/// character plus a VARCHAR's 1- or 2-byte length; a TEXT, BLOB or JSON column
+/// only the 9 to 12 bytes that point at it. Anything not listed is taken at
+/// the 12 a pointer takes at most — `emit` writes nothing wider that is not.
+fn mysql_row_bytes(ty: &str) -> u64 {
+    let upper = ty.trim().to_uppercase();
+    let base = upper.split('(').next().unwrap_or(&upper).trim();
+    let args = upper.find('(').map_or("", |i| &upper[i..]);
+    let n = length_of(args);
+    // Nine digits of a DECIMAL pack into four bytes, the rest into these.
+    const LEFTOVER: [u64; 10] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+    let digits = |d: i64| {
+        let d = d.max(0) as u64;
+        (d / 9) * 4 + LEFTOVER[(d % 9) as usize]
+    };
+    // Fractional seconds take a byte per two digits.
+    let fsp = |n: Option<u64>| n.unwrap_or(0).div_ceil(2);
+    match base {
+        "TINYINT" => 1,
+        "SMALLINT" => 2,
+        "INT" | "FLOAT" => 4,
+        "BIGINT" | "DOUBLE" => 8,
+        "DATE" => 3,
+        "TIME" => 3 + fsp(n),
+        "DATETIME" => 5 + fsp(n),
+        "DECIMAL" => {
+            let (p, s) = precision_scale(args).unwrap_or((10, 0));
+            digits(p - s) + digits(s)
+        }
+        "CHAR" => n.unwrap_or(1) * MYSQL_BYTES_PER_CHAR,
+        "VARCHAR" | "VARBINARY" => {
+            let per = if base == "VARCHAR" { MYSQL_BYTES_PER_CHAR } else { 1 };
+            let bytes = n.unwrap_or(0) * per;
+            bytes + if bytes > 255 { 2 } else { 1 }
+        }
+        "TINYTEXT" | "TINYBLOB" => 9,
+        "TEXT" | "BLOB" => 10,
+        "MEDIUMTEXT" | "MEDIUMBLOB" => 11,
+        _ => 12,
+    }
+}
+
+/// The bytes a column emitted as `ty` fixes in a SQL Server row, or `None` for
+/// a variable-length type, which may overflow the row (the "Storage size" of
+/// each type in "Data types (Transact-SQL)").
+fn tsql_fixed_bytes(ty: &str) -> Option<u64> {
+    let lower = ty.trim().to_lowercase();
+    let base = lower.split('(').next().unwrap_or(&lower).trim();
+    let args = lower.find('(').map_or("", |i| &lower[i..]);
+    let n = length_of(args);
+    Some(match base {
+        "bit" | "tinyint" => 1,
+        "smallint" => 2,
+        "int" | "real" => 4,
+        "bigint" | "float" => 8,
+        "date" => 3,
+        "time" => match n {
+            Some(0..=2) => 3,
+            Some(3..=4) => 4,
+            _ => 5,
+        },
+        "datetime2" => match n {
+            Some(0..=2) => 6,
+            Some(3..=4) => 7,
+            _ => 8,
+        },
+        "datetimeoffset" => match n {
+            Some(0..=2) => 8,
+            Some(3..=4) => 9,
+            _ => 10,
+        },
+        "decimal" | "numeric" => match precision_scale(args).map_or(18, |(p, _)| p) {
+            ..=9 => 5,
+            10..=19 => 9,
+            20..=28 => 13,
+            _ => 17,
+        },
+        "uniqueidentifier" => 16,
+        "nchar" => 2 * n.unwrap_or(1),
+        "char" | "binary" => n.unwrap_or(1),
+        _ => return None,
+    })
 }
 
 /// The bounded type a key column of PostgreSQL type `pg` gets. SQL Server keys
@@ -1349,15 +1598,35 @@ fn fk_action(action: FkAction, target: Target) -> Option<&'static str> {
     }
 }
 
-/// Why the target cannot index a column of PostgreSQL type `pg` as it is
-/// emitted — the type maps to an unbounded text or binary column.
-fn unindexable(pg: &str, target: Target) -> Option<&'static str> {
-    let t = pg.trim().to_lowercase();
-    let base = t.split('(').next().unwrap_or(&t).trim();
-    let unbounded = t.ends_with("[]") || matches!(base, "text" | "json" | "jsonb" | "bytea");
+/// Why the target cannot index a column emitted as `ty` — an unbounded text,
+/// binary or JSON type.
+///
+/// Read off the emitted type, not PostgreSQL's: an unbounded `varchar`, a
+/// `varchar(70000)` and a column [`fit_row`] moved to TEXT are all unbounded
+/// here, whatever PostgreSQL called them.
+fn unindexable(ty: &str, target: Target) -> Option<&'static str> {
+    let upper = ty.trim().to_uppercase();
+    let base = upper.split('(').next().unwrap_or(&upper).trim();
     match target {
-        Target::MySql if unbounded => Some("MySQL cannot index a TEXT, BLOB or JSON column without a prefix length"),
-        Target::TSql if unbounded => Some("SQL Server cannot index an nvarchar(max) or varbinary(max) column"),
+        Target::MySql
+            if matches!(
+                base,
+                "TINYTEXT"
+                    | "TEXT"
+                    | "MEDIUMTEXT"
+                    | "LONGTEXT"
+                    | "TINYBLOB"
+                    | "BLOB"
+                    | "MEDIUMBLOB"
+                    | "LONGBLOB"
+                    | "JSON"
+            ) =>
+        {
+            Some("MySQL cannot index a TEXT, BLOB or JSON column without a prefix length")
+        }
+        Target::TSql if upper.ends_with("(MAX)") => {
+            Some("SQL Server cannot index an nvarchar(max) or varbinary(max) column")
+        }
         _ => None,
     }
 }
@@ -1382,10 +1651,12 @@ fn emit_indexes(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Vec
     let Some(td) = &e.table_def else { return Vec::new() };
     let bare = e.name.rsplit('.').next().unwrap_or(&e.name);
     let table = qualified(e.schema.as_deref(), bare, target);
-    let bounded = bounded_key_columns(e, td, script);
+    // Whether the target can index a column depends on the type it is
+    // emitted as — bounded for a key, or moved to TEXT to fit the row.
+    let types: Vec<String> = column_types(e, td, script).into_iter().map(|t| t.ty).collect();
     td.indexes
         .iter()
-        .filter_map(|idx| emit_index(e, td, idx, bare, &table, &bounded, target, report))
+        .filter_map(|idx| emit_index(e, td, idx, bare, &table, &types, target, report))
         .collect()
 }
 
@@ -1396,7 +1667,7 @@ fn emit_index(
     idx: &IndexDef,
     bare: &str,
     table: &str,
-    bounded: &HashSet<String>,
+    types: &[String],
     target: Target,
     report: &mut Vec<Downgrade>,
 ) -> Option<String> {
@@ -1427,13 +1698,11 @@ fn emit_index(
         } else if let Some(ty) = td
             .columns
             .iter()
-            .find(|c| c.name == col.name)
-            .map(|c| c.data_type.as_str())
-            // A column bounded for a key is no longer unbounded.
-            && !bounded.contains(&col.name)
+            .position(|c| c.name == col.name)
+            .and_then(|i| types.get(i))
             && let Some(why) = unindexable(ty, target)
         {
-            blockers.push(format!("{why} (`{}` is {ty})", col.name));
+            blockers.push(format!("{why} (`{}` is {ty} here)", col.name));
         }
     }
     if !blockers.is_empty() {
@@ -1821,7 +2090,15 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
     let args = t.find('(').map(|i| t[i..].trim()).unwrap_or("");
 
     match (base, target) {
-        ("jsonb" | "json", Target::MySql) => "JSON".to_string(),
+        ("jsonb", Target::MySql) => "JSON".to_string(),
+        // MySQL normalizes a JSON document as `jsonb` does; `json` keeps the
+        // text it was given, so only `json` loses something here.
+        ("json", Target::MySql) => lose(
+            "JSON",
+            "MySQL's JSON stores a document normalized — keys sorted, a duplicated key kept once, \
+             whitespace dropped — where `json` keeps the text as written, so a document reads back \
+             differently from how it was stored",
+        ),
         ("jsonb" | "json", Target::TSql) => lose(
             "nvarchar(max)",
             "SQL Server has no JSON column type here, so it is stored as text and the \
@@ -1838,13 +2115,13 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
         ("uuid", Target::TSql) => "uniqueidentifier".to_string(),
         ("uuid", Target::Sqlite) => lose("TEXT", "SQLite has no UUID type"),
 
-        ("text", Target::MySql) => "TEXT".to_string(),
-        ("text", Target::TSql) => "nvarchar(max)".to_string(),
-        ("text", Target::Sqlite) => "TEXT".to_string(),
+        // PostgreSQL's text holds up to a gigabyte. MySQL's TEXT holds 65,535
+        // bytes — as few as 16,383 utf8mb4 characters — and refused a longer
+        // value without a word in the report; LONGTEXT holds 4 GB ("String
+        // Type Storage Requirements", MySQL 8.4 manual).
+        ("text", target) => unbounded_text(target).to_string(),
 
-        ("varchar" | "character varying", Target::MySql) => format!("VARCHAR{}", args_or(args, "(255)")),
-        ("varchar" | "character varying", Target::TSql) => format!("nvarchar{}", args_or(args, "(255)")),
-        ("varchar" | "character varying", Target::Sqlite) => "TEXT".to_string(),
+        ("varchar" | "character varying", _) => settle(varchar(args, target), &mut lose),
 
         // The serial types are integers numbered by a sequence; the numbering is
         // the column's, and `numbering` carries it.
@@ -1864,27 +2141,30 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
         ("boolean" | "bool", Target::TSql) => "bit".to_string(),
         ("boolean" | "bool", Target::Sqlite) => "INTEGER".to_string(),
 
-        ("numeric" | "decimal", Target::MySql) => format!("DECIMAL{}", args_or(args, "(65,30)")),
-        ("numeric" | "decimal", Target::TSql) => format!("decimal{}", args_or(args, "(38,10)")),
-        ("numeric" | "decimal", Target::Sqlite) => "NUMERIC".to_string(),
+        ("numeric" | "decimal", _) => settle(decimal(args, target), &mut lose),
 
         ("double precision" | "float8", Target::MySql) => "DOUBLE".to_string(),
         ("double precision" | "float8", Target::TSql) => "float".to_string(),
         ("double precision" | "float8", Target::Sqlite) => "REAL".to_string(),
 
-        ("timestamptz" | "timestamp with time zone", Target::MySql) => "DATETIME".to_string(),
-        ("timestamptz" | "timestamp with time zone", Target::TSql) => "datetimeoffset".to_string(),
+        // A timestamp keeps its fractional seconds: MySQL's DATETIME defaults
+        // to whole seconds (see `mysql_fsp`); SQL Server's types default to
+        // seven digits, finer than PostgreSQL's six, so only a declared
+        // precision is carried there.
+        ("timestamptz" | "timestamp with time zone", Target::MySql) => format!("DATETIME{}", mysql_fsp(args)),
+        ("timestamptz" | "timestamp with time zone", Target::TSql) => format!("datetimeoffset{args}"),
         ("timestamptz" | "timestamp with time zone", Target::Sqlite) => "TEXT".to_string(),
 
-        ("timestamp" | "timestamp without time zone", Target::MySql) => "DATETIME".to_string(),
-        ("timestamp" | "timestamp without time zone", Target::TSql) => "datetime2".to_string(),
+        ("timestamp" | "timestamp without time zone", Target::MySql) => format!("DATETIME{}", mysql_fsp(args)),
+        ("timestamp" | "timestamp without time zone", Target::TSql) => format!("datetime2{args}"),
         ("timestamp" | "timestamp without time zone", Target::Sqlite) => "TEXT".to_string(),
 
         ("date", Target::MySql) => "DATE".to_string(),
         ("date", Target::TSql) => "date".to_string(),
         ("date", Target::Sqlite) => "TEXT".to_string(),
 
-        ("bytea", Target::MySql) => "BLOB".to_string(),
+        // BLOB holds 65,535 bytes and bytea a gigabyte; LONGBLOB holds 4 GB.
+        ("bytea", Target::MySql) => "LONGBLOB".to_string(),
         ("bytea", Target::TSql) => "varbinary(max)".to_string(),
         ("bytea", Target::Sqlite) => "BLOB".to_string(),
 
@@ -1892,14 +2172,27 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
         // spells a bare `char` as `char(1)`. A bare `bpchar` has no length at
         // all, so it is not this.
         ("char" | "character" | "bpchar", _) if !args.is_empty() => {
-            let n: u32 = args.trim_matches(['(', ')']).trim().parse().unwrap_or(1);
+            let n = length_of(args).unwrap_or(1);
             match target {
                 Target::MySql if n <= 255 => format!("CHAR({n})"),
-                Target::MySql => lose(
+                Target::MySql if n <= MYSQL_VARCHAR_MAX => lose(
                     &format!("VARCHAR({n})"),
                     "MySQL's CHAR holds at most 255 characters, so it is a VARCHAR — no longer padded to its length",
                 ),
-                Target::TSql if n <= 4000 => format!("nchar({n})"),
+                Target::MySql => {
+                    let to = mysql_text_holding(n);
+                    lose(
+                        to,
+                        &format!(
+                            "MySQL's CHAR holds at most 255 characters and its VARCHAR {} in utf8mb4, so it is \
+                             a {to} — no longer padded to its length, and a value longer than {} characters is \
+                             no longer refused",
+                            thousands(MYSQL_VARCHAR_MAX),
+                            thousands(n)
+                        ),
+                    )
+                }
+                Target::TSql if n <= TSQL_NCHAR_MAX => format!("nchar({n})"),
                 Target::TSql => lose(
                     "nvarchar(max)",
                     "SQL Server's nchar holds at most 4000 characters, so it is an nvarchar(max) — no longer \
@@ -1916,13 +2209,13 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
 
         // A time of day, its fractional precision kept; SQLite keeps every date
         // and time as text, as it does `date`.
-        ("time", Target::MySql) => format!("TIME{args}"),
+        ("time", Target::MySql) => format!("TIME{}", mysql_fsp(args)),
         ("time", Target::TSql) => format!("time{args}"),
         ("time", Target::Sqlite) => "TEXT".to_string(),
 
         // Neither MySQL nor SQL Server keeps a time of day with its offset.
         ("timetz", Target::MySql) => lose(
-            &format!("TIME{args}"),
+            &format!("TIME{}", mysql_fsp(args)),
             "MySQL's TIME has no time zone, so a value's offset is not kept — times from different \
              zones now compare as if they shared one",
         ),
@@ -1983,9 +2276,268 @@ fn text_of(target: Target, n: u32) -> String {
     }
 }
 
-fn args_or(args: &str, fallback: &str) -> String {
+// ── The targets' documented limits ──────────────────────────────────────────
+//
+// `emit` cannot run the target, so a limit it does not know is DDL the target
+// refuses — `nvarchar(5000)`, `DECIMAL(50,40)`, `VARCHAR(70000)` — or a type
+// that quietly cuts values short. Each limit below is the documented one, so a
+// type is switched to the target's larger type, or clamped, exactly where the
+// target would otherwise refuse or cut, and the change is reported.
+
+/// MySQL counts a string at its character set's widest, and dbd assumes
+/// utf8mb4 — the server default since MySQL 8.0 — at four bytes a character
+/// ("The utf8mb4 Character Set", MySQL 8.4 Reference Manual).
+const MYSQL_BYTES_PER_CHAR: u64 = 4;
+
+/// The longest VARCHAR MySQL creates in utf8mb4: 65,535 bytes over four bytes a
+/// character. A longer one is refused with "Column length too big … (max =
+/// 16383); use BLOB or TEXT instead" ("The CHAR and VARCHAR Types").
+const MYSQL_VARCHAR_MAX: u64 = 16_383;
+
+/// The most a MySQL row holds outside its TEXT and BLOB columns, which count 9
+/// to 12 bytes each; a wider table is refused with "Row size too large" ("Limits
+/// on Table Column Count and Row Size").
+const MYSQL_ROW_MAX: u64 = 65_535;
+
+/// MySQL's DECIMAL: at most 65 digits, at most 30 of them after the point
+/// ("Fixed-Point Types (Exact Value) - DECIMAL, NUMERIC").
+const MYSQL_DECIMAL: (i64, i64) = (65, 30);
+
+/// SQL Server's nchar(n) and nvarchar(n) take n from 1 to 4,000; beyond that
+/// there is only nvarchar(max), which holds 2^31-1 bytes ("nchar and nvarchar
+/// (Transact-SQL)").
+const TSQL_NCHAR_MAX: u64 = 4_000;
+
+/// SQL Server's decimal: at most 38 digits, its scale at most its precision
+/// ("decimal and numeric (Transact-SQL)").
+const TSQL_DECIMAL: (i64, i64) = (38, 38);
+
+/// The most a SQL Server row's fixed-length columns — nchar among them — may
+/// take; only variable-length ones may overflow it ("Maximum capacity
+/// specifications for SQL Server": bytes per row).
+const TSQL_ROW_MAX: u64 = 8_060;
+
+/// `n` as the documentation writes it — `16,383`, `65,535`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// A type, and why choosing it loses something — `None` when nothing is lost.
+type Mapped = (String, Option<String>);
+
+/// The type of a [`Mapped`], its loss recorded through `lose` when it has one.
+fn settle(mapped: Mapped, lose: &mut impl FnMut(&str, &str) -> String) -> String {
+    match mapped {
+        (ty, Some(reason)) => lose(&ty, &reason),
+        (ty, None) => ty,
+    }
+}
+
+/// The `n` of a `(n)` type modifier.
+fn length_of(args: &str) -> Option<u64> {
+    args.strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok()
+}
+
+/// The target's text type without a length — what PostgreSQL's `text` and an
+/// unbounded `varchar` are, neither of which limits a value short of a
+/// gigabyte.
+fn unbounded_text(target: Target) -> &'static str {
+    match target {
+        Target::MySql => "LONGTEXT",
+        Target::TSql => "nvarchar(max)",
+        Target::Sqlite => "TEXT",
+    }
+}
+
+/// The smallest MySQL text type that holds `chars` utf8mb4 characters: TEXT
+/// holds 2^16-1 bytes, MEDIUMTEXT 2^24-1 and LONGTEXT 2^32-1 ("String Type
+/// Storage Requirements").
+fn mysql_text_holding(chars: u64) -> &'static str {
+    match chars * MYSQL_BYTES_PER_CHAR {
+        b if b < 1 << 16 => "TEXT",
+        b if b < 1 << 24 => "MEDIUMTEXT",
+        _ => "LONGTEXT",
+    }
+}
+
+/// `varchar(n)` — or an unbounded `varchar` — on the target.
+fn varchar(args: &str, target: Target) -> Mapped {
+    let Some(n) = length_of(args) else {
+        // Unbounded in PostgreSQL, so unbounded here: it was silently cut to
+        // 255 characters.
+        return (unbounded_text(target).to_string(), None);
+    };
+    match target {
+        Target::MySql if n <= MYSQL_VARCHAR_MAX => (format!("VARCHAR({n})"), None),
+        Target::MySql => {
+            let to = mysql_text_holding(n);
+            (
+                to.to_string(),
+                Some(format!(
+                    "MySQL's VARCHAR holds at most {} utf8mb4 characters, so it is a {to} — a value longer \
+                     than {} characters is no longer refused",
+                    thousands(MYSQL_VARCHAR_MAX),
+                    thousands(n)
+                )),
+            )
+        }
+        Target::TSql if n <= TSQL_NCHAR_MAX => (format!("nvarchar({n})"), None),
+        Target::TSql => (
+            "nvarchar(max)".to_string(),
+            Some(format!(
+                "SQL Server's nvarchar holds at most {} characters, so it is an nvarchar(max) — a value \
+                 longer than {} characters is no longer refused",
+                thousands(TSQL_NCHAR_MAX),
+                thousands(n)
+            )),
+        ),
+        Target::Sqlite => ("TEXT".to_string(), None),
+    }
+}
+
+/// The `(p)` or `(p,s)` of a numeric type; the scale defaults to 0, as
+/// PostgreSQL's does.
+fn precision_scale(args: &str) -> Option<(i64, i64)> {
+    let inner = args.strip_prefix('(')?.strip_suffix(')')?;
+    let mut parts = inner.split(',').map(|part| part.trim().parse::<i64>());
+    let p = parts.next()?.ok()?;
+    let s = match parts.next() {
+        Some(s) => s.ok()?,
+        None => 0,
+    };
+    Some((p, s))
+}
+
+/// `10^e` written out — `100`, `0.01`.
+fn power_of_ten(e: i64) -> String {
+    if e >= 0 {
+        format!("1{}", "0".repeat(e as usize))
+    } else {
+        format!("0.{}1", "0".repeat((-e - 1) as usize))
+    }
+}
+
+/// What rounding a value to `scale` decimal places reads as.
+fn rounded_to(scale: i64) -> String {
+    if scale == 0 {
+        "a value is rounded to a whole number".to_string()
+    } else {
+        format!("a value is rounded to {scale} decimal places")
+    }
+}
+
+/// `numeric(p,s)` — or an unbounded `numeric` — on the target.
+///
+/// A precision or scale the target allows goes across as written. Otherwise
+/// the digits before the point are kept first, since losing one refuses a
+/// value outright where losing a decimal place only rounds it; PostgreSQL's
+/// negative scale and its scale above the precision (both PostgreSQL 15) have
+/// no counterpart and become the nearest ordinary decimal.
+fn decimal(args: &str, target: Target) -> Mapped {
+    let declared = precision_scale(args);
+    let (name, (max_p, max_s), (up, us)) = match target {
+        Target::Sqlite => return ("NUMERIC".to_string(), sqlite_numeric_loss(declared)),
+        Target::MySql => ("DECIMAL", MYSQL_DECIMAL, MYSQL_DECIMAL),
+        // SQL Server's widest decimal keeps 10 places: a choice, reported.
+        Target::TSql => ("decimal", TSQL_DECIMAL, (38, 10)),
+    };
+    let label = target.label();
+    let holds = if max_s < max_p {
+        format!("at most {max_p} digits, {max_s} of them after the point")
+    } else {
+        format!("at most {max_p} digits")
+    };
+    let Some((p, s)) = declared else {
+        let to = format!("{name}({up},{us})");
+        return (
+            to.clone(),
+            Some(format!(
+                "a numeric with no precision keeps any number of digits, and {label}'s {name} holds {holds}, \
+                 so it is {to} — a value with more than {} digits before the point is refused, and one with \
+                 more than {us} after it is rounded",
+                up - us
+            )),
+        );
+    };
+
+    let mut losses = Vec::new();
+    let (p1, s1) = if s < 0 {
+        losses.push(format!(
+            "a value is no longer rounded to a multiple of {} on the way in, since {label}'s scale cannot be \
+             negative",
+            power_of_ten(-s)
+        ));
+        (p - s, 0)
+    } else if s > p {
+        losses.push(format!(
+            "a value from {} up to 1 is now accepted, since {label}'s scale cannot exceed its precision",
+            power_of_ten(p - s)
+        ));
+        (s, s)
+    } else {
+        (p, s)
+    };
+    let before_point = p1 - s1;
+    let kept_before = before_point.min(max_p);
+    let kept_after = s1.min(max_s).min(max_p - kept_before);
+    if losses.is_empty() && kept_before == before_point && kept_after == s1 {
+        return (format!("{name}{args}"), None);
+    }
+    if kept_after < s1 {
+        losses.push(rounded_to(kept_after));
+    }
+    if kept_before < before_point {
+        losses.push(format!(
+            "a value with more than {kept_before} digits before the point is refused"
+        ));
+    }
+    let to = format!("{name}({},{kept_after})", kept_before + kept_after);
+    (
+        to.clone(),
+        Some(format!(
+            "{label}'s {name} holds {holds}, so `numeric{args}` is {to} — {}",
+            losses.join(", and ")
+        )),
+    )
+}
+
+/// What SQLite's NUMERIC loses of `numeric(p,s)`, if anything.
+///
+/// SQLite keeps a NUMERIC value as a 64-bit integer when it is a whole number
+/// that fits one — any 18 digits do — and otherwise as an 8-byte float, of
+/// which "only the first 15 significant decimal digits of the number are
+/// preserved" ("Datatypes In SQLite": Type Affinity). Enforcing no precision
+/// or scale is SQLite's convention, as its TEXT enforces no length, and is not
+/// reported; losing digits is.
+fn sqlite_numeric_loss(declared: Option<(i64, i64)>) -> Option<String> {
+    let exact = match declared {
+        Some((p, s)) if s <= 0 => p - s <= 18,
+        Some((p, _)) => p <= 15,
+        None => false,
+    };
+    (!exact).then(|| {
+        "SQLite stores a NUMERIC value as a 64-bit integer when it is a whole number that fits one, and \
+         otherwise as a floating-point number that keeps 15 significant digits — so a value with more \
+         digits than that is rounded"
+            .to_string()
+    })
+}
+
+/// MySQL's fractional-seconds precision for a PostgreSQL time or timestamp
+/// declared with `args`. MySQL's default is whole seconds where PostgreSQL's
+/// is microseconds, so a bare TIME or DATETIME rounded every value to the
+/// second ("Fractional Seconds in Time Values"); both top out at 6.
+fn mysql_fsp(args: &str) -> String {
     if args.is_empty() {
-        fallback.to_string()
+        "(6)".to_string()
     } else {
         args.to_string()
     }
@@ -2217,7 +2769,15 @@ fn column_default(
         // `now()` on a `date` column is today's date; MySQL refuses
         // CURRENT_TIMESTAMP on a DATE column.
         PgDefault::Now if base != "date" => match target {
-            Target::MySql | Target::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+            // At the column's own fractional precision: MySQL refuses a
+            // DATETIME(6) defaulting to CURRENT_TIMESTAMP — "the same value
+            // must be used throughout the column definition" ("Automatic
+            // Initialization and Updating for TIMESTAMP and DATETIME").
+            Target::MySql => match ty.trim().to_uppercase().split_once('(') {
+                Some(("DATETIME" | "TIMESTAMP", precision)) => format!("CURRENT_TIMESTAMP({precision}"),
+                _ => "CURRENT_TIMESTAMP".to_string(),
+            },
+            Target::Sqlite => "CURRENT_TIMESTAMP".to_string(),
             Target::TSql => "SYSDATETIMEOFFSET()".to_string(),
         },
         PgDefault::Now | PgDefault::Today => match target {
@@ -2297,7 +2857,11 @@ fn column_default(
     // MySQL takes a default on a TEXT, BLOB or JSON column only as an
     // expression (8.0.13 and later): `('open')`, never `'open'`.
     let ty_base = ty.split('(').next().unwrap_or(ty).trim().to_uppercase();
-    let needs_expression = target == Target::MySql && matches!(ty_base.as_str(), "TEXT" | "BLOB" | "JSON");
+    let needs_expression = target == Target::MySql
+        && matches!(
+            ty_base.as_str(),
+            "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "JSON"
+        );
     if needs_expression && !mapped.starts_with('(') && mapped != "NULL" {
         return Some(format!("({mapped})"));
     }

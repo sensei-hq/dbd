@@ -17,12 +17,28 @@ pub(crate) struct ResetOptions {
     pub allow_scope_change: bool,
 }
 
-/// The platform whose own schemas reset must leave alone: `--target` when
-/// given, otherwise the design's target (its first `target:` key), otherwise
-/// plain `postgres`. Defaulting to `postgres` regardless of the design let a
-/// Supabase project's `reset --schemas` drop `public`.
+/// The targets `reset` has a script for — what `--target` accepts.
+const RESET_TARGETS: &[&str] = &["postgres", "supabase", "sqlite"];
+
+/// The platform reset runs for: `--target` when given, otherwise the design's
+/// target (its first `target:` key), otherwise plain `postgres`. It decides
+/// the dialect of the drops and which schemas reset must leave alone.
+/// Defaulting to `postgres` regardless of the design let a Supabase project's
+/// `reset --schemas` drop `public`, and ran PostgreSQL's drops on SQLite.
 fn reset_target<'a>(flag: Option<&'a str>, design: &'a Design) -> &'a str {
     flag.or_else(|| design.config().default_target()).unwrap_or("postgres")
+}
+
+/// Refuse, before connecting, a target reset has no script for. clap refuses
+/// such a `--target`; this catches the design's own (a `convex:` target).
+fn check_reset_target(target: &str) -> Result<()> {
+    if !RESET_TARGETS.contains(&target) {
+        anyhow::bail!(
+            "reset supports the {} targets; this design's target is `{target}`",
+            RESET_TARGETS.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,25 +65,40 @@ pub async fn cmd_reset(
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
     let target = reset_target(target, &design);
+    check_reset_target(target)?;
+    if target == "sqlite" && (drop_schemas || drop_extensions) {
+        output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
+    }
 
     if dry_run {
         // A preview of a reset the real run would refuse is a false promise, so
         // with a database to ask, ask it first. With none configured the plan
         // is all there is to show, and the dry run stays database-free.
-        if let Some(url) = super::configured_database_url(config, database_url)? {
-            let adapter = get_adapter(config, Some(&url)).await?;
+        // The roles the real run keeps are asked of the same database, so the
+        // preview does not list a `DROP ROLE` the run will not perform.
+        let mut kept = Vec::new();
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+            kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
         }
+        let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
         let sql = design
-            .reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?
+            .reset_script_keeping(target, drop_schemas, drop_extensions, Some(&resolved), &keep)?
             .unwrap_or_else(|| "-- nothing to drop".to_string());
         output::info(verbosity, "[dry-run] Reset would run:");
         output::always(&sql);
+        let preview = dbd_core::ResetComplete {
+            roles_kept: kept,
+            ..Default::default()
+        };
+        for line in kept_role_lines(&preview) {
+            output::info(verbosity, &format!("[dry-run] {line}"));
+        }
         return Ok(());
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    reset_with_adapter(
+    let summary = reset_with_adapter(
         &*adapter,
         &design,
         target,
@@ -77,7 +108,74 @@ pub async fn cmd_reset(
         &resolved,
         allow_scope_change,
     )
-    .await
+    .await?;
+    for line in format_reset_summary(&summary) {
+        output::info(verbosity, &line);
+    }
+    Ok(())
+}
+
+/// What a reset did, as `dbd reset` prints it: what it dropped, counted by
+/// kind — and the roles by name, since a role outlives any one database — or
+/// that it found nothing to drop. It printed nothing at all, so a reset that
+/// emptied the schema and one that found nothing looked the same.
+pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    use dbd_core::EntityType;
+    if summary.dropped.is_empty() {
+        let mut lines = vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
+        lines.extend(kept_role_lines(summary));
+        return lines;
+    }
+    let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts: Vec<String> = [
+        (EntityType::Function, "function", "functions"),
+        (EntityType::Procedure, "procedure", "procedures"),
+        (EntityType::MaterializedView, "materialized view", "materialized views"),
+        (EntityType::View, "view", "views"),
+        (EntityType::Table, "table", "tables"),
+        (EntityType::Sequence, "sequence", "sequences"),
+        (EntityType::Enum, "enum", "enums"),
+        (EntityType::Extension, "extension", "extensions"),
+        (EntityType::Schema, "schema", "schemas"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, one, many)| match summary.count(kind) {
+        0 => None,
+        n => Some(counted(n, one, many)),
+    })
+    .collect();
+    let roles: Vec<&str> = summary
+        .dropped
+        .iter()
+        .filter(|(kind, _)| *kind == EntityType::Role)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    if !roles.is_empty() {
+        parts.push(format!(
+            "{} ({})",
+            counted(roles.len(), "role", "roles"),
+            roles.join(", ")
+        ));
+    }
+    let mut lines = vec![format!("Reset dropped {}.", parts.join(", "))];
+    lines.extend(kept_role_lines(summary));
+    lines
+}
+
+/// One line per role the reset kept: which, and the databases that hold it.
+fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    summary
+        .roles_kept
+        .iter()
+        .map(|k| {
+            format!(
+                "Role {} kept: it holds privileges or objects in database {} — roles are server-wide, \
+                 and dropping it would break that database.",
+                k.role,
+                k.databases.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
@@ -95,12 +193,11 @@ pub(crate) async fn reset_with_adapter(
     drop_extensions: bool,
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
-) -> Result<()> {
+) -> Result<dbd_core::ResetComplete> {
     check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
-    design
+    Ok(design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
-        .await?;
-    Ok(())
+        .await?)
 }
 
 /// Every guard a reset checks before it drops anything, read-only: the scope

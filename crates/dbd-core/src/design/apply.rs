@@ -17,6 +17,94 @@ impl Design {
         Ok(self.gated_apply_set(name, scope)?.1)
     }
 
+    /// The pending migrations [`Self::apply`] would run against `adapter`'s
+    /// database: the migration steps of the plan it builds there — from the
+    /// version the database records, under the same gates and scope — each
+    /// with the statements of the files it runs. Writes nothing.
+    ///
+    /// `apply --dry-run` listed entities and never these, though the run
+    /// executes them first — including a migration that drops a table. Built
+    /// from the run's own plan rather than from `migrations/`, so a preview
+    /// lists what the run does under a scope and not every file on disk; and a
+    /// drop of a table this database does not have is marked as skipped, as
+    /// the run skips it.
+    pub async fn pending_migration_preview(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<MigrationPreview> {
+        let (working_set, entities) = self.gated_apply_set(name, scope)?;
+        let to_version = self.config.project.version.unwrap_or(0);
+        // A batch adapter applies without an execution plan, so no migration runs.
+        if adapter.prefers_batch_apply() {
+            return Ok(MigrationPreview {
+                to_version,
+                ..Default::default()
+            });
+        }
+        let from_version = adapter.get_db_version().await?;
+        let pending = snapshot::pending_migrations(from_version, &self.project_dir);
+        let owned: Vec<Entity> = entities.iter().map(|e| (*e).clone()).collect();
+        let plan = build_execution_plan(&owned, from_version, to_version, &pending, working_set.as_ref());
+
+        let mut steps = Vec::new();
+        for step in &plan.steps {
+            match step {
+                ExecutionStep::CreateEntity(entity) => {
+                    let version = pending
+                        .iter()
+                        .find(|m| m.added.iter().any(|a| a == entity))
+                        .map_or(to_version, |m| m.to_version);
+                    steps.push(MigrationStepPreview {
+                        version,
+                        entity: entity.clone(),
+                        action: MigrationAction::Create,
+                        statements: Vec::new(),
+                        runs: true,
+                    });
+                }
+                ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_sql_path,
+                    migration_version,
+                } => {
+                    let mut statements = planned_statements(migration_sql_path)?;
+                    statements.extend(planned_statements(&migration_sql_path.with_extension("data.sql"))?);
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Migrate,
+                        statements,
+                        runs: true,
+                    });
+                }
+                ExecutionStep::DropEntity {
+                    entity_name,
+                    drop_sql_path,
+                    migration_version,
+                } => {
+                    let runs = drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some();
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Drop,
+                        statements: planned_statements(drop_sql_path)?,
+                        runs,
+                    });
+                }
+                ExecutionStep::ApplyEntity(_)
+                | ExecutionStep::RecordMigration { .. }
+                | ExecutionStep::SetVersion(_) => {}
+            }
+        }
+        Ok(MigrationPreview {
+            from_version,
+            to_version,
+            steps,
+        })
+    }
+
     /// The scope's working set and the entities an apply acts on, once every
     /// pre-write gate has passed. Shared by [`Self::apply`] and
     /// [`Self::entities_to_apply`] so a preview cannot pass what the run refuses.
@@ -117,15 +205,24 @@ impl Design {
         C: FnMut(ApplyComplete),
     {
         let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
+        // Before the first hook or write: a dev run against a database marked
+        // prod is refused, not left to re-mark it (see `check_env_guard`).
+        self.guard_env(adapter).await?;
+
+        // A project older than the database it points at is refused before
+        // anything runs — the `apply.before` hooks included — and under
+        // `dry_run` too, since the database is there to ask. Read without
+        // healing the bookkeeping, which is itself a write.
+        Self::check_version_guard(
+            adapter.get_db_version().await?,
+            self.config.project.version.unwrap_or(0),
+        )?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
@@ -247,11 +344,12 @@ impl Design {
             .copied()
             .filter(|e| e.entity_type == EntityType::MaterializedView)
             .collect();
-        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty() {
-            std::collections::HashSet::new()
+        let pre_existing_states = if applied_matviews.is_empty() {
+            std::collections::HashMap::new()
         } else {
-            adapter.matview_states().await?.into_keys().collect()
+            adapter.matview_states().await?
         };
+        let pre_existing_matviews: std::collections::HashSet<String> = pre_existing_states.keys().cloned().collect();
 
         // Wrap the whole plan in one transaction when the backend supports it,
         // so an interrupted upgrade rolls back to the prior schema instead of
@@ -319,7 +417,13 @@ impl Design {
         // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
         // hash onto one whose deployed definition may have drifted would mask
         // that drift. Runs after commit, so the object exists for the COMMENT.
-        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
+        let adopted = self
+            .verified_unstamped_matviews(adapter, &applied_matviews, &pre_existing_states)
+            .await?;
+        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews)
+            .into_iter()
+            .chain(adopted)
+        {
             adapter
                 .stamp_matview(
                     &crate::reconcile::qualified_entity_name(e),
@@ -395,7 +499,7 @@ impl Design {
                     let result = adapter.apply_entity(entity).await;
                     report_step_result(&desc, on_done, result)?;
                     counts.created += 1;
-                    counts.applied += 1;
+                    counts.applied(entity_name);
                 }
             }
             ExecutionStep::ApplyEntity(entity_name) => {
@@ -404,7 +508,7 @@ impl Design {
                     on_start(&desc);
                     let result = adapter.apply_entity(entity).await;
                     report_step_result(&desc, on_done, result)?;
-                    counts.applied += 1;
+                    counts.applied(entity_name);
                 }
             }
             ExecutionStep::MigrateEntity {
@@ -434,7 +538,7 @@ impl Design {
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
-                counts.migrated += 1;
+                counts.migrated(entity_name);
             }
             ExecutionStep::DropEntity {
                 entity_name,
@@ -481,6 +585,46 @@ impl Design {
         Ok(())
     }
 
+    /// The pre-existing matviews among `applied` that carry no stamp and whose
+    /// deployed definition is the design's — the ones apply may adopt.
+    ///
+    /// Apply stamps what it creates and leaves an existing matview alone,
+    /// because stamping one whose deployed definition may differ would vouch
+    /// for it and mask that drift. A matview dbd did not create is the
+    /// brownfield case (`init --from-db` read it from this very database): left
+    /// unstamped, every `dbd diff` reported it "not stamped by dbd" and the
+    /// round trip never converged. Checking the deployed definition first is
+    /// what makes stamping it safe. One already stamped keeps its stamp — a
+    /// stale one is drift to report, not to overwrite.
+    async fn verified_unstamped_matviews<'a>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        applied: &[&'a Entity],
+        pre_existing: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<Vec<&'a Entity>> {
+        let unstamped: Vec<&'a Entity> = applied
+            .iter()
+            .copied()
+            .filter(|e| {
+                pre_existing
+                    .get(&e.name)
+                    .is_some_and(|c| crate::reconcile::parse_dbd_hash(c.as_deref()).is_none())
+            })
+            .collect();
+        if unstamped.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live = adapter.live_matviews().await?;
+        Ok(unstamped
+            .into_iter()
+            .filter(|e| {
+                live.iter()
+                    .find(|l| l.name == e.name)
+                    .is_some_and(|l| crate::reconcile::same_matview_definition(e, l))
+            })
+            .collect())
+    }
+
     /// The grants a run under `scope` applies: schema → role → privileges.
     ///
     /// Every `schemas:` entry's `grants:`, with the target's `grants:` merged
@@ -515,11 +659,8 @@ impl Design {
     /// error here, as it is in the run.
     pub fn hook_skips(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
         let working_set = self.scope_working_set(scope)?;
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
         let mut skips = Vec::new();
         for (entries, kind) in [
             (&self.config.apply.before, hooks::HookKind::Before),
@@ -631,12 +772,13 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(DeployComplete),
     {
-        // The import phase's refusals (`Design::check_import_plan`) — a data
+        // The import phase's refusals (`Design::scoped_import_plan`) — a data
         // file outside `import.staging`, a staging table whose loader dbd
-        // cannot pick — are known before the first statement.
-        // Checked here, not when the import phase reaches them, so a refusal
-        // never leaves the deploy half done: schema applied, data not loaded.
-        self.check_import_plan(None)?;
+        // cannot pick, a loader the scope leaves out — are known before the
+        // first statement. Checked here, not when the import phase reaches
+        // them, so a refusal never leaves the deploy half done: schema
+        // applied, data not loaded.
+        self.scoped_import_plan(None, scope)?;
 
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
@@ -704,6 +846,66 @@ impl Design {
         });
         Ok(())
     }
+}
+
+/// The statements of a migration file, one line each, for a preview — empty
+/// when there is no such file, as the run then runs nothing for it.
+///
+/// Split and read by libpg_query, the grammar the run's server uses: the text
+/// is the parse tree deparsed (so comments and layout fall away), and whether
+/// a statement destroys something comes from its node, not from its spelling.
+/// A file the grammar cannot split is shown whole and unmarked — the run sends
+/// it as one script either way.
+fn planned_statements(path: &std::path::Path) -> Result<Vec<PlannedStatement>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let sql = crate::source_text::read_to_string(path)?;
+    let pieces: Vec<&str> = pg_query::split_with_parser(&sql).unwrap_or_else(|_| vec![sql.as_str()]);
+    Ok(pieces.into_iter().filter_map(planned_statement).collect())
+}
+
+/// One statement as [`planned_statements`] shows it, or `None` for a piece
+/// that holds no statement (a trailing comment).
+fn planned_statement(piece: &str) -> Option<PlannedStatement> {
+    use pg_query::NodeEnum;
+    let parsed = pg_query::parse(piece).ok();
+    if parsed.as_ref().is_some_and(|p| p.protobuf.stmts.is_empty()) {
+        return None;
+    }
+    let drops = parsed.as_ref().is_some_and(|p| {
+        p.protobuf
+            .stmts
+            .iter()
+            .filter_map(|s| s.stmt.as_ref().and_then(|n| n.node.as_ref()))
+            .any(|n| match n {
+                NodeEnum::DropStmt(_) | NodeEnum::TruncateStmt(_) => true,
+                NodeEnum::AlterTableStmt(a) => a.cmds.iter().any(|c| {
+                    matches!(
+                        c.node.as_ref(),
+                        Some(NodeEnum::AlterTableCmd(cmd))
+                            if cmd.subtype == pg_query::protobuf::AlterTableType::AtDropColumn as i32
+                                || cmd.subtype == pg_query::protobuf::AlterTableType::AtDropConstraint as i32
+                    )
+                }),
+                _ => false,
+            })
+    });
+    let text = parsed
+        .and_then(|p| p.deparse().ok())
+        .unwrap_or_else(|| piece.to_string());
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    // Long enough to name the statement and its target; a DO block or a long
+    // ALTER is cut rather than wrapped across the preview.
+    const WIDTH: usize = 120;
+    let text = match line.char_indices().nth(WIDTH) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line,
+    };
+    Some(PlannedStatement { text, drops })
 }
 
 #[cfg(test)]

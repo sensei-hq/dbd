@@ -201,6 +201,21 @@ async fn the_connecting_commands_name_the_scope_they_ran_under() {
         assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
     }
 
+    // An ad-hoc `-n X -f F` load is an import under the scope too.
+    std::fs::write(dir.join("nodes.jsonl"), "{\"id\": 1}\n").unwrap();
+    let o = dbd(
+        dir,
+        &url,
+        &["import", "-n", "hub.nodes", "-f", "nodes.jsonl", "--scope", "hub"],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(
+        scope_line(&o),
+        Some(expected.clone()),
+        "ad-hoc import:\n{}",
+        combined(&o)
+    );
+
     // `--json` keeps stdout a JSON document; the scope goes to stderr.
     let o = dbd(dir, &url, &["diff", "--json", "--scope", "hub"]);
     assert!(o.status.success(), "{}", combined(&o));
@@ -242,7 +257,9 @@ async fn export_counts_what_it_writes_and_names_what_the_scope_left_out() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     listed_export_project(dir);
-    assert!(dbd(dir, &url, &["apply"]).status.success());
+    // Built under the scope it exports: export refuses a database pinned to
+    // another scope, as apply does.
+    assert!(dbd(dir, &url, &["apply", "--scope", "app_only"]).status.success());
 
     let out = dir.join("out");
     let o = dbd(
@@ -507,7 +524,88 @@ fn exported_widgets(dir: &Path, url: &str) -> String {
         &["export", "-n", "app.widgets", "-f", "csv", "-o", out.to_str().unwrap()],
     );
     assert!(o.status.success(), "export failed: {}", combined(&o));
-    std::fs::read_to_string(out.join("widgets.csv")).expect("export wrote widgets.csv")
+    std::fs::read_to_string(out.join("app/widgets.csv")).expect("export wrote app/widgets.csv")
+}
+
+// ── Where an export writes ──────────────────────────────────────────────────
+
+/// `core.accounts` and `staging.accounts` — the shape of every project that
+/// stages a live table under its own name.
+fn same_named_tables_project(dir: &Path) {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: twins\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - staging\n  - core\n",
+    )
+    .unwrap();
+    for schema in ["staging", "core"] {
+        let t = dir.join(format!("ddl/table/{schema}"));
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join("accounts.ddl"),
+            format!("set search_path to {schema};\ncreate table if not exists accounts (id integer, name text);\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// `-o dir` wrote every table flat as `dir/<table>.<fmt>`, so the second of
+/// two same-named tables overwrote the first while the summary counted both.
+/// Each table gets `dir/<schema>/<table>.<fmt>` — the layout of the default
+/// `export/`, and the `import/<schema>/<table>` layout an import reads.
+#[tokio::test]
+async fn export_to_a_directory_keeps_same_named_tables_from_different_schemas_apart() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    same_named_tables_project(dir);
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::write(dir.join("staged.jsonl"), "{\"id\":1,\"name\":\"staged\"}\n").unwrap();
+    std::fs::write(dir.join("live.jsonl"), "{\"id\":2,\"name\":\"live\"}\n").unwrap();
+    for (table, file) in [("staging.accounts", "staged.jsonl"), ("core.accounts", "live.jsonl")] {
+        let o = dbd(dir, &url, &["import", "-n", table, "-f", file]);
+        assert!(o.status.success(), "{}", combined(&o));
+    }
+
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("Exporting 2 table(s)"), "{}", combined(&o));
+
+    let staged = std::fs::read_to_string(out.join("staging/accounts.csv")).expect("staging/accounts.csv");
+    let live = std::fs::read_to_string(out.join("core/accounts.csv")).expect("core/accounts.csv");
+    assert_eq!(staged, "id,name\n1,staged\n");
+    assert_eq!(live, "id,name\n2,live\n");
+    assert!(!out.join("accounts.csv").exists(), "nothing is written flat");
+}
+
+/// `-s` says where the project is, and the default `export/` is the
+/// project's — it was written under whatever directory dbd ran in.
+#[tokio::test]
+async fn the_default_export_directory_is_the_projects() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("project");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    project(&dir);
+    assert!(dbd(&dir, &url, &["apply"]).status.success());
+
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["export", "-s", dir.to_str().unwrap(), "-d", &url])
+        .current_dir(&elsewhere)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(
+        dir.join("export/app/widgets.csv").exists(),
+        "written under the project: {}",
+        combined(&o)
+    );
+    assert!(!elsewhere.join("export").exists(), "and not where dbd ran");
 }
 
 /// `dbd import -n <table> -f <file>.jsonl` loads one file outside the import
@@ -587,7 +685,7 @@ fn unversioned_scoped_project(dir: &Path) {
 /// same way. Without one it stays a database-free preview.
 #[tokio::test]
 async fn reset_dry_run_refuses_where_the_real_reset_would() {
-    let (_pg, url) = start_pg().await;
+    let (pg, url) = start_pg().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     unversioned_scoped_project(dir);
@@ -620,12 +718,11 @@ async fn reset_dry_run_refuses_where_the_real_reset_would() {
     );
 
     // ── A database pinned to another scope ──
-    // `-e dev`: `-e` defaults to prod, and the prod guard must not be what fires.
-    let o = dbd(
-        dir,
-        &url,
-        &["apply", "-e", "dev", "--scope", "hub", "--allow-scope-change"],
-    );
+    // A dev database of its own: `-e` defaults to prod, and the prod guard must
+    // not be what fires — and a dev run may not re-mark the prod one above.
+    pg.create_database("pinned").await.unwrap();
+    let url = pg.settings().url("pinned");
+    let o = dbd(dir, &url, &["apply", "-e", "dev", "--scope", "hub"]);
     assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
 
     let real = dbd(dir, &url, &["reset"]);
@@ -751,6 +848,608 @@ async fn a_scoped_apply_that_fails_still_names_the_hook_it_skipped() {
     assert!(
         combined(&o).contains("before-script sql/seed_users.sql skipped"),
         "the failure must still name the skipped hook: {}",
+        combined(&o)
+    );
+}
+
+// ── reconcile runs the design's grants and apply hooks ───────────────────────
+
+/// `reconcile` is the pre-release `apply`, and a reconciled database must be the
+/// one an apply builds. It never ran the design's grants or its `apply.before`
+/// / `apply.after` hooks, so a role had no access to a schema it was granted
+/// and a hook's setup or seed data never happened. The after-hook writes a table
+/// only reconcile creates, so it can only succeed after the writes.
+#[tokio::test]
+async fn reconcile_runs_the_designs_grants_and_apply_hooks() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\nsource:\n  dialect: postgresql\n\
+         schemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+         \x20   grants:\n      app:\n        app_reader: [usage, select]\n\
+         apply:\n  before:\n    - sql/before.sql\n  after:\n    - sql/after.sql\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/before.sql"),
+        "create schema if not exists hooks;\ncreate table if not exists hooks.log (step text);\n\
+         insert into hooks.log values ('before');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("sql/after.sql"),
+        "insert into app.t (id) values (1);\ninsert into hooks.log values ('after');\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["reconcile"]);
+    assert!(o.status.success(), "reconcile failed: {}", combined(&o));
+
+    // Each predicate must hold, checked in the database through dbd-core's own
+    // adapter: a DO block that raises names what is missing.
+    let adapter = dbd_core::connect(&url, "clilive").await.unwrap();
+    for (predicate, what) in [
+        (
+            "SELECT 1 WHERE (SELECT string_agg(step, ',' ORDER BY step DESC) FROM hooks.log) = 'before,after'",
+            "both hooks' rows",
+        ),
+        (
+            "SELECT 1 FROM app.t WHERE id = 1",
+            "the after-hook's row in a table reconcile created",
+        ),
+        (
+            "SELECT 1 WHERE has_schema_privilege('app_writer', 'app', 'USAGE') \
+             AND has_schema_privilege('app_reader', 'app', 'USAGE')",
+            "the schema grants",
+        ),
+    ] {
+        let sql = format!(
+            "DO $$ BEGIN IF NOT EXISTS ({predicate}) THEN RAISE EXCEPTION '{} missing'; END IF; END $$",
+            what.replace('\'', "''")
+        );
+        adapter
+            .execute_script(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}\n{}", combined(&o)));
+    }
+}
+
+// ── source.search_path is the path a pathless file runs on ──────────────────
+
+/// `psql` from the embedded server's own installation, so a script is run the
+/// way a user runs `combine`'s output — not through dbd's adapter, which
+/// rewrites what it executes.
+fn psql(pg: &PostgreSQL, url: &str, args: &[&str]) -> Output {
+    std::process::Command::new(pg.settings().binary_dir().join("psql"))
+        .arg(url)
+        .args(["-X", "-q", "-v", "ON_ERROR_STOP=1"])
+        .args(args)
+        .output()
+        .expect("psql failed to run")
+}
+
+/// The schema a table named `name` landed in, one per line.
+fn schemas_of(pg: &PostgreSQL, url: &str, name: &str) -> String {
+    let o = psql(
+        pg,
+        url,
+        &[
+            "-tA",
+            "-c",
+            &format!("select schemaname from pg_tables where tablename = '{name}' order by 1"),
+        ],
+    );
+    assert!(o.status.success(), "psql query failed: {}", combined(&o));
+    stdout(&o).trim().to_string()
+}
+
+/// `source.search_path` is what the parser resolves a file with no `SET
+/// search_path` against: `ddl/table/app/a.ddl` holding a bare `create table a`
+/// is `app.a`, and `inspect` says so. Nothing ran it there. The DDL ran on the
+/// session's own path, so the table landed in `public`, `diff` then reported
+/// `+ create app.a`, and reconcile never converged on its own diff.
+///
+/// Every path that runs or writes the file has to use the path the parser
+/// used: `apply`, `reconcile` on a fresh database, and the script `combine`
+/// writes, run as a user runs it — with `psql`.
+#[tokio::test]
+async fn a_file_with_no_search_path_runs_on_source_search_path() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: pathless\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/a.ddl"),
+        "create table if not exists a (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &url, "a"),
+        "app",
+        "apply builds it where the parser read it"
+    );
+
+    let o = dbd(dir, &url, &["diff"]);
+    assert!(o.status.success(), "diff failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("in sync"),
+        "and the design's own diff is then empty: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["reconcile", "--dry-run"]);
+    assert!(o.status.success(), "reconcile --dry-run failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("Already in sync"),
+        "so reconcile has nothing to do: {}",
+        combined(&o)
+    );
+
+    // A fresh database, built by reconcile.
+    pg.create_database("by_reconcile").await.unwrap();
+    let reconciled = pg.settings().url("by_reconcile");
+    let o = dbd(dir, &reconciled, &["reconcile"]);
+    assert!(o.status.success(), "reconcile failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &reconciled, "a"),
+        "app",
+        "reconcile builds it there too"
+    );
+
+    // A fresh database, built from the combined script by psql.
+    let o = dbd(dir, &url, &["combine", "-f", "combined.sql"]);
+    assert!(o.status.success(), "combine failed: {}", combined(&o));
+    pg.create_database("by_psql").await.unwrap();
+    let scripted = pg.settings().url("by_psql");
+    let o = psql(&pg, &scripted, &["-f", dir.join("combined.sql").to_str().unwrap()]);
+    assert!(o.status.success(), "psql -f combined.sql failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &scripted, "a"),
+        "app",
+        "the combined script runs like apply"
+    );
+}
+
+// ── Every command that reaches a pinned database checks the pin ─────────────
+
+/// `apply`, `deploy`, `reconcile`, `reset` and `policies` refuse another scope
+/// on a database pinned to one. `refresh` did not: on a `hub` database it
+/// refreshed the other scope's matview and failed partway. And the `policies`,
+/// `apply` and `deploy` dry runs, given a database with `-d`, never asked it
+/// for its pin — previewing a run the guard then refused.
+///
+/// Each now checks the pin whenever it has a database to ask, and lets the
+/// pinned scope (or `--allow-scope-change`, where the run takes it) through.
+#[tokio::test]
+async fn refresh_and_the_dry_runs_refuse_another_scope_on_a_pinned_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let mv = dir.join("ddl/materialized_view/app");
+    std::fs::create_dir_all(&mv).unwrap();
+    std::fs::write(
+        mv.join("user_count.ddl"),
+        "set search_path to app;\ncreate materialized view if not exists user_count as select count(*) as n from users;\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("policies/app")).unwrap();
+    std::fs::write(
+        dir.join("policies/app/users.sql"),
+        "alter table app.users enable row level security;\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    for args in [
+        &["refresh"][..],
+        &["policies", "--dry-run"],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?} on a hub database: {}", combined(&o));
+        assert!(
+            combined(&o).contains("pinned to scope 'hub'"),
+            "{args:?} is refused by the scope guard, naming the pin: {}",
+            combined(&o)
+        );
+    }
+
+    for args in [
+        &["refresh", "--scope", "hub"][..],
+        &["policies", "--dry-run", "--scope", "hub"],
+        &["apply", "--dry-run", "--scope", "hub"],
+        &["deploy", "--dry-run", "--scope", "hub"],
+        &["apply", "--dry-run", "--allow-scope-change"],
+        &["deploy", "--dry-run", "--allow-scope-change"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?} is let through: {}", combined(&o));
+    }
+}
+
+// ── apply --dry-run names the pending migrations ────────────────────────────
+
+/// `dbd <args>` with no database: no `-d`, and no `$DATABASE_URL` to fall back on.
+fn dbd_offline(dir: &Path, args: &[&str]) -> Output {
+    Command::cargo_bin("dbd")
+        .unwrap()
+        .args(args)
+        .args(["-c", dir.join("design.yaml").to_str().unwrap()])
+        .env_remove("DATABASE_URL")
+        .current_dir(dir)
+        .output()
+        .expect("dbd failed to run")
+}
+
+/// `apply --dry-run` listed the entities it would apply and never the pending
+/// migrations — not even one that drops a table — though the run executes them
+/// first. With a database to read the recorded version from, the preview lists
+/// each migration step the run would take and the statements it runs, a drop
+/// marked; with none, it says it cannot.
+#[tokio::test]
+async fn apply_dry_run_lists_the_pending_migrations() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let legacy = dir.join("ddl/table/app/legacy.ddl");
+    std::fs::write(
+        &legacy,
+        "set search_path to app;\ncreate table if not exists legacy (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "v1"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::remove_file(&legacy).unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "drop legacy"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "apply --dry-run failed: {}", combined(&o));
+    let out = stdout(&o);
+    assert!(
+        out.lines()
+            .any(|l| l.contains("DROP TABLE") && l.contains("app.legacy") && l.trim_start().starts_with('⚠')),
+        "the drop is listed, and marked: {out}"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("v2") && l.contains("app.legacy")),
+        "under the version that drops it: {out}"
+    );
+
+    let o = dbd_offline(dir, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "the offline preview still runs: {}", combined(&o));
+    assert!(
+        combined(&o).contains("pending migrations are not listed"),
+        "and says what it cannot show: {}",
+        combined(&o)
+    );
+}
+
+// ── An older project does not apply to a newer database ─────────────────────
+
+/// A branch at v1 pointed at a database at v2 planned as "current": it
+/// re-applied v1's DDL over v2's schema and printed "Already up to date (v2)".
+/// `apply`, `deploy` and their dry runs given the database refuse it before
+/// anything runs, naming both versions and the way out, as the scope and prod
+/// guards refuse. The database keeps v2; an offline dry run, which cannot know
+/// the version, still previews.
+#[tokio::test]
+async fn an_older_project_is_refused_on_a_newer_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let o = dbd(dir, &url, &["snapshot", "-n", "v1"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let gadgets = dir.join("ddl/table/app/gadgets.ddl");
+    std::fs::write(
+        &gadgets,
+        "set search_path to app;\ncreate table if not exists gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "v2"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    // Check out the v1 revision: its design.yaml, snapshots and DDL.
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    assert!(yaml.contains("version: 2"), "{yaml}");
+    std::fs::write(dir.join("design.yaml"), yaml.replace("version: 2", "version: 1")).unwrap();
+    std::fs::remove_file(dir.join("snapshots/002.json")).unwrap();
+    std::fs::remove_dir_all(dir.join("migrations/002")).unwrap();
+    std::fs::remove_file(&gadgets).unwrap();
+
+    for args in [
+        &["apply"][..],
+        &["deploy"],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?} must refuse: {}", combined(&o));
+        let out = combined(&o);
+        assert!(
+            out.contains("at v2") && out.contains("at v1") && out.contains("newer revision"),
+            "{args:?} names both versions and what to do: {out}"
+        );
+    }
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    assert!(
+        stdout(&o).contains("Database version: 002"),
+        "the database keeps v2: {}",
+        combined(&o)
+    );
+    let o = dbd_offline(dir, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "offline, the preview still runs: {}", combined(&o));
+}
+
+// ── a dev run against a prod database is refused ────────────────────────────
+
+/// The audit's repro: `apply -e prod`, then a dev run of apply, deploy,
+/// reconcile or import. Each re-marked the database `dev`, so `reset` — which
+/// refuses a prod database — went ahead. Each must exit non-zero naming the
+/// database's env and the way out, and `reset` must stay refused.
+#[tokio::test]
+async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays_refused() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::create_dir_all(dir.join("import/dev/app")).unwrap();
+    std::fs::write(dir.join("import/dev/app/widgets.csv"), "id,name\n7,dev-seed\n").unwrap();
+
+    let o = dbd(dir, &url, &["-e", "prod", "apply"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+
+    for command in [&["apply"][..], &["deploy"], &["reconcile"], &["import"]] {
+        let args = [&["-e", "dev"][..], command].concat();
+        let o = dbd(dir, &url, &args);
+        assert!(
+            !o.status.success(),
+            "`dbd {}` must be refused on a prod database: {}",
+            args.join(" "),
+            combined(&o)
+        );
+        assert!(
+            combined(&o).contains("marked prod") && combined(&o).contains("-e prod"),
+            "`dbd {}` must name the env and what to do: {}",
+            args.join(" "),
+            combined(&o)
+        );
+    }
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(
+        !o.status.success() && combined(&o).contains("prod"),
+        "reset must stay refused on the prod database: {}",
+        combined(&o)
+    );
+    let csv = exported_widgets(dir, &url);
+    assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
+}
+
+// ── init --from-db writes a project that applies ────────────────────────────
+
+/// A database with every kind of object `init --from-db` captures.
+const BROWNFIELD: &str = "\
+    CREATE EXTENSION \"uuid-ossp\";
+    CREATE EXTENSION citext;
+    CREATE SCHEMA app;
+    CREATE TYPE app.mood AS ENUM ('happy', 'sad');
+    CREATE SEQUENCE app.ticket_seq START 100;
+    CREATE TABLE app.regions (id int PRIMARY KEY, name citext NOT NULL);
+    CREATE TABLE app.people (
+      id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      region_id int,
+      mood app.mood,
+      ticket int DEFAULT nextval('app.ticket_seq'),
+      CONSTRAINT people_region_fk FOREIGN KEY (region_id) REFERENCES app.regions (id)
+    );
+    CREATE INDEX people_mood_idx ON app.people (mood);
+    CREATE TABLE app.counters (id serial PRIMARY KEY, n int NOT NULL DEFAULT 0);
+    CREATE VIEW app.people_v AS SELECT id, mood FROM app.people;
+    CREATE MATERIALIZED VIEW app.mood_counts AS SELECT mood, count(*) AS n FROM app.people GROUP BY mood;
+    CREATE INDEX mood_counts_idx ON app.mood_counts (mood);";
+
+/// The documented brownfield path, end to end. `init --from-db` wrote
+/// `ddl/extension/<name>.ddl` — a folder the scanner does not read, so
+/// `inspect` and `apply` exited 1 on any database with an extension — and DDL
+/// that was not idempotent (`create sequence`, `CREATE TABLE` with no
+/// `IF NOT EXISTS`), so applying the project back to the database it came
+/// from failed with `already exists`. The reversed project must inspect
+/// clean, apply to its own database and to a fresh one, and leave no drift on
+/// either.
+#[tokio::test]
+async fn a_reverse_engineered_project_applies_to_its_own_database_and_to_a_fresh_one_without_drift() {
+    let (pg, url) = start_pg().await;
+    dbd_core::connect(&url, "brownfield")
+        .await
+        .unwrap()
+        .execute_script(BROWNFIELD)
+        .await
+        .expect("build the brownfield database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    assert!(
+        !dir.join("ddl/extension").exists(),
+        "extensions belong in design.yaml, not a folder the scanner does not read"
+    );
+
+    let o = dbd(dir, &url, &["inspect"]);
+    assert!(
+        o.status.success(),
+        "inspect of the reversed project failed: {}",
+        combined(&o)
+    );
+
+    // Back to the database it came from.
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply to its own database failed: {}", combined(&o));
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on its own database: {}", combined(&o));
+
+    // And to a database that has none of it.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = pg.settings().url("fresh");
+    let o = dbd(dir, &fresh, &["apply"]);
+    assert!(o.status.success(), "apply to a fresh database failed: {}", combined(&o));
+    let o = dbd(dir, &fresh, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on the fresh database: {}", combined(&o));
+}
+
+// ── init --from-db says what it leaves out ──────────────────────────────────
+
+/// On a database with Supabase's `auth` and `storage` schemas, the platform
+/// schemas are left out — and `init --from-db` dropped them without a word,
+/// and wrote nothing for the foreign key into `auth.users`. Every schema left
+/// out is named with the reason, and the referenced table is declared
+/// `external:`, so the project inspects clean.
+#[tokio::test]
+async fn init_from_db_names_every_schema_it_leaves_out_and_declares_what_a_foreign_key_reaches() {
+    let (_pg, url) = start_pg().await;
+    dbd_core::connect(&url, "platform")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid PRIMARY KEY);
+             CREATE SCHEMA storage; CREATE TABLE storage.objects (id uuid PRIMARY KEY);
+             CREATE SCHEMA extensions; CREATE EXTENSION pgcrypto WITH SCHEMA extensions;
+             CREATE SCHEMA audit; CREATE TABLE audit.log (id int PRIMARY KEY);
+             CREATE SCHEMA app;
+             CREATE TABLE app.profiles (id uuid PRIMARY KEY REFERENCES auth.users (id));",
+        )
+        .await
+        .expect("build the database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db", "--exclude-schema", "audit"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    let said = combined(&o);
+    for (schema, why) in [
+        ("auth", "Supabase"),
+        ("storage", "Supabase"),
+        ("extensions", "Supabase"),
+        ("audit", "--exclude-schema"),
+    ] {
+        assert!(
+            said.lines()
+                .any(|l| l.contains(&format!("`{schema}`")) && l.contains(why)),
+            "`{schema}` must be named as left out ({why}): {said}"
+        );
+    }
+    assert!(
+        said.lines().any(|l| l.contains("`pgcrypto`")),
+        "an extension left out with its schema must be named too: {said}"
+    );
+
+    let config = dbd_core::config::read(&dir.join("design.yaml")).unwrap();
+    let externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(externals, vec!["auth.users"]);
+
+    let o = dbd(dir, &url, &["inspect"]);
+    assert!(o.status.success(), "inspect failed: {}", combined(&o));
+    assert!(
+        !combined(&o).contains("auth.users"),
+        "the declared external must resolve: {}",
+        combined(&o)
+    );
+}
+
+// ── reset says what it did ──────────────────────────────────────────────────
+
+/// `dbd reset` printed nothing on success, so a reset that dropped the whole
+/// schema and one that found nothing to drop looked the same. It counts what
+/// it dropped, by kind — and says when there was nothing.
+#[tokio::test]
+async fn reset_reports_what_it_dropped() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    unversioned_scoped_project(dir);
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "reset failed: {}", combined(&o));
+    let said = stdout(&o);
+    assert!(
+        said.contains("dropped") && said.contains("1 table") && said.contains("1 view"),
+        "reset must count what it dropped: {said}"
+    );
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "a second reset failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("nothing"),
+        "a reset that finds nothing to drop says so: {}",
+        stdout(&o)
+    );
+}
+
+// ── reset keeps a role another database holds, and says so ──────────────────
+
+/// Roles are server-wide, so two databases built from one design share them.
+/// `dbd reset` of one failed claiming the role "holds privileges dbd did not
+/// grant", which dbd had granted — in the other database. The reset keeps the
+/// role, completes, and says which role it kept and the database that holds it.
+#[tokio::test]
+async fn reset_keeps_a_role_another_database_holds_and_names_that_database() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("other_db").await.unwrap();
+    let other = pg.settings().url("other_db");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\n\
+         schemas:\n  - app:\n      grants:\n        live_writer: [usage, select]\n\n\
+         target:\n  postgres:\n    roles:\n      - name: live_writer\n",
+    )
+    .unwrap();
+
+    for db in [&url, &other] {
+        let o = dbd(dir, db, &["-e", "dev", "apply"]);
+        assert!(o.status.success(), "apply failed: {}", combined(&o));
+    }
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "reset failed: {}", combined(&o));
+    assert!(
+        stdout(&o)
+            .lines()
+            .any(|l| l.contains("live_writer") && l.contains("kept") && l.contains("other_db")),
+        "reset must say which role it kept and which database holds it: {}",
         combined(&o)
     );
 }

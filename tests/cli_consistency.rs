@@ -187,6 +187,30 @@ fn apply_and_deploy_dry_runs_name_a_hook_the_scope_skips() {
     }
 }
 
+/// `deploy` runs the import's `import.after` hooks too, and skips one whose
+/// tables the scope leaves out exactly as `import` does. `import --dry-run`
+/// named the skip; `deploy --dry-run` said nothing of it.
+#[test]
+fn deploy_dry_run_names_an_import_after_hook_the_scope_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    let yaml = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        &format!("{yaml}\nimport:\n  after:\n    - sql/after_import.sql\n"),
+    );
+    write(tmp.path(), "sql/after_import.sql", "update app.users set id = id;\n");
+
+    let out = dbd(tmp.path(), &["deploy", "--dry-run", "--scope", "hub"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("sql/after_import.sql skipped") && stderr(&out).contains("app.users"),
+        "deploy --dry-run must name the skipped import.after hook and why: {}",
+        stderr(&out)
+    );
+}
+
 // ── a document says what it leaves out ──────────────────────────────────────
 
 /// `dbml` and `diagram` cannot document a file dbd could not read, and both
@@ -211,6 +235,38 @@ fn dbml_and_diagram_name_a_file_they_leave_out_because_it_does_not_parse() {
             stderr(&out)
         );
     }
+}
+
+/// `graph` left the file out of its nodes the same way, and said nothing. Its
+/// stdout is a JSON document (`dbd graph | jq`), so the file is named on stderr
+/// and stdout stays a document that parses — with `-v` too, whose node count
+/// was printed after the JSON on stdout.
+#[test]
+fn graph_names_a_file_it_leaves_out_on_stderr_and_keeps_stdout_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    for args in [&["graph"][..], &["graph", "-v"][..]] {
+        let out = dbd(tmp.path(), args);
+        assert!(out.status.success(), "{args:?} still writes: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("broken.ddl") && stderr(&out).contains("could not be parsed"),
+            "{args:?} must name the file it leaves out: {}",
+            stderr(&out)
+        );
+        let doc: serde_json::Value = serde_json::from_str(&stdout(&out))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout must be one JSON document ({e}):\n{}", stdout(&out)));
+        assert!(doc["nodes"].is_array(), "{args:?}: {doc}");
+    }
+
+    let scoped = dbd(tmp.path(), &["graph", "--scope", "hub"]);
+    assert!(scoped.status.success(), "{}", stderr(&scoped));
+    assert!(
+        !stderr(&scoped).contains("broken.ddl"),
+        "a file outside the scope is not missing from its graph: {}",
+        stderr(&scoped)
+    );
 }
 
 /// Like apply's refusal, the warning follows the scope: a file the scope does
@@ -984,4 +1040,368 @@ fn inspect_finds_the_files_of_a_project_given_by_relative_path() {
         stdout(&out)
     );
     assert!(out.status.success(), "{}", stdout(&out));
+}
+
+// ── An unset $DATABASE_URL is named, not parsed ─────────────────────────────
+
+/// `url: $DATABASE_URL` with the variable unset was passed through literally,
+/// and the driver reported `relative URL without a base` — true of the string
+/// `$DATABASE_URL`, and no help to anyone who just forgot to export it.
+#[test]
+fn an_unset_url_variable_is_named_with_how_to_set_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["apply"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("DATABASE_URL is not set"),
+        "the variable is named as unset: {err}"
+    );
+    assert!(err.contains("-d"), "and the way past it is given: {err}");
+    assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
+
+    // Exported but empty: clap hands the empty value over as `-d ""`, which
+    // names no database any more than an unset one does.
+    let out = Command::cargo_bin("dbd")
+        .unwrap()
+        .env("DATABASE_URL", "")
+        .arg("-s")
+        .arg(tmp.path())
+        .arg("apply")
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.contains("DATABASE_URL is empty"),
+        "an empty variable is named as empty: {err}"
+    );
+    assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
+}
+
+// ── A closed pipe ends the output quietly ───────────────────────────────────
+
+/// `dbd inspect | head` panicked — `failed printing to stdout: Broken pipe` —
+/// once `head` had what it wanted and closed the pipe. Every command prints
+/// through `println!`, so every command did; a reader closing early is how
+/// output is meant to be consumed, and the process should simply end.
+#[cfg(unix)]
+#[test]
+fn a_closed_pipe_ends_any_command_without_a_panic() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: big\nsource:\n  dialect: postgresql\n  search_path: [app]\nschemas:\n  - app\n",
+    );
+    // Far more output than a pipe buffers: one warning per pathless file.
+    for i in 0..2000 {
+        write(
+            tmp.path(),
+            &format!("ddl/table/app/t{i}.ddl"),
+            &format!("create table if not exists t{i} (id integer primary key);\n"),
+        );
+    }
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .env_remove("DATABASE_URL")
+        .arg("-s")
+        .arg(tmp.path())
+        .arg("inspect")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 16];
+    child.stdout.take().unwrap().read_exact(&mut first).unwrap();
+    // The read end is dropped here, as `head -1` closes it.
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "no panic on a closed pipe: {err}");
+    assert_ne!(out.status.code(), Some(101), "and no panic exit: {err}");
+}
+
+// ── A file that does not parse is not also missing a search path ────────────
+
+/// A file that fails to parse states no search path the parser could record,
+/// so it also got "states no `SET search_path`" — beside its parse error, for
+/// a file whose first line was `set search_path to app;`. The parse error is
+/// the finding; a pathless file that parses still gets its warning.
+#[test]
+fn a_file_that_does_not_parse_gets_no_search_path_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+    write(
+        tmp.path(),
+        "ddl/table/app/pathless.ddl",
+        "create table if not exists pathless (id integer primary key);\n",
+    );
+
+    let out = dbd(tmp.path(), &["inspect"]);
+    let report = format!("{}{}", stdout(&out), stderr(&out));
+    let warned = |file: &str| {
+        report
+            .lines()
+            .any(|l| l.contains(file) && l.contains("states no `SET search_path`"))
+    };
+    assert!(report.contains("broken.ddl"), "the parse error is reported: {report}");
+    assert!(!warned("broken.ddl"), "and nothing else about that file: {report}");
+    assert!(
+        warned("pathless.ddl"),
+        "a pathless file that parses still warns: {report}"
+    );
+}
+
+// ── doctor counts what it fixes as it counts what it finds ──────────────────
+
+/// `doctor` found "2 issues" — two plural folders — and `--fix` then reported
+/// "4 issues fixed": it counted every file it moved out of a folder whose
+/// singular already existed, and a folder it renamed whole as one.
+#[test]
+fn doctor_fixes_as_many_issues_as_it_finds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "design.yaml", "project:\n  name: d\nschemas:\n  - app\n");
+    write(
+        dir,
+        "ddl/table/app/x.ddl",
+        "set search_path to app;\ncreate table if not exists x (id integer);\n",
+    );
+    for t in ["a", "b", "c"] {
+        write(
+            dir,
+            &format!("ddl/tables/app/{t}.ddl"),
+            &format!("set search_path to app;\ncreate table if not exists {t} (id integer);\n"),
+        );
+    }
+    write(
+        dir,
+        "ddl/views/app/v.ddl",
+        "set search_path to app;\ncreate or replace view v as select 1 as one;\n",
+    );
+
+    let found = stdout(&dbd(dir, &["doctor"]));
+    assert!(found.contains("2 issues found."), "{found}");
+    let fixed = stdout(&dbd(dir, &["doctor", "--fix"]));
+    assert!(fixed.contains("2 issues fixed"), "the same two, fixed: {fixed}");
+}
+
+// ── an external name is not something inspect can check ─────────────────────
+
+/// `inspect -n auth.users` said "Everything looks ok — 1 entities, no issues"
+/// for a name declared `external:`, while `apply -n auth.users` refused it.
+/// apply is right: dbd has no DDL for an external and reads nothing of it, so
+/// there is nothing to inspect, and reporting it checked is the false all-clear
+/// a `-n` that selects nothing used to give.
+#[test]
+fn inspect_refuses_an_external_name_as_apply_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: ext\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: auth.users\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    );
+
+    let apply = dbd(dir, &["apply", "--dry-run", "-n", "auth.users"]);
+    assert!(!apply.status.success(), "precondition: apply refuses it");
+    let out = dbd(dir, &["inspect", "-n", "auth.users"]);
+    assert!(!out.status.success(), "inspect refuses it too: {}", stdout(&out));
+    assert!(stderr(&out).contains("external"), "saying why: {}", stderr(&out));
+    assert!(!stdout(&out).contains("Everything looks ok"), "{}", stdout(&out));
+}
+
+// ── an import counts tables ─────────────────────────────────────────────────
+
+/// A table with a shared data file and a dev-only one is one table. The
+/// import's preview counted its plan's data files, as the run's summary did.
+#[test]
+fn import_dry_run_counts_a_table_with_two_data_files_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: twofiles\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - staging\n",
+    );
+    write(
+        dir,
+        "ddl/table/staging/items.ddl",
+        "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+    );
+    write(dir, "import/staging/items.csv", "id\n1\n");
+    write(dir, "import/dev/staging/items.csv", "id\n2\n");
+
+    let out = dbd(dir, &["import", "--dry-run", "-e", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).matches("import staging.items").count(),
+        2,
+        "precondition: both files load: {}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("1 entities"), "one table: {}", stdout(&out));
+}
+
+// ── an ad-hoc import names its scope ────────────────────────────────────────
+
+/// Every scoped command prints `scope 'X': N of M entities`, and `import`
+/// does — except for an ad-hoc `-n X -f F` load, which said nothing about the
+/// scope it was checked against.
+#[test]
+fn an_adhoc_import_dry_run_names_its_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    write(tmp.path(), "nodes.csv", "id\n1\n");
+
+    let expected = dbd(tmp.path(), &["import", "--dry-run", "--scope", "hub"]);
+    let line = stdout(&expected)
+        .lines()
+        .find(|l| l.starts_with("scope 'hub'"))
+        .map(str::to_string)
+        .expect("precondition: the plan's dry run names the scope");
+
+    let nodes = tmp.path().join("nodes.csv");
+    let out = dbd(
+        tmp.path(),
+        &[
+            "import",
+            "--dry-run",
+            "-n",
+            "hub.nodes",
+            "-f",
+            nodes.to_str().unwrap(),
+            "--scope",
+            "hub",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == line),
+        "{line:?} in:\n{}",
+        stdout(&out)
+    );
+}
+
+// ── schemas and extensions belong in design.yaml ────────────────────────────
+
+/// `init --from-db` wrote each extension as `ddl/extension/<name>.ddl`, a
+/// folder the scanner does not read: `inspect` refused the project while
+/// `doctor` said "No issues found". Extensions and schemas are declared in
+/// design.yaml, and both commands must say so about a file in either folder.
+#[test]
+fn inspect_and_doctor_agree_that_extensions_and_schemas_are_declared_in_design_yaml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "design.yaml", "project:\n  name: folders\n\nschemas:\n  - app\n");
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id int);\n",
+    );
+    write(
+        dir,
+        "ddl/extension/citext.ddl",
+        "create extension if not exists \"citext\" with schema \"public\";\n",
+    );
+    write(dir, "ddl/schema/app.ddl", "create schema if not exists \"app\";\n");
+
+    let inspect = dbd(dir, &["inspect"]);
+    let said = format!("{}{}", stdout(&inspect), stderr(&inspect));
+    assert!(!inspect.status.success(), "inspect must refuse the file: {said}");
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("extensions:"),
+        "inspect must say where an extension is declared: {said}"
+    );
+
+    let doctor = dbd(dir, &["doctor"]);
+    let said = format!("{}{}", stdout(&doctor), stderr(&doctor));
+    assert!(
+        !said.contains("No issues found"),
+        "doctor must agree with inspect: {said}"
+    );
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("`citext`") && said.contains("extensions:"),
+        "doctor must name the extension file and the entry that replaces it: {said}"
+    );
+    assert!(
+        said.contains("ddl/schema/app.ddl") && said.contains("schemas:"),
+        "doctor must name the schema file dbd does not read: {said}"
+    );
+}
+
+// ── reset: the targets its help names, SQLite included ──────────────────────
+
+/// `reset --help` named postgres or supabase, `--target` accepted any word,
+/// and on a SQLite project — the design's own target — every reset failed on
+/// PostgreSQL's `"public"."items" CASCADE`. The values the help names are the
+/// ones accepted, and a SQLite database resets.
+#[test]
+fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
+    let help = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["reset", "--help"])
+        .output()
+        .unwrap();
+    let help = stdout(&help);
+    for target in ["postgres", "supabase", "sqlite"] {
+        assert!(help.contains(target), "--help must name `{target}`: {help}");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: lite\n\nsource:\n  dialect: sqlite\n\ntarget:\n  sqlite:\n    url: $DATABASE_URL\n\nschemas: []\n",
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+    write(
+        dir,
+        "ddl/table/parts.ddl",
+        "CREATE TABLE IF NOT EXISTS parts (id INTEGER PRIMARY KEY, item_id INTEGER REFERENCES items(id));\n",
+    );
+    let url = format!("sqlite://{}", dir.join("app.db").display());
+
+    let o = dbd(dir, &["reset", "--target", "mysql", "--dry-run"]);
+    assert!(!o.status.success(), "an unknown --target must be refused");
+    assert!(
+        stderr(&o).contains("sqlite"),
+        "and the refusal names what is accepted: {}",
+        stderr(&o)
+    );
+
+    let o = dbd(dir, &["-e", "dev", "apply", "-d", &url]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+    let o = dbd(dir, &["-e", "dev", "reset", "--dry-run"]);
+    assert!(o.status.success(), "reset --dry-run: {}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stdout(&o).contains("CASCADE") && !stdout(&o).contains("\"public\""),
+        "SQLite has neither CASCADE nor schemas: {}",
+        stdout(&o)
+    );
+    let o = dbd(dir, &["-e", "dev", "reset", "-d", &url]);
+    assert!(o.status.success(), "reset: {}{}", stdout(&o), stderr(&o));
+    let o = dbd(dir, &["-e", "dev", "apply", "-d", &url]);
+    assert!(
+        o.status.success(),
+        "the reset database applies again: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
 }

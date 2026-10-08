@@ -52,6 +52,15 @@ const JSONB_IMPORT_SCHEMA: &str = "dbd";
 /// See sensei-hq/dbd#6.
 const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
 
+/// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
+struct ColumnKind {
+    name: String,
+    /// `json`, `jsonb`, or a domain over either.
+    json: bool,
+    /// A stored or virtual generated column: computed, never written.
+    generated: bool,
+}
+
 /// `CALL` that moves staged rows into `target` via the internal import
 /// procedure. Both the procedure schema and the source table are pinned and
 /// fully-qualified so resolution never depends on the session `search_path`.
@@ -238,18 +247,88 @@ impl PostgresAdapter {
     }
 
     /// The columns of `table` (`schema.table`, or a bare name resolved through
-    /// the search_path), in table order. Empty when there is no such table:
-    /// `to_regclass` returns NULL for a missing relation instead of erroring.
-    async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT attname::text FROM pg_catalog.pg_attribute \
-             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
-             ORDER BY attnum",
+    /// the search_path; a table or a view), in table order, with what an
+    /// import and an export need to know of each. Empty when there is no such
+    /// relation: `to_regclass` returns NULL for a missing one instead of
+    /// erroring.
+    async fn column_kinds(&self, table: &str) -> Result<Vec<ColumnKind>> {
+        let rows = sqlx::query_as::<_, (String, bool, bool)>(
+            "SELECT a.attname::text, \
+                    coalesce(nullif(t.typbasetype, 0), t.oid) IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype), \
+                    a.attgenerated <> '' \
+             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
         )
         .bind(crate::sql_quote::qualified(table))
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
+        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, json, generated)| ColumnKind { name, json, generated })
+            .collect())
+    }
+
+    /// The columns of `table` an import loads `file` into, and the ones of
+    /// them that are generated — refusing a table that does not exist.
+    async fn import_columns(&self, table: &str, file: &Path) -> Result<(Vec<String>, Vec<String>)> {
+        let kinds = self.column_kinds(table).await?;
+        if kinds.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot import {} into {table}: no such table",
+                file.display()
+            )));
+        }
+        let generated = kinds.iter().filter(|c| c.generated).map(|c| c.name.clone()).collect();
+        Ok((kinds.into_iter().map(|c| c.name).collect(), generated))
+    }
+
+    /// Move each sequence that numbers one of `columns` of `table` — an
+    /// identity's, or a `serial`'s — past the largest value an import just
+    /// loaded into it.
+    ///
+    /// An import writes ids as they are in the file (COPY always did, and the
+    /// JSON load writes a `GENERATED ALWAYS` identity with `OVERRIDING SYSTEM
+    /// VALUE`), and neither moves the sequence. Left behind, it hands out the
+    /// loaded ids again, and the next insert fails on the primary key. A
+    /// sequence already past them is left alone.
+    async fn advance_sequences(&self, table: &str, columns: &[String]) -> Result<()> {
+        let qualified = crate::sql_quote::qualified(table);
+        let numbered: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.attname::text, pg_catalog.pg_get_serial_sequence($1, a.attname) \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attname::text = ANY($2) \
+               AND a.atttypid IN ('pg_catalog.int2'::regtype, 'pg_catalog.int4'::regtype, 'pg_catalog.int8'::regtype) \
+               AND pg_catalog.pg_get_serial_sequence($1, a.attname) IS NOT NULL",
+        )
+        .bind(&qualified)
+        .bind(columns)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the sequences of {table} failed: {e}")))?;
+        for (column, sequence) in numbered {
+            let sql = format!(
+                "SELECT pg_catalog.setval($1::regclass, m.v) \
+                 FROM (SELECT max({}) AS v FROM {qualified}) m, pg_catalog.pg_sequence q \
+                 WHERE q.seqrelid = $1::regclass AND q.seqincrement > 0 AND m.v IS NOT NULL \
+                   AND m.v BETWEEN q.seqmin AND q.seqmax \
+                   AND m.v > coalesce(pg_catalog.pg_sequence_last_value($1::regclass), q.seqstart - 1)",
+                crate::sql_quote::ident(&column)
+            );
+            sqlx::query(&sql)
+                .bind(&sequence)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!(
+                        "{table} loaded, but its sequence {sequence} could not be moved past the loaded \
+                         {column} values, so the next insert may reuse one: {e}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Static pattern matching for reference classification (offline fallback).
@@ -417,8 +496,10 @@ impl PostgresAdapter {
         // with zero pg_enum rows, so an inner join made it invisible to
         // introspection — reconcile then saw it as missing and recreated it
         // every run, forever, without ever converging.
+        // `obj_description(…, 'pg_type')` is the enum's own `COMMENT ON TYPE`,
+        // which the enum file carries and the parser reads back.
         let sql = format!(
-            "SELECT n.nspname, t.typname, e.enumlabel \
+            "SELECT n.nspname, t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') AS comment \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
              LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
@@ -434,12 +515,14 @@ impl PostgresAdapter {
         // map entry (via `.or_default()`) even though nothing is pushed to it,
         // because its single row carries a NULL `enumlabel` rather than
         // contributing no rows at all.
-        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> = indexmap::IndexMap::new();
+        let mut map: indexmap::IndexMap<(String, String), (Vec<EnumValue>, Option<String>)> = indexmap::IndexMap::new();
         for row in &rows {
             let schema: String = row.get("nspname");
             let typname: String = row.get("typname");
             let label: Option<String> = row.get("enumlabel");
-            let values = map.entry((schema, typname)).or_default();
+            let comment: Option<String> = row.get("comment");
+            let (values, type_comment) = map.entry((schema, typname)).or_default();
+            *type_comment = comment;
             if let Some(label) = label {
                 values.push(EnumValue {
                     name: label,
@@ -450,9 +533,10 @@ impl PostgresAdapter {
 
         let entities = map
             .into_iter()
-            .map(|((schema, typname), values)| {
+            .map(|((schema, typname), (values, comment))| {
                 let mut e = Entity::new(EntityType::Enum, &format!("{schema}.{typname}"));
                 e.enum_values = values;
+                e.comment = comment;
                 e
             })
             .collect();
@@ -1082,9 +1166,10 @@ impl PostgresAdapter {
             let cache_size: i64 = row.get("cache_size");
 
             // Deterministic, fully-explicit CREATE SEQUENCE for fidelity. Quoting
-            // matches the rest of the emitter (q()).
+            // matches the rest of the emitter (q()). `IF NOT EXISTS`: a reversed
+            // project is applied back to the database it was read from.
             let mut ddl = format!(
-                "CREATE SEQUENCE \"{schema}\".\"{name}\" AS {seq_type} \
+                "CREATE SEQUENCE IF NOT EXISTS \"{schema}\".\"{name}\" AS {seq_type} \
                  INCREMENT BY {increment_by} MINVALUE {min_value} MAXVALUE {max_value} \
                  START WITH {start_value} CACHE {cache_size}"
             );
@@ -1278,7 +1363,9 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
-        let sql = match script::ddl_from_entity(entity) {
+        // `runnable_ddl`, not the bare file: a file that states no search path
+        // runs on the one its names were resolved against (`source.search_path`).
+        let sql = match script::runnable_ddl(entity) {
             Some(s) => s,
             None => return Ok(()), // External entities, etc.
         };
@@ -1320,15 +1407,10 @@ impl DatabaseAdapter for PostgresAdapter {
                 let Some((header, rows_at)) = super::delimited_header(&data, tab, file_path)? else {
                     return Ok(()); // An empty file: no columns, no rows.
                 };
-                let columns = self.table_columns(&entity.name).await?;
-                if columns.is_empty() {
-                    return Err(DbdError::Config(format!(
-                        "cannot import {} into {}: no such table",
-                        file_path.display(),
-                        entity.name
-                    )));
-                }
-                let column_list = super::header_columns(&header, &columns, &entity.name, file_path)?
+                let (columns, generated) = self.import_columns(&entity.name, file_path).await?;
+                let loaded = super::header_columns(&header, &columns, &entity.name, file_path)?;
+                super::refuse_generated(&loaded, &generated, &entity.name, file_path)?;
+                let column_list = loaded
                     .iter()
                     .map(|c| crate::sql_quote::ident(c))
                     .collect::<Vec<_>>()
@@ -1363,6 +1445,8 @@ impl DatabaseAdapter for PostgresAdapter {
                 copy.finish()
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
+                drop(conn);
+                self.advance_sequences(&entity.name, &loaded).await?;
             }
             "json" | "jsonl" => {
                 // JSONL: stage rows in dbd's schema-qualified temp table, then hand
@@ -1376,18 +1460,30 @@ impl DatabaseAdapter for PostgresAdapter {
                 // than left to the caller: only the full import plan used to, so an
                 // ad-hoc `dbd import -n … -f rows.jsonl` against a database that had
                 // never run one failed for want of a procedure the user never wrote.
+                //
+                // Every key must name a column — checked before anything is staged,
+                // as a CSV header is (see `check_json_keys`).
+                let records = super::json_records(&data, format, file_path)?;
+                let (columns, generated) = self.import_columns(&entity.name, file_path).await?;
+                let loaded = super::check_json_keys(&records, &columns, &entity.name, file_path)?;
+                super::refuse_generated(&loaded, &generated, &entity.name, file_path)?;
                 self.ensure_import_procedure().await?;
-                self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
-                    .await?;
-                self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
+                // Staged as `json`, not `jsonb`: jsonb rewrites a json column's
+                // value — its spacing and key order — on the way through. Dropped
+                // and created rather than reused, so a `jsonb` table an earlier
+                // dbd left behind after a failed import is not read as this one.
+                self.execute_script(&format!(
+                    "DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}; CREATE TABLE {JSONB_IMPORT_TMP} (data json)"
+                ))
+                .await?;
 
-                // Stage each record as a JSONB row — bound, not interpolated into
+                // Stage each record as a JSON row — bound, not interpolated into
                 // `execute_script`, which rewrites every `set search_path to …;`
                 // in its text to add `public`. A record is data, and a value that
                 // quoted the statement was altered on the way in. On the pool, as
                 // the CSV `COPY` is: an import never runs inside an apply batch.
-                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::jsonb)");
-                for record in super::json_records(&data, format, file_path)? {
+                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
+                for record in records {
                     sqlx::query(&insert)
                         .bind(record)
                         .execute(&self.pool)
@@ -1400,6 +1496,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
                 self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}"))
                     .await?;
+                self.advance_sequences(&entity.name, &loaded).await?;
             }
             _ => {
                 return Err(DbdError::Config(format!("Unsupported import format: {format}")));
@@ -1442,12 +1539,51 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut data = Vec::new();
         use futures_lite::StreamExt;
 
+        // What an import can write back: every column but a generated one,
+        // whose value is computed from the row. `SELECT *` wrote those too,
+        // and the import then refused the file ("column is a generated
+        // column"), so no export of such a table imported back.
+        let kinds = self.column_kinds(&entity.name).await?;
+        if kinds.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: no such table or view",
+                entity.name
+            )));
+        }
+        let columns: Vec<&ColumnKind> = kinds.iter().filter(|c| !c.generated).collect();
+
         if format == "jsonl" {
             // Fetched as rows, not `COPY … TO STDOUT`: COPY's text format escapes
             // every backslash again, and the JSON `row_to_json` renders is full
             // of them — a newline came out as `\\n`, a quote as `\\"`, and the
             // file imported back as different values (or as no JSON at all).
-            let sql = format!("SELECT row_to_json(t)::text FROM {qualified} t");
+            //
+            // Each record is built field by field, as `row_to_json` builds it
+            // (`to_json` of each value), with one difference: `row_to_json`
+            // writes `null` for an SQL NULL and for a json/jsonb column holding
+            // the JSON value `null`, so the import could not tell them apart. A
+            // json/jsonb column that is SQL NULL is left out of its record — an
+            // absent key, which imports as NULL — and `null` is the JSON value.
+            let fields: Vec<String> = columns
+                .iter()
+                .map(|c| {
+                    let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(c.name.clone())));
+                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(&c.name));
+                    if c.json {
+                        format!(
+                            "CASE WHEN t.{} IS NULL THEN NULL ELSE {key} || {value} END",
+                            crate::sql_quote::ident(&c.name)
+                        )
+                    } else {
+                        format!("{key} || coalesce({value}, 'null')")
+                    }
+                })
+                .collect();
+            // `array_to_string` skips the NULL a left-out field is.
+            let sql = format!(
+                "SELECT '{{' || array_to_string(ARRAY[{}]::text[], ',') || '}}' FROM {qualified} t",
+                fields.join(", ")
+            );
             let mut rows = sqlx::query_scalar::<_, String>(&sql).fetch(&self.pool);
             while let Some(line) = rows.next().await {
                 let line = line.map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
@@ -1455,12 +1591,17 @@ impl DatabaseAdapter for PostgresAdapter {
                 data.push(b'\n');
             }
         } else {
+            let select_list = columns
+                .iter()
+                .map(|c| crate::sql_quote::ident(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             let copy_sql = match format {
                 "tsv" => format!(
-                    "COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
+                    "COPY (SELECT {select_list} FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
                 ),
                 // csv — the only format left once the guard above has run.
-                _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+                _ => format!("COPY (SELECT {select_list} FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
             };
 
             let mut conn = self
@@ -1783,6 +1924,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.clear_migrations().await
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        self.bookkeeping.forget_meta().await
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         // Embedded at compile time — always up to date with this version of dbd.
         const DDL: &str = include_str!("../../internal/import_jsonb_to_table.ddl");
@@ -1853,6 +1998,95 @@ impl DatabaseAdapter for PostgresAdapter {
     /// merge/init) — this reads only what reconcile's create/skip/restamp/
     /// recreate decision needs. Returns the comment unparsed (see the trait
     /// doc); `reconcile::parse_dbd_hash` extracts the sentinel.
+    async fn existing_objects(
+        &self,
+        objects: &[(EntityType, String)],
+    ) -> Result<std::collections::HashSet<(EntityType, String)>> {
+        // One query per catalog, each answering with the 1-based positions of
+        // the names it found. A relation or type is looked up by its quoted
+        // qualified name, so a name is never re-read through the search_path;
+        // `to_regclass`/`to_regtype` return NULL for a missing one.
+        let mut groups: std::collections::HashMap<&'static str, Vec<(usize, String)>> = Default::default();
+        for (i, (kind, name)) in objects.iter().enumerate() {
+            let (catalog, key) = match kind {
+                EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence => {
+                    ("relation", crate::sql_quote::qualified(name))
+                }
+                EntityType::Enum => ("type", crate::sql_quote::qualified(name)),
+                EntityType::Function | EntityType::Procedure => ("routine", name.clone()),
+                EntityType::Role => ("role", name.clone()),
+                EntityType::Schema => ("schema", name.clone()),
+                EntityType::Extension => ("extension", name.clone()),
+                _ => continue,
+            };
+            groups.entry(catalog).or_default().push((i, key));
+        }
+        let mut found = std::collections::HashSet::new();
+        for (catalog, entries) in groups {
+            let test = match catalog {
+                "relation" => "to_regclass(u.n) IS NOT NULL",
+                "type" => "to_regtype(u.n) IS NOT NULL",
+                "routine" => {
+                    "EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace \
+                     WHERE s.nspname || '.' || p.proname = u.n)"
+                }
+                "role" => "EXISTS (SELECT 1 FROM pg_roles WHERE rolname = u.n)",
+                "schema" => "EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = u.n)",
+                _ => "EXISTS (SELECT 1 FROM pg_extension WHERE extname = u.n)",
+            };
+            let names: Vec<&str> = entries.iter().map(|(_, n)| n.as_str()).collect();
+            let hits: Vec<i64> = sqlx::query_scalar(&format!(
+                "SELECT u.i FROM unnest($1::text[]) WITH ORDINALITY AS u(n, i) WHERE {test}"
+            ))
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("checking which {catalog}s exist failed: {e}")))?;
+            for hit in hits {
+                if let Some((i, _)) = usize::try_from(hit - 1).ok().and_then(|at| entries.get(at)) {
+                    found.insert(objects[*i].clone());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn roles_held_elsewhere(&self, roles: &[String]) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if roles.is_empty() {
+            return Ok(Default::default());
+        }
+        // `pg_shdepend` is the server's record of what each role holds in each
+        // database — grants, default privileges, ownership, policies — readable
+        // from any of them. A database's own owner is recorded on the database.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT r.rolname::text, db.datname::text \
+             FROM pg_shdepend d \
+             JOIN pg_roles r ON r.oid = d.refobjid \
+             JOIN pg_database db ON db.oid = d.dbid \
+             WHERE d.refclassid = 'pg_authid'::regclass \
+               AND d.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND r.rolname = ANY($1) \
+             UNION \
+             SELECT r.rolname::text, db.datname::text \
+             FROM pg_database db JOIN pg_roles r ON r.oid = db.datdba \
+             WHERE db.datname <> current_database() AND r.rolname = ANY($1) \
+             ORDER BY 1, 2",
+        )
+        .bind(roles)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading what the project's roles hold elsewhere failed: {e}")))?;
+        let mut held: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (role, database) in rows {
+            held.entry(role).or_default().push(database);
+        }
+        Ok(held)
+    }
+
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        self.introspect_matviews().await
+    }
+
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
         let sql = format!(

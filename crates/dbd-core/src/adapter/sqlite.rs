@@ -15,7 +15,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::{Row, SqlitePool};
 
 use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
 use crate::entity::{Entity, EntityType};
@@ -381,15 +381,32 @@ impl DatabaseAdapter for SqliteAdapter {
             )));
         }
 
-        let rows = sqlx::query(&format!("SELECT * FROM {}", crate::sql_quote::ident(table)))
+        // The columns an import can write, in table order — read from the
+        // catalog, not from the first row: an empty table has none, and its
+        // export was a blank line where the header belongs. Generated columns
+        // (`hidden` 2 and 3) are left out: SQLite computes them and refuses a
+        // value for one, so an export holding them could not be imported back.
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {} failed: {e}", entity.name)))?;
+        if columns.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: no such table or view",
+                entity.name
+            )));
+        }
+        let select_list = columns
+            .iter()
+            .map(|c| crate::sql_quote::ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = sqlx::query(&format!("SELECT {select_list} FROM {}", crate::sql_quote::ident(table)))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
-
-        let columns: Vec<String> = rows
-            .first()
-            .map(|row| row.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
 
         let mut output = String::new();
         match format {
@@ -610,6 +627,23 @@ impl DatabaseAdapter for SqliteAdapter {
             .execute(&self.pool)
             .await
             .ok();
+        Ok(())
+    }
+
+    async fn forget_project_meta(&self) -> Result<()> {
+        // No `_dbd_meta` table means nothing was ever recorded to forget; any
+        // other failure is surfaced — a row left behind keeps its prod mark.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        if exists > 0 {
+            sqlx::query("DELETE FROM _dbd_meta WHERE project = ?1")
+                .bind(&self.project)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("clear _dbd_meta failed: {e}")))?;
+        }
         Ok(())
     }
 
@@ -1229,6 +1263,60 @@ mod tests {
         );
     }
 
+    /// A SQLite project keeps a table's data in `import/<table>.csv` and its
+    /// dev-only rows in `import/dev/<table>.csv`. The dev file was read as a
+    /// table `dev.<table>` that every env loads, and SQLite, having no
+    /// schemas, loaded it into `<table>` — in prod.
+    #[tokio::test]
+    async fn a_prod_import_leaves_a_dev_folders_rows_out() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/dev")).unwrap();
+        std::fs::write(dir.path().join("import/items.csv"), "id,name\n1,shared\n").unwrap();
+        std::fs::write(dir.path().join("import/dev/items.csv"), "id,name\n2,dev only\n").unwrap();
+
+        let loaded = |env: &'static str| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let design = Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(&dir)).unwrap();
+                let a = mem().await;
+                a.execute_script("CREATE TABLE items (id INTEGER, name TEXT)")
+                    .await
+                    .unwrap();
+                design
+                    .import_data(&a, None, false, None, Progress::none())
+                    .await
+                    .unwrap();
+                let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+                    .fetch_all(&a.pool)
+                    .await
+                    .unwrap();
+                (rows, design.import_warnings(None))
+            }
+        };
+
+        let (prod, warnings) = loaded("prod").await;
+        assert_eq!(prod, vec![(1, "shared".to_string())], "prod loads the shared rows only");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("import/dev/") && w.contains("'prod'")),
+            "and says it left the dev file out: {warnings:?}"
+        );
+
+        let (dev, _) = loaded("dev").await;
+        assert_eq!(
+            dev,
+            vec![(1, "shared".to_string()), (2, "dev only".to_string())],
+            "dev loads both"
+        );
+    }
+
     #[tokio::test]
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
@@ -1264,6 +1352,72 @@ mod tests {
         let body = std::fs::read_to_string(&written).unwrap();
         assert!(body.contains("id,name"), "header missing: {body}");
         assert!(body.contains("1,alice"), "row missing: {body}");
+    }
+
+    /// The header came from the first row, so an empty table wrote an empty
+    /// line — a file no import can read as the table's columns. Postgres's
+    /// COPY writes the header either way.
+    #[tokio::test]
+    async fn an_empty_table_exports_its_header() {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE empty_t (id INTEGER, label TEXT)")
+            .await
+            .unwrap();
+        for (format, header) in [("csv", "id,label\n"), ("tsv", "id\tlabel\n")] {
+            let mut entity = Entity::new(EntityType::Table, "empty_t");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let body = std::fs::read_to_string(out.path().join(format!("empty_t.{format}"))).unwrap();
+            assert_eq!(body, header, "{format}");
+        }
+    }
+
+    /// A generated column is computed, and SQLite refuses a value for one
+    /// ("cannot INSERT into generated column"), so an export that wrote it
+    /// could not be imported back. The export writes what an import can, and
+    /// the import recomputes the rest.
+    #[tokio::test]
+    async fn an_export_leaves_out_generated_columns_and_imports_back() {
+        const DDL: &str = "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, \
+                           b INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+                           c INTEGER GENERATED ALWAYS AS (a * 3) VIRTUAL)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO g (id, a) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "g");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("g.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            let first = body.lines().next().unwrap_or_default();
+            match format {
+                "csv" => assert_eq!(first, "id,a", "only the columns an import can write"),
+                "tsv" => assert_eq!(first, "id\ta", "only the columns an import can write"),
+                _ => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(first).unwrap(),
+                    serde_json::json!({"id": 1, "a": 10}),
+                    "jsonl: only the columns an import can write"
+                ),
+            }
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: the export imports back: {e}"));
+            let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as("SELECT id, a, b, c FROM g ORDER BY id")
+                .fetch_all(&b.pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![(1, 10, 20, 30), (2, 20, 40, 60)], "{format}");
+        }
     }
 
     #[test]
