@@ -897,27 +897,94 @@ fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enum
     lines.join("\n")
 }
 
+/// A column default as DBML writes it: a number, `true`/`false`, `null`, a
+/// `'string'`, or anything else as a `` `backticked` `` expression.
+///
+/// Decided by parsing the default as Postgres does, not by its spelling. A
+/// word was taken for a string, so `current_date` — one of SQL's value
+/// keywords, which the parser reads as a function of the clock or the session
+/// — was written `'current_date'`, and `init --from-dbml` rebuilt
+/// `DEFAULT 'current_date'`: refused on a date column, the literal text on a
+/// text one.
 fn quote_default(value: &str) -> String {
     let trimmed = value.trim();
-    // Booleans
+    match default_kind(trimmed) {
+        Some(DefaultKind::Number) => trimmed.to_string(),
+        Some(DefaultKind::Bool(b)) => b.to_string(),
+        Some(DefaultKind::Null) => "null".to_string(),
+        Some(DefaultKind::Text(text)) => dbml_string(&text),
+        Some(DefaultKind::Expression) => format!("`{trimmed}`"),
+        None => quote_unparsed_default(trimmed),
+    }
+}
+
+/// What a default is, read from libpg_query's tree.
+enum DefaultKind {
+    Number,
+    Bool(bool),
+    Null,
+    /// A string literal's text, its SQL escaping already undone.
+    Text(String),
+    Expression,
+}
+
+/// The kind of default `expr` is, or `None` when it is not SQL Postgres reads.
+///
+/// A bare identifier is the one exception to "anything else is an expression":
+/// Postgres refuses a column reference in a default, so a bare word can only
+/// be text that came from elsewhere written without quotes, and is read as the
+/// string it was before. Keywords are not identifiers here — `current_user`
+/// parses as SQL's own function.
+fn default_kind(expr: &str) -> Option<DefaultKind> {
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::a_const::Val;
+
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
+    let NodeEnum::SelectStmt(select) = stmt else {
+        return None;
+    };
+    if select.target_list.len() != 1 {
+        return None;
+    }
+    let NodeEnum::ResTarget(target) = select.target_list.first()?.node.as_ref()? else {
+        return None;
+    };
+    Some(match target.val.as_deref()?.node.as_ref()? {
+        NodeEnum::AConst(c) if c.isnull => DefaultKind::Null,
+        NodeEnum::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(_) | Val::Fval(_) => DefaultKind::Number,
+            Val::Boolval(b) => DefaultKind::Bool(b.boolval),
+            Val::Sval(s) => DefaultKind::Text(s.sval.clone()),
+            Val::Bsval(_) => DefaultKind::Expression,
+        },
+        NodeEnum::ColumnRef(r) if r.fields.len() == 1 && !expr.contains('"') => match r.fields[0].node.as_ref()? {
+            NodeEnum::String(word) => DefaultKind::Text(word.sval.clone()),
+            _ => DefaultKind::Expression,
+        },
+        _ => DefaultKind::Expression,
+    })
+}
+
+/// A default Postgres does not read as SQL, written as it always was: a
+/// number, a boolean or `null` bare, something with a call or a cast as an
+/// expression, anything else as text.
+fn quote_unparsed_default(trimmed: &str) -> String {
     if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
         return trimmed.to_lowercase();
     }
-    // Numbers
     if trimmed.parse::<f64>().is_ok() {
         return trimmed.to_string();
     }
-    // NULL
     if trimmed.eq_ignore_ascii_case("null") {
         return "null".to_string();
     }
-    // Expression (function call or complex expression)
     if trimmed.contains('(') || trimmed.contains("::") || trimmed.contains('+') {
-        return format!("`{}`", trimmed);
+        return format!("`{trimmed}`");
     }
-    // String literal — a SQL `'…'` (whose `''` is one quote) or a bare word.
-    // DBML gets the text itself, in DBML's escaping: SQL's doubled quote is
-    // not a DBML escape, and written as-is it ends the string.
+    // A SQL `'…'` (whose `''` is one quote) or a bare word. DBML gets the text
+    // itself, in DBML's escaping: SQL's doubled quote is not a DBML escape,
+    // and written as-is it ends the string.
     let text = match trimmed.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
         Some(inner) => inner.replace("''", "'"),
         None => trimmed.trim_matches('\'').to_string(),
