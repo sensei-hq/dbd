@@ -46,6 +46,8 @@ const SURFACES: &[&str] = &[
     "docs/skills/dbd/SKILL.md",
     "src/assets/skills/dbd/SKILL.md",
     "docs/llms/llms-full.txt",
+    // The embedding guide is nothing but copyable calls, so every block compiles.
+    "docs/guide/12-embedding.md",
     // The architecture document's copyable examples. Its other 22 blocks are
     // illustrative — signatures, sketches, aspirational test files — and are
     // fenced ```rust,ignore so they keep their highlighting while staying out

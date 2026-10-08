@@ -4,6 +4,7 @@
  *  - docs/llms/*.txt          → src/lib/content/llms/  (served by +server.ts routes
  *                                with an explicit text/plain; charset=utf-8 header)
  *  - docs/guide/*.md          → src/lib/content/guide/ (rendered at /guide/<slug>)
+ *  - CHANGELOG.md             → src/lib/content/CHANGELOG.md (latest releases at /changelog)
  *
  * Keeps a single source of truth in docs/ — the site never forks the content.
  */
@@ -43,7 +44,12 @@ if (existsSync(guideSrc)) {
 	console.warn(`  ! missing ${guideSrc}`);
 }
 
-// 3. skills + agents + manifest → static/ (served as raw files at the site root,
+// 3. the repo-root CHANGELOG.md → src/lib/content/ (parsed by /changelog)
+const changelog = join(repo, 'CHANGELOG.md');
+if (existsSync(changelog)) copyInto(changelog, join(here, '..', 'src', 'lib', 'content', 'CHANGELOG.md'));
+else console.warn(`  ! missing ${changelog}`);
+
+// 4. skills + agents + manifest → static/ (served as raw files at the site root,
 //    so the library is installable via sensei.library.json from the site and GitHub).
 const staticDir = join(here, '..', 'static');
 const skillsSrc = join(docs, 'skills');

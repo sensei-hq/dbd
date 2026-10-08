@@ -81,7 +81,7 @@
   <title>{model.project.name} — dbd</title>
   <meta
     name="description"
-    content="Interactive ER diagram viewer — pan, zoom, and inspect tables, columns, and relationships."
+    content="Interactive schema viewer — an overview, an ER diagram, a page for every table, view, routine, trigger and enum, and a changelog built from snapshots."
   />
 </svelte:head>
 

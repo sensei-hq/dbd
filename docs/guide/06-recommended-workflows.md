@@ -30,11 +30,25 @@ Reconcile only diffs within the schemas the design declares, so it never touches
 schemas. Two kinds of destruction each need their own opt-in:
 
 - **`--allow-destructive`** — drop a *column* or constraint from a managed table, or remove a
-  *value* from an enum (the type is recreated; dependent managed views are dropped and re-applied).
+  *value* from an enum (the type is recreated; the managed views over a table with a column of
+  the enum are dropped and re-applied, and nothing else is dropped).
 - **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
-  design (an orphan). Without `--prune`, orphans are reported and left in place.
+  design (an orphan). Without `--prune`, orphans are reported and left in place. Under
+  `--scope`, a table the design declares outside the scope is not an orphan — a scope narrows
+  what is applied, not what the project owns. **Upgrade to 0.24.1 before a scoped prune:**
+  earlier releases dropped those tables ([#40](https://github.com/sensei-hq/dbd/issues/40)).
+  `public` is managed only when the design puts something there — a role or an extension with
+  no `schema:` does not; **before 0.25 either did**, and prune dropped the undeclared tables in
+  `public`.
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
+
+Reconcile runs the design's `apply.before` and `apply.after` hooks and its `grants:` too, scoped
+as `apply` scopes them, so a dev loop on reconcile builds the database `apply` would.
+
+Reconcile is not one transaction: it writes in the dependency order `apply` uses, each step
+committing as it runs, so a step that fails stops the run with the earlier steps applied. Fix the
+cause and run it again — what is already in place is no longer drift.
 
 **Cut v1 with `dbd release`.** When the schema stabilizes, `dbd release` (alias `dbd baseline`)
 writes a baseline snapshot at the current version and flips `project.released: true`:
@@ -64,6 +78,35 @@ dbd format         # normalize to your conventions (introspected column order is
 **refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
 use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
 
+The reversed project applies cleanly back to the database it came from — the DDL is re-runnable
+(`IF NOT EXISTS`, `OR REPLACE`), so the first `dbd apply` records the version and changes nothing,
+and `dbd diff` afterwards is empty — and to a fresh one. Its extensions are in the target's
+`extensions:`, its schemas under `schemas:`, and a table a foreign key reaches outside what was
+captured under `external:`; every schema left out is named as it is left out. The DDL is fully
+qualified and states no `SET search_path`, so `dbd inspect` notes that on every file; nothing in the
+files depends on the path, so the note is harmless.
+
+Adopting a Supabase database? `init --from-db` recognises it by Supabase's `auth` and `storage`
+schemas, names the target `supabase`, so Supabase's own schemas are protected (see
+[targets and adapters](08-targets.md#what-the-supabase-key-changes)), and leaves its platform
+schemas out of the project. Only a Supabase database loses them: on any other PostgreSQL, an `auth`
+or `extensions` schema is the project's own and is captured.
+
+#### Snapshots, but not released
+
+`init --from-db` and `dbd merge` write snapshots, but only `dbd release` sets
+`project.released: true`. A project built this way is in between:
+
+- it **has snapshots**, so it is on the migration track — `dbd snapshot` then `dbd apply` is
+  the way to change it, as for a released project;
+- it is **not released**, so `dbd reconcile` still runs — reconcile checks the flag, nothing
+  else.
+
+Treat it as released, and make it so with `dbd release`: on a project with snapshots it writes
+no second baseline — it releases at the version the latest snapshot reached and sets the flag,
+after which `reconcile` refuses. It refuses while the design has changes no snapshot records
+(run `dbd snapshot` first), and when `project.version` disagrees with the latest snapshot.
+
 ### Add a new database to an existing project
 
 You have a dbd project and are bringing in another database — say a new service's schema. `dbd
@@ -79,7 +122,9 @@ dbd merge postgres://host/newdb          # pull the new tables in (+ snapshot th
 dbd apply --scope billing -d $BILLING_URL   # deploy just that module to its own database
 ```
 
-`merge` never edits `design.yaml` and never deletes files (orphans are reported, not removed), and
+`merge` edits nothing in `design.yaml` but `project.version`, and never deletes files (orphans are
+reported, not removed; an extension, an external table or a schema the config should declare is
+warned about, for you to add), and
 it **refuses** if the source database is behind your project version (see Version safety below).
 
 ### Start from a dbdiagram.io / dbdocs design
@@ -87,7 +132,8 @@ it **refuses** if the source database is behind your project version (see Versio
 Designed the schema visually first? Reverse-engineer the DBML export — no connection needed:
 
 ```sh
-dbd init --from-dbml schema.dbml         # schemas + enums + tables + foreign keys
+dbd init --from-dbml schema.dbml         # schemas, enums, tables (CHECKs, indexes) and foreign keys
+dbd init --from-dbml schema.dbml --target supabase   # the same, for a Supabase database
 ```
 
 ### Keep a project in sync with a drifting database
@@ -96,7 +142,7 @@ Someone changed the database out-of-band. Re-`merge` to pull the drift back as a
 version, then apply it everywhere:
 
 ```sh
-dbd merge -d $DATABASE_URL --dry-run     # preview create/skip/conflict + the snapshot version
+dbd merge -d $DATABASE_URL --dry-run     # preview created/unchanged/conflict + the snapshot version
 dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the diff (guarded)
 ```
 
@@ -104,12 +150,13 @@ dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the dif
 
 | Source | Captured |
 |--------|----------|
-| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, comments, `serial`/identity columns), views, functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: partial/expression indexes, triggers. |
+| **Postgres / Supabase** (`--from-db postgres://…`) | schemas (under `schemas:`), extensions (in the target's `extensions:`), enums with their comments, tables (columns, defaults, identity, PK/FK/unique/check with their names, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns), views and materialized views with their comments (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`); a table a foreign key reaches outside the project is declared `external:`. **Not** captured: triggers. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target, and only there are its platform schemas left out. |
 | **SQLite** (`--from-db sqlite://…`) | tables, user indexes, and views — captured **verbatim** from `sqlite_master` (CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID` all survive). No schemas/enums/functions/sequences/roles; triggers skipped. Files land flat (`ddl/table/<name>.ddl`); `design.yaml` carries `schemas: []`. |
-| **DBML** (`--from-dbml <file>`) | schemas + enums + tables + foreign keys only — DBML can't express functions, procedures, views, standalone sequences, roles, or check constraints. `serial`/identity survive (dbd's DBML carries `bigserial`/`[increment]`). |
+| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes and key order survive; a table-level UNIQUE comes back as its named constraint, and a stub table as an `external:` entry; enum comments are lost. |
 
-The generated `design.yaml` target dialect comes from the connection URL scheme (`postgres://` →
-`postgres`, `sqlite://`/`file:` → `sqlite`). Secrets never land in the repo — the target `url` is
+The generated `design.yaml` target comes from the source: the connection URL scheme
+(`postgres://` → `postgres`, `sqlite://`/`file:` → `sqlite`), `supabase` for a PostgreSQL database
+with Supabase's `auth` and `storage` schemas, and `--target` for a DBML file. Secrets never land in the repo — the target `url` is
 written as the literal `$DATABASE_URL` reference, not the connection string you passed.
 
 ## Version safety

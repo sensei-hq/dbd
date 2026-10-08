@@ -6,7 +6,7 @@
 
 <Seo
 	title="Guide — dbd"
-	description="Guides for dbd: getting started, the design.yaml reference, commands, schema evolution, and recommended workflows."
+	description="Guides for dbd: getting started, design.yaml, commands, migrations and workflows, scopes, targets, access control, data, the schema viewer, embedding, and other dialects."
 />
 
 <section class="mx-auto max-w-content px-6 py-section">
