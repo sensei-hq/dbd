@@ -34,9 +34,14 @@ This:
 
 | DB state | Action |
 |----------|--------|
-| Fresh (no bookkeeping table) | Apply all DDL directly, mark latest version |
+| Fresh (no bookkeeping table) | Apply all DDL directly, mark latest version — `Fresh install at v2` |
+| Built but unversioned (no version recorded, but dbd applied it before, or the design's objects are already there) | Apply all DDL over what exists, mark latest version — `v2 recorded on a database that was already built but had no version` |
 | Behind (version < latest) | Run pending migrations, then apply DDL |
 | Current (version == latest) | Idempotent apply (CREATE IF NOT EXISTS) |
+
+No recorded version does not mean an empty database: one built before the
+project had a version, or by hand, records none. `apply` tells the two apart and
+says which it found, rather than calling the second a fresh install.
 
 On PostgreSQL every scenario runs in one transaction (unless `DBD_NO_TX` is
 set), so a migration that fails part-way leaves the database at the version it
@@ -47,6 +52,25 @@ steps for the scope's entities while the database's version still advances; the
 drop of a table the design removed runs under a scope that occupies its schema,
 and only where the table still exists — see
 [scopes](07-scopes.md#migrations-under-a-scope).
+
+## Dropping a table
+
+Delete a table's DDL file and `dbd snapshot` writes its drop where it writes
+every per-table migration, `migrations/<NNN>/<schema>/<table>.sql`:
+
+```
+migrations/002/
+  graph.json
+  app/b.sql                  # DROP TABLE app.b CASCADE;
+```
+
+The next `dbd apply` runs it — `Migrated v1 → v2 — … 1 dropped.` A hand-written
+`<table>.drop.sql` in the same folder takes precedence over the generated file.
+A drop runs only where the table still exists, and the summary counts only the
+drops that ran. Before 0.25 apply looked only for `<table>.drop.sql`, so no
+generated drop ever ran, while the migration was recorded as applied and its
+summary counted the drop; a database upgraded through such a migration still has
+the table, and needs it dropped by hand.
 
 ## Smart multi-snapshot
 
@@ -94,4 +118,9 @@ dbd snapshot --list
 dbd migrate --status
 ```
 
-Shows current DB version, latest version, and pending migration list.
+Shows current DB version, latest version, and pending migration list. A
+database with no recorded version shows `Database version: none recorded`, and
+`Database is up to date.` appears only when the two versions match — with none
+pending but the versions apart, it says why instead (the next apply will record
+the version, no migration bridges the gap, or the database is ahead of the
+latest snapshot).
