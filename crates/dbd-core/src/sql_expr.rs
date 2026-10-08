@@ -118,6 +118,30 @@ pub fn canonicalize_expression_for_columns(expr: &str, cols: &CoercibleColumns) 
     canonicalize_wrapped(&format!("SELECT ({expr})"), "SELECT ", cols)
 }
 
+/// Whether `expr` — an index key expression or a partial index's `WHERE`
+/// predicate — reads the column `column`.
+///
+/// Read from libpg_query's tree: any `ColumnRef` whose last field is `column`,
+/// compared after the parser's own case folding, so `Mood` unquoted is `mood`
+/// and `"Mood"` is not. An index expression is single-table, so a qualified
+/// `t.mood` is the same column as a bare `mood`.
+///
+/// An expression that does not parse reads as `true`. The caller is deciding
+/// what to drop and rebuild around a change to the column, and rebuilding one
+/// index too many costs a rebuild; leaving one out fails the change.
+pub fn reads_column(expr: &str, column: &str) -> bool {
+    let Ok(parsed) = pg_query::parse(&format!("SELECT ({expr})")) else {
+        return true;
+    };
+    parsed.protobuf.nodes().iter().any(|(node, ..)| match node {
+        pg_query::NodeRef::ColumnRef(c) => matches!(
+            c.fields.last().and_then(|f| f.node.as_ref()),
+            Some(NodeEnum::String(s)) if s.sval == column
+        ),
+        _ => false,
+    })
+}
+
 /// Parse `sql`, normalize its expression tree, re-deparse, and strip `prefix`.
 fn canonicalize_wrapped(sql: &str, prefix: &str, cols: &CoercibleColumns) -> Option<String> {
     let mut parsed = pg_query::parse(sql).ok()?;

@@ -340,8 +340,15 @@ impl Design {
         // type-swap that does converge. Needs the entity list, not just the
         // snapshots: the managed views to drop first come from the dependency
         // graph, and the write pass re-applies each one at its place in
-        // dependency order — after the enum whose ALTER dropped it.
-        plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
+        // dependency order — after the enum whose ALTER dropped it. The
+        // snapshots carry their raw indexes back in: the swap rebuilds the ones
+        // that read the column, and canonicalizing stripped them.
+        plan_enum_recreation(
+            &mut plan,
+            &crate::reconcile::with_indexes_of(&live, &live_raw),
+            &crate::reconcile::with_indexes_of(&desired, &desired_raw),
+            &desired_owned,
+        );
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates, restamps, AND drift warnings.
