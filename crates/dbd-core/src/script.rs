@@ -759,6 +759,51 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// The additions a run commits ahead of a version: each `ADD VALUE`
+    /// made idempotent, with the path that names its type — and nothing else
+    /// of the script, which runs later in the version's own transaction.
+    #[test]
+    fn a_scripts_enum_value_additions_keep_their_search_path_and_nothing_else() {
+        let sql = "set search_path to app;\n\
+                   alter type mood add value 'archived' after 'ok';\n\
+                   alter type mood rename value 'bad' to 'poor';\n\
+                   alter table people alter column mood set default 'archived';\n";
+        let additions = enum_value_additions(sql).expect("the script adds a value");
+        assert!(
+            additions.to_lowercase().contains("set search_path to app"),
+            "{additions}"
+        );
+        assert!(
+            additions.contains("ADD VALUE IF NOT EXISTS 'archived' AFTER 'ok'"),
+            "{additions}"
+        );
+        assert!(!additions.to_lowercase().contains("rename value"), "{additions}");
+        assert!(!additions.to_lowercase().contains("set default"), "{additions}");
+    }
+
+    #[test]
+    fn a_script_adding_no_enum_value_has_no_additions() {
+        assert!(enum_value_additions("alter table t add column c int;").is_none());
+        assert!(enum_value_additions("alter type mood rename value 'a' to 'b';").is_none());
+        assert!(enum_value_additions("not sql at all ;;").is_none());
+    }
+
+    /// Run after its values committed, a script's `ADD VALUE` must be a
+    /// no-op — and the rest of the file must reach the server exactly as
+    /// written, comments and spelling included.
+    #[test]
+    fn only_the_add_value_statements_of_a_script_are_rewritten() {
+        let sql = "-- keep me\nALTER TYPE app.mood ADD VALUE 'archived';\nUPDATE app.t SET c = 'x;y' /* ; */ ;\n";
+        assert_eq!(
+            idempotent_enum_value_additions(sql),
+            "-- keep me\nALTER TYPE app.mood ADD VALUE IF NOT EXISTS 'archived';\nUPDATE app.t SET c = 'x;y' /* ; */ ;\n"
+        );
+        let already = "ALTER TYPE app.mood ADD VALUE IF NOT EXISTS 'archived';\n";
+        assert_eq!(idempotent_enum_value_additions(already), already);
+        let unparsable = "ALTER TYPE app.mood ADD VALUE 'x'; this is not sql";
+        assert_eq!(idempotent_enum_value_additions(unparsable), unparsable);
+    }
+
     #[test]
     fn dbd_schema_is_protected_on_all_targets() {
         assert!(schema_is_protected("dbd", "postgres"));

@@ -6596,7 +6596,7 @@ async fn an_enum_value_a_version_adds_can_be_used_in_that_version() {
         &*adapter,
         true,
         "SELECT 1 FROM app.people WHERE id = 1 AND was = 'paused'",
-        "the row, given the new column's default",
+        "the row, given the default of the new column",
     )
     .await;
     let diff = design.diff_live(&*adapter, None).await.expect("diff");
