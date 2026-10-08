@@ -100,6 +100,31 @@ pub fn runnable_ddl(entity: &Entity) -> Option<String> {
     })
 }
 
+/// The text a migration or hook script runs as on PostgreSQL: the script,
+/// opened with the search path a DDL file stating none of its own runs on.
+///
+/// - A script that states its own path (`SET search_path …`) runs as written.
+/// - Otherwise, in a project with `source.search_path`, it runs on that path —
+///   the one [`runnable_ddl`] gives a pathless DDL file, `public` kept on it.
+/// - Otherwise it runs on the session's default (`RESET search_path`).
+///
+/// Migration and hook scripts were sent bare, so they ran on whatever path the
+/// last DDL file had set on the connection: a `data.sql` naming `notes` failed
+/// with `relation "notes" does not exist` in a project whose bare names
+/// resolve on `app`, and a hook's tables were judged on one path and run on
+/// another. A hook's scope analysis reads its bare names on this same path
+/// (see `design::hooks::derive_dependencies`).
+pub fn runnable_script(sql: &str, project_path: Option<&[crate::entity::PathEntry]>) -> String {
+    if crate::parser::pg::common::extract_search_paths_via_pg_query(sql).stated() {
+        return sql.to_string();
+    }
+    let set = match project_path {
+        Some(entries) if !entries.is_empty() => search_path_statement(entries),
+        _ => "RESET search_path;".to_string(),
+    };
+    format!("{set}\n{sql}")
+}
+
 /// `SET search_path TO …;` for an entity whose names were resolved against
 /// `source.search_path`, or `None` when the file stated its own path or the
 /// session default applies. Only a file-backed entity has names to resolve:

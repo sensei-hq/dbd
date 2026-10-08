@@ -590,6 +590,9 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.search_path`, resolved: the path a migration or hook script
+    /// that states none of its own runs on, and its bare names are read on.
+    search_path: Option<Vec<crate::entity::PathEntry>>,
     /// `source.dialect` as the project wrote it.
     ///
     /// Kept beside [`Self::parser`] because a refusal has to name what the
@@ -931,8 +934,23 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            search_path: project_search_path,
             dialect: dialect_label,
         })
+    }
+
+    /// `source.search_path`, resolved — `None` when the project sets none.
+    /// What a migration or hook script stating no path of its own runs on.
+    pub(crate) fn script_search_path(&self) -> Option<&[crate::entity::PathEntry]> {
+        self.search_path.as_deref()
+    }
+
+    /// Where the hooks are read from, and the path they run on.
+    pub(in crate::design) fn hook_source(&self) -> hooks::HookSource<'_> {
+        hooks::HookSource {
+            dir: &self.project_dir,
+            search_path: self.script_search_path(),
+        }
     }
 
     /// Access the parsed config.

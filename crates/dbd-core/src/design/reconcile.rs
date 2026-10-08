@@ -385,7 +385,7 @@ impl Design {
             ] {
                 hooks::run_hooks(
                     adapter,
-                    &self.project_dir,
+                    self.hook_source(),
                     entries,
                     kind,
                     hook_scope,
@@ -410,7 +410,7 @@ impl Design {
         // prepare the ground the DDL lands on.
         let before = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.before,
             hooks::HookKind::Before,
             hook_scope,
@@ -445,7 +445,7 @@ impl Design {
         // `apply.after`, once everything it may seed or adjust is in place.
         let after = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.after,
             hooks::HookKind::After,
             hook_scope,

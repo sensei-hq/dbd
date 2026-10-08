@@ -293,7 +293,7 @@ impl Design {
         // entity, so a hook can prepare the ground the DDL lands on.
         let before = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.before,
             hooks::HookKind::Before,
             hook_scope,
@@ -309,7 +309,7 @@ impl Design {
             // which is a misconfiguration whether or not we are about to write.
             hooks::run_hooks(
                 adapter,
-                &self.project_dir,
+                self.hook_source(),
                 &self.config.apply.after,
                 hooks::HookKind::After,
                 hook_scope,
@@ -341,7 +341,7 @@ impl Design {
             // one backend, exactly the silent no-op this feature removes.
             let after = hooks::run_hooks(
                 adapter,
-                &self.project_dir,
+                self.hook_source(),
                 &self.config.apply.after,
                 hooks::HookKind::After,
                 hook_scope,
@@ -518,7 +518,7 @@ impl Design {
         // RLS is independent of them, so it stays last (see `deploy_with_progress`).
         let after = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.after,
             hooks::HookKind::After,
             hook_scope,
@@ -600,8 +600,12 @@ impl Design {
                         let sql = crate::source_text::read_to_string(migration_sql_path)?;
                         // Its enum values already ran, and committed, at the
                         // head of the version; here they are no-ops.
+                        // Bare names resolve as in a DDL file stating no path.
                         adapter
-                            .execute_script(&crate::script::idempotent_enum_value_additions(&sql))
+                            .execute_project_script(
+                                &crate::script::idempotent_enum_value_additions(&sql),
+                                self.script_search_path(),
+                            )
                             .await?;
                     }
                     Ok(())
@@ -621,7 +625,7 @@ impl Design {
                         .unwrap_or_else(|| "entity".to_string());
                     let desc = format!("add values {type_tag}:{entity_name} → v{migration_version}");
                     on_start(&desc);
-                    let result = adapter.execute_script(script).await;
+                    let result = adapter.execute_project_script(script, self.script_search_path()).await;
                     report_step_result(&desc, on_done, result)?;
                 }
             }
@@ -638,7 +642,7 @@ impl Design {
                 on_start(&desc);
                 let result: Result<()> = async {
                     let sql = crate::source_text::read_to_string(data_sql_path)?;
-                    adapter.execute_script(&sql).await
+                    adapter.execute_project_script(&sql, self.script_search_path()).await
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
@@ -662,7 +666,7 @@ impl Design {
                     if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         // Decoded like the migration's `.sql` and `.data.sql`.
                         let sql = crate::source_text::read_to_string(drop_sql_path)?;
-                        adapter.execute_script(&sql).await?;
+                        adapter.execute_project_script(&sql, self.script_search_path()).await?;
                         return Ok(true);
                     }
                     Ok(false)
@@ -770,7 +774,7 @@ impl Design {
             (&self.config.apply.before, hooks::HookKind::Before),
             (&self.config.apply.after, hooks::HookKind::After),
         ] {
-            skips.extend(hooks::plan_hooks(&self.project_dir, entries, kind, hook_scope)?.warnings);
+            skips.extend(hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?.warnings);
         }
         Ok(skips)
     }

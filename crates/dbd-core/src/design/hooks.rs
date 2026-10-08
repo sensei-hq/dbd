@@ -15,6 +15,7 @@ use std::path::Path;
 
 use crate::adapter::DatabaseAdapter;
 use crate::config::ScriptEntry;
+use crate::entity::PathEntry;
 use crate::error::{DbdError, Result};
 use crate::path_safe::safe_relative_path;
 
@@ -24,12 +25,25 @@ use crate::path_safe::safe_relative_path;
 /// than identifiers. Callers treat empty as "unknowable, so run it": silently
 /// skipping a hook because analysis came up short would hide, for instance, a
 /// realtime hook quietly not firing.
-pub(crate) fn derive_dependencies(sql: &str) -> Vec<String> {
+///
+/// A bare name is read on the path the script runs on (see
+/// [`crate::script::runnable_script`]): its own `SET search_path` if it states
+/// one, else `project_path` — `source.search_path` — else the session default,
+/// `public`. Reading every bare name as `public` judged a hook on one path and
+/// ran it on another: under a scope leaving `app` out, a hook naming `notes`
+/// was not skipped, and failed.
+pub(crate) fn derive_dependencies(sql: &str, project_path: Option<&[PathEntry]>) -> Vec<String> {
     let Ok(parsed) = pg_query::parse(sql) else {
         return Vec::new();
     };
-    let default_schema = crate::parser::pg::common::extract_search_paths_via_pg_query(sql)
-        .default_schema()
+    let own = crate::parser::pg::common::extract_search_paths_via_pg_query(sql);
+    let project = project_path.and_then(|entries| {
+        entries.iter().find_map(|e| match e {
+            PathEntry::Schema(s) => Some(s.as_str()),
+            PathEntry::CurrentUser => None,
+        })
+    });
+    let default_schema = if own.stated() { own.default_schema() } else { project }
         .unwrap_or("public")
         .to_string();
 
@@ -59,12 +73,23 @@ pub(crate) fn hook_in_scope(deps: &[String], outside: &HashSet<String>, is_all: 
     is_all || !deps.iter().any(|d| outside.contains(d))
 }
 
-/// A hook's dependencies: declared if present, derived otherwise.
-pub(crate) fn dependencies_of(entry: &ScriptEntry, sql: &str) -> Vec<String> {
+/// A hook's dependencies: declared if present, derived otherwise — its bare
+/// names read on `project_path` when it states no path of its own.
+pub(crate) fn dependencies_of(entry: &ScriptEntry, sql: &str, project_path: Option<&[PathEntry]>) -> Vec<String> {
     match entry.declared_writes() {
         Some(w) => w.to_vec(),
-        None => derive_dependencies(sql),
+        None => derive_dependencies(sql, project_path),
     }
+}
+
+/// Where a project's hook scripts are read from, and the path a script that
+/// states none of its own runs on — and has its bare names read on.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::design) struct HookSource<'a> {
+    /// The project directory every hook path is relative to.
+    pub dir: &'a Path,
+    /// `source.search_path`; `None` when the project sets none.
+    pub search_path: Option<&'a [PathEntry]>,
 }
 
 /// Which lifecycle phase a hook list belongs to, so a skip warning says which
@@ -118,14 +143,14 @@ pub(in crate::design) struct HookPlan {
 /// file from a mistyped path, and continuing past either is how a declared hook
 /// comes to do nothing without saying so.
 pub(in crate::design) fn plan_hooks(
-    project_dir: &Path,
+    source: HookSource<'_>,
     entries: &[ScriptEntry],
     kind: HookKind,
     scope: Option<(&str, &HashSet<String>)>,
 ) -> Result<HookPlan> {
     // Canonicalize the root once so the containment check is reliable, matching
     // how `apply_policies` guards the files it executes.
-    let canon_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
+    let canon_root = source.dir.canonicalize().unwrap_or_else(|_| source.dir.to_path_buf());
 
     let mut plan = HookPlan::default();
     for entry in entries {
@@ -133,7 +158,7 @@ pub(in crate::design) fn plan_hooks(
         let sql = read_hook(&canon_root, script, kind)?;
 
         if let Some((scope_name, outside)) = scope {
-            let deps = dependencies_of(entry, &sql);
+            let deps = dependencies_of(entry, &sql, source.search_path);
             if !hook_in_scope(&deps, outside, false) {
                 let missing: Vec<&str> = deps
                     .iter()
@@ -200,7 +225,7 @@ fn read_hook(canon_root: &Path, script: &str, kind: HookKind) -> Result<String> 
 /// `import_run_after_scripts` already had.
 pub(in crate::design) async fn run_hooks<S, D, C>(
     adapter: &dyn DatabaseAdapter,
-    project_dir: &Path,
+    source: HookSource<'_>,
     entries: &[ScriptEntry],
     kind: HookKind,
     scope: Option<(&str, &HashSet<String>)>,
@@ -211,7 +236,7 @@ where
     S: FnMut(&str),
     D: FnMut(&str, Option<&str>),
 {
-    let plan = plan_hooks(project_dir, entries, kind, scope)?;
+    let plan = plan_hooks(source, entries, kind, scope)?;
     let mut outcome = HookOutcome {
         ran: 0,
         warnings: plan.warnings,
@@ -222,7 +247,7 @@ where
         let result = if dry_run {
             Ok(())
         } else {
-            adapter.execute_script(sql).await
+            adapter.execute_project_script(sql, source.search_path).await
         };
         super::report_step_result(&desc, &mut progress.on_done, result)?;
         outcome.ran += 1;
@@ -236,6 +261,11 @@ mod tests {
     use crate::adapter::mock::MockAdapter;
     use crate::design::Progress;
     use std::collections::HashSet;
+
+    /// Hooks read from `dir`, in a project with no `source.search_path`.
+    fn at(dir: &Path) -> HookSource<'_> {
+        HookSource { dir, search_path: None }
+    }
 
     fn ws(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -264,9 +294,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("sql/absent.sql".to_string())];
-        let err = run_hooks(&mock, tmp.path(), &entries, HookKind::After, None, false, &mut silent())
-            .await
-            .unwrap_err();
+        let err = run_hooks(
+            &mock,
+            at(tmp.path()),
+            &entries,
+            HookKind::After,
+            None,
+            false,
+            &mut silent(),
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("sql/absent.sql"), "the error must name the script: {msg}");
     }
@@ -283,9 +321,17 @@ mod tests {
 
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("../secret.sql".to_string())];
-        let err = run_hooks(&mock, &project, &entries, HookKind::After, None, false, &mut silent())
-            .await
-            .unwrap_err();
+        let err = run_hooks(
+            &mock,
+            at(&project),
+            &entries,
+            HookKind::After,
+            None,
+            false,
+            &mut silent(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("relative"), "got: {err}");
         assert_eq!(mock.script_count(), 0, "nothing outside the project may execute");
@@ -313,7 +359,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         let outcome = run_hooks(
             &mock,
-            tmp.path(),
+            at(tmp.path()),
             &entries,
             HookKind::After,
             None,
@@ -347,7 +393,7 @@ mod tests {
         let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
-            tmp.path(),
+            at(tmp.path()),
             &entries,
             HookKind::After,
             Some(("partial", &outside)),
@@ -385,7 +431,7 @@ mod tests {
         let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
-            tmp.path(),
+            at(tmp.path()),
             &entries,
             HookKind::After,
             Some(("partial", &outside)),
@@ -413,7 +459,7 @@ mod tests {
         let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
-            tmp.path(),
+            at(tmp.path()),
             &entries,
             HookKind::Before,
             Some(("partial", &outside)),
@@ -456,6 +502,7 @@ mod tests {
     fn plain_sql_dependencies_are_derived_and_qualified() {
         let deps = derive_dependencies(
             "set search_path to app;\ninsert into target select * from staging.a join b on b.id = a.id;",
+            None,
         );
         assert!(deps.contains(&"app.target".to_string()), "got {deps:?}");
         assert!(deps.contains(&"staging.a".to_string()), "got {deps:?}");
@@ -488,13 +535,14 @@ mod tests {
     fn a_do_block_naming_tables_in_data_derives_nothing() {
         let deps = derive_dependencies(
             "do $$ begin\n  execute format('alter publication p add table dojo.%I', 'x');\nend $$;",
+            None,
         );
         assert!(deps.is_empty(), "expected no derivable deps, got {deps:?}");
     }
 
     #[test]
     fn unparseable_sql_derives_nothing_rather_than_erroring() {
-        assert!(derive_dependencies("NOT SQL AT ALL ;;;").is_empty());
+        assert!(derive_dependencies("NOT SQL AT ALL ;;;", None).is_empty());
     }
 
     #[test]
@@ -509,6 +557,7 @@ mod tests {
         let deps = dependencies_of(
             &entry,
             "do $$ begin execute format('insert into %I.target values (1)', 'app'); end $$;",
+            None,
         );
         assert_eq!(deps, vec!["app.target".to_string()]);
     }
@@ -516,7 +565,7 @@ mod tests {
     #[test]
     fn no_declared_writes_falls_back_to_derivation() {
         let entry = ScriptEntry::Path("sql/loader.sql".to_string());
-        let deps = dependencies_of(&entry, "insert into app.target select * from staging.a;");
+        let deps = dependencies_of(&entry, "insert into app.target select * from staging.a;", None);
         assert!(deps.contains(&"app.target".to_string()), "got {deps:?}");
         assert!(deps.contains(&"staging.a".to_string()), "got {deps:?}");
     }

@@ -1362,6 +1362,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.exec_raw(&sql).await
     }
 
+    async fn execute_project_script(&self, sql: &str, search_path: Option<&[crate::entity::PathEntry]>) -> Result<()> {
+        self.execute_script(&script::runnable_script(sql, search_path)).await
+    }
+
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
         // `runnable_ddl`, not the bare file: a file that states no search path
         // runs on the one its names were resolved against (`source.search_path`).
