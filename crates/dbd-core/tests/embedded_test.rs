@@ -5443,3 +5443,75 @@ async fn reverse_engineering_keeps_key_names_and_an_enums_own_comment() {
     let regions = emitted("app.regions");
     assert!(regions.contains(r#"CONSTRAINT "regions_pk" PRIMARY KEY"#), "{regions}");
 }
+
+// ── A scoped reset destroys nothing outside its scope ─────────────────────────
+
+const MOODS_YAML: &str = "project:\n  name: scoped_reset\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    scopes:\n  moods:\n    includes: [app.mood, app.mood_names]\n  names:\n    includes: [app.mood_names]\n";
+
+const MOODS_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/enum/app/mood.ddl",
+        "create type app.mood as enum ('happy', 'sad');\n",
+    ),
+    (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\ncreate table if not exists people (id int primary key, mood app.mood);\n",
+    ),
+    (
+        "ddl/view/app/mood_names.ddl",
+        "set search_path to app;\ncreate or replace view mood_names as select unnest(enum_range(null::app.mood))::text as name;\n",
+    ),
+];
+
+/// The audit's repro: a scope holding the enum `app.mood` but not the table
+/// `app.people` whose column uses it. The reset dropped the enum `CASCADE`, and
+/// with it the `app.people.mood` column — out of scope, and its data with it.
+/// A scoped reset drops without `CASCADE`, all or nothing: refused, it names
+/// what outside the scope depends on what it would drop, and drops nothing.
+#[tokio::test]
+async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_scope() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), MOODS_YAML, MOODS_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let moods = design.resolve_scope(Some("moods"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&moods))
+        .await
+        .expect_err("the enum is used outside the scope")
+        .to_string();
+    assert!(
+        err.contains("app.mood") && err.contains("column mood of table app.people"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+
+    assert_column_exists(&*adapter, "app", "people", "mood").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'app' AND viewname = 'mood_names'",
+        "view app.mood_names (the refused reset drops nothing)",
+    )
+    .await;
+
+    // A scope that nothing outside it depends on still resets.
+    let names = design.resolve_scope(Some("names"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&names))
+        .await
+        .expect("a self-contained scope resets");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'app' AND viewname = 'mood_names'",
+        "view app.mood_names",
+    )
+    .await;
+    assert_column_exists(&*adapter, "app", "people", "mood").await;
+}
