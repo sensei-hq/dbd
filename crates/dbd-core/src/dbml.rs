@@ -380,15 +380,16 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     }
 
     // Indexes block. A table-level UNIQUE is listed here first: DBML has no
-    // constraint syntax for it, and a named unique index is how DBML spells
-    // one. Leaving it out made `init --from-dbml` rebuild a table that accepts
-    // the duplicates the design refuses. It reads back as a unique index —
-    // DBML cannot tell the two apart — which enforces the same thing under the
-    // same name.
-    let indexes: Vec<IndexDef> = unique_constraint_indexes(table_def)
-        .chain(table_def.indexes.iter().cloned())
+    // constraint syntax for it, and a unique index is how DBML spells one.
+    // Leaving it out made `init --from-dbml` rebuild a table that accepts the
+    // duplicates the design refuses. Read back as an index it enforced the
+    // same thing and still read as drift against the database the design
+    // built — a constraint to drop, an index to create — so its note marks it
+    // as a constraint (see `index_note`), and it reads back as one.
+    let idx_block: Vec<String> = unique_constraint_indexes(table_def)
+        .map(|ix| emit_index_line(&ix, true))
+        .chain(table_def.indexes.iter().map(|ix| emit_index_line(ix, false)))
         .collect();
-    let idx_block = emit_indexes(&indexes);
     if !idx_block.is_empty() {
         lines.push(String::new());
         lines.push("  indexes {".to_string());
@@ -528,36 +529,34 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
 }
 
 fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
-    let mut lines = Vec::new();
+    indexes.iter().map(|idx| emit_index_line(idx, false)).collect()
+}
 
-    for idx in indexes {
-        let cols = if idx.columns.len() == 1 {
-            index_key(&idx.columns[0])
-        } else {
-            format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
-        };
+/// One entry of an `indexes { … }` block; `constraint` when it is a table-level
+/// UNIQUE constraint rather than an index.
+fn emit_index_line(idx: &IndexDef, constraint: bool) -> String {
+    let cols = if idx.columns.len() == 1 {
+        index_key(&idx.columns[0])
+    } else {
+        format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
+    };
 
-        let mut settings = Vec::new();
-        if idx.unique {
-            settings.push("unique".to_string());
-        }
-        if let Some(ref name) = idx.name {
-            settings.push(format!("name: {}", dbml_string(name)));
-        }
-        if let Some(note) = index_note::write(idx) {
-            settings.push(format!("note: {}", dbml_string(&note)));
-        }
-
-        let settings_str = if settings.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", settings.join(", "))
-        };
-
-        lines.push(format!("{}{}", cols, settings_str));
+    let mut settings = Vec::new();
+    if idx.unique {
+        settings.push("unique".to_string());
+    }
+    if let Some(ref name) = idx.name {
+        settings.push(format!("name: {}", dbml_string(name)));
+    }
+    if let Some(note) = index_note::write(idx, constraint) {
+        settings.push(format!("note: {}", dbml_string(&note)));
     }
 
-    lines
+    if settings.is_empty() {
+        cols
+    } else {
+        format!("{} [{}]", cols, settings.join(", "))
+    }
 }
 
 /// One index key as DBML writes it: a column by name, an expression in
@@ -594,16 +593,26 @@ fn index_key(key: &IndexColumn) -> String {
 ///   entries do not cover every key, or do not parse, is ignored whole rather
 ///   than applied to the wrong keys.
 /// - `nulls not distinct` — the index treats NULLs as equal.
+/// - `unique constraint` — the entry is a table-level UNIQUE constraint, not an
+///   index. A database holds the two as different objects, so a constraint
+///   read back as an index reads as drift against the database the design
+///   built. Honoured only on a `unique` entry of plain columns with no other
+///   line; anything else stays an index.
 pub(crate) mod index_note {
     use crate::entity::{IndexColumn, IndexDef, SortOrder};
 
     const WHERE: &str = "where:";
     const ORDER: &str = "order:";
     const NULLS_NOT_DISTINCT: &str = "nulls not distinct";
+    const UNIQUE_CONSTRAINT: &str = "unique constraint";
 
-    /// The note for `ix`, or `None` when DBML's own syntax already says it all.
-    pub(crate) fn write(ix: &IndexDef) -> Option<String> {
+    /// The note for `ix` — `constraint` when it stands for a table-level UNIQUE
+    /// — or `None` when DBML's own syntax already says it all.
+    pub(crate) fn write(ix: &IndexDef, constraint: bool) -> Option<String> {
         let mut lines = Vec::new();
+        if constraint {
+            lines.push(UNIQUE_CONSTRAINT.to_string());
+        }
         if let Some(predicate) = &ix.predicate {
             lines.push(format!("{WHERE} {}", predicate.replace(['\r', '\n'], " ")));
         }
@@ -619,6 +628,11 @@ pub(crate) mod index_note {
             lines.push(NULLS_NOT_DISTINCT.to_string());
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Whether `note` marks its entry as a table-level UNIQUE constraint.
+    pub(crate) fn marks_a_constraint(note: &str) -> bool {
+        note.lines().any(|line| line.trim() == UNIQUE_CONSTRAINT)
     }
 
     /// Apply the convention's lines in `note` to `ix`, whose keys are already set.
