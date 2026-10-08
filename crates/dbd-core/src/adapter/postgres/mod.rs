@@ -1376,6 +1376,19 @@ impl DatabaseAdapter for PostgresAdapter {
                 // than left to the caller: only the full import plan used to, so an
                 // ad-hoc `dbd import -n … -f rows.jsonl` against a database that had
                 // never run one failed for want of a procedure the user never wrote.
+                //
+                // Every key must name a column — checked before anything is staged,
+                // as a CSV header is (see `check_json_keys`).
+                let records = super::json_records(&data, format, file_path)?;
+                let columns = self.table_columns(&entity.name).await?;
+                if columns.is_empty() {
+                    return Err(DbdError::Config(format!(
+                        "cannot import {} into {}: no such table",
+                        file_path.display(),
+                        entity.name
+                    )));
+                }
+                super::check_json_keys(&records, &columns, &entity.name, file_path)?;
                 self.ensure_import_procedure().await?;
                 self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
                     .await?;
@@ -1387,7 +1400,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 // quoted the statement was altered on the way in. On the pool, as
                 // the CSV `COPY` is: an import never runs inside an apply batch.
                 let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::jsonb)");
-                for record in super::json_records(&data, format, file_path)? {
+                for record in records {
                     sqlx::query(&insert)
                         .bind(record)
                         .execute(&self.pool)

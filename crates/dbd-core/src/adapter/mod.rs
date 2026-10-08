@@ -498,6 +498,48 @@ pub(crate) fn header_columns(header: &[String], columns: &[String], table: &str,
     )))
 }
 
+/// Refuse a JSON record holding a key `table` has no column for, naming each
+/// such key, the first record holding it, and the file — as
+/// [`header_columns`] refuses a CSV header naming one.
+///
+/// A key is a column name as written: the load matches keys to columns
+/// exactly. Postgres's JSON load moved only the keys matching a column and
+/// dropped the rest without a word, so a misspelled key left its column empty
+/// while the import reported success. A record that is not a JSON object is
+/// refused here too, before anything is staged.
+pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &str, file: &Path) -> Result<()> {
+    let mut unknown: Vec<(String, usize)> = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
+            serde_json::from_str(record).map_err(|e| {
+                crate::error::DbdError::Config(format!(
+                    "{}: record {} is not a JSON object: {e}",
+                    file.display(),
+                    at + 1
+                ))
+            })?;
+        for key in keys.into_keys() {
+            if !columns.contains(&key) && !unknown.iter().any(|(k, _)| *k == key) {
+                unknown.push((key, at + 1));
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = unknown
+        .iter()
+        .map(|(key, record)| format!("'{key}' (record {record})"))
+        .collect();
+    Err(crate::error::DbdError::Config(format!(
+        "{}: the key {} names no column of {table} — its columns are {}. A JSON record's keys name the \
+         columns its values load into",
+        file.display(),
+        named.join(", "),
+        columns.join(", ")
+    )))
+}
+
 pub mod convex;
 pub mod mock;
 #[cfg(feature = "postgres")]
