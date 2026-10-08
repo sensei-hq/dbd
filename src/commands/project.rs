@@ -277,20 +277,24 @@ fn fix_stale_files(stale_files: &[dbd_core::doctor::StaleFile], verbosity: Verbo
 }
 
 /// Migrate plural DDL folders to their singular canonical form, returning how
-/// many moves succeeded.
+/// many folders were migrated in full.
+///
+/// A folder is one issue — that is how `doctor` finds and reports it — so it
+/// is one fixed, however many files moving it took. Counting the moves, doctor
+/// found "2 issues" and fixed "4". A folder any of whose files failed to move
+/// is not fixed.
 fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Verbosity) -> usize {
     use dbd_core::doctor::DdlMoveOutcome;
     let mut fixed = 0;
     for d in plural_dirs {
+        let mut all_moved = true;
         for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
             match outcome {
                 DdlMoveOutcome::RenamedDir { from, to } => {
                     output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::MovedFile { from, to } => {
                     output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::BackedUp {
                     winner,
@@ -305,12 +309,15 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
                         loser.display(),
                         backup.display()
                     ));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::Error { path, error } => {
                     output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                    all_moved = false;
                 }
             }
+        }
+        if all_moved {
+            fixed += 1;
         }
     }
     fixed
@@ -381,6 +388,16 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // With a database to ask, refuse where the deploy refuses — the scope pin.
+        let adapter = super::dry_run_adapter(&config_path, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let meta = adapter.get_project_meta().await?;
+            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+            Design::check_version_guard(
+                adapter.get_db_version().await?,
+                design.config().project.version.unwrap_or(0),
+            )?;
+        }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
             output::warn(&skip);
@@ -391,6 +408,16 @@ pub async fn cmd_deploy(
             output::scope_gaps(&resolved, &report.gaps);
         }
         output::info(verbosity, &format!("{to_apply} entities would be applied."));
+        // The migrations its apply phase executes first, as `apply --dry-run` lists them.
+        match &adapter {
+            Some(adapter) => super::print_migration_preview(
+                verbosity,
+                &design
+                    .pending_migration_preview(&**adapter, None, Some(&resolved))
+                    .await?,
+            ),
+            None => super::note_unlisted_migrations(verbosity, &project_dir),
+        }
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
@@ -927,9 +954,9 @@ mod tests {
     /// so it never opens a DB connection.
     #[tokio::test]
     async fn deploy_dry_run_from_local_source() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -950,7 +977,7 @@ mod tests {
     /// error. Guards against the regression where deploy silently skipped RLS.
     #[tokio::test]
     async fn deploy_dry_run_includes_policies() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         cmd_deploy(
@@ -1138,9 +1165,9 @@ mod tests {
     /// of the (local, no-DB) dry-run flow proceeds.
     #[tokio::test]
     async fn deploy_clears_cache_before_dry_run() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -1208,9 +1235,9 @@ mod tests {
     /// gap never reaches (it bails earlier, in `check_scope_gaps`).
     #[tokio::test]
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,

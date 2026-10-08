@@ -487,7 +487,7 @@ fn canonical_datetime(s: &str) -> Option<String> {
 /// comes back `now()`, `coalesce(…)` comes back `COALESCE(…)`. Comparing those
 /// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
 /// re-spelled, so the next diff reported the same change — forever.
-fn canonical_default(raw: &str, data_type: &str) -> String {
+pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     // Postgres keeps `nextval('s')`'s argument as an OID and reports it as
     // `nextval('s'::regclass)`; a design without the cast read as a changed
     // default on every run. Both sides take the reported form — valid SQL with
@@ -1146,7 +1146,7 @@ fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
 /// A fixed suffix rather than a generated one: the whole recreation runs in a
 /// single implicit transaction, so the name exists only inside it, and a fixed
 /// name is what an operator reading a failed run's SQL can act on.
-const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
+pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 
 /// Converge an enum whose declared value set **lost** a member.
 ///
@@ -1159,13 +1159,26 @@ const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 ///
 /// ```text
 /// DROP VIEW   … ;                 -- managed views over the column, deepest first
+/// DROP INDEX  … ;                 -- indexes whose WHERE or expression reads it
 /// ALTER TABLE … DROP DEFAULT;     -- the default is typed against the old type
 /// ALTER TYPE  … RENAME TO x__dbd_old;
 /// CREATE TYPE … AS ENUM (…);      -- exactly the declared values, in order
 /// ALTER TABLE … TYPE … USING c::text::…;
 /// ALTER TABLE … SET DEFAULT …;
+/// CREATE INDEX …;                 -- the dropped indexes, against the new type
 /// DROP TYPE   x__dbd_old;
 /// ```
+///
+/// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+/// definition, and one that compares the column with an enum literal is stored
+/// as `mood <> 'bad'::app.mood` — after the rename, a comparison with the old
+/// type, which fails with `operator does not exist: mood <> mood__dbd_old` and
+/// names no index. So an index whose predicate or expression key reads the
+/// column is dropped first and created after, as the design declares it when it
+/// declares one of that name, else as it was. The indexes come from the tables
+/// of `live` and `desired`: a canonicalized snapshot has none (`canonicalize`
+/// strips them), so a caller passes ones that carry them — see
+/// [`with_indexes_of`].
 ///
 /// Every failure this can hit is a *loud* one, inside the single implicit
 /// transaction `execute_script` runs the batch in: a row holding a removed value
@@ -1259,6 +1272,17 @@ pub fn plan_enum_recreation(
             lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
         }
 
+        let rebuilt = indexes_to_rebuild(live, &columns);
+        for (table, ix) in &rebuilt {
+            if let Some(name) = &ix.name {
+                lines.push(format!(
+                    "DROP INDEX IF EXISTS {}.{};",
+                    crate::sql_quote::ident(&table.schema),
+                    crate::sql_quote::ident(name)
+                ));
+            }
+        }
+
         for c in columns.iter().filter(|c| c.default_value.is_some()) {
             lines.push(format!(
                 "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
@@ -1298,6 +1322,23 @@ pub fn plan_enum_recreation(
             }
         }
 
+        for (table, live_ix) in &rebuilt {
+            // The design's definition when it declares one of that name: the
+            // live one may compare with a value this swap just removed.
+            let ix = desired
+                .tables
+                .iter()
+                .find(|d| d.schema == table.schema && d.name == table.name)
+                .and_then(|d| d.indexes.iter().find(|d| d.name.is_some() && d.name == live_ix.name))
+                .unwrap_or(live_ix);
+            let qtable = format!(
+                "{}.{}",
+                crate::sql_quote::ident(&table.schema),
+                crate::sql_quote::ident(&table.name)
+            );
+            lines.push(crate::emit::emit_index_sql(ix, &qtable, &table.name, false));
+        }
+
         lines.push(format!("DROP TYPE {old_type};"));
 
         // The recreation IS the whole change for this enum: `CREATE TYPE` already
@@ -1317,6 +1358,66 @@ pub fn plan_enum_recreation(
         // gated behind `--allow-destructive` like any other data-losing change.
         plan.destructive = true;
     }
+}
+
+/// The live indexes an enum swap over `columns` has to drop and create again —
+/// those whose `WHERE` predicate or expression key reads one of the columns
+/// (see [`plan_enum_recreation`]) — with their table, in table then index order
+/// so the SQL is byte-stable run to run.
+///
+/// Taken from `live` alone: what blocks the swap is what the database has.
+fn indexes_to_rebuild<'a>(
+    live: &'a Snapshot,
+    columns: &[EnumColumn],
+) -> Vec<(&'a TableSnapshot, &'a crate::entity::IndexDef)> {
+    let mut out = Vec::new();
+    for t in &live.tables {
+        let qtable = format!("{}.{}", t.schema, t.name);
+        let read: Vec<&str> = columns
+            .iter()
+            .filter(|c| c.table == qtable)
+            .map(|c| c.column.as_str())
+            .collect();
+        if read.is_empty() {
+            continue;
+        }
+        out.extend(indexes_reading_columns(t, &read).into_iter().map(|ix| (t, ix)));
+    }
+    out.sort_by(|a, b| (&a.0.schema, &a.0.name, &a.1.name).cmp(&(&b.0.schema, &b.0.name, &b.1.name)));
+    out
+}
+
+/// The indexes on `table` whose `WHERE` predicate or expression key reads any
+/// of `columns` — the ones Postgres cannot rebuild across an enum type swap of
+/// those columns. Shared by reconcile's swap and the migration `dbd snapshot`
+/// writes for the same change.
+pub(crate) fn indexes_reading_columns<'a>(
+    table: &'a TableSnapshot,
+    columns: &[&str],
+) -> Vec<&'a crate::entity::IndexDef> {
+    let reads = |expr: &str| columns.iter().any(|c| crate::sql_expr::reads_column(expr, c));
+    table
+        .indexes
+        .iter()
+        .filter(|ix| {
+            ix.predicate.as_deref().is_some_and(reads) || ix.columns.iter().any(|k| k.is_expression && reads(&k.name))
+        })
+        .collect()
+}
+
+/// `canonical` with each table's indexes taken from the same table in `raw`.
+///
+/// Reconcile diffs canonicalized snapshots, and `canonicalize` strips indexes
+/// (they converge separately, from the raw ones). [`plan_enum_recreation`]
+/// reads columns in their canonical form but has to see the indexes too.
+pub(crate) fn with_indexes_of(canonical: &Snapshot, raw: &Snapshot) -> Snapshot {
+    let mut out = canonical.clone();
+    for t in &mut out.tables {
+        if let Some(r) = raw.tables.iter().find(|r| r.schema == t.schema && r.name == t.name) {
+            t.indexes = r.indexes.clone();
+        }
+    }
+    out
 }
 
 /// A live column whose type is the enum being recreated.
@@ -1369,7 +1470,7 @@ fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
 /// the view it selects from — which is the order they have to be dropped in.
 /// The iteration is bounded by the entity count so a `refers` cycle terminates
 /// rather than spinning.
-fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+pub(crate) fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
     let views: Vec<&Entity> = entities
         .iter()
         .filter(|e| matches!(e.entity_type, EntityType::View | EntityType::MaterializedView))
@@ -4071,6 +4172,68 @@ mod enum_recreation_tests {
         assert!(
             sql.contains("ALTER COLUMN c TYPE app.colour[] USING c::text[]::app.colour[]"),
             "an array column must cast through text[]:\n{sql}"
+        );
+    }
+
+    /// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+    /// definition. One whose `WHERE` or expression key compares the column with
+    /// a literal of the enum — stored as `'bad'::app.mood` — is re-read after the
+    /// rename as a comparison with the *old* type, and the swap failed with
+    /// `operator does not exist: mood <> mood__dbd_old`, naming no index. Those
+    /// are dropped before the swap and created again after it; an index that
+    /// does not read the column is left alone.
+    #[test]
+    fn an_index_reading_the_column_is_rebuilt_around_the_swap() {
+        use crate::entity::{IndexColumn, IndexDef};
+        let index = |name: &str, key: &str, is_expression: bool, predicate: Option<&str>| IndexDef {
+            name: Some(name.to_string()),
+            columns: vec![IndexColumn {
+                name: key.to_string(),
+                is_expression,
+                ..Default::default()
+            }],
+            predicate: predicate.map(str::to_string),
+            ..Default::default()
+        };
+        let mut people = table(
+            "app",
+            "people",
+            vec![col("id", "integer", None), col("mood", "app.mood", None)],
+        );
+        // Spelled as introspection reports them (`pg_get_expr`, `pg_get_indexdef`).
+        people.indexes = vec![
+            index("people_not_bad", "id", false, Some("(mood <> 'bad'::app.mood)")),
+            index("people_is_ok", "(mood = 'ok'::app.mood)", true, None),
+            index("people_by_id", "id", false, Some("(id > 0)")),
+        ];
+        let live = snap(vec![people], vec![enum_snap("app", "mood", &["ok", "meh", "bad"])]);
+        let desired = snap(
+            vec![table(
+                "app",
+                "people",
+                vec![col("id", "integer", None), col("mood", "app.mood", None)],
+            )],
+            vec![enum_snap("app", "mood", &["ok", "bad"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        let sql = &plan.altered[0].sql;
+
+        let swap = sql
+            .find("ALTER TABLE app.people ALTER COLUMN mood TYPE")
+            .expect("type swap");
+        for name in ["people_not_bad", "people_is_ok"] {
+            let drop = sql
+                .find(&format!("DROP INDEX IF EXISTS \"app\".\"{name}\";"))
+                .unwrap_or_else(|| panic!("{name} is dropped:\n{sql}"));
+            let create = sql
+                .find(&format!("INDEX \"{name}\" ON \"app\".\"people\""))
+                .unwrap_or_else(|| panic!("{name} is created again:\n{sql}"));
+            assert!(drop < swap && swap < create, "{name} around the swap:\n{sql}");
+        }
+        assert!(
+            !sql.contains("people_by_id"),
+            "an index that does not read the column is left alone:\n{sql}"
         );
     }
 

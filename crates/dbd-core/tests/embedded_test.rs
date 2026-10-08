@@ -5224,3 +5224,320 @@ async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
         assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
     }
 }
+
+// ── source.search_path: reconcile creates a pathless matview on it ────────────
+
+/// Reconcile creates an absent materialized view from its model, not its file,
+/// and ran that `CREATE` on a path of every managed schema in name order. A
+/// matview file that states no path was read against `source.search_path`, so a
+/// bare `a` in its body meant `app.a`; created on `"aaa", "app", public` it
+/// meant `aaa.a` instead — here a table without the column, so reconcile failed
+/// building a view `apply` builds without complaint.
+#[tokio::test]
+async fn reconcile_creates_a_pathless_matview_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "pathless_mv_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: pathless_mv_test\nsource:\n  dialect: postgresql\n  search_path: [app]\n\
+         schemas:\n  - aaa\n  - app\n",
+        &[
+            (
+                "ddl/table/aaa/a.ddl",
+                "set search_path to aaa;\ncreate table if not exists a (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/app/a.ddl",
+                "create table if not exists a (id integer primary key, x integer);\n",
+            ),
+            (
+                "ddl/materialized_view/app/m.ddl",
+                "create materialized view if not exists m as select x from a;\n",
+            ),
+        ],
+    );
+
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the matview's body resolves on source.search_path, as apply runs its file");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'm'",
+        "materialized view app.m",
+    )
+    .await;
+}
+
+// ── A scoped migration keeps the always-on roles and extensions ──────────────
+
+/// v2 adds `citext` to the target's extensions, a role, and a table with a
+/// `citext` column. Unscoped, the migration worked; under a scope it failed with
+/// `type "citext" does not exist` and never created the role, though
+/// `apply --dry-run --scope` listed both: the migrate plan filtered the run's
+/// entities by the scope's working set a second time, and roles and extensions
+/// are never in it — they are always on.
+#[tokio::test]
+async fn a_scoped_migration_installs_its_new_extension_and_role() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_migrate_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let people = (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\ncreate table if not exists people (id integer primary key);\n",
+    );
+    let v1 = "project:\n  name: scoped_migrate_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+              target:\n  postgres:\n    roles:\n      - name: app_reader\n\
+              scopes:\n  app_only:\n    includes: [app]\n";
+    let design = write_project(dir, v1, &[people]);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("v1 applies under the scope");
+
+    let v2 = "project:\n  name: scoped_migrate_test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+              target:\n  postgres:\n    extensions:\n      - citext\n    roles:\n      - name: app_reader\n      - name: app_writer\n\
+              scopes:\n  app_only:\n    includes: [app]\n";
+    let emails = (
+        "ddl/table/app/emails.ddl",
+        "set search_path to app;\ncreate table if not exists emails (id integer primary key, addr citext);\n",
+    );
+    let design = write_project(dir, v2, &[people, emails]);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v2").unwrap();
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    assert_eq!(design.config().project.version, Some(2));
+    let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("the scoped migration installs the extension its new table needs");
+
+    assert_table_exists(&*adapter, "app", "emails").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_extension WHERE extname = 'citext'",
+        "extension citext",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_roles WHERE rolname = 'app_writer'",
+        "role app_writer",
+    )
+    .await;
+}
+
+// ── Enum value removal: indexes that read the column ─────────────────────────
+
+/// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+/// definition. A partial index comparing the column with an enum literal —
+/// stored as `mood <> 'bad'::app.mood` — is re-read after the type swap's
+/// rename as a comparison with the old type, and reconcile failed with
+/// `operator does not exist: mood <> mood__dbd_old`, naming no index. An
+/// expression key comparing the column fails the same way.
+///
+/// The swap rebuilds both around it, the rows survive, and the design then
+/// diffs clean — the indexes included.
+#[tokio::test]
+async fn removing_an_enum_value_rebuilds_the_indexes_that_read_its_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_index_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: enum_index_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let people = (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\n\
+         create table if not exists people (\n  id integer primary key\n, mood mood not null default 'ok'\n);\n\
+         create index if not exists people_not_bad on people (id) where mood <> 'bad';\n\
+         create index if not exists people_is_ok on people ((mood = 'ok'));\n",
+    );
+    let load = |values: &str| {
+        let enum_sql = format!("set search_path to app;\ncreate type mood as enum ({values});\n");
+        write_project(dir, yaml, &[people, ("ddl/enum/app/mood.ddl", enum_sql.as_str())])
+    };
+
+    load("'ok', 'meh', 'bad'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("phase 1 builds the table and its indexes");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'ok'), (2, 'bad');")
+        .await
+        .expect("seed rows");
+
+    let design = load("'ok', 'bad'");
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("removing an enum value rebuilds the indexes over its column");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    for index in ["people_not_bad", "people_is_ok"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = '{index}'"),
+            &format!("index app.{index}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 2 AND mood = 'bad'",
+        "the rows in app.people",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the design diffs clean afterwards: {:?}", diff.changes);
+}
+
+// ── Enum value removal: the migration `dbd snapshot` writes applies ──────────
+
+/// Removing an enum value from a released project wrote a three-stage migration
+/// that could not apply:
+///
+/// - `ALTER … TYPE TEXT` failed on any column a view or matview selects
+///   ("cannot alter type of a column used by a view or rule");
+/// - `DROP TYPE` failed on any column with an enum default — the normal case
+///   for a status column;
+/// - the stage-one `data.sql` mapping the removed value was never run, its
+///   table being in no stage's `altered` list;
+/// - and apply, running each entity's migrations at its place in dependency
+///   order, re-pointed the column at the old type before the drop ran.
+///
+/// The migration now swaps the type the way reconcile does, around the views,
+/// the matview, the default and an index over the column; the mapped row is
+/// kept, and the design then diffs clean and snapshots with no changes.
+#[tokio::test]
+async fn the_enum_value_removal_migration_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_migration_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let yaml = "project:\n  name: enum_migration_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let rest: Vec<(&str, &str)> = vec![
+        (
+            "ddl/table/app/people.ddl",
+            "set search_path to app;\n\
+             create table if not exists people (\n  id integer primary key\n, mood mood not null default 'ok'\n);\n\
+             create index if not exists people_not_bad on people (id) where mood <> 'bad';\n",
+        ),
+        (
+            "ddl/view/app/happy.ddl",
+            "set search_path to app;\ncreate or replace view happy as select id, mood from people where mood = 'ok';\n",
+        ),
+        (
+            "ddl/materialized_view/app/mood_counts.ddl",
+            "set search_path to app;\n\
+             create materialized view if not exists mood_counts as select mood, count(*) as n from people group by mood;\n",
+        ),
+    ];
+    let load = |values: &str| {
+        let enum_sql = format!("set search_path to app;\ncreate type mood as enum ({values});\n");
+        let mut files = rest.clone();
+        files.push(("ddl/enum/app/mood.ddl", enum_sql.as_str()));
+        write_project(dir, yaml, &files)
+    };
+
+    // ── v1, released and applied, with a row holding the value to remove ──
+    let design = load("'ok', 'meh', 'bad'");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'meh'), (2, 'bad');")
+        .await
+        .expect("seed rows");
+
+    // ── remove 'meh', snapshot, and resolve the data TODO as a user would ──
+    let design = load("'ok', 'bad'");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "drop meh").unwrap();
+    let todos = dbd_core::snapshot::scan_data_sql_todos(dir).unwrap();
+    assert!(!todos.is_empty(), "the removal asks for its rows to be mapped");
+    for todo in &todos {
+        let sql = std::fs::read_to_string(&todo.file).unwrap();
+        let resolved: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("-- TODO"))
+            .map(|l| format!("{}\n", l.replace("'???'", "'ok'")))
+            .collect();
+        std::fs::write(&todo.file, resolved).unwrap();
+    }
+
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the generated migration applies");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND mood = 'ok'",
+        "the mapped row",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.happy WHERE id = 1",
+        "the view, over the new type",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mood_counts'",
+        "the matview",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE n.nspname = 'app' AND t.typname <> 'mood' AND t.typtype = 'e'",
+        "a leftover enum type",
+    )
+    .await;
+
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(
+        diff.is_empty(),
+        "the design diffs clean: {:?} {:?}",
+        diff.changes,
+        diff.matview_drift
+    );
+    let again = dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "again").unwrap();
+    assert!(
+        again.snapshots.len() == 1 && again.snapshots[0].no_changes,
+        "and the snapshots end where the design is"
+    );
+}

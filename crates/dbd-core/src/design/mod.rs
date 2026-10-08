@@ -54,14 +54,88 @@ pub struct ApplyComplete {
     pub previously_built: bool,
 }
 
+/// The pending migrations a run would execute against one database, from
+/// [`Design::pending_migration_preview`] — what `apply --dry-run` lists.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationPreview {
+    /// The version the database records (0: none).
+    pub from_version: u32,
+    /// The version the design is at.
+    pub to_version: u32,
+    /// The migration steps the run takes, in the order it takes them. Empty
+    /// when the run migrates nothing.
+    pub steps: Vec<MigrationStepPreview>,
+}
+
+/// One migration step of a run, for a preview.
+#[derive(Debug, Clone)]
+pub struct MigrationStepPreview {
+    /// The migration it belongs to.
+    pub version: u32,
+    /// The entity it acts on.
+    pub entity: String,
+    pub action: MigrationAction,
+    /// The statements of the files the step runs, in order. Empty for
+    /// [`MigrationAction::Create`], which runs the entity's own DDL.
+    pub statements: Vec<PlannedStatement>,
+    /// `false` for a drop of a table this database does not have: the run
+    /// skips it.
+    pub runs: bool,
+}
+
+/// What a migration step does to its entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAction {
+    /// A migration added it; its DDL creates it.
+    Create,
+    /// A migration altered it; its `.sql` and `.data.sql` run.
+    Migrate,
+    /// A migration dropped it; its drop script runs where it still exists.
+    Drop,
+}
+
+/// One statement a migration file runs, as a preview shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStatement {
+    /// The statement on one line, shortened when long.
+    pub text: String,
+    /// Whether it destroys something — a `DROP`, a `TRUNCATE`, or an `ALTER
+    /// TABLE` dropping a column or constraint — read from the parse tree.
+    pub drops: bool,
+}
+
 /// Running tallies accumulated while executing an apply plan's steps. Folded
 /// into [`ApplyComplete`] once the plan finishes.
+///
+/// `applied` and `migrated` count entities, as [`ApplyComplete`] says they do,
+/// not steps: an entity a migration adds is created and may then be migrated
+/// and re-applied, and one altered by two pending migrations runs two
+/// migration files. Counted per step, a design of 35 entities reported "36
+/// applied".
 #[derive(Default)]
 struct ApplyCounts {
     applied: u32,
     migrated: u32,
     created: u32,
     dropped: u32,
+    counted_applied: std::collections::HashSet<String>,
+    counted_migrated: std::collections::HashSet<String>,
+}
+
+impl ApplyCounts {
+    /// Count `entity` as applied, once however many steps applied it.
+    fn applied(&mut self, entity: &str) {
+        if self.counted_applied.insert(entity.to_string()) {
+            self.applied += 1;
+        }
+    }
+
+    /// Count `entity` as migrated, once however many migration files it ran.
+    fn migrated(&mut self, entity: &str) {
+        if self.counted_migrated.insert(entity.to_string()) {
+            self.migrated += 1;
+        }
+    }
 }
 
 /// Summary passed to the `on_complete` callback of `import_data()`.
@@ -534,6 +608,13 @@ pub struct Design {
 fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
     use crate::entity::PathSource;
     if entity.schema_path.stated() || !entity.entity_type.has_schema() {
+        return;
+    }
+    // A file that did not parse has no path the parser could record — its
+    // `SET search_path` may be its first line — so "states no SET
+    // search_path" beside its parse error was false. The parse error is the
+    // finding.
+    if !entity.errors.is_empty() {
         return;
     }
     // A dialect with no schema path at all has nothing to warn about. T-SQL
@@ -1650,6 +1731,49 @@ import:
             .collect()
     }
 
+    /// A project at v1 applied to a database at v2 — a branch checked out
+    /// behind the database it points at — planned as "current", re-applied
+    /// v1's DDL over v2's schema, and reported "Already up to date (v2)".
+    /// It is refused before anything runs, hooks included, naming both
+    /// versions; the run, its dry run and a deploy alike.
+    #[tokio::test]
+    async fn an_older_project_is_refused_on_a_newer_database() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        assert_eq!(design.config().project.version, Some(1));
+
+        for dry_run in [false, true] {
+            let mock = MockAdapter::new().with_meta("dev", 2);
+            let err = design
+                .apply(&mock, None, dry_run, None, Progress::none())
+                .await
+                .expect_err("a v1 project must not apply to a v2 database");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, DbdError::SafetyGuard(_)),
+                "a guard, like scope and prod: {msg}"
+            );
+            assert!(msg.contains("v2") && msg.contains("v1"), "naming both versions: {msg}");
+            assert!(markers_run(&mock).is_empty(), "no hook ran (dry run {dry_run})");
+            assert!(mock.applied.lock().unwrap().is_empty(), "no entity was applied");
+            assert!(mock.scripts.lock().unwrap().is_empty(), "no script ran");
+        }
+
+        let mock = MockAdapter::new().with_meta("dev", 2);
+        let err = design.deploy(&mock, false, None, |_| {}).await.expect_err("nor deploy");
+        assert!(matches!(err, DbdError::SafetyGuard(_)), "{err}");
+        assert!(mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty());
+
+        // The database's own version, and an older one, still apply.
+        for db in [1, 0] {
+            let mock = MockAdapter::new().with_meta("dev", db);
+            design
+                .apply(&mock, None, false, None, Progress::none())
+                .await
+                .unwrap_or_else(|e| panic!("a v{db} database takes a v1 project: {e}"));
+        }
+    }
+
     /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
     /// alone, so an `import.after` hook never runs on it. `apply.after` does.
     #[tokio::test]
@@ -1971,12 +2095,23 @@ import:
 
     #[tokio::test]
     async fn apply_repins_scope_on_current_strategy() {
-        // A DB already at/above the latest version takes the Current strategy,
-        // whose plan has no SetVersion step. The scope must still be (re)pinned.
-        let config_path = fixture_dir().join("design.yaml");
-        let design = Design::from_config(&config_path, "dev").unwrap();
-        // db_version 99 >= any fixture latest_version → Current strategy.
-        let mock = MockAdapter::new().with_meta("dev", 99).with_scope("public");
+        // A DB already at the latest version takes the Current strategy, whose
+        // plan has no SetVersion step. The scope must still be (re)pinned. (A
+        // DB *above* the design's version is refused by the version guard.)
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\n  version: 7\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new().with_meta("dev", 7).with_scope("public");
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
@@ -1985,9 +2120,9 @@ import:
             .unwrap();
 
         let meta = mock.get_project_meta().await.unwrap().expect("meta");
-        // Re-pinned to the applied scope, and the version was preserved (not downgraded).
+        // Re-pinned to the applied scope, and the version was preserved.
         assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
-        assert_eq!(meta.version, 99);
+        assert_eq!(meta.version, 7);
     }
 
     /// `reset --clean` drops what the project installs: every role the design
@@ -2122,6 +2257,86 @@ import:
         design.combine(&out, None).unwrap();
         let sql = std::fs::read_to_string(&out).unwrap();
         assert!(sql.contains("set search_path to app, public;"), "{sql}");
+    }
+
+    /// The search path each `CREATE TABLE` in `sql` runs under: the args of the
+    /// last `SET search_path` before it, keyed by the table's bare name. Read
+    /// from libpg_query's tree, so a spelling change cannot pass or fail it.
+    fn search_path_per_table(sql: &str) -> std::collections::HashMap<String, Vec<String>> {
+        use pg_query::NodeEnum;
+        let parsed = pg_query::parse(sql).expect("combined SQL parses");
+        let mut path: Vec<String> = Vec::new();
+        let mut out = std::collections::HashMap::new();
+        for stmt in &parsed.protobuf.stmts {
+            match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+                Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                    path = set
+                        .args
+                        .iter()
+                        .filter_map(|a| match a.node.as_ref() {
+                            Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                                Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                }
+                Some(NodeEnum::CreateStmt(create)) => {
+                    let table = create.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                    out.insert(table, path.clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `source.search_path` is the path the parser resolves a file with no
+    /// `SET search_path` against, so `ddl/table/app/a.ddl` holding a bare
+    /// `create table a` was read as `app.a`. Nothing ran it there: the script
+    /// carried the file as written, the table landed wherever the session
+    /// pointed (`public`), and `diff` then reported `+ create app.a` forever.
+    /// The combined script must run each such file on the project's path —
+    /// with `public` after it, as a file's own path gets — and leave a file
+    /// that states its own path alone.
+    #[test]
+    fn combine_runs_a_file_with_no_search_path_on_the_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: postgresql\n  search_path: [app]\nschemas:\n  - app\n  - other\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/a.ddl"),
+            "create table if not exists a (id int primary key);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/other")).unwrap();
+        std::fs::write(
+            dir.join("ddl/table/other/b.ddl"),
+            "set search_path to other;\ncreate table if not exists b (id int primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+
+        let paths = search_path_per_table(&sql);
+        assert_eq!(
+            paths.get("a").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "a pathless file runs on source.search_path, then public:\n{sql}"
+        );
+        assert_eq!(
+            paths.get("b").map(Vec::as_slice),
+            Some(["other".to_string(), "public".to_string()].as_slice()),
+            "a file's own path still wins:\n{sql}"
+        );
     }
 
     /// A scope that keeps an extension but excludes the schema it installs into
@@ -3347,6 +3562,93 @@ import:
                 .any(|s| matches!(s, ExecutionStep::RecordMigration { version: 2, .. }))
         );
         assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
+    }
+
+    /// A scope's working set names the schemas and tables it builds; roles and
+    /// extensions are never in it, because they are always on (see
+    /// `entity_in_scope`). The entities handed to the plan have already been
+    /// through that rule — and a fresh install applies every one of them — but
+    /// the migrate plan filtered them by the working set again, so under a scope
+    /// a new role was never created and a new extension never installed, and the
+    /// first table using the extension's type failed (`type "citext" does not
+    /// exist`).
+    #[test]
+    fn a_scoped_migration_applies_the_roles_and_extensions_the_scope_keeps() {
+        let role = Entity::new(EntityType::Role, "app_writer");
+        let extension = Entity::new(EntityType::Extension, "citext");
+        let entities = vec![role, extension, test_entity("app.emails")];
+        let migrations = vec![test_migration(1, 2, vec!["app.emails"], vec![], vec![])];
+        let working_set: std::collections::HashSet<String> = ["app", "app.emails"].map(String::from).into();
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, Some(&working_set));
+
+        let applied: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(n) | ExecutionStep::CreateEntity(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(applied.contains(&"app_writer"), "the role is created: {applied:?}");
+        assert!(applied.contains(&"citext"), "the extension is installed: {applied:?}");
+        let emails = applied.iter().position(|n| *n == "app.emails").unwrap();
+        let citext = applied.iter().position(|n| *n == "citext").unwrap();
+        assert!(citext < emails, "before the table that uses it: {applied:?}");
+    }
+
+    /// `applied` counts entities: "Entities whose DDL was applied", of which
+    /// `created` is a subset. A migration's new entity runs `CreateEntity` and
+    /// then `ApplyEntity`, and both counted it — a design of 3 entities reported
+    /// "4 applied", one more than it has.
+    #[tokio::test]
+    async fn a_migration_counts_each_entity_it_applies_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "migrations/002"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\n  version: 2\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        for t in ["users", "audit"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"added":["app.audit"],"altered":[],"dropped":[]}"#,
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let entities = design.entities_to_apply(None, None).unwrap().len() as u32;
+
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let mut summary = None;
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+
+        let s = summary.expect("a successful apply reports a summary");
+        assert_eq!(s.strategy, ApplyStrategy::Migrate);
+        assert_eq!(s.applied, entities, "each of the {entities} entities counted once");
+        assert_eq!(s.created, 1, "the one the migration adds");
     }
 
     // ── data.sql TODO blocking ────────────────────────────

@@ -1017,3 +1017,183 @@ fn inspect_finds_the_files_of_a_project_given_by_relative_path() {
     );
     assert!(out.status.success(), "{}", stdout(&out));
 }
+
+// ── An unset $DATABASE_URL is named, not parsed ─────────────────────────────
+
+/// `url: $DATABASE_URL` with the variable unset was passed through literally,
+/// and the driver reported `relative URL without a base` — true of the string
+/// `$DATABASE_URL`, and no help to anyone who just forgot to export it.
+#[test]
+fn an_unset_url_variable_is_named_with_how_to_set_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["apply"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("DATABASE_URL is not set"),
+        "the variable is named as unset: {err}"
+    );
+    assert!(err.contains("-d"), "and the way past it is given: {err}");
+    assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
+
+    // Exported but empty: clap hands the empty value over as `-d ""`, which
+    // names no database any more than an unset one does.
+    let out = Command::cargo_bin("dbd")
+        .unwrap()
+        .env("DATABASE_URL", "")
+        .arg("-s")
+        .arg(tmp.path())
+        .arg("apply")
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.contains("DATABASE_URL is empty"),
+        "an empty variable is named as empty: {err}"
+    );
+    assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
+}
+
+// ── A closed pipe ends the output quietly ───────────────────────────────────
+
+/// `dbd inspect | head` panicked — `failed printing to stdout: Broken pipe` —
+/// once `head` had what it wanted and closed the pipe. Every command prints
+/// through `println!`, so every command did; a reader closing early is how
+/// output is meant to be consumed, and the process should simply end.
+#[cfg(unix)]
+#[test]
+fn a_closed_pipe_ends_any_command_without_a_panic() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: big\nsource:\n  dialect: postgresql\n  search_path: [app]\nschemas:\n  - app\n",
+    );
+    // Far more output than a pipe buffers: one warning per pathless file.
+    for i in 0..2000 {
+        write(
+            tmp.path(),
+            &format!("ddl/table/app/t{i}.ddl"),
+            &format!("create table if not exists t{i} (id integer primary key);\n"),
+        );
+    }
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .env_remove("DATABASE_URL")
+        .arg("-s")
+        .arg(tmp.path())
+        .arg("inspect")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 16];
+    child.stdout.take().unwrap().read_exact(&mut first).unwrap();
+    // The read end is dropped here, as `head -1` closes it.
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "no panic on a closed pipe: {err}");
+    assert_ne!(out.status.code(), Some(101), "and no panic exit: {err}");
+}
+
+// ── A file that does not parse is not also missing a search path ────────────
+
+/// A file that fails to parse states no search path the parser could record,
+/// so it also got "states no `SET search_path`" — beside its parse error, for
+/// a file whose first line was `set search_path to app;`. The parse error is
+/// the finding; a pathless file that parses still gets its warning.
+#[test]
+fn a_file_that_does_not_parse_gets_no_search_path_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+    write(
+        tmp.path(),
+        "ddl/table/app/pathless.ddl",
+        "create table if not exists pathless (id integer primary key);\n",
+    );
+
+    let out = dbd(tmp.path(), &["inspect"]);
+    let report = format!("{}{}", stdout(&out), stderr(&out));
+    let warned = |file: &str| {
+        report
+            .lines()
+            .any(|l| l.contains(file) && l.contains("states no `SET search_path`"))
+    };
+    assert!(report.contains("broken.ddl"), "the parse error is reported: {report}");
+    assert!(!warned("broken.ddl"), "and nothing else about that file: {report}");
+    assert!(
+        warned("pathless.ddl"),
+        "a pathless file that parses still warns: {report}"
+    );
+}
+
+// ── doctor counts what it fixes as it counts what it finds ──────────────────
+
+/// `doctor` found "2 issues" — two plural folders — and `--fix` then reported
+/// "4 issues fixed": it counted every file it moved out of a folder whose
+/// singular already existed, and a folder it renamed whole as one.
+#[test]
+fn doctor_fixes_as_many_issues_as_it_finds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "design.yaml", "project:\n  name: d\nschemas:\n  - app\n");
+    write(
+        dir,
+        "ddl/table/app/x.ddl",
+        "set search_path to app;\ncreate table if not exists x (id integer);\n",
+    );
+    for t in ["a", "b", "c"] {
+        write(
+            dir,
+            &format!("ddl/tables/app/{t}.ddl"),
+            &format!("set search_path to app;\ncreate table if not exists {t} (id integer);\n"),
+        );
+    }
+    write(
+        dir,
+        "ddl/views/app/v.ddl",
+        "set search_path to app;\ncreate or replace view v as select 1 as one;\n",
+    );
+
+    let found = stdout(&dbd(dir, &["doctor"]));
+    assert!(found.contains("2 issues found."), "{found}");
+    let fixed = stdout(&dbd(dir, &["doctor", "--fix"]));
+    assert!(fixed.contains("2 issues fixed"), "the same two, fixed: {fixed}");
+}
+
+// ── an external name is not something inspect can check ─────────────────────
+
+/// `inspect -n auth.users` said "Everything looks ok — 1 entities, no issues"
+/// for a name declared `external:`, while `apply -n auth.users` refused it.
+/// apply is right: dbd has no DDL for an external and reads nothing of it, so
+/// there is nothing to inspect, and reporting it checked is the false all-clear
+/// a `-n` that selects nothing used to give.
+#[test]
+fn inspect_refuses_an_external_name_as_apply_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: ext\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: auth.users\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    );
+
+    let apply = dbd(dir, &["apply", "--dry-run", "-n", "auth.users"]);
+    assert!(!apply.status.success(), "precondition: apply refuses it");
+    let out = dbd(dir, &["inspect", "-n", "auth.users"]);
+    assert!(!out.status.success(), "inspect refuses it too: {}", stdout(&out));
+    assert!(stderr(&out).contains("external"), "saying why: {}", stderr(&out));
+    assert!(!stdout(&out).contains("Everything looks ok"), "{}", stdout(&out));
+}

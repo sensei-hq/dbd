@@ -180,8 +180,14 @@ impl Design {
                     };
                     let desc = format!("{}:{}", e.entity_type.tag(), e.name);
                     on_start(&desc);
+                    // A file that states no path was read against
+                    // `source.search_path`, so its body is created on that path
+                    // — as `apply` runs the file — not on the managed-schema one.
+                    let prelude = crate::script::project_search_path(e)
+                        .map(|set| format!("{set}\n"))
+                        .unwrap_or_else(|| search_path.clone());
                     let result = match adapter
-                        .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                        .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
                         .await
                     {
                         Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
@@ -342,8 +348,15 @@ impl Design {
         // type-swap that does converge. Needs the entity list, not just the
         // snapshots: the managed views to drop first come from the dependency
         // graph, and the write pass re-applies each one at its place in
-        // dependency order — after the enum whose ALTER dropped it.
-        plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
+        // dependency order — after the enum whose ALTER dropped it. The
+        // snapshots carry their raw indexes back in: the swap rebuilds the ones
+        // that read the column, and canonicalizing stripped them.
+        plan_enum_recreation(
+            &mut plan,
+            &crate::reconcile::with_indexes_of(&live, &live_raw),
+            &crate::reconcile::with_indexes_of(&desired, &desired_raw),
+            &desired_owned,
+        );
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates, restamps, AND drift warnings.

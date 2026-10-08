@@ -561,15 +561,38 @@ pub(super) async fn get_adapter(
 ) -> Result<Box<dyn dbd_core::DatabaseAdapter>> {
     let design_config = dbd_core::config::read(config).context("Failed to read config")?;
 
-    let url = match database_url {
+    // An exported-but-empty `$DATABASE_URL` reaches here as `-d ""` (clap reads
+    // the variable for `-d`); it names no database, so the target's URL is
+    // asked instead, as `configured_database_url` does.
+    let url = match database_url.filter(|u| !u.is_empty()) {
         Some(u) => u.to_string(),
         None => {
             let target = design_config.get_target(None).context("No target configured")?;
-            target
+            let configured = target
                 .url
                 .clone()
-                .map(|u| resolve_env_vars(&u))
-                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?
+                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?;
+            let url = resolve_env_vars(&configured);
+            // A `$VAR` the environment does not have comes back as itself, and
+            // the driver then reported `relative URL without a base` — true of
+            // the string `$DATABASE_URL`, and no help to someone who forgot to
+            // export it. Say which variable, and how to supply it.
+            if let Some(var) = configured.strip_prefix('$') {
+                let state = if url == configured {
+                    Some("not set")
+                } else if url.is_empty() {
+                    Some("empty")
+                } else {
+                    None
+                };
+                if let Some(state) = state {
+                    anyhow::bail!(
+                        "target.url is ${var}, but {var} is {state} — export {var}=postgres://user:password@host:5432/database, \
+                         or pass the URL with -d <url>"
+                    );
+                }
+            }
+            url
         }
     };
 
@@ -597,6 +620,111 @@ pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>)
         .and_then(|t| t.url.as_deref())
         .map(resolve_env_vars)
         .filter(|u| usable(u)))
+}
+
+/// The database a dry run asks, when one is configured — see
+/// [`configured_database_url`] — or `None`, and the dry run stays offline.
+///
+/// A dry run writes nothing, but a preview of a run the database would refuse
+/// is a false promise: with a database to ask, every dry run checks the scope
+/// pin its real run checks, and `apply`/`deploy` read the version their
+/// pending migrations start from. Named for `reset --dry-run`, which did this
+/// first; a configured database that cannot be reached is an error, as it is
+/// for the run.
+pub(super) async fn dry_run_adapter(
+    config: &Path,
+    database_url: Option<&str>,
+) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
+    match configured_database_url(config, database_url)? {
+        Some(url) => Ok(Some(get_adapter(config, Some(&url)).await?)),
+        None => Ok(None),
+    }
+}
+
+/// The scope guard for a command that never re-pins the database — `policies`
+/// and `refresh` — so it has no `--allow-scope-change` to offer: the way through
+/// is the pinned scope, or re-pointing the database with `apply` first.
+/// `consequence` says what running another scope here would do.
+pub(super) async fn check_pinned_scope(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    resolved: &dbd_core::ResolvedScope,
+    consequence: &str,
+) -> Result<()> {
+    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
+    if let Some(pinned) = pinned
+        && pinned != resolved.name
+    {
+        anyhow::bail!(
+            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
+             {consequence}\n\
+             → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
+             --allow-scope-change` first.",
+            resolved.name,
+            resolved.name
+        );
+    }
+    Ok(())
+}
+
+/// Print the pending migrations a run would execute: each step under its
+/// version, then the statements it runs, a destructive one marked `⚠`.
+pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
+    use dbd_core::design::MigrationAction;
+    // Versions spelled as the run's own summary spells them (`Migrated v1 → v3`).
+    if preview.steps.is_empty() {
+        output::info(
+            verbosity,
+            &format!(
+                "No pending migration to run (database at {}, design at v{}).",
+                match preview.from_version {
+                    0 => "no recorded version".to_string(),
+                    v => format!("v{v}"),
+                },
+                preview.to_version
+            ),
+        );
+        return;
+    }
+    output::info(
+        verbosity,
+        &format!(
+            "Pending migrations, v{} → v{} — the run executes these first:",
+            preview.from_version, preview.to_version
+        ),
+    );
+    for step in &preview.steps {
+        let action = match step.action {
+            MigrationAction::Create => "create",
+            MigrationAction::Migrate => "migrate",
+            MigrationAction::Drop => "drop",
+        };
+        let note = match (step.action, step.runs) {
+            (MigrationAction::Create, _) => " (from its DDL)",
+            (MigrationAction::Drop, false) => " — not in this database, so skipped",
+            _ => "",
+        };
+        output::info(
+            verbosity,
+            &format!("  v{} {action} {}{note}", step.version, step.entity),
+        );
+        for statement in &step.statements {
+            let mark = if statement.drops { "⚠ " } else { "" };
+            output::info(verbosity, &format!("      {mark}{}", statement.text));
+        }
+    }
+}
+
+/// For a dry run with no database: pending migrations start from the version
+/// the database records, so they cannot be listed. Said only for a project that
+/// has migrations at all.
+pub(super) fn note_unlisted_migrations(verbosity: Verbosity, project_dir: &Path) {
+    if !dbd_core::snapshot::pending_migrations(0, project_dir).is_empty() {
+        output::info(
+            verbosity,
+            "No database to read the recorded version from, so pending migrations are not listed \
+             — pass -d <url>, or set target.url, to list them.",
+        );
+    }
 }
 
 fn resolve_env_vars(s: &str) -> String {
@@ -762,6 +890,23 @@ pub(crate) mod testutil {
     pub(crate) fn copy_fixture_project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         copy_dir(&fixtures(), tmp.path()).unwrap();
+        tmp
+    }
+
+    /// [`copy_fixture_project`] with the fixture's `url: $DATABASE_URL`
+    /// removed, for a dry run that must find no database. A dry run asks the
+    /// database when one is configured — for its scope pin and its version —
+    /// and a `$DATABASE_URL` set in the shell running the tests would otherwise
+    /// give it one.
+    pub(crate) fn offline_fixture_project() -> tempfile::TempDir {
+        let tmp = copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         tmp
     }
 }

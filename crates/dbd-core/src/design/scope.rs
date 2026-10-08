@@ -350,4 +350,31 @@ impl Design {
         }
         Ok(())
     }
+
+    /// Version guard: refuse to apply a project older than the database.
+    ///
+    /// `db_version` is what the database records, `design_version` the
+    /// project's `project.version` (0 when it has none). A database ahead of
+    /// the design was built from a newer revision — typically a branch checked
+    /// out behind it. The plan then came out "current" and re-applied the older
+    /// DDL over the newer schema, reporting "Already up to date". Nothing short
+    /// of a newer revision makes that right, so there is no flag to pass it.
+    /// Shaped like [`Self::check_scope_guard`] and [`Self::check_reset_guard`];
+    /// [`Self::apply`] runs it before anything it writes, and the CLI dry runs
+    /// run it whenever they have a database to ask.
+    pub fn check_version_guard(db_version: u32, design_version: u32) -> Result<()> {
+        if db_version > design_version {
+            let project = match design_version {
+                0 => "this project records no version".to_string(),
+                v => format!("this project is at v{v}"),
+            };
+            return Err(DbdError::SafetyGuard(format!(
+                "version guard: the database is at v{db_version}, but {project}.\n\
+                 Applying an older project would re-apply its DDL over a newer schema.\n\
+                 → check out a newer revision of the project (at v{db_version} or later), or point it at \
+                 a database built from this one."
+            )));
+        }
+        Ok(())
+    }
 }

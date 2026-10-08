@@ -75,6 +75,68 @@ pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     }
 }
 
+/// The DDL that runs for `entity` on PostgreSQL: [`ddl_from_entity`], opened
+/// with the search path the parser resolved its unqualified names against when
+/// that path is the project's — `source.search_path`, for a file that states
+/// none of its own.
+///
+/// The parser read a pathless `create table a` in `ddl/table/app/` against
+/// `source.search_path: [app]` as `app.a`, and `inspect` said so; but the file
+/// ran as written, on whatever path the session had, so the table landed in
+/// `public` and `diff` reported `+ create app.a` forever. The path is now a
+/// statement ahead of the file rather than an edit inside it: the file's text
+/// is never rewritten, and a file that states its own path (which wins over
+/// the project's) gets nothing added.
+///
+/// The one place both `apply` (the Postgres adapter) and `combine` take a
+/// file's runnable DDL from, so the script `combine` writes runs as `apply`
+/// does — and `reconcile` and `deploy`, which apply through the adapter, with
+/// them.
+pub fn runnable_ddl(entity: &Entity) -> Option<String> {
+    let ddl = ddl_from_entity(entity)?;
+    Some(match project_search_path(entity) {
+        Some(set) => format!("{set}\n{ddl}"),
+        None => ddl,
+    })
+}
+
+/// `SET search_path TO …;` for an entity whose names were resolved against
+/// `source.search_path`, or `None` when the file stated its own path or the
+/// session default applies. Only a file-backed entity has names to resolve:
+/// what dbd generates (schemas, extensions, roles) is fully qualified.
+pub(crate) fn project_search_path(entity: &Entity) -> Option<String> {
+    let path = &entity.schema_path;
+    if path.source != crate::entity::PathSource::Project || path.entries.is_empty() || entity.file.is_none() {
+        return None;
+    }
+    Some(search_path_statement(&path.entries))
+}
+
+/// `SET search_path TO <entries>, "public";` — `public` appended unless the
+/// path already names it, as [`ensure_public_in_search_path`] does for a path a
+/// file states, so an extension installed there stays reachable.
+///
+/// Every entry is quoted: an unquoted name is folded to lower case, which would
+/// point a mixed-case schema somewhere else. `"$user"` is Postgres's own
+/// spelling of the role placeholder and is written that way.
+fn search_path_statement(entries: &[crate::entity::PathEntry]) -> String {
+    use crate::entity::PathEntry;
+    let mut names: Vec<String> = entries
+        .iter()
+        .map(|e| match e {
+            PathEntry::Schema(s) => crate::sql_quote::ident(s),
+            PathEntry::CurrentUser => "\"$user\"".to_string(),
+        })
+        .collect();
+    if !entries
+        .iter()
+        .any(|e| matches!(e, PathEntry::Schema(s) if s == crate::reconcile::DEFAULT_SCHEMA))
+    {
+        names.push(crate::sql_quote::ident(crate::reconcile::DEFAULT_SCHEMA));
+    }
+    format!("SET search_path TO {};", names.join(", "))
+}
+
 /// Ensure `public` is included in any SET search_path statement.
 /// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
 /// but omit `public`, which hides extensions installed in the public schema.
@@ -143,7 +205,7 @@ fn generated_or_authored_ddl(entity: &Entity, dialect: crate::parser::Dialect) -
     use crate::parser::Dialect;
     match (dialect, entity.entity_type) {
         (Dialect::PostgreSql | Dialect::Unstated, _) => {
-            ddl_from_entity(entity).map(|ddl| ensure_public_in_search_path(&ddl))
+            runnable_ddl(entity).map(|ddl| ensure_public_in_search_path(&ddl))
         }
         (Dialect::TSql, EntityType::Schema) => {
             // `]` doubles inside a bracketed name, then `'` inside the N'…' literal.
