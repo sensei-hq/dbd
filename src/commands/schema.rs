@@ -837,6 +837,11 @@ pub async fn cmd_apply(
     // to, and the run it previewed did not.
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    // Each file the run executes on a path it does not state, said before the
+    // run and its preview alike — a forgotten search_path is never silent.
+    for warning in design.search_path_warnings(name, Some(&resolved))? {
+        output::warn(&warning);
+    }
 
     if dry_run {
         // The real apply's own gate, not a copy of it: the scope's gaps and

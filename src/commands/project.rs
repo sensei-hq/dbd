@@ -430,6 +430,11 @@ pub async fn cmd_deploy(
     // does not happen. Named for the run as for its preview.
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    // Each file its apply executes on a path it does not state, as `apply`
+    // says it — a forgotten search_path is never silent.
+    for warning in design.search_path_warnings(None, Some(&resolved))? {
+        output::warn(&warning);
+    }
 
     if dry_run {
         // The real deploy's own gate (it runs `Design::apply`): scope gaps and

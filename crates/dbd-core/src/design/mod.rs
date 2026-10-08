@@ -595,6 +595,11 @@ pub struct Design {
     dialect: String,
 }
 
+/// The phrase [`warn_if_no_search_path`] reports with, so
+/// [`Design::search_path_warnings`] finds its warnings among an entity's
+/// others without a second copy of the rule.
+const NO_SEARCH_PATH: &str = "states no `SET search_path`";
+
 /// Report a DDL file that states no `SET search_path` of its own.
 ///
 /// Every dbd DDL file is expected to open with one — no emitter writes it, so
@@ -635,12 +640,39 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
     };
     entity.warnings.push(format!(
-        "{} states no `SET search_path`; unqualified names resolved against {resolved_against}",
+        "{} {NO_SEARCH_PATH}; unqualified names resolved against {resolved_against}",
         relative.display()
     ));
 }
 
 impl Design {
+    /// Every DDL file a run under `scope` — narrowed to the entity `name`
+    /// selects, if any — executes that states no `SET search_path`, as a
+    /// warning naming the path its unqualified names were resolved against:
+    /// what `apply` and `deploy` print before they run.
+    ///
+    /// `inspect` counted these and nothing else said them, though the design
+    /// is that a forgotten path is never silent: a file the run executes on a
+    /// path nobody wrote into it is how an object lands in a schema nobody
+    /// chose.
+    pub fn search_path_warnings(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let entities = match scope {
+            Some(s) => self.scoped_entities(s)?,
+            None => self.entities.clone(),
+        };
+        let named = match name {
+            Some(n) => Some(self.resolve_name(n, scope)?.name.clone()),
+            None => None,
+        };
+        Ok(entities
+            .iter()
+            .filter(|e| named.as_ref().is_none_or(|n| &e.name == n))
+            .flat_map(|e| &e.warnings)
+            .filter(|w| w.contains(NO_SEARCH_PATH))
+            .cloned()
+            .collect())
+    }
+
     /// Which reader this project's DDL was read by.
     ///
     /// Exposed because it decides what a caller may ask for: only a reader
