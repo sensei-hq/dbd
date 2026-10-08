@@ -6324,7 +6324,7 @@ async fn a_jump_across_versions_ends_where_running_them_one_at_a_time_does() {
             &**db,
             true,
             "SELECT 1 WHERE (SELECT string_agg(id || ':' || cnt, ',' ORDER BY id) FROM s.t) = '1:2,2:1'",
-            "the counts v3's data script wrote",
+            "the counts the v3 data script wrote",
         )
         .await;
         let diff = design.diff_live(&**db, None).await.expect("diff");
@@ -6409,7 +6409,7 @@ async fn a_versions_data_script_runs_after_every_schema_change_of_that_version()
         &*adapter,
         true,
         "SELECT 1 FROM s.t WHERE id = 1 AND cnt = 2",
-        "the count v2's data script wrote",
+        "the count the v2 data script wrote",
     )
     .await;
 }
