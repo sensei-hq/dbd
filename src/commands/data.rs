@@ -452,6 +452,8 @@ pub(crate) async fn export_with_adapter(
 
     output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
+    // `-o` replaces the project's `export/`; the layout under it is the same.
+    let root = output.map_or_else(|| design.project_dir().join("export"), Path::to_path_buf);
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
         let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
@@ -459,17 +461,39 @@ pub(crate) async fn export_with_adapter(
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
         adapter
-            .export_data(&export_entity, output)
+            .export_data(&export_entity, Some(&export_dir(&root, &table.name)?))
             .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
     }
 
-    let dest = output
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "export/".to_string());
-    output::info(verbosity, &format!("Export complete. Files written to {dest}"));
+    output::info(
+        verbosity,
+        &format!("Export complete. Files written to {}", root.display()),
+    );
     Ok(())
+}
+
+/// The directory `table`'s file is written to: `<root>/<schema>/`, or `<root>/`
+/// for a table with no schema (SQLite's).
+///
+/// One layout for the default `export/` and for `-o`, and the
+/// `import/<schema>/<table>` layout an import reads — so `-o import` exports
+/// straight into the import tree. `-o` wrote every table flat into `<root>`,
+/// and the second of two same-named tables in different schemas overwrote the
+/// first while the summary counted both. The default `export/` was resolved
+/// against the directory dbd ran in rather than the project `-s` names.
+fn export_dir(root: &Path, table: &str) -> Result<std::path::PathBuf> {
+    match dbd_core::entity::split_qualified_name(table) {
+        (Some(schema), _) if dbd_core::path_safe::is_safe_segment(&schema) => Ok(root.join(schema)),
+        // A schema name is a directory name here, and a quoted identifier may
+        // hold a path separator — refused rather than joined.
+        (Some(_), _) => bail!(
+            "cannot export {table}: its schema name is not usable as a directory name (it contains a path \
+             separator, or is '.' or '..'). Rename the schema, or export the table by hand"
+        ),
+        (None, _) => Ok(root.to_path_buf()),
+    }
 }
 
 #[cfg(test)]
