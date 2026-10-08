@@ -6151,3 +6151,112 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
     assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
     assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
 }
+
+// ── `public` on the search path, without rewriting any text ──────────────────
+
+/// The files `search_path_text_survives_apply_and_combine` applies: two
+/// Supabase-style `SECURITY DEFINER` functions pinned to an empty path (`=`
+/// and `to`), a function whose body follows its `set search_path to` clause,
+/// and a table whose file sets its own path and needs an extension installed
+/// in `public`, with defaults quoting the statement.
+const SEARCH_PATH_FILES: [(&str, &str); 4] = [
+    (
+        "ddl/function/app/secure.ddl",
+        "create or replace function app.secure() returns int\n\
+         language sql security definer set search_path = ''\nas $$ select 1; $$;\n",
+    ),
+    (
+        "ddl/function/app/secure_to.ddl",
+        "create or replace function app.secure_to() returns int\n\
+         language sql security definer set search_path to ''\nas $$ select 2; $$;\n",
+    ),
+    (
+        "ddl/function/app/greet.ddl",
+        "create or replace function app.greet() returns text\n\
+         language plpgsql set search_path to app\nas $$ begin return 'g; ok'; end; $$;\n",
+    ),
+    (
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\n\
+         create table if not exists notes (id int primary key, addr citext, \
+         body text default 'set search_path to x; y');\n",
+    ),
+];
+
+/// What `SEARCH_PATH_FILES` must leave in a database, however they got there.
+async fn assert_search_path_text_survived(adapter: &dyn dbd_core::DatabaseAdapter, label: &str) {
+    for (function, expected) in [
+        ("secure", "{\"search_path=\\\"\\\"\"}"),
+        ("secure_to", "{\"search_path=\\\"\\\"\"}"),
+        ("greet", "{search_path=app}"),
+    ] {
+        assert_catalog(
+            adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM pg_proc WHERE proname = '{function}' AND proconfig::text = '{}'",
+                expected.replace('\'', "''")
+            ),
+            &format!("{label}: {function} with its own search_path {expected}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        adapter,
+        true,
+        "SELECT 1 WHERE app.greet() = 'g; ok'",
+        &format!("{label}: app.greet() returning the literal in its body"),
+    )
+    .await;
+    assert_catalog(
+        adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+         WHERE d.adrelid = 'app.notes'::regclass AND a.attname = 'body' \
+         AND pg_get_expr(d.adbin, d.adrelid) = '''set search_path to x; y''::text'",
+        &format!("{label}: the default quoting `set search_path to x; y`"),
+    )
+    .await;
+}
+
+/// Every script `apply` ran, and the one `combine` wrote, had each `set
+/// search_path to …;` in its text rewritten to add `public` — matched anywhere
+/// and up to the next `;`. A Supabase-style function with `set search_path to
+/// ''` failed with `column "public" does not exist`; a body `return 'g; ok'`
+/// after a `set search_path to app` clause deployed returning `'g, public;
+/// ok'`; a default quoting the statement was changed. Only a top-level `SET
+/// search_path` statement now gets `public` — by a statement after it, so no
+/// text is edited — and the script `combine` writes, run as `psql -f` runs
+/// it, builds the same database.
+#[tokio::test]
+async fn search_path_text_survives_apply_and_combine() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("combined").await.unwrap();
+    let adapter = connect(&url, "search_path_text").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: search_path_text\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         target:\n  postgres:\n    extensions:\n      - citext\n",
+        &SEARCH_PATH_FILES,
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_search_path_text_survived(&*adapter, "apply").await;
+
+    let script = tmp.path().join("init.sql");
+    design.combine(&script, None).expect("combine");
+    let combined_url = pg.settings().url("combined");
+    {
+        use sqlx::Connection as _;
+        let mut raw = sqlx::PgConnection::connect(&combined_url).await.unwrap();
+        sqlx::raw_sql(&std::fs::read_to_string(&script).unwrap())
+            .execute(&mut raw)
+            .await
+            .expect("the combined script runs as written");
+    }
+    let combined = connect(&combined_url, "search_path_text").await.unwrap();
+    assert_search_path_text_survived(&*combined, "combine").await;
+}
