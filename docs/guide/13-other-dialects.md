@@ -65,7 +65,7 @@ columns, so:
 
 | Works | Refused or empty |
 |---|---|
-| `inspect`, `graph`, `combine` — the files concatenated, with the schema statements in the project's dialect: a guarded `CREATE SCHEMA` and `GO` for T-SQL, none for MySQL and SQLite | `diff`, `reconcile` — nothing to compare; they refuse and say why |
+| `inspect`, `graph`, `combine` — the files concatenated, with the schema statements in the project's dialect: for T-SQL a guarded `CREATE SCHEMA`, and every entity's DDL closed with `GO` (SQL Server needs `CREATE VIEW`, `PROCEDURE` and `TRIGGER` first in their batch; a file that already ends in `GO` keeps its own); none for MySQL and SQLite | `diff`, `reconcile` — nothing to compare; they refuse and say why |
 | `doctor` | `emit` — nothing to translate |
 | `apply`/`deploy` on SQLite | `dbml`, `diagram` — they run, but with no tables to draw |
 | | `snapshot` — it records tables from their structure, so it records none |
@@ -140,8 +140,10 @@ scope's entities.
 
 - **Tables**, with their columns, `NOT NULL`, defaults, primary keys, unique
   constraints, foreign keys, `CHECK` constraints, indexes (`CREATE INDEX`) and
-  comments where the target keeps them. Identity and `serial` columns are
-  numbered by the target; generated columns are computed by it.
+  comments where the target keeps them. A foreign key and a `CHECK` keep their
+  names (`CONSTRAINT [people_amt_ck] CHECK (…)`); a primary key and a unique
+  constraint are written unnamed. Identity and `serial` columns are numbered by
+  the target; generated columns are computed by it.
 - **Views** and **materialized views**, as `CREATE VIEW`. A materialized view
   becomes a plain view, which is reported, and each of its indexes is reported
   and left out. On MySQL and SQL Server the `SELECT` is passed through
@@ -171,8 +173,9 @@ A generated column's expression is passed through untranslated and reported on
 every target, a partial index's predicate on SQL Server and SQLite, and a
 `CHECK` expression on MySQL and SQL Server — the same way a view body is there. An index
 the target would reject outright is left out and reported, so
-the script still applies: an expression key on SQL Server, a key on an
-unbounded `text`/`bytea`/`json` column on MySQL or SQL Server. MySQL has no
+the script still applies: an expression key on SQL Server, and on MySQL or SQL
+Server a key on a column the target holds as unbounded text or binary — `text`,
+a `varchar` with no length or one past the target's limit, `bytea`, `json`. MySQL has no
 partial indexes, so there one becomes an index over every row (reported). A
 foreign key to a table the script does not create — declared `external:`, or
 left out by `--scope` — is left out and reported; the script has to apply on its
@@ -224,32 +227,35 @@ nobody reads.
 | PostgreSQL | MySQL | T-SQL | SQLite |
 |---|---|---|---|
 | `integer` / `bigint` / `smallint` | `INT` / `BIGINT` / `SMALLINT` | `int` / `bigint` / `smallint` | `INTEGER` |
-| `text` | `TEXT` | `nvarchar(max)` | `TEXT` |
-| `varchar(n)` | `VARCHAR(n)` | `nvarchar(n)` | `TEXT` |
+| `text`, and `varchar` with no length | `LONGTEXT` | `nvarchar(max)` | `TEXT` |
+| `varchar(n)` | `VARCHAR(n)`; past 16,383, `MEDIUMTEXT` or `LONGTEXT` ⚠ | `nvarchar(n)`; past 4,000, `nvarchar(max)` ⚠ | `TEXT` |
 | `boolean` | `TINYINT(1)` | `bit` | `INTEGER` |
-| `numeric(p,s)` | `DECIMAL(p,s)` | `decimal(p,s)` | `NUMERIC` |
+| `numeric(p,s)` | `DECIMAL(p,s)`, at most 65 digits with 30 after the point ⚠ | `decimal(p,s)`, at most 38 digits ⚠ | `NUMERIC` (⚠ past 15 digits) |
+| `numeric` with no precision | `DECIMAL(65,30)` ⚠ | `decimal(38,10)` ⚠ | `NUMERIC` ⚠ |
 | `double precision` | `DOUBLE` | `float` | `REAL` |
 | `real` / `float4` | `FLOAT` | `real` | `REAL` |
-| `char(n)` | `CHAR(n)` | `nchar(n)` | `TEXT` |
-| `timestamptz` | `DATETIME` | `datetimeoffset` | `TEXT` |
-| `timestamp` | `DATETIME` | `datetime2` | `TEXT` |
+| `char(n)` | `CHAR(n)`; past 255, `VARCHAR(n)` ⚠; past 16,383, text ⚠ | `nchar(n)`; past 4,000, `nvarchar(max)` ⚠ | `TEXT` |
+| `timestamptz` | `DATETIME(6)` | `datetimeoffset` | `TEXT` |
+| `timestamp` | `DATETIME(6)` | `datetime2` | `TEXT` |
 | `date` | `DATE` | `date` | `TEXT` |
-| `time` | `TIME` | `time` | `TEXT` |
-| `timetz` | `TIME` ⚠ — the offset is not kept | `time` ⚠ — the same | `TEXT` |
+| `time` | `TIME(6)` | `time` | `TEXT` |
+| `timetz` | `TIME(6)` ⚠ — the offset is not kept | `time` ⚠ — the same | `TEXT` |
 | `interval` | `VARCHAR(255)` ⚠ | `nvarchar(255)` ⚠ | `TEXT` ⚠ |
 | `inet`, `cidr` | `VARCHAR(49)` ⚠ | `nvarchar(49)` ⚠ | `TEXT` ⚠ |
-| `bytea` | `BLOB` | `varbinary(max)` | `BLOB` |
-| `jsonb`, `json` | `JSON` | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
+| `bytea` | `LONGBLOB` | `varbinary(max)` | `BLOB` |
+| `jsonb` | `JSON` | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
+| `json` | `JSON` ⚠ — MySQL normalises the document | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
 | `uuid` | `CHAR(36)` ⚠ | `uniqueidentifier` | `TEXT` ⚠ |
 | `text[]` (any array) | `JSON` ⚠ | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
 | an enum, or any other type | `VARCHAR(255)` ⚠ | `nvarchar(255)` ⚠ | `TEXT` ⚠ |
 | `schema.table` | `` `schema_table` `` ⚠ | `[schema].[table]` | `"schema_table"` ⚠ |
-| `text` in a key (primary, unique or foreign) | `VARCHAR(255)` ⚠ | `nvarchar(450)` ⚠ | `TEXT` |
+| `text` or a `varchar` with no length, in a key (primary, unique or foreign) | `VARCHAR(255)` ⚠ | `nvarchar(450)` ⚠ | `TEXT` |
+| a row wider than the target stores | the widest non-key `VARCHAR`/`CHAR` columns become text ⚠ — 65,535 bytes a row | the widest `nchar` columns become `nvarchar` ⚠ — 8,060 bytes | — |
 | identity, `serial` | `AUTO_INCREMENT` (⚠ for `ALWAYS`) | `IDENTITY(1,1)` (⚠ for `BY DEFAULT` and `serial`) | `INTEGER PRIMARY KEY AUTOINCREMENT` (⚠ for `ALWAYS`) |
 | a sequence | nothing ⚠ | `CREATE SEQUENCE` | nothing ⚠ |
 | `DEFAULT nextval('s')` | the table's `AUTO_INCREMENT` on its numbered key ⚠, else no default ⚠ | `NEXT VALUE FOR` (no default ⚠ when the sequence is not in the script) | `AUTOINCREMENT` on its integer key ⚠, else no default ⚠ |
 | a generated column | `GENERATED ALWAYS AS (…) STORED` ⚠ | `AS CAST((…) AS type) PERSISTED` ⚠ | `GENERATED ALWAYS AS (…) STORED` ⚠ |
-| `now()`, `current_date` | `CURRENT_TIMESTAMP`, `(CURRENT_DATE)` | `SYSDATETIMEOFFSET()`, `CONVERT(date, SYSDATETIME())` | `CURRENT_TIMESTAMP`, `CURRENT_DATE` |
+| `now()`, `current_date` | `CURRENT_TIMESTAMP(n)` at the column's precision, `(CURRENT_DATE)` | `SYSDATETIMEOFFSET()`, `CONVERT(date, SYSDATETIME())` | `CURRENT_TIMESTAMP`, `CURRENT_DATE` |
 | `gen_random_uuid()` | `(UUID())` ⚠ — version 1, not random | `NEWID()` | a random v4 expression over `randomblob` |
 | a literal default | the literal, without its `::cast` | the same | the same |
 | any other default | left out ⚠ | left out ⚠ | left out ⚠ |
@@ -267,6 +273,16 @@ design declares as an enum; any other type dbd has no mapping for (`point`,
 schemas, so the schema is folded into the name with an underscore, and every
 reference to the table has to be updated to match.
 
+**Limits.** emit knows each target's documented limits, so a type the target
+would refuse is switched or clamped where the target would fail, and reported:
+`varchar(5000)` is `nvarchar(max)` on SQL Server, `varchar(70000)` `MEDIUMTEXT`
+on MySQL (counted at four bytes a character), `numeric(70,40)` `DECIMAL(60,30)`
+on MySQL — the integer digits kept — and `decimal(38,8)` on SQL Server. A row
+whose columns add up past the target's row size has its widest non-key columns
+moved out of the row. `text` is `LONGTEXT` and `bytea` `LONGBLOB` on MySQL,
+because MySQL's `TEXT` and `BLOB` hold 64 KB; date-times keep fractional
+seconds as `DATETIME(6)` and `TIME(6)`, a declared precision kept as written.
+
 ```sql
 -- dbd: `id` was `uuid` — emitted as CHAR(36); MySQL has no UUID column type, so it is stored as its text form
 `id` CHAR(36) NOT NULL,
@@ -282,9 +298,12 @@ Some losses are still **not** reported, so check for them by hand:
 - **Identity options** — an identity column's `START WITH` and `INCREMENT BY`;
   the target's numbering counts from 1 by 1.
 - **Precision and zones** — `timestamptz` loses its time zone on MySQL and
-  SQLite, `varchar(n)` its length on SQLite; a bare `varchar` becomes
-  `VARCHAR(255)`/`nvarchar(255)` and a bare `numeric` `DECIMAL(65,30)`/
-  `decimal(38,10)`.
+  SQLite, and `varchar(n)` its length on SQLite.
+- **Index-key length** — MySQL refuses an index key past 3,072 bytes and SQL
+  Server one past 900, and neither limit is checked: a `UNIQUE` on a
+  `varchar(3000)` is 12,000 bytes on MySQL.
+- **A MySQL `time DEFAULT now()`** is still written `DEFAULT CURRENT_TIMESTAMP`,
+  which MySQL refuses on a `TIME` column.
 - **A view's column list** — `CREATE VIEW v (a, b) AS …` comes out with the
   query's own column names on every target.
 
