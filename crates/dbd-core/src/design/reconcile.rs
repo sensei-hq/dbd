@@ -180,8 +180,14 @@ impl Design {
                     };
                     let desc = format!("{}:{}", e.entity_type.tag(), e.name);
                     on_start(&desc);
+                    // A file that states no path was read against
+                    // `source.search_path`, so its body is created on that path
+                    // — as `apply` runs the file — not on the managed-schema one.
+                    let prelude = crate::script::project_search_path(e)
+                        .map(|set| format!("{set}\n"))
+                        .unwrap_or_else(|| search_path.clone());
                     let result = match adapter
-                        .execute_script(&format!("{search_path}{}", matview_create_sql(e)))
+                        .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
                         .await
                     {
                         Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
