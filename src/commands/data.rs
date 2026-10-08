@@ -921,6 +921,91 @@ mod tests {
         assert!(err.to_string().contains("not listed under export:"), "{err}");
     }
 
+    // ── The scope guard ────────────────────────────────────────────────────────
+
+    /// `apply` and `deploy` refuse a database pinned to another scope; `import`
+    /// ran on one and failed partway — staging truncated, some loaders called
+    /// — because the tables it loads are another scope's to build. Refused
+    /// before anything is truncated or loaded.
+    #[tokio::test]
+    async fn an_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect_err("the database is pinned to config_only, and this run asks for all");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scope guard") && msg.contains("pinned to scope 'config_only'") && msg.contains("'all'"),
+            "{msg}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "nothing truncated, loaded or run: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+    }
+
+    /// An ad-hoc `-f` load is an import too.
+    #[tokio::test]
+    async fn an_adhoc_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("refused like the full import");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
+
+    /// `import` never re-pins the database, so there is no flag to override
+    /// the guard with; the refusal says how to get through instead.
+    #[tokio::test]
+    async fn the_import_scope_guard_names_the_way_through() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--scope config_only") && msg.contains("dbd apply --scope all --allow-scope-change"),
+            "the pinned scope to re-run with, or the re-pin: {msg}"
+        );
+    }
+
+    /// The pinned scope itself is let through.
+    #[tokio::test]
+    async fn an_import_under_the_pinned_scope_runs() {
+        let mock = MockAdapter::new().with_scope("all");
+        let design = fixture_design();
+        import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect("the requested scope is the pinned one");
+        assert!(!mock.imported.lock().unwrap().is_empty());
+    }
+
+    /// `export` read tables the pinned scope never built, and failed on the
+    /// first missing one with some files already written. Refused before
+    /// anything is written.
+    #[tokio::test]
+    async fn an_export_from_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let err = export_project(&mock, &testutil::fixture_config(), &testutil::fixtures(), None, "csv")
+            .await
+            .expect_err("pinned to config_only, and this run asks for all");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.exported.lock().unwrap().is_empty(), "nothing exported");
+    }
+
     /// A full (non-ad-hoc) import runs the design's import plan through the
     /// adapter and loads the fixture's data files.
     #[tokio::test]
