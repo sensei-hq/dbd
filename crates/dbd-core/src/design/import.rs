@@ -1389,6 +1389,57 @@ mod tests {
         );
     }
 
+    /// `staging.items` with a shared data file and a dev-only one, and the
+    /// procedure loading it into `app.items`.
+    const TWO_FILES_ONE_TABLE: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/procedure/staging/import_items.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure import_items() language sql\n\
+             as $$ insert into app.items (id) select id from staging.items $$;\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+        ("import/dev/staging/items.csv", "id\n2\n"),
+    ];
+
+    /// The summary says "N table(s) loaded" and counted data files: a table
+    /// with a shared file and a dev-only one was two tables, so three tables
+    /// read as four.
+    #[tokio::test]
+    async fn the_import_summary_counts_tables_not_data_files() {
+        let (_tmp, design) = project_from(TWO_FILES_ONE_TABLE);
+        let mock = MockAdapter::new();
+        let mut summary = None;
+        design
+            .import_data(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.imported.lock().unwrap().len(), 2, "precondition: both files load");
+        assert_eq!(summary.expect("a summary").tables, 1, "one table");
+    }
+
     /// Shared seed data in `import/staging/` and dev-only rows in
     /// `import/dev/staging/` are two data files for one table. Both load, and
     /// then the table's loader runs — once, over both. It ran once per file,
@@ -1396,28 +1447,7 @@ mod tests {
     /// file must not read as a second table claiming the same loader.
     #[tokio::test]
     async fn a_table_with_two_data_files_calls_its_loader_once() {
-        let (_tmp, design) = project_from(&[
-            (
-                "design.yaml",
-                "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
-            ),
-            (
-                "ddl/table/staging/items.ddl",
-                "set search_path to staging;\ncreate table if not exists items (id integer);\n",
-            ),
-            (
-                "ddl/table/app/items.ddl",
-                "set search_path to app;\ncreate table if not exists items (id integer);\n",
-            ),
-            (
-                "ddl/procedure/staging/import_items.ddl",
-                "set search_path to staging;\n\
-                 create or replace procedure import_items() language sql\n\
-                 as $$ insert into app.items (id) select id from staging.items $$;\n",
-            ),
-            ("import/staging/items.csv", "id\n1\n"),
-            ("import/dev/staging/items.csv", "id\n2\n"),
-        ]);
+        let (_tmp, design) = project_from(TWO_FILES_ONE_TABLE);
 
         let (plan, _) = design.scoped_import_plan(None, None).expect("not refused");
         assert_eq!(plan.len(), 2, "both files load");

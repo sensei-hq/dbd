@@ -985,3 +985,35 @@ fn inspect_finds_the_files_of_a_project_given_by_relative_path() {
     );
     assert!(out.status.success(), "{}", stdout(&out));
 }
+
+// ── an import counts tables ─────────────────────────────────────────────────
+
+/// A table with a shared data file and a dev-only one is one table. The
+/// import's preview counted its plan's data files, as the run's summary did.
+#[test]
+fn import_dry_run_counts_a_table_with_two_data_files_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: twofiles\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - staging\n",
+    );
+    write(
+        dir,
+        "ddl/table/staging/items.ddl",
+        "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+    );
+    write(dir, "import/staging/items.csv", "id\n1\n");
+    write(dir, "import/dev/staging/items.csv", "id\n2\n");
+
+    let out = dbd(dir, &["import", "--dry-run", "-e", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).matches("import staging.items").count(),
+        2,
+        "precondition: both files load: {}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("1 entities"), "one table: {}", stdout(&out));
+}
