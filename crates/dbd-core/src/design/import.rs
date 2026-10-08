@@ -64,7 +64,58 @@ impl Design {
             self.check_import_name(n)?;
         }
         self.check_import_staging(name)?;
+        self.check_import_kinds(name)?;
         self.check_import_loaders(name)
+    }
+
+    /// Refuse a data file whose target the design declares as something other
+    /// than a table — a view, a materialized view, a sequence — naming each.
+    ///
+    /// A data file loads into the relation its path names, after the run has
+    /// truncated every staging table it loads. A view got that far: the
+    /// tables before it in the plan were emptied, `TRUNCATE` failed on the view
+    /// (`"items" is not a table`), and nothing loaded.
+    fn check_import_kinds(&self, name: Option<&str>) -> Result<()> {
+        let kind_of = |table: &str| {
+            let declared: Vec<EntityType> = self
+                .entities
+                .iter()
+                .filter(|e| e.name == table)
+                .map(|e| e.entity_type)
+                .collect();
+            if declared.contains(&EntityType::Table) {
+                return None;
+            }
+            declared.into_iter().find_map(|kind| match kind {
+                EntityType::View => Some("a view"),
+                EntityType::MaterializedView => Some("a materialized view"),
+                EntityType::Sequence => Some("a sequence"),
+                _ => None,
+            })
+        };
+        let not_tables: Vec<String> = self
+            .import_tables
+            .iter()
+            .filter(|t| name.is_none_or(|n| t.name == n))
+            .filter_map(|t| {
+                let kind = kind_of(&t.name)?;
+                let file = t
+                    .file
+                    .as_deref()
+                    .map(|f| f.strip_prefix(&self.project_dir).unwrap_or(f).display().to_string())
+                    .unwrap_or_default();
+                Some(format!("  {file} → {} ({kind})", t.name))
+            })
+            .collect();
+        if not_tables.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!(
+            "import refused: these data files load something that is not a table:\n{}\n\
+             An import truncates and loads tables; a view has no rows of its own to load. Move each \
+             file to import/<schema>/<table>.<ext> for the table it holds rows of.",
+            not_tables.join("\n")
+        )))
     }
 
     /// Whether `import.staging` lets an import load into `schema`.
