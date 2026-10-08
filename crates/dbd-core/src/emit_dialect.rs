@@ -2769,7 +2769,15 @@ fn column_default(
         // `now()` on a `date` column is today's date; MySQL refuses
         // CURRENT_TIMESTAMP on a DATE column.
         PgDefault::Now if base != "date" => match target {
-            Target::MySql | Target::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+            // At the column's own fractional precision: MySQL refuses a
+            // DATETIME(6) defaulting to CURRENT_TIMESTAMP — "the same value
+            // must be used throughout the column definition" ("Automatic
+            // Initialization and Updating for TIMESTAMP and DATETIME").
+            Target::MySql => match ty.trim().to_uppercase().split_once('(') {
+                Some(("DATETIME" | "TIMESTAMP", precision)) => format!("CURRENT_TIMESTAMP({precision}"),
+                _ => "CURRENT_TIMESTAMP".to_string(),
+            },
+            Target::Sqlite => "CURRENT_TIMESTAMP".to_string(),
             Target::TSql => "SYSDATETIMEOFFSET()".to_string(),
         },
         PgDefault::Now | PgDefault::Today => match target {
