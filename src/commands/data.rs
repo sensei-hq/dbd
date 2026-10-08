@@ -74,11 +74,33 @@ fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope
     Ok(())
 }
 
+/// What importing under a scope the database is not pinned to would do.
+const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
+
+/// Every guard an import checks before it loads anything: the scope pin, then
+/// the environment — a dev import into a database marked prod would load
+/// `import/dev/` data into production. [`Design::import_data`] checks the
+/// second itself; the ad-hoc `-f` load, which goes to the adapter directly,
+/// and both previews check them here.
+async fn check_import_guards(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<()> {
+    super::check_pinned_scope(adapter, design, resolved, PINNED).await?;
+    design.guard_env(adapter).await?;
+    Ok(())
+}
+
+/// `dbd import --dry-run`. Offline when no database is configured; with one to
+/// ask, it refuses where the import would — a preview of a load the run
+/// refuses is a false promise.
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_import_dry_run(
+pub async fn cmd_import_dry_run(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    database_url: Option<&str>,
     name: Option<&str>,
     file: Option<&Path>,
     scope: Option<&str>,
@@ -86,6 +108,13 @@ pub fn cmd_import_dry_run(
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // The guards, whenever a database is configured to ask.
+    let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<()> {
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+            check_import_guards(&*adapter, &design, resolved).await?;
+        }
+        Ok(())
+    };
 
     // Ad-hoc single-file import plan: print the one line and write nothing.
     if let Some(path) = file {
@@ -98,6 +127,7 @@ pub fn cmd_import_dry_run(
         let (kept, total) = design.scope_counts(&resolved)?;
         output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(&design, &resolved, &qualified)?;
+        guard(&resolved).await?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
         return Ok(());
@@ -110,6 +140,7 @@ pub fn cmd_import_dry_run(
     design.check_scope_gaps(&resolved).context("scope check failed")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    guard(&resolved).await?;
     let (plan, skips) = design.scoped_import_plan(name, Some(&resolved))?;
 
     // Anything the scan, plan or scope left out, before listing what remains —
@@ -209,8 +240,6 @@ pub(crate) async fn import_with_adapter(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
-
     // Ad-hoc single-file import: `dbd import -n <entity> -f <path>`.
     if let Some(path) = file {
         let name = match name {
@@ -224,7 +253,10 @@ pub(crate) async fn import_with_adapter(
         let (kept, total) = design.scope_counts(&resolved)?;
         output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(design, &resolved, &qualified)?;
-        super::check_pinned_scope(adapter, design, &resolved, PINNED).await?;
+        // It loads data into the database as any import does, so it is held
+        // to the same guards — the environment guard included, which it
+        // skipped: `-e dev import -n -f` loaded a dev file into production.
+        check_import_guards(adapter, design, &resolved).await?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -527,50 +559,59 @@ mod tests {
 
     /// Full-plan dry-run against the fixture: resolves scope, builds the import
     /// plan, prints it, writes nothing.
-    #[test]
-    fn import_dry_run_full_plan_on_fixture() {
+    #[tokio::test]
+    async fn import_dry_run_full_plan_on_fixture() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             None,
             None,
             None,
             Verbosity::Verbose,
         )
+        .await
         .unwrap();
     }
 
     /// Ad-hoc single-file dry-run prints one line for the resolved target.
-    #[test]
-    fn import_dry_run_adhoc_file() {
+    #[tokio::test]
+    async fn import_dry_run_adhoc_file() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             Some("lookups"),
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap();
     }
 
     /// `--file` without `--name` is an actionable error (both dry-run and real).
-    #[test]
-    fn import_dry_run_file_without_name_bails() {
+    #[tokio::test]
+    async fn import_dry_run_file_without_name_bails() {
+        let tmp = testutil::offline_fixture_project();
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("--file requires --name"), "got: {err}");
     }
@@ -730,18 +771,21 @@ mod tests {
     }
 
     /// The dry run refuses it too, rather than printing a load the run refuses.
-    #[test]
-    fn an_adhoc_dry_run_into_a_table_outside_the_staging_schemas_is_refused() {
+    #[tokio::test]
+    async fn an_adhoc_dry_run_into_a_table_outside_the_staging_schemas_is_refused() {
+        let tmp = testutil::offline_fixture_project();
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             Some("config.lookups"),
             Some(Path::new("data/lookups.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .expect_err("config is not a staging schema");
         assert!(err.to_string().contains("import.staging"), "{err}");
     }

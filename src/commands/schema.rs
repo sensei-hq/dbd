@@ -845,12 +845,13 @@ pub async fn cmd_apply(
         // will not do and passes what the run refuses.
         let entities = design.entities_to_apply(name, Some(&resolved))?;
 
-        // With a database to ask, refuse where the run refuses — the scope pin.
+        // With a database to ask, refuse where the run refuses: the scope pin,
+        // then the run's own environment and version guards.
         let adapter = super::dry_run_adapter(config, database_url).await?;
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            Design::check_version_guard(&marks, design.config().project.version.unwrap_or(0))?;
+            design.check_apply_guards(&marks)?;
         }
 
         for entity in &entities {

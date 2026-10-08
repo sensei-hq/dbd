@@ -60,8 +60,22 @@ impl Design {
     /// [`Self::check_env_guard`] against the database `adapter` reaches, for
     /// this design's env. Read-only, and read before any heal: the meta read
     /// resolves a legacy layout as well as the current one.
-    pub(crate) async fn guard_env(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+    ///
+    /// Public for a caller that loads data outside [`Self::import_data`] — the
+    /// CLI's ad-hoc `import -n -f` — and for a preview of either, which must
+    /// refuse where the run does.
+    pub async fn guard_env(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         Self::check_env_guard(&self.database_marks(adapter).await?, &self.env)
+    }
+
+    /// The guards [`Self::apply`] checks against the database before it runs
+    /// anything: the environment and the version. One function, so a preview
+    /// with a database to ask refuses exactly where the run does — `apply` and
+    /// `deploy --dry-run -e dev` previewed a run over a prod database that the
+    /// run then refused.
+    pub fn check_apply_guards(&self, marks: &DatabaseMarks) -> Result<()> {
+        Self::check_env_guard(marks, &self.env)?;
+        Self::check_version_guard(marks, self.config.project.version.unwrap_or(0))
     }
 }
 

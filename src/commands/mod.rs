@@ -183,12 +183,14 @@ pub async fn run(
                     config,
                     env,
                     project_dir,
+                    database_url,
                     name.as_deref(),
                     file.as_deref(),
                     scope,
                     deps,
                     verbosity,
                 )
+                .await
             } else {
                 data::cmd_import(
                     config,
@@ -1304,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn run_dispatches_import_dry_run_without_a_database() {
         use crate::cli::Commands;
-        let tmp = testutil::copy_fixture_project();
+        let tmp = testutil::offline_fixture_project();
         run_in_copy(
             &Commands::Import {
                 name: None,

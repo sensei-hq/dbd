@@ -212,9 +212,7 @@ impl Design {
         // `dry_run` too, since the database is there to ask. Both read the
         // database's marks without healing the bookkeeping, which is itself a
         // write.
-        let marks = self.database_marks(adapter).await?;
-        Self::check_env_guard(&marks, &self.env)?;
-        Self::check_version_guard(&marks, self.config.project.version.unwrap_or(0))?;
+        self.check_apply_guards(&self.database_marks(adapter).await?)?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the

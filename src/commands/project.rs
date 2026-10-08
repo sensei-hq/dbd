@@ -437,12 +437,14 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
-        // With a database to ask, refuse where the deploy refuses — the scope pin.
+        // With a database to ask, refuse where the deploy refuses: the scope
+        // pin, then its apply's environment and version guards — the import's
+        // environment guard is the same one.
         let adapter = super::dry_run_adapter(&config_path, database_url).await?;
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            Design::check_version_guard(&marks, design.config().project.version.unwrap_or(0))?;
+            design.check_apply_guards(&marks)?;
         }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
