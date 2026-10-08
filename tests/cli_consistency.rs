@@ -1017,3 +1017,43 @@ fn import_dry_run_counts_a_table_with_two_data_files_once() {
     );
     assert!(stdout(&out).contains("1 entities"), "one table: {}", stdout(&out));
 }
+
+// ── an ad-hoc import names its scope ────────────────────────────────────────
+
+/// Every scoped command prints `scope 'X': N of M entities`, and `import`
+/// does — except for an ad-hoc `-n X -f F` load, which said nothing about the
+/// scope it was checked against.
+#[test]
+fn an_adhoc_import_dry_run_names_its_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    write(tmp.path(), "nodes.csv", "id\n1\n");
+
+    let expected = dbd(tmp.path(), &["import", "--dry-run", "--scope", "hub"]);
+    let line = stdout(&expected)
+        .lines()
+        .find(|l| l.starts_with("scope 'hub'"))
+        .map(str::to_string)
+        .expect("precondition: the plan's dry run names the scope");
+
+    let nodes = tmp.path().join("nodes.csv");
+    let out = dbd(
+        tmp.path(),
+        &[
+            "import",
+            "--dry-run",
+            "-n",
+            "hub.nodes",
+            "-f",
+            nodes.to_str().unwrap(),
+            "--scope",
+            "hub",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == line),
+        "{line:?} in:\n{}",
+        stdout(&out)
+    );
+}

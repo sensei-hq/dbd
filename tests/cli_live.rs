@@ -201,6 +201,21 @@ async fn the_connecting_commands_name_the_scope_they_ran_under() {
         assert_eq!(scope_line(&o), Some(expected.clone()), "{args:?}:\n{}", combined(&o));
     }
 
+    // An ad-hoc `-n X -f F` load is an import under the scope too.
+    std::fs::write(dir.join("nodes.jsonl"), "{\"id\": 1}\n").unwrap();
+    let o = dbd(
+        dir,
+        &url,
+        &["import", "-n", "hub.nodes", "-f", "nodes.jsonl", "--scope", "hub"],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(
+        scope_line(&o),
+        Some(expected.clone()),
+        "ad-hoc import:\n{}",
+        combined(&o)
+    );
+
     // `--json` keeps stdout a JSON document; the scope goes to stderr.
     let o = dbd(dir, &url, &["diff", "--json", "--scope", "hub"]);
     assert!(o.status.success(), "{}", combined(&o));
