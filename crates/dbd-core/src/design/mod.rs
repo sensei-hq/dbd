@@ -3429,6 +3429,93 @@ import:
         assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
     }
 
+    /// A scope's working set names the schemas and tables it builds; roles and
+    /// extensions are never in it, because they are always on (see
+    /// `entity_in_scope`). The entities handed to the plan have already been
+    /// through that rule — and a fresh install applies every one of them — but
+    /// the migrate plan filtered them by the working set again, so under a scope
+    /// a new role was never created and a new extension never installed, and the
+    /// first table using the extension's type failed (`type "citext" does not
+    /// exist`).
+    #[test]
+    fn a_scoped_migration_applies_the_roles_and_extensions_the_scope_keeps() {
+        let role = Entity::new(EntityType::Role, "app_writer");
+        let extension = Entity::new(EntityType::Extension, "citext");
+        let entities = vec![role, extension, test_entity("app.emails")];
+        let migrations = vec![test_migration(1, 2, vec!["app.emails"], vec![], vec![])];
+        let working_set: std::collections::HashSet<String> = ["app", "app.emails"].map(String::from).into();
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, Some(&working_set));
+
+        let applied: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(n) | ExecutionStep::CreateEntity(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(applied.contains(&"app_writer"), "the role is created: {applied:?}");
+        assert!(applied.contains(&"citext"), "the extension is installed: {applied:?}");
+        let emails = applied.iter().position(|n| *n == "app.emails").unwrap();
+        let citext = applied.iter().position(|n| *n == "citext").unwrap();
+        assert!(citext < emails, "before the table that uses it: {applied:?}");
+    }
+
+    /// `applied` counts entities: "Entities whose DDL was applied", of which
+    /// `created` is a subset. A migration's new entity runs `CreateEntity` and
+    /// then `ApplyEntity`, and both counted it — a design of 3 entities reported
+    /// "4 applied", one more than it has.
+    #[tokio::test]
+    async fn a_migration_counts_each_entity_it_applies_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "migrations/002"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\n  version: 2\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        for t in ["users", "audit"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"added":["app.audit"],"altered":[],"dropped":[]}"#,
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let entities = design.entities_to_apply(None, None).unwrap().len() as u32;
+
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let mut summary = None;
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+
+        let s = summary.expect("a successful apply reports a summary");
+        assert_eq!(s.strategy, ApplyStrategy::Migrate);
+        assert_eq!(s.applied, entities, "each of the {entities} entities counted once");
+        assert_eq!(s.created, 1, "the one the migration adds");
+    }
+
     // ── data.sql TODO blocking ────────────────────────────
 
     #[tokio::test]

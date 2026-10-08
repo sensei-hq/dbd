@@ -5270,3 +5270,68 @@ async fn reconcile_creates_a_pathless_matview_on_source_search_path() {
     )
     .await;
 }
+
+// ── A scoped migration keeps the always-on roles and extensions ──────────────
+
+/// v2 adds `citext` to the target's extensions, a role, and a table with a
+/// `citext` column. Unscoped, the migration worked; under a scope it failed with
+/// `type "citext" does not exist` and never created the role, though
+/// `apply --dry-run --scope` listed both: the migrate plan filtered the run's
+/// entities by the scope's working set a second time, and roles and extensions
+/// are never in it — they are always on.
+#[tokio::test]
+async fn a_scoped_migration_installs_its_new_extension_and_role() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_migrate_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let people = (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\ncreate table if not exists people (id integer primary key);\n",
+    );
+    let v1 = "project:\n  name: scoped_migrate_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+              target:\n  postgres:\n    roles:\n      - name: app_reader\n\
+              scopes:\n  app_only:\n    includes: [app]\n";
+    let design = write_project(dir, v1, &[people]);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("v1 applies under the scope");
+
+    let v2 = "project:\n  name: scoped_migrate_test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+              target:\n  postgres:\n    extensions:\n      - citext\n    roles:\n      - name: app_reader\n      - name: app_writer\n\
+              scopes:\n  app_only:\n    includes: [app]\n";
+    let emails = (
+        "ddl/table/app/emails.ddl",
+        "set search_path to app;\ncreate table if not exists emails (id integer primary key, addr citext);\n",
+    );
+    let design = write_project(dir, v2, &[people, emails]);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v2").unwrap();
+    let design = Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+    assert_eq!(design.config().project.version, Some(2));
+    let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("the scoped migration installs the extension its new table needs");
+
+    assert_table_exists(&*adapter, "app", "emails").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_extension WHERE extname = 'citext'",
+        "extension citext",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_roles WHERE rolname = 'app_writer'",
+        "role app_writer",
+    )
+    .await;
+}
