@@ -384,6 +384,17 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Delete this project's `dbd.meta` row. Like [`Self::clear_migrations`],
+    /// called only by `reset`, which heals first.
+    pub(super) async fn forget_meta(&self) -> Result<()> {
+        sqlx::query("DELETE FROM dbd.meta WHERE project = $1")
+            .bind(&self.project)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("clear dbd.meta failed: {e}")))?;
+        Ok(())
+    }
+
     /// Read-only detection: `Some(version)` if this DB is dbd-managed — resolving
     /// `dbd.meta` OR a legacy `_dbd_meta` in ANY schema — reading the applied
     /// version for this project (`0` if the relation exists but has no matching

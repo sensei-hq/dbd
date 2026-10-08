@@ -690,6 +690,16 @@ impl DatabaseAdapter for ConvexAdapter {
         save_state(&self.output_dir, &state)
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        let mut state = load_state(&self.output_dir)?;
+        // An empty project is what `get_project_meta` reads as "no record".
+        state.project.clear();
+        state.env.clear();
+        state.version = 0;
+        state.scope = None;
+        save_state(&self.output_dir, &state)
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         Ok(())
     }

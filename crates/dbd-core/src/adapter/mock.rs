@@ -278,6 +278,11 @@ impl DatabaseAdapter for MockAdapter {
         Ok(())
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        *self.meta.lock().unwrap() = None;
+        Ok(())
+    }
+
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
         Ok(self.meta.lock().unwrap().clone())
     }

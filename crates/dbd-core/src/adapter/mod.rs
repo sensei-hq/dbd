@@ -306,6 +306,9 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;
+    /// Forget the database's record of this project — its env, version and
+    /// scope pin — as a full `reset` leaves nothing of the project behind.
+    async fn forget_project_meta(&self) -> Result<()>;
 
     // ── Internal dbd procedures ────────────────────────
 

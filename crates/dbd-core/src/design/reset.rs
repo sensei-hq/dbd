@@ -30,8 +30,9 @@ impl Design {
     /// schemas to that scope's working set (`None`/all-scope ⇒ everything). Roles
     /// are only dropped on a full reset — a subset scope leaves shared roles
     /// intact since roles are not scope-selectable. The bookkeeping of what it
-    /// drops goes too: the project's recorded migrations, and the drift stamp of
-    /// every materialized view the reset removed.
+    /// drops goes too: the project's recorded migrations, the drift stamp of
+    /// every materialized view the reset removed, and — on a full reset — the
+    /// database's record of the project (env, version, scope pin).
     ///
     /// Returns what it dropped, read from the database before and after rather
     /// than from the script: every drop is `IF EXISTS`, so the script alone
@@ -81,6 +82,15 @@ impl Design {
                 .collect();
         }
         adapter.clear_project_migrations().await?;
+        // A full reset leaves nothing of the project, so its record of the
+        // database goes too, and the next apply records it afresh. That is the
+        // way to rebuild, with `-e dev`, a database a run without `-e` marked
+        // prod: the env guard refuses a dev run against the mark, and the mark
+        // survived the reset. A scoped reset leaves the rest of the project —
+        // and its version and pin — in place.
+        if scope.is_none_or(|s| s.is_all) {
+            adapter.forget_project_meta().await?;
+        }
 
         Ok(summary)
     }

@@ -630,6 +630,23 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(())
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        // No `_dbd_meta` table means nothing was ever recorded to forget; any
+        // other failure is surfaced — a row left behind keeps its prod mark.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        if exists > 0 {
+            sqlx::query("DELETE FROM _dbd_meta WHERE project = ?1")
+                .bind(&self.project)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("clear _dbd_meta failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         // No stored procedures in SQLite.
         Ok(())

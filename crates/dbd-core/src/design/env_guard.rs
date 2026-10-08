@@ -18,7 +18,8 @@ impl Design {
     /// tightens what `reset` allows. Nothing re-marks a prod database dev.
     /// There is no override flag either: the default `-e` is prod, so a dev
     /// database a run without `-e` marked prod is the one case it bites, and
-    /// the way out there is a database built with `-e dev`, not a flag that
+    /// the way out there is to rebuild it — `reset --force`, which forgets the
+    /// mark with everything else, then a run with `-e dev` — not a flag that
     /// would also unguard a real production database.
     pub fn check_env_guard(meta: Option<&crate::adapter::ProjectMeta>, env: &str) -> Result<()> {
         let Some(meta) = meta else { return Ok(()) };
@@ -31,7 +32,8 @@ impl Design {
                  A {env} run would re-mark it {env}, which lifts the prod guard on `dbd reset`, \
                  and would load import/{env}/ data into it.\n\
                  → re-run with -e prod (the default). dbd never re-marks a prod database: if this \
-                 is not production, a run without -e marked it prod — use a database built with -e {env}."
+                 is not production, a run without -e marked it prod — rebuild it: \
+                 `dbd reset --force`, then run with -e {env}."
             )));
         }
         Ok(())

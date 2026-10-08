@@ -345,8 +345,13 @@ async fn reset_drops_a_sqlite_projects_tables_and_views() {
         .expect("a SQLite reset");
 
     assert_eq!(db.list_entities().await.unwrap(), Vec::<String>::new());
+    // The bookkeeping tables are dbd's, not the project's: they survive, while
+    // a full reset forgets the project's row in them.
+    db.execute_script("SELECT 1 FROM _dbd_meta LIMIT 0")
+        .await
+        .expect("dbd's bookkeeping is not the project's to drop");
     assert!(
-        db.get_project_meta().await.unwrap().is_some(),
-        "dbd's bookkeeping is not the project's to drop"
+        db.get_project_meta().await.unwrap().is_none(),
+        "a full reset forgets the database's record of the project"
     );
 }

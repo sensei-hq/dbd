@@ -1924,6 +1924,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.clear_migrations().await
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        self.bookkeeping.forget_meta().await
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         // Embedded at compile time — always up to date with this version of dbd.
         const DDL: &str = include_str!("../../internal/import_jsonb_to_table.ddl");
