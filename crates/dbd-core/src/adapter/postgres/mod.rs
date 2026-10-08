@@ -52,6 +52,15 @@ const JSONB_IMPORT_SCHEMA: &str = "dbd";
 /// See sensei-hq/dbd#6.
 const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
 
+/// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
+struct ColumnKind {
+    name: String,
+    /// `json`, `jsonb`, or a domain over either.
+    json: bool,
+    /// A stored or virtual generated column: computed, never written.
+    generated: bool,
+}
+
 /// `CALL` that moves staged rows into `target` via the internal import
 /// procedure. Both the procedure schema and the source table are pinned and
 /// fully-qualified so resolution never depends on the session `search_path`.
@@ -238,27 +247,15 @@ impl PostgresAdapter {
     }
 
     /// The columns of `table` (`schema.table`, or a bare name resolved through
-    /// the search_path), in table order. Empty when there is no such table:
-    /// `to_regclass` returns NULL for a missing relation instead of erroring.
-    async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT attname::text FROM pg_catalog.pg_attribute \
-             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
-             ORDER BY attnum",
-        )
-        .bind(crate::sql_quote::qualified(table))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
-    }
-
-    /// The columns of `table` (or view), in table order, each with whether it
-    /// holds JSON — `json`, `jsonb`, or a domain over either. Empty when there
-    /// is no such relation.
-    async fn export_columns(&self, table: &str) -> Result<Vec<(String, bool)>> {
-        sqlx::query_as::<_, (String, bool)>(
+    /// the search_path; a table or a view), in table order, with what an
+    /// import and an export need to know of each. Empty when there is no such
+    /// relation: `to_regclass` returns NULL for a missing one instead of
+    /// erroring.
+    async fn column_kinds(&self, table: &str) -> Result<Vec<ColumnKind>> {
+        let rows = sqlx::query_as::<_, (String, bool, bool)>(
             "SELECT a.attname::text, \
-                    coalesce(nullif(t.typbasetype, 0), t.oid) IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype) \
+                    coalesce(nullif(t.typbasetype, 0), t.oid) IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype), \
+                    a.attgenerated <> '' \
              FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
              WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
@@ -266,7 +263,25 @@ impl PostgresAdapter {
         .bind(crate::sql_quote::qualified(table))
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
+        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, json, generated)| ColumnKind { name, json, generated })
+            .collect())
+    }
+
+    /// The columns of `table` an import loads `file` into, and the ones of
+    /// them that are generated — refusing a table that does not exist.
+    async fn import_columns(&self, table: &str, file: &Path) -> Result<(Vec<String>, Vec<String>)> {
+        let kinds = self.column_kinds(table).await?;
+        if kinds.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot import {} into {table}: no such table",
+                file.display()
+            )));
+        }
+        let generated = kinds.iter().filter(|c| c.generated).map(|c| c.name.clone()).collect();
+        Ok((kinds.into_iter().map(|c| c.name).collect(), generated))
     }
 
     /// Move each sequence that numbers one of `columns` of `table` — an
@@ -1384,15 +1399,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 let Some((header, rows_at)) = super::delimited_header(&data, tab, file_path)? else {
                     return Ok(()); // An empty file: no columns, no rows.
                 };
-                let columns = self.table_columns(&entity.name).await?;
-                if columns.is_empty() {
-                    return Err(DbdError::Config(format!(
-                        "cannot import {} into {}: no such table",
-                        file_path.display(),
-                        entity.name
-                    )));
-                }
+                let (columns, generated) = self.import_columns(&entity.name, file_path).await?;
                 let loaded = super::header_columns(&header, &columns, &entity.name, file_path)?;
+                super::refuse_generated(&loaded, &generated, &entity.name, file_path)?;
                 let column_list = loaded
                     .iter()
                     .map(|c| crate::sql_quote::ident(c))
@@ -1447,15 +1456,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 // Every key must name a column — checked before anything is staged,
                 // as a CSV header is (see `check_json_keys`).
                 let records = super::json_records(&data, format, file_path)?;
-                let columns = self.table_columns(&entity.name).await?;
-                if columns.is_empty() {
-                    return Err(DbdError::Config(format!(
-                        "cannot import {} into {}: no such table",
-                        file_path.display(),
-                        entity.name
-                    )));
-                }
+                let (columns, generated) = self.import_columns(&entity.name, file_path).await?;
                 let loaded = super::check_json_keys(&records, &columns, &entity.name, file_path)?;
+                super::refuse_generated(&loaded, &generated, &entity.name, file_path)?;
                 self.ensure_import_procedure().await?;
                 // Staged as `json`, not `jsonb`: jsonb rewrites a json column's
                 // value — its spacing and key order — on the way through. Dropped
@@ -1528,6 +1531,19 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut data = Vec::new();
         use futures_lite::StreamExt;
 
+        // What an import can write back: every column but a generated one,
+        // whose value is computed from the row. `SELECT *` wrote those too,
+        // and the import then refused the file ("column is a generated
+        // column"), so no export of such a table imported back.
+        let kinds = self.column_kinds(&entity.name).await?;
+        if kinds.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: no such table or view",
+                entity.name
+            )));
+        }
+        let columns: Vec<&ColumnKind> = kinds.iter().filter(|c| !c.generated).collect();
+
         if format == "jsonl" {
             // Fetched as rows, not `COPY … TO STDOUT`: COPY's text format escapes
             // every backslash again, and the JSON `row_to_json` renders is full
@@ -1540,22 +1556,15 @@ impl DatabaseAdapter for PostgresAdapter {
             // the JSON value `null`, so the import could not tell them apart. A
             // json/jsonb column that is SQL NULL is left out of its record — an
             // absent key, which imports as NULL — and `null` is the JSON value.
-            let columns = self.export_columns(&entity.name).await?;
-            if columns.is_empty() {
-                return Err(DbdError::Config(format!(
-                    "cannot export {}: no such table or view",
-                    entity.name
-                )));
-            }
             let fields: Vec<String> = columns
                 .iter()
-                .map(|(name, json)| {
-                    let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(name.clone())));
-                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(name));
-                    if *json {
+                .map(|c| {
+                    let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(c.name.clone())));
+                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(&c.name));
+                    if c.json {
                         format!(
                             "CASE WHEN t.{} IS NULL THEN NULL ELSE {key} || {value} END",
-                            crate::sql_quote::ident(name)
+                            crate::sql_quote::ident(&c.name)
                         )
                     } else {
                         format!("{key} || coalesce({value}, 'null')")
@@ -1574,12 +1583,17 @@ impl DatabaseAdapter for PostgresAdapter {
                 data.push(b'\n');
             }
         } else {
+            let select_list = columns
+                .iter()
+                .map(|c| crate::sql_quote::ident(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
             let copy_sql = match format {
                 "tsv" => format!(
-                    "COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
+                    "COPY (SELECT {select_list} FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER E'\\t')"
                 ),
                 // csv — the only format left once the guard above has run.
-                _ => format!("COPY (SELECT * FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+                _ => format!("COPY (SELECT {select_list} FROM {qualified}) TO STDOUT WITH (FORMAT csv, HEADER true)"),
             };
 
             let mut conn = self

@@ -545,6 +545,31 @@ pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &st
     )))
 }
 
+/// Refuse a data file that sets a generated column of `table` — any of
+/// `loaded` (the columns its header or keys name) that is in `generated`.
+///
+/// A generated column's value is computed from the row, so a file cannot set
+/// one. COPY refused it with "column is a generated column" and the JSON load
+/// dropped it without a word; both now say which column, and that the file
+/// should leave it out — as `dbd export` does.
+pub(crate) fn refuse_generated(loaded: &[String], generated: &[String], table: &str, file: &Path) -> Result<()> {
+    let set: Vec<&str> = loaded
+        .iter()
+        .filter(|c| generated.contains(c))
+        .map(String::as_str)
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::DbdError::Config(format!(
+        "{}: {} of {table} {} generated — computed from the row, so a data file cannot set it. Leave it \
+         out of the file; dbd export writes no generated column",
+        file.display(),
+        set.join(", "),
+        if set.len() == 1 { "is" } else { "are" }
+    )))
+}
+
 pub mod convex;
 pub mod mock;
 #[cfg(feature = "postgres")]
