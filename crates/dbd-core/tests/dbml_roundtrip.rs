@@ -74,10 +74,36 @@ fn key_names(ix: &IndexDef) -> Vec<&str> {
     ix.columns.iter().map(|c| c.name.as_str()).collect()
 }
 
+/// The table-level UNIQUE constraints of `td`, as `(name, columns,
+/// nulls_not_distinct)`.
+fn uniques(td: &TableDef) -> Vec<(Option<&str>, Vec<&str>, bool)> {
+    td.constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } => Some((
+                name.as_deref(),
+                columns.iter().map(String::as_str).collect(),
+                *nulls_not_distinct,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A table-level `UNIQUE` is a constraint the design states, and DBML has no
 /// constraint syntax for it — only a unique index. Leaving it out of the
 /// document meant the table `init --from-dbml` rebuilt accepted duplicate
 /// order codes the original refused.
+///
+/// Read back as a unique *index*, it enforced the same thing and still read
+/// as drift: `diff` against the database the original built asked to drop the
+/// constraint and create the index. The document marks it as a constraint (in
+/// the index note, DBML's one free-text slot), so it comes back as one, under
+/// its own name.
 #[test]
 fn a_table_level_unique_constraint_survives_dbml_and_back() {
     let orders = parse(
@@ -94,13 +120,48 @@ fn a_table_level_unique_constraint_survives_dbml_and_back() {
     let reversed = reverse(&dbml);
     let td = table(&reversed, "shop.orders");
 
-    let single = index(td, "orders_ref_code_uq");
-    assert!(single.unique, "uniqueness is the whole point:\n{dbml}");
-    assert_eq!(key_names(single), vec!["ref_code"]);
+    assert_eq!(
+        uniques(td),
+        vec![
+            (Some("orders_ref_code_uq"), vec!["ref_code"], false),
+            (Some("orders_customer_ref_uq"), vec!["customer_id", "ref_code"], false),
+        ],
+        "both come back as the constraints they were:\n{dbml}"
+    );
+    assert!(
+        td.indexes.is_empty(),
+        "and not as unique indexes beside them: {:#?}\n{dbml}",
+        td.indexes
+    );
+}
 
-    let composite = index(td, "orders_customer_ref_uq");
-    assert!(composite.unique, "uniqueness is the whole point:\n{dbml}");
-    assert_eq!(key_names(composite), vec!["customer_id", "ref_code"]);
+/// An unnamed UNIQUE comes back unnamed, so Postgres names it the way it named
+/// the original (`t_r_s_key`) — the name reconcile's `ADD UNIQUE` gives it too
+/// — rather than the `t_idx` the unique index was given. `NULLS NOT DISTINCT`
+/// rides along. A unique index the design declared as an index stays an index.
+#[test]
+fn an_unnamed_unique_constraint_comes_back_unnamed_and_a_unique_index_stays_an_index() {
+    let t = parse(
+        "ddl/table/app/t.ddl",
+        "create table app.t (id int primary key, r text, s text, u text, unique (r, s), \
+         unique nulls not distinct (u));\n\
+         create unique index t_lower_r_idx on app.t (r) where s is not null;",
+    );
+    let dbml = document(&[t]);
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "app.t");
+
+    assert_eq!(
+        uniques(td),
+        vec![(None, vec!["r", "s"], false), (None, vec!["u"], true)],
+        "{dbml}"
+    );
+    let ix = index(td, "t_lower_r_idx");
+    assert!(
+        ix.unique && ix.predicate.is_some(),
+        "the unique index stays one: {ix:#?}\n{dbml}"
+    );
+    assert_eq!(td.indexes.len(), 1, "{:#?}", td.indexes);
 }
 
 fn keys(ix: &IndexDef) -> Vec<(&str, bool)> {
