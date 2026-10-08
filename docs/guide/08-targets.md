@@ -23,8 +23,10 @@ entry, so a second entry is never read; don't write one.
 
 The connection comes from, in order: `-d`/`--database`, then `$DATABASE_URL`,
 then the target's `url`. A `url` written as a whole `$VAR` is expanded from the
-environment; if the variable is unset, the literal string is used and the
-connection fails. Interpolation inside a longer string is not supported.
+environment; a variable that is unset or empty is refused by name, with how to
+set it, rather than handed to the driver as a URL. An exported-but-empty
+`$DATABASE_URL` does not override the target's `url`. Interpolation inside a
+longer string is not supported.
 
 To deploy one design to several databases, keep the one target and change the
 URL per run — pairing it with a [scope](07-scopes.md) when each database needs a
@@ -86,9 +88,11 @@ DBML source, which names no platform.
 
 ### `reset --target`
 
-`dbd reset` decides what is protected by a target name: the design's target key
-by default — the first `target:` entry, so a Supabase project's schemas are
-protected without passing anything — or the `--target` flag when given.
+`dbd reset` decides what it drops, and what it protects, by a target name —
+`postgres`, `supabase` or `sqlite`: the design's target key by default — the
+first `target:` entry, so a Supabase project's schemas are protected without
+passing anything — or the `--target` flag when given. A design whose target has
+no reset (Convex) is refused before anything connects.
 
 ```sh
 dbd reset --schemas --dry-run                    # protected set from the design's target key
@@ -96,8 +100,10 @@ dbd reset --schemas --target postgres --dry-run  # override: drop public too
 ```
 
 With `postgres`, `public` **is** dropped by `--schemas`, and every role the design
-declares (`ddl/role/` and `target.roles`) is dropped on a full (unscoped) reset;
-with `supabase`, neither is.
+declares (`ddl/role/` and `target.roles`) is dropped on a full reset — `--scope
+all`, or no `--scope` when no `default:` scope is defined — unless another
+database on the server holds it; with `supabase`, neither is. With `sqlite`, see
+[below](#sqlite).
 
 ## PostgreSQL
 
@@ -113,7 +119,8 @@ The reference target: every feature works here.
   one — fails there; set `DBD_NO_TX` (to any value) to apply without the
   transaction.
 - **Bookkeeping** lives in a `dbd` schema: `dbd.meta` (project, environment,
-  version, pinned scope), `dbd.migrations`, and `dbd.matview_stamps` (each
+  version, pinned scope — the row a full `reset` deletes, so the next apply
+  records the database afresh), `dbd.migrations`, and `dbd.matview_stamps` (each
   materialized view's drift stamp — kept out of the view's `COMMENT`, which is
   the author's; `reset` deletes the rows of the matviews it drops), and, once a
   JSON import has run, the `import_jsonb_to_table` procedure. The schema is not
@@ -136,7 +143,9 @@ The reference target: every feature works here.
   0.25 it lived in a schema called `staging`, created whatever your staging
   schemas were called; a database an earlier dbd imported JSON into keeps its
   `staging.import_jsonb_to_table` — drop it if nothing else uses it.) The
-  truncate before a load is `TRUNCATE`.
+  truncate before a load is `TRUNCATE`. Ids load as given, and each identity or
+  `serial` sequence is then moved past the largest id loaded — a `setval`, so
+  the importing role needs `UPDATE` on the sequence.
 
 ## SQLite
 
@@ -166,9 +175,21 @@ target:
   quotes, nothing trimmed, a quoted field never NULL — so a file PostgreSQL
   exported imports unchanged. SQLite has no `TRUNCATE`, so the default truncate
   runs `DELETE FROM` instead; with `truncate: false`, rows are appended.
+- **Data folders.** With no schemas, the shared data files sit directly in
+  `import/` and the environment-only ones directly in `import/dev/` or
+  `import/prod/`, which load only under that `-e` (before 0.25 a file directly
+  in `import/dev/` loaded in prod).
 - **Export** writes CSV and TSV as PostgreSQL's `COPY` does: NULL as an empty
   field, `''` as `""`, and a value holding the delimiter, a quote or a line break
-  quoted — so an export loads back to the same values here or into PostgreSQL.
+  quoted — with the header even for a table with no rows, and without its
+  generated columns — so an export loads back to the same values here or into
+  PostgreSQL. Files land flat in `export/` (or the `-o` directory), as
+  `<table>.<fmt>`.
+- **Reset** drops the project's tables and views in one transaction, with
+  foreign keys deferred to its commit (`PRAGMA defer_foreign_keys = ON`) — the
+  verbatim DDL gives dbd no references to order the drops by. `--schemas`,
+  `--extensions` and `--clean` change nothing, and say so; the prod and
+  migrations guards apply as on PostgreSQL.
 - **Not available:** `diff`, `reconcile` and `emit` refuse a SQLite project,
   because the `verbatim` reader builds no structured model to compare or
   translate; `refresh` has no materialized views to refresh.
@@ -218,6 +239,7 @@ from the design's tables and enums:
 | `export` | yes | yes | refused | no adapter |
 | `diff`, `reconcile` | yes | no (no structured model) | no | no |
 | grants, `policies` | yes | grants skipped; policies fail | no | no |
+| `reset` | yes | tables and views | refused | no adapter |
 | `refresh`, materialized views | yes | no | no | no |
 | `dbd emit` can write its DDL | — | `--dialect sqlite` | — | `--dialect mysql`, `--dialect tsql` |
 | Bookkeeping | `dbd.meta`, `dbd.migrations`, `dbd.matview_stamps` | `_dbd_meta`, `_dbd_migrations` | `.dbd_state.json` | — |
