@@ -206,6 +206,15 @@ impl Design {
     {
         let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
 
+        // A project older than the database it points at is refused before
+        // anything runs — the `apply.before` hooks included — and under
+        // `dry_run` too, since the database is there to ask. Read without
+        // healing the bookkeeping, which is itself a write.
+        Self::check_version_guard(
+            adapter.get_db_version().await?,
+            self.config.project.version.unwrap_or(0),
+        )?;
+
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.

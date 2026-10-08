@@ -850,6 +850,10 @@ pub async fn cmd_apply(
         if let Some(adapter) = &adapter {
             let meta = adapter.get_project_meta().await?;
             Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+            Design::check_version_guard(
+                adapter.get_db_version().await?,
+                design.config().project.version.unwrap_or(0),
+            )?;
         }
 
         for entity in &entities {
