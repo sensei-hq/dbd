@@ -13,6 +13,25 @@ fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
     result
 }
 
+/// The extensions among `entities` that `config`'s target does not list, as
+/// `(name, schema)` with `schema` `None` for `public`.
+fn undeclared_extensions(
+    entities: &[dbd_core::Entity],
+    config: &dbd_core::config::DesignConfig,
+) -> Vec<(String, Option<String>)> {
+    let listed: Vec<&str> = config
+        .target
+        .values()
+        .next()
+        .map(|t| t.extensions.iter().map(|e| e.name()).collect())
+        .unwrap_or_default();
+    reverse::Declared::from_entities(entities)
+        .extensions
+        .into_iter()
+        .filter(|(name, _)| !listed.contains(&name.as_str()))
+        .collect()
+}
+
 /// Resolve the connection string from the single pre-resolved candidate.
 ///
 /// The caller is responsible for combining explicit flag values with the
@@ -395,6 +414,18 @@ fn merge_snapshot(
     for schema in undeclared_schemas(&selected, &declared) {
         eprintln!("  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files");
     }
+    // An extension is declared in design.yaml, never written as a file, and
+    // `merge` never edits config — so one the target does not list is named,
+    // as an undeclared schema is.
+    for (name, schema) in undeclared_extensions(&kept, config) {
+        let entry = match schema {
+            None => format!("`{name}`"),
+            Some(schema) => format!("`{{ name: {name}, schema: {schema} }}`"),
+        };
+        eprintln!(
+            "  warning: extension `{name}` is installed in the database but not declared; add {entry} to the target's extensions: list in design.yaml"
+        );
+    }
 
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
@@ -555,7 +586,10 @@ fn run_plan(
     // 3. write design.yaml (init only; only if absent; skip on dry-run)
     if write_config && !dry_run {
         let project = name.map(String::from).unwrap_or_else(|| "project".into());
-        let yaml = reverse::design_yaml(&project, dialect, &selected, version.unwrap_or(1));
+        // Extensions go in the target's `extensions:` list — the project format
+        // has no DDL file for one (see `reverse::MANAGED_KINDS`).
+        let declared = reverse::Declared::from_entities(&kept);
+        let yaml = reverse::design_yaml_with(&project, dialect, &selected, version.unwrap_or(1), &declared);
         // Write to the resolved config path (project_dir/<--config>), matching what the
         // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
         // diverge under `--config custom.yaml`).

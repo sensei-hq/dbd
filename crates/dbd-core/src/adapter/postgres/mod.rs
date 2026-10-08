@@ -1082,9 +1082,10 @@ impl PostgresAdapter {
             let cache_size: i64 = row.get("cache_size");
 
             // Deterministic, fully-explicit CREATE SEQUENCE for fidelity. Quoting
-            // matches the rest of the emitter (q()).
+            // matches the rest of the emitter (q()). `IF NOT EXISTS`: a reversed
+            // project is applied back to the database it was read from.
             let mut ddl = format!(
-                "CREATE SEQUENCE \"{schema}\".\"{name}\" AS {seq_type} \
+                "CREATE SEQUENCE IF NOT EXISTS \"{schema}\".\"{name}\" AS {seq_type} \
                  INCREMENT BY {increment_by} MINVALUE {min_value} MAXVALUE {max_value} \
                  START WITH {start_value} CACHE {cache_size}"
             );
@@ -1853,6 +1854,10 @@ impl DatabaseAdapter for PostgresAdapter {
     /// merge/init) — this reads only what reconcile's create/skip/restamp/
     /// recreate decision needs. Returns the comment unparsed (see the trait
     /// doc); `reconcile::parse_dbd_hash` extracts the sentinel.
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        self.introspect_matviews().await
+    }
+
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
         let sql = format!(

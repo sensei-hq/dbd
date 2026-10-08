@@ -147,10 +147,15 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
     p
 }
 
-/// The entity kinds this command generates (used to scope orphan detection).
+/// The entity kinds this command writes as DDL files (also the kinds orphan
+/// detection scans).
+///
+/// Not schemas or extensions: the project format declares both in
+/// design.yaml (`schemas:` and the target's `extensions:`), and the scanner
+/// reads no `ddl/schema/` or `ddl/extension/` folder. Written as files, an
+/// extension made `inspect` and `apply` refuse the project, and a schema file
+/// was never read at all. [`design_yaml_with`] writes them instead.
 pub const MANAGED_KINDS: &[EntityType] = &[
-    EntityType::Schema,
-    EntityType::Extension,
     EntityType::Role,
     EntityType::Sequence,
     EntityType::Enum,
@@ -218,7 +223,7 @@ pub fn build_plan(root: &Path, generated: Vec<(PathBuf, String)>, selected_schem
     let mut orphans = Vec::new();
     for kind in MANAGED_KINDS {
         if !kind.has_schema() {
-            continue; // schema/extension live flat; skip orphan scan for them in v1
+            continue; // roles live flat; skip orphan scan for them in v1
         }
         for schema in selected_schemas {
             let dir = root.join("ddl").join(kind.folder_name()).join(schema);
@@ -385,6 +390,54 @@ pub fn plan_from_entities(
 /// under the Postgres default — which rejects `AUTOINCREMENT`, `WITHOUT ROWID`
 /// and `STRICT`, so a project dbd had just written refused to load (issue #20).
 pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u32) -> String {
+    design_yaml_with(project, dialect, schemas, version, &Declared::default())
+}
+
+/// What a reversed `design.yaml` declares beyond its schemas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// The database's extensions, as `(name, schema)` — `schema` is `None`
+    /// for `public`, which is where an entry without one installs.
+    pub extensions: Vec<(String, Option<String>)>,
+}
+
+impl Declared {
+    /// The extensions among `entities`, sorted by name.
+    pub fn from_entities(entities: &[Entity]) -> Self {
+        let mut extensions: Vec<(String, Option<String>)> = entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Extension)
+            .map(|e| (e.name.clone(), e.schema.clone().filter(|s| s != "public")))
+            .collect();
+        extensions.sort();
+        extensions.dedup();
+        Self { extensions }
+    }
+}
+
+/// A YAML scalar for an identifier: plain when it is one YAML reads back as
+/// the same string, double-quoted otherwise.
+fn yaml_scalar(value: &str) -> String {
+    let plain = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "null"
+        );
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// [`design_yaml`], plus what the database holds that the project format
+/// declares in design.yaml rather than as DDL files: its extensions, in the
+/// target's `extensions:` list.
+pub fn design_yaml_with(project: &str, dialect: &str, schemas: &[String], version: u32, declared: &Declared) -> String {
     let is_sqlite = dialect == "sqlite";
     let target_key = match dialect {
         "sqlite" => "sqlite",
@@ -408,10 +461,27 @@ pub fn design_yaml(project: &str, dialect: &str, schemas: &[String], version: u3
             .join("\n");
         format!("schemas:\n{lines}\n")
     };
+    let extensions_block = if declared.extensions.is_empty() {
+        String::new()
+    } else {
+        let entries: String = declared
+            .extensions
+            .iter()
+            .map(|(name, schema)| match schema {
+                None => format!("      - {}\n", yaml_scalar(name)),
+                Some(schema) => format!(
+                    "      - name: {}\n        schema: {}\n",
+                    yaml_scalar(name),
+                    yaml_scalar(schema)
+                ),
+            })
+            .collect();
+        format!("    extensions:\n{entries}")
+    };
     format!(
         "project:\n  name: {project}\n  version: {version}\n\n\
          {source_block}\
-         target:\n  {target_key}:\n    url: $DATABASE_URL\n\n\
+         target:\n  {target_key}:\n    url: $DATABASE_URL\n{extensions_block}\n\
          {schemas_block}"
     )
 }

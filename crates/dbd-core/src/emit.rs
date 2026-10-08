@@ -35,7 +35,15 @@ pub fn emit_enum(entity: &Entity) -> String {
     format!("CREATE TYPE {}.{} AS ENUM ({});", q(schema), q(name), values)
 }
 
-/// `CREATE TABLE "schema"."name" ( … );` + `CREATE INDEX …;` + `COMMENT ON …;`
+/// `CREATE TABLE IF NOT EXISTS "schema"."name" ( … );` + `CREATE INDEX IF NOT
+/// EXISTS …;` + `COMMENT ON …;`
+///
+/// # Re-runnable
+///
+/// Every statement can run against a database that already has the table:
+/// reverse output is applied back to the database it was read from (the
+/// documented brownfield path), and `dbd apply` re-runs each file on every
+/// apply. Without `IF NOT EXISTS` that failed with `already exists`.
 ///
 /// # Serial / identity columns
 ///
@@ -63,7 +71,7 @@ pub fn emit_table(entity: &Entity) -> String {
     let name = bare(&entity.name);
     let qname = format!("{}.{}", q(schema), q(name));
     let Some(def) = &entity.table_def else {
-        return format!("CREATE TABLE {qname} ();");
+        return format!("CREATE TABLE IF NOT EXISTS {qname} ();");
     };
 
     let mut lines: Vec<String> = Vec::new();
@@ -84,14 +92,14 @@ pub fn emit_table(entity: &Entity) -> String {
     } else {
         format!("\n{}\n", lines.join(",\n"))
     };
-    let mut out = format!("CREATE TABLE {qname} ({body});");
+    let mut out = format!("CREATE TABLE IF NOT EXISTS {qname} ({body});");
 
     // Indexes — every entry in def.indexes is emitted as-is. Filtering of
     // implicit PK/UNIQUE-backing indexes happens upstream in the introspector,
     // not here.
     for ix in &def.indexes {
         out.push('\n');
-        out.push_str(&emit_index_sql(ix, &qname, name, false));
+        out.push_str(&emit_index_sql(ix, &qname, name, true));
     }
 
     // Comments
@@ -264,8 +272,9 @@ pub(crate) fn emit_index_column(c: &crate::entity::IndexColumn) -> String {
 ///
 /// `table_name` is the bare table name used to synthesize an index name when
 /// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
-/// statement is idempotent on re-apply — matviews set it (their whole DDL is
-/// re-applied by `dbd apply`); tables keep their existing exact output.
+/// statement is idempotent on re-apply — table and matview files set it (their
+/// whole DDL is re-applied by `dbd apply`); a migration's index, which runs
+/// once, does not.
 pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &str, if_not_exists: bool) -> String {
     let cols = ix.columns.iter().map(emit_index_column).collect::<Vec<_>>().join(", ");
     let unique = if ix.unique { "UNIQUE " } else { "" };
@@ -322,13 +331,14 @@ fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
     }
 }
 
-/// `CREATE SEQUENCE "schema"."name" …;`
+/// `CREATE SEQUENCE IF NOT EXISTS "schema"."name" …;`
 ///
 /// The fully-rendered statement is carried verbatim in `entity.body[0]` (set by
-/// the introspector, which reconstructs it from `pg_sequences`/`pg_sequence`). We
-/// emit that text, trimmed of any trailing whitespace/`;` and re-terminated with a
-/// single `;`. Falls back to a bare `CREATE SEQUENCE "s"."n";` when no body was
-/// captured.
+/// the introspector, which reconstructs it from `pg_sequences`/`pg_sequence`,
+/// `IF NOT EXISTS` included). We emit that text, trimmed of any trailing
+/// whitespace/`;` and re-terminated with a single `;`. Falls back to a bare
+/// `CREATE SEQUENCE IF NOT EXISTS "s"."n";` when no body was captured —
+/// re-runnable, for the reason given on [`emit_table`].
 pub fn emit_sequence(entity: &Entity) -> String {
     if let Some(body) = entity.body.first() {
         let body = body.trim().trim_end_matches(';').trim_end();
@@ -338,18 +348,19 @@ pub fn emit_sequence(entity: &Entity) -> String {
     }
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
-    format!("CREATE SEQUENCE {}.{};", q(schema), q(name))
+    format!("CREATE SEQUENCE IF NOT EXISTS {}.{};", q(schema), q(name))
 }
 
-/// `CREATE VIEW "schema"."name" AS <definition>;`
+/// `CREATE OR REPLACE VIEW "schema"."name" AS <definition>;`
 /// The view body is carried in `entity.body[0]` (set by the introspector).
+/// `OR REPLACE` keeps it re-runnable, for the reason given on [`emit_table`].
 pub fn emit_view(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
     let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
     let qname = format!("{}.{}", q(schema), q(name));
-    let mut out = format!("CREATE VIEW {qname} AS {body};");
+    let mut out = format!("CREATE OR REPLACE VIEW {qname} AS {body};");
     if let Some(comment) = &entity.comment {
         out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
     }

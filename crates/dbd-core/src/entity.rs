@@ -926,9 +926,7 @@ impl Entity {
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
-            entity.errors.push(format!(
-                "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
-            ));
+            entity.errors.push(unread_folder_error(folder));
         }
         entity
     }
@@ -1000,6 +998,28 @@ impl Entity {
     /// Whether this entity has validation errors.
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+}
+
+/// Why a file under `ddl/<folder>/` is not read, for a folder that names no
+/// entity type.
+///
+/// Schemas and extensions are real kinds, but design.yaml declares them —
+/// `schemas:` and the target's `extensions:` — so a file for one says where
+/// it belongs rather than only that its folder is unknown (`dbd doctor` names
+/// the entry to write).
+fn unread_folder_error(folder: &str) -> String {
+    match folder {
+        "extension" | "extensions" => format!(
+            "ddl/{folder}/ is not read: extensions are declared in design.yaml, in the target's \
+             `extensions:` list (`dbd doctor` names the entry)"
+        ),
+        "schema" | "schemas" => {
+            format!("ddl/{folder}/ is not read: schemas are declared in design.yaml, under `schemas:`")
+        }
+        _ => format!(
+            "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
+        ),
     }
 }
 

@@ -130,6 +130,14 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// The deployed materialized views, each with its definition as the
+    /// database prints it (`body[0]`) and its indexes — what `introspect`
+    /// returns for them, without the rest. Default: none (targets without
+    /// materialized views).
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
     /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
     /// materialized view `qualified` (`schema.name`). Kept apart from the view's
     /// own comment, which belongs to its author. Default: no-op (targets without

@@ -70,6 +70,12 @@ impl PgQueryDdl {
 pub(crate) fn parse_with_fallback(file: &Path, sql: &str, fallback: &crate::entity::SchemaPath) -> Result<Entity> {
     let mut entity = Entity::from_file(file);
     entity.schema_path = fallback.clone();
+    // A file in a folder that names no type is reported as that, and only
+    // that: reading it as the table it falls back to added "this table file
+    // declares no `CREATE TABLE`" to a `CREATE EXTENSION`.
+    if !entity.errors.is_empty() {
+        return Ok(entity);
+    }
     match PgQueryDdl::native(entity.entity_type) {
         Some(parse) => parse(entity, sql),
         None => Ok(entity),
