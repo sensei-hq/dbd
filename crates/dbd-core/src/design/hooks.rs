@@ -462,6 +462,25 @@ mod tests {
         assert!(deps.contains(&"app.b".to_string()), "got {deps:?}");
     }
 
+    /// A hook stating no path runs on `source.search_path`, so that is where
+    /// its bare names are judged; one stating its own is judged on its own.
+    #[test]
+    fn a_hooks_bare_table_resolves_on_the_project_path() {
+        let app = [crate::entity::PathEntry::Schema("app".to_string())];
+        assert_eq!(
+            derive_dependencies("insert into notes values (1);", Some(&app)),
+            vec!["app.notes".to_string()]
+        );
+        assert_eq!(
+            derive_dependencies("set search_path to core;\ninsert into notes values (1);", Some(&app)),
+            vec!["core.notes".to_string()]
+        );
+        assert_eq!(
+            derive_dependencies("insert into notes values (1);", None),
+            vec!["public.notes".to_string()]
+        );
+    }
+
     /// Measured against sensei's real realtime hook: its table names live in
     /// `array[…]` and a `format()` string, so no parser can see them. This is
     /// the case `writes:` exists for.

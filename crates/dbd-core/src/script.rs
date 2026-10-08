@@ -876,6 +876,29 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// A migration or hook script that states no path runs on the one the
+    /// project gives bare names — `source.search_path`, with `public` kept on
+    /// it as for a DDL file — and one that states its own runs as written.
+    #[test]
+    fn a_script_stating_no_path_runs_on_the_projects() {
+        let app = [crate::entity::PathEntry::Schema("app".to_string())];
+        let sql = "update notes set tag = 'old';\n";
+        assert_eq!(
+            runnable_script(sql, Some(&app)),
+            format!("SET search_path TO \"app\", \"public\";\n{sql}")
+        );
+        let own = "set search_path to core;\nupdate zones set id = id;\n";
+        assert_eq!(runnable_script(own, Some(&app)), own);
+    }
+
+    /// With no project path, a script stating none runs on the session's
+    /// default — not on whatever path the last DDL file left the connection.
+    #[test]
+    fn a_script_in_a_project_without_a_path_runs_on_the_session_default() {
+        let sql = "insert into items values (1);\n";
+        assert_eq!(runnable_script(sql, None), format!("RESET search_path;\n{sql}"));
+    }
+
     /// The additions a run commits ahead of a version: each `ADD VALUE`
     /// made idempotent, with the path that names its type — and nothing else
     /// of the script, which runs later in the version's own transaction.

@@ -6794,3 +6794,160 @@ async fn the_migration_preview_lists_the_steps_in_the_order_the_run_takes_them()
         "the run takes them in the order the preview lists them: {started:#?}"
     );
 }
+
+// ── Migration and hook scripts run on source.search_path ─────────────────────
+
+/// `source.search_path: [app]`, a `notes` table whose file states no path of
+/// its own, and a `core` table applied after it whose file leaves the session
+/// on `core`. With `hook`, an `apply.after` script naming `notes` bare.
+fn search_path_project(dir: &std::path::Path, hook: bool, notes_columns: &str) -> Design {
+    let mut yaml = "project:\n  name: path_test\nsource:\n  dialect: postgresql\n  search_path: [app]\n\
+                    schemas:\n  - app\n  - core\nscopes:\n  core_only:\n    includes: [core]\n"
+        .to_string();
+    if hook {
+        yaml.push_str("apply:\n  after:\n    - sql/seed.sql\n");
+    }
+    let notes = format!("create table if not exists notes (id integer primary key, body text{notes_columns});\n");
+    write_project(
+        dir,
+        &yaml,
+        &[
+            ("ddl/table/app/notes.ddl", notes.as_str()),
+            (
+                "ddl/table/core/zones.ddl",
+                "set search_path to core;\ncreate table if not exists zones (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into notes (id, body) values (1, 'seed') on conflict do nothing;\n",
+            ),
+        ],
+    )
+}
+
+/// A hook naming a table bare ran on whatever path the last DDL file left —
+/// here `core` — and failed with `relation "notes" does not exist`, though the
+/// project says bare names resolve on `app`.
+#[tokio::test]
+async fn a_hook_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    search_path_project(tmp.path(), true, "")
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the hook finds app.notes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.notes WHERE id = 1",
+        "the seeded row",
+    )
+    .await;
+}
+
+/// A hand-written `migrations/002/app/notes.data.sql` naming `notes` bare ran
+/// with no path at all and failed with `relation "notes" does not exist`.
+#[tokio::test]
+async fn a_migration_script_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let design = search_path_project(dir, false, "");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.notes (id, body) VALUES (1, 'a'), (2, 'b');")
+        .await
+        .expect("seed rows");
+
+    let design = search_path_project(dir, false, ", tag text");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v2 tags notes").unwrap();
+    std::fs::write(
+        dir.join("migrations/002/app/notes.data.sql"),
+        "update notes set tag = 'old';\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the data script finds app.notes");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.notes WHERE tag IS DISTINCT FROM 'old'",
+        "a row the data script missed",
+    )
+    .await;
+}
+
+/// A hook's tables decide whether a scope runs it, and its bare `notes` was
+/// read as `public.notes`: under `core_only`, which leaves `app` out, the hook
+/// was not skipped, ran, and failed the apply. It is read on the path it runs
+/// on — `app.notes` — and skipped, with a warning naming it.
+#[tokio::test]
+async fn a_scope_judges_a_hooks_bare_table_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = search_path_project(tmp.path(), true, "");
+    let scope = design.resolve_scope(Some("core_only"), None).unwrap();
+
+    let skips = design.hook_skips(Some(&scope)).unwrap();
+    assert!(
+        skips.len() == 1 && skips[0].contains("app.notes"),
+        "the hook is skipped for app.notes: {skips:?}"
+    );
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("the scoped apply skips the hook");
+    assert_table_exists(&*adapter, "core", "zones").await;
+}
+
+/// With no `source.search_path`, a hook stating no path is read on the
+/// session's default — that is what its scope analysis assumes — but it ran on
+/// whatever path the last DDL file left: here `zeta`, so `items` meant
+/// `zeta.items`, not the `public.items` the analysis judged.
+#[tokio::test]
+async fn a_hook_stating_no_path_in_a_project_with_none_runs_on_the_session_default() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: path_test\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - zeta\n\
+         apply:\n  after:\n    - sql/seed.sql\n",
+        &[
+            (
+                "ddl/table/public/items.ddl",
+                "set search_path to public;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/zeta/items.ddl",
+                "set search_path to zeta;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into items (id) values (1) on conflict do nothing;\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM public.items WHERE id = 1",
+        "the row in public.items",
+    )
+    .await;
+    assert_catalog(&*adapter, false, "SELECT 1 FROM zeta.items", "a row in zeta.items").await;
+}
