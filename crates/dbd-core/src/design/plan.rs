@@ -91,12 +91,19 @@ pub fn build_execution_plan(
     }
 
     // Current: no pending migrations or already at latest
-    if db_version >= latest_version || pending_migrations.is_empty() {
+    if !migrates(db_version, latest_version, pending_migrations) {
         return plan_current(&valid_entities);
     }
 
     // Migrate: db_version < latest and there are pending migrations
     plan_migrate(&valid_entities, pending_migrations, latest_version, scope_names)
+}
+
+/// Whether a run from `db_version` migrates: the database records a version,
+/// the design is past it, and a migration lies between. A fresh database is
+/// built from the DDL instead, and an up-to-date one re-applies it.
+pub(crate) fn migrates(db_version: u32, latest_version: u32, pending_migrations: &[PendingMigration]) -> bool {
+    db_version != 0 && db_version < latest_version && !pending_migrations.is_empty()
 }
 
 /// Fresh install: apply every entity's DDL, then stamp the latest version.

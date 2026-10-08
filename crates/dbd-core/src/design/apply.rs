@@ -45,6 +45,7 @@ impl Design {
         }
         let from_version = adapter.get_db_version().await?;
         let pending = snapshot::pending_migrations(from_version, &self.project_dir);
+        refuse_a_named_apply_over_pending_migrations(name, from_version, to_version, &pending)?;
         let owned: Vec<Entity> = entities.iter().map(|e| (*e).clone()).collect();
         let plan = build_execution_plan(&owned, from_version, to_version, &pending, working_set.as_ref());
 
@@ -235,9 +236,15 @@ impl Design {
         // anything runs — the `apply.before` hooks included — and under
         // `dry_run` too, since the database is there to ask. Read without
         // healing the bookkeeping, which is itself a write.
-        Self::check_version_guard(
-            adapter.get_db_version().await?,
-            self.config.project.version.unwrap_or(0),
+        let db_version = adapter.get_db_version().await?;
+        let latest_version = self.config.project.version.unwrap_or(0);
+        Self::check_version_guard(db_version, latest_version)?;
+        // Also before the first hook, and under `dry_run` (see the function).
+        refuse_a_named_apply_over_pending_migrations(
+            name,
+            db_version,
+            latest_version,
+            &snapshot::pending_migrations(db_version, &self.project_dir),
         )?;
 
         // A hook is filtered against the same working set the entities were.
@@ -882,6 +889,42 @@ impl Design {
         });
         Ok(())
     }
+}
+
+/// Refuse `apply -n <name>` while the run would migrate.
+///
+/// A named apply builds one entity, but a migrating plan records every pending
+/// version and stamps the latest. So `apply -n app.people` ran v8's change to
+/// `app.people` — and v8's drops, of tables it was not named for — skipped the
+/// rest of v8, and recorded v8 as applied; the next full apply said "Already up
+/// to date" over a missing column. Running every pending migration instead
+/// would do far more than the user asked for, so the run refuses and says how
+/// to proceed. With nothing pending, a named apply applies its entity as ever.
+///
+/// Checked before any write — the `apply.before` hooks included — and by the
+/// preview, so a dry run refuses where the run does.
+fn refuse_a_named_apply_over_pending_migrations(
+    name: Option<&str>,
+    db_version: u32,
+    latest_version: u32,
+    pending: &[PendingMigration],
+) -> Result<()> {
+    let Some(name) = name else { return Ok(()) };
+    if !super::plan::migrates(db_version, latest_version, pending) {
+        return Ok(());
+    }
+    let versions: Vec<String> = pending.iter().map(|m| format!("v{}", m.to_version)).collect();
+    let (noun, verb, them) = if versions.len() == 1 {
+        ("migration", "is", "it")
+    } else {
+        ("migrations", "are", "them")
+    };
+    Err(DbdError::Config(format!(
+        "apply -n {name} refused: the database is at v{db_version} and {noun} {} {verb} pending. A named \
+         apply builds one entity and cannot run {them}, and would record {them} as applied. Run `dbd apply` \
+         first to apply {them}, then `dbd apply -n {name}`.",
+        versions.join(", ")
+    )))
 }
 
 /// The statements of a migration file, one line each, for a preview — empty

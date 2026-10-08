@@ -856,6 +856,18 @@ pub async fn cmd_apply(
             )?;
         }
 
+        // Built before anything is printed: it refuses where the run does — a
+        // named apply while migrations are pending — and a refused preview
+        // should not list a plan first.
+        let preview = match &adapter {
+            Some(adapter) => Some(
+                design
+                    .pending_migration_preview(&**adapter, name, Some(&resolved))
+                    .await?,
+            ),
+            None => None,
+        };
+
         for entity in &entities {
             let detail = match &entity.file {
                 Some(f) => format!("{:?} => {} using \"{}\"", entity.entity_type, entity.name, f.display()),
@@ -868,13 +880,8 @@ pub async fn cmd_apply(
             output::warn(&skip);
         }
         // The migrations the run executes before the entities, a drop marked.
-        match &adapter {
-            Some(adapter) => super::print_migration_preview(
-                verbosity,
-                &design
-                    .pending_migration_preview(&**adapter, name, Some(&resolved))
-                    .await?,
-            ),
+        match &preview {
+            Some(preview) => super::print_migration_preview(verbosity, preview),
             None => super::note_unlisted_migrations(verbosity, project_dir),
         }
         output::summary(0, 0, entities.len());
