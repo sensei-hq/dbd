@@ -811,6 +811,72 @@ mod tests {
         }
     }
 
+    /// The introspected extensions go where the project format declares them —
+    /// the target's `extensions:` list, with the schema when it is not
+    /// `public` — and nowhere under `ddl/`, so the project loads with no error.
+    /// They were written to `ddl/extension/<name>.ddl`, which the scanner does
+    /// not read, so `inspect` and `apply` refused every reversed project whose
+    /// database had an extension.
+    #[test]
+    fn init_declares_the_databases_extensions_in_design_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("design.yaml");
+        let mut citext = dbd_core::Entity::new(dbd_core::EntityType::Extension, "citext");
+        citext.schema = Some("public".into());
+        let mut pgcrypto = dbd_core::Entity::new(dbd_core::EntityType::Extension, "pgcrypto");
+        pgcrypto.schema = Some("app".into());
+        let mut table = dbd_core::Entity::new(dbd_core::EntityType::Table, "app.t");
+        table.table_def = Some(dbd_core::entity::TableDef {
+            columns: vec![dbd_core::entity::ColumnDef {
+                name: "id".into(),
+                data_type: "integer".into(),
+                nullable: false,
+                default_value: None,
+                is_pk: false,
+                is_unique: false,
+                identity: None,
+                generated: None,
+                comment: None,
+                inline_fk: None,
+            }],
+            constraints: vec![],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        let entities = vec![
+            dbd_core::Entity::schema("public"),
+            dbd_core::Entity::schema("app"),
+            citext,
+            pgcrypto,
+            table,
+        ];
+
+        init_with_entities(
+            tmp.path(),
+            &cfg,
+            "dev",
+            entities,
+            "proj",
+            1,
+            all_schemas(),
+            false,
+            "postgres",
+            "init from database",
+        )
+        .unwrap();
+
+        assert!(!tmp.path().join("ddl/extension").exists());
+        assert!(!tmp.path().join("ddl/schema").exists());
+        let config = dbd_core::config::read(&cfg).unwrap();
+        let target = config.target.get("postgres").expect("a postgres target");
+        let declared: Vec<(&str, Option<&str>)> = target.extensions.iter().map(|e| (e.name(), e.schema())).collect();
+        assert_eq!(declared, vec![("citext", None), ("pgcrypto", Some("app"))]);
+
+        let design = dbd_core::Design::from_config_with_dir(&cfg, "dev", Some(tmp.path())).unwrap();
+        let errors: Vec<&String> = design.entities().iter().flat_map(|e| &e.errors).collect();
+        assert!(errors.is_empty(), "the reversed project must load clean: {errors:?}");
+    }
+
     /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.
     #[test]
     fn init_from_dbml_creates_project() {

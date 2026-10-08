@@ -985,3 +985,50 @@ fn inspect_finds_the_files_of_a_project_given_by_relative_path() {
     );
     assert!(out.status.success(), "{}", stdout(&out));
 }
+
+// ── schemas and extensions belong in design.yaml ────────────────────────────
+
+/// `init --from-db` wrote each extension as `ddl/extension/<name>.ddl`, a
+/// folder the scanner does not read: `inspect` refused the project while
+/// `doctor` said "No issues found". Extensions and schemas are declared in
+/// design.yaml, and both commands must say so about a file in either folder.
+#[test]
+fn inspect_and_doctor_agree_that_extensions_and_schemas_are_declared_in_design_yaml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "design.yaml", "project:\n  name: folders\n\nschemas:\n  - app\n");
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id int);\n",
+    );
+    write(
+        dir,
+        "ddl/extension/citext.ddl",
+        "create extension if not exists \"citext\" with schema \"public\";\n",
+    );
+    write(dir, "ddl/schema/app.ddl", "create schema if not exists \"app\";\n");
+
+    let inspect = dbd(dir, &["inspect"]);
+    let said = format!("{}{}", stdout(&inspect), stderr(&inspect));
+    assert!(!inspect.status.success(), "inspect must refuse the file: {said}");
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("extensions:"),
+        "inspect must say where an extension is declared: {said}"
+    );
+
+    let doctor = dbd(dir, &["doctor"]);
+    let said = format!("{}{}", stdout(&doctor), stderr(&doctor));
+    assert!(
+        !said.contains("No issues found"),
+        "doctor must agree with inspect: {said}"
+    );
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("`citext`") && said.contains("extensions:"),
+        "doctor must name the extension file and the entry that replaces it: {said}"
+    );
+    assert!(
+        said.contains("ddl/schema/app.ddl") && said.contains("schemas:"),
+        "doctor must name the schema file dbd does not read: {said}"
+    );
+}

@@ -799,3 +799,75 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     let csv = exported_widgets(dir, &url);
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
 }
+
+// ── init --from-db writes a project that applies ────────────────────────────
+
+/// A database with every kind of object `init --from-db` captures.
+const BROWNFIELD: &str = "\
+    CREATE EXTENSION \"uuid-ossp\";
+    CREATE EXTENSION citext;
+    CREATE SCHEMA app;
+    CREATE TYPE app.mood AS ENUM ('happy', 'sad');
+    CREATE SEQUENCE app.ticket_seq START 100;
+    CREATE TABLE app.regions (id int PRIMARY KEY, name citext NOT NULL);
+    CREATE TABLE app.people (
+      id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      region_id int,
+      mood app.mood,
+      ticket int DEFAULT nextval('app.ticket_seq'),
+      CONSTRAINT people_region_fk FOREIGN KEY (region_id) REFERENCES app.regions (id)
+    );
+    CREATE INDEX people_mood_idx ON app.people (mood);
+    CREATE TABLE app.counters (id serial PRIMARY KEY, n int NOT NULL DEFAULT 0);
+    CREATE VIEW app.people_v AS SELECT id, mood FROM app.people;
+    CREATE MATERIALIZED VIEW app.mood_counts AS SELECT mood, count(*) AS n FROM app.people GROUP BY mood;
+    CREATE INDEX mood_counts_idx ON app.mood_counts (mood);";
+
+/// The documented brownfield path, end to end. `init --from-db` wrote
+/// `ddl/extension/<name>.ddl` — a folder the scanner does not read, so
+/// `inspect` and `apply` exited 1 on any database with an extension — and DDL
+/// that was not idempotent (`create sequence`, `CREATE TABLE` with no
+/// `IF NOT EXISTS`), so applying the project back to the database it came
+/// from failed with `already exists`. The reversed project must inspect
+/// clean, apply to its own database and to a fresh one, and leave no drift on
+/// either.
+#[tokio::test]
+async fn a_reverse_engineered_project_applies_to_its_own_database_and_to_a_fresh_one_without_drift() {
+    let (pg, url) = start_pg().await;
+    dbd_core::connect(&url, "brownfield")
+        .await
+        .unwrap()
+        .execute_script(BROWNFIELD)
+        .await
+        .expect("build the brownfield database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    assert!(
+        !dir.join("ddl/extension").exists(),
+        "extensions belong in design.yaml, not a folder the scanner does not read"
+    );
+
+    let o = dbd(dir, &url, &["inspect"]);
+    assert!(
+        o.status.success(),
+        "inspect of the reversed project failed: {}",
+        combined(&o)
+    );
+
+    // Back to the database it came from.
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply to its own database failed: {}", combined(&o));
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on its own database: {}", combined(&o));
+
+    // And to a database that has none of it.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = pg.settings().url("fresh");
+    let o = dbd(dir, &fresh, &["apply"]);
+    assert!(o.status.success(), "apply to a fresh database failed: {}", combined(&o));
+    let o = dbd(dir, &fresh, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on the fresh database: {}", combined(&o));
+}

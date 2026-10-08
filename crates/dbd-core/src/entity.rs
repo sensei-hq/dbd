@@ -1016,6 +1016,20 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `ddl/extension/` and `ddl/schema/` are not DDL folders: both kinds are
+    /// declared in design.yaml. The scanner said only "unrecognized DDL folder",
+    /// which left the reader to guess where an extension goes instead.
+    #[test]
+    fn a_file_under_ddl_extension_or_ddl_schema_is_pointed_at_design_yaml() {
+        let ext = Entity::from_file(Path::new("ddl/extension/citext.ddl"));
+        let said = ext.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("extensions:"), "{said}");
+
+        let schema = Entity::from_file(Path::new("ddl/schema/app.ddl"));
+        let said = schema.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("schemas:"), "{said}");
+    }
+
     #[test]
     fn entity_type_from_folder_name() {
         assert_eq!(EntityType::from_folder_name("table"), Some(EntityType::Table));

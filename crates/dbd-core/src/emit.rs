@@ -534,12 +534,14 @@ mod tests {
         let sql = emit_table(&e);
 
         // Sanity on the emitted text:
-        assert!(sql.contains("CREATE TABLE \"shop\".\"orders\""));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"shop\".\"orders\""));
         assert!(sql.contains("\"id\" uuid NOT NULL"));
         assert!(sql.contains("\"total_cents\" integer NOT NULL DEFAULT 0"));
         assert!(sql.contains("PRIMARY KEY (\"id\")"));
         assert!(sql.contains("FOREIGN KEY (\"customer_id\") REFERENCES \"shop\".\"customers\" (\"id\")"));
-        assert!(sql.contains("CREATE INDEX \"orders_customer_id_idx\" ON \"shop\".\"orders\" (\"customer_id\");"));
+        assert!(sql.contains(
+            "CREATE INDEX IF NOT EXISTS \"orders_customer_id_idx\" ON \"shop\".\"orders\" (\"customer_id\");"
+        ));
         assert!(sql.contains("COMMENT ON COLUMN \"shop\".\"orders\".\"id\" IS 'Order PK';"));
 
         // Round-trip: emitted DDL re-parses to a TableDef with the same structure.
@@ -588,6 +590,9 @@ mod tests {
         );
     }
 
+    /// `OR REPLACE`, as every emitted statement is re-runnable: reverse output
+    /// is applied back to the database it came from (the brownfield path), and
+    /// a plain `CREATE VIEW` failed there with `already exists`.
     #[test]
     fn emits_view() {
         let mut e = Entity::new(EntityType::View, "shop.active_orders");
@@ -596,7 +601,7 @@ mod tests {
         let sql = emit_view(&e);
         assert_eq!(
             sql,
-            "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
+            "CREATE OR REPLACE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
         );
     }
 
@@ -754,11 +759,12 @@ mod tests {
         assert_eq!(emit_entity(&e).as_deref(), Some(sql.as_str()));
     }
 
+    /// `IF NOT EXISTS`, for the same brownfield re-apply as `emits_view`.
     #[test]
     fn emits_sequence_fallback_without_body() {
         let mut e = Entity::new(EntityType::Sequence, "app.counter");
         e.schema = Some("app".into());
-        assert_eq!(emit_sequence(&e), "CREATE SEQUENCE \"app\".\"counter\";");
+        assert_eq!(emit_sequence(&e), "CREATE SEQUENCE IF NOT EXISTS \"app\".\"counter\";");
     }
 
     /// A computed column must carry its `GENERATED … STORED` clause into the
@@ -1004,24 +1010,24 @@ mod tests {
         // tsvector column would be invalid as a plain btree, so the access method
         // must survive reverse-engineering.
         assert!(
-            sql.contains("CREATE INDEX \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"),
             "got:\n{sql}"
         );
         // btree (None) emits no USING clause.
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"),
             "got:\n{sql}"
         );
     }
