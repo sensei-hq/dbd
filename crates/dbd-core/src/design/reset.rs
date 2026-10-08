@@ -164,6 +164,18 @@ impl Design {
             })
             .unwrap_or_default();
 
+        // A subset scope drops its own objects and nothing else: no CASCADE.
+        if is_subset {
+            return Ok(script::build_scoped_reset_script(
+                &entities,
+                &extensions,
+                target,
+                drop_schemas,
+                drop_extensions,
+                &schemas,
+            ));
+        }
+
         // What apply granted on the schemas, so the roles it granted to can be
         // dropped: Postgres refuses to drop a role that still holds a grant.
         let grants = self.config.effective_schema_grants();

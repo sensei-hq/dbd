@@ -299,6 +299,88 @@ pub fn build_reset_script(
     Ok(Some(lines.join("\n")))
 }
 
+/// The reset script for a subset scope: the scope's own objects, dropped
+/// without `CASCADE`, all or nothing.
+///
+/// `CASCADE` reaches past the scope: dropping an in-scope enum took the column
+/// of an out-of-scope table that used it, with its data. So nothing here
+/// cascades — not the objects, schemas or extensions — and Postgres itself
+/// decides what depends on what, columns, defaults and objects dbd never made
+/// included. Without `CASCADE` the drops must run dependents first, so they
+/// follow `entities` (apply order) in reverse rather than grouping by kind:
+/// a view calling an in-scope function goes before it. Extensions go before
+/// schemas, which may hold them.
+///
+/// The drops share one block: if any is refused because something outside the
+/// scope depends on it, every drop rolls back and the error names the object
+/// and its dependents (Postgres's `DETAIL`, which the driver's message leaves
+/// out), each by its schema. Roles are a full reset's alone and never appear
+/// here.
+pub fn build_scoped_reset_script(
+    entities: &[&Entity],
+    extensions: &[String],
+    target: &str,
+    drop_schemas: bool,
+    drop_extensions: bool,
+    schemas: &[String],
+) -> Option<String> {
+    let mut drops = Vec::new();
+    let mut seen_routines = std::collections::HashSet::new();
+    for e in entities.iter().rev() {
+        let schema = entity_schema(e);
+        let (_, bare) = crate::entity::split_qualified_name(&e.name);
+        let qualified = format!("\"{}\".\"{}\"", quote_ident(schema), quote_ident(&bare));
+        match e.entity_type {
+            EntityType::Function | EntityType::Procedure => {
+                if seen_routines.insert((schema.to_string(), bare.clone())) {
+                    drops.push(format!(
+                        "FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p\n    \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace\n    \
+                         WHERE n.nspname = '{}' AND p.proname = '{}'\n  \
+                         LOOP EXECUTE format('DROP ROUTINE IF EXISTS %s', r.sig); END LOOP;",
+                        sql_quote_escape(schema),
+                        sql_quote_escape(&bare)
+                    ));
+                }
+            }
+            EntityType::MaterializedView => drops.push(format!("DROP MATERIALIZED VIEW IF EXISTS {qualified};")),
+            EntityType::View => drops.push(format!("DROP VIEW IF EXISTS {qualified};")),
+            EntityType::Table => drops.push(format!("DROP TABLE IF EXISTS {qualified};")),
+            EntityType::Sequence => drops.push(format!("DROP SEQUENCE IF EXISTS {qualified};")),
+            EntityType::Enum => drops.push(format!("DROP TYPE IF EXISTS {qualified};")),
+            _ => {}
+        }
+    }
+    if drop_extensions {
+        for ext in extensions {
+            drops.push(format!("DROP EXTENSION IF EXISTS \"{}\";", quote_ident(ext)));
+        }
+    }
+    if drop_schemas {
+        for schema in schemas.iter().filter(|s| !schema_is_protected(s, target)) {
+            drops.push(format!("DROP SCHEMA IF EXISTS \"{}\";", quote_ident(schema)));
+        }
+    }
+    if drops.is_empty() {
+        return None;
+    }
+    // An empty search_path, local to the block's transaction, so Postgres
+    // names every object in the refusal by its schema: it qualifies only what
+    // the session's path does not reach, and a pooled session's path is
+    // whatever the last DDL file `SET`.
+    Some(format!(
+        "DO $dbd_reset$ DECLARE r record; what text; held text; BEGIN\n  \
+         PERFORM set_config('search_path', '', true);\n  {}\n\
+         EXCEPTION WHEN dependent_objects_still_exist THEN\n  \
+         GET STACKED DIAGNOSTICS what = MESSAGE_TEXT, held = PG_EXCEPTION_DETAIL;\n  \
+         RAISE EXCEPTION 'scoped reset refused, nothing was dropped — %: %. A scoped reset drops only \
+         what its scope holds, and never cascades: add the dependents to the scope, or reset without --scope.', \
+         what, replace(held, E'\\n', '; ') USING ERRCODE = 'dependent_objects_still_exist';\n\
+         END $dbd_reset$;",
+        drops.join("\n  ")
+    ))
+}
+
 /// The reset script for a SQLite database: `DROP VIEW` and `DROP TABLE IF
 /// EXISTS "name";` for each of the project's views and tables, `entities`
 /// given in apply order and dropped in reverse.
