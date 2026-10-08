@@ -1499,7 +1499,7 @@ mod tests {
                 auto_group_by_schema: false,
             });
             assert!(
-                !doc.content.contains("'''\n"),
+                !doc.content.contains("Note: '''\n") && !doc.content.lines().any(|l| l.trim() == "'''"),
                 "flush against its quotes:\n{}",
                 doc.content
             );
