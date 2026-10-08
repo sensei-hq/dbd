@@ -440,11 +440,30 @@ impl PostgresAdapter {
         )
     }
 
+    /// SQL that is true when the object `oid` of the system catalog `catalog`
+    /// (`pg_class`, `pg_type`, …) is **not** a member of an extension.
+    ///
+    /// What an extension owns — `pg_depend.deptype = 'e'` — is the
+    /// extension's: `CREATE EXTENSION` makes it, `DROP EXTENSION` removes it,
+    /// and dropping it on its own is refused. So it is never part of a
+    /// project, and every introspection query leaves it out; `diff` and
+    /// `reconcile` read the same queries, so neither sees it as drift or as an
+    /// orphan to prune. The `classid` is matched as well as the `objid`: oids
+    /// are only unique within one catalog.
+    fn not_extension_member(catalog: &str, oid: &str) -> String {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend ext_dep \
+             WHERE ext_dep.classid = '{catalog}'::regclass AND ext_dep.objid = {oid} \
+               AND ext_dep.deptype = 'e')"
+        )
+    }
+
     // ── Private introspection helpers ──────────────────────────────────────────
 
     async fn introspect_schemas(&self) -> crate::error::Result<Vec<Entity>> {
         let filter = Self::schema_filter_column("nspname");
-        let sql = format!("SELECT nspname FROM pg_namespace WHERE {filter} ORDER BY nspname");
+        let owned = Self::not_extension_member("pg_namespace", "oid");
+        let sql = format!("SELECT nspname FROM pg_namespace WHERE {filter} AND {owned} ORDER BY nspname");
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -498,12 +517,13 @@ impl PostgresAdapter {
         // every run, forever, without ever converging.
         // `obj_description(…, 'pg_type')` is the enum's own `COMMENT ON TYPE`,
         // which the enum file carries and the parser reads back.
+        let owned = Self::not_extension_member("pg_type", "t.oid");
         let sql = format!(
             "SELECT n.nspname, t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') AS comment \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
              LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
-             WHERE t.typtype = 'e' AND {ns_filter} \
+             WHERE t.typtype = 'e' AND {ns_filter} AND {owned} \
              ORDER BY n.nspname, t.typname, e.enumsortorder"
         );
         let rows = sqlx::query(&sql)
@@ -552,11 +572,13 @@ impl PostgresAdapter {
         //    tables (`_dbd_meta`, `_dbd_migrations`) — they are created/managed by
         //    `dbd apply`, not authored DDL, so they must never be reverse-engineered
         //    into the project (mirrors the sqlite adapter's exclusion).
+        let owned = Self::not_extension_member("pg_class", "format('%I.%I', c.table_schema, c.table_name)::regclass");
         let tables_sql = format!(
             "SELECT c.table_schema, c.table_name \
              FROM information_schema.tables c \
              WHERE c.table_type = 'BASE TABLE' AND {ns_filter} \
              AND c.table_name NOT IN ('_dbd_meta', '_dbd_migrations') \
+             AND {owned} \
              ORDER BY c.table_schema, c.table_name"
         );
         let table_rows = sqlx::query(&tables_sql)
@@ -1031,11 +1053,12 @@ impl PostgresAdapter {
 
     async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("schemaname");
+        let owned = Self::not_extension_member("pg_class", "format('%I.%I', schemaname, viewname)::regclass");
         let sql = format!(
             "SELECT schemaname, viewname, definition, \
                     obj_description(format('%I.%I', schemaname, viewname)::regclass, 'pg_class') AS comment \
              FROM pg_views \
-             WHERE {ns_filter} \
+             WHERE {ns_filter} AND {owned} \
              ORDER BY schemaname, viewname"
         );
         let rows = sqlx::query(&sql)
@@ -1072,11 +1095,12 @@ impl PostgresAdapter {
         use crate::entity::TableDef;
 
         let ns_filter = Self::schema_filter_column("schemaname");
+        let owned = Self::not_extension_member("pg_class", "format('%I.%I', schemaname, matviewname)::regclass");
         let sql = format!(
             "SELECT schemaname, matviewname, definition, \
                     obj_description(format('%I.%I', schemaname, matviewname)::regclass, 'pg_class') AS comment \
              FROM pg_matviews \
-             WHERE {ns_filter} \
+             WHERE {ns_filter} AND {owned} \
              ORDER BY schemaname, matviewname"
         );
         let rows = sqlx::query(&sql)
@@ -1128,6 +1152,7 @@ impl PostgresAdapter {
     /// `pg_get_sequencedef` exists, so this is reconstruct-from-catalog).
     async fn introspect_sequences(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_class", "c.oid");
         let sql = format!(
             "SELECT s.schemaname, s.sequencename, \
                     s.start_value, s.min_value, s.max_value, \
@@ -1139,6 +1164,7 @@ impl PostgresAdapter {
              JOIN pg_sequence pgs ON pgs.seqrelid = c.oid \
              WHERE c.relkind = 'S' \
                AND {ns_filter} \
+               AND {owned} \
                AND NOT EXISTS ( \
                    SELECT 1 FROM pg_depend d \
                    WHERE d.classid = 'pg_class'::regclass \
@@ -1199,6 +1225,7 @@ impl PostgresAdapter {
     /// order. This avoids `ddl/<kind>/<schema>/<name>.ddl` path collisions.
     async fn introspect_functions(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_proc", "p.oid");
         let sql = format!(
             "SELECT n.nspname AS schema, p.proname AS name, p.prokind::text AS kind, \
                     pg_get_functiondef(p.oid) AS definition \
@@ -1206,10 +1233,7 @@ impl PostgresAdapter {
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE p.prokind IN ('f', 'p') \
                AND {ns_filter} \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM pg_depend d \
-                   WHERE d.objid = p.oid AND d.deptype = 'e' \
-               ) \
+               AND {owned} \
              ORDER BY n.nspname, p.proname, p.prokind, p.oid"
         );
         let rows = sqlx::query(&sql)
@@ -2089,12 +2113,13 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_class", "c.oid");
         let sql = format!(
             "SELECT n.nspname AS schema, c.relname AS name, \
                     obj_description(c.oid, 'pg_class') AS comment \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind = 'm' AND {ns_filter}"
+             WHERE c.relkind = 'm' AND {ns_filter} AND {owned}"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
