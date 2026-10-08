@@ -498,16 +498,17 @@ pub(crate) fn header_columns(header: &[String], columns: &[String], table: &str,
     )))
 }
 
-/// Refuse a JSON record holding a key `table` has no column for, naming each
-/// such key, the first record holding it, and the file — as
-/// [`header_columns`] refuses a CSV header naming one.
+/// The keys `records` hold, each once — refusing a JSON record holding a key
+/// `table` has no column for, naming each such key, the first record holding
+/// it, and the file — as [`header_columns`] refuses a CSV header naming one.
 ///
 /// A key is a column name as written: the load matches keys to columns
 /// exactly. Postgres's JSON load moved only the keys matching a column and
 /// dropped the rest without a word, so a misspelled key left its column empty
 /// while the import reported success. A record that is not a JSON object is
 /// refused here too, before anything is staged.
-pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &str, file: &Path) -> Result<()> {
+pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &str, file: &Path) -> Result<Vec<String>> {
+    let mut present: Vec<String> = Vec::new();
     let mut unknown: Vec<(String, usize)> = Vec::new();
     for (at, record) in records.iter().enumerate() {
         let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
@@ -519,13 +520,17 @@ pub(crate) fn check_json_keys(records: &[String], columns: &[String], table: &st
                 ))
             })?;
         for key in keys.into_keys() {
-            if !columns.contains(&key) && !unknown.iter().any(|(k, _)| *k == key) {
-                unknown.push((key, at + 1));
+            if !columns.contains(&key) {
+                if !unknown.iter().any(|(k, _)| *k == key) {
+                    unknown.push((key, at + 1));
+                }
+            } else if !present.contains(&key) {
+                present.push(key);
             }
         }
     }
     if unknown.is_empty() {
-        return Ok(());
+        return Ok(present);
     }
     let named: Vec<String> = unknown
         .iter()

@@ -252,6 +252,70 @@ impl PostgresAdapter {
         .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
     }
 
+    /// The columns of `table` (or view), in table order, each with whether it
+    /// holds JSON — `json`, `jsonb`, or a domain over either. Empty when there
+    /// is no such relation.
+    async fn export_columns(&self, table: &str) -> Result<Vec<(String, bool)>> {
+        sqlx::query_as::<_, (String, bool)>(
+            "SELECT a.attname::text, \
+                    coalesce(nullif(t.typbasetype, 0), t.oid) IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype) \
+             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+        )
+        .bind(crate::sql_quote::qualified(table))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
+    }
+
+    /// Move each sequence that numbers one of `columns` of `table` — an
+    /// identity's, or a `serial`'s — past the largest value an import just
+    /// loaded into it.
+    ///
+    /// An import writes ids as they are in the file (COPY always did, and the
+    /// JSON load writes a `GENERATED ALWAYS` identity with `OVERRIDING SYSTEM
+    /// VALUE`), and neither moves the sequence. Left behind, it hands out the
+    /// loaded ids again, and the next insert fails on the primary key. A
+    /// sequence already past them is left alone.
+    async fn advance_sequences(&self, table: &str, columns: &[String]) -> Result<()> {
+        let qualified = crate::sql_quote::qualified(table);
+        let numbered: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.attname::text, pg_catalog.pg_get_serial_sequence($1, a.attname) \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attname::text = ANY($2) \
+               AND a.atttypid IN ('pg_catalog.int2'::regtype, 'pg_catalog.int4'::regtype, 'pg_catalog.int8'::regtype) \
+               AND pg_catalog.pg_get_serial_sequence($1, a.attname) IS NOT NULL",
+        )
+        .bind(&qualified)
+        .bind(columns)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the sequences of {table} failed: {e}")))?;
+        for (column, sequence) in numbered {
+            let sql = format!(
+                "SELECT pg_catalog.setval($1::regclass, m.v) \
+                 FROM (SELECT max({}) AS v FROM {qualified}) m, pg_catalog.pg_sequence q \
+                 WHERE q.seqrelid = $1::regclass AND q.seqincrement > 0 AND m.v IS NOT NULL \
+                   AND m.v BETWEEN q.seqmin AND q.seqmax \
+                   AND m.v > coalesce(pg_catalog.pg_sequence_last_value($1::regclass), q.seqstart - 1)",
+                crate::sql_quote::ident(&column)
+            );
+            sqlx::query(&sql)
+                .bind(&sequence)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    DbdError::Config(format!(
+                        "{table} loaded, but its sequence {sequence} could not be moved past the loaded \
+                         {column} values, so the next insert may reuse one: {e}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Static pattern matching for reference classification (offline fallback).
     fn matches_static_pattern(name: &str) -> bool {
         let lower = name.to_lowercase();
@@ -1328,7 +1392,8 @@ impl DatabaseAdapter for PostgresAdapter {
                         entity.name
                     )));
                 }
-                let column_list = super::header_columns(&header, &columns, &entity.name, file_path)?
+                let loaded = super::header_columns(&header, &columns, &entity.name, file_path)?;
+                let column_list = loaded
                     .iter()
                     .map(|c| crate::sql_quote::ident(c))
                     .collect::<Vec<_>>()
@@ -1363,6 +1428,8 @@ impl DatabaseAdapter for PostgresAdapter {
                 copy.finish()
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY finish failed: {e}")))?;
+                drop(conn);
+                self.advance_sequences(&entity.name, &loaded).await?;
             }
             "json" | "jsonl" => {
                 // JSONL: stage rows in dbd's schema-qualified temp table, then hand
@@ -1388,18 +1455,23 @@ impl DatabaseAdapter for PostgresAdapter {
                         entity.name
                     )));
                 }
-                super::check_json_keys(&records, &columns, &entity.name, file_path)?;
+                let loaded = super::check_json_keys(&records, &columns, &entity.name, file_path)?;
                 self.ensure_import_procedure().await?;
-                self.execute_script(&format!("CREATE TABLE IF NOT EXISTS {JSONB_IMPORT_TMP} (data jsonb)"))
-                    .await?;
-                self.execute_script(&format!("TRUNCATE {JSONB_IMPORT_TMP}")).await?;
+                // Staged as `json`, not `jsonb`: jsonb rewrites a json column's
+                // value — its spacing and key order — on the way through. Dropped
+                // and created rather than reused, so a `jsonb` table an earlier
+                // dbd left behind after a failed import is not read as this one.
+                self.execute_script(&format!(
+                    "DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}; CREATE TABLE {JSONB_IMPORT_TMP} (data json)"
+                ))
+                .await?;
 
-                // Stage each record as a JSONB row — bound, not interpolated into
+                // Stage each record as a JSON row — bound, not interpolated into
                 // `execute_script`, which rewrites every `set search_path to …;`
                 // in its text to add `public`. A record is data, and a value that
                 // quoted the statement was altered on the way in. On the pool, as
                 // the CSV `COPY` is: an import never runs inside an apply batch.
-                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::jsonb)");
+                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
                 for record in records {
                     sqlx::query(&insert)
                         .bind(record)
@@ -1413,6 +1485,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
                 self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}"))
                     .await?;
+                self.advance_sequences(&entity.name, &loaded).await?;
             }
             _ => {
                 return Err(DbdError::Config(format!("Unsupported import format: {format}")));
@@ -1460,7 +1533,40 @@ impl DatabaseAdapter for PostgresAdapter {
             // every backslash again, and the JSON `row_to_json` renders is full
             // of them — a newline came out as `\\n`, a quote as `\\"`, and the
             // file imported back as different values (or as no JSON at all).
-            let sql = format!("SELECT row_to_json(t)::text FROM {qualified} t");
+            //
+            // Each record is built field by field, as `row_to_json` builds it
+            // (`to_json` of each value), with one difference: `row_to_json`
+            // writes `null` for an SQL NULL and for a json/jsonb column holding
+            // the JSON value `null`, so the import could not tell them apart. A
+            // json/jsonb column that is SQL NULL is left out of its record — an
+            // absent key, which imports as NULL — and `null` is the JSON value.
+            let columns = self.export_columns(&entity.name).await?;
+            if columns.is_empty() {
+                return Err(DbdError::Config(format!(
+                    "cannot export {}: no such table or view",
+                    entity.name
+                )));
+            }
+            let fields: Vec<String> = columns
+                .iter()
+                .map(|(name, json)| {
+                    let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(name.clone())));
+                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(name));
+                    if *json {
+                        format!(
+                            "CASE WHEN t.{} IS NULL THEN NULL ELSE {key} || {value} END",
+                            crate::sql_quote::ident(name)
+                        )
+                    } else {
+                        format!("{key} || coalesce({value}, 'null')")
+                    }
+                })
+                .collect();
+            // `array_to_string` skips the NULL a left-out field is.
+            let sql = format!(
+                "SELECT '{{' || array_to_string(ARRAY[{}]::text[], ',') || '}}' FROM {qualified} t",
+                fields.join(", ")
+            );
             let mut rows = sqlx::query_scalar::<_, String>(&sql).fetch(&self.pool);
             while let Some(line) = rows.next().await {
                 let line = line.map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
