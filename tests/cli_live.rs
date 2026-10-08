@@ -754,3 +754,107 @@ async fn a_scoped_apply_that_fails_still_names_the_hook_it_skipped() {
         combined(&o)
     );
 }
+
+// ── source.search_path is the path a pathless file runs on ──────────────────
+
+/// `psql` from the embedded server's own installation, so a script is run the
+/// way a user runs `combine`'s output — not through dbd's adapter, which
+/// rewrites what it executes.
+fn psql(pg: &PostgreSQL, url: &str, args: &[&str]) -> Output {
+    std::process::Command::new(pg.settings().binary_dir().join("psql"))
+        .arg(url)
+        .args(["-X", "-q", "-v", "ON_ERROR_STOP=1"])
+        .args(args)
+        .output()
+        .expect("psql failed to run")
+}
+
+/// The schema a table named `name` landed in, one per line.
+fn schemas_of(pg: &PostgreSQL, url: &str, name: &str) -> String {
+    let o = psql(
+        pg,
+        url,
+        &[
+            "-tA",
+            "-c",
+            &format!("select schemaname from pg_tables where tablename = '{name}' order by 1"),
+        ],
+    );
+    assert!(o.status.success(), "psql query failed: {}", combined(&o));
+    stdout(&o).trim().to_string()
+}
+
+/// `source.search_path` is what the parser resolves a file with no `SET
+/// search_path` against: `ddl/table/app/a.ddl` holding a bare `create table a`
+/// is `app.a`, and `inspect` says so. Nothing ran it there. The DDL ran on the
+/// session's own path, so the table landed in `public`, `diff` then reported
+/// `+ create app.a`, and reconcile never converged on its own diff.
+///
+/// Every path that runs or writes the file has to use the path the parser
+/// used: `apply`, `reconcile` on a fresh database, and the script `combine`
+/// writes, run as a user runs it — with `psql`.
+#[tokio::test]
+async fn a_file_with_no_search_path_runs_on_source_search_path() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: pathless\n\nsource:\n  dialect: postgresql\n  search_path: [app]\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/a.ddl"),
+        "create table if not exists a (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &url, "a"),
+        "app",
+        "apply builds it where the parser read it"
+    );
+
+    let o = dbd(dir, &url, &["diff"]);
+    assert!(o.status.success(), "diff failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("in sync"),
+        "and the design's own diff is then empty: {}",
+        combined(&o)
+    );
+
+    let o = dbd(dir, &url, &["reconcile", "--dry-run"]);
+    assert!(o.status.success(), "reconcile --dry-run failed: {}", combined(&o));
+    assert!(
+        stdout(&o).contains("Already in sync"),
+        "so reconcile has nothing to do: {}",
+        combined(&o)
+    );
+
+    // A fresh database, built by reconcile.
+    pg.create_database("by_reconcile").await.unwrap();
+    let reconciled = pg.settings().url("by_reconcile");
+    let o = dbd(dir, &reconciled, &["reconcile"]);
+    assert!(o.status.success(), "reconcile failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &reconciled, "a"),
+        "app",
+        "reconcile builds it there too"
+    );
+
+    // A fresh database, built from the combined script by psql.
+    let o = dbd(dir, &url, &["combine", "-f", "combined.sql"]);
+    assert!(o.status.success(), "combine failed: {}", combined(&o));
+    pg.create_database("by_psql").await.unwrap();
+    let scripted = pg.settings().url("by_psql");
+    let o = psql(&pg, &scripted, &["-f", dir.join("combined.sql").to_str().unwrap()]);
+    assert!(o.status.success(), "psql -f combined.sql failed: {}", combined(&o));
+    assert_eq!(
+        schemas_of(&pg, &scripted, "a"),
+        "app",
+        "the combined script runs like apply"
+    );
+}

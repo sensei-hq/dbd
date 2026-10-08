@@ -2124,6 +2124,86 @@ import:
         assert!(sql.contains("set search_path to app, public;"), "{sql}");
     }
 
+    /// The search path each `CREATE TABLE` in `sql` runs under: the args of the
+    /// last `SET search_path` before it, keyed by the table's bare name. Read
+    /// from libpg_query's tree, so a spelling change cannot pass or fail it.
+    fn search_path_per_table(sql: &str) -> std::collections::HashMap<String, Vec<String>> {
+        use pg_query::NodeEnum;
+        let parsed = pg_query::parse(sql).expect("combined SQL parses");
+        let mut path: Vec<String> = Vec::new();
+        let mut out = std::collections::HashMap::new();
+        for stmt in &parsed.protobuf.stmts {
+            match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+                Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                    path = set
+                        .args
+                        .iter()
+                        .filter_map(|a| match a.node.as_ref() {
+                            Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                                Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                }
+                Some(NodeEnum::CreateStmt(create)) => {
+                    let table = create.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                    out.insert(table, path.clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `source.search_path` is the path the parser resolves a file with no
+    /// `SET search_path` against, so `ddl/table/app/a.ddl` holding a bare
+    /// `create table a` was read as `app.a`. Nothing ran it there: the script
+    /// carried the file as written, the table landed wherever the session
+    /// pointed (`public`), and `diff` then reported `+ create app.a` forever.
+    /// The combined script must run each such file on the project's path —
+    /// with `public` after it, as a file's own path gets — and leave a file
+    /// that states its own path alone.
+    #[test]
+    fn combine_runs_a_file_with_no_search_path_on_the_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: postgresql\n  search_path: [app]\nschemas:\n  - app\n  - other\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/a.ddl"),
+            "create table if not exists a (id int primary key);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/other")).unwrap();
+        std::fs::write(
+            dir.join("ddl/table/other/b.ddl"),
+            "set search_path to other;\ncreate table if not exists b (id int primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+
+        let paths = search_path_per_table(&sql);
+        assert_eq!(
+            paths.get("a").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "a pathless file runs on source.search_path, then public:\n{sql}"
+        );
+        assert_eq!(
+            paths.get("b").map(Vec::as_slice),
+            Some(["other".to_string(), "public".to_string()].as_slice()),
+            "a file's own path still wins:\n{sql}"
+        );
+    }
+
     /// A scope that keeps an extension but excludes the schema it installs into
     /// contradicts itself: `inspect` passed it and apply failed with `schema
     /// "ext" does not exist`. Refused where the scope is resolved, so every
