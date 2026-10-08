@@ -957,14 +957,14 @@ impl Entity {
             None => &parts,
         };
 
-        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
-        // vs import/staging/file.csv → env=None, schema=staging
-        let (_env, schema_and_rest) =
-            if after_import.len() >= 3 && (after_import[0] == "dev" || after_import[0] == "prod") {
-                (Some(after_import[0].to_string()), &after_import[1..])
-            } else {
-                (None, after_import)
-            };
+        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging,
+        // and import/dev/file.csv → env=dev, no schema (a schemaless project's
+        // layout); vs import/staging/file.csv → env=None, schema=staging.
+        let (_env, schema_and_rest) = if after_import.len() >= 2 && crate::scanner::is_env_folder(after_import[0]) {
+            (Some(after_import[0].to_string()), &after_import[1..])
+        } else {
+            (None, after_import)
+        };
 
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
