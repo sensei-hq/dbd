@@ -1632,6 +1632,69 @@ mod tests {
         assert!(graph.nodes.iter().any(|n| n.name.starts_with("config.")));
     }
 
+    /// `dbd graph` said a file it could not parse "is left out" — and kept its
+    /// entity in `nodes`, in `layers`, and at the end of an edge. The graph now
+    /// leaves it out as the message says: no node, no layer entry, no edge to
+    /// it, whole or scoped.
+    #[test]
+    fn graph_leaves_out_an_entity_whose_file_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\nscopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        for (name, sql) in [
+            ("good", "create table if not exists app.good (id int primary key);\n"),
+            (
+                "bad",
+                "create table if not exists app.bad (id int primary key,, oops;\n",
+            ),
+            (
+                "child",
+                "create table if not exists app.child (id int primary key, bad_id int references app.bad (id));\n",
+            ),
+        ] {
+            std::fs::write(dir.join(format!("ddl/table/app/{name}.ddl")), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let all = design.resolve_scope(None, None).unwrap();
+        let scoped = design.resolve_scope(Some("app_only"), None).unwrap();
+        for (label, graph) in [
+            ("unscoped", design.graph(None, None).unwrap()),
+            ("all", design.graph(None, Some(&all)).unwrap()),
+            ("scoped", design.graph(None, Some(&scoped)).unwrap()),
+        ] {
+            let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert!(
+                names.contains(&"app.good") && names.contains(&"app.child"),
+                "{label}: {names:?}"
+            );
+            assert!(!names.contains(&"app.bad"), "{label}: no node for app.bad: {names:?}");
+            assert!(
+                graph.layers.iter().flatten().all(|n| n != "app.bad"),
+                "{label}: no layer holds app.bad: {:?}",
+                graph.layers
+            );
+            assert!(
+                graph.edges.iter().all(|e| e.from != "app.bad" && e.to != "app.bad"),
+                "{label}: no edge reaches app.bad"
+            );
+        }
+        assert_eq!(
+            design
+                .unparsed(&all)
+                .unwrap()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.bad"],
+            "and it is the one named as left out"
+        );
+    }
+
     #[tokio::test]
     async fn apply_dry_run_does_not_execute() {
         let config_path = fixture_dir().join("design.yaml");
