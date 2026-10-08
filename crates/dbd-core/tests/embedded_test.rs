@@ -859,6 +859,236 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     assert_eq!(row["body"], "first run set search_path to app; then load");
 }
 
+// ── Test: JSON values and identity ids survive the round trip ─────────────────
+
+/// What a JSONL export lost on its way back in:
+/// - a json/jsonb string scalar (`"a string"`) failed the import — its text was
+///   cast to json without its quotes;
+/// - a JSON `null` in a json/jsonb column came back as SQL NULL;
+/// - a json column's own text (spacing, key order) was rewritten;
+/// - `GENERATED ALWAYS` identity ids were renumbered, breaking every foreign
+///   key pointing at them.
+///
+/// A JSON null stays the JSON value; an SQL NULL is exported as an absent key
+/// and imports as NULL. Ids import as-is, and the identity then continues past
+/// them, so the next insert does not collide — after a CSV import too, whose
+/// COPY kept the ids and left the sequence behind.
+#[tokio::test]
+async fn json_values_and_identity_ids_survive_an_export_and_import() {
+    const TABLE: &str = "CREATE TABLE app.docs (\n\
+                           id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY\n\
+                         , j json\n\
+                         , jb jsonb\n\
+                         , note text\n\
+                         );";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            r#"CREATE SCHEMA app;
+               {TABLE}
+               INSERT INTO app.docs (j, jb, note) VALUES
+                 ('{{}}', '{{}}', 'deleted, so the ids have a gap'),
+                 ('"a string"', '"a string"', 'string scalars'),
+                 ('null', 'null', 'json null'),
+                 (NULL, NULL, 'sql null'),
+                 ('{{"b" : 1,  "a":[1, "x", null]}}', '{{"b": 1, "a": [1, "x", null]}}', 'objects'),
+                 ('42', 'true', 'other scalars');
+               DELETE FROM app.docs WHERE id = 1;
+               CREATE TABLE app.expected AS
+                 SELECT id, j::text AS j, j IS NULL AS j_null, jb, jb IS NULL AS jb_null, note FROM app.docs;"#
+        ))
+        .await
+        .unwrap();
+
+    for format in ["jsonl", "csv"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.docs");
+        entity.format = Some(format.to_string());
+        adapter
+            .export_data(&entity, Some(out.path()))
+            .await
+            .unwrap_or_else(|e| panic!("{format}: export failed: {e}"));
+
+        // A fresh table, as on a new database: its identity starts at 1.
+        adapter
+            .execute_script(&format!("DROP TABLE app.docs; {TABLE}"))
+            .await
+            .unwrap();
+        entity.file = Some(out.path().join(format!("docs.{format}")));
+        adapter
+            .import_data(&entity, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: import failed: {e}"));
+
+        assert_catalog(
+            &*adapter,
+            false,
+            "(SELECT id, j::text, j IS NULL, jb, jb IS NULL, note FROM app.docs \
+               EXCEPT ALL SELECT * FROM app.expected) \
+             UNION ALL (SELECT * FROM app.expected \
+               EXCEPT ALL SELECT id, j::text, j IS NULL, jb, jb IS NULL, note FROM app.docs)",
+            &format!("{format}: a row that differs after the round trip"),
+        )
+        .await;
+
+        // The identity continues past the loaded ids — not into the gap below
+        // them, where a reused id would point a stale reference at a new row.
+        adapter
+            .execute_script("INSERT INTO app.docs (note) VALUES ('after the import')")
+            .await
+            .unwrap_or_else(|e| panic!("{format}: the next insert must get a fresh id: {e}"));
+        assert_catalog(
+            &*adapter,
+            true,
+            "SELECT 1 FROM app.docs WHERE note = 'after the import' \
+               AND id > (SELECT max(id) FROM app.expected)",
+            &format!("{format}: an id past the imported ones"),
+        )
+        .await;
+        adapter
+            .execute_script("DELETE FROM app.docs WHERE note = 'after the import'")
+            .await
+            .unwrap();
+    }
+}
+
+// ── Test: a generated column is computed, not exported or imported ────────────
+
+/// The export wrote a generated column, and the import then refused it (COPY:
+/// "column is a generated column") — so no CSV export of a table with one
+/// imported back. The JSON load dropped the same key in silence. The export
+/// leaves a generated column out, the import recomputes it, and a data file
+/// that names one is refused in every format, saying why.
+#[tokio::test]
+async fn a_generated_column_is_left_out_of_an_export_and_refused_by_an_import() {
+    const TABLE: &str = "CREATE TABLE app.items (\n\
+                           id integer PRIMARY KEY\n\
+                         , price numeric\n\
+                         , doubled numeric GENERATED ALWAYS AS (price * 2) STORED\n\
+                         );";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA app; {TABLE} INSERT INTO app.items (id, price) VALUES (1, 1.50), (2, NULL);"
+        ))
+        .await
+        .unwrap();
+
+    for format in ["csv", "tsv", "jsonl"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.items");
+        entity.format = Some(format.to_string());
+        adapter
+            .export_data(&entity, Some(out.path()))
+            .await
+            .unwrap_or_else(|e| panic!("{format}: export failed: {e}"));
+        let file = out.path().join(format!("items.{format}"));
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(!written.contains("doubled"), "{format}: {written}");
+
+        adapter
+            .execute_script(&format!("DROP TABLE app.items; {TABLE}"))
+            .await
+            .unwrap();
+        entity.file = Some(file);
+        adapter
+            .import_data(&entity, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: the export imports back: {e}"));
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 WHERE (SELECT count(*) FROM app.items WHERE \
+               (id = 1 AND price = 1.50 AND doubled = 3.00) OR (id = 2 AND price IS NULL AND doubled IS NULL)) <> 2",
+            &format!("{format}: rows other than the exported ones"),
+        )
+        .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (file, body, format) in [
+        ("items.csv", "id,price,doubled\n3,1,2\n", "csv"),
+        ("items.jsonl", "{\"id\": 3, \"price\": 1, \"doubled\": 2}\n", "jsonl"),
+    ] {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.items");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+        let err = adapter
+            .import_data(&entity, "", false)
+            .await
+            .expect_err("a value for a generated column must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doubled") && msg.contains("generated") && msg.contains(file),
+            "{format}: the column, why, and the file: {msg}"
+        );
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM app.items WHERE id = 3",
+            "a refused row",
+        )
+        .await;
+    }
+}
+
+// ── Test: a JSON key naming no column is refused ──────────────────────────────
+
+/// A CSV header naming a column the table lacks is refused, on Postgres and
+/// SQLite, and so is a SQLite JSON key. A Postgres JSON import loaded only the
+/// keys that matched a column and dropped the rest without a word — a typo'd
+/// key left its column empty and the import reported success.
+#[tokio::test]
+async fn a_json_key_naming_no_column_is_refused_naming_the_key_and_the_file() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    for (file, body, format) in [
+        (
+            "people.jsonl",
+            "{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"nmae\": \"beta\"}\n",
+            "jsonl",
+        ),
+        (
+            "people.json",
+            "[{\"id\": 1, \"name\": \"alpha\"}, {\"id\": 2, \"nmae\": \"beta\"}]",
+            "json",
+        ),
+    ] {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.people");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+
+        let err = adapter
+            .import_data(&entity, "", false)
+            .await
+            .expect_err("a key naming no column must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'nmae'") && msg.contains(file) && msg.contains("app.people"),
+            "{format}: the key, the file and the table are named: {msg}"
+        );
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM app.people",
+            &format!("a row loaded from {file}"),
+        )
+        .await;
+    }
+}
+
 // ── Test: an export format dbd cannot write is refused ────────────────────────
 
 /// Any format but `tsv` and `jsonl` fell through to CSV, and the file was still

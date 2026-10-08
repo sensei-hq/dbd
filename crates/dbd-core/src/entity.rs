@@ -957,14 +957,14 @@ impl Entity {
             None => &parts,
         };
 
-        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
-        // vs import/staging/file.csv → env=None, schema=staging
-        let (_env, schema_and_rest) =
-            if after_import.len() >= 3 && (after_import[0] == "dev" || after_import[0] == "prod") {
-                (Some(after_import[0].to_string()), &after_import[1..])
-            } else {
-                (None, after_import)
-            };
+        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging,
+        // and import/dev/file.csv → env=dev, no schema (a schemaless project's
+        // layout); vs import/staging/file.csv → env=None, schema=staging.
+        let (_env, schema_and_rest) = if after_import.len() >= 2 && crate::scanner::is_env_folder(after_import[0]) {
+            (Some(after_import[0].to_string()), &after_import[1..])
+        } else {
+            (None, after_import)
+        };
 
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
@@ -1157,6 +1157,21 @@ mod tests {
         assert_eq!(entity.name, "staging.lookups");
         assert_eq!(entity.schema, Some("staging".to_string()));
         assert_eq!(entity.format, Some("csv".to_string()));
+    }
+
+    /// A file directly in an env folder is that env's data for a table of no
+    /// schema — SQLite's layout — not a table in a schema named after the env.
+    #[test]
+    fn a_file_directly_in_an_env_folder_names_a_table_of_no_schema() {
+        let entity = Entity::from_import_file(Path::new("import/dev/items.csv"));
+        assert_eq!(entity.name, "items");
+        assert_eq!(entity.schema, None);
+
+        let staged = Entity::from_import_file(Path::new("import/prod/staging/items.csv"));
+        assert_eq!(
+            staged.name, "staging.items",
+            "the schema folder under an env still counts"
+        );
     }
 
     // ── IF2: Import entity from TSV file ─────────────────

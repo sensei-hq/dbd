@@ -287,12 +287,9 @@ impl Design {
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // A reconciled database is the one an apply builds, so reconcile runs
-        // the apply hooks, filtered by scope exactly as apply filters them.
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        // the apply hooks, filtered by scope through apply's own rule.
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // Desired snapshot (tables + enums, schema-normalized).
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();

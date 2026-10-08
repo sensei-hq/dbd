@@ -256,8 +256,8 @@ pub enum Commands {
         /// Output format (csv, tsv, jsonl)
         #[arg(short, long, default_value = "csv")]
         format: String,
-        /// Output directory; selected tables are written flat as
-        /// <dir>/<name>.<fmt> (default: export/<schema>/<name>.<fmt>)
+        /// Output directory, in place of the project's export/; each table
+        /// is written to <dir>/<schema>/<name>.<fmt>
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },

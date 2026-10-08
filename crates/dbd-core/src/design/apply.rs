@@ -218,11 +218,8 @@ impl Design {
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
@@ -612,11 +609,8 @@ impl Design {
     /// error here, as it is in the run.
     pub fn hook_skips(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
         let working_set = self.scope_working_set(scope)?;
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
         let mut skips = Vec::new();
         for (entries, kind) in [
             (&self.config.apply.before, hooks::HookKind::Before),
@@ -728,12 +722,13 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(DeployComplete),
     {
-        // The import phase's refusals (`Design::check_import_plan`) — a data
+        // The import phase's refusals (`Design::scoped_import_plan`) — a data
         // file outside `import.staging`, a staging table whose loader dbd
-        // cannot pick — are known before the first statement.
-        // Checked here, not when the import phase reaches them, so a refusal
-        // never leaves the deploy half done: schema applied, data not loaded.
-        self.check_import_plan(None)?;
+        // cannot pick, a loader the scope leaves out — are known before the
+        // first statement. Checked here, not when the import phase reaches
+        // them, so a refusal never leaves the deploy half done: schema
+        // applied, data not loaded.
+        self.scoped_import_plan(None, scope)?;
 
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;

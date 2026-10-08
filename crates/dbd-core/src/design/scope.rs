@@ -260,12 +260,29 @@ impl Design {
         declared.difference(&wanted).cloned().collect()
     }
 
+    /// What a run's hooks are judged against under `scope`: the scope's name,
+    /// and what the design manages outside `working_set` (a hook touching any
+    /// of it is skipped). `None` for an unscoped or all-scope run, where every
+    /// hook runs.
+    ///
+    /// The one statement of the rule, for every run and every preview — the
+    /// `import --dry-run` preview once passed the working set itself where the
+    /// run passed what lies outside it, and so reported each hook the run
+    /// executes as skipped, and each one it skips as run.
+    pub(in crate::design) fn hook_scope<'s>(
+        &self,
+        scope: Option<&'s ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+    ) -> Option<(&'s str, std::collections::HashSet<String>)> {
+        match (scope, working_set) {
+            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), self.managed_outside(ws))),
+            _ => None,
+        }
+    }
+
     /// What the design manages that a working set leaves out — the names a
     /// scoped hook must not touch. Externals are not the design's to manage.
-    pub(in crate::design) fn managed_outside(
-        &self,
-        working_set: &std::collections::HashSet<String>,
-    ) -> std::collections::HashSet<String> {
+    fn managed_outside(&self, working_set: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
         self.entities
             .iter()
             .filter(|e| e.entity_type != EntityType::External && !working_set.contains(&e.name))

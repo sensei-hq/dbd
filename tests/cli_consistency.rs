@@ -1197,3 +1197,75 @@ fn inspect_refuses_an_external_name_as_apply_does() {
     assert!(stderr(&out).contains("external"), "saying why: {}", stderr(&out));
     assert!(!stdout(&out).contains("Everything looks ok"), "{}", stdout(&out));
 }
+
+// ── an import counts tables ─────────────────────────────────────────────────
+
+/// A table with a shared data file and a dev-only one is one table. The
+/// import's preview counted its plan's data files, as the run's summary did.
+#[test]
+fn import_dry_run_counts_a_table_with_two_data_files_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: twofiles\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - staging\n",
+    );
+    write(
+        dir,
+        "ddl/table/staging/items.ddl",
+        "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+    );
+    write(dir, "import/staging/items.csv", "id\n1\n");
+    write(dir, "import/dev/staging/items.csv", "id\n2\n");
+
+    let out = dbd(dir, &["import", "--dry-run", "-e", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).matches("import staging.items").count(),
+        2,
+        "precondition: both files load: {}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("1 entities"), "one table: {}", stdout(&out));
+}
+
+// ── an ad-hoc import names its scope ────────────────────────────────────────
+
+/// Every scoped command prints `scope 'X': N of M entities`, and `import`
+/// does — except for an ad-hoc `-n X -f F` load, which said nothing about the
+/// scope it was checked against.
+#[test]
+fn an_adhoc_import_dry_run_names_its_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    write(tmp.path(), "nodes.csv", "id\n1\n");
+
+    let expected = dbd(tmp.path(), &["import", "--dry-run", "--scope", "hub"]);
+    let line = stdout(&expected)
+        .lines()
+        .find(|l| l.starts_with("scope 'hub'"))
+        .map(str::to_string)
+        .expect("precondition: the plan's dry run names the scope");
+
+    let nodes = tmp.path().join("nodes.csv");
+    let out = dbd(
+        tmp.path(),
+        &[
+            "import",
+            "--dry-run",
+            "-n",
+            "hub.nodes",
+            "-f",
+            nodes.to_str().unwrap(),
+            "--scope",
+            "hub",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == line),
+        "{line:?} in:\n{}",
+        stdout(&out)
+    );
+}
