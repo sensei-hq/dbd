@@ -15,7 +15,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::{Row, SqlitePool};
 
 use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
 use crate::entity::{Entity, EntityType};
@@ -381,15 +381,32 @@ impl DatabaseAdapter for SqliteAdapter {
             )));
         }
 
-        let rows = sqlx::query(&format!("SELECT * FROM {}", crate::sql_quote::ident(table)))
+        // The columns an import can write, in table order — read from the
+        // catalog, not from the first row: an empty table has none, and its
+        // export was a blank line where the header belongs. Generated columns
+        // (`hidden` 2 and 3) are left out: SQLite computes them and refuses a
+        // value for one, so an export holding them could not be imported back.
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {} failed: {e}", entity.name)))?;
+        if columns.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: no such table or view",
+                entity.name
+            )));
+        }
+        let select_list = columns
+            .iter()
+            .map(|c| crate::sql_quote::ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = sqlx::query(&format!("SELECT {select_list} FROM {}", crate::sql_quote::ident(table)))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
-
-        let columns: Vec<String> = rows
-            .first()
-            .map(|row| row.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
 
         let mut output = String::new();
         match format {
