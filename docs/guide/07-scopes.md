@@ -55,7 +55,7 @@ the extension contradicts itself — the extension would have nowhere to go — 
 every command refuses it where it resolves the scope:
 
 ```
-Error: scope 'reporting' excludes the schema its extension 'vector' (installs into 'extensions') installs into — stop excluding that schema, or leave the extension out of the scope's `extensions:` allowlist
+Error: Config error: scope 'reporting' keeps an extension whose schema it excludes ('vector' installs into 'extensions') — stop excluding that schema, or leave the extension out of the scope's `extensions:` allowlist
 ```
 
 A scope may also be the bare string `all` (`everything: all` above): the full
@@ -175,6 +175,11 @@ What a scope does not narrow:
 
 - **Roles** are cluster-wide, so every scope creates them; `reset` drops them
   only when it is not scoped.
+- **A scoped `reset` never cascades.** It drops only what its scope holds,
+  without `CASCADE`, all or nothing: when an object outside the scope depends on
+  one it would drop — an out-of-scope table's column typed with an in-scope
+  enum — it drops nothing and names the dependent. Add the dependents to the
+  scope, or reset without `--scope`.
 - **pg_cron refresh jobs.** A scoped apply syncs the jobs of every materialized
   view in the design, because the sync unschedules any `dbd:refresh:` job
   missing from the set it is given. A scope whose `extensions:` allowlist
@@ -214,7 +219,10 @@ emit a spurious `CREATE` for them on every database.
 So a scope decides which migration steps **run**, not which exist. On a
 released project, `dbd deploy --scope hub` applies the pending migration steps
 for entities in the hub's working set, skips the rest, and still advances the
-database to the latest version.
+database to the latest version. A migration that adds a role or an extension the
+scope keeps installs it, as a fresh scoped install does — so a table typed with
+a new extension's type migrates under a scope too — and the summary counts each
+entity once.
 
 A table removed from the design is in no working set any more, so its drop step
 belongs to the scopes that occupy its schema: a scoped `apply` or `deploy` runs
@@ -233,8 +241,9 @@ Both are filtered by what they touch:
   creates itself — never causes a skip. dbd derives a script's tables by
   parsing it; when the tables are *data* (inside `format()` or an `array[…]`),
   declare them with `writes:`. A script with no derivable tables and no
-  `writes:` always runs. An `apply.*` skip is named before the run starts and
-  in `apply --dry-run` and `deploy --dry-run`. See
+  `writes:` always runs. An `apply.*` skip is named before `apply`, `deploy` or
+  `reconcile` starts and in their dry runs; an `import.after` skip in
+  `import --dry-run` and `deploy --dry-run`, as the real run names it. See
   [Hook scripts](03-design-yaml.md#hook-scripts).
 - **Policies** are filtered by path: `policies/<schema>/<table>.sql` names its
   table, and a policy whose table is outside the working set is skipped and
@@ -249,8 +258,10 @@ scope to *stop* a script or a policy running.
 The first `apply`, `deploy` or `reconcile` **pins** a database to the scope it
 was built with, in the `scope` column of the bookkeeping table (`dbd.meta` on
 PostgreSQL, `_dbd_meta` on SQLite). A later `apply`, `deploy`, `reconcile`,
-`reset` or `policies` under a different scope is refused — as are
-`reconcile --dry-run`, and `reset --dry-run` when a database is configured:
+`reset`, `import`, `export`, `refresh` or `policies` under a different scope is
+refused — the match is exact, so a database pinned to `all` refuses
+`export --scope hub` — as are `reconcile --dry-run`, and the `apply`, `deploy`,
+`policies` and `reset` dry runs when a database is configured:
 
 ```
 Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
@@ -262,8 +273,11 @@ That stops a forgotten or mistyped `--scope` from building half a schema in the
 wrong database. To re-point a database on purpose, pass `--allow-scope-change`:
 an `apply`, `deploy` or `reconcile` then re-pins it to the new scope. On `reset`
 the flag (like `--force`) only bypasses the check — a reset does not re-pin.
-`policies` takes no such flag, since it never re-pins: run it under the pinned
-scope, or re-point the database with `apply --allow-scope-change` first. A
+`import`, `export`, `refresh` and `policies` take no such flag, since none of
+them re-pins: run them under the pinned scope, or re-point the database with
+`apply --allow-scope-change` first. Each says what running another scope would
+do — load, read, refresh or secure tables the database was not built with —
+and the way through. A
 database created before scopes existed is unpinned and pins on its next write.
 
 To host several modules in one database, define one scope that includes them
