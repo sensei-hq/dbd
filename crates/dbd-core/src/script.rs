@@ -299,6 +299,43 @@ pub fn build_reset_script(
     Ok(Some(lines.join("\n")))
 }
 
+/// The reset script for a SQLite database: `DROP VIEW` and `DROP TABLE IF
+/// EXISTS "name";` for each of the project's views and tables, `entities`
+/// given in apply order and dropped in reverse.
+///
+/// SQLite has no schemas, extensions, roles, sequences or enums, and no
+/// `CASCADE` — the PostgreSQL script failed on its first `"public"."items"
+/// CASCADE`. Its drop of a table a foreign key still references fails too, and
+/// SQLite reads no reference out of a verbatim DDL file to order by, so the
+/// drops run in one transaction with every foreign key deferred to its
+/// commit (`PRAGMA defer_foreign_keys`, which the commit itself resets), by
+/// when the tables that hold the keys are gone as well. An index or trigger
+/// goes with its table.
+pub fn build_sqlite_reset_script(entities: &[&Entity]) -> Option<String> {
+    let drops: Vec<String> = entities
+        .iter()
+        .rev()
+        .filter_map(|e| {
+            let kind = match e.entity_type {
+                EntityType::View => "VIEW",
+                EntityType::Table => "TABLE",
+                _ => return None,
+            };
+            // A SQLite name is bare; a schema-qualified one names `main`'s
+            // table the adapter strips it to.
+            let (_, bare) = crate::entity::split_qualified_name(&e.name);
+            Some(format!("DROP {kind} IF EXISTS {};", crate::sql_quote::ident(&bare)))
+        })
+        .collect();
+    if drops.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "BEGIN;\nPRAGMA defer_foreign_keys = ON;\n{}\nCOMMIT;",
+        drops.join("\n")
+    ))
+}
+
 /// The privileges a grant entry's perms confer, split the way
 /// [`build_grants_script`] grants them: `usage` is schema USAGE, and everything
 /// else is a table privilege, upper-cased and joined. Shared so a revoke is the

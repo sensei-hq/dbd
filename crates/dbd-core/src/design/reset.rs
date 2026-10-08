@@ -134,6 +134,11 @@ impl Design {
             _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
         };
 
+        // SQLite has the tables and views alone, and its own dialect for them.
+        if target == "sqlite" {
+            return Ok(script::build_sqlite_reset_script(&entities));
+        }
+
         // Schemas the `--schemas` path may drop — all managed schemas, or just
         // those the scope occupies.
         let schemas = self.reset_target_schemas(scope)?;

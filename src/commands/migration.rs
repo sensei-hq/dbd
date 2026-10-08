@@ -17,12 +17,28 @@ pub(crate) struct ResetOptions {
     pub allow_scope_change: bool,
 }
 
-/// The platform whose own schemas reset must leave alone: `--target` when
-/// given, otherwise the design's target (its first `target:` key), otherwise
-/// plain `postgres`. Defaulting to `postgres` regardless of the design let a
-/// Supabase project's `reset --schemas` drop `public`.
+/// The targets `reset` has a script for — what `--target` accepts.
+const RESET_TARGETS: &[&str] = &["postgres", "supabase", "sqlite"];
+
+/// The platform reset runs for: `--target` when given, otherwise the design's
+/// target (its first `target:` key), otherwise plain `postgres`. It decides
+/// the dialect of the drops and which schemas reset must leave alone.
+/// Defaulting to `postgres` regardless of the design let a Supabase project's
+/// `reset --schemas` drop `public`, and ran PostgreSQL's drops on SQLite.
 fn reset_target<'a>(flag: Option<&'a str>, design: &'a Design) -> &'a str {
     flag.or_else(|| design.config().default_target()).unwrap_or("postgres")
+}
+
+/// Refuse, before connecting, a target reset has no script for. clap refuses
+/// such a `--target`; this catches the design's own (a `convex:` target).
+fn check_reset_target(target: &str) -> Result<()> {
+    if !RESET_TARGETS.contains(&target) {
+        anyhow::bail!(
+            "reset supports the {} targets; this design's target is `{target}`",
+            RESET_TARGETS.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,6 +65,10 @@ pub async fn cmd_reset(
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
     let target = reset_target(target, &design);
+    check_reset_target(target)?;
+    if target == "sqlite" && (drop_schemas || drop_extensions) {
+        output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
+    }
 
     if dry_run {
         // A preview of a reset the real run would refuse is a false promise, so

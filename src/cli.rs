@@ -217,9 +217,11 @@ pub enum Commands {
     },
     /// Drop the project's managed objects (with safety guards)
     Reset {
-        /// Target platform whose own schemas reset must never drop
-        /// (postgres or supabase). Default: the design's target.
-        #[arg(long)]
+        /// Target platform: postgres, supabase or sqlite. Default: the
+        /// design's target. On postgres and supabase it decides which schemas
+        /// reset must never drop; sqlite has no schemas, so there reset drops
+        /// the project's tables and views alone.
+        #[arg(long, value_parser = ["postgres", "supabase", "sqlite"])]
         target: Option<String>,
         /// Print what would be dropped
         #[arg(long)]
