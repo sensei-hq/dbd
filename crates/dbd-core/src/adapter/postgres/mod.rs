@@ -417,8 +417,10 @@ impl PostgresAdapter {
         // with zero pg_enum rows, so an inner join made it invisible to
         // introspection — reconcile then saw it as missing and recreated it
         // every run, forever, without ever converging.
+        // `obj_description(…, 'pg_type')` is the enum's own `COMMENT ON TYPE`,
+        // which the enum file carries and the parser reads back.
         let sql = format!(
-            "SELECT n.nspname, t.typname, e.enumlabel \
+            "SELECT n.nspname, t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') AS comment \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
              LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
@@ -434,12 +436,14 @@ impl PostgresAdapter {
         // map entry (via `.or_default()`) even though nothing is pushed to it,
         // because its single row carries a NULL `enumlabel` rather than
         // contributing no rows at all.
-        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> = indexmap::IndexMap::new();
+        let mut map: indexmap::IndexMap<(String, String), (Vec<EnumValue>, Option<String>)> = indexmap::IndexMap::new();
         for row in &rows {
             let schema: String = row.get("nspname");
             let typname: String = row.get("typname");
             let label: Option<String> = row.get("enumlabel");
-            let values = map.entry((schema, typname)).or_default();
+            let comment: Option<String> = row.get("comment");
+            let (values, type_comment) = map.entry((schema, typname)).or_default();
+            *type_comment = comment;
             if let Some(label) = label {
                 values.push(EnumValue {
                     name: label,
@@ -450,9 +454,10 @@ impl PostgresAdapter {
 
         let entities = map
             .into_iter()
-            .map(|((schema, typname), values)| {
+            .map(|((schema, typname), (values, comment))| {
                 let mut e = Entity::new(EntityType::Enum, &format!("{schema}.{typname}"));
                 e.enum_values = values;
+                e.comment = comment;
                 e
             })
             .collect();

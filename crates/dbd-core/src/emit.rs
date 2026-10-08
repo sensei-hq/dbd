@@ -22,7 +22,8 @@ pub(crate) fn is_serial_type(ty: &str) -> bool {
     )
 }
 
-/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');`
+/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');`, then its `COMMENT ON
+/// TYPE` when it has one — the comment the parser reads back from the file.
 pub fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -32,7 +33,12 @@ pub fn emit_enum(entity: &Entity) -> String {
         .map(|v| format!("'{}'", v.name.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TYPE {}.{} AS ENUM ({});", q(schema), q(name), values)
+    let qname = format!("{}.{}", q(schema), q(name));
+    let mut out = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!("\nCOMMENT ON TYPE {qname} IS '{}';", esc(comment)));
+    }
+    out
 }
 
 /// `CREATE TABLE IF NOT EXISTS "schema"."name" ( … );` + `CREATE INDEX IF NOT
@@ -185,22 +191,33 @@ fn column_definition(c: &crate::entity::ColumnDef) -> String {
 
 /// Render one table-level constraint line (indented, no trailing comma).
 /// Foreign keys default to the table's own `schema` when no `ref_schema` is set.
+///
+/// Every key keeps its name. The name is the constraint's identity to
+/// anything that catches its violation or drops it by name; left out, a fresh
+/// apply names it as Postgres would (`people_region_id_fkey`), which is a
+/// different constraint to all of them.
 fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str) -> String {
     use crate::entity::TableConstraint;
+    // `CONSTRAINT "name" ` before the key, or nothing for an unnamed one.
+    let named = |name: &Option<String>| match name {
+        Some(name) => format!("CONSTRAINT {} ", q(name)),
+        None => String::new(),
+    };
     match con {
-        TableConstraint::PrimaryKey { columns, .. } => {
-            format!("  PRIMARY KEY ({})", quote_cols(columns))
+        TableConstraint::PrimaryKey { name, columns } => {
+            format!("  {}PRIMARY KEY ({})", named(name), quote_cols(columns))
         }
         // `NULLS NOT DISTINCT` precedes the column list, mirroring the index
         // emitter. Dropping it here would make every emitted/reverse-engineered
         // DDL file declare a weaker constraint than the database holds.
         TableConstraint::Unique {
+            name,
             columns,
             nulls_not_distinct,
-            ..
         } => {
             format!(
-                "  UNIQUE{} ({})",
+                "  {}UNIQUE{} ({})",
+                named(name),
                 if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
                 quote_cols(columns)
             )
@@ -208,7 +225,8 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
         TableConstraint::ForeignKey(fk) => {
             let ref_schema = fk.ref_schema.as_deref().unwrap_or(schema);
             let mut s = format!(
-                "  FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                "  {}FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                named(&fk.name),
                 quote_cols(&fk.columns),
                 q(ref_schema),
                 q(&fk.ref_table),
@@ -222,12 +240,7 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
             }
             s
         }
-        // The name is the constraint's identity to anything that catches its
-        // violation; dropped, a fresh apply names it `<table>_<col>_check`.
-        TableConstraint::Check { name, expression } => match name {
-            Some(name) => format!("  CONSTRAINT {} CHECK ({expression})", q(name)),
-            None => format!("  CHECK ({expression})"),
-        },
+        TableConstraint::Check { name, expression } => format!("  {}CHECK ({expression})", named(name)),
     }
 }
 
