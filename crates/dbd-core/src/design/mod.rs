@@ -1731,6 +1731,49 @@ import:
             .collect()
     }
 
+    /// A project at v1 applied to a database at v2 — a branch checked out
+    /// behind the database it points at — planned as "current", re-applied
+    /// v1's DDL over v2's schema, and reported "Already up to date (v2)".
+    /// It is refused before anything runs, hooks included, naming both
+    /// versions; the run, its dry run and a deploy alike.
+    #[tokio::test]
+    async fn an_older_project_is_refused_on_a_newer_database() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        assert_eq!(design.config().project.version, Some(1));
+
+        for dry_run in [false, true] {
+            let mock = MockAdapter::new().with_meta("dev", 2);
+            let err = design
+                .apply(&mock, None, dry_run, None, Progress::none())
+                .await
+                .expect_err("a v1 project must not apply to a v2 database");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, DbdError::SafetyGuard(_)),
+                "a guard, like scope and prod: {msg}"
+            );
+            assert!(msg.contains("v2") && msg.contains("v1"), "naming both versions: {msg}");
+            assert!(markers_run(&mock).is_empty(), "no hook ran (dry run {dry_run})");
+            assert!(mock.applied.lock().unwrap().is_empty(), "no entity was applied");
+            assert!(mock.scripts.lock().unwrap().is_empty(), "no script ran");
+        }
+
+        let mock = MockAdapter::new().with_meta("dev", 2);
+        let err = design.deploy(&mock, false, None, |_| {}).await.expect_err("nor deploy");
+        assert!(matches!(err, DbdError::SafetyGuard(_)), "{err}");
+        assert!(mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty());
+
+        // The database's own version, and an older one, still apply.
+        for db in [1, 0] {
+            let mock = MockAdapter::new().with_meta("dev", db);
+            design
+                .apply(&mock, None, false, None, Progress::none())
+                .await
+                .unwrap_or_else(|e| panic!("a v{db} database takes a v1 project: {e}"));
+        }
+    }
+
     /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
     /// alone, so an `import.after` hook never runs on it. `apply.after` does.
     #[tokio::test]

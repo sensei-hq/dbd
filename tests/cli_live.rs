@@ -979,3 +979,63 @@ async fn apply_dry_run_lists_the_pending_migrations() {
         combined(&o)
     );
 }
+
+// ── An older project does not apply to a newer database ─────────────────────
+
+/// A branch at v1 pointed at a database at v2 planned as "current": it
+/// re-applied v1's DDL over v2's schema and printed "Already up to date (v2)".
+/// `apply`, `deploy` and their dry runs given the database refuse it before
+/// anything runs, naming both versions and the way out, as the scope and prod
+/// guards refuse. The database keeps v2; an offline dry run, which cannot know
+/// the version, still previews.
+#[tokio::test]
+async fn an_older_project_is_refused_on_a_newer_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let o = dbd(dir, &url, &["snapshot", "-n", "v1"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let gadgets = dir.join("ddl/table/app/gadgets.ddl");
+    std::fs::write(
+        &gadgets,
+        "set search_path to app;\ncreate table if not exists gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "v2"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    // Check out the v1 revision: its design.yaml, snapshots and DDL.
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    assert!(yaml.contains("version: 2"), "{yaml}");
+    std::fs::write(dir.join("design.yaml"), yaml.replace("version: 2", "version: 1")).unwrap();
+    std::fs::remove_file(dir.join("snapshots/002.json")).unwrap();
+    std::fs::remove_dir_all(dir.join("migrations/002")).unwrap();
+    std::fs::remove_file(&gadgets).unwrap();
+
+    for args in [
+        &["apply"][..],
+        &["deploy"],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?} must refuse: {}", combined(&o));
+        let out = combined(&o);
+        assert!(
+            out.contains("at v2") && out.contains("at v1") && out.contains("newer revision"),
+            "{args:?} names both versions and what to do: {out}"
+        );
+    }
+
+    let o = dbd(dir, &url, &["migrate", "--status"]);
+    assert!(
+        stdout(&o).contains("Database version: 002"),
+        "the database keeps v2: {}",
+        combined(&o)
+    );
+    let o = dbd_offline(dir, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "offline, the preview still runs: {}", combined(&o));
+}
