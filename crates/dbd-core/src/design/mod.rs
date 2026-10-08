@@ -1176,7 +1176,10 @@ impl Design {
         if let Some(n) = name {
             self.resolve_name(n, scope)?;
         }
-        let graphable = crate::scope::is_scopable;
+        // A file dbd could not parse is left out, as `dbd graph` tells the user
+        // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
+        // the end of an edge although nothing about it was read.
+        let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
