@@ -29,6 +29,28 @@ fn written_schemas(plan: &reverse::WritePlan) -> Vec<String> {
         .collect()
 }
 
+/// The tables the project at `project_dir` builds, as `schema.name`: every
+/// `ddl/table/<schema>/<name>` file under a schema `config` lists — the files
+/// a load of the project reads as tables. Read from the paths alone, so a file
+/// that does not parse still counts as the project's.
+fn managed_tables(
+    project_dir: &Path,
+    config: &dbd_core::config::DesignConfig,
+) -> Result<std::collections::HashSet<String>> {
+    let schemas = config.schema_names();
+    Ok(dbd_core::scanner::scan_ddl(project_dir)
+        .context("failed to scan the project's ddl/ folder")?
+        .iter()
+        .map(|path| dbd_core::Entity::from_file(path))
+        .filter(|e| {
+            e.entity_type == dbd_core::EntityType::Table
+                && e.errors.is_empty()
+                && e.schema.as_ref().is_some_and(|s| schemas.contains(s))
+        })
+        .map(|e| e.name)
+        .collect())
+}
+
 /// The extensions among `entities` that `config`'s target does not list, as
 /// `(name, schema)` with `schema` `None` for `public`.
 fn undeclared_extensions(
@@ -464,16 +486,24 @@ fn merge_snapshot(
     for schema in undeclared_schemas(&written_schemas(&plan), &declared) {
         eprintln!("  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files");
     }
-    // An extension is declared in design.yaml, never written as a file, and
-    // `merge` never edits config — so one the target does not list is named,
-    // as an undeclared schema is.
+    // A table a foreign key reaches outside the captured schemas is named, so
+    // the user can declare it `external:` — unless it is declared already, or
+    // the project builds it. A scoped DBML document stands a stub in for
+    // both kinds alike, and a merge narrowed by `--schema` reaches the
+    // project's own tables in the schemas it left out; an external is
+    // somebody else's table, and declaring one the project builds would stop
+    // the project building it.
+    let managed = managed_tables(project_dir, config)?;
     for name in reverse::Declared::from_entities(&kept, &selected).externals {
-        if !declared_externals.contains(&name.as_str()) {
+        if !declared_externals.contains(&name.as_str()) && !managed.contains(&name) {
             eprintln!(
                 "  warning: a foreign key references `{name}`, outside the captured schemas; declare it under external: in design.yaml"
             );
         }
     }
+    // An extension is declared in design.yaml, never written as a file, and
+    // `merge` never edits config — so one the target does not list is named,
+    // as an undeclared schema is.
     for (name, schema) in undeclared_extensions(&kept, config) {
         let entry = match schema {
             None => format!("`{name}`"),
