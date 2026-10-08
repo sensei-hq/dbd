@@ -3439,6 +3439,67 @@ import:
         assert!(dropped.contains(&("config.legacy", 2)));
     }
 
+    /// The position of the first step `matches` picks out, for asserting order.
+    fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
+        plan.steps
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no such step in {:#?}", plan.steps))
+    }
+
+    /// Migrations ran entity by entity: every pending migration of `t`, then
+    /// every one of `u`, in dependency order. So v3's change to `t` ran before
+    /// v2's change to `u`, and a v3 script reading what v2 adds failed on a
+    /// jump that a stepwise upgrade survived. Each version now runs whole, and
+    /// is recorded, before the next one starts.
+    #[test]
+    fn each_pending_version_runs_whole_before_the_next() {
+        let entities = vec![test_entity("s.t"), test_entity("s.u")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["s.u"], vec![]),
+            test_migration(2, 3, vec![], vec!["s.t"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
+
+        let v2_u = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 2, .. } if entity_name == "s.u"),
+        );
+        let v2_recorded = step_at(&plan, |s| {
+            matches!(s, ExecutionStep::RecordMigration { version: 2, .. })
+        });
+        let v3_t = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 3, .. } if entity_name == "s.t"),
+        );
+        assert!(v2_u < v2_recorded && v2_recorded < v3_t, "{:#?}", plan.steps);
+    }
+
+    /// v2 drops a table and v5 adds it back. The create of v5 ran first — a
+    /// no-op over the old table — and v2's drop after it, so the run ended at
+    /// v5 with no table.
+    #[test]
+    fn a_later_versions_create_runs_after_an_earlier_versions_drop() {
+        let entities = vec![test_entity("app.counters")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec![], vec!["app.counters"]),
+            test_migration(4, 5, vec!["app.counters"], vec![], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 5, &migrations, None);
+
+        let dropped = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::DropEntity { entity_name, migration_version: 2, .. } if entity_name == "app.counters"),
+        );
+        let created = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::CreateEntity(n) if n == "app.counters"),
+        );
+        assert!(dropped < created, "{:#?}", plan.steps);
+    }
+
     // ════════════════════════════════════════════════════════
     // Scenario Tests: Execution plan edge cases
     // ════════════════════════════════════════════════════════

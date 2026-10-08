@@ -6151,3 +6151,265 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
     assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
     assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
 }
+
+// ── Migrations run version by version ────────────────────────────────────────
+
+/// Write `files`, remove `gone`, and cut a snapshot of the result — one
+/// version of a released project, as `dbd snapshot` writes it.
+fn cut_version(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)], gone: &[&str], description: &str) {
+    for rel in gone {
+        std::fs::remove_file(dir.join(rel)).unwrap();
+    }
+    let design = write_project(dir, yaml, files);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &dir.join("design.yaml"), description).unwrap();
+}
+
+/// The project as its last snapshot left it.
+fn released(dir: &std::path::Path) -> Design {
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// v2 drops `app.counters` and v5 adds it back with another shape. Applied to
+/// a v1 database, the run created v5's table — a no-op over the old one — and
+/// only then ran v2's drop: it reported success at v5 with no table at all.
+/// Each version now runs whole, in order, so the drop comes first.
+#[tokio::test]
+async fn a_table_dropped_and_later_re_added_ends_in_its_re_added_shape() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "readd_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: readd_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key, n integer);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text not null);\n",
+        )],
+        &[],
+        "v5 re-adds counters",
+    );
+
+    let design = released(dir);
+    assert_eq!(design.config().project.version, Some(5));
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v5 applies");
+
+    assert_column_exists(&*adapter, "app", "counters", "label").await;
+    assert_column_absent(&*adapter, "app", "counters", "n").await;
+    assert_column_exists(&*adapter, "app", "notes", "b").await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// v2 adds `s.u.b`; v3 adds `s.t.cnt` with a `data.sql` that counts `u` rows
+/// by `b`. Run one version at a time it works. Jumping v1 → v3 ran every
+/// pending migration of `t` before any of `u` (`u` references `t`), so v3's
+/// script ran before v2 had added the column it reads: `column u.b does not
+/// exist`. Each version now runs whole before the next, so the jump and the
+/// stepwise run end in the same database.
+#[tokio::test]
+async fn a_jump_across_versions_ends_where_running_them_one_at_a_time_does() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("jump").await.unwrap();
+    let stepwise = connect(&url, "jump_test").await.unwrap();
+    let jump = connect(&pg.settings().url("jump"), "jump_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: jump_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    for db in [&stepwise, &jump] {
+        released(dir)
+            .apply(&**db, None, false, None, Progress::none())
+            .await
+            .expect("v1 applies");
+        db.execute_script("INSERT INTO s.t VALUES (1), (2); INSERT INTO s.u VALUES (10, 1), (11, 1), (12, 2);")
+            .await
+            .expect("seed rows");
+    }
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            u,
+            "set search_path to s;\n\
+             create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+        )],
+        &[],
+        "v2 adds u.b",
+    );
+    released(dir)
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            t,
+            "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+        )],
+        &[],
+        "v3 adds t.cnt",
+    );
+    std::fs::write(
+        dir.join("migrations/003/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v2 → v3 applies");
+    design
+        .apply(&*jump, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies in one run");
+
+    for db in [&stepwise, &jump] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT string_agg(id || ':' || cnt, ',' ORDER BY id) FROM s.t) = '1:2,2:1'",
+            "the counts v3's data script wrote",
+        )
+        .await;
+        let diff = design.diff_live(&**db, None).await.expect("diff");
+        assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+    }
+    let shape = |entities: Vec<Entity>| {
+        serde_json::to_string_pretty(&dbd_core::reconcile::raw_snapshot_from_entities(&entities)).unwrap()
+    };
+    assert_eq!(
+        shape(stepwise.introspect().await.unwrap()),
+        shape(jump.introspect().await.unwrap()),
+        "the jump and the stepwise run end in the same schema"
+    );
+}
+
+/// Within one version the same holds: `t`'s `data.sql` reads `u.b`, which the
+/// same version adds. Each table ran its `.sql` and then its `.data.sql` before
+/// the next table's `.sql`, so `t`'s script ran before `u` had the column. A
+/// version's data scripts now run after all of its schema changes.
+#[tokio::test]
+async fn a_versions_data_script_runs_after_every_schema_change_of_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "data_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: data_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO s.t VALUES (1); INSERT INTO s.u VALUES (10, 1), (11, 1);")
+        .await
+        .expect("seed rows");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\n\
+                 create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+            ),
+        ],
+        &[],
+        "v2 adds t.cnt and u.b",
+    );
+    std::fs::write(
+        dir.join("migrations/002/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM s.t WHERE id = 1 AND cnt = 2",
+        "the count v2's data script wrote",
+    )
+    .await;
+}
