@@ -334,8 +334,9 @@ scopes:
 - A bare `schema` selects its entities **and** its `CREATE SCHEMA`; `schema.*`
   selects the entities only; `schema.entity` selects one entity — a sequence
   as well as a table. A name or wildcard that matches nothing is an error. An
-  installed extension's `schema:` is kept with it — see
-  [scopes](07-scopes.md#defining-a-scope).
+  installed extension's `schema:` is kept with it, and a scope that keeps the
+  extension while excluding that schema by name is refused by every command —
+  see [scopes](07-scopes.md#defining-a-scope).
 - A scope's value may be the bare string `all` — the full set. Any other string
   is refused.
 - **`all`** and **`default`** are reserved: `--scope all` is always the full
@@ -374,15 +375,31 @@ guide is [import and export](10-data.md).
 | Field     | Type   | Description |
 |-----------|--------|-------------|
 | `options` | object | `truncate` (default `true`: empty each table before loading it — `TRUNCATE` on PostgreSQL, `DELETE FROM` on SQLite; a Convex import always replaces) and `null_value` (default `''`) |
-| `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — every data file loads |
+| `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — it does not filter which files load |
 | `after`   | list   | SQL scripts run after the data is loaded and the import procedures have run — on `dbd import` and `dbd deploy`. See [Hook scripts](#hook-scripts) |
-| `staging` | list   | Reserved — parsed, not used |
+| `staging` | list   | The schemas an import may load into. Empty or absent: no restriction |
 
-`options.format` and a per-table `env` are parsed but not used either: the
-format comes from the file's extension (or a per-table `format`), and the
-environment from the folder.
+**`staging`** is enforced, because a load truncates its table first. A data file
+whose target schema the list leaves out is refused — every such file named in
+one error — before anything is truncated, on every path that loads data:
+`dbd import`, `import --dry-run`, `import -n X -f file`, `dbd deploy` (before it
+applies anything) and `deploy --dry-run`. Once the list is set, a target with
+no schema is refused too, since it would resolve through the database's
+`search_path` to a schema nobody vouched for. Before 0.25 the list was parsed
+and ignored, and a data file under `import/app/` emptied and reloaded the live
+`app` table.
 
-`null_value` is the sentinel string that means SQL NULL in a CSV/TSV data file. It defaults to `''` (empty string), so by default an empty cell loads as NULL — this is unchanged unless you configure a sentinel. Set a non-empty sentinel (e.g. `\N`, Postgres's own COPY default) when your data files need to distinguish a genuine empty string from NULL: once configured, only a cell matching the sentinel exactly becomes NULL, and a plain empty cell loads as a literal empty string. A per-table `null_value` under `tables:` overrides the global `options.null_value` for that table only:
+```
+Error: import refused: import.staging allows only staging, and these data files load other schemas:
+  import/app/people.csv → app.people
+An import loads (and by default truncates) staging tables only. Move each file under import/<staging schema>/, or list its schema under import.staging if it is a staging schema.
+```
+
+`options.format` and a per-table `env` are parsed but not used: the format
+comes from the file's extension (or a per-table `format`), and the environment
+from the folder.
+
+`null_value` is the sentinel string that means SQL NULL in a CSV/TSV data file. It defaults to `''` (empty string), so by default an empty cell loads as NULL — this is unchanged unless you configure a sentinel. Set a non-empty sentinel (e.g. `\N`, Postgres's own COPY default) when your data files need to distinguish a genuine empty string from NULL: once configured, only a cell matching the sentinel exactly becomes NULL, and a plain empty cell loads as a literal empty string. A *quoted* field is never NULL, whatever the sentinel — `""` is the empty string, as PostgreSQL's `COPY` reads and writes it — so a file `dbd export` wrote keeps NULL and `''` apart under the default too. A per-table `null_value` under `tables:` overrides the global `options.null_value` for that table only:
 
 ```yaml
 import:
@@ -409,13 +426,13 @@ apply:
 
 Scripts run in the order written. A path dbd cannot find is an error, not a skip — a hook you declared and dbd cannot locate is a misconfiguration, and continuing past it is how a declared hook comes to do nothing without saying so. Paths must stay inside the project: `..` and absolute paths are refused.
 
-**Scope filtering.** Under `--scope`, a hook runs only when every table it depends on is in the working set — the same rule that already governs staging entries. A hook whose table the scope excludes is skipped and reported:
+**Scope filtering.** Under `--scope`, a hook is skipped when it depends on a table the design manages *outside* the scope — one this database was not built with. A table the design does not manage is not the scope's to judge, so a hook that touches only `external:` tables, or tables it creates itself, runs under every scope. A skipped hook is reported:
 
 ```
 ⚠ after-script import/loader.sql skipped — needs staging.values, which is outside scope 'partial'
 ```
 
-The run continues; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out.
+An `apply.before` or `apply.after` skip is named before `apply` or `deploy` starts — so a run that then fails because of it still says so — and in `apply --dry-run` and `deploy --dry-run`, which make the same decision without running anything (`Design::hook_skips` for an embedder). A hook file that is missing is an error in the preview as in the run. The run continues past a skip; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out. (Before 0.25 a hook ran only when every table it named was in the working set, so a hook touching an `external:` table was skipped under every named scope, and the skip was said only in the summary of a run that succeeded.)
 
 **Where `writes:` is needed.** dbd derives a script's tables by parsing it, which works when they appear as SQL identifiers. It cannot work when they are *data* — inside a `format()` string or an `array[…]` literal, as a realtime-publication hook typically is. No parser can recover those, so declare them with `writes:`.
 
