@@ -539,6 +539,12 @@ pub(crate) async fn reconcile_with_adapter(
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
+    // The hooks the run skips, said before it — a run that fails prints no
+    // summary, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(resolved))? {
+        output::warn(&skip);
+    }
+
     if dry_run {
         let plan = design
             .reconcile(
@@ -592,14 +598,22 @@ pub(crate) async fn reconcile_with_adapter(
         }
     }
     if let Some(s) = summary {
+        let hooks = match s.before_scripts + s.after_scripts {
+            0 => String::new(),
+            n => format!(", {n} hook script(s) run"),
+        };
         output::info(
             verbosity,
             &format!(
-                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned.",
+                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned{hooks}.",
                 s.created, s.altered, s.reapplied, s.restamped, s.dropped
             ),
         );
     }
+
+    // As after `dbd apply`: the design's grants are part of the database it
+    // describes, and a reconciled one had none.
+    super::apply_and_report_grants(design, adapter, resolved, verbosity).await?;
     Ok(())
 }
 

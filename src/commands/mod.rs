@@ -648,6 +648,32 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read {}", file.display()))
 }
 
+/// Apply the design's grants under `scope` and say what happened — the step
+/// `dbd apply` and `dbd reconcile` both end with, so the two grant and report
+/// alike (`Design::deploy` runs the same `apply_grants`).
+pub(super) async fn apply_and_report_grants(
+    design: &dbd_core::Design,
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    scope: &dbd_core::ResolvedScope,
+    verbosity: Verbosity,
+) -> Result<()> {
+    match design
+        .apply_grants(adapter, Some(scope))
+        .await
+        .context("Failed to apply grants")?
+    {
+        dbd_core::design::GrantsOutcome::Applied => {
+            output::info(verbosity, "Applied grants.");
+            output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+        }
+        dbd_core::design::GrantsOutcome::Unsupported => {
+            output::info(verbosity, "Skipping schema grants (target has no grant model).");
+        }
+        dbd_core::design::GrantsOutcome::None => {}
+    }
+    Ok(())
+}
+
 /// Format one DDL file — rewriting it when `write` — in the encoding it was
 /// saved in; whether it needed formatting. Shared by `format` and
 /// `inspect --fix`, so the two cannot disagree about a file.

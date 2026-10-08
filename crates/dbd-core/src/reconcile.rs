@@ -1655,6 +1655,10 @@ pub struct ReconcileComplete {
     /// write — to a live object, during what looks like a routine reconcile —
     /// is visible in the summary rather than folded into an unrelated count.
     pub restamped: u32,
+    /// `apply.before` hook scripts run.
+    pub before_scripts: u32,
+    /// `apply.after` hook scripts run.
+    pub after_scripts: u32,
 }
 
 // ── Materialized-view convergence (Task 13) ──────────────────
