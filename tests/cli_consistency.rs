@@ -187,6 +187,30 @@ fn apply_and_deploy_dry_runs_name_a_hook_the_scope_skips() {
     }
 }
 
+/// `deploy` runs the import's `import.after` hooks too, and skips one whose
+/// tables the scope leaves out exactly as `import` does. `import --dry-run`
+/// named the skip; `deploy --dry-run` said nothing of it.
+#[test]
+fn deploy_dry_run_names_an_import_after_hook_the_scope_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    let yaml = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        &format!("{yaml}\nimport:\n  after:\n    - sql/after_import.sql\n"),
+    );
+    write(tmp.path(), "sql/after_import.sql", "update app.users set id = id;\n");
+
+    let out = dbd(tmp.path(), &["deploy", "--dry-run", "--scope", "hub"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("sql/after_import.sql skipped") && stderr(&out).contains("app.users"),
+        "deploy --dry-run must name the skipped import.after hook and why: {}",
+        stderr(&out)
+    );
+}
+
 // ── a document says what it leaves out ──────────────────────────────────────
 
 /// `dbml` and `diagram` cannot document a file dbd could not read, and both
