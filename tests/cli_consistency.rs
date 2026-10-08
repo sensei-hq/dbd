@@ -1405,3 +1405,50 @@ fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
         stderr(&o)
     );
 }
+
+// ── a dry run creates nothing ───────────────────────────────────────────────
+
+/// A dry run asks the configured database for its guards — and the SQLite
+/// adapter opens its file with `create_if_missing`, so a preview of a project
+/// whose database did not exist yet created it: `reset --dry-run` left an
+/// empty database file behind. A dry run writes nothing, so it opens only a
+/// file that is already there, and without one previews as it does with no
+/// database at all.
+#[test]
+fn a_dry_run_does_not_create_a_sqlite_database_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let db = dir.join("not-yet.db");
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            db.display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [
+        &["reset", "--dry-run"][..],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+        &["import", "--dry-run"],
+        &["policies", "--dry-run"],
+    ] {
+        let out = dbd(dir, args);
+        if !out.status.success() {
+            failures.push(format!("{args:?} failed: {}{}", stdout(&out), stderr(&out)));
+        }
+        if db.exists() {
+            failures.push(format!("{args:?} created {}", db.display()));
+            fs::remove_file(&db).unwrap();
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
