@@ -13,6 +13,22 @@ fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
     result
 }
 
+/// The schemas `plan` writes a file into — the `<schema>` of every
+/// `ddl/<kind>/<schema>/<name>.ddl` it holds. A schema-less kind (a role)
+/// contributes none.
+fn written_schemas(plan: &reverse::WritePlan) -> Vec<String> {
+    plan.items
+        .iter()
+        .filter_map(|it| {
+            let parts: Vec<&str> = it.path.iter().filter_map(|c| c.to_str()).collect();
+            match parts.as_slice() {
+                ["ddl", _kind, schema, _file] => Some(schema.to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// The extensions among `entities` that `config`'s target does not list, as
 /// `(name, schema)` with `schema` `None` for `public`.
 fn undeclared_extensions(
@@ -420,6 +436,16 @@ fn merge_snapshot(
     // the normal path).
     let (selected, kept) = select_and_keep(entities, &sel);
     report_left_out(entities, &sel);
+    // A table the design declares `external:` is somebody else's — the
+    // Supabase scaffold's `auth.users` is the usual one. Captured, it became a
+    // project file `reset` would then `DROP … CASCADE`.
+    let declared_externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    let (externals, kept): (Vec<_>, Vec<_>) = kept
+        .into_iter()
+        .partition(|e| e.entity_type == dbd_core::EntityType::Table && declared_externals.contains(&e.name.as_str()));
+    for e in &externals {
+        println!("  left out: table `{}` — declared under external:", e.name);
+    }
     // Gate on entities, not schemas: a schema-less source (SQLite) has an empty
     // `selected` but non-empty `kept`.
     if kept.is_empty() {
@@ -427,16 +453,20 @@ fn merge_snapshot(
         return Ok(());
     }
 
+    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
+
     // Warn about schemas written but not declared in design.yaml (spec line 67).
     // `merge` never edits config — it surfaces the gap so the user adds the schema.
+    // Only the schemas files land in: a schema the database has but nothing
+    // was written to — an empty `public`, or one holding only an external —
+    // has nothing for the project to include.
     let declared = config.schema_names();
-    for schema in undeclared_schemas(&selected, &declared) {
+    for schema in undeclared_schemas(&written_schemas(&plan), &declared) {
         eprintln!("  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files");
     }
     // An extension is declared in design.yaml, never written as a file, and
     // `merge` never edits config — so one the target does not list is named,
     // as an undeclared schema is.
-    let declared_externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
     for name in reverse::Declared::from_entities(&kept, &selected).externals {
         if !declared_externals.contains(&name.as_str()) {
             eprintln!(
@@ -453,8 +483,6 @@ fn merge_snapshot(
             "  warning: extension `{name}` is installed in the database but not declared; add {entry} to the target's extensions: list in design.yaml"
         );
     }
-
-    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
     if dry_run {
         // Count straight off the plan — a dry-run writes nothing, so there's no
