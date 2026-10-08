@@ -513,6 +513,56 @@ async fn merge_reads_a_live_database_into_the_project() {
     assert!(!combined(&o).is_empty(), "merge must report what it would do");
 }
 
+/// A table the design declares `external:` is somebody else's — the Supabase
+/// scaffold's `auth.users` is the usual one. `merge` wrote it into the project
+/// as `ddl/table/auth/users.ddl`, after which `reset` planned `DROP TABLE
+/// "auth"."users" CASCADE`; and it warned that schema `auth` — and the empty
+/// `public` — were "written but not listed", when nothing of the project's
+/// was written to either. A declared external is never captured, and a
+/// schema is only reported for files actually written to it.
+#[tokio::test]
+async fn merge_never_captures_a_declared_external_and_names_only_schemas_it_wrote_to() {
+    let (_pg, url) = start_pg().await;
+    dbd_core::connect(&url, "platform")
+        .await
+        .unwrap()
+        .execute_script("CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid PRIMARY KEY);")
+        .await
+        .expect("build the database");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n\n\
+         external:\n  - name: auth.users\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/profiles.ddl"),
+        "set search_path to app;\n\
+         create table if not exists profiles (id uuid primary key references auth.users (id));\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["merge"]);
+    assert!(o.status.success(), "merge failed: {}", combined(&o));
+    let said = combined(&o);
+    assert!(
+        !dir.join("ddl/table/auth").exists(),
+        "a declared external is not the project's to capture: {said}"
+    );
+    for schema in ["auth", "public"] {
+        assert!(
+            !said.contains(&format!("schema `{schema}` written")),
+            "nothing was written to `{schema}`: {said}"
+        );
+    }
+    assert!(dir.join("ddl/table/app/profiles.ddl").exists(), "{said}");
+}
+
 // ── Ad-hoc data files ───────────────────────────────────────────────────────
 
 /// Export `app.widgets` as CSV through the binary and return the file's text.
