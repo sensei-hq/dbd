@@ -344,6 +344,8 @@ pub async fn run(
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
                     all: *all_schemas,
+                    // Decided from the source by the command (see `SchemaSelect::supabase`).
+                    supabase: false,
                 };
                 return reverse::cmd_init_from_dbml(
                     project_dir,
@@ -367,6 +369,8 @@ pub async fn run(
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
                     all: *all_schemas,
+                    // Decided from the source by the command (see `SchemaSelect::supabase`).
+                    supabase: false,
                 };
                 // Fix 1: thread database_url so the global -d flag is honoured.
                 // Precedence: explicit --from-db URL > global -d/$DATABASE_URL.
@@ -405,6 +409,8 @@ pub async fn run(
                 only: schemas.clone(),
                 exclude: exclude_schemas.clone(),
                 all: *all_schemas,
+                // Decided from the source by the command (see `SchemaSelect::supabase`).
+                supabase: false,
             };
             if let Some(dbml_path) = from_dbml {
                 // DBML is always foreign — no connection, no version-safety gate.
