@@ -1209,6 +1209,92 @@ mod tests {
         );
     }
 
+    // ── A loader the scope leaves out ─────────────────────────────────────────
+
+    /// A staging table, its live target and its loader, with a scope that
+    /// keeps both tables and leaves the loader out.
+    const LOADER_SCOPED_OUT: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n\
+             scopes:\n  no_loader:\n    excludes: [staging.import_items]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id integer primary key);\n",
+        ),
+        (
+            "ddl/procedure/staging/import_items.ddl",
+            "set search_path to staging;\n\
+             create or replace procedure import_items() language sql\n\
+             as $$ insert into app.items (id) select id from staging.items $$;\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+    ];
+
+    /// The scope builds `staging.items` and `app.items` but not the procedure
+    /// that moves rows between them, so the database has no such procedure.
+    /// The plan still listed `call staging.import_items()` and every preview
+    /// said "no issues"; the run truncated and loaded staging, committed the
+    /// other loaders, then failed on the CALL. Refused in the plan, naming
+    /// the loader and the scope — the plan every import path and preview runs.
+    #[test]
+    fn the_import_plan_refuses_a_loader_the_scope_leaves_out() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let err = design
+            .scoped_import_plan(None, Some(&resolved))
+            .expect_err("a loader the scope does not build must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staging.import_items") && msg.contains("no_loader") && msg.contains("staging.items"),
+            "the loader, the scope and the table it loads are named: {msg}"
+        );
+    }
+
+    /// The run refuses before anything touches the database: no TRUNCATE, no
+    /// load, no CALL.
+    #[tokio::test]
+    async fn a_scoped_import_refuses_a_loader_the_scope_leaves_out_before_any_write() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let mock = MockAdapter::new();
+        let err = design
+            .import_data(&mock, None, false, Some(&resolved), Progress::none())
+            .await
+            .expect_err("the run refuses it too");
+        assert!(err.to_string().contains("staging.import_items"), "{err}");
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "nothing truncated, loaded or called: {:?} {:?}",
+            mock.scripts.lock().unwrap(),
+            mock.imported.lock().unwrap()
+        );
+    }
+
+    /// `deploy` applies the schema and then imports, so a refusal at the
+    /// import would leave it half done. It refuses before applying anything.
+    #[tokio::test]
+    async fn a_scoped_deploy_refuses_a_loader_the_scope_leaves_out_before_applying() {
+        let (_tmp, design) = project_from(LOADER_SCOPED_OUT);
+        let resolved = design.resolve_scope(Some("no_loader"), None).unwrap();
+        let mock = MockAdapter::new();
+        let err = design
+            .deploy(&mock, false, Some(&resolved), |_| {})
+            .await
+            .expect_err("deploy refuses it");
+        assert!(err.to_string().contains("staging.import_items"), "{err}");
+        assert!(
+            mock.applied.lock().unwrap().is_empty() && mock.scripts.lock().unwrap().is_empty(),
+            "nothing applied: {:?}",
+            mock.applied.lock().unwrap()
+        );
+    }
+
     // ── import.after under a scope: the preview and the run agree ────────────
 
     /// A staging table, a live `core.items`, an `import.after` hook updating
