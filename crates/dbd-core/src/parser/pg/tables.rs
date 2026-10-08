@@ -947,6 +947,19 @@ mod tests {
         );
     }
 
+    /// Postgres's grammar names `json`, `bit` and `bit varying` through
+    /// `pg_catalog`, and its deparser — unlike for `int` or `varchar` — writes
+    /// the qualification back out. Kept, `json` reached `emit` as
+    /// `pg_catalog.json`, matched no mapping, and became `VARCHAR(255)` on
+    /// MySQL; the DBML document spelled it that way too. The same type reads
+    /// as its own name, as `jsonb` always did.
+    #[test]
+    fn a_type_postgres_names_through_pg_catalog_comes_back_unqualified() {
+        let d = def("create table t (a json, b json[], c JSON, d bit(3), e bit varying(5), f jsonb);");
+        let types: Vec<&str> = d.columns.iter().map(|c| c.data_type.as_str()).collect();
+        assert_eq!(types, vec!["json", "json[]", "json", "bit(3)", "varbit(5)", "jsonb"]);
+    }
+
     /// `format_type` — what introspection reports — spells a type modifier list
     /// without spaces, so a deparsed `numeric(10, 2)` would read as permanent
     /// drift against the very same column in the database.

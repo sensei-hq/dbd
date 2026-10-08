@@ -1877,3 +1877,55 @@ fn a_sqlite_view_keeps_postgres_column_names_null_order_and_like_escape() {
         assert_eq!(got, expected, "`{query}`:\n{sql}");
     }
 }
+
+// ── json and jsonb are JSON on every target ─────────────────────────────────
+
+/// `json` was read as `pg_catalog.json`, matched no mapping, and became
+/// `VARCHAR(255)` — reported as a type dbd had no mapping for, so a document
+/// longer than 255 characters no longer fit. `json` maps as `jsonb` does: to
+/// MySQL's `JSON`, and to text on SQL Server and SQLite, reported there
+/// because the engine no longer validates it.
+///
+/// MySQL's `JSON` is also reported for `json` alone. It normalizes a document
+/// as `jsonb` does — sorted keys, the last of a duplicated key, no whitespace —
+/// while `json` keeps the text exactly as written, so what is read back is no
+/// longer what was stored.
+#[test]
+fn json_and_jsonb_become_the_targets_json_type() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, doc json, docs json[], bin jsonb);",
+    )];
+    for (dialect, ty) in [
+        (Dialect::MySql, "JSON"),
+        (Dialect::TSql, "nvarchar(max)"),
+        (Dialect::Sqlite, "TEXT"),
+    ] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        for column in ["doc", "docs", "bin"] {
+            assert_eq!(
+                declared_type(&sql, dialect, column),
+                ty,
+                "{dialect:?} `{column}`:\n{sql}"
+            );
+        }
+        assert!(
+            !sql.contains("pg_catalog") && report.iter().all(|d| !d.from.contains("pg_catalog")),
+            "{dialect:?}: `json` is not `pg_catalog.json`: {report:?}\n{sql}"
+        );
+        let doc = about(&report, "doc");
+        assert_eq!(doc.len(), 1, "{dialect:?}: `json` is reported once: {report:?}");
+        let bin = about(&report, "bin");
+        if dialect == Dialect::MySql {
+            assert!(
+                doc[0].reason.contains("key") && doc[0].reason.contains("as written"),
+                "MySQL's JSON normalizes the document `json` kept as written: {:?}",
+                doc[0]
+            );
+            assert!(bin.is_empty(), "jsonb → JSON is faithful, so not reported: {bin:?}");
+        } else {
+            assert!(doc[0].reason.contains("validate"), "{dialect:?}: {:?}", doc[0]);
+            assert_eq!(bin.len(), 1, "{dialect:?}: `jsonb` is reported as it was: {report:?}");
+        }
+    }
+}
