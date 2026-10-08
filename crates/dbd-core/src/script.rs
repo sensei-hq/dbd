@@ -934,6 +934,82 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// The path each statement of `sql` runs on, in order: the args of the
+    /// last top-level `SET search_path` before it, read from libpg_query's
+    /// tree so a spelling change cannot pass or fail it.
+    fn paths_by_statement(sql: &str) -> Vec<Vec<String>> {
+        let parsed = pg_query::parse(sql).unwrap_or_else(|e| panic!("{e}:\n{sql}"));
+        let mut path = Vec::new();
+        let mut out = Vec::new();
+        for raw in &parsed.protobuf.stmts {
+            if let Some(pg_query::NodeEnum::VariableSetStmt(set)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref())
+                && set.name == "search_path"
+            {
+                path = set.args.iter().filter_map(set_argument).collect();
+                continue;
+            }
+            out.push(path.clone());
+        }
+        out
+    }
+
+    /// `SET LOCAL` keeps its scope, the empty path `''` is restated as a
+    /// string (an empty identifier is an error), and a path that is replaced
+    /// by the next statement, or already holds `public`, gets nothing.
+    #[test]
+    fn public_follows_each_path_a_statement_sets_in_its_own_spelling() {
+        let sql = "set local search_path to app;\nselect 1;\n\
+                   set search_path = '';\nselect 2;\n\
+                   set search_path to a;\nset search_path to b, public;\nselect 3;\n\
+                   set search_path to \"Mixed\", \"$user\";\nselect 4;\n\
+                   reset search_path;\nselect 5;\n";
+        let out = keep_public_on_search_path(sql);
+        assert!(out.contains("set local search_path to app;\nSET LOCAL search_path TO \"app\", \"public\";"));
+        let paths = paths_by_statement(&out);
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(paths[0], strings(&["app", "public"]), "{out}");
+        assert_eq!(paths[1], strings(&["", "public"]), "{out}");
+        assert_eq!(paths[2], strings(&["b", "public"]), "{out}");
+        assert_eq!(paths[3], strings(&["Mixed", "$user", "public"]), "{out}");
+        assert_eq!(
+            out.matches("SET search_path TO").count(),
+            2,
+            "only where a path lacks it:\n{out}"
+        );
+    }
+
+    /// What is added is followed by nothing that needs it, so running a script
+    /// through twice — `combine`'s output applied by `apply` — adds nothing more.
+    #[test]
+    fn keeping_public_twice_adds_nothing_the_second_time() {
+        let sql = "set search_path to app; -- the app's own\ncreate table t (id int);\nset search_path to x";
+        let once = keep_public_on_search_path(sql).into_owned();
+        assert_eq!(keep_public_on_search_path(&once), once);
+        assert_eq!(
+            paths_by_statement(&once)[0],
+            vec!["app".to_string(), "public".to_string()]
+        );
+        assert!(
+            once.ends_with("set search_path to x\n;\nSET search_path TO \"x\", \"public\";"),
+            "an unterminated last statement gets its `;` on a line of its own:\n{once}"
+        );
+    }
+
+    /// A script libpg_query's grammar refuses whole — syntax newer than it, or
+    /// an error further on — is still split by its scanner, and its `SET
+    /// search_path` statements still found; one it cannot scan is left alone.
+    #[test]
+    fn an_unparsable_script_still_has_its_set_statements_found() {
+        let sql = "set search_path to app;\nthis is not sql;\nselect 'set search_path to y;';\n";
+        let out = keep_public_on_search_path(sql);
+        assert_eq!(
+            out,
+            "set search_path to app;\nSET search_path TO \"app\", \"public\";\nthis is not sql;\nselect 'set search_path to y;';\n"
+        );
+        let unscannable = "set search_path to app;\nselect 'never closed";
+        assert_eq!(keep_public_on_search_path(unscannable), unscannable);
+    }
+
     #[test]
     fn dbd_schema_is_protected_on_all_targets() {
         assert!(schema_is_protected("dbd", "postgres"));
