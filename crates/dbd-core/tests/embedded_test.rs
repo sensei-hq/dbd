@@ -5171,6 +5171,10 @@ async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the
         err.contains("privileges for table other.x"),
         "the error must say what the role still holds: {err}"
     );
+    // A grant reset does not revoke is not one dbd did not make — a hook, a
+    // policy file or another database's apply makes them too — so the message
+    // does not claim to know which.
+    assert!(!err.contains("dbd did not grant"), "{err}");
 
     assert_table_exists(&*adapter, "app", "t").await;
     assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
@@ -5514,4 +5518,54 @@ async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_sco
     )
     .await;
     assert_column_exists(&*adapter, "app", "people", "mood").await;
+}
+
+// ── Roles are server-wide: a reset keeps one another database holds ───────────
+
+/// Two databases on one server built from the same design share its roles,
+/// which are server-wide. Resetting one failed — "role app_writer … holds
+/// privileges dbd did not grant … objects in database a1", though dbd granted
+/// them, in the other database — and had it gone ahead it would have dropped
+/// a role the other database still uses. A role that holds anything in
+/// another database is kept, and the reset continues; the last database to
+/// reset drops it.
+#[tokio::test]
+async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("second").await.unwrap();
+    let first = connect(&url, "grants_reset_test").await.unwrap();
+    let second = connect(&pg.settings().url("second"), "grants_reset_test")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+    design
+        .deploy(&*first, false, None, |_| {})
+        .await
+        .expect("deploy the first");
+    design
+        .deploy(&*second, false, None, |_| {})
+        .await
+        .expect("deploy the second");
+
+    design
+        .reset(&*second, "postgres", false, false, false, None)
+        .await
+        .expect("the second database resets, keeping the roles the first holds");
+    assert_table_absent(&*second, "app", "t").await;
+    assert_catalog(&*second, true, &role_predicate("app_writer"), "role app_writer").await;
+    assert_catalog(
+        &*first,
+        true,
+        "SELECT 1 WHERE has_table_privilege('app_writer', 'app.t', 'INSERT')",
+        "app_writer's grant in the first database",
+    )
+    .await;
+
+    design
+        .reset(&*first, "postgres", false, false, false, None)
+        .await
+        .expect("the first database resets");
+    assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
+    assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
 }

@@ -960,3 +960,41 @@ async fn reset_reports_what_it_dropped() {
         stdout(&o)
     );
 }
+
+// ── reset keeps a role another database holds, and says so ──────────────────
+
+/// Roles are server-wide, so two databases built from one design share them.
+/// `dbd reset` of one failed claiming the role "holds privileges dbd did not
+/// grant", which dbd had granted — in the other database. The reset keeps the
+/// role, completes, and says which role it kept and the database that holds it.
+#[tokio::test]
+async fn reset_keeps_a_role_another_database_holds_and_names_that_database() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("other_db").await.unwrap();
+    let other = pg.settings().url("other_db");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\n\
+         schemas:\n  - app:\n      grants:\n        live_writer: [usage, select]\n\n\
+         target:\n  postgres:\n    roles:\n      - name: live_writer\n",
+    )
+    .unwrap();
+
+    for db in [&url, &other] {
+        let o = dbd(dir, db, &["-e", "dev", "apply"]);
+        assert!(o.status.success(), "apply failed: {}", combined(&o));
+    }
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(o.status.success(), "reset failed: {}", combined(&o));
+    assert!(
+        stdout(&o)
+            .lines()
+            .any(|l| l.contains("live_writer") && l.contains("kept") && l.contains("other_db")),
+        "reset must say which role it kept and which database holds it: {}",
+        combined(&o)
+    );
+}
