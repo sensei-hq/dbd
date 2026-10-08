@@ -2154,3 +2154,26 @@ fn an_unbounded_varchar_is_keyed_as_text_is() {
         assert!(!statements(&sql).contains("CREATE INDEX"), "{dialect:?}:\n{sql}");
     }
 }
+
+/// MySQL refuses a DATETIME whose default is written at another fractional
+/// precision than the column: "If a TIMESTAMP or DATETIME column definition
+/// includes an explicit fractional seconds precision value anywhere, the same
+/// value must be used throughout the column definition" (MySQL 8.4 manual,
+/// "Automatic Initialization and Updating for TIMESTAMP and DATETIME"). The
+/// column now keeps PostgreSQL's precision, so the clock it defaults to does too.
+#[test]
+fn a_mysql_clock_default_has_its_columns_fractional_precision() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, a timestamptz not null default now(), \
+         b timestamp(3) default current_timestamp, c timestamp default localtimestamp);",
+    )];
+    let (sql, _) = emit_with(Dialect::MySql, "", &files, None);
+    for line in [
+        "`a` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        "`b` DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)",
+        "`c` DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)",
+    ] {
+        assert!(sql.contains(line), "{line}:\n{sql}");
+    }
+}
