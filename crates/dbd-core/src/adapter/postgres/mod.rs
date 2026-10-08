@@ -1278,7 +1278,9 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
-        let sql = match script::ddl_from_entity(entity) {
+        // `runnable_ddl`, not the bare file: a file that states no search path
+        // runs on the one its names were resolved against (`source.search_path`).
+        let sql = match script::runnable_ddl(entity) {
             Some(s) => s,
             None => return Ok(()), // External entities, etc.
         };
