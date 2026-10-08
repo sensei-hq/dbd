@@ -1159,6 +1159,21 @@ mod tests {
         assert_eq!(entity.format, Some("csv".to_string()));
     }
 
+    /// A file directly in an env folder is that env's data for a table of no
+    /// schema — SQLite's layout — not a table in a schema named after the env.
+    #[test]
+    fn a_file_directly_in_an_env_folder_names_a_table_of_no_schema() {
+        let entity = Entity::from_import_file(Path::new("import/dev/items.csv"));
+        assert_eq!(entity.name, "items");
+        assert_eq!(entity.schema, None);
+
+        let staged = Entity::from_import_file(Path::new("import/prod/staging/items.csv"));
+        assert_eq!(
+            staged.name, "staging.items",
+            "the schema folder under an env still counts"
+        );
+    }
+
     // ── IF2: Import entity from TSV file ─────────────────
 
     #[test]

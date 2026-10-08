@@ -1229,6 +1229,60 @@ mod tests {
         );
     }
 
+    /// A SQLite project keeps a table's data in `import/<table>.csv` and its
+    /// dev-only rows in `import/dev/<table>.csv`. The dev file was read as a
+    /// table `dev.<table>` that every env loads, and SQLite, having no
+    /// schemas, loaded it into `<table>` — in prod.
+    #[tokio::test]
+    async fn a_prod_import_leaves_a_dev_folders_rows_out() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/dev")).unwrap();
+        std::fs::write(dir.path().join("import/items.csv"), "id,name\n1,shared\n").unwrap();
+        std::fs::write(dir.path().join("import/dev/items.csv"), "id,name\n2,dev only\n").unwrap();
+
+        let loaded = |env: &'static str| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let design = Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(&dir)).unwrap();
+                let a = mem().await;
+                a.execute_script("CREATE TABLE items (id INTEGER, name TEXT)")
+                    .await
+                    .unwrap();
+                design
+                    .import_data(&a, None, false, None, Progress::none())
+                    .await
+                    .unwrap();
+                let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+                    .fetch_all(&a.pool)
+                    .await
+                    .unwrap();
+                (rows, design.import_warnings(None))
+            }
+        };
+
+        let (prod, warnings) = loaded("prod").await;
+        assert_eq!(prod, vec![(1, "shared".to_string())], "prod loads the shared rows only");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("import/dev/") && w.contains("'prod'")),
+            "and says it left the dev file out: {warnings:?}"
+        );
+
+        let (dev, _) = loaded("dev").await;
+        assert_eq!(
+            dev,
+            vec![(1, "shared".to_string()), (2, "dev only".to_string())],
+            "dev loads both"
+        );
+    }
+
     #[tokio::test]
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");

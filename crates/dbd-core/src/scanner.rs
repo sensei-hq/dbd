@@ -318,6 +318,29 @@ mod tests {
         assert_eq!(skipped, vec!["fixtures.csv"]);
     }
 
+    /// A schemaless project (SQLite's) keeps its data files directly under
+    /// `import/` and its env-only ones directly under `import/<env>/`. Only a
+    /// file two folders down was treated as an env's, so `import/dev/items.csv`
+    /// loaded in prod.
+    #[test]
+    fn a_file_directly_in_an_env_folder_belongs_to_that_env() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("import/dev")).unwrap();
+        fs::write(tmp.path().join("import/items.csv"), "id\n1\n").unwrap();
+        fs::write(tmp.path().join("import/dev/items.csv"), "id\n2\n").unwrap();
+
+        let prod = scan_import(tmp.path(), Some("prod")).unwrap();
+        assert_eq!(prod.files, vec![tmp.path().join("import/items.csv")]);
+        assert_eq!(
+            prod.skipped_by_env,
+            vec![("dev".to_string(), PathBuf::from("dev/items.csv"))],
+            "and reported as skipped"
+        );
+
+        let dev = scan_import(tmp.path(), Some("dev")).unwrap();
+        assert_eq!(dev.files.len(), 2, "{:?}", dev.files);
+    }
+
     #[test]
     fn scan_import_env_excludes_other_envs() {
         let tmp = create_test_project();
