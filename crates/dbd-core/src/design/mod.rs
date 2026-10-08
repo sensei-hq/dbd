@@ -54,6 +54,56 @@ pub struct ApplyComplete {
     pub previously_built: bool,
 }
 
+/// The pending migrations a run would execute against one database, from
+/// [`Design::pending_migration_preview`] — what `apply --dry-run` lists.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationPreview {
+    /// The version the database records (0: none).
+    pub from_version: u32,
+    /// The version the design is at.
+    pub to_version: u32,
+    /// The migration steps the run takes, in the order it takes them. Empty
+    /// when the run migrates nothing.
+    pub steps: Vec<MigrationStepPreview>,
+}
+
+/// One migration step of a run, for a preview.
+#[derive(Debug, Clone)]
+pub struct MigrationStepPreview {
+    /// The migration it belongs to.
+    pub version: u32,
+    /// The entity it acts on.
+    pub entity: String,
+    pub action: MigrationAction,
+    /// The statements of the files the step runs, in order. Empty for
+    /// [`MigrationAction::Create`], which runs the entity's own DDL.
+    pub statements: Vec<PlannedStatement>,
+    /// `false` for a drop of a table this database does not have: the run
+    /// skips it.
+    pub runs: bool,
+}
+
+/// What a migration step does to its entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAction {
+    /// A migration added it; its DDL creates it.
+    Create,
+    /// A migration altered it; its `.sql` and `.data.sql` run.
+    Migrate,
+    /// A migration dropped it; its drop script runs where it still exists.
+    Drop,
+}
+
+/// One statement a migration file runs, as a preview shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStatement {
+    /// The statement on one line, shortened when long.
+    pub text: String,
+    /// Whether it destroys something — a `DROP`, a `TRUNCATE`, or an `ALTER
+    /// TABLE` dropping a column or constraint — read from the parse tree.
+    pub drops: bool,
+}
+
 /// Running tallies accumulated while executing an apply plan's steps. Folded
 /// into [`ApplyComplete`] once the plan finishes.
 ///

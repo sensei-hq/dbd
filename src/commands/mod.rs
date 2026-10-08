@@ -599,6 +599,111 @@ pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>)
         .filter(|u| usable(u)))
 }
 
+/// The database a dry run asks, when one is configured — see
+/// [`configured_database_url`] — or `None`, and the dry run stays offline.
+///
+/// A dry run writes nothing, but a preview of a run the database would refuse
+/// is a false promise: with a database to ask, every dry run checks the scope
+/// pin its real run checks, and `apply`/`deploy` read the version their
+/// pending migrations start from. Named for `reset --dry-run`, which did this
+/// first; a configured database that cannot be reached is an error, as it is
+/// for the run.
+pub(super) async fn dry_run_adapter(
+    config: &Path,
+    database_url: Option<&str>,
+) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
+    match configured_database_url(config, database_url)? {
+        Some(url) => Ok(Some(get_adapter(config, Some(&url)).await?)),
+        None => Ok(None),
+    }
+}
+
+/// The scope guard for a command that never re-pins the database — `policies`
+/// and `refresh` — so it has no `--allow-scope-change` to offer: the way through
+/// is the pinned scope, or re-pointing the database with `apply` first.
+/// `consequence` says what running another scope here would do.
+pub(super) async fn check_pinned_scope(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    resolved: &dbd_core::ResolvedScope,
+    consequence: &str,
+) -> Result<()> {
+    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
+    if let Some(pinned) = pinned
+        && pinned != resolved.name
+    {
+        anyhow::bail!(
+            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
+             {consequence}\n\
+             → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
+             --allow-scope-change` first.",
+            resolved.name,
+            resolved.name
+        );
+    }
+    Ok(())
+}
+
+/// Print the pending migrations a run would execute: each step under its
+/// version, then the statements it runs, a destructive one marked `⚠`.
+pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
+    use dbd_core::design::MigrationAction;
+    // Versions spelled as the run's own summary spells them (`Migrated v1 → v3`).
+    if preview.steps.is_empty() {
+        output::info(
+            verbosity,
+            &format!(
+                "No pending migration to run (database at {}, design at v{}).",
+                match preview.from_version {
+                    0 => "no recorded version".to_string(),
+                    v => format!("v{v}"),
+                },
+                preview.to_version
+            ),
+        );
+        return;
+    }
+    output::info(
+        verbosity,
+        &format!(
+            "Pending migrations, v{} → v{} — the run executes these first:",
+            preview.from_version, preview.to_version
+        ),
+    );
+    for step in &preview.steps {
+        let action = match step.action {
+            MigrationAction::Create => "create",
+            MigrationAction::Migrate => "migrate",
+            MigrationAction::Drop => "drop",
+        };
+        let note = match (step.action, step.runs) {
+            (MigrationAction::Create, _) => " (from its DDL)",
+            (MigrationAction::Drop, false) => " — not in this database, so skipped",
+            _ => "",
+        };
+        output::info(
+            verbosity,
+            &format!("  v{} {action} {}{note}", step.version, step.entity),
+        );
+        for statement in &step.statements {
+            let mark = if statement.drops { "⚠ " } else { "" };
+            output::info(verbosity, &format!("      {mark}{}", statement.text));
+        }
+    }
+}
+
+/// For a dry run with no database: pending migrations start from the version
+/// the database records, so they cannot be listed. Said only for a project that
+/// has migrations at all.
+pub(super) fn note_unlisted_migrations(verbosity: Verbosity, project_dir: &Path) {
+    if !dbd_core::snapshot::pending_migrations(0, project_dir).is_empty() {
+        output::info(
+            verbosity,
+            "No database to read the recorded version from, so pending migrations are not listed \
+             — pass -d <url>, or set target.url, to list them.",
+        );
+    }
+}
+
 fn resolve_env_vars(s: &str) -> String {
     if let Some(var) = s.strip_prefix('$') {
         std::env::var(var).unwrap_or_else(|_| s.to_string())

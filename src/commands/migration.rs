@@ -54,8 +54,7 @@ pub async fn cmd_reset(
         // A preview of a reset the real run would refuse is a false promise, so
         // with a database to ask, ask it first. With none configured the plan
         // is all there is to show, and the dry run stays database-free.
-        if let Some(url) = super::configured_database_url(config, database_url)? {
-            let adapter = get_adapter(config, Some(&url)).await?;
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
         }
         let sql = design

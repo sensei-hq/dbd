@@ -17,6 +17,94 @@ impl Design {
         Ok(self.gated_apply_set(name, scope)?.1)
     }
 
+    /// The pending migrations [`Self::apply`] would run against `adapter`'s
+    /// database: the migration steps of the plan it builds there — from the
+    /// version the database records, under the same gates and scope — each
+    /// with the statements of the files it runs. Writes nothing.
+    ///
+    /// `apply --dry-run` listed entities and never these, though the run
+    /// executes them first — including a migration that drops a table. Built
+    /// from the run's own plan rather than from `migrations/`, so a preview
+    /// lists what the run does under a scope and not every file on disk; and a
+    /// drop of a table this database does not have is marked as skipped, as
+    /// the run skips it.
+    pub async fn pending_migration_preview(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<MigrationPreview> {
+        let (working_set, entities) = self.gated_apply_set(name, scope)?;
+        let to_version = self.config.project.version.unwrap_or(0);
+        // A batch adapter applies without an execution plan, so no migration runs.
+        if adapter.prefers_batch_apply() {
+            return Ok(MigrationPreview {
+                to_version,
+                ..Default::default()
+            });
+        }
+        let from_version = adapter.get_db_version().await?;
+        let pending = snapshot::pending_migrations(from_version, &self.project_dir);
+        let owned: Vec<Entity> = entities.iter().map(|e| (*e).clone()).collect();
+        let plan = build_execution_plan(&owned, from_version, to_version, &pending, working_set.as_ref());
+
+        let mut steps = Vec::new();
+        for step in &plan.steps {
+            match step {
+                ExecutionStep::CreateEntity(entity) => {
+                    let version = pending
+                        .iter()
+                        .find(|m| m.added.iter().any(|a| a == entity))
+                        .map_or(to_version, |m| m.to_version);
+                    steps.push(MigrationStepPreview {
+                        version,
+                        entity: entity.clone(),
+                        action: MigrationAction::Create,
+                        statements: Vec::new(),
+                        runs: true,
+                    });
+                }
+                ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_sql_path,
+                    migration_version,
+                } => {
+                    let mut statements = planned_statements(migration_sql_path)?;
+                    statements.extend(planned_statements(&migration_sql_path.with_extension("data.sql"))?);
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Migrate,
+                        statements,
+                        runs: true,
+                    });
+                }
+                ExecutionStep::DropEntity {
+                    entity_name,
+                    drop_sql_path,
+                    migration_version,
+                } => {
+                    let runs = drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some();
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Drop,
+                        statements: planned_statements(drop_sql_path)?,
+                        runs,
+                    });
+                }
+                ExecutionStep::ApplyEntity(_)
+                | ExecutionStep::RecordMigration { .. }
+                | ExecutionStep::SetVersion(_) => {}
+            }
+        }
+        Ok(MigrationPreview {
+            from_version,
+            to_version,
+            steps,
+        })
+    }
+
     /// The scope's working set and the entities an apply acts on, once every
     /// pre-write gate has passed. Shared by [`Self::apply`] and
     /// [`Self::entities_to_apply`] so a preview cannot pass what the run refuses.
@@ -704,6 +792,66 @@ impl Design {
         });
         Ok(())
     }
+}
+
+/// The statements of a migration file, one line each, for a preview — empty
+/// when there is no such file, as the run then runs nothing for it.
+///
+/// Split and read by libpg_query, the grammar the run's server uses: the text
+/// is the parse tree deparsed (so comments and layout fall away), and whether
+/// a statement destroys something comes from its node, not from its spelling.
+/// A file the grammar cannot split is shown whole and unmarked — the run sends
+/// it as one script either way.
+fn planned_statements(path: &std::path::Path) -> Result<Vec<PlannedStatement>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let sql = crate::source_text::read_to_string(path)?;
+    let pieces: Vec<&str> = pg_query::split_with_parser(&sql).unwrap_or_else(|_| vec![sql.as_str()]);
+    Ok(pieces.into_iter().filter_map(planned_statement).collect())
+}
+
+/// One statement as [`planned_statements`] shows it, or `None` for a piece
+/// that holds no statement (a trailing comment).
+fn planned_statement(piece: &str) -> Option<PlannedStatement> {
+    use pg_query::NodeEnum;
+    let parsed = pg_query::parse(piece).ok();
+    if parsed.as_ref().is_some_and(|p| p.protobuf.stmts.is_empty()) {
+        return None;
+    }
+    let drops = parsed.as_ref().is_some_and(|p| {
+        p.protobuf
+            .stmts
+            .iter()
+            .filter_map(|s| s.stmt.as_ref().and_then(|n| n.node.as_ref()))
+            .any(|n| match n {
+                NodeEnum::DropStmt(_) | NodeEnum::TruncateStmt(_) => true,
+                NodeEnum::AlterTableStmt(a) => a.cmds.iter().any(|c| {
+                    matches!(
+                        c.node.as_ref(),
+                        Some(NodeEnum::AlterTableCmd(cmd))
+                            if cmd.subtype == pg_query::protobuf::AlterTableType::AtDropColumn as i32
+                                || cmd.subtype == pg_query::protobuf::AlterTableType::AtDropConstraint as i32
+                    )
+                }),
+                _ => false,
+            })
+    });
+    let text = parsed
+        .and_then(|p| p.deparse().ok())
+        .unwrap_or_else(|| piece.to_string());
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    // Long enough to name the statement and its target; a DO block or a long
+    // ALTER is cut rather than wrapped across the preview.
+    const WIDTH: usize = 120;
+    let text = match line.char_indices().nth(WIDTH) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line,
+    };
+    Some(PlannedStatement { text, drops })
 }
 
 #[cfg(test)]

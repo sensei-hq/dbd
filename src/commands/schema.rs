@@ -836,6 +836,13 @@ pub async fn cmd_apply(
         // will not do and passes what the run refuses.
         let entities = design.entities_to_apply(name, Some(&resolved))?;
 
+        // With a database to ask, refuse where the run refuses — the scope pin.
+        let adapter = super::dry_run_adapter(config, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let meta = adapter.get_project_meta().await?;
+            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+        }
+
         for entity in &entities {
             let detail = match &entity.file {
                 Some(f) => format!("{:?} => {} using \"{}\"", entity.entity_type, entity.name, f.display()),
@@ -846,6 +853,16 @@ pub async fn cmd_apply(
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
             output::warn(&skip);
+        }
+        // The migrations the run executes before the entities, a drop marked.
+        match &adapter {
+            Some(adapter) => super::print_migration_preview(
+                verbosity,
+                &design
+                    .pending_migration_preview(&**adapter, name, Some(&resolved))
+                    .await?,
+            ),
+            None => super::note_unlisted_migrations(verbosity, project_dir),
         }
         output::summary(0, 0, entities.len());
         return Ok(());
@@ -1025,6 +1042,16 @@ pub async fn cmd_refresh(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+    // Every other command that reaches the database checks its pin; `refresh`
+    // did not, and on another scope's database refreshed views over tables it
+    // was not built with — failing partway, after the ones that happened to
+    // exist. It never re-pins, so there is no `--allow-scope-change` here.
+    super::check_pinned_scope(
+        &*adapter,
+        &resolved_scope,
+        "Refreshing another scope's materialized views would read tables this database was not built with.",
+    )
+    .await?;
 
     for entity in selected {
         let resolved = design.config().materialized_views.resolve(&entity.name);
@@ -1058,7 +1085,16 @@ pub async fn cmd_policies(
     output::scope_filtered(&resolved, kept, total);
     let policy_ws = policy_working_set(&design, &resolved)?;
 
+    // What a policy for another scope would do to this database.
+    const POLICY_CONSEQUENCE: &str =
+        "Applying another scope's policies would secure tables this database was not built with.";
+
     if dry_run {
+        // The real run's guard, whenever there is a database to ask: a preview
+        // of policies the run refuses to apply promised something it won't do.
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+            super::check_pinned_scope(&*adapter, &resolved, POLICY_CONSEQUENCE).await?;
+        }
         // The real run's filter, so the preview never lists a policy the scope
         // skips — and says which ones it skips, as the real run does.
         let plan = dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
@@ -1087,21 +1123,8 @@ pub async fn cmd_policies(
 
     let adapter = get_adapter(config, database_url).await?;
     // The scope guard every other writing command runs. Policies do not re-pin
-    // the database, so there is no `--allow-scope-change` to offer: the way
-    // through is the pinned scope, or re-pointing the database with `apply`.
-    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
-    if let Some(pinned) = pinned
-        && pinned != resolved.name
-    {
-        anyhow::bail!(
-            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
-             Applying another scope's policies would secure tables this database was not built with.\n\
-             → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
-             --allow-scope-change` first.",
-            resolved.name,
-            resolved.name
-        );
-    }
+    // the database, so there is no `--allow-scope-change` to offer.
+    super::check_pinned_scope(&*adapter, &resolved, POLICY_CONSEQUENCE).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,

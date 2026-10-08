@@ -376,6 +376,12 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // With a database to ask, refuse where the deploy refuses — the scope pin.
+        let adapter = super::dry_run_adapter(&config_path, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let meta = adapter.get_project_meta().await?;
+            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+        }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
             output::warn(&skip);
@@ -386,6 +392,16 @@ pub async fn cmd_deploy(
             output::scope_gaps(&resolved, &report.gaps);
         }
         output::info(verbosity, &format!("{to_apply} entities would be applied."));
+        // The migrations its apply phase executes first, as `apply --dry-run` lists them.
+        match &adapter {
+            Some(adapter) => super::print_migration_preview(
+                verbosity,
+                &design
+                    .pending_migration_preview(&**adapter, None, Some(&resolved))
+                    .await?,
+            ),
+            None => super::note_unlisted_migrations(verbosity, &project_dir),
+        }
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
