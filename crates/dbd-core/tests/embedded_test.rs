@@ -6413,3 +6413,107 @@ async fn a_versions_data_script_runs_after_every_schema_change_of_that_version()
     )
     .await;
 }
+
+// ── A named apply never records migrations it did not run ────────────────────
+
+/// `apply -n app.people` on a database with v2 pending ran v2's change to
+/// `app.people` and v2's drop of `app.flags` — a table it was not named for —
+/// skipped v2's change to `core.regions`, and recorded v2 as applied. The next
+/// full apply said "Already up to date (v2)" and `core.regions.iso` was never
+/// added. A named apply now refuses while migrations are pending, before any
+/// write (its `apply.before` hook included), naming them; its preview refuses
+/// alike. With none pending it applies the one entity, as before.
+#[tokio::test]
+async fn a_named_apply_refuses_while_migrations_are_pending() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "named_apply_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: named_apply_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+                apply:\n  before:\n    - sql/mark.sql\n";
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/mark.sql"),
+        "create table if not exists public.hook_ran (id integer);\n",
+    )
+    .unwrap();
+    let people = "ddl/table/app/people.ddl";
+    let flags = "ddl/table/app/flags.ddl";
+    let regions = "ddl/table/core/regions.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key);\n",
+            ),
+            (
+                flags,
+                "set search_path to app;\ncreate table if not exists flags (id integer primary key);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("DROP TABLE public.hook_ran;")
+        .await
+        .expect("forget the v1 run's hook");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, nickname text);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key, iso text);\n",
+            ),
+        ],
+        &[flags],
+        "v2",
+    );
+    let design = released(dir);
+
+    let err = design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect_err("a named apply refuses while v2 is pending")
+        .to_string();
+    assert!(err.contains("v2"), "the pending version is named: {err}");
+    assert!(err.contains("dbd apply"), "the way through is named: {err}");
+    assert_column_absent(&*adapter, "app", "people", "nickname").await;
+    assert_column_absent(&*adapter, "core", "regions", "iso").await;
+    assert_table_exists(&*adapter, "app", "flags").await;
+    assert_table_absent(&*adapter, "public", "hook_ran").await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "nothing is recorded");
+
+    let preview = design
+        .pending_migration_preview(&*adapter, Some("app.people"), None)
+        .await
+        .expect_err("the preview refuses as the run does")
+        .to_string();
+    assert_eq!(preview, err, "the preview says what the run says");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the full apply runs v2");
+    assert_column_exists(&*adapter, "core", "regions", "iso").await;
+    design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect("with nothing pending, a named apply applies its entity");
+}
