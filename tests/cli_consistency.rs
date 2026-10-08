@@ -213,6 +213,38 @@ fn dbml_and_diagram_name_a_file_they_leave_out_because_it_does_not_parse() {
     }
 }
 
+/// `graph` left the file out of its nodes the same way, and said nothing. Its
+/// stdout is a JSON document (`dbd graph | jq`), so the file is named on stderr
+/// and stdout stays a document that parses — with `-v` too, whose node count
+/// was printed after the JSON on stdout.
+#[test]
+fn graph_names_a_file_it_leaves_out_on_stderr_and_keeps_stdout_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    for args in [&["graph"][..], &["graph", "-v"][..]] {
+        let out = dbd(tmp.path(), args);
+        assert!(out.status.success(), "{args:?} still writes: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("broken.ddl") && stderr(&out).contains("could not be parsed"),
+            "{args:?} must name the file it leaves out: {}",
+            stderr(&out)
+        );
+        let doc: serde_json::Value = serde_json::from_str(&stdout(&out))
+            .unwrap_or_else(|e| panic!("{args:?}: stdout must be one JSON document ({e}):\n{}", stdout(&out)));
+        assert!(doc["nodes"].is_array(), "{args:?}: {doc}");
+    }
+
+    let scoped = dbd(tmp.path(), &["graph", "--scope", "hub"]);
+    assert!(scoped.status.success(), "{}", stderr(&scoped));
+    assert!(
+        !stderr(&scoped).contains("broken.ddl"),
+        "a file outside the scope is not missing from its graph: {}",
+        stderr(&scoped)
+    );
+}
+
 /// Like apply's refusal, the warning follows the scope: a file the scope does
 /// not document is not missing from it.
 #[test]

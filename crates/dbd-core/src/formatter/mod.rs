@@ -28,15 +28,7 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        let formatted = format_statement_block(trimmed, config);
-        // Safety guard: never emit a reformatted statement that changed the SQL.
-        // If the formatted output doesn't re-parse to the same AST, or drops a
-        // comment or a `$$` body, keep the original statement untouched.
-        if block_is_faithful(trimmed, &formatted) {
-            output_parts.push(formatted);
-        } else {
-            output_parts.push(ensure_semicolon(trimmed));
-        }
+        output_parts.push(format_block(trimmed, config));
     }
 
     let mut result = output_parts.join("\n\n");
@@ -47,15 +39,59 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
     result
 }
 
+/// One statement, formatted as far as stays faithful to it: laid out with its
+/// keywords in the configured case; failing that, as written with its keywords
+/// recased; failing that, as written.
+///
+/// Safety guard: never emit a reformatted statement that changed the SQL. A
+/// layout that does not re-parse to the same AST, or drops a comment or a `$$`
+/// body, is not used. The layout covers some statements only partly (a table's
+/// storage parameters), and falling back to the statement untouched left its
+/// keywords in whatever case the file had — `upper` leaving a table lowercase —
+/// so the fallback still recases them.
+fn format_block(original: &str, config: &FormatConfig) -> String {
+    let laid_out = match config.keyword_case {
+        // The layout writes keywords of its own, so it is laid out in one case
+        // and each keyword given back the spelling the statement used.
+        KeywordCase::Preserve => {
+            let lower = FormatConfig {
+                keyword_case: KeywordCase::Lower,
+                ..config.clone()
+            };
+            preserve_keyword_case(&format_statement_block(original, &lower), original)
+        }
+        _ => format_statement_block(original, config),
+    };
+    if block_is_faithful(original, &laid_out) {
+        return laid_out;
+    }
+    let recased = ensure_semicolon(&apply_keyword_case(original, &config.keyword_case));
+    if block_is_faithful(original, &recased) {
+        recased
+    } else {
+        ensure_semicolon(original)
+    }
+}
+
 /// Whether a formatted statement faithfully preserves the original: same parsed
 /// AST (so semantics are unchanged), plus every comment and every `$$` body
 /// retained. Statements sqlparser can't parse fall back to the
 /// comment/body-preservation check (the formatter used a conservative
 /// keyword-case/verbatim path for those).
+///
+/// The trees are compared with both sides' keywords lowercased. A keyword's
+/// case is not meaning — an unquoted word reads the same in any case, Postgres
+/// folds it — but sqlparser keeps a word it reads as a name in the case it was
+/// written: `serial`, `inet`, `search_path` and `sql` are names to it, and
+/// `SERIAL` parsed to a different tree than `serial`. So every table with a
+/// serial or inet column, every SET and every function header failed the guard
+/// in `upper` and was kept lowercase. Lowercasing an unquoted keyword changes
+/// neither side's meaning, and every other difference still counts.
 fn block_is_faithful(original: &str, formatted: &str) -> bool {
     let dialect = PostgreSqlDialect {};
-    let po = Parser::parse_sql(&dialect, &ensure_semicolon(original));
-    let pf = Parser::parse_sql(&dialect, &ensure_semicolon(formatted));
+    let lowered = |sql: &str| ensure_semicolon(&apply_keyword_case(sql, &KeywordCase::Lower));
+    let po = Parser::parse_sql(&dialect, &lowered(original));
+    let pf = Parser::parse_sql(&dialect, &lowered(formatted));
     match (po, pf) {
         (Ok(a), Ok(b)) => {
             a == b && comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted)
@@ -397,6 +433,170 @@ mod tests {
             result.contains("CREATE TABLE"),
             "Should have uppercase keywords, got: {result}"
         );
+    }
+
+    // ── keyword_case: every mode, every keyword, every layout ──────────────
+
+    /// One file holding every statement layout the formatter has: SET, a
+    /// table (serial and inet columns, an inline foreign key with an action, a
+    /// default, a comment, a named constraint), an index, a view (river), a
+    /// COMMENT ON, an enum type, a function with a `$$` body, and a table the
+    /// layout cannot render faithfully (its storage parameters), which keeps
+    /// its own layout.
+    const EVERY_LAYOUT: &str = "set search_path to app;\n\n\
+        create table if not exists t (\n  \
+          id serial primary key,\n  \
+          addr inet not null,\n  \
+          name varchar(20) default 'Select me', -- SELECT is a word here\n  \
+          owner_id integer references owners (id) on delete cascade,\n  \
+          created timestamptz not null default now(),\n  \
+          constraint t_name_uq unique (name)\n\
+        );\n\n\
+        create index if not exists t_name_idx on t (name);\n\n\
+        create or replace view v as select t.id, t.name from t inner join owners o on o.id = t.owner_id \
+          where t.id > 1 order by t.id;\n\n\
+        comment on table t is 'A Table';\n\n\
+        create type mood as enum ('happy', 'sad');\n\n\
+        create or replace function f() returns integer language sql as $$ select 1 $$;\n\n\
+        create table if not exists w (id integer) with (fillfactor = 70);\n";
+
+    /// Every keyword in `sql` as written, outside string literals, quoted
+    /// identifiers, comments and `$$` bodies — where a word is text, not SQL.
+    fn keywords_in(sql: &str) -> Vec<String> {
+        let keywords = sql_keywords();
+        let mut out = Vec::new();
+        let chars: Vec<char> = sql.chars().collect();
+        let mut i = 0;
+        let skip_to = |i: usize, end: &str| -> usize {
+            let rest: String = chars[i..].iter().collect();
+            rest.find(end)
+                .map_or(chars.len(), |p| i + rest[..p].chars().count() + end.chars().count())
+        };
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '\'' {
+                i = skip_to(i + 1, "'");
+            } else if c == '"' {
+                i = skip_to(i + 1, "\"");
+            } else if c == '$' && next == Some('$') {
+                i = skip_to(i + 2, "$$");
+            } else if c == '-' && next == Some('-') {
+                i = skip_to(i, "\n");
+            } else if c == '/' && next == Some('*') {
+                i = skip_to(i + 2, "*/");
+            } else if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                if keywords.contains(word.to_uppercase().as_str()) {
+                    out.push(word);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn in_case(case: KeywordCase) -> FormatConfig {
+        FormatConfig {
+            keyword_case: case,
+            ..Default::default()
+        }
+    }
+
+    /// `lower` and `upper` recase every keyword — the SET that `upper` left
+    /// lowercase, and the tables with a serial or inet column, which `upper`
+    /// left wholly lowercase: their uppercased type no longer matched
+    /// sqlparser's case-sensitive type name, the faithfulness guard took that
+    /// for a change of meaning, and the original was kept. A table whose
+    /// layout cannot be rendered is still recased. Strings, comments and `$$`
+    /// bodies are text and keep their case.
+    #[test]
+    fn lower_and_upper_recase_every_keyword_in_every_layout() {
+        for (case, expected) in [(KeywordCase::Lower, false), (KeywordCase::Upper, true)] {
+            let out = format_ddl(EVERY_LAYOUT, &in_case(case.clone()));
+            let words = keywords_in(&out);
+            assert!(words.len() > 60, "the keywords are all there: {words:?}\n{out}");
+            let wrong: Vec<&String> = words.iter().filter(|w| (w.to_uppercase() == **w) != expected).collect();
+            assert!(wrong.is_empty(), "{case:?} left {wrong:?}:\n{out}");
+            for text in ["'Select me'", "-- SELECT is a word here", "$$ select 1 $$", "'A Table'"] {
+                assert!(out.contains(text), "{case:?} keeps {text} as written:\n{out}");
+            }
+        }
+    }
+
+    /// `preserve` uppercased a lowercase file: the layout writes its keywords
+    /// itself (`CREATE TABLE`, `PRIMARY KEY`, sqlparser's `VARCHAR`), and wrote
+    /// them uppercase whatever the file said. Each keyword now keeps the
+    /// spelling the statement gave it — over a lowercase file, an uppercase one
+    /// and a mixed one alike.
+    #[test]
+    fn preserve_keeps_every_keyword_as_the_statement_spelled_it() {
+        let upper: String = {
+            let mut out = EVERY_LAYOUT.to_string();
+            for word in keywords_in(EVERY_LAYOUT) {
+                out = out.replace(&format!(" {word} "), &format!(" {} ", word.to_uppercase()));
+            }
+            format_ddl(&out, &in_case(KeywordCase::Upper))
+        };
+        // Every other keyword uppercased, consistently: one spelling a word.
+        let mut distinct: Vec<String> = keywords_in(EVERY_LAYOUT).iter().map(|w| w.to_lowercase()).collect();
+        distinct.sort();
+        distinct.dedup();
+        let shout: std::collections::HashSet<&str> = distinct.iter().step_by(2).map(String::as_str).collect();
+        let mixed = format_ddl(&upper, &in_case(KeywordCase::Lower))
+            .split_inclusive(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .map(|piece| {
+                let word = piece.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                if shout.contains(word) {
+                    piece.replacen(word, &word.to_uppercase(), 1)
+                } else {
+                    piece.to_string()
+                }
+            })
+            .collect::<String>();
+
+        for (input, label) in [
+            (EVERY_LAYOUT.to_string(), "lowercase"),
+            (upper.clone(), "uppercase"),
+            (mixed.clone(), "mixed"),
+        ] {
+            let written: std::collections::HashMap<String, String> =
+                keywords_in(&input).into_iter().map(|w| (w.to_uppercase(), w)).collect();
+            let out = format_ddl(&input, &in_case(KeywordCase::Preserve));
+            let wrong: Vec<String> = keywords_in(&out)
+                .into_iter()
+                .filter(|w| written.get(&w.to_uppercase()).is_some_and(|spelled| spelled != w))
+                .collect();
+            assert!(
+                wrong.is_empty(),
+                "{label}: {wrong:?} changed case:\n{input}\n--- became ---\n{out}"
+            );
+        }
+        let lowered = format_ddl(EVERY_LAYOUT, &in_case(KeywordCase::Preserve));
+        assert!(
+            keywords_in(&lowered).iter().all(|w| w.to_lowercase() == *w),
+            "a lowercase file stays lowercase, the keywords the layout adds included:\n{lowered}"
+        );
+        let shouted = format_ddl(&upper, &in_case(KeywordCase::Preserve));
+        assert!(
+            keywords_in(&shouted).iter().all(|w| w.to_uppercase() == *w),
+            "an uppercase file stays uppercase:\n{shouted}"
+        );
+    }
+
+    /// A column's `REFERENCES … ON DELETE CASCADE` lost its action in the
+    /// layout, so the guard kept every such table as it was written: no
+    /// layout, and no keyword case.
+    #[test]
+    fn a_column_foreign_key_keeps_its_action_through_the_layout() {
+        let out = format_ddl(EVERY_LAYOUT, &in_case(KeywordCase::Lower));
+        assert!(out.contains(", owner_id"), "the table is laid out:\n{out}");
+        assert!(out.contains("on delete cascade"), "{out}");
     }
 
     // ── River formatter tests ─────────────────────────────

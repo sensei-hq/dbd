@@ -213,6 +213,7 @@ impl<'a> Parser<'a> {
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk_cols: Vec<String> = Vec::new();
         let mut indexes: Vec<IndexDef> = Vec::new();
+        let mut uniques: Vec<TableConstraint> = Vec::new();
         let mut checks: Vec<TableConstraint> = Vec::new();
         let mut table_note: Option<String> = None;
 
@@ -236,7 +237,10 @@ impl<'a> Parser<'a> {
             match kw.as_str() {
                 "indexes" => {
                     for entry in self.block_entries(&line, "indexes", &qualified)? {
-                        indexes.push(parse_index_line(&entry, &qualified)?);
+                        match parse_index_line(&entry, &qualified)? {
+                            IndexEntry::Index(index) => indexes.push(index),
+                            IndexEntry::Unique(unique) => uniques.push(unique),
+                        }
                     }
                 }
                 // Only as a block opener: an unquoted column may well be named
@@ -273,6 +277,7 @@ impl<'a> Parser<'a> {
                 columns: pk_cols,
             });
         }
+        constraints.append(&mut uniques);
         constraints.append(&mut checks);
 
         let comments = Self::table_comments_from(table_note, &columns);
@@ -792,8 +797,15 @@ fn parse_default_value(v: &str) -> String {
     v.to_string()
 }
 
+/// An entry of an `indexes { … }` block: an index, or the table-level UNIQUE
+/// constraint dbd wrote as one (see `crate::dbml::index_note`).
+enum IndexEntry {
+    Index(IndexDef),
+    Unique(TableConstraint),
+}
+
 /// Parse an index line: `(<cols>) [settings]` or `<col> [settings]`.
-fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
+fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
     let line = line.trim();
     let (cols_part, settings_part) = split_trailing_settings(line);
     let cols_part = cols_part.trim();
@@ -847,10 +859,27 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexDef> {
     // syntax; dbd carries them in the note (see `crate::dbml::index_note`).
     // An operator class, `INCLUDE` and storage parameters are not carried and
     // stay at their defaults.
+    let constraint = note.as_deref().is_some_and(crate::dbml::index_note::marks_a_constraint);
     if let Some(note) = note {
         crate::dbml::index_note::read(&note, &mut index);
     }
-    Ok(index)
+    // A UNIQUE constraint is a plain list of columns; an entry marked as one
+    // that holds an expression, a predicate or a key order is something a
+    // constraint cannot be, and stays the index it says it is.
+    let plain = index.unique
+        && index.predicate.is_none()
+        && index
+            .columns
+            .iter()
+            .all(|k| !k.is_expression && k.order.is_none() && k.nulls_first.is_none());
+    if constraint && plain {
+        return Ok(IndexEntry::Unique(TableConstraint::Unique {
+            name: index.name,
+            columns: index.columns.into_iter().map(|k| k.name).collect(),
+            nulls_not_distinct: index.nulls_not_distinct,
+        }));
+    }
+    Ok(IndexEntry::Index(index))
 }
 
 /// One index key: DBML writes an expression in backticks and a column by
@@ -1431,6 +1460,53 @@ mod tests {
             ]
         );
         assert!(!td.columns[0].nullable, "the other settings still apply");
+    }
+
+    /// A multi-line note written flush against its quotes — the form
+    /// @dbml/core reads back exactly — reads back exactly here too, a quote at
+    /// its end included.
+    #[test]
+    fn a_multi_line_note_reads_back_exactly() {
+        use crate::dbml::{DbmlParams, generate_dbml};
+        use crate::entity::TableComments;
+
+        for note in [
+            "line one\nline two",
+            "say\n'hi'",
+            "two\nquotes ''",
+            "a\n  indented\nnote",
+        ] {
+            let mut t = Entity::new(EntityType::Table, "app.t");
+            t.table_def = Some(TableDef {
+                columns: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments {
+                    table: Some(note.into()),
+                    ..Default::default()
+                },
+            });
+            let doc = generate_dbml(&DbmlParams {
+                entities: &[t],
+                project_name: "notes",
+                database_type: "PostgreSQL",
+                project_note: Some(note),
+                include_schemas: vec![],
+                exclude_schemas: vec![],
+                include_tables: vec![],
+                exclude_tables: vec![],
+                groups: vec![],
+                auto_group_by_schema: false,
+            });
+            assert!(
+                !doc.content.contains("Note: '''\n") && !doc.content.lines().any(|l| l.trim() == "'''"),
+                "flush against its quotes:\n{}",
+                doc.content
+            );
+            let parsed = parse_dbml(&doc.content).expect("DBML must parse");
+            let td = find_table(&parsed, "app.t").table_def.as_ref().unwrap();
+            assert_eq!(td.comments.table.as_deref(), Some(note), "\n{}", doc.content);
+        }
     }
 
     #[test]

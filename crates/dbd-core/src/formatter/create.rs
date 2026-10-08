@@ -344,19 +344,12 @@ pub(in crate::formatter) fn format_column_constraints(
                 let expr_str = apply_keyword_case(&expr.to_string(), &config.keyword_case);
                 format!("{} {expr_str}", kw("DEFAULT"))
             }
-            sqlparser::ast::ColumnOption::ForeignKey(fk_constraint) => {
-                let cols: Vec<String> = fk_constraint
-                    .referred_columns
-                    .iter()
-                    .map(|c| c.value.to_lowercase())
-                    .collect();
-                let col_list = cols.join(", ");
-                format!(
-                    "{} {}({})",
-                    kw("REFERENCES"),
-                    fk_constraint.foreign_table.to_string().to_lowercase(),
-                    col_list
-                )
+            // sqlparser's own rendering carries the referential actions, MATCH
+            // and DEFERRABLE. Writing `REFERENCES t(id)` alone dropped them, so
+            // the guard kept every table with `on delete cascade` as written —
+            // no layout, and no keyword case.
+            sqlparser::ast::ColumnOption::ForeignKey(_) => {
+                apply_keyword_case(&opt.option.to_string(), &config.keyword_case)
             }
             sqlparser::ast::ColumnOption::Check(expr) => {
                 let expr_str = apply_keyword_case(&expr.to_string(), &config.keyword_case);

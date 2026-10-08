@@ -380,15 +380,16 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     }
 
     // Indexes block. A table-level UNIQUE is listed here first: DBML has no
-    // constraint syntax for it, and a named unique index is how DBML spells
-    // one. Leaving it out made `init --from-dbml` rebuild a table that accepts
-    // the duplicates the design refuses. It reads back as a unique index —
-    // DBML cannot tell the two apart — which enforces the same thing under the
-    // same name.
-    let indexes: Vec<IndexDef> = unique_constraint_indexes(table_def)
-        .chain(table_def.indexes.iter().cloned())
+    // constraint syntax for it, and a unique index is how DBML spells one.
+    // Leaving it out made `init --from-dbml` rebuild a table that accepts the
+    // duplicates the design refuses. Read back as an index it enforced the
+    // same thing and still read as drift against the database the design
+    // built — a constraint to drop, an index to create — so its note marks it
+    // as a constraint (see `index_note`), and it reads back as one.
+    let idx_block: Vec<String> = unique_constraint_indexes(table_def)
+        .map(|ix| emit_index_line(&ix, true))
+        .chain(table_def.indexes.iter().map(|ix| emit_index_line(ix, false)))
         .collect();
-    let idx_block = emit_indexes(&indexes);
     if !idx_block.is_empty() {
         lines.push(String::new());
         lines.push("  indexes {".to_string());
@@ -528,36 +529,34 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
 }
 
 fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
-    let mut lines = Vec::new();
+    indexes.iter().map(|idx| emit_index_line(idx, false)).collect()
+}
 
-    for idx in indexes {
-        let cols = if idx.columns.len() == 1 {
-            index_key(&idx.columns[0])
-        } else {
-            format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
-        };
+/// One entry of an `indexes { … }` block; `constraint` when it is a table-level
+/// UNIQUE constraint rather than an index.
+fn emit_index_line(idx: &IndexDef, constraint: bool) -> String {
+    let cols = if idx.columns.len() == 1 {
+        index_key(&idx.columns[0])
+    } else {
+        format!("({})", idx.columns.iter().map(index_key).collect::<Vec<_>>().join(", "))
+    };
 
-        let mut settings = Vec::new();
-        if idx.unique {
-            settings.push("unique".to_string());
-        }
-        if let Some(ref name) = idx.name {
-            settings.push(format!("name: {}", dbml_string(name)));
-        }
-        if let Some(note) = index_note::write(idx) {
-            settings.push(format!("note: {}", dbml_string(&note)));
-        }
-
-        let settings_str = if settings.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", settings.join(", "))
-        };
-
-        lines.push(format!("{}{}", cols, settings_str));
+    let mut settings = Vec::new();
+    if idx.unique {
+        settings.push("unique".to_string());
+    }
+    if let Some(ref name) = idx.name {
+        settings.push(format!("name: {}", dbml_string(name)));
+    }
+    if let Some(note) = index_note::write(idx, constraint) {
+        settings.push(format!("note: {}", dbml_string(&note)));
     }
 
-    lines
+    if settings.is_empty() {
+        cols
+    } else {
+        format!("{} [{}]", cols, settings.join(", "))
+    }
 }
 
 /// One index key as DBML writes it: a column by name, an expression in
@@ -594,16 +593,26 @@ fn index_key(key: &IndexColumn) -> String {
 ///   entries do not cover every key, or do not parse, is ignored whole rather
 ///   than applied to the wrong keys.
 /// - `nulls not distinct` — the index treats NULLs as equal.
+/// - `unique constraint` — the entry is a table-level UNIQUE constraint, not an
+///   index. A database holds the two as different objects, so a constraint
+///   read back as an index reads as drift against the database the design
+///   built. Honoured only on a `unique` entry of plain columns with no other
+///   line; anything else stays an index.
 pub(crate) mod index_note {
     use crate::entity::{IndexColumn, IndexDef, SortOrder};
 
     const WHERE: &str = "where:";
     const ORDER: &str = "order:";
     const NULLS_NOT_DISTINCT: &str = "nulls not distinct";
+    const UNIQUE_CONSTRAINT: &str = "unique constraint";
 
-    /// The note for `ix`, or `None` when DBML's own syntax already says it all.
-    pub(crate) fn write(ix: &IndexDef) -> Option<String> {
+    /// The note for `ix` — `constraint` when it stands for a table-level UNIQUE
+    /// — or `None` when DBML's own syntax already says it all.
+    pub(crate) fn write(ix: &IndexDef, constraint: bool) -> Option<String> {
         let mut lines = Vec::new();
+        if constraint {
+            lines.push(UNIQUE_CONSTRAINT.to_string());
+        }
         if let Some(predicate) = &ix.predicate {
             lines.push(format!("{WHERE} {}", predicate.replace(['\r', '\n'], " ")));
         }
@@ -619,6 +628,11 @@ pub(crate) mod index_note {
             lines.push(NULLS_NOT_DISTINCT.to_string());
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Whether `note` marks its entry as a table-level UNIQUE constraint.
+    pub(crate) fn marks_a_constraint(note: &str) -> bool {
+        note.lines().any(|line| line.trim() == UNIQUE_CONSTRAINT)
     }
 
     /// Apply the convention's lines in `note` to `ix`, whose keys are already set.
@@ -897,27 +911,94 @@ fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enum
     lines.join("\n")
 }
 
+/// A column default as DBML writes it: a number, `true`/`false`, `null`, a
+/// `'string'`, or anything else as a `` `backticked` `` expression.
+///
+/// Decided by parsing the default as Postgres does, not by its spelling. A
+/// word was taken for a string, so `current_date` — one of SQL's value
+/// keywords, which the parser reads as a function of the clock or the session
+/// — was written `'current_date'`, and `init --from-dbml` rebuilt
+/// `DEFAULT 'current_date'`: refused on a date column, the literal text on a
+/// text one.
 fn quote_default(value: &str) -> String {
     let trimmed = value.trim();
-    // Booleans
+    match default_kind(trimmed) {
+        Some(DefaultKind::Number) => trimmed.to_string(),
+        Some(DefaultKind::Bool(b)) => b.to_string(),
+        Some(DefaultKind::Null) => "null".to_string(),
+        Some(DefaultKind::Text(text)) => dbml_string(&text),
+        Some(DefaultKind::Expression) => format!("`{trimmed}`"),
+        None => quote_unparsed_default(trimmed),
+    }
+}
+
+/// What a default is, read from libpg_query's tree.
+enum DefaultKind {
+    Number,
+    Bool(bool),
+    Null,
+    /// A string literal's text, its SQL escaping already undone.
+    Text(String),
+    Expression,
+}
+
+/// The kind of default `expr` is, or `None` when it is not SQL Postgres reads.
+///
+/// A bare identifier is the one exception to "anything else is an expression":
+/// Postgres refuses a column reference in a default, so a bare word can only
+/// be text that came from elsewhere written without quotes, and is read as the
+/// string it was before. Keywords are not identifiers here — `current_user`
+/// parses as SQL's own function.
+fn default_kind(expr: &str) -> Option<DefaultKind> {
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::a_const::Val;
+
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
+    let NodeEnum::SelectStmt(select) = stmt else {
+        return None;
+    };
+    if select.target_list.len() != 1 {
+        return None;
+    }
+    let NodeEnum::ResTarget(target) = select.target_list.first()?.node.as_ref()? else {
+        return None;
+    };
+    Some(match target.val.as_deref()?.node.as_ref()? {
+        NodeEnum::AConst(c) if c.isnull => DefaultKind::Null,
+        NodeEnum::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(_) | Val::Fval(_) => DefaultKind::Number,
+            Val::Boolval(b) => DefaultKind::Bool(b.boolval),
+            Val::Sval(s) => DefaultKind::Text(s.sval.clone()),
+            Val::Bsval(_) => DefaultKind::Expression,
+        },
+        NodeEnum::ColumnRef(r) if r.fields.len() == 1 && !expr.contains('"') => match r.fields[0].node.as_ref()? {
+            NodeEnum::String(word) => DefaultKind::Text(word.sval.clone()),
+            _ => DefaultKind::Expression,
+        },
+        _ => DefaultKind::Expression,
+    })
+}
+
+/// A default Postgres does not read as SQL, written as it always was: a
+/// number, a boolean or `null` bare, something with a call or a cast as an
+/// expression, anything else as text.
+fn quote_unparsed_default(trimmed: &str) -> String {
     if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
         return trimmed.to_lowercase();
     }
-    // Numbers
     if trimmed.parse::<f64>().is_ok() {
         return trimmed.to_string();
     }
-    // NULL
     if trimmed.eq_ignore_ascii_case("null") {
         return "null".to_string();
     }
-    // Expression (function call or complex expression)
     if trimmed.contains('(') || trimmed.contains("::") || trimmed.contains('+') {
-        return format!("`{}`", trimmed);
+        return format!("`{trimmed}`");
     }
-    // String literal — a SQL `'…'` (whose `''` is one quote) or a bare word.
-    // DBML gets the text itself, in DBML's escaping: SQL's doubled quote is
-    // not a DBML escape, and written as-is it ends the string.
+    // A SQL `'…'` (whose `''` is one quote) or a bare word. DBML gets the text
+    // itself, in DBML's escaping: SQL's doubled quote is not a DBML escape,
+    // and written as-is it ends the string.
     let text = match trimmed.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
         Some(inner) => inner.replace("''", "'"),
         None => trimmed.trim_matches('\'').to_string(),
@@ -935,11 +1016,17 @@ fn quote_type_if_needed(data_type: &str) -> String {
 
 /// Format a string for DBML.
 /// Single-line → single quotes: 'text'
-/// Multi-line → triple quotes: '''text'''
+/// Multi-line → triple quotes, flush against the text: '''text'''
+///
+/// Flush, as @dbml/core's own exporter writes it: that parser drops a blank
+/// first line but keeps a blank last one, so `'''`, newline, text, newline,
+/// `'''` read back with a trailing newline — every multi-line note one
+/// character longer than the comment it documents. The text is trimmed, so
+/// its first line has no indent and @dbml/core's dedent leaves it whole.
 fn quote_dbml_string(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.contains('\n') {
-        format!("'''\n{}\n'''", dbml_multiline_body(trimmed))
+        format!("'''{}'''", dbml_multiline_body(trimmed))
     } else {
         dbml_string(trimmed)
     }
@@ -971,14 +1058,17 @@ fn dbml_string(text: &str) -> String {
 
 /// The body of a DBML `'''` string. Backslashes are escapes there too, and
 /// three quotes in a row end the string, so each `\` is doubled and a quote
-/// that would open a `'''` run is escaped. Other quotes stay as written —
-/// apostrophes are common in prose notes and DBML needs nothing done to them.
+/// that would open a `'''` run is escaped — as is every quote at the very end,
+/// which would otherwise run into the closing `'''`. Other quotes stay as
+/// written — apostrophes are common in prose notes and DBML needs nothing done
+/// to them.
 fn dbml_multiline_body(text: &str) -> String {
+    let trailing_quotes = text.len() - text.trim_end_matches('\'').len();
     let mut out = String::with_capacity(text.len());
     for (i, c) in text.char_indices() {
         match c {
             '\\' => out.push_str("\\\\"),
-            '\'' if text[i..].starts_with("'''") => out.push_str("\\'"),
+            '\'' if text[i..].starts_with("'''") || i >= text.len() - trailing_quotes => out.push_str("\\'"),
             other => out.push(other),
         }
     }
@@ -1117,7 +1207,8 @@ mod tests {
     }
 
     /// DBML has no table-constraint syntax for UNIQUE; its spelling is a unique
-    /// index, single-column or composite, carrying the constraint's name.
+    /// index, single-column or composite, carrying the constraint's name — and
+    /// a note saying it is a constraint, which `dbml_parse` reads back as one.
     #[test]
     fn a_table_level_unique_constraint_is_written_as_a_named_unique_index() {
         let entity = make_table_entity(
@@ -1139,10 +1230,13 @@ mod tests {
 
         let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
         assert!(
-            block.contains("ref_code [unique, name: 'orders_ref_code_uq']"),
+            block.contains("ref_code [unique, name: 'orders_ref_code_uq', note: 'unique constraint']"),
             "got:\n{block}"
         );
-        assert!(block.contains("(customer_id, ref_code) [unique]"), "got:\n{block}");
+        assert!(
+            block.contains("(customer_id, ref_code) [unique, note: 'unique constraint']"),
+            "got:\n{block}"
+        );
     }
 
     /// DBML writes an index expression in backticks — bare, `lower(email)`
@@ -1506,6 +1600,52 @@ mod tests {
         assert_eq!(quote_default("now()"), "`now()`");
         assert_eq!(quote_default("uuid_generate_v4()"), "`uuid_generate_v4()`");
         assert_eq!(quote_default("'hello'"), "'hello'");
+    }
+
+    /// SQL's value keywords are expressions, not text: `current_date` was
+    /// written as the string `'current_date'`, which `init --from-dbml` turned
+    /// into `DEFAULT 'current_date'` — refused on a date column, and on a text
+    /// column the literal text `current_user` in place of the user's name.
+    /// Each is written as DBML writes an expression, in backticks. A string
+    /// that only spells one stays a string.
+    #[test]
+    fn a_sql_value_keyword_default_is_an_expression_not_a_string() {
+        for keyword in [
+            "current_date",
+            "current_time",
+            "current_timestamp",
+            "localtime",
+            "localtimestamp",
+            "current_user",
+            "session_user",
+            "user",
+            "current_role",
+            "current_catalog",
+            "current_schema",
+            "CURRENT_TIMESTAMP(3)",
+        ] {
+            assert_eq!(quote_default(keyword), format!("`{keyword}`"));
+        }
+        assert_eq!(quote_default("'current_date'"), "'current_date'");
+        assert_eq!(quote_default("'it''s'"), r"'it\'s'");
+        assert_eq!(quote_default("-1"), "-1");
+        assert_eq!(quote_default("1.5"), "1.5");
+        assert_eq!(quote_default("'x'::text"), "`'x'::text`");
+    }
+
+    /// @dbml/core reads `'''`, a line break, the text, a line break and `'''`
+    /// as the text plus a trailing newline — it drops a blank first line, not
+    /// a blank last one — so every multi-line note dbd wrote read back one
+    /// character longer, a comment that no longer matched its table's. Its own
+    /// exporter writes the text flush against the quotes, which reads back
+    /// exactly in both parsers. A quote that would run into the closing `'''`
+    /// is escaped.
+    #[test]
+    fn a_multi_line_note_is_written_flush_against_its_quotes() {
+        assert_eq!(quote_dbml_string("line one\nline two"), "'''line one\nline two'''");
+        assert_eq!(quote_dbml_string("say\n'hi'"), "'''say\n'hi\\''''");
+        assert_eq!(quote_dbml_string("two\nquotes ''"), "'''two\nquotes \\'\\''''");
+        assert_eq!(quote_dbml_string("  padded\n  lines  "), "'''padded\n  lines'''");
     }
 
     #[test]

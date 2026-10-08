@@ -20,6 +20,10 @@ pub fn cmd_graph(
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
     let graph = design.graph(name, Some(&resolved))?;
+    // A file dbd could not parse is missing from the nodes, as it is from the
+    // DBML and the diagram, and is named the same way — on stderr, which
+    // `left_out_unparsed` writes to, so stdout stays the JSON document.
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let json = serde_json::json!({
         "nodes": graph.nodes.iter().map(|n| serde_json::json!({
@@ -37,15 +41,16 @@ pub fn cmd_graph(
     });
 
     output::always(&serde_json::to_string_pretty(&json)?);
-    output::detail(
-        verbosity,
-        &format!(
+    // On stderr: printed after the document on stdout, the count made
+    // `dbd graph -v | jq` fail to parse.
+    if verbosity.is_verbose() {
+        eprintln!(
             "{} nodes, {} edges, {} layers",
             graph.nodes.len(),
             graph.edges.len(),
             graph.layers.len()
-        ),
-    );
+        );
+    }
     Ok(())
 }
 

@@ -185,14 +185,19 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
         }
         // `NULLS NOT DISTINCT` precedes the column list, mirroring the index
         // emitter. Dropping it here would make every emitted/reverse-engineered
-        // DDL file declare a weaker constraint than the database holds.
+        // DDL file declare a weaker constraint than the database holds. The
+        // name is kept, as a CHECK's is: a constraint DBML carried back under
+        // its own name was rebuilt as `<table>_<cols>_key`.
         TableConstraint::Unique {
+            name,
             columns,
             nulls_not_distinct,
-            ..
         } => {
             format!(
-                "  UNIQUE{} ({})",
+                "  {}UNIQUE{} ({})",
+                name.as_deref()
+                    .map(|n| format!("CONSTRAINT {} ", q(n)))
+                    .unwrap_or_default(),
                 if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
                 quote_cols(columns)
             )
