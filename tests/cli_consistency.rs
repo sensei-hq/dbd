@@ -1005,6 +1005,23 @@ fn an_unset_url_variable_is_named_with_how_to_set_it() {
     );
     assert!(err.contains("-d"), "and the way past it is given: {err}");
     assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
+
+    // Exported but empty: clap hands the empty value over as `-d ""`, which
+    // names no database any more than an unset one does.
+    let out = Command::cargo_bin("dbd")
+        .unwrap()
+        .env("DATABASE_URL", "")
+        .arg("-s")
+        .arg(tmp.path())
+        .arg("apply")
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.contains("DATABASE_URL is empty"),
+        "an empty variable is named as empty: {err}"
+    );
+    assert!(!err.contains("relative URL"), "not the parser's complaint: {err}");
 }
 
 // ── A closed pipe ends the output quietly ───────────────────────────────────
