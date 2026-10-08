@@ -70,10 +70,6 @@ fn index<'a>(td: &'a TableDef, name: &str) -> &'a IndexDef {
         .unwrap_or_else(|| panic!("index {name} missing; indexes are {:#?}", td.indexes))
 }
 
-fn key_names(ix: &IndexDef) -> Vec<&str> {
-    ix.columns.iter().map(|c| c.name.as_str()).collect()
-}
-
 /// The table-level UNIQUE constraints of `td`, as `(name, columns,
 /// nulls_not_distinct)`.
 fn uniques(td: &TableDef) -> Vec<(Option<&str>, Vec<&str>, bool)> {
