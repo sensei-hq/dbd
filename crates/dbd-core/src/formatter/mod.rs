@@ -28,15 +28,7 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        let formatted = format_statement_block(trimmed, config);
-        // Safety guard: never emit a reformatted statement that changed the SQL.
-        // If the formatted output doesn't re-parse to the same AST, or drops a
-        // comment or a `$$` body, keep the original statement untouched.
-        if block_is_faithful(trimmed, &formatted) {
-            output_parts.push(formatted);
-        } else {
-            output_parts.push(ensure_semicolon(trimmed));
-        }
+        output_parts.push(format_block(trimmed, config));
     }
 
     let mut result = output_parts.join("\n\n");
@@ -47,15 +39,59 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
     result
 }
 
+/// One statement, formatted as far as stays faithful to it: laid out with its
+/// keywords in the configured case; failing that, as written with its keywords
+/// recased; failing that, as written.
+///
+/// Safety guard: never emit a reformatted statement that changed the SQL. A
+/// layout that does not re-parse to the same AST, or drops a comment or a `$$`
+/// body, is not used. The layout covers some statements only partly (a table's
+/// storage parameters), and falling back to the statement untouched left its
+/// keywords in whatever case the file had — `upper` leaving a table lowercase —
+/// so the fallback still recases them.
+fn format_block(original: &str, config: &FormatConfig) -> String {
+    let laid_out = match config.keyword_case {
+        // The layout writes keywords of its own, so it is laid out in one case
+        // and each keyword given back the spelling the statement used.
+        KeywordCase::Preserve => {
+            let lower = FormatConfig {
+                keyword_case: KeywordCase::Lower,
+                ..config.clone()
+            };
+            preserve_keyword_case(&format_statement_block(original, &lower), original)
+        }
+        _ => format_statement_block(original, config),
+    };
+    if block_is_faithful(original, &laid_out) {
+        return laid_out;
+    }
+    let recased = ensure_semicolon(&apply_keyword_case(original, &config.keyword_case));
+    if block_is_faithful(original, &recased) {
+        recased
+    } else {
+        ensure_semicolon(original)
+    }
+}
+
 /// Whether a formatted statement faithfully preserves the original: same parsed
 /// AST (so semantics are unchanged), plus every comment and every `$$` body
 /// retained. Statements sqlparser can't parse fall back to the
 /// comment/body-preservation check (the formatter used a conservative
 /// keyword-case/verbatim path for those).
+///
+/// The trees are compared with both sides' keywords lowercased. A keyword's
+/// case is not meaning — an unquoted word reads the same in any case, Postgres
+/// folds it — but sqlparser keeps a word it reads as a name in the case it was
+/// written: `serial`, `inet`, `search_path` and `sql` are names to it, and
+/// `SERIAL` parsed to a different tree than `serial`. So every table with a
+/// serial or inet column, every SET and every function header failed the guard
+/// in `upper` and was kept lowercase. Lowercasing an unquoted keyword changes
+/// neither side's meaning, and every other difference still counts.
 fn block_is_faithful(original: &str, formatted: &str) -> bool {
     let dialect = PostgreSqlDialect {};
-    let po = Parser::parse_sql(&dialect, &ensure_semicolon(original));
-    let pf = Parser::parse_sql(&dialect, &ensure_semicolon(formatted));
+    let lowered = |sql: &str| ensure_semicolon(&apply_keyword_case(sql, &KeywordCase::Lower));
+    let po = Parser::parse_sql(&dialect, &lowered(original));
+    let pf = Parser::parse_sql(&dialect, &lowered(formatted));
     match (po, pf) {
         (Ok(a), Ok(b)) => {
             a == b && comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted)

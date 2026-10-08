@@ -244,73 +244,79 @@ pub(in crate::formatter) fn sql_keywords() -> HashSet<&'static str> {
     .collect()
 }
 
-/// Apply keyword case transformation to a SQL string.
-///
-/// Preserves quoted identifiers and string literals.
-/// Copy the rest of a single-quoted literal (opening quote already emitted)
-/// into `result`, honoring `''` (SQL escaped-quote) the same way
-/// `split::scan_single_quoted` does — a lone `'` closes the literal.
-pub(in crate::formatter) fn copy_single_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    result: &mut String,
-) {
-    while let Some(ch) = chars.next() {
-        result.push(ch);
-        if ch == '\'' {
-            // `''` escape stays inside the string; a lone `'` closes it.
-            if chars.peek() == Some(&'\'') {
-                result.push(chars.next().unwrap());
+/// `sql` with `recase` applied to each word of SQL in it: every word outside a
+/// string literal, a quoted identifier, a dollar-quoted body (`$$ … $$` or
+/// `$tag$ … $tag$`) and a comment. Those are text, and keep the case they were
+/// written in — a word recased inside a comment or a body is a changed file
+/// the faithfulness guard then rejects whole.
+pub(in crate::formatter) fn map_sql_words(sql: &str, mut recase: impl FnMut(&str) -> String) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < sql.len() {
+        let rest = &sql[i..];
+        let first = rest.as_bytes()[0];
+        let len = match first {
+            b'\'' | b'"' => 1 + quoted_len(&rest[1..], first),
+            b'-' if rest.starts_with("--") => rest.find('\n').unwrap_or(rest.len()),
+            b'/' if rest.starts_with("/*") => rest.find("*/").map_or(rest.len(), |p| p + 2),
+            b'$' => match dollar_tag(rest) {
+                Some(tag) => {
+                    let body = &rest[tag.len()..];
+                    tag.len() + body.find(tag).map_or(body.len(), |p| p + tag.len())
+                }
+                None => 1,
+            },
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let len = rest
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                    .count();
+                out.push_str(&recase(&rest[..len]));
+                i += len;
                 continue;
             }
-            break;
-        }
+            _ => rest.chars().next().map_or(1, char::len_utf8),
+        };
+        out.push_str(&rest[..len]);
+        i += len;
     }
+    out
 }
 
-/// Copy the rest of a double-quoted identifier (opening quote already emitted).
-pub(in crate::formatter) fn copy_quoted_ident(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    result: &mut String,
-) {
-    for ch in chars.by_ref() {
-        result.push(ch);
-        if ch == '"' {
-            break;
-        }
-    }
-}
-
-/// Copy the rest of a `$$ … $$` body (opening `$$` already emitted).
-pub(in crate::formatter) fn copy_dollar_body(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    result: &mut String,
-) {
-    loop {
-        match chars.next() {
-            Some('$') if chars.peek() == Some(&'$') => {
-                result.push('$');
-                result.push(chars.next().unwrap());
-                break;
+/// The length of a quoted string or identifier's rest, up to and including
+/// its closing `quote` — a doubled quote is one inside it, as SQL writes one.
+fn quoted_len(rest: &str, quote: u8) -> usize {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
             }
-            Some(ch) => result.push(ch),
-            None => break,
+            return i + 1;
         }
+        i += 1;
     }
+    bytes.len()
 }
 
-/// Read an identifier-like word beginning with `first`, consuming trailing
-/// alphanumeric/underscore characters from `chars`.
-pub(in crate::formatter) fn read_word(first: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut word = String::new();
-    word.push(first);
-    while let Some(&next) = chars.peek() {
-        if next.is_ascii_alphanumeric() || next == '_' {
-            word.push(chars.next().unwrap());
-        } else {
-            break;
-        }
+/// The dollar-quote tag `s` opens with — `$$` or `$name$` — or `None` when the
+/// `$` is something else (a `$1` parameter).
+fn dollar_tag(s: &str) -> Option<&str> {
+    let after = &s[1..];
+    let name = after
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    let starts_well = after
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+    match after.as_bytes().get(name) {
+        Some(b'$') if name == 0 || starts_well => Some(&s[..name + 2]),
+        _ => None,
     }
-    word
 }
 
 /// Re-case `word` per `case` when it is a SQL keyword; otherwise return it as-is.
@@ -325,50 +331,54 @@ pub(in crate::formatter) fn recase_keyword(word: &str, keywords: &HashSet<&'stat
     }
 }
 
+/// Apply keyword case transformation to a SQL string — every keyword outside
+/// the text [`map_sql_words`] leaves alone.
 pub(in crate::formatter) fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
     if matches!(case, KeywordCase::Preserve) {
         return sql.to_string();
     }
-
     let keywords = sql_keywords();
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
+    map_sql_words(sql, |word| recase_keyword(word, &keywords, case))
+}
 
-    while let Some(c) = chars.next() {
-        // Skip string literals (single quotes)
-        if c == '\'' {
-            result.push(c);
-            copy_single_quoted(&mut chars, &mut result);
-            continue;
+/// `formatted` — laid out with lowercase keywords — with each keyword given
+/// back the spelling `original` gave it: what `keyword_case: preserve` means
+/// once the layout has rewritten the statement.
+///
+/// The layout writes keywords of its own — `CREATE TABLE`, `PRIMARY KEY`,
+/// sqlparser's `VARCHAR` for a `varchar` — and wrote them uppercase whatever
+/// the file said, so `preserve` uppercased a lowercase file. A keyword the
+/// statement spells is spelled that way; one the layout adds that the
+/// statement does not have (an `as` before an alias) takes the case most of
+/// the statement's keywords are in.
+pub(in crate::formatter) fn preserve_keyword_case(formatted: &str, original: &str) -> String {
+    let keywords = sql_keywords();
+    let mut spelled: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let (mut upper, mut lower) = (0usize, 0usize);
+    map_sql_words(original, |word| {
+        let key = word.to_uppercase();
+        if keywords.contains(key.as_str()) {
+            if word == key {
+                upper += 1;
+            } else if word == word.to_lowercase() {
+                lower += 1;
+            }
+            spelled.entry(key).or_insert_with(|| word.to_string());
         }
-
-        // Skip quoted identifiers (double quotes)
-        if c == '"' {
-            result.push(c);
-            copy_quoted_ident(&mut chars, &mut result);
-            continue;
+        word.to_string()
+    });
+    let shout = upper > lower;
+    map_sql_words(formatted, |word| {
+        let key = word.to_uppercase();
+        if !keywords.contains(key.as_str()) {
+            return word.to_string();
         }
-
-        // Skip $$ quoted bodies (format_dollar_quoted normally handles these
-        // for function bodies, so we shouldn't usually reach here).
-        if c == '$' && chars.peek() == Some(&'$') {
-            result.push(c);
-            result.push(chars.next().unwrap());
-            copy_dollar_body(&mut chars, &mut result);
-            continue;
+        match spelled.get(&key) {
+            Some(spelling) => spelling.clone(),
+            None if shout => key,
+            None => word.to_lowercase(),
         }
-
-        // Collect a word and re-case it when it is a keyword.
-        if c.is_ascii_alphabetic() || c == '_' {
-            let word = read_word(c, &mut chars);
-            result.push_str(&recase_keyword(&word, &keywords, case));
-            continue;
-        }
-
-        result.push(c);
-    }
-
-    result
+    })
 }
 
 #[cfg(test)]
