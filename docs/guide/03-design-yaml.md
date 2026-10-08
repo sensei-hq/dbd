@@ -110,15 +110,23 @@ source:
   search_path: [app, shared]
 ```
 
-A file that states its own path still wins; this only fills the gap. Omit the
-key and PostgreSQL's own default applies (`"$user", public`), which depends on
-the connecting role and can be moved by `ALTER ROLE`/`ALTER DATABASE … SET
-search_path` — so dbd cannot know it from your files.
+A file that states its own path still wins. One that states none runs on this
+path: `apply`, `deploy`, `reconcile`, migrations and `combine` run
+`SET search_path TO <list>, public` ahead of it — a statement in front of the
+file, which is never rewritten — so a table lands where the parser resolved it,
+and `diff` agrees. Before 0.25 only the parser read the key, so the table landed
+in `public` while `diff` wanted to create it in `app`, and reconcile never
+converged.
 
-**Either way it is reported, not silent.** Every DDL file that states no path
-is named in a warning saying what its names were resolved against instead.
-`dbd inspect` counts them; `apply` and `deploy` print them. An empty list is
-refused rather than treated as "no schemas".
+Omit the key and the file runs as written, on PostgreSQL's own default
+(`"$user", public`), which depends on the connecting role and can be moved by
+`ALTER ROLE`/`ALTER DATABASE … SET search_path` — so dbd cannot know it from
+your files, and a pathless file under `ddl/table/app/` creates its table in
+`public`.
+
+**Either way it is reported, not silent.** `dbd inspect` names every DDL file
+that states no path, with what its names were resolved against instead, and
+counts them. An empty list is refused rather than treated as "no schemas".
 
 `dialect` picks the reader; `parser` overrides that choice and you should not
 normally need it.
@@ -175,8 +183,15 @@ dbd deploy -d $MAIN_URL
 
 The adapter (PostgreSQL/SQLite/Convex) is selected from the **URL scheme** (`postgres://`, `sqlite://`/`file:`, `convex:`), not the target name. The key still matters in one case: a target named **`supabase`** uses the same PostgreSQL adapter, but exposes `public` by default, keeps Supabase's own schemas out of `reconcile --prune` and `dbd reset`, and adds PostgREST `USAGE` to configured grants. See [targets and adapters](08-targets.md#what-the-supabase-key-changes).
 
-A `url` written as a whole `$VAR` is read from the environment. A variable that
-is not set is used literally, and the connection fails.
+A `url` written as a whole `$VAR` is read from the environment. One that is
+unset or empty is refused by name, with how to set it, rather than handed to the
+driver as a URL:
+
+```
+Error: target.url is $DATABASE_URL, but DATABASE_URL is not set — export DATABASE_URL=postgres://user:password@host:5432/database, or pass the URL with -d <url>
+```
+
+An exported-but-empty `$DATABASE_URL` does not override `target.url` either.
 
 **PostgreSQL / Supabase:**
 
@@ -247,8 +262,9 @@ schemas:
 
 This emits `GRANT USAGE ON SCHEMA` (for `usage`, written in lower case), `GRANT <perms> ON ALL TABLES IN SCHEMA`, and matching `ALTER DEFAULT PRIVILEGES` for each role, then `NOTIFY pgrst, 'reload config'`. If the same schema also has a `target.grants` entry, the target's per-role permissions merge in on top (adding new roles, replacing the list for roles present in both). On a `supabase` target, configured grants also give `anon`, `authenticated` and `service_role` `USAGE` on every listed schema, for PostgREST.
 
-`dbd apply` and `dbd deploy` apply grants once the schema is in place — after
-the entities and the `apply.after` hooks, before import and policies. They are
+`dbd apply`, `dbd deploy` and `dbd reconcile` apply grants once the schema is in
+place — after the entities and the `apply.after` hooks, before import and
+policies. They are
 not applied by `--dry-run`, and under `--scope` only the grants on schemas the
 scope builds are applied. Targets without a SQL grant model (SQLite, Convex)
 skip them with a note rather than failing. See
@@ -355,7 +371,8 @@ Lifecycle hooks around the DDL phase, for SQL dbd does not model — attaching a
 
 `apply.after` runs before `policies/` because publications and grants attach to objects that must already exist, while RLS policies are independent of them. A hook that needs a policy to exist will not find one.
 
-These run on `dbd apply` and `dbd deploy`. `import.after` runs with the import
+These run on `dbd apply`, `dbd deploy` and `dbd reconcile` — a reconciled
+database is the one an apply builds. `import.after` runs with the import
 phase instead — on `dbd import` and `dbd deploy`, never on `dbd apply`. Post-DDL
 SQL that lives in `import.after` today (publications, grants) belongs in
 `apply.after`: on a plain `dbd apply` an `import.after` hook does nothing.
@@ -410,7 +427,7 @@ import:
         null_value: '\N' # this table's data files use \N for NULL; empty cells are literal ''
 ```
 
-> **Environment-specific data** is by folder, not config: files under `import/<env>/<schema>/<file>` load only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment (see [Commands → import](04-commands.md#dbd-import)).
+> **Environment-specific data** is by folder, not config: files under `import/<env>/<schema>/<file>` — and directly under `import/dev/` or `import/prod/` — load only when `-e <env>` matches; files directly under `import/<schema>/` load in every environment (see [import and export](10-data.md#environment-folders)).
 
 ### Hook scripts
 
@@ -432,7 +449,7 @@ Scripts run in the order written. A path dbd cannot find is an error, not a skip
 ⚠ after-script import/loader.sql skipped — needs staging.values, which is outside scope 'partial'
 ```
 
-An `apply.before` or `apply.after` skip is named before `apply` or `deploy` starts — so a run that then fails because of it still says so — and in `apply --dry-run` and `deploy --dry-run`, which make the same decision without running anything (`Design::hook_skips` for an embedder). A hook file that is missing is an error in the preview as in the run. The run continues past a skip; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out. (Before 0.25 a hook ran only when every table it named was in the working set, so a hook touching an `external:` table was skipped under every named scope, and the skip was said only in the summary of a run that succeeded.)
+An `apply.before` or `apply.after` skip is named before `apply`, `deploy` or `reconcile` starts — so a run that then fails because of it still says so — and in their dry runs, which make the same decision without running anything (`Design::hook_skips` for an embedder). An `import.after` skip is named in `import --dry-run` and `deploy --dry-run`, as the real run names it; before 0.25 `import --dry-run` had the rule backwards. A hook file that is missing is an error in the preview as in the run. The run continues past a skip; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out. (Before 0.25 a hook ran only when every table it named was in the working set, so a hook touching an `external:` table was skipped under every named scope, and the skip was said only in the summary of a run that succeeded.)
 
 **Where `writes:` is needed.** dbd derives a script's tables by parsing it, which works when they appear as SQL identifiers. It cannot work when they are *data* — inside a `format()` string or an `array[…]` literal, as a realtime-publication hook typically is. No parser can recover those, so declare them with `writes:`.
 
@@ -458,8 +475,10 @@ export:
   reported, and the rest still export.
 - A per-entry `format` (`csv`, `tsv` or `jsonl`) wins over `-f`.
 
-Files are written to `export/<schema>/<name>.<format>`, or flat into the
-directory `-o` names. See [import and export](10-data.md#export).
+Files are written to `export/<schema>/<name>.<format>` in the project, or, with
+`-o <dir>`, to `<dir>/<schema>/<name>.<format>` — the layout `import/` reads, so
+`-o import` exports into the import tree. Generated columns are left out. See
+[import and export](10-data.md#export).
 
 ### `materialized_views`
 
@@ -485,7 +504,7 @@ materialized_views:
 
 **Requirements & validation.** Scheduling requires the `pg_cron` extension in `target.postgres.extensions`; `concurrently: true` requires the matview to declare a unique index. `dbd inspect` reports both, offline. PostgreSQL/Supabase only.
 
-**Reconcile & diff.** `dbd reconcile` creates an absent matview (recording a `dbd:hash` drift stamp in `dbd.matview_stamps` — the matview's own `COMMENT` stays yours) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it. `reconcile --dry-run` previews these creates and drift warnings, and read-only `dbd diff` reports each matview as `missing`/`drifted`/`unstamped`/`orphan` (in `--json` and `--exit-code`).
+**Reconcile & diff.** `apply` adopts a matview the database already has with no stamp when its deployed query and index keys are the design's, so a brownfield project diffs clean. `dbd reconcile` creates an absent matview (recording a `dbd:hash` drift stamp in `dbd.matview_stamps` — the matview's own `COMMENT` stays yours) but only **warns** when a deployed matview's definition drifts — it never auto-drops one (a recreate is `DROP … CASCADE`). To apply a changed definition, drop it manually, then `apply`/reconcile recreates it. `reconcile --dry-run` previews these creates and drift warnings, and read-only `dbd diff` reports each matview as `missing`/`drifted`/`unstamped`/`orphan` (in `--json` and `--exit-code`).
 
 ### `dbml`
 
