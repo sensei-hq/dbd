@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xc7e657b59edc6330
+// docs-digest: 0x4ee682ad2c84ff41
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -614,7 +614,8 @@ async fn doc_docs_llms_llms_full_txt_0() -> dbd_core::Result<()> {
     let report = design.report(None, None);
     // report.issues:              errors blocking the active scope (what apply refuses on)
     // report.out_of_scope_issues: errored entities the scope excludes (non-blocking)
-    // report.warnings:            entities with warnings
+    // report.warnings:            entities with warnings that the scope builds
+    // report.out_of_scope_warnings: entities with warnings the scope excludes
     // report.gaps:                out-of-scope dependency gaps (when a scope is passed)
 
     // Connect an adapter — Postgres/SQLite/Convex is chosen from the URL scheme.
