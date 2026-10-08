@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x4ee682ad2c84ff41
+// docs-digest: 0xa3631c9f9ba7763c
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -74,7 +74,8 @@ async fn doc_docs_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
     let report = design.report(None, None);
     //    report.issues              → errors blocking the active scope (what apply refuses on)
     //    report.out_of_scope_issues → errored entities the scope excludes (non-blocking)
-    //    report.warnings            → entities with warnings (e.g. unresolved entity refs)
+    //    report.warnings            → entities with warnings the scope builds (e.g. unresolved entity refs)
+    //    report.out_of_scope_warnings → entities with warnings the scope excludes
 
     // 3. Connect an adapter — Postgres/SQLite/Convex chosen from the URL scheme.
     let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;
@@ -344,7 +345,8 @@ async fn doc_src_assets_skills_dbd_skill_md_0() -> dbd_core::Result<()> {
     let report = design.report(None, None);
     //    report.issues              → errors blocking the active scope (what apply refuses on)
     //    report.out_of_scope_issues → errored entities the scope excludes (non-blocking)
-    //    report.warnings            → entities with warnings (e.g. unresolved entity refs)
+    //    report.warnings            → entities with warnings the scope builds (e.g. unresolved entity refs)
+    //    report.out_of_scope_warnings → entities with warnings the scope excludes
 
     // 3. Connect an adapter — Postgres/SQLite/Convex chosen from the URL scheme.
     let adapter = connect("postgres://localhost/mydb", &design.config().project.name).await?;
