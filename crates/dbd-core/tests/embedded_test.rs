@@ -859,6 +859,90 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     assert_eq!(row["body"], "first run set search_path to app; then load");
 }
 
+// ── Test: JSON values and identity ids survive the round trip ─────────────────
+
+/// What a JSONL export lost on its way back in:
+/// - a json/jsonb string scalar (`"a string"`) failed the import — its text was
+///   cast to json without its quotes;
+/// - a JSON `null` in a json/jsonb column came back as SQL NULL;
+/// - a json column's own text (spacing, key order) was rewritten;
+/// - `GENERATED ALWAYS` identity ids were renumbered, breaking every foreign
+///   key pointing at them.
+///
+/// A JSON null stays the JSON value; an SQL NULL is exported as an absent key
+/// and imports as NULL. Ids import as-is, and the identity then continues past
+/// them, so the next insert does not collide — after a CSV import too, whose
+/// COPY kept the ids and left the sequence behind.
+#[tokio::test]
+async fn json_values_and_identity_ids_survive_an_export_and_import() {
+    const TABLE: &str = "CREATE TABLE app.docs (\n\
+                           id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY\n\
+                         , j json\n\
+                         , jb jsonb\n\
+                         , note text\n\
+                         );";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            r#"CREATE SCHEMA app;
+               {TABLE}
+               INSERT INTO app.docs (j, jb, note) VALUES
+                 ('{{}}', '{{}}', 'deleted, so the ids have a gap'),
+                 ('"a string"', '"a string"', 'string scalars'),
+                 ('null', 'null', 'json null'),
+                 (NULL, NULL, 'sql null'),
+                 ('{{"b" : 1,  "a":[1, "x", null]}}', '{{"b": 1, "a": [1, "x", null]}}', 'objects'),
+                 ('42', 'true', 'other scalars');
+               DELETE FROM app.docs WHERE id = 1;
+               CREATE TABLE app.expected AS
+                 SELECT id, j::text AS j, j IS NULL AS j_null, jb, jb IS NULL AS jb_null, note FROM app.docs;"#
+        ))
+        .await
+        .unwrap();
+
+    for format in ["jsonl", "csv"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.docs");
+        entity.format = Some(format.to_string());
+        adapter
+            .export_data(&entity, Some(out.path()))
+            .await
+            .unwrap_or_else(|e| panic!("{format}: export failed: {e}"));
+
+        // A fresh table, as on a new database: its identity starts at 1.
+        adapter
+            .execute_script(&format!("DROP TABLE app.docs; {TABLE}"))
+            .await
+            .unwrap();
+        entity.file = Some(out.path().join(format!("docs.{format}")));
+        adapter
+            .import_data(&entity, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: import failed: {e}"));
+
+        assert_catalog(
+            &*adapter,
+            false,
+            "(SELECT id, j::text, j IS NULL, jb, jb IS NULL, note FROM app.docs \
+               EXCEPT ALL SELECT * FROM app.expected) \
+             UNION ALL (SELECT * FROM app.expected \
+               EXCEPT ALL SELECT id, j::text, j IS NULL, jb, jb IS NULL, note FROM app.docs)",
+            &format!("{format}: a row that differs after the round trip"),
+        )
+        .await;
+
+        adapter
+            .execute_script("INSERT INTO app.docs (note) VALUES ('after the import')")
+            .await
+            .unwrap_or_else(|e| panic!("{format}: the next insert must get a fresh id: {e}"));
+        adapter
+            .execute_script("DELETE FROM app.docs WHERE note = 'after the import'")
+            .await
+            .unwrap();
+    }
+}
+
 // ── Test: a JSON key naming no column is refused ──────────────────────────────
 
 /// A CSV header naming a column the table lacks is refused, on Postgres and
