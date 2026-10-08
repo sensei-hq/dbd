@@ -1016,11 +1016,17 @@ fn quote_type_if_needed(data_type: &str) -> String {
 
 /// Format a string for DBML.
 /// Single-line → single quotes: 'text'
-/// Multi-line → triple quotes: '''text'''
+/// Multi-line → triple quotes, flush against the text: '''text'''
+///
+/// Flush, as @dbml/core's own exporter writes it: that parser drops a blank
+/// first line but keeps a blank last one, so `'''`, newline, text, newline,
+/// `'''` read back with a trailing newline — every multi-line note one
+/// character longer than the comment it documents. The text is trimmed, so
+/// its first line has no indent and @dbml/core's dedent leaves it whole.
 fn quote_dbml_string(s: &str) -> String {
     let trimmed = s.trim();
     if trimmed.contains('\n') {
-        format!("'''\n{}\n'''", dbml_multiline_body(trimmed))
+        format!("'''{}'''", dbml_multiline_body(trimmed))
     } else {
         dbml_string(trimmed)
     }
@@ -1052,14 +1058,17 @@ fn dbml_string(text: &str) -> String {
 
 /// The body of a DBML `'''` string. Backslashes are escapes there too, and
 /// three quotes in a row end the string, so each `\` is doubled and a quote
-/// that would open a `'''` run is escaped. Other quotes stay as written —
-/// apostrophes are common in prose notes and DBML needs nothing done to them.
+/// that would open a `'''` run is escaped — as is every quote at the very end,
+/// which would otherwise run into the closing `'''`. Other quotes stay as
+/// written — apostrophes are common in prose notes and DBML needs nothing done
+/// to them.
 fn dbml_multiline_body(text: &str) -> String {
+    let trailing_quotes = text.len() - text.trim_end_matches('\'').len();
     let mut out = String::with_capacity(text.len());
     for (i, c) in text.char_indices() {
         match c {
             '\\' => out.push_str("\\\\"),
-            '\'' if text[i..].starts_with("'''") => out.push_str("\\'"),
+            '\'' if text[i..].starts_with("'''") || i >= text.len() - trailing_quotes => out.push_str("\\'"),
             other => out.push(other),
         }
     }
