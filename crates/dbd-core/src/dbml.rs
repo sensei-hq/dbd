@@ -1624,6 +1624,21 @@ mod tests {
         assert_eq!(quote_default("'x'::text"), "`'x'::text`");
     }
 
+    /// @dbml/core reads `'''`, a line break, the text, a line break and `'''`
+    /// as the text plus a trailing newline — it drops a blank first line, not
+    /// a blank last one — so every multi-line note dbd wrote read back one
+    /// character longer, a comment that no longer matched its table's. Its own
+    /// exporter writes the text flush against the quotes, which reads back
+    /// exactly in both parsers. A quote that would run into the closing `'''`
+    /// is escaped.
+    #[test]
+    fn a_multi_line_note_is_written_flush_against_its_quotes() {
+        assert_eq!(quote_dbml_string("line one\nline two"), "'''line one\nline two'''");
+        assert_eq!(quote_dbml_string("say\n'hi'"), "'''say\n'hi\\''''");
+        assert_eq!(quote_dbml_string("two\nquotes ''"), "'''two\nquotes \\'\\''''");
+        assert_eq!(quote_dbml_string("  padded\n  lines  "), "'''padded\n  lines'''");
+    }
+
     #[test]
     fn types_with_spaces_are_quoted() {
         assert_eq!(quote_type_if_needed("INT"), "INT");

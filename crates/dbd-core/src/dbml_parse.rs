@@ -1462,6 +1462,53 @@ mod tests {
         assert!(!td.columns[0].nullable, "the other settings still apply");
     }
 
+    /// A multi-line note written flush against its quotes — the form
+    /// @dbml/core reads back exactly — reads back exactly here too, a quote at
+    /// its end included.
+    #[test]
+    fn a_multi_line_note_reads_back_exactly() {
+        use crate::dbml::{DbmlParams, generate_dbml};
+        use crate::entity::TableComments;
+
+        for note in [
+            "line one\nline two",
+            "say\n'hi'",
+            "two\nquotes ''",
+            "a\n  indented\nnote",
+        ] {
+            let mut t = Entity::new(EntityType::Table, "app.t");
+            t.table_def = Some(TableDef {
+                columns: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments {
+                    table: Some(note.into()),
+                    ..Default::default()
+                },
+            });
+            let doc = generate_dbml(&DbmlParams {
+                entities: &[t],
+                project_name: "notes",
+                database_type: "PostgreSQL",
+                project_note: Some(note),
+                include_schemas: vec![],
+                exclude_schemas: vec![],
+                include_tables: vec![],
+                exclude_tables: vec![],
+                groups: vec![],
+                auto_group_by_schema: false,
+            });
+            assert!(
+                !doc.content.contains("'''\n"),
+                "flush against its quotes:\n{}",
+                doc.content
+            );
+            let parsed = parse_dbml(&doc.content).expect("DBML must parse");
+            let td = find_table(&parsed, "app.t").table_def.as_ref().unwrap();
+            assert_eq!(td.comments.table.as_deref(), Some(note), "\n{}", doc.content);
+        }
+    }
+
     #[test]
     fn parse_multiline_triple_quoted_note() {
         let dbml = "Table \"app\".\"t\" {\n  \"id\" int\n\n  Note: '''\nLine one.\nLine two.\n'''\n}\n";
