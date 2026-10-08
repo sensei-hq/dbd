@@ -184,7 +184,10 @@ pub fn cmd_import_dry_run(
         output::warn(warning);
     }
 
-    output::summary(0, 0, plan.len());
+    // Tables, as the run's summary counts them: a table with a shared data
+    // file and an env's own is two plan entries and one table.
+    let tables: std::collections::HashSet<&str> = plan.iter().map(|e| e.table.name.as_str()).collect();
+    output::summary(0, 0, tables.len());
     Ok(())
 }
 

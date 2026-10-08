@@ -680,7 +680,8 @@ impl Design {
 
     /// Import phase: truncate staging tables (per-table override wins over the
     /// global setting) then load each entry's data file. Returns the number of
-    /// tables loaded.
+    /// tables loaded — a table with two data files (a shared one and an env's
+    /// own) is one table, where counting files made three tables read as four.
     async fn import_load_staging<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -701,7 +702,7 @@ impl Design {
             }
         }
 
-        let mut count = 0;
+        let mut loaded: HashSet<&str> = HashSet::new();
         for entry in plan {
             // A per-table `format` override forces that parser regardless of the
             // file extension; clone the entity only when an override applies.
@@ -725,9 +726,9 @@ impl Design {
                 adapter.import_data(table, null_value, false).await
             };
             report_step_result(&desc, on_done, result)?;
-            count += 1;
+            loaded.insert(entry.table.name.as_str());
         }
-        Ok(count)
+        Ok(loaded.len() as u32)
     }
 
     /// Import phase: call each entry's import procedure. Returns the number
