@@ -5903,6 +5903,73 @@ async fn a_forced_full_reset_lets_a_mis_marked_database_be_rebuilt_as_dev() {
     assert_eq!(meta.env, "dev");
 }
 
+/// A design with a `default:` scope: a bare run resolves to it, so the
+/// database is pinned to `default` and a bare `reset --force` is a reset under
+/// `default`. It kept the record — only a reset under the all-scope forgot it —
+/// so the environment guard's own way out (`reset --force`, then `-e dev`)
+/// still refused. A reset under the scope the database was built with leaves
+/// nothing of the project and forgets the record; a narrower one keeps it.
+#[tokio::test]
+async fn a_forced_reset_under_the_scope_the_database_was_built_with_forgets_its_record() {
+    let (pg, _url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(
+        tmp.path(),
+        "project:\n  name: env_guard\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+         scopes:\n  default:\n    includes: [app, core]\n  narrow:\n    includes: [app]\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/table/core/regions.ddl",
+                "set search_path to core;\ncreate table if not exists regions (id int primary key);\n",
+            ),
+        ],
+    );
+    let config = tmp.path().join("design.yaml");
+    let prod = Design::from_config_with_dir(&config, "prod", Some(tmp.path())).unwrap();
+    let dev = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+    let default = prod.resolve_scope(None, None).unwrap();
+    assert_eq!(
+        default.name, "default",
+        "precondition: a bare run resolves to `default`"
+    );
+    let narrow = prod.resolve_scope(Some("narrow"), None).unwrap();
+
+    // The scope the database was built with: the record goes.
+    pg.create_database("built_default").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_default"), "env_guard").await.unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&default))
+        .await
+        .expect("a forced reset under `default`");
+    assert!(
+        adapter.get_project_meta().await.unwrap().is_none(),
+        "a reset under the scope the database was built with forgets its record"
+    );
+    dev.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("so the database is rebuilt with -e dev");
+
+    // A narrower scope: the rest of the project stays, and so does its record.
+    pg.create_database("built_narrower").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_narrower"), "env_guard")
+        .await
+        .unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&narrow))
+        .await
+        .expect("a forced reset under the narrower scope");
+    let meta = adapter.get_project_meta().await.unwrap().expect("the record is kept");
+    assert_eq!((meta.env.as_str(), meta.scope.as_deref()), ("prod", Some("default")));
+}
+
 /// The guard is one-way. A database marked dev may be promoted to prod: that
 /// only tightens what `reset` allows.
 #[tokio::test]
