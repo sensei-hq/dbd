@@ -455,6 +455,117 @@ pub fn detect_ddl_type_mismatches(project_dir: &Path) -> Vec<DdlTypeMismatch> {
     out
 }
 
+// ── DDL files for what design.yaml declares ────────────────────────────────
+
+/// A file under `ddl/extension/` or `ddl/schema/`. Both kinds are declared in
+/// design.yaml — the target's `extensions:` and `schemas:` — and the scanner
+/// reads neither folder, so the file does nothing (a schema) or makes the
+/// project refuse to load (an extension). `dbd init --from-db` wrote both
+/// before 0.25. Detection only: the fix edits design.yaml, which doctor
+/// leaves to the human, naming the entry to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredKindFile {
+    pub path: PathBuf,
+    pub kind: DeclaredKind,
+    /// The extension or schema the file creates.
+    pub name: String,
+    /// An extension's `WITH SCHEMA`, when it names one other than `public`.
+    pub schema: Option<String>,
+    /// Whether design.yaml already declares it, so the file only needs deleting.
+    pub declared: bool,
+}
+
+/// Which design.yaml list a [`DeclaredKindFile`] belongs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredKind {
+    Extension,
+    Schema,
+}
+
+/// Detect the files under `ddl/extension/` and `ddl/schema/` (plurals
+/// included), reading each one's `CREATE EXTENSION` / `CREATE SCHEMA` for the
+/// name and schema — the file name when it holds neither. `config` is the
+/// project's design.yaml, when it parses, to say whether each is already
+/// declared there.
+pub fn detect_declared_kind_files(
+    project_dir: &Path,
+    config: Option<&crate::config::DesignConfig>,
+) -> Vec<DeclaredKindFile> {
+    let ddl = project_dir.join("ddl");
+    let listed_extensions: Vec<&str> = config
+        .and_then(|c| c.target.values().next())
+        .map(|t| t.extensions.iter().map(|e| e.name()).collect())
+        .unwrap_or_default();
+    let listed_schemas = config.map(|c| c.schema_names()).unwrap_or_default();
+
+    let mut out = Vec::new();
+    for (folder, kind) in [
+        ("extension", DeclaredKind::Extension),
+        ("extensions", DeclaredKind::Extension),
+        ("schema", DeclaredKind::Schema),
+        ("schemas", DeclaredKind::Schema),
+    ] {
+        let dir = ddl.join(folder);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut files = collect_files(&dir);
+        files.sort();
+        for file in files {
+            if !file
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "ddl" || e == "sql")
+            {
+                continue;
+            }
+            let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let sql = crate::source_text::read_to_string(&file).unwrap_or_default();
+            let (name, schema) = created_by(&sql, kind).unwrap_or((stem, None));
+            let declared = match kind {
+                DeclaredKind::Extension => listed_extensions.contains(&name.as_str()),
+                DeclaredKind::Schema => listed_schemas.contains(&name),
+            };
+            out.push(DeclaredKindFile {
+                path: file,
+                kind,
+                name,
+                schema: schema.filter(|s| s != "public"),
+                declared,
+            });
+        }
+    }
+    out
+}
+
+/// The name (and, for an extension, the `WITH SCHEMA`) the first `CREATE
+/// EXTENSION` or `CREATE SCHEMA` in `sql` creates. Read through libpg_query,
+/// so quoting and `IF NOT EXISTS` are Postgres's business, not a pattern's.
+fn created_by(sql: &str, kind: DeclaredKind) -> Option<(String, Option<String>)> {
+    use pg_query::NodeEnum;
+    let parsed = pg_query::parse(sql).ok()?;
+    parsed
+        .protobuf
+        .stmts
+        .iter()
+        .find_map(|stmt| match (kind, stmt.stmt.as_ref().and_then(|s| s.node.as_ref())?) {
+            (DeclaredKind::Extension, NodeEnum::CreateExtensionStmt(c)) => {
+                let schema = c.options.iter().find_map(|opt| match opt.node.as_ref()? {
+                    NodeEnum::DefElem(def) if def.defname == "schema" => {
+                        match def.arg.as_ref().and_then(|a| a.node.as_ref())? {
+                            NodeEnum::String(s) => Some(s.sval.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                });
+                Some((c.extname.clone(), schema))
+            }
+            (DeclaredKind::Schema, NodeEnum::CreateSchemaStmt(c)) => Some((c.schemaname.clone(), None)),
+            _ => None,
+        })
+}
+
 /// Detect `ddl/<plural>/` folders (e.g. `ddl/functions`) that should use the
 /// canonical singular form (`ddl/function`).
 pub fn detect_plural_ddl_dirs(project_dir: &Path) -> Vec<PluralDdlDir> {

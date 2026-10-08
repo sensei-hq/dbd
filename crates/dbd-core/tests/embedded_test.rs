@@ -5401,6 +5401,10 @@ async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the
         err.contains("privileges for table other.x"),
         "the error must say what the role still holds: {err}"
     );
+    // A grant reset does not revoke is not one dbd did not make — a hook, a
+    // policy file or another database's apply makes them too — so the message
+    // does not claim to know which.
+    assert!(!err.contains("dbd did not grant"), "{err}");
 
     assert_table_exists(&*adapter, "app", "t").await;
     assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
@@ -5770,4 +5774,345 @@ async fn the_enum_value_removal_migration_applies() {
         again.snapshots.len() == 1 && again.snapshots[0].no_changes,
         "and the snapshots end where the design is"
     );
+}
+
+// ── A dev run against a prod database is refused ──────────────────────────────
+
+const ENV_GUARD_YAML: &str = "project:\n  name: env_guard\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+
+const ENV_GUARD_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/items.ddl",
+        "set search_path to app;\ncreate table if not exists items (id int primary key, name text);\n",
+    ),
+    // Seed data only a dev database should ever get.
+    ("import/dev/app/items.csv", "id,name\n1,dev-seed\n"),
+];
+
+fn env_guard_design(dir: &std::path::Path, env: &str) -> Design {
+    write_project(dir, ENV_GUARD_YAML, ENV_GUARD_FILES);
+    Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).expect("load design")
+}
+
+/// `apply -e prod` and then `apply -e dev` rewrote `dbd.meta.env` to `dev`,
+/// which lifted the prod guard on `reset` — and a dev deploy or import loaded
+/// `import/dev/` seed data into the production database. A dev run against a
+/// database marked prod is itself the mistake, so every command that records
+/// the environment (and import, which picks its data by it) refuses it before
+/// writing anything, and the database stays marked prod.
+#[tokio::test]
+async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "env_guard").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let prod = env_guard_design(tmp.path(), "prod");
+    let dev = env_guard_design(tmp.path(), "dev");
+
+    prod.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the prod apply");
+    let meta = adapter.get_project_meta().await.unwrap().expect("apply records meta");
+    assert_eq!(meta.env, "prod");
+
+    let refusals = [
+        (
+            "apply",
+            dev.apply(&*adapter, None, false, None, Progress::none()).await.err(),
+        ),
+        ("deploy", dev.deploy(&*adapter, false, None, |_| {}).await.err()),
+        (
+            "reconcile",
+            dev.reconcile(&*adapter, false, false, false, None, Progress::none())
+                .await
+                .err(),
+        ),
+        (
+            "import",
+            dev.import_data(&*adapter, None, false, None, Progress::none())
+                .await
+                .err(),
+        ),
+    ];
+    for (command, err) in refusals {
+        let err = err
+            .unwrap_or_else(|| panic!("a dev {command} against a prod database must be refused"))
+            .to_string();
+        assert!(
+            err.contains("marked prod") && err.contains("-e prod"),
+            "the {command} refusal must name the database's env and what to do: {err}"
+        );
+    }
+
+    let meta = adapter.get_project_meta().await.unwrap().expect("meta");
+    assert_eq!(meta.env, "prod", "a refused dev run must not re-mark the database");
+    assert!(
+        Design::check_reset_guard(Some(&meta)).is_err(),
+        "reset must stay blocked on the prod database"
+    );
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.items WHERE name = 'dev-seed'",
+        "dev seed data in the prod database",
+    )
+    .await;
+}
+
+/// The guard is one-way. A database marked dev may be promoted to prod: that
+/// only tightens what `reset` allows.
+#[tokio::test]
+async fn a_database_marked_dev_may_be_promoted_to_prod() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "env_guard").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = env_guard_design(tmp.path(), "dev");
+    let prod = env_guard_design(tmp.path(), "prod");
+
+    dev.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the dev apply");
+    prod.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("promoting a dev database to prod");
+
+    let meta = adapter.get_project_meta().await.unwrap().expect("meta");
+    assert_eq!(meta.env, "prod");
+}
+
+// ── A brownfield matview is adopted only when it is the design's ──────────────
+
+/// The brownfield path: `init --from-db` reads a materialized view dbd did not
+/// create, so the first apply finds it already there. Apply stamps only the
+/// matviews it creates, so this one stayed unstamped and every `dbd diff`
+/// reported it "not stamped by dbd" — the round trip never converged. Apply
+/// adopts a pre-existing, unstamped matview whose deployed definition is the
+/// design's, and only that one: a different deployed definition stays
+/// unstamped, since stamping it would vouch for a definition the design does
+/// not have.
+#[tokio::test]
+async fn apply_stamps_an_unstamped_matview_only_when_its_deployed_definition_is_the_designs() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "adopt_mv").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.items (id int PRIMARY KEY, name text); \
+             CREATE MATERIALIZED VIEW app.same AS SELECT id, name FROM app.items; \
+             CREATE INDEX same_id ON app.same (id); \
+             CREATE MATERIALIZED VIEW app.other AS SELECT id FROM app.items;",
+        )
+        .await
+        .expect("the brownfield database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: adopt_mv\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "create table if not exists app.items (id int primary key, name text);\n",
+            ),
+            // The same query as deployed, written the way a person (or the
+            // formatter) writes it rather than the way Postgres prints it.
+            (
+                "ddl/materialized_view/app/same.ddl",
+                "create materialized view if not exists app.same as\n  select id\n       , name\n    from app.items\n  with data;\n\
+                 create index if not exists same_id on app.same (id);\n",
+            ),
+            // Not what is deployed: the database has `select id` only.
+            (
+                "ddl/materialized_view/app/other.ddl",
+                "create materialized view if not exists app.other as select id, name from app.items with data;\n",
+            ),
+        ],
+    );
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let drift = design.diff_live(&*adapter, None).await.expect("diff").matview_drift;
+    let kind = |name: &str| drift.iter().find(|d| d.name == name).map(|d| d.kind);
+    assert_eq!(
+        kind("app.same"),
+        None,
+        "the deployed definition is the design's: {drift:?}"
+    );
+    assert_eq!(
+        kind("app.other"),
+        Some(dbd_core::schema_diff::MatviewDriftKind::Unstamped),
+        "a different deployed definition must stay unverified: {drift:?}"
+    );
+}
+
+// ── init --from-db keeps key names and an enum's comment ──────────────────────
+
+/// `init --from-db` rebuilt `people_region_fk` as Postgres's own
+/// `people_region_id_fkey`, and dropped the enum's `COMMENT ON TYPE` — neither
+/// of which `diff` can see. Introspection reads both, and the emitted DDL must
+/// carry both, as it carries a CHECK's name and a view's comment.
+#[tokio::test]
+async fn reverse_engineering_keeps_key_names_and_an_enums_own_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.mood AS ENUM ('happy', 'sad'); \
+             COMMENT ON TYPE app.mood IS 'how a person''s day went'; \
+             CREATE TABLE app.regions (id int CONSTRAINT regions_pk PRIMARY KEY); \
+             CREATE TABLE app.people (id int PRIMARY KEY, code text, region_id int, mood app.mood, \
+               CONSTRAINT people_code_uq UNIQUE (code), \
+               CONSTRAINT people_region_fk FOREIGN KEY (region_id) REFERENCES app.regions (id));",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let emitted = |name: &str| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} introspected"));
+        dbd_core::emit::emit_entity(e).unwrap_or_default()
+    };
+
+    let mood = emitted("app.mood");
+    assert!(
+        mood.contains(r#"COMMENT ON TYPE "app"."mood" IS 'how a person''s day went';"#),
+        "{mood}"
+    );
+    let people = emitted("app.people");
+    for named in [
+        r#"CONSTRAINT "people_region_fk" FOREIGN KEY"#,
+        r#"CONSTRAINT "people_code_uq" UNIQUE"#,
+        r#"CONSTRAINT "people_pkey" PRIMARY KEY"#,
+    ] {
+        assert!(people.contains(named), "{named} in:\n{people}");
+    }
+    let regions = emitted("app.regions");
+    assert!(regions.contains(r#"CONSTRAINT "regions_pk" PRIMARY KEY"#), "{regions}");
+}
+
+// ── A scoped reset destroys nothing outside its scope ─────────────────────────
+
+const MOODS_YAML: &str = "project:\n  name: scoped_reset\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    scopes:\n  moods:\n    includes: [app.mood, app.mood_names]\n  names:\n    includes: [app.mood_names]\n";
+
+const MOODS_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/enum/app/mood.ddl",
+        "create type app.mood as enum ('happy', 'sad');\n",
+    ),
+    (
+        "ddl/table/app/people.ddl",
+        "set search_path to app;\ncreate table if not exists people (id int primary key, mood app.mood);\n",
+    ),
+    (
+        "ddl/view/app/mood_names.ddl",
+        "set search_path to app;\ncreate or replace view mood_names as select unnest(enum_range(null::app.mood))::text as name;\n",
+    ),
+];
+
+/// The audit's repro: a scope holding the enum `app.mood` but not the table
+/// `app.people` whose column uses it. The reset dropped the enum `CASCADE`, and
+/// with it the `app.people.mood` column — out of scope, and its data with it.
+/// A scoped reset drops without `CASCADE`, all or nothing: refused, it names
+/// what outside the scope depends on what it would drop, and drops nothing.
+#[tokio::test]
+async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_scope() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), MOODS_YAML, MOODS_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let moods = design.resolve_scope(Some("moods"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&moods))
+        .await
+        .expect_err("the enum is used outside the scope")
+        .to_string();
+    assert!(
+        err.contains("app.mood") && err.contains("column mood of table app.people"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+
+    assert_column_exists(&*adapter, "app", "people", "mood").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'app' AND viewname = 'mood_names'",
+        "view app.mood_names (the refused reset drops nothing)",
+    )
+    .await;
+
+    // A scope that nothing outside it depends on still resets.
+    let names = design.resolve_scope(Some("names"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&names))
+        .await
+        .expect("a self-contained scope resets");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'app' AND viewname = 'mood_names'",
+        "view app.mood_names",
+    )
+    .await;
+    assert_column_exists(&*adapter, "app", "people", "mood").await;
+}
+
+// ── Roles are server-wide: a reset keeps one another database holds ───────────
+
+/// Two databases on one server built from the same design share its roles,
+/// which are server-wide. Resetting one failed — "role app_writer … holds
+/// privileges dbd did not grant … objects in database a1", though dbd granted
+/// them, in the other database — and had it gone ahead it would have dropped
+/// a role the other database still uses. A role that holds anything in
+/// another database is kept, and the reset continues; the last database to
+/// reset drops it.
+#[tokio::test]
+async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("second").await.unwrap();
+    let first = connect(&url, "grants_reset_test").await.unwrap();
+    let second = connect(&pg.settings().url("second"), "grants_reset_test")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+    design
+        .deploy(&*first, false, None, |_| {})
+        .await
+        .expect("deploy the first");
+    design
+        .deploy(&*second, false, None, |_| {})
+        .await
+        .expect("deploy the second");
+
+    design
+        .reset(&*second, "postgres", false, false, false, None)
+        .await
+        .expect("the second database resets, keeping the roles the first holds");
+    assert_table_absent(&*second, "app", "t").await;
+    assert_catalog(&*second, true, &role_predicate("app_writer"), "role app_writer").await;
+    assert_catalog(
+        &*first,
+        true,
+        "SELECT 1 WHERE has_table_privilege('app_writer', 'app.t', 'INSERT')",
+        "the grant to app_writer in the first database",
+    )
+    .await;
+
+    design
+        .reset(&*first, "postgres", false, false, false, None)
+        .await
+        .expect("the first database resets");
+    assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
+    assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
 }

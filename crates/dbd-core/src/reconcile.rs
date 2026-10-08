@@ -1898,6 +1898,24 @@ pub(crate) fn matview_create_sql(entity: &Entity) -> String {
     crate::emit::emit_entity(entity).unwrap_or_default()
 }
 
+/// Whether a deployed materialized view (`live`, as introspected) is the
+/// design's: the same query and the same index key set.
+///
+/// The queries are compared as libpg_query parse trees, deparsed — so layout,
+/// keyword case and the formatter's leading commas do not count, while any
+/// difference in what the query does does. Postgres prints a deployed
+/// definition its own way (qualified names, explicit casts), so a hand-written
+/// body often reads differently from it; that is a `false`, which leaves the
+/// matview unverified rather than vouching for it.
+pub(crate) fn same_matview_definition(design: &Entity, live: &Entity) -> bool {
+    fn canonical(e: &Entity) -> Option<String> {
+        let body = e.body.first()?.trim().trim_end_matches(';');
+        pg_query::deparse(&pg_query::parse(body).ok()?.protobuf).ok()
+    }
+    matview_index_keys(design) == matview_index_keys(live)
+        && canonical(design).is_some_and(|d| canonical(live).is_some_and(|l| l == d))
+}
+
 /// Normalize a matview's `SELECT` body for a stable hash input: first `body`
 /// entry, trimmed, a single trailing `;` removed, internal whitespace collapsed
 /// to single spaces, lowercased.

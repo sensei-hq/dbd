@@ -205,6 +205,9 @@ impl Design {
         C: FnMut(ApplyComplete),
     {
         let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
+        // Before the first hook or write: a dev run against a database marked
+        // prod is refused, not left to re-mark it (see `check_env_guard`).
+        self.guard_env(adapter).await?;
 
         // A project older than the database it points at is refused before
         // anything runs — the `apply.before` hooks included — and under
@@ -341,11 +344,12 @@ impl Design {
             .copied()
             .filter(|e| e.entity_type == EntityType::MaterializedView)
             .collect();
-        let pre_existing_matviews: std::collections::HashSet<String> = if applied_matviews.is_empty() {
-            std::collections::HashSet::new()
+        let pre_existing_states = if applied_matviews.is_empty() {
+            std::collections::HashMap::new()
         } else {
-            adapter.matview_states().await?.into_keys().collect()
+            adapter.matview_states().await?
         };
+        let pre_existing_matviews: std::collections::HashSet<String> = pre_existing_states.keys().cloned().collect();
 
         // Wrap the whole plan in one transaction when the backend supports it,
         // so an interrupted upgrade rolls back to the prior schema instead of
@@ -413,7 +417,13 @@ impl Design {
         // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
         // hash onto one whose deployed definition may have drifted would mask
         // that drift. Runs after commit, so the object exists for the COMMENT.
-        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews) {
+        let adopted = self
+            .verified_unstamped_matviews(adapter, &applied_matviews, &pre_existing_states)
+            .await?;
+        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews)
+            .into_iter()
+            .chain(adopted)
+        {
             adapter
                 .stamp_matview(
                     &crate::reconcile::qualified_entity_name(e),
@@ -573,6 +583,46 @@ impl Design {
             }
         }
         Ok(())
+    }
+
+    /// The pre-existing matviews among `applied` that carry no stamp and whose
+    /// deployed definition is the design's — the ones apply may adopt.
+    ///
+    /// Apply stamps what it creates and leaves an existing matview alone,
+    /// because stamping one whose deployed definition may differ would vouch
+    /// for it and mask that drift. A matview dbd did not create is the
+    /// brownfield case (`init --from-db` read it from this very database): left
+    /// unstamped, every `dbd diff` reported it "not stamped by dbd" and the
+    /// round trip never converged. Checking the deployed definition first is
+    /// what makes stamping it safe. One already stamped keeps its stamp — a
+    /// stale one is drift to report, not to overwrite.
+    async fn verified_unstamped_matviews<'a>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        applied: &[&'a Entity],
+        pre_existing: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<Vec<&'a Entity>> {
+        let unstamped: Vec<&'a Entity> = applied
+            .iter()
+            .copied()
+            .filter(|e| {
+                pre_existing
+                    .get(&e.name)
+                    .is_some_and(|c| crate::reconcile::parse_dbd_hash(c.as_deref()).is_none())
+            })
+            .collect();
+        if unstamped.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live = adapter.live_matviews().await?;
+        Ok(unstamped
+            .into_iter()
+            .filter(|e| {
+                live.iter()
+                    .find(|l| l.name == e.name)
+                    .is_some_and(|l| crate::reconcile::same_matview_definition(e, l))
+            })
+            .collect())
     }
 
     /// The grants a run under `scope` applies: schema → role → privileges.

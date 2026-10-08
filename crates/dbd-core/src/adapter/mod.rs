@@ -3,7 +3,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityType};
 use crate::error::Result;
 
 /// Classification result for a reference name.
@@ -130,6 +130,14 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// The deployed materialized views, each with its definition as the
+    /// database prints it (`body[0]`) and its indexes — what `introspect`
+    /// returns for them, without the rest. Default: none (targets without
+    /// materialized views).
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
     /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
     /// materialized view `qualified` (`schema.name`). Kept apart from the view's
     /// own comment, which belongs to its author. Default: no-op (targets without
@@ -213,6 +221,39 @@ pub trait DatabaseAdapter: Send + Sync {
     /// for offline lookups.
     async fn list_entities(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// Which of `objects` — each a kind and a name: `schema.name` for a
+    /// schema-qualified kind, the bare name of a role, schema or extension —
+    /// exist now.
+    ///
+    /// `reset` asks before and after it drops, so it reports what it dropped
+    /// rather than what it ran: every drop is `IF EXISTS`. Default: tables and
+    /// views, from [`Self::list_entities`] — all a target without schemas,
+    /// roles or extensions (SQLite) has.
+    async fn existing_objects(&self, objects: &[(EntityType, String)]) -> Result<HashSet<(EntityType, String)>> {
+        let live: HashSet<String> = self.list_entities().await?.into_iter().collect();
+        Ok(objects
+            .iter()
+            .filter(|(kind, name)| {
+                let (_, bare) = crate::entity::split_qualified_name(name);
+                matches!(kind, EntityType::Table | EntityType::View) && (live.contains(name) || live.contains(&bare))
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// The other databases on this server where each of `roles` holds
+    /// anything — a privilege, a default privilege, an object, or the database
+    /// itself — as role → those databases' names, sorted. A role missing from
+    /// the map holds nothing elsewhere.
+    ///
+    /// Roles are server-wide, so a role this design declares is shared by
+    /// every database on the server built from it. `reset` keeps one another
+    /// database holds rather than break that database. Default: none (targets
+    /// without server-wide roles).
+    async fn roles_held_elsewhere(&self, _roles: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        Ok(HashMap::new())
     }
 
     /// Introspect the live database and return a complete `Vec<Entity>` covering

@@ -496,8 +496,10 @@ impl PostgresAdapter {
         // with zero pg_enum rows, so an inner join made it invisible to
         // introspection — reconcile then saw it as missing and recreated it
         // every run, forever, without ever converging.
+        // `obj_description(…, 'pg_type')` is the enum's own `COMMENT ON TYPE`,
+        // which the enum file carries and the parser reads back.
         let sql = format!(
-            "SELECT n.nspname, t.typname, e.enumlabel \
+            "SELECT n.nspname, t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') AS comment \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
              LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
@@ -513,12 +515,14 @@ impl PostgresAdapter {
         // map entry (via `.or_default()`) even though nothing is pushed to it,
         // because its single row carries a NULL `enumlabel` rather than
         // contributing no rows at all.
-        let mut map: indexmap::IndexMap<(String, String), Vec<EnumValue>> = indexmap::IndexMap::new();
+        let mut map: indexmap::IndexMap<(String, String), (Vec<EnumValue>, Option<String>)> = indexmap::IndexMap::new();
         for row in &rows {
             let schema: String = row.get("nspname");
             let typname: String = row.get("typname");
             let label: Option<String> = row.get("enumlabel");
-            let values = map.entry((schema, typname)).or_default();
+            let comment: Option<String> = row.get("comment");
+            let (values, type_comment) = map.entry((schema, typname)).or_default();
+            *type_comment = comment;
             if let Some(label) = label {
                 values.push(EnumValue {
                     name: label,
@@ -529,9 +533,10 @@ impl PostgresAdapter {
 
         let entities = map
             .into_iter()
-            .map(|((schema, typname), values)| {
+            .map(|((schema, typname), (values, comment))| {
                 let mut e = Entity::new(EntityType::Enum, &format!("{schema}.{typname}"));
                 e.enum_values = values;
+                e.comment = comment;
                 e
             })
             .collect();
@@ -1161,9 +1166,10 @@ impl PostgresAdapter {
             let cache_size: i64 = row.get("cache_size");
 
             // Deterministic, fully-explicit CREATE SEQUENCE for fidelity. Quoting
-            // matches the rest of the emitter (q()).
+            // matches the rest of the emitter (q()). `IF NOT EXISTS`: a reversed
+            // project is applied back to the database it was read from.
             let mut ddl = format!(
-                "CREATE SEQUENCE \"{schema}\".\"{name}\" AS {seq_type} \
+                "CREATE SEQUENCE IF NOT EXISTS \"{schema}\".\"{name}\" AS {seq_type} \
                  INCREMENT BY {increment_by} MINVALUE {min_value} MAXVALUE {max_value} \
                  START WITH {start_value} CACHE {cache_size}"
             );
@@ -1988,6 +1994,95 @@ impl DatabaseAdapter for PostgresAdapter {
     /// merge/init) — this reads only what reconcile's create/skip/restamp/
     /// recreate decision needs. Returns the comment unparsed (see the trait
     /// doc); `reconcile::parse_dbd_hash` extracts the sentinel.
+    async fn existing_objects(
+        &self,
+        objects: &[(EntityType, String)],
+    ) -> Result<std::collections::HashSet<(EntityType, String)>> {
+        // One query per catalog, each answering with the 1-based positions of
+        // the names it found. A relation or type is looked up by its quoted
+        // qualified name, so a name is never re-read through the search_path;
+        // `to_regclass`/`to_regtype` return NULL for a missing one.
+        let mut groups: std::collections::HashMap<&'static str, Vec<(usize, String)>> = Default::default();
+        for (i, (kind, name)) in objects.iter().enumerate() {
+            let (catalog, key) = match kind {
+                EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence => {
+                    ("relation", crate::sql_quote::qualified(name))
+                }
+                EntityType::Enum => ("type", crate::sql_quote::qualified(name)),
+                EntityType::Function | EntityType::Procedure => ("routine", name.clone()),
+                EntityType::Role => ("role", name.clone()),
+                EntityType::Schema => ("schema", name.clone()),
+                EntityType::Extension => ("extension", name.clone()),
+                _ => continue,
+            };
+            groups.entry(catalog).or_default().push((i, key));
+        }
+        let mut found = std::collections::HashSet::new();
+        for (catalog, entries) in groups {
+            let test = match catalog {
+                "relation" => "to_regclass(u.n) IS NOT NULL",
+                "type" => "to_regtype(u.n) IS NOT NULL",
+                "routine" => {
+                    "EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace \
+                     WHERE s.nspname || '.' || p.proname = u.n)"
+                }
+                "role" => "EXISTS (SELECT 1 FROM pg_roles WHERE rolname = u.n)",
+                "schema" => "EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = u.n)",
+                _ => "EXISTS (SELECT 1 FROM pg_extension WHERE extname = u.n)",
+            };
+            let names: Vec<&str> = entries.iter().map(|(_, n)| n.as_str()).collect();
+            let hits: Vec<i64> = sqlx::query_scalar(&format!(
+                "SELECT u.i FROM unnest($1::text[]) WITH ORDINALITY AS u(n, i) WHERE {test}"
+            ))
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("checking which {catalog}s exist failed: {e}")))?;
+            for hit in hits {
+                if let Some((i, _)) = usize::try_from(hit - 1).ok().and_then(|at| entries.get(at)) {
+                    found.insert(objects[*i].clone());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn roles_held_elsewhere(&self, roles: &[String]) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if roles.is_empty() {
+            return Ok(Default::default());
+        }
+        // `pg_shdepend` is the server's record of what each role holds in each
+        // database — grants, default privileges, ownership, policies — readable
+        // from any of them. A database's own owner is recorded on the database.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT r.rolname::text, db.datname::text \
+             FROM pg_shdepend d \
+             JOIN pg_roles r ON r.oid = d.refobjid \
+             JOIN pg_database db ON db.oid = d.dbid \
+             WHERE d.refclassid = 'pg_authid'::regclass \
+               AND d.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND r.rolname = ANY($1) \
+             UNION \
+             SELECT r.rolname::text, db.datname::text \
+             FROM pg_database db JOIN pg_roles r ON r.oid = db.datdba \
+             WHERE db.datname <> current_database() AND r.rolname = ANY($1) \
+             ORDER BY 1, 2",
+        )
+        .bind(roles)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading what the project's roles hold elsewhere failed: {e}")))?;
+        let mut held: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (role, database) in rows {
+            held.entry(role).or_default().push(database);
+        }
+        Ok(held)
+    }
+
+    async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        self.introspect_matviews().await
+    }
+
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
         let sql = format!(

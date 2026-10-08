@@ -293,7 +293,7 @@ fn quote_ident(s: &str) -> String {
 /// Always protects the true system schemas. On a `supabase` target, also
 /// protects the full Supabase-managed set (including `public`). On `postgres`,
 /// `public` is a normal project schema and is dropped.
-fn schema_is_protected(schema: &str, target: &str) -> bool {
+pub(crate) fn schema_is_protected(schema: &str, target: &str) -> bool {
     if ALWAYS_PROTECTED.contains(&schema) {
         return true;
     }
@@ -350,6 +350,43 @@ pub fn build_reset_script(
     schemas: &[String],
     grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<Option<String>, String> {
+    build_reset_script_keeping(
+        entities,
+        roles,
+        extensions,
+        target,
+        drop_schemas,
+        drop_extensions,
+        schemas,
+        grants,
+        &[],
+    )
+}
+
+/// [`build_reset_script`], keeping the roles named in `keep`: their grants in
+/// this database are revoked like every other role's, but they are not
+/// dropped.
+///
+/// A role is server-wide, and one this design declares may hold privileges or
+/// objects in another database on the same server — one built from the same
+/// design. Dropping it there breaks that database; trying failed this reset.
+/// The caller decides which to keep from the server's catalogs (see
+/// [`crate::adapter::DatabaseAdapter::roles_held_elsewhere`]). Revoking a kept
+/// role's grants here still matters: they are this database's, and left in
+/// place they would keep the role "held elsewhere" from the other database's
+/// own reset, so no reset would ever drop it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_reset_script_keeping(
+    entities: &[&Entity],
+    roles: &[RoleEntry],
+    extensions: &[String],
+    target: &str,
+    drop_schemas: bool,
+    drop_extensions: bool,
+    schemas: &[String],
+    grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    keep: &[String],
+) -> Result<Option<String>, String> {
     let mut lines = entity_drop_lines(entities);
 
     // ── Optional schema DROPs (filtered by protected rules) ───
@@ -374,7 +411,7 @@ pub fn build_reset_script(
     // ── Role DROPs (postgres only, reverse order) ─────────────
     if target == "postgres" {
         lines.extend(revoke_grant_lines(roles, grants, &dropped_schemas));
-        for role in roles.iter().rev() {
+        for role in roles.iter().rev().filter(|r| !keep.contains(&r.name)) {
             lines.push(role_drop_block(&role.name));
         }
     }
@@ -383,6 +420,125 @@ pub fn build_reset_script(
         return Ok(None);
     }
     Ok(Some(lines.join("\n")))
+}
+
+/// The reset script for a subset scope: the scope's own objects, dropped
+/// without `CASCADE`, all or nothing.
+///
+/// `CASCADE` reaches past the scope: dropping an in-scope enum took the column
+/// of an out-of-scope table that used it, with its data. So nothing here
+/// cascades — not the objects, schemas or extensions — and Postgres itself
+/// decides what depends on what, columns, defaults and objects dbd never made
+/// included. Without `CASCADE` the drops must run dependents first, so they
+/// follow `entities` (apply order) in reverse rather than grouping by kind:
+/// a view calling an in-scope function goes before it. Extensions go before
+/// schemas, which may hold them.
+///
+/// The drops share one block: if any is refused because something outside the
+/// scope depends on it, every drop rolls back and the error names the object
+/// and its dependents (Postgres's `DETAIL`, which the driver's message leaves
+/// out), each by its schema. Roles are a full reset's alone and never appear
+/// here.
+pub fn build_scoped_reset_script(
+    entities: &[&Entity],
+    extensions: &[String],
+    target: &str,
+    drop_schemas: bool,
+    drop_extensions: bool,
+    schemas: &[String],
+) -> Option<String> {
+    let mut drops = Vec::new();
+    let mut seen_routines = std::collections::HashSet::new();
+    for e in entities.iter().rev() {
+        let schema = entity_schema(e);
+        let (_, bare) = crate::entity::split_qualified_name(&e.name);
+        let qualified = format!("\"{}\".\"{}\"", quote_ident(schema), quote_ident(&bare));
+        match e.entity_type {
+            EntityType::Function | EntityType::Procedure => {
+                if seen_routines.insert((schema.to_string(), bare.clone())) {
+                    drops.push(format!(
+                        "FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p\n    \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace\n    \
+                         WHERE n.nspname = '{}' AND p.proname = '{}'\n  \
+                         LOOP EXECUTE format('DROP ROUTINE IF EXISTS %s', r.sig); END LOOP;",
+                        sql_quote_escape(schema),
+                        sql_quote_escape(&bare)
+                    ));
+                }
+            }
+            EntityType::MaterializedView => drops.push(format!("DROP MATERIALIZED VIEW IF EXISTS {qualified};")),
+            EntityType::View => drops.push(format!("DROP VIEW IF EXISTS {qualified};")),
+            EntityType::Table => drops.push(format!("DROP TABLE IF EXISTS {qualified};")),
+            EntityType::Sequence => drops.push(format!("DROP SEQUENCE IF EXISTS {qualified};")),
+            EntityType::Enum => drops.push(format!("DROP TYPE IF EXISTS {qualified};")),
+            _ => {}
+        }
+    }
+    if drop_extensions {
+        for ext in extensions {
+            drops.push(format!("DROP EXTENSION IF EXISTS \"{}\";", quote_ident(ext)));
+        }
+    }
+    if drop_schemas {
+        for schema in schemas.iter().filter(|s| !schema_is_protected(s, target)) {
+            drops.push(format!("DROP SCHEMA IF EXISTS \"{}\";", quote_ident(schema)));
+        }
+    }
+    if drops.is_empty() {
+        return None;
+    }
+    // An empty search_path, local to the block's transaction, so Postgres
+    // names every object in the refusal by its schema: it qualifies only what
+    // the session's path does not reach, and a pooled session's path is
+    // whatever the last DDL file `SET`.
+    Some(format!(
+        "DO $dbd_reset$ DECLARE r record; what text; held text; BEGIN\n  \
+         PERFORM set_config('search_path', '', true);\n  {}\n\
+         EXCEPTION WHEN dependent_objects_still_exist THEN\n  \
+         GET STACKED DIAGNOSTICS what = MESSAGE_TEXT, held = PG_EXCEPTION_DETAIL;\n  \
+         RAISE EXCEPTION 'scoped reset refused, nothing was dropped — %: %. A scoped reset drops only \
+         what its scope holds, and never cascades: add the dependents to the scope, or reset without --scope.', \
+         what, replace(held, E'\\n', '; ') USING ERRCODE = 'dependent_objects_still_exist';\n\
+         END $dbd_reset$;",
+        drops.join("\n  ")
+    ))
+}
+
+/// The reset script for a SQLite database: `DROP VIEW` and `DROP TABLE IF
+/// EXISTS "name";` for each of the project's views and tables, `entities`
+/// given in apply order and dropped in reverse.
+///
+/// SQLite has no schemas, extensions, roles, sequences or enums, and no
+/// `CASCADE` — the PostgreSQL script failed on its first `"public"."items"
+/// CASCADE`. Its drop of a table a foreign key still references fails too, and
+/// SQLite reads no reference out of a verbatim DDL file to order by, so the
+/// drops run in one transaction with every foreign key deferred to its
+/// commit (`PRAGMA defer_foreign_keys`, which the commit itself resets), by
+/// when the tables that hold the keys are gone as well. An index or trigger
+/// goes with its table.
+pub fn build_sqlite_reset_script(entities: &[&Entity]) -> Option<String> {
+    let drops: Vec<String> = entities
+        .iter()
+        .rev()
+        .filter_map(|e| {
+            let kind = match e.entity_type {
+                EntityType::View => "VIEW",
+                EntityType::Table => "TABLE",
+                _ => return None,
+            };
+            // A SQLite name is bare; a schema-qualified one names `main`'s
+            // table the adapter strips it to.
+            let (_, bare) = crate::entity::split_qualified_name(&e.name);
+            Some(format!("DROP {kind} IF EXISTS {};", crate::sql_quote::ident(&bare)))
+        })
+        .collect();
+    if drops.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "BEGIN;\nPRAGMA defer_foreign_keys = ON;\n{}\nCOMMIT;",
+        drops.join("\n")
+    ))
 }
 
 /// The privileges a grant entry's perms confer, split the way
@@ -467,17 +623,23 @@ fn revoke_grant_lines(
 /// A role that still holds a privilege or owns an object cannot be dropped, and
 /// Postgres says so as `role "x" cannot be dropped because some objects depend
 /// on it` — the *what* is only in the error's DETAIL, which the driver's
-/// message leaves out. The refusal stands (reset revokes only what dbd granted,
-/// and never `DROP OWNED BY`, which would drop objects the project does not
-/// own); this only makes it say which role and why.
+/// message leaves out. The refusal stands (reset revokes only the schema grants
+/// design.yaml declares, and never `DROP OWNED BY`, which would drop objects
+/// the project does not own); this only makes it say which role and why.
+///
+/// It does not say *who* granted what is left: it said "privileges dbd did not
+/// grant", which was false for the grants dbd made in another database, and is
+/// for any a hook or policy file made. What reset can say is that it does not
+/// revoke them.
 fn role_drop_block(role: &str) -> String {
     format!(
         "DO $$ DECLARE held text; BEGIN\n  \
          DROP ROLE IF EXISTS \"{}\";\n\
          EXCEPTION WHEN dependent_objects_still_exist THEN\n  \
          GET STACKED DIAGNOSTICS held = PG_EXCEPTION_DETAIL;\n  \
-         RAISE EXCEPTION 'reset cannot drop role \"%\" — it still holds privileges dbd did not grant, \
-         or owns objects: %. Revoke or reassign them, then re-run reset.', '{}', \
+         RAISE EXCEPTION 'reset cannot drop role \"%\" — it still holds privileges or owns objects \
+         reset does not revoke (it revokes only the schema grants design.yaml declares): %. \
+         Revoke or reassign them, then re-run reset.', '{}', \
          replace(held, E'\\n', '; ') USING ERRCODE = 'dependent_objects_still_exist';\n\
          END $$;",
         quote_ident(role),

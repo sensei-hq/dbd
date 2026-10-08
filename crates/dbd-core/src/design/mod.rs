@@ -15,6 +15,7 @@ use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
 mod apply;
+mod env_guard;
 mod hooks;
 mod import;
 mod plan;
@@ -23,6 +24,7 @@ mod reset;
 mod scope;
 
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
+pub use reset::{KeptRole, ResetComplete};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]
@@ -2168,6 +2170,48 @@ import:
             !scoped.contains("DROP EXTENSION"),
             "hub installs no extension: {scoped}"
         );
+    }
+
+    /// A scoped reset must not reach past its scope, and `CASCADE` is how it
+    /// did: dropping an in-scope enum took an out-of-scope table's column with
+    /// it. Not one statement of a scoped reset cascades — schemas and
+    /// extensions included — while the full reset keeps its `CASCADE`.
+    #[test]
+    fn a_scoped_reset_script_never_cascades() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/enum/app"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n\
+             \x20   extensions:\n      - pgcrypto\n\
+             scopes:\n  moods:\n    includes: [app.mood]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/app/mood.ddl"),
+            "create type app.mood as enum ('a');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key, m app.mood);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let moods = design.resolve_scope(Some("moods"), None).unwrap();
+        let scoped = design
+            .reset_script("postgres", true, true, Some(&moods))
+            .unwrap()
+            .unwrap();
+        assert!(scoped.contains("DROP TYPE IF EXISTS \"app\".\"mood\""), "{scoped}");
+        assert!(!scoped.contains("CASCADE"), "a scoped reset never cascades: {scoped}");
+
+        let all = design.reset_script("postgres", true, true, None).unwrap().unwrap();
+        assert!(all.contains("CASCADE"), "the full reset still does: {all}");
     }
 
     /// A role the design granted on a schema cannot be dropped while it holds

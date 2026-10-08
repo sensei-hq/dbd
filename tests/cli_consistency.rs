@@ -1269,3 +1269,115 @@ fn an_adhoc_import_dry_run_names_its_scope() {
         stdout(&out)
     );
 }
+
+// ── schemas and extensions belong in design.yaml ────────────────────────────
+
+/// `init --from-db` wrote each extension as `ddl/extension/<name>.ddl`, a
+/// folder the scanner does not read: `inspect` refused the project while
+/// `doctor` said "No issues found". Extensions and schemas are declared in
+/// design.yaml, and both commands must say so about a file in either folder.
+#[test]
+fn inspect_and_doctor_agree_that_extensions_and_schemas_are_declared_in_design_yaml() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "design.yaml", "project:\n  name: folders\n\nschemas:\n  - app\n");
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id int);\n",
+    );
+    write(
+        dir,
+        "ddl/extension/citext.ddl",
+        "create extension if not exists \"citext\" with schema \"public\";\n",
+    );
+    write(dir, "ddl/schema/app.ddl", "create schema if not exists \"app\";\n");
+
+    let inspect = dbd(dir, &["inspect"]);
+    let said = format!("{}{}", stdout(&inspect), stderr(&inspect));
+    assert!(!inspect.status.success(), "inspect must refuse the file: {said}");
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("extensions:"),
+        "inspect must say where an extension is declared: {said}"
+    );
+
+    let doctor = dbd(dir, &["doctor"]);
+    let said = format!("{}{}", stdout(&doctor), stderr(&doctor));
+    assert!(
+        !said.contains("No issues found"),
+        "doctor must agree with inspect: {said}"
+    );
+    assert!(
+        said.contains("ddl/extension/citext.ddl") && said.contains("`citext`") && said.contains("extensions:"),
+        "doctor must name the extension file and the entry that replaces it: {said}"
+    );
+    assert!(
+        said.contains("ddl/schema/app.ddl") && said.contains("schemas:"),
+        "doctor must name the schema file dbd does not read: {said}"
+    );
+}
+
+// ── reset: the targets its help names, SQLite included ──────────────────────
+
+/// `reset --help` named postgres or supabase, `--target` accepted any word,
+/// and on a SQLite project — the design's own target — every reset failed on
+/// PostgreSQL's `"public"."items" CASCADE`. The values the help names are the
+/// ones accepted, and a SQLite database resets.
+#[test]
+fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
+    let help = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["reset", "--help"])
+        .output()
+        .unwrap();
+    let help = stdout(&help);
+    for target in ["postgres", "supabase", "sqlite"] {
+        assert!(help.contains(target), "--help must name `{target}`: {help}");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: lite\n\nsource:\n  dialect: sqlite\n\ntarget:\n  sqlite:\n    url: $DATABASE_URL\n\nschemas: []\n",
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+    write(
+        dir,
+        "ddl/table/parts.ddl",
+        "CREATE TABLE IF NOT EXISTS parts (id INTEGER PRIMARY KEY, item_id INTEGER REFERENCES items(id));\n",
+    );
+    let url = format!("sqlite://{}", dir.join("app.db").display());
+
+    let o = dbd(dir, &["reset", "--target", "mysql", "--dry-run"]);
+    assert!(!o.status.success(), "an unknown --target must be refused");
+    assert!(
+        stderr(&o).contains("sqlite"),
+        "and the refusal names what is accepted: {}",
+        stderr(&o)
+    );
+
+    let o = dbd(dir, &["-e", "dev", "apply", "-d", &url]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+    let o = dbd(dir, &["-e", "dev", "reset", "--dry-run"]);
+    assert!(o.status.success(), "reset --dry-run: {}{}", stdout(&o), stderr(&o));
+    assert!(
+        !stdout(&o).contains("CASCADE") && !stdout(&o).contains("\"public\""),
+        "SQLite has neither CASCADE nor schemas: {}",
+        stdout(&o)
+    );
+    let o = dbd(dir, &["-e", "dev", "reset", "-d", &url]);
+    assert!(o.status.success(), "reset: {}{}", stdout(&o), stderr(&o));
+    let o = dbd(dir, &["-e", "dev", "apply", "-d", &url]);
+    assert!(
+        o.status.success(),
+        "the reset database applies again: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}

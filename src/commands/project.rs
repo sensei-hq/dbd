@@ -122,9 +122,14 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
     // Misfiled view/matview DDL — detection only; the fix is a manual move.
     let mismatches = dbd_core::doctor::detect_ddl_type_mismatches(project_dir);
+    // Extension/schema files the scanner does not read — detection only; the
+    // fix is a design.yaml entry, named for each.
+    let parsed_config = dbd_core::config::read(config).ok();
+    let declared_files = dbd_core::doctor::detect_declared_kind_files(project_dir, parsed_config.as_ref());
 
     let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
-    let total_issues = auto_fixable + mismatches.len();
+    let by_hand = mismatches.len() + declared_files.len();
+    let total_issues = auto_fixable + by_hand;
 
     // doctor counts issues, not entities: the shared entity summary printed
     // "0 entities — no issues" here on a project full of tables.
@@ -134,6 +139,7 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     }
 
     report_doctor_issues(&config_issues, &stale_files, &plural_dirs, &mismatches);
+    report_declared_kind_files(&declared_files);
 
     if !fix {
         if auto_fixable > 0 {
@@ -141,6 +147,9 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         }
         if !mismatches.is_empty() {
             output::always("Misfiled DDL files must be moved manually (see above).");
+        }
+        if !declared_files.is_empty() {
+            output::always("Extension and schema files must be replaced by hand (see above).");
         }
         output::always(&format!("\n{} found.", issues(total_issues)));
         return Ok(());
@@ -169,13 +178,53 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
         }
     }
-    output::always(&format!(
-        "\n{} fixed, {} left to move by hand.",
-        issues(fixed),
-        mismatches.len()
-    ));
+    if !declared_files.is_empty() {
+        output::always(&format!(
+            "\n{} left unchanged — replace by hand (see above).",
+            files(declared_files.len(), "extension/schema file")
+        ));
+    }
+    output::always(&format!("\n{} fixed, {by_hand} left to fix by hand.", issues(fixed)));
 
     Ok(())
+}
+
+/// `1 <what>` / `N <what>s`.
+fn files(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Print each `ddl/extension/` and `ddl/schema/` file with the design.yaml
+/// entry that replaces it.
+fn report_declared_kind_files(found: &[dbd_core::doctor::DeclaredKindFile]) {
+    use dbd_core::doctor::DeclaredKind;
+    if found.is_empty() {
+        return;
+    }
+    output::always(&format!(
+        "\nFound {} dbd does not read (design.yaml declares extensions and schemas):",
+        files(found.len(), "DDL file")
+    ));
+    for f in found {
+        let fix = match (f.kind, f.declared) {
+            (DeclaredKind::Extension, true) => format!(
+                "`{}` is already in the target's extensions: list — delete the file",
+                f.name
+            ),
+            (DeclaredKind::Extension, false) => {
+                let entry = match &f.schema {
+                    None => format!("`{}`", f.name),
+                    Some(schema) => format!("`{{ name: {}, schema: {schema} }}`", f.name),
+                };
+                format!("add {entry} to the target's extensions: list in design.yaml, then delete the file")
+            }
+            (DeclaredKind::Schema, true) => format!("`{}` is already listed under schemas: — delete the file", f.name),
+            (DeclaredKind::Schema, false) => {
+                format!("list `{}` under schemas: in design.yaml, then delete the file", f.name)
+            }
+        };
+        output::always(&format!("  - {} → {fix}", f.path.display()));
+    }
 }
 
 /// `1 issue` / `N issues`.

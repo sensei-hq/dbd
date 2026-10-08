@@ -926,9 +926,7 @@ impl Entity {
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
-            entity.errors.push(format!(
-                "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
-            ));
+            entity.errors.push(unread_folder_error(folder));
         }
         entity
     }
@@ -1003,6 +1001,28 @@ impl Entity {
     }
 }
 
+/// Why a file under `ddl/<folder>/` is not read, for a folder that names no
+/// entity type.
+///
+/// Schemas and extensions are real kinds, but design.yaml declares them —
+/// `schemas:` and the target's `extensions:` — so a file for one says where
+/// it belongs rather than only that its folder is unknown (`dbd doctor` names
+/// the entry to write).
+fn unread_folder_error(folder: &str) -> String {
+    match folder {
+        "extension" | "extensions" => format!(
+            "ddl/{folder}/ is not read: extensions are declared in design.yaml, in the target's \
+             `extensions:` list (`dbd doctor` names the entry)"
+        ),
+        "schema" | "schemas" => {
+            format!("ddl/{folder}/ is not read: schemas are declared in design.yaml, under `schemas:`")
+        }
+        _ => format!(
+            "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
+        ),
+    }
+}
+
 /// Split "schema.name" into (Some("schema"), "name"), or (None, "name").
 pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
     match name.split_once('.') {
@@ -1015,6 +1035,20 @@ pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// `ddl/extension/` and `ddl/schema/` are not DDL folders: both kinds are
+    /// declared in design.yaml. The scanner said only "unrecognized DDL folder",
+    /// which left the reader to guess where an extension goes instead.
+    #[test]
+    fn a_file_under_ddl_extension_or_ddl_schema_is_pointed_at_design_yaml() {
+        let ext = Entity::from_file(Path::new("ddl/extension/citext.ddl"));
+        let said = ext.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("extensions:"), "{said}");
+
+        let schema = Entity::from_file(Path::new("ddl/schema/app.ddl"));
+        let said = schema.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("schemas:"), "{said}");
+    }
 
     #[test]
     fn entity_type_from_folder_name() {
