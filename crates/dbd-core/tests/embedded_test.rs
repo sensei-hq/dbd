@@ -3820,6 +3820,60 @@ async fn dbd_schema_excluded_from_introspect_and_survives() {
     assert_table_exists(&*adapter, "dbd", "migrations").await;
 }
 
+/// What an extension owns is the extension's: `CREATE EXTENSION` makes it and
+/// `DROP EXTENSION` removes it. Introspection left out only its functions, so
+/// `init --from-db` wrote an extension's tables, views, sequences and types
+/// into the project as the project's own — and `reset` then failed on every
+/// run, "cannot drop view … because extension … requires it". `diff` and
+/// `reconcile` read the same introspection, so it leaves out everything an
+/// extension owns, schemas included, and keeps the project's own objects —
+/// a table whose columns use an extension's types among them.
+#[tokio::test]
+async fn introspection_leaves_out_every_object_an_extension_owns() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    // pg_cron and PostGIS are not on the embedded server; `ALTER EXTENSION …
+    // ADD` makes an object an extension's exactly as its install script does.
+    adapter
+        .execute_script(
+            "CREATE EXTENSION citext; \
+             CREATE SCHEMA ext_own; ALTER EXTENSION citext ADD SCHEMA ext_own; \
+             CREATE TABLE public.ext_cfg (id int PRIMARY KEY); ALTER EXTENSION citext ADD TABLE public.ext_cfg; \
+             CREATE VIEW public.ext_v AS SELECT 1 AS x; ALTER EXTENSION citext ADD VIEW public.ext_v; \
+             CREATE MATERIALIZED VIEW public.ext_mv AS SELECT 1 AS x; \
+             ALTER EXTENSION citext ADD MATERIALIZED VIEW public.ext_mv; \
+             CREATE SEQUENCE public.ext_seq; ALTER EXTENSION citext ADD SEQUENCE public.ext_seq; \
+             CREATE TYPE public.ext_e AS ENUM ('a'); ALTER EXTENSION citext ADD TYPE public.ext_e; \
+             CREATE FUNCTION public.ext_f() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+             ALTER EXTENSION citext ADD FUNCTION public.ext_f(); \
+             CREATE TABLE public.mine (id int PRIMARY KEY, e public.ext_e, email citext);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for owned in [
+        "ext_own",
+        "public.ext_cfg",
+        "public.ext_v",
+        "public.ext_mv",
+        "public.ext_seq",
+        "public.ext_e",
+        "public.ext_f",
+    ] {
+        assert!(
+            !names.contains(&owned),
+            "{owned} is citext's, not the project's: {names:?}"
+        );
+    }
+    assert!(
+        names.contains(&"public.mine"),
+        "the project's own table stays: {names:?}"
+    );
+    assert!(names.contains(&"citext"), "and the extension itself: {names:?}");
+}
+
 // ── Reconcile convergence: PRIMARY KEY replacement ────────────────────────────
 
 /// End-to-end: `dbd reconcile` must be able to REPLACE a composite PRIMARY KEY on
