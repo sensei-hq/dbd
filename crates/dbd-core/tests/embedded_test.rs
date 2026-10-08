@@ -5558,7 +5558,7 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
         &*first,
         true,
         "SELECT 1 WHERE has_table_privilege('app_writer', 'app.t', 'INSERT')",
-        "app_writer's grant in the first database",
+        "the grant to app_writer in the first database",
     )
     .await;
 
