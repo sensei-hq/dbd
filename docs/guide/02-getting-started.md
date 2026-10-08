@@ -147,7 +147,7 @@ dbd apply -e dev
 ```
 
 Preview the order — offline, or, when a database is configured, checked against
-it the way the real run checks it, with its pending migrations listed:
+its scope pin and recorded version, with the pending migrations listed:
 
 ```sh
 dbd apply --dry-run
