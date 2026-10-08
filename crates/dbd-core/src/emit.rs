@@ -729,6 +729,58 @@ mod tests {
         assert_eq!(checks, [Some("qty_positive".to_string()), None]);
     }
 
+    /// A key's name is its identity to whatever catches a violation of it, and
+    /// `init --from-db` dropped every one but a CHECK's: a fresh apply named
+    /// `people_region_fk` `people_region_id_fkey`, and a custom primary-key
+    /// or unique name likewise became Postgres's own.
+    #[test]
+    fn named_keys_round_trip_with_their_names() {
+        let ddl = "create table app.people (\n  id int,\n  code text,\n  region_id int,\n  \
+                   constraint people_pk primary key (id),\n  constraint people_code_uq unique (code),\n  \
+                   constraint people_region_fk foreign key (region_id) references app.regions (id)\n);";
+        let path = std::path::Path::new("ddl/table/app/people.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+
+        let reparsed = crate::parser::parse_entity(path, &emit_table(&entity)).unwrap();
+        let names: Vec<Option<String>> = reparsed
+            .table_def
+            .unwrap()
+            .constraints
+            .into_iter()
+            .map(|c| match c {
+                crate::entity::TableConstraint::PrimaryKey { name, .. }
+                | crate::entity::TableConstraint::Unique { name, .. }
+                | crate::entity::TableConstraint::Check { name, .. } => name,
+                crate::entity::TableConstraint::ForeignKey(fk) => fk.name,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("people_pk".to_string()),
+                Some("people_code_uq".to_string()),
+                Some("people_region_fk".to_string())
+            ]
+        );
+    }
+
+    /// An enum's `COMMENT ON TYPE` was read by the parser and dropped by the
+    /// emitter, so `init --from-db` lost it — as a view's comment once was.
+    #[test]
+    fn an_enums_comment_is_emitted() {
+        let mut e = Entity::new(EntityType::Enum, "app.mood");
+        e.enum_values = vec![EnumValue {
+            name: "happy".into(),
+            note: None,
+        }];
+        e.comment = Some("how a person's day went".into());
+        assert_eq!(
+            emit_enum(&e),
+            "CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+             COMMENT ON TYPE \"app\".\"mood\" IS 'how a person''s day went';"
+        );
+    }
+
     #[test]
     fn emit_entity_dispatches_by_type() {
         let s = Entity::new(EntityType::Schema, "shop");

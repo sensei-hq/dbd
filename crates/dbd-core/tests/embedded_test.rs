@@ -5394,3 +5394,52 @@ async fn apply_stamps_an_unstamped_matview_only_when_its_deployed_definition_is_
         "a different deployed definition must stay unverified: {drift:?}"
     );
 }
+
+// ── init --from-db keeps key names and an enum's comment ──────────────────────
+
+/// `init --from-db` rebuilt `people_region_fk` as Postgres's own
+/// `people_region_id_fkey`, and dropped the enum's `COMMENT ON TYPE` — neither
+/// of which `diff` can see. Introspection reads both, and the emitted DDL must
+/// carry both, as it carries a CHECK's name and a view's comment.
+#[tokio::test]
+async fn reverse_engineering_keeps_key_names_and_an_enums_own_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.mood AS ENUM ('happy', 'sad'); \
+             COMMENT ON TYPE app.mood IS 'how a person''s day went'; \
+             CREATE TABLE app.regions (id int CONSTRAINT regions_pk PRIMARY KEY); \
+             CREATE TABLE app.people (id int PRIMARY KEY, code text, region_id int, mood app.mood, \
+               CONSTRAINT people_code_uq UNIQUE (code), \
+               CONSTRAINT people_region_fk FOREIGN KEY (region_id) REFERENCES app.regions (id));",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let emitted = |name: &str| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} introspected"));
+        dbd_core::emit::emit_entity(e).unwrap_or_default()
+    };
+
+    let mood = emitted("app.mood");
+    assert!(
+        mood.contains(r#"COMMENT ON TYPE "app"."mood" IS 'how a person''s day went';"#),
+        "{mood}"
+    );
+    let people = emitted("app.people");
+    for named in [
+        r#"CONSTRAINT "people_region_fk" FOREIGN KEY"#,
+        r#"CONSTRAINT "people_code_uq" UNIQUE"#,
+        r#"CONSTRAINT "people_pkey" PRIMARY KEY"#,
+    ] {
+        assert!(people.contains(named), "{named} in:\n{people}");
+    }
+    let regions = emitted("app.regions");
+    assert!(regions.contains(r#"CONSTRAINT "regions_pk" PRIMARY KEY"#), "{regions}");
+}
