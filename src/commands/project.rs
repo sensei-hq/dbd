@@ -478,6 +478,12 @@ pub async fn cmd_deploy(
         for warning in design.import_warnings(None).into_iter().chain(skips) {
             output::warn(&warning);
         }
+        // The import's `import.after` hooks, judged as `import --dry-run` and
+        // the real deploy judge them.
+        let (_, after_skips) = design.import_after_preview(Some(&resolved))?;
+        for warning in after_skips {
+            output::warn(&warning);
+        }
 
         // The policy phase's own scope filter, counted the way the real
         // deploy's summary counts it.
