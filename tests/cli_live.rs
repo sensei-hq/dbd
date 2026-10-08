@@ -509,7 +509,88 @@ fn exported_widgets(dir: &Path, url: &str) -> String {
         &["export", "-n", "app.widgets", "-f", "csv", "-o", out.to_str().unwrap()],
     );
     assert!(o.status.success(), "export failed: {}", combined(&o));
-    std::fs::read_to_string(out.join("widgets.csv")).expect("export wrote widgets.csv")
+    std::fs::read_to_string(out.join("app/widgets.csv")).expect("export wrote app/widgets.csv")
+}
+
+// ── Where an export writes ──────────────────────────────────────────────────
+
+/// `core.accounts` and `staging.accounts` — the shape of every project that
+/// stages a live table under its own name.
+fn same_named_tables_project(dir: &Path) {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: twins\n\n\
+         source:\n  dialect: postgresql\n\nschemas:\n  - staging\n  - core\n",
+    )
+    .unwrap();
+    for schema in ["staging", "core"] {
+        let t = dir.join(format!("ddl/table/{schema}"));
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join("accounts.ddl"),
+            format!("set search_path to {schema};\ncreate table if not exists accounts (id integer, name text);\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// `-o dir` wrote every table flat as `dir/<table>.<fmt>`, so the second of
+/// two same-named tables overwrote the first while the summary counted both.
+/// Each table gets `dir/<schema>/<table>.<fmt>` — the layout of the default
+/// `export/`, and the `import/<schema>/<table>` layout an import reads.
+#[tokio::test]
+async fn export_to_a_directory_keeps_same_named_tables_from_different_schemas_apart() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    same_named_tables_project(dir);
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::write(dir.join("staged.jsonl"), "{\"id\":1,\"name\":\"staged\"}\n").unwrap();
+    std::fs::write(dir.join("live.jsonl"), "{\"id\":2,\"name\":\"live\"}\n").unwrap();
+    for (table, file) in [("staging.accounts", "staged.jsonl"), ("core.accounts", "live.jsonl")] {
+        let o = dbd(dir, &url, &["import", "-n", table, "-f", file]);
+        assert!(o.status.success(), "{}", combined(&o));
+    }
+
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("Exporting 2 table(s)"), "{}", combined(&o));
+
+    let staged = std::fs::read_to_string(out.join("staging/accounts.csv")).expect("staging/accounts.csv");
+    let live = std::fs::read_to_string(out.join("core/accounts.csv")).expect("core/accounts.csv");
+    assert_eq!(staged, "id,name\n1,staged\n");
+    assert_eq!(live, "id,name\n2,live\n");
+    assert!(!out.join("accounts.csv").exists(), "nothing is written flat");
+}
+
+/// `-s` says where the project is, and the default `export/` is the
+/// project's — it was written under whatever directory dbd ran in.
+#[tokio::test]
+async fn the_default_export_directory_is_the_projects() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("project");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    project(&dir);
+    assert!(dbd(&dir, &url, &["apply"]).status.success());
+
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["export", "-s", dir.to_str().unwrap(), "-d", &url])
+        .current_dir(&elsewhere)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(
+        dir.join("export/app/widgets.csv").exists(),
+        "written under the project: {}",
+        combined(&o)
+    );
+    assert!(!elsewhere.join("export").exists(), "and not where dbd ran");
 }
 
 /// `dbd import -n <table> -f <file>.jsonl` loads one file outside the import
