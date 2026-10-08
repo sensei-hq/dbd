@@ -1254,6 +1254,44 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
 }
 
+// ── a file with no SET search_path is named by the runs that execute it ─────
+
+/// A DDL file that states no `SET search_path` resolves its unqualified names
+/// against a path nobody wrote into it. The design says that is never silent —
+/// `inspect` counts these files and `apply`/`deploy` print them — but only
+/// `inspect` did. The runs that execute the file, and their previews, name it.
+#[tokio::test]
+async fn apply_and_deploy_name_a_file_that_states_no_search_path() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("ddl/table/app/pathless.ddl"),
+        "create table if not exists app.pathless (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["apply"],
+        &["deploy", "--dry-run"],
+        &["deploy"],
+    ] {
+        let o = dbd(dir, &url, args);
+        let out = combined(&o);
+        if !o.status.success() {
+            failures.push(format!("{args:?} failed: {out}"));
+        } else if !out.contains("pathless.ddl states no `SET search_path`") {
+            failures.push(format!("{args:?} does not name the file: {out}"));
+        } else if out.contains("widgets.ddl states no") {
+            failures.push(format!("{args:?} names a file that states one: {out}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 // ── a dry run checks every guard its real run checks ────────────────────────
 
 /// The audit's repro. With a database to ask, `apply`, `deploy` and `import
