@@ -90,8 +90,11 @@ pub struct MigrationStepPreview {
 pub enum MigrationAction {
     /// A migration added it; its DDL creates it.
     Create,
-    /// A migration altered it; its `.sql` and `.data.sql` run.
+    /// A migration altered it; its `.sql` runs.
     Migrate,
+    /// A migration altered it; its `.data.sql` runs, after every schema change
+    /// of the same version.
+    Data,
     /// A migration dropped it; its drop script runs where it still exists.
     Drop,
 }

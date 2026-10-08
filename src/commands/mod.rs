@@ -702,6 +702,7 @@ pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::
         let action = match step.action {
             MigrationAction::Create => "create",
             MigrationAction::Migrate => "migrate",
+            MigrationAction::Data => "migrate data of",
             MigrationAction::Drop => "drop",
         };
         let note = match (step.action, step.runs) {

@@ -48,14 +48,22 @@ impl Design {
         let owned: Vec<Entity> = entities.iter().map(|e| (*e).clone()).collect();
         let plan = build_execution_plan(&owned, from_version, to_version, &pending, working_set.as_ref());
 
+        // The version each step belongs to: the plan records a version after
+        // its last step, so walking backwards the next record is its own.
+        let mut versions: Vec<u32> = Vec::with_capacity(plan.steps.len());
+        let mut recorded = to_version;
+        for step in plan.steps.iter().rev() {
+            if let ExecutionStep::RecordMigration { version, .. } = step {
+                recorded = *version;
+            }
+            versions.push(recorded);
+        }
+        versions.reverse();
+
         let mut steps = Vec::new();
-        for step in &plan.steps {
+        for (step, version) in plan.steps.iter().zip(versions) {
             match step {
                 ExecutionStep::CreateEntity(entity) => {
-                    let version = pending
-                        .iter()
-                        .find(|m| m.added.iter().any(|a| a == entity))
-                        .map_or(to_version, |m| m.to_version);
                     steps.push(MigrationStepPreview {
                         version,
                         entity: entity.clone(),
@@ -64,18 +72,31 @@ impl Design {
                         runs: true,
                     });
                 }
+                // An altered entity with no `.sql` of its own — a table whose
+                // version only maps data — runs nothing at this step.
                 ExecutionStep::MigrateEntity {
                     entity_name,
                     migration_sql_path,
                     migration_version,
-                } => {
-                    let mut statements = planned_statements(migration_sql_path)?;
-                    statements.extend(planned_statements(&migration_sql_path.with_extension("data.sql"))?);
+                } if migration_sql_path.exists() => {
                     steps.push(MigrationStepPreview {
                         version: *migration_version,
                         entity: entity_name.clone(),
                         action: MigrationAction::Migrate,
-                        statements,
+                        statements: planned_statements(migration_sql_path)?,
+                        runs: true,
+                    });
+                }
+                ExecutionStep::MigrateData {
+                    entity_name,
+                    data_sql_path,
+                    migration_version,
+                } => {
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Data,
+                        statements: planned_statements(data_sql_path)?,
                         runs: true,
                     });
                 }
@@ -93,7 +114,8 @@ impl Design {
                         runs,
                     });
                 }
-                ExecutionStep::ApplyEntity(_)
+                ExecutionStep::MigrateEntity { .. }
+                | ExecutionStep::ApplyEntity(_)
                 | ExecutionStep::RecordMigration { .. }
                 | ExecutionStep::SetVersion(_) => {}
             }
@@ -529,12 +551,26 @@ impl Design {
                         let sql = crate::source_text::read_to_string(migration_sql_path)?;
                         adapter.execute_script(&sql).await?;
                     }
-                    let data_path = migration_sql_path.with_extension("data.sql");
-                    if data_path.exists() {
-                        let sql = crate::source_text::read_to_string(&data_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
                     Ok(())
+                }
+                .await;
+                report_step_result(&desc, on_done, result)?;
+                counts.migrated(entity_name);
+            }
+            ExecutionStep::MigrateData {
+                entity_name,
+                data_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
+                    .map(|e| e.entity_type.tag())
+                    .unwrap_or_else(|| "entity".to_string());
+                let desc = format!("migrate data {type_tag}:{entity_name} → v{migration_version}");
+                on_start(&desc);
+                let result: Result<()> = async {
+                    let sql = crate::source_text::read_to_string(data_sql_path)?;
+                    adapter.execute_script(&sql).await
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
