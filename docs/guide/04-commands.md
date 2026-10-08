@@ -227,7 +227,7 @@ names each hook the run would skip (see
 `⚠ after-script … skipped — needs …` line the real run prints before it starts.
 
 With a database configured — `-d`, `$DATABASE_URL`, or a `target.url` that
-resolves — the dry run asks it what the run would: it refuses a database
+resolves — the dry run asks it two of the run's questions: it refuses a database
 [pinned](#scope-guard) to another scope and one newer than the project (below),
 and lists the pending migrations the run executes before the entities, each
 statement that destroys something marked `⚠`:
