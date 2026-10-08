@@ -5,7 +5,7 @@ files:
 
 | Question | Managed by | Applied by |
 |---|---|---|
-| Can a role use the schema and its tables at all? | `grants:` in `design.yaml` | `dbd apply`, `dbd deploy` |
+| Can a role use the schema and its tables at all? | `grants:` in `design.yaml` | `dbd apply`, `dbd deploy`, `dbd reconcile` |
 | Is the schema reachable from outside the database? | `exposed:` in `design.yaml` | nothing — it drives a report |
 | Which rows can a role see? | RLS policies in `policies/` | `dbd deploy`, `dbd policies`, `dbd apply --with-policies` |
 
@@ -64,9 +64,11 @@ anything else belong in an [`apply.after` hook](03-design-yaml.md#apply).
 
 ### When they are applied
 
-`dbd apply` and `dbd deploy` both apply grants, once the schema is in place:
-after every entity, migration and `apply.after` hook, and before the import
-phase and the policies. An application embedding dbd gets them from
+`dbd apply`, `dbd deploy` and `dbd reconcile` apply grants, once the schema is
+in place: after every entity, migration and `apply.after` hook, and before the
+import phase and the policies. Reconcile grants after its writes, as apply does,
+because a reconciled database is meant to be the one an apply builds — before
+0.25 it was left with none. An application embedding dbd gets them from
 `Design::deploy` the same way, or from `Design::apply_grants` on its own.
 
 They are not applied by `--dry-run`. Under `--scope`, only the grants on
@@ -82,9 +84,16 @@ the `DROP ROLE`s, reset revokes exactly what `apply` granted those roles — the
 `USAGE`, the table privileges and the `ALTER DEFAULT PRIVILEGES` entry, from the
 same merged `schemas:` and target `grants:` — on every schema that survives the
 reset. The default-privileges entry it can revoke is the one set by the user
-running the reset; run reset as the user that ran `apply`. A role that still
-holds anything dbd did not grant fails the reset with an error naming the role
-and what it holds, and dbd never runs `DROP OWNED BY`. See
+running the reset; run reset as the user that ran `apply`.
+
+Roles are server-wide, so a role another database on the server still holds
+something in is kept, and named (`Role reader kept: it holds privileges or
+objects in database other — …`); its grants here are revoked all the same. A
+role that still holds anything else here — a grant dbd did not make, an object
+it owns — fails the reset with an error naming the role and what it holds
+(`reset cannot drop role "writer" — it still holds privileges or owns objects
+reset does not revoke (it revokes only the schema grants design.yaml declares):
+…`), and dbd never runs `DROP OWNED BY`. See
 [`dbd reset`](04-commands.md#dbd-reset).
 
 ### PostgREST on Supabase
@@ -176,4 +185,6 @@ boundary.
 database pinned to `hub`, an unscoped run — or one under any other scope — is
 refused rather than securing tables that database was not built with. It has no
 `--allow-scope-change`, because it never re-pins; run it under the pinned scope,
-or re-point the database with `dbd apply --allow-scope-change` first.
+or re-point the database with `dbd apply --allow-scope-change` first. With a
+database configured, `dbd policies --dry-run` checks the pin as well, so the
+preview refuses where the run would.
