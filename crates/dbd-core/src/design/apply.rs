@@ -625,12 +625,13 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(DeployComplete),
     {
-        // The import phase's refusals (`Design::check_import_plan`) — a data
+        // The import phase's refusals (`Design::scoped_import_plan`) — a data
         // file outside `import.staging`, a staging table whose loader dbd
-        // cannot pick — are known before the first statement.
-        // Checked here, not when the import phase reaches them, so a refusal
-        // never leaves the deploy half done: schema applied, data not loaded.
-        self.check_import_plan(None)?;
+        // cannot pick, a loader the scope leaves out — are known before the
+        // first statement. Checked here, not when the import phase reaches
+        // them, so a refusal never leaves the deploy half done: schema
+        // applied, data not loaded.
+        self.scoped_import_plan(None, scope)?;
 
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;

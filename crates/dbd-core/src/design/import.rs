@@ -283,6 +283,10 @@ impl Design {
     /// scope's to judge). A proc-less entry needs its own table. Checking the
     /// targets alone kept an import whose staging table the scope never built.
     ///
+    /// A kept entry whose loader the scope leaves out is refused: the scope's
+    /// database has no such procedure, and the run would truncate and load
+    /// staging, commit every loader before it, and then fail on the `CALL`.
+    ///
     /// The one rule for `import`, `deploy`, and both commands' `--dry-run`.
     /// `None` or the all-scope keeps the whole plan. Refuses what
     /// [`Design::check_import_plan`] refuses, so no preview can show a plan
@@ -321,6 +325,21 @@ impl Design {
                 )),
                 None => kept.push(entry),
             }
+        }
+        let unbuilt: Vec<String> = kept
+            .iter()
+            .filter_map(|e| e.procedure.as_ref().map(|p| (&e.table.name, p)))
+            .filter(|(_, procedure)| !ws.contains(*procedure))
+            .map(|(table, procedure)| format!("  {table} → call {procedure}()"))
+            .collect();
+        if !unbuilt.is_empty() {
+            return Err(DbdError::Config(format!(
+                "import refused: scope '{}' leaves out the loader of these staging tables, so a database \
+                 built with it has no such procedure:\n{}\nAdd each loader to the scope, or leave its staging \
+                 table out of the scope too.",
+                scope.name,
+                unbuilt.join("\n")
+            )));
         }
         Ok((kept, skips))
     }
