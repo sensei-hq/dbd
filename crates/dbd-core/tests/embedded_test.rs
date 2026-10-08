@@ -6951,3 +6951,188 @@ async fn a_hook_stating_no_path_in_a_project_with_none_runs_on_the_session_defau
     .await;
     assert_catalog(&*adapter, false, "SELECT 1 FROM zeta.items", "a row in zeta.items").await;
 }
+
+// ── Enum value removal: a live matview blocks, the type keeps its comment ────
+
+/// The enum, a table using it, a matview reading the column, and one that
+/// reads the table but not the column.
+fn matview_over_enum_files(values: &str) -> [(String, String); 4] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/mood_counts.ddl".to_string(),
+            "set search_path to app;\n\
+             create materialized view if not exists mood_counts as select mood, count(*) as n from people group by mood;\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/people_count.ddl".to_string(),
+            "set search_path to app;\ncreate materialized view if not exists people_count as select count(*) as n from people;\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn matview_over_enum_design(dir: &std::path::Path, values: &str) -> Design {
+    let files = matview_over_enum_files(values);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    write_project(
+        dir,
+        "project:\n  name: matview_block_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &files,
+    )
+}
+
+/// Reconcile decided whether a materialized view blocked an enum value's
+/// removal from the design, so it could never remove one while the design had
+/// a matview over the table: dropping the matview by hand, as told, and
+/// re-running re-created it and declined again — and every run exited 0,
+/// "Reconciled". It now asks the database which matviews read the column, and
+/// refuses, before any write and with a non-zero exit, naming them and the
+/// steps. A matview that reads the table but not the column blocks nothing.
+#[tokio::test]
+async fn reconcile_refuses_an_enum_value_removal_a_live_matview_blocks_and_goes_on_once_it_is_dropped() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "matview_block_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    matview_over_enum_design(dir, "'ok', 'meh', 'bad'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("build");
+
+    let design = matview_over_enum_design(dir, "'ok', 'bad'");
+    let err = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect_err("a live matview over the column blocks the removal")
+        .to_string();
+    for needed in ["app.mood_counts", "DROP MATERIALIZED VIEW", "dbd reconcile", "meh"] {
+        assert!(err.contains(needed), "the refusal names {needed}: {err}");
+    }
+    assert!(
+        !err.contains("people_count"),
+        "a matview not reading the column blocks nothing: {err}"
+    );
+    let dry = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect_err("the dry run refuses as the run does")
+        .to_string();
+    assert_eq!(dry, err);
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,meh,bad}'",
+        "the untouched enum",
+    )
+    .await;
+
+    adapter
+        .execute_script("DROP MATERIALIZED VIEW app.mood_counts;")
+        .await
+        .expect("drop it, as told");
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("with the matview gone, the value goes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    for matview in ["mood_counts", "people_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = '{matview}'"),
+            &format!("matview app.{matview}"),
+        )
+        .await;
+    }
+}
+
+/// Removing a value renames the type aside and creates it again; its `COMMENT
+/// ON TYPE` stayed on the old one and went with it — in reconcile and in the
+/// migration `dbd snapshot` writes — and `diff` cannot see the loss.
+#[tokio::test]
+async fn removing_an_enum_value_keeps_the_enums_comment() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("migrated").await.unwrap();
+    let reconciled = connect(&url, "enum_comment_test").await.unwrap();
+    let migrated = connect(&pg.settings().url("migrated"), "enum_comment_test")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: enum_comment_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let files = |values: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "ddl/enum/app/mood.ddl".to_string(),
+                format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+            ),
+            (
+                "ddl/table/app/people.ddl".to_string(),
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                    .to_string(),
+            ),
+        ]
+    };
+    let version = |values: &str, description: &str| {
+        let f = files(values);
+        let f: Vec<(&str, &str)> = f.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+        cut_version(dir, yaml, &f, &[], description);
+    };
+    let comment = "SELECT 1 WHERE obj_description('app.mood'::regtype, 'pg_type') = 'how they feel'";
+
+    version("'ok', 'meh', 'bad'", "v1");
+    let v1 = released(dir);
+    v1.reconcile(&*reconciled, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile builds v1");
+    v1.apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("apply builds v1");
+
+    version("'ok', 'bad'", "drop meh");
+    for todo in dbd_core::snapshot::scan_data_sql_todos(dir).unwrap() {
+        let sql = std::fs::read_to_string(&todo.file).unwrap();
+        let resolved: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("-- TODO"))
+            .map(|l| format!("{}\n", l.replace("'???'", "'ok'")))
+            .collect();
+        std::fs::write(&todo.file, resolved).unwrap();
+    }
+    let design = released(dir);
+    design
+        .reconcile(&*reconciled, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile removes meh");
+    design
+        .apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("the migration removes meh");
+
+    for db in [&reconciled, &migrated] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+            "enum app.mood without meh",
+        )
+        .await;
+        assert_catalog(&**db, true, comment, "the comment on app.mood").await;
+    }
+}

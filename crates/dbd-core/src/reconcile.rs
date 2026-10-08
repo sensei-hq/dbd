@@ -4339,12 +4339,15 @@ mod enum_recreation_tests {
         );
     }
 
-    /// dbd never auto-drops a materialized view — a `DROP … CASCADE` would
-    /// repopulate it and take its dependents with it. So a matview over the
-    /// affected table is the one case recreation cannot do, and it must say so
-    /// rather than emit SQL Postgres will reject halfway through.
+    /// Whether a materialized view blocks the swap is a fact about the
+    /// database: one dropped by hand blocks nothing, and one the design does
+    /// not declare still does. The design's matviews decided it, so dropping
+    /// the matview as told and re-running declined again, forever. The planner
+    /// now plans the swap and records the columns it moves, which the caller
+    /// checks against the live database (`Design::reconcile`); and it never
+    /// emits `DROP VIEW` for a matview, which fails on one that exists.
     #[test]
-    fn a_dependent_materialized_view_refuses_loudly_instead_of_half_applying() {
+    fn a_design_matview_over_the_column_is_left_to_the_live_check() {
         let live = snap(
             vec![table("app", "t", vec![col("c", "app.colour", None)])],
             vec![enum_snap("app", "colour", &["red", "green", "blue"])],
@@ -4356,20 +4359,26 @@ mod enum_recreation_tests {
         let entities = vec![
             entity(EntityType::Table, "app.t", &[]),
             entity(EntityType::MaterializedView, "app.mv", &["app.t"]),
+            entity(EntityType::View, "app.v", &["app.t"]),
         ];
         let mut plan = ReconcilePlan::default();
         plan_enum_recreation(&mut plan, &live, &desired, &entities);
 
-        assert!(
-            plan.altered.iter().all(|s| s.entity_name != "app.colour"),
-            "no partial recreation may be planned"
-        );
-        assert!(
-            plan.warnings
-                .iter()
-                .any(|w| w.contains("app.mv") && w.contains("app.colour")),
-            "the blocked recreation must be reported; got {:?}",
-            plan.warnings
+        let sql = &plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the swap is planned")
+            .sql;
+        assert!(sql.contains("DROP VIEW IF EXISTS app.v;"), "{sql}");
+        assert!(!sql.contains("app.mv"), "a matview is never dropped by the swap: {sql}");
+        assert_eq!(
+            plan.enum_swaps,
+            vec![EnumSwap {
+                enum_name: "app.colour".to_string(),
+                removed: vec!["blue".to_string()],
+                columns: vec![("app.t".to_string(), "c".to_string())],
+            }]
         );
     }
 
