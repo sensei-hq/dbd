@@ -56,12 +56,36 @@ pub struct ApplyComplete {
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
 /// into [`ApplyComplete`] once the plan finishes.
+///
+/// `applied` and `migrated` count entities, as [`ApplyComplete`] says they do,
+/// not steps: an entity a migration adds is created and may then be migrated
+/// and re-applied, and one altered by two pending migrations runs two
+/// migration files. Counted per step, a design of 35 entities reported "36
+/// applied".
 #[derive(Default)]
 struct ApplyCounts {
     applied: u32,
     migrated: u32,
     created: u32,
     dropped: u32,
+    counted_applied: std::collections::HashSet<String>,
+    counted_migrated: std::collections::HashSet<String>,
+}
+
+impl ApplyCounts {
+    /// Count `entity` as applied, once however many steps applied it.
+    fn applied(&mut self, entity: &str) {
+        if self.counted_applied.insert(entity.to_string()) {
+            self.applied += 1;
+        }
+    }
+
+    /// Count `entity` as migrated, once however many migration files it ran.
+    fn migrated(&mut self, entity: &str) {
+        if self.counted_migrated.insert(entity.to_string()) {
+            self.migrated += 1;
+        }
+    }
 }
 
 /// Summary passed to the `on_complete` callback of `import_data()`.

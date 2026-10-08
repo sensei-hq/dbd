@@ -51,6 +51,17 @@ pub struct ExecutionPlan {
 /// Build an execution plan based on entity state and pending migrations.
 ///
 /// Pure logic — no I/O. The caller is responsible for executing the steps.
+///
+/// `entities` are the ones the run acts on, already narrowed to its scope —
+/// [`crate::Design::apply`] passes what `entities_in_scope` keeps. Every
+/// strategy plans exactly those. `scope_names`, the scope's working set, is
+/// consulted only for what is no longer in the design: a migration's dropped
+/// tables, which belong to the scope that occupies their schema.
+///
+/// The migrate plan used to filter `entities` by `scope_names` a second time.
+/// That set names schemas and tables, and never the roles and extensions every
+/// scope keeps, so a scoped migration skipped a new role and a new extension —
+/// and failed on the first table using the extension's type.
 pub fn build_execution_plan(
     entities: &[Entity],
     db_version: u32,
@@ -104,16 +115,14 @@ fn plan_current(valid_entities: &[&Entity]) -> ExecutionPlan {
     }
 }
 
-/// Migrate forward: create/alter/apply in-scope entities, run drop scripts,
-/// record each pending migration, and stamp the latest version.
+/// Migrate forward: create/alter/apply the run's entities, run the drop scripts
+/// of its scope, record each pending migration, and stamp the latest version.
 fn plan_migrate(
     valid_entities: &[&Entity],
     pending_migrations: &[PendingMigration],
     latest_version: u32,
     scope_names: Option<&std::collections::HashSet<String>>,
 ) -> ExecutionPlan {
-    let in_scope = |n: &str| scope_names.is_none_or(|s| s.contains(n));
-
     // Collect all added/altered across all pending migrations
     let all_added: std::collections::HashSet<&str> = pending_migrations
         .iter()
@@ -127,24 +136,27 @@ fn plan_migrate(
     let mut steps: Vec<ExecutionStep> = Vec::new();
 
     for entity in valid_entities {
-        if !in_scope(entity.name.as_str()) {
-            continue;
-        }
-        if all_added.contains(entity.name.as_str()) {
+        let added = all_added.contains(entity.name.as_str());
+        let altered = all_altered.contains(entity.name.as_str());
+        if added {
             steps.push(ExecutionStep::CreateEntity(entity.name.clone()));
         }
-        if all_altered.contains(entity.name.as_str()) {
+        if altered {
             push_migrate_steps_for(&entity.name, pending_migrations, &mut steps);
         }
-        // Every in-scope entity (added, altered, or unchanged) re-applies its DDL.
-        steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
+        // Every entity of the run re-applies its DDL, after any migration step
+        // so it lands on the migrated object. A new one already ran exactly
+        // that DDL to be created; running it again was a second identical step.
+        if !added || altered {
+            steps.push(ExecutionStep::ApplyEntity(entity.name.clone()));
+        }
     }
 
     // A dropped table is gone from the design, so it is in no working set: it
     // belongs to a scope that occupies its schema, as it did while it existed.
     // Apply runs the drop only where the table still exists.
     let drop_in_scope = |n: &str| {
-        in_scope(n)
+        scope_names.is_none_or(|s| s.contains(n))
             || crate::entity::split_qualified_name(n)
                 .0
                 .is_some_and(|schema| scope_names.is_some_and(|s| s.contains(&schema)))

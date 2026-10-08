@@ -395,7 +395,7 @@ impl Design {
                     let result = adapter.apply_entity(entity).await;
                     report_step_result(&desc, on_done, result)?;
                     counts.created += 1;
-                    counts.applied += 1;
+                    counts.applied(entity_name);
                 }
             }
             ExecutionStep::ApplyEntity(entity_name) => {
@@ -404,7 +404,7 @@ impl Design {
                     on_start(&desc);
                     let result = adapter.apply_entity(entity).await;
                     report_step_result(&desc, on_done, result)?;
-                    counts.applied += 1;
+                    counts.applied(entity_name);
                 }
             }
             ExecutionStep::MigrateEntity {
@@ -434,7 +434,7 @@ impl Design {
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
-                counts.migrated += 1;
+                counts.migrated(entity_name);
             }
             ExecutionStep::DropEntity {
                 entity_name,
