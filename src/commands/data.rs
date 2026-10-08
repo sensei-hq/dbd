@@ -123,6 +123,8 @@ pub fn cmd_import_dry_run(
         };
         let qualified = resolve_table_name(&design, name);
         let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(&design, &resolved, &qualified)?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
@@ -245,6 +247,10 @@ pub(crate) async fn import_with_adapter(
         };
         let qualified = resolve_table_name(design, name);
         let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        // Said as every scoped run says it — the ad-hoc load is checked
+        // against the scope too, and was the one import path silent about it.
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(design, &resolved, &qualified)?;
         check_pinned_scope(adapter, &resolved, PINNED).await?;
         let format = format_from_ext(path);
