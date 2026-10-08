@@ -1112,4 +1112,21 @@ SELECT 1;
         assert_eq!(nonempty.len(), 2, "got: {nonempty:#?}");
         assert!(nonempty[0].contains("LANGUAGE plpgsql"));
     }
+
+    /// The formatter knew only `$$`: a `$tag$` body was split at each `;` in
+    /// it, a blank line went in at every split, and `keyword_case: upper`
+    /// uppercased the body's `end`. In every keyword case the body is one
+    /// statement and comes out byte for byte.
+    #[test]
+    fn a_tag_quoted_body_is_one_statement_and_kept_as_written() {
+        let body = "$body$\nbegin\n  -- select stays; here\n  return 'x';\nend;\n$body$";
+        let input = format!("create or replace function f() returns text language plpgsql as {body};\nselect 1;\n");
+        let blocks = super::split_statements(&input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(nonempty.len(), 2, "the body ends no statement: {nonempty:#?}");
+        for case in [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve] {
+            let out = format_ddl(&input, &in_case(case.clone()));
+            assert!(out.contains(body), "{case:?} keeps the body as written:\n{out}");
+        }
+    }
 }
