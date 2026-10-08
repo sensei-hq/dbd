@@ -859,6 +859,59 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     assert_eq!(row["body"], "first run set search_path to app; then load");
 }
 
+// ── Test: a JSON key naming no column is refused ──────────────────────────────
+
+/// A CSV header naming a column the table lacks is refused, on Postgres and
+/// SQLite, and so is a SQLite JSON key. A Postgres JSON import loaded only the
+/// keys that matched a column and dropped the rest without a word — a typo'd
+/// key left its column empty and the import reported success.
+#[tokio::test]
+async fn a_json_key_naming_no_column_is_refused_naming_the_key_and_the_file() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    for (file, body, format) in [
+        (
+            "people.jsonl",
+            "{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"nmae\": \"beta\"}\n",
+            "jsonl",
+        ),
+        (
+            "people.json",
+            "[{\"id\": 1, \"name\": \"alpha\"}, {\"id\": 2, \"nmae\": \"beta\"}]",
+            "json",
+        ),
+    ] {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.people");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+
+        let err = adapter
+            .import_data(&entity, "", false)
+            .await
+            .expect_err("a key naming no column must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'nmae'") && msg.contains(file) && msg.contains("app.people"),
+            "{format}: the key, the file and the table are named: {msg}"
+        );
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM app.people",
+            &format!("a row loaded from {file}"),
+        )
+        .await;
+    }
+}
+
 // ── Test: an export format dbd cannot write is refused ────────────────────────
 
 /// Any format but `tsv` and `jsonl` fell through to CSV, and the file was still
