@@ -395,10 +395,13 @@ impl DatabaseAdapter for SqliteAdapter {
         match format {
             "csv" | "tsv" => {
                 let sep = if format == "tsv" { '\t' } else { ',' };
-                output.push_str(&columns.join(&sep.to_string()));
+                let header: Vec<String> = columns.iter().map(|c| delimited_cell(Some(c), sep)).collect();
+                output.push_str(&header.join(&sep.to_string()));
                 output.push('\n');
                 for row in &rows {
-                    let cells: Vec<String> = (0..columns.len()).map(|i| sqlite_cell_to_text(row, i)).collect();
+                    let cells: Vec<String> = (0..columns.len())
+                        .map(|i| delimited_cell(sqlite_cell_to_text(row, i).as_deref(), sep))
+                        .collect();
                     output.push_str(&cells.join(&sep.to_string()));
                     output.push('\n');
                 }
@@ -883,17 +886,34 @@ impl JsonBindable {
     }
 }
 
-fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+/// A cell's text, `None` for NULL — kept apart from `''`, which a delimited
+/// export has to write differently.
+fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Option<String> {
     if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
-        return v.unwrap_or_default();
+        return v;
     }
     if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
-    String::new()
+    None
+}
+
+/// One CSV/TSV field as Postgres's `COPY … CSV` writes it, so the RFC 4180
+/// reader on the other side — this adapter's or Postgres's — reads back what
+/// was there: NULL is an empty field, `''` is `""`, and a value holding the
+/// delimiter, a quote or a line break is quoted with its quotes doubled.
+/// Joined bare, a comma in a value split the row, and NULL and `''` both came
+/// out empty.
+fn delimited_cell(value: Option<&str>, sep: char) -> String {
+    match value {
+        None => String::new(),
+        Some("") => "\"\"".to_string(),
+        Some(v) if v.contains([sep, '"', '\n', '\r']) => format!("\"{}\"", v.replace('"', "\"\"")),
+        Some(v) => v.to_string(),
+    }
 }
 
 fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json::Value {
