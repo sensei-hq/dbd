@@ -858,3 +858,124 @@ async fn a_file_with_no_search_path_runs_on_source_search_path() {
         "the combined script runs like apply"
     );
 }
+
+// ── Every command that reaches a pinned database checks the pin ─────────────
+
+/// `apply`, `deploy`, `reconcile`, `reset` and `policies` refuse another scope
+/// on a database pinned to one. `refresh` did not: on a `hub` database it
+/// refreshed the other scope's matview and failed partway. And the `policies`,
+/// `apply` and `deploy` dry runs, given a database with `-d`, never asked it
+/// for its pin — previewing a run the guard then refused.
+///
+/// Each now checks the pin whenever it has a database to ask, and lets the
+/// pinned scope (or `--allow-scope-change`, where the run takes it) through.
+#[tokio::test]
+async fn refresh_and_the_dry_runs_refuse_another_scope_on_a_pinned_database() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let mv = dir.join("ddl/materialized_view/app");
+    std::fs::create_dir_all(&mv).unwrap();
+    std::fs::write(
+        mv.join("user_count.ddl"),
+        "set search_path to app;\ncreate materialized view if not exists user_count as select count(*) as n from users;\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("policies/app")).unwrap();
+    std::fs::write(
+        dir.join("policies/app/users.sql"),
+        "alter table app.users enable row level security;\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    for args in [
+        &["refresh"][..],
+        &["policies", "--dry-run"],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?} on a hub database: {}", combined(&o));
+        assert!(
+            combined(&o).contains("pinned to scope 'hub'"),
+            "{args:?} is refused by the scope guard, naming the pin: {}",
+            combined(&o)
+        );
+    }
+
+    for args in [
+        &["refresh", "--scope", "hub"][..],
+        &["policies", "--dry-run", "--scope", "hub"],
+        &["apply", "--dry-run", "--scope", "hub"],
+        &["deploy", "--dry-run", "--scope", "hub"],
+        &["apply", "--dry-run", "--allow-scope-change"],
+        &["deploy", "--dry-run", "--allow-scope-change"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?} is let through: {}", combined(&o));
+    }
+}
+
+// ── apply --dry-run names the pending migrations ────────────────────────────
+
+/// `dbd <args>` with no database: no `-d`, and no `$DATABASE_URL` to fall back on.
+fn dbd_offline(dir: &Path, args: &[&str]) -> Output {
+    Command::cargo_bin("dbd")
+        .unwrap()
+        .args(args)
+        .args(["-c", dir.join("design.yaml").to_str().unwrap()])
+        .env_remove("DATABASE_URL")
+        .current_dir(dir)
+        .output()
+        .expect("dbd failed to run")
+}
+
+/// `apply --dry-run` listed the entities it would apply and never the pending
+/// migrations — not even one that drops a table — though the run executes them
+/// first. With a database to read the recorded version from, the preview lists
+/// each migration step the run would take and the statements it runs, a drop
+/// marked; with none, it says it cannot.
+#[tokio::test]
+async fn apply_dry_run_lists_the_pending_migrations() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let legacy = dir.join("ddl/table/app/legacy.ddl");
+    std::fs::write(
+        &legacy,
+        "set search_path to app;\ncreate table if not exists legacy (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "v1"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::remove_file(&legacy).unwrap();
+    let o = dbd(dir, &url, &["snapshot", "-n", "drop legacy"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "apply --dry-run failed: {}", combined(&o));
+    let out = stdout(&o);
+    assert!(
+        out.lines()
+            .any(|l| l.contains("DROP TABLE") && l.contains("app.legacy") && l.trim_start().starts_with('⚠')),
+        "the drop is listed, and marked: {out}"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("v2") && l.contains("app.legacy")),
+        "under the version that drops it: {out}"
+    );
+
+    let o = dbd_offline(dir, &["apply", "--dry-run"]);
+    assert!(o.status.success(), "the offline preview still runs: {}", combined(&o));
+    assert!(
+        combined(&o).contains("pending migrations are not listed"),
+        "and says what it cannot show: {}",
+        combined(&o)
+    );
+}

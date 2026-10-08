@@ -1672,10 +1672,11 @@ mod tests {
     /// constructing an adapter.
     #[tokio::test]
     async fn apply_dry_run_lists_entities() {
+        let proj = testutil::offline_fixture_project();
         cmd_apply(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*name*/ None,
             /*dry_run*/ true,
@@ -1693,10 +1694,11 @@ mod tests {
     /// "no policy files" path without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_without_policy_dir() {
+        let proj = testutil::offline_fixture_project();
         cmd_policies(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*dry_run*/ true,
             None,
@@ -1799,10 +1801,11 @@ mod tests {
     /// short-circuit the all-scope tests take).
     #[tokio::test]
     async fn apply_dry_run_lists_entities_for_named_scope() {
+        let proj = testutil::offline_fixture_project();
         cmd_apply(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*name*/ None,
             /*dry_run*/ true,
@@ -1820,7 +1823,7 @@ mod tests {
     /// it would apply, still without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_lists_existing_policy_files() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");

@@ -738,6 +738,23 @@ pub(crate) mod testutil {
         copy_dir(&fixtures(), tmp.path()).unwrap();
         tmp
     }
+
+    /// [`copy_fixture_project`] with the fixture's `url: $DATABASE_URL`
+    /// removed, for a dry run that must find no database. A dry run asks the
+    /// database when one is configured — for its scope pin and its version —
+    /// and a `$DATABASE_URL` set in the shell running the tests would otherwise
+    /// give it one.
+    pub(crate) fn offline_fixture_project() -> tempfile::TempDir {
+        let tmp = copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
+        tmp
+    }
 }
 
 #[cfg(test)]

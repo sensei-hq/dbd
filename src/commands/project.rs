@@ -908,9 +908,9 @@ mod tests {
     /// so it never opens a DB connection.
     #[tokio::test]
     async fn deploy_dry_run_from_local_source() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -931,7 +931,7 @@ mod tests {
     /// error. Guards against the regression where deploy silently skipped RLS.
     #[tokio::test]
     async fn deploy_dry_run_includes_policies() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         cmd_deploy(
@@ -1119,9 +1119,9 @@ mod tests {
     /// of the (local, no-DB) dry-run flow proceeds.
     #[tokio::test]
     async fn deploy_clears_cache_before_dry_run() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
@@ -1189,9 +1189,9 @@ mod tests {
     /// gap never reaches (it bails earlier, in `check_scope_gaps`).
     #[tokio::test]
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
+            src.path().to_str().unwrap(),
             Path::new("design.yaml"),
             "dev",
             None,
