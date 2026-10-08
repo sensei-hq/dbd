@@ -1859,6 +1859,59 @@ impl DatabaseAdapter for PostgresAdapter {
     /// merge/init) — this reads only what reconcile's create/skip/restamp/
     /// recreate decision needs. Returns the comment unparsed (see the trait
     /// doc); `reconcile::parse_dbd_hash` extracts the sentinel.
+    async fn existing_objects(
+        &self,
+        objects: &[(EntityType, String)],
+    ) -> Result<std::collections::HashSet<(EntityType, String)>> {
+        // One query per catalog, each answering with the 1-based positions of
+        // the names it found. A relation or type is looked up by its quoted
+        // qualified name, so a name is never re-read through the search_path;
+        // `to_regclass`/`to_regtype` return NULL for a missing one.
+        let mut groups: std::collections::HashMap<&'static str, Vec<(usize, String)>> = Default::default();
+        for (i, (kind, name)) in objects.iter().enumerate() {
+            let (catalog, key) = match kind {
+                EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence => {
+                    ("relation", crate::sql_quote::qualified(name))
+                }
+                EntityType::Enum => ("type", crate::sql_quote::qualified(name)),
+                EntityType::Function | EntityType::Procedure => ("routine", name.clone()),
+                EntityType::Role => ("role", name.clone()),
+                EntityType::Schema => ("schema", name.clone()),
+                EntityType::Extension => ("extension", name.clone()),
+                _ => continue,
+            };
+            groups.entry(catalog).or_default().push((i, key));
+        }
+        let mut found = std::collections::HashSet::new();
+        for (catalog, entries) in groups {
+            let test = match catalog {
+                "relation" => "to_regclass(u.n) IS NOT NULL",
+                "type" => "to_regtype(u.n) IS NOT NULL",
+                "routine" => {
+                    "EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace \
+                     WHERE s.nspname || '.' || p.proname = u.n)"
+                }
+                "role" => "EXISTS (SELECT 1 FROM pg_roles WHERE rolname = u.n)",
+                "schema" => "EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = u.n)",
+                _ => "EXISTS (SELECT 1 FROM pg_extension WHERE extname = u.n)",
+            };
+            let names: Vec<&str> = entries.iter().map(|(_, n)| n.as_str()).collect();
+            let hits: Vec<i64> = sqlx::query_scalar(&format!(
+                "SELECT u.i FROM unnest($1::text[]) WITH ORDINALITY AS u(n, i) WHERE {test}"
+            ))
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("checking which {catalog}s exist failed: {e}")))?;
+            for hit in hits {
+                if let Some((i, _)) = usize::try_from(hit - 1).ok().and_then(|at| entries.get(at)) {
+                    found.insert(objects[*i].clone());
+                }
+            }
+        }
+        Ok(found)
+    }
+
     async fn live_matviews(&self) -> Result<Vec<Entity>> {
         self.introspect_matviews().await
     }

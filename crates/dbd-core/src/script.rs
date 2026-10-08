@@ -207,7 +207,7 @@ fn quote_ident(s: &str) -> String {
 /// Always protects the true system schemas. On a `supabase` target, also
 /// protects the full Supabase-managed set (including `public`). On `postgres`,
 /// `public` is a normal project schema and is dropped.
-fn schema_is_protected(schema: &str, target: &str) -> bool {
+pub(crate) fn schema_is_protected(schema: &str, target: &str) -> bool {
     if ALWAYS_PROTECTED.contains(&schema) {
         return true;
     }

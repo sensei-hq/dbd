@@ -87,7 +87,7 @@ pub async fn cmd_reset(
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    reset_with_adapter(
+    let summary = reset_with_adapter(
         &*adapter,
         &design,
         target,
@@ -97,7 +97,54 @@ pub async fn cmd_reset(
         &resolved,
         allow_scope_change,
     )
-    .await
+    .await?;
+    for line in format_reset_summary(&summary) {
+        output::info(verbosity, &line);
+    }
+    Ok(())
+}
+
+/// What a reset did, as `dbd reset` prints it: what it dropped, counted by
+/// kind — and the roles by name, since a role outlives any one database — or
+/// that it found nothing to drop. It printed nothing at all, so a reset that
+/// emptied the schema and one that found nothing looked the same.
+pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    use dbd_core::EntityType;
+    if summary.dropped.is_empty() {
+        return vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
+    }
+    let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts: Vec<String> = [
+        (EntityType::Function, "function", "functions"),
+        (EntityType::Procedure, "procedure", "procedures"),
+        (EntityType::MaterializedView, "materialized view", "materialized views"),
+        (EntityType::View, "view", "views"),
+        (EntityType::Table, "table", "tables"),
+        (EntityType::Sequence, "sequence", "sequences"),
+        (EntityType::Enum, "enum", "enums"),
+        (EntityType::Extension, "extension", "extensions"),
+        (EntityType::Schema, "schema", "schemas"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, one, many)| match summary.count(kind) {
+        0 => None,
+        n => Some(counted(n, one, many)),
+    })
+    .collect();
+    let roles: Vec<&str> = summary
+        .dropped
+        .iter()
+        .filter(|(kind, _)| *kind == EntityType::Role)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    if !roles.is_empty() {
+        parts.push(format!(
+            "{} ({})",
+            counted(roles.len(), "role", "roles"),
+            roles.join(", ")
+        ));
+    }
+    vec![format!("Reset dropped {}.", parts.join(", "))]
 }
 
 /// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
@@ -115,12 +162,11 @@ pub(crate) async fn reset_with_adapter(
     drop_extensions: bool,
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
-) -> Result<()> {
+) -> Result<dbd_core::ResetComplete> {
     check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
-    design
+    Ok(design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
-        .await?;
-    Ok(())
+        .await?)
 }
 
 /// Every guard a reset checks before it drops anything, read-only: the scope

@@ -32,6 +32,10 @@ impl Design {
     /// intact since roles are not scope-selectable. The bookkeeping of what it
     /// drops goes too: the project's recorded migrations, and the drift stamp of
     /// every materialized view the reset removed.
+    ///
+    /// Returns what it dropped, read from the database before and after rather
+    /// than from the script: every drop is `IF EXISTS`, so the script alone
+    /// cannot tell a reset that emptied the schema from one that found nothing.
     pub async fn reset(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -40,7 +44,7 @@ impl Design {
         drop_schemas: bool,
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
-    ) -> Result<()> {
+    ) -> Result<ResetComplete> {
         // Heal-first: ensure bookkeeping storage exists (and is at the current
         // layout, healing any legacy layout in place) before the meta read below
         // — every ownership operation calls this up front.
@@ -50,20 +54,30 @@ impl Design {
             Self::check_reset_guard(adapter.get_project_meta().await?.as_ref())?;
         }
 
-        if let Some(sql) = self.reset_script(target, drop_schemas, drop_extensions, scope)? {
+        let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope)?;
+        let mut summary = ResetComplete::default();
+        if let Some(sql) = &plan.sql {
+            let existed = adapter.existing_objects(&plan.objects).await?;
             // The matviews that exist now and not after the drop are the ones
             // this reset dropped — by name, with their schema, or by CASCADE
             // from what they read. Their drift stamps go with them.
             let before = adapter.matview_states().await?;
-            adapter.execute_script(&sql).await?;
+            adapter.execute_script(sql).await?;
             let after = adapter.matview_states().await?;
             let mut dropped: Vec<String> = before.into_keys().filter(|mv| !after.contains_key(mv)).collect();
             dropped.sort();
             adapter.forget_matview_stamps(&dropped).await?;
+
+            let remaining = adapter.existing_objects(&plan.objects).await?;
+            summary.dropped = plan
+                .objects
+                .into_iter()
+                .filter(|o| existed.contains(o) && !remaining.contains(o))
+                .collect();
         }
         adapter.clear_project_migrations().await?;
 
-        Ok(())
+        Ok(summary)
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,
@@ -102,6 +116,19 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<Option<String>> {
+        Ok(self.reset_plan(target, drop_schemas, drop_extensions, scope)?.sql)
+    }
+
+    /// [`Self::reset_script`]'s SQL, and every object it drops — by kind and
+    /// name, in the order it drops them — so a reset can report which it found
+    /// and dropped.
+    fn reset_plan(
+        &self,
+        target: &str,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<ResetPlan> {
         // Roles aren't scope-selectable, so only a full reset drops them; a
         // subset scope leaves shared roles intact. Every role the design
         // declares counts — `ddl/role/` files as well as `target.roles`, which
@@ -134,9 +161,16 @@ impl Design {
             _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
         };
 
+        let mut objects: Vec<(EntityType, String)> =
+            entities.iter().rev().map(|e| (e.entity_type, e.name.clone())).collect();
+
         // SQLite has the tables and views alone, and its own dialect for them.
         if target == "sqlite" {
-            return Ok(script::build_sqlite_reset_script(&entities));
+            objects.retain(|(kind, _)| matches!(kind, EntityType::Table | EntityType::View));
+            return Ok(ResetPlan {
+                sql: script::build_sqlite_reset_script(&entities),
+                objects,
+            });
         }
 
         // Schemas the `--schemas` path may drop — all managed schemas, or just
@@ -164,23 +198,42 @@ impl Design {
             })
             .unwrap_or_default();
 
+        if drop_extensions {
+            objects.extend(extensions.iter().map(|e| (EntityType::Extension, e.clone())));
+        }
+        if drop_schemas {
+            objects.extend(
+                schemas
+                    .iter()
+                    .filter(|s| !script::schema_is_protected(s, target))
+                    .map(|s| (EntityType::Schema, s.clone())),
+            );
+        }
+
         // A subset scope drops its own objects and nothing else: no CASCADE.
         if is_subset {
-            return Ok(script::build_scoped_reset_script(
-                &entities,
-                &extensions,
-                target,
-                drop_schemas,
-                drop_extensions,
-                &schemas,
-            ));
+            return Ok(ResetPlan {
+                sql: script::build_scoped_reset_script(
+                    &entities,
+                    &extensions,
+                    target,
+                    drop_schemas,
+                    drop_extensions,
+                    &schemas,
+                ),
+                objects,
+            });
         }
 
         // What apply granted on the schemas, so the roles it granted to can be
         // dropped: Postgres refuses to drop a role that still holds a grant.
         let grants = self.config.effective_schema_grants();
 
-        script::build_reset_script(
+        // Roles are dropped on a postgres target only (see `build_reset_script`).
+        if target == "postgres" {
+            objects.extend(roles.iter().rev().map(|r| (EntityType::Role, r.name.clone())));
+        }
+        let sql = script::build_reset_script(
             &entities,
             &roles,
             &extensions,
@@ -190,6 +243,29 @@ impl Design {
             &schemas,
             &grants,
         )
-        .map_err(DbdError::SafetyGuard)
+        .map_err(DbdError::SafetyGuard)?;
+        Ok(ResetPlan { sql, objects })
+    }
+}
+
+/// What [`Design::reset_plan`] would run, and what it would drop.
+struct ResetPlan {
+    sql: Option<String>,
+    objects: Vec<(EntityType, String)>,
+}
+
+/// What a [`Design::reset`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResetComplete {
+    /// Every one of the project's objects the reset dropped — `(kind, name)`,
+    /// in the order it dropped them. Only what existed before and is gone
+    /// after: an object the database never had is not counted.
+    pub dropped: Vec<(EntityType, String)>,
+}
+
+impl ResetComplete {
+    /// How many objects of `kind` the reset dropped.
+    pub fn count(&self, kind: EntityType) -> usize {
+        self.dropped.iter().filter(|(k, _)| *k == kind).count()
     }
 }

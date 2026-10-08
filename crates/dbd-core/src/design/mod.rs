@@ -24,6 +24,7 @@ mod reset;
 mod scope;
 
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
+pub use reset::ResetComplete;
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityType};
 use crate::error::Result;
 
 /// Classification result for a reference name.
@@ -221,6 +221,26 @@ pub trait DatabaseAdapter: Send + Sync {
     /// for offline lookups.
     async fn list_entities(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// Which of `objects` — each a kind and a name: `schema.name` for a
+    /// schema-qualified kind, the bare name of a role, schema or extension —
+    /// exist now.
+    ///
+    /// `reset` asks before and after it drops, so it reports what it dropped
+    /// rather than what it ran: every drop is `IF EXISTS`. Default: tables and
+    /// views, from [`Self::list_entities`] — all a target without schemas,
+    /// roles or extensions (SQLite) has.
+    async fn existing_objects(&self, objects: &[(EntityType, String)]) -> Result<HashSet<(EntityType, String)>> {
+        let live: HashSet<String> = self.list_entities().await?.into_iter().collect();
+        Ok(objects
+            .iter()
+            .filter(|(kind, name)| {
+                let (_, bare) = crate::entity::split_qualified_name(name);
+                matches!(kind, EntityType::Table | EntityType::View) && (live.contains(name) || live.contains(&bare))
+            })
+            .cloned()
+            .collect())
     }
 
     /// Introspect the live database and return a complete `Vec<Entity>` covering
