@@ -634,19 +634,26 @@ pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>)
 /// [`configured_database_url`] — or `None`, and the dry run stays offline.
 ///
 /// A dry run writes nothing, but a preview of a run the database would refuse
-/// is a false promise: with a database to ask, every dry run checks the scope
-/// pin its real run checks, and `apply`/`deploy` read the version their
+/// is a false promise: with a database to ask, every dry run checks the
+/// guards its real run checks, and `apply`/`deploy` read the version their
 /// pending migrations start from. Named for `reset --dry-run`, which did this
 /// first; a configured database that cannot be reached is an error, as it is
-/// for the run.
+/// for the run. It opens only a database that exists: a SQLite file that is
+/// not there yet is not created — the preview made one — and reads as none.
 pub(super) async fn dry_run_adapter(
     config: &Path,
     database_url: Option<&str>,
 ) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
-    match configured_database_url(config, database_url)? {
-        Some(url) => Ok(Some(get_adapter(config, Some(&url)).await?)),
-        None => Ok(None),
-    }
+    let Some(url) = configured_database_url(config, database_url)? else {
+        return Ok(None);
+    };
+    let project = dbd_core::config::read(config)
+        .context("Failed to read config")?
+        .project
+        .name;
+    dbd_core::connect_existing(&url, &project)
+        .await
+        .context("Failed to connect to database")
 }
 
 /// The scope guard for a command that never re-pins the database — `policies`,

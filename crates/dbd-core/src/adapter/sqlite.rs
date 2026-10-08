@@ -214,6 +214,32 @@ impl SqliteAdapter {
         })
     }
 
+    /// Open the database at `url` only if it already exists — `None` when its
+    /// file does not (an in-memory URL names no file, so it is `None` too).
+    ///
+    /// [`Self::new`] creates a missing file, as a run that builds the
+    /// database must. A dry run writes nothing, and asking a database that is
+    /// not there for its guards created it: `reset --dry-run` left an empty
+    /// database file behind. A file that is not there holds nothing to guard.
+    pub async fn open_existing(url: &str, project: &str) -> Result<Option<Self>> {
+        let options: SqliteConnectOptions = url
+            .parse::<SqliteConnectOptions>()
+            .map_err(|e| DbdError::Config(format!("Invalid sqlite URL '{url}': {e}")))?
+            .create_if_missing(false);
+        if !options.get_filename().is_file() {
+            return Ok(None);
+        }
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .map_err(|e| DbdError::Config(format!("SQLite connection failed: {e}")))?;
+        Ok(Some(Self {
+            pool,
+            project: project.to_string(),
+        }))
+    }
+
     /// Strip the leading `schema.` from a Postgres-style entity name.
     /// Returns the original string when no `.` is present.
     fn bare_name(name: &str) -> &str {
