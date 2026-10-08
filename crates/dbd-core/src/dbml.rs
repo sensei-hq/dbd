@@ -325,7 +325,7 @@ impl EnumTypes {
             return data_type.to_string();
         }
         // `public` is searched last: apply appends it to every path a file
-        // states (`ensure_public_in_search_path`), and a file stating none
+        // states (`script::keep_public_on_search_path`), and a file stating none
         // resolves there.
         path.schemas()
             .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))

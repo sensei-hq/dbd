@@ -845,8 +845,8 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     adapter.import_data(&entity, "", false).await.expect("import failed");
 
     // Read back through the export, not a SQL predicate: a predicate quoting
-    // the same text goes through `execute_script` too, and is rewritten to
-    // match the damage.
+    // the same text goes through `execute_script` too, which once rewrote it
+    // to match the damage.
     let out = tempfile::tempdir().unwrap();
     let mut export = Entity::new(EntityType::Table, "app.notes");
     export.format = Some("jsonl".to_string());

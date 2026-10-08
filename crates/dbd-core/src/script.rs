@@ -113,7 +113,7 @@ pub(crate) fn project_search_path(entity: &Entity) -> Option<String> {
 }
 
 /// `SET search_path TO <entries>, "public";` — `public` appended unless the
-/// path already names it, as [`ensure_public_in_search_path`] does for a path a
+/// path already names it, as [`keep_public_on_search_path`] does for a path a
 /// file states, so an extension installed there stays reachable.
 ///
 /// Every entry is quoted: an unquoted name is folded to lower case, which would
@@ -121,41 +121,216 @@ pub(crate) fn project_search_path(entity: &Entity) -> Option<String> {
 /// spelling of the role placeholder and is written that way.
 fn search_path_statement(entries: &[crate::entity::PathEntry]) -> String {
     use crate::entity::PathEntry;
-    let mut names: Vec<String> = entries
+    let names: Vec<String> = entries
         .iter()
         .map(|e| match e {
-            PathEntry::Schema(s) => crate::sql_quote::ident(s),
-            PathEntry::CurrentUser => "\"$user\"".to_string(),
+            PathEntry::Schema(s) => s.clone(),
+            PathEntry::CurrentUser => "$user".to_string(),
         })
         .collect();
-    if !entries
-        .iter()
-        .any(|e| matches!(e, PathEntry::Schema(s) if s == crate::reconcile::DEFAULT_SCHEMA))
-    {
-        names.push(crate::sql_quote::ident(crate::reconcile::DEFAULT_SCHEMA));
-    }
-    format!("SET search_path TO {};", names.join(", "))
+    set_search_path_with_public(&names, false)
 }
 
-/// Ensure `public` is included in any SET search_path statement.
-/// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
-/// but omit `public`, which hides extensions installed in the public schema.
+/// `SET [LOCAL] search_path TO <names>, "public";` — `public` added unless
+/// `names` already holds it.
+///
+/// Each name is one schema, exactly as `SET` reads its arguments, so it is
+/// written as a quoted identifier: unquoted, a mixed-case name would be folded
+/// to lower case and point somewhere else. The empty name — Supabase's `''`,
+/// "no schema" — has no identifier spelling (`""` is an error) and is written
+/// as the string `''`, which `SET` reads as the same empty name.
+fn set_search_path_with_public(names: &[String], local: bool) -> String {
+    let mut written: Vec<String> = names
+        .iter()
+        .map(|name| match name.as_str() {
+            "" => "''".to_string(),
+            name => crate::sql_quote::ident(name),
+        })
+        .collect();
+    if !names.iter().any(|n| n == crate::reconcile::DEFAULT_SCHEMA) {
+        written.push(crate::sql_quote::ident(crate::reconcile::DEFAULT_SCHEMA));
+    }
+    let scope = if local { "LOCAL " } else { "" };
+    format!("SET {scope}search_path TO {};", written.join(", "))
+}
+
+/// `sql` with `public` kept on every search path one of its own top-level `SET
+/// search_path` statements sets: DDL files often set the path to their own
+/// schemas (`sensei, extensions`) and leave `public` off it, which hides the
+/// extensions installed there.
+///
+/// No text of `sql` is changed. After each such statement whose path lacks
+/// `public`, a statement of its own sets the same path with `public` added.
+/// This replaced a regex that rewrote `set search_path to …;` wherever the text
+/// appeared, up to the next `;`: a Supabase-style `SECURITY DEFINER` function's
+/// `SET search_path TO ''` clause became `'' as $$ select 1, public;` and failed
+/// with `column "public" does not exist`, a body `return 'g; ok'` after such a
+/// clause deployed returning `'g, public; ok'`, and a string literal quoting
+/// the statement was altered. So the statements are found in libpg_query's
+/// parse tree — their boundaries and node types — and only a top-level
+/// `VariableSetStmt` for `search_path` counts. A function's own `SET` clause,
+/// a body, a literal, a comment and a `set_config(…)` call are never one.
+///
+/// A statement whose path is reset to the default (`RESET`, `TO DEFAULT`)
+/// gets nothing: the default already holds `public`. Nor does one followed at
+/// once by another `SET search_path`, which replaces its path before anything
+/// runs on it — and which makes this idempotent: what it adds is followed by
+/// nothing that needs it. A script libpg_query cannot parse whole (syntax
+/// newer than its grammar) is split by its scanner instead and each piece
+/// parsed alone; one it cannot even scan is returned as it is, for the server
+/// to report.
 ///
 /// Shared by `apply` (the Postgres adapter runs every script through it) and
 /// `combine`, so the script `combine` writes runs the way `apply` does.
-pub(crate) fn ensure_public_in_search_path(sql: &str) -> String {
-    let re = regex::Regex::new(r"(?i)(set\s+search_path\s+to\s+)([^;]+)(;)").unwrap();
-    re.replace_all(sql, |caps: &regex::Captures| {
-        let prefix = &caps[1];
-        let schemas = &caps[2];
-        let suffix = &caps[3];
-        if schemas.to_lowercase().contains("public") {
-            format!("{prefix}{schemas}{suffix}")
-        } else {
-            format!("{prefix}{schemas}, public{suffix}")
+pub(crate) fn keep_public_on_search_path(sql: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    // A fast path, not a decision: a script that never spells the setting's
+    // name sets no search path, and parsing every large data script to learn
+    // that is waste. One that does is parsed, and the tree decides.
+    if !sql.to_ascii_lowercase().contains("search_path") {
+        return Cow::Borrowed(sql);
+    }
+    let Some(statements) = top_level_statements(sql) else {
+        return Cow::Borrowed(sql);
+    };
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut copied = 0;
+    for (i, statement) in statements.iter().enumerate() {
+        let Some(SearchPathSet { names, local }) = &statement.sets_search_path else {
+            continue;
+        };
+        let replaced_at_once = statements
+            .get(i + 1)
+            .is_some_and(|next| next.sets_search_path.is_some() || next.resets_search_path);
+        if replaced_at_once || names.iter().any(|n| n == crate::reconcile::DEFAULT_SCHEMA) {
+            continue;
         }
-    })
-    .to_string()
+        let added = set_search_path_with_public(names, *local);
+        match statement.terminator {
+            Some(semicolon) => {
+                out.push_str(&sql[copied..=semicolon]);
+                out.push('\n');
+                out.push_str(&added);
+                copied = semicolon + 1;
+            }
+            // The last statement, with no `;`: one is written on a line of its
+            // own, so a trailing `--` comment cannot swallow it.
+            None => {
+                out.push_str(&sql[copied..]);
+                out.push_str("\n;\n");
+                out.push_str(&added);
+                copied = sql.len();
+            }
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(sql);
+    }
+    out.push_str(&sql[copied..]);
+    Cow::Owned(out)
+}
+
+/// A top-level statement, as [`keep_public_on_search_path`] needs it.
+struct TopLevel {
+    /// The byte offset of the `;` ending it, or `None` when it runs to the end
+    /// of the script unterminated.
+    terminator: Option<usize>,
+    /// The path a `SET [LOCAL] search_path TO …` sets.
+    sets_search_path: Option<SearchPathSet>,
+    /// `RESET search_path` or `SET search_path TO DEFAULT`.
+    resets_search_path: bool,
+}
+
+struct SearchPathSet {
+    names: Vec<String>,
+    local: bool,
+}
+
+/// `sql`'s top-level statements in order: from libpg_query's parse when the
+/// whole script parses, otherwise from its scanner's split with each piece
+/// parsed alone. `None` when the scanner cannot read the script either.
+fn top_level_statements(sql: &str) -> Option<Vec<TopLevel>> {
+    if let Ok(parsed) = pg_query::parse(sql) {
+        return Some(
+            parsed
+                .protobuf
+                .stmts
+                .iter()
+                .map(|raw| {
+                    let start = usize::try_from(raw.stmt_location).unwrap_or(0);
+                    // `stmt_len` 0 means "to the end of the script"; otherwise
+                    // the statement ends where its `;` is.
+                    let terminator = match usize::try_from(raw.stmt_len).unwrap_or(0) {
+                        0 => None,
+                        len => Some(start + len).filter(|&at| sql.as_bytes().get(at) == Some(&b';')),
+                    };
+                    let node = raw.stmt.as_ref().and_then(|s| s.node.as_ref());
+                    classify(node, terminator)
+                })
+                .collect(),
+        );
+    }
+    let pieces = pg_query::split_with_scanner(sql).ok()?;
+    Some(
+        pieces
+            .iter()
+            .map(|piece| {
+                // Each piece is a slice of `sql`; its offset is where it starts.
+                let end = piece.as_ptr() as usize - sql.as_ptr() as usize + piece.len();
+                let terminator = (sql.as_bytes().get(end) == Some(&b';')).then_some(end);
+                let parsed = pg_query::parse(piece).ok();
+                let node = parsed
+                    .as_ref()
+                    .and_then(|p| p.protobuf.stmts.first())
+                    .and_then(|raw| raw.stmt.as_ref())
+                    .and_then(|s| s.node.as_ref());
+                classify(node, terminator)
+            })
+            .collect(),
+    )
+}
+
+/// What a top-level statement does to the search path, read off its node.
+fn classify(node: Option<&pg_query::NodeEnum>, terminator: Option<usize>) -> TopLevel {
+    use pg_query::protobuf::VariableSetKind;
+    let mut statement = TopLevel {
+        terminator,
+        sets_search_path: None,
+        resets_search_path: false,
+    };
+    let Some(pg_query::NodeEnum::VariableSetStmt(set)) = node else {
+        return statement;
+    };
+    if !set.name.eq_ignore_ascii_case("search_path") {
+        return statement;
+    }
+    match set.kind() {
+        VariableSetKind::VarSetValue => {
+            // Every argument of `SET search_path` is a name — an identifier or
+            // a string. Anything else is a path dbd cannot restate, so it is
+            // left to stand as written.
+            let names: Option<Vec<String>> = set.args.iter().map(set_argument).collect();
+            statement.sets_search_path = names.map(|names| SearchPathSet {
+                names,
+                local: set.is_local,
+            });
+        }
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => statement.resets_search_path = true,
+        _ => {}
+    }
+    statement
+}
+
+/// One `SET` argument's name: the string an identifier or a literal holds.
+fn set_argument(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    match node.node.as_ref()? {
+        pg_query::NodeEnum::AConst(c) => match c.val.as_ref()? {
+            Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The DDL `combine` writes for `entity` in a project whose SQL is `dialect`.
@@ -205,7 +380,7 @@ fn generated_or_authored_ddl(entity: &Entity, dialect: crate::parser::Dialect) -
     use crate::parser::Dialect;
     match (dialect, entity.entity_type) {
         (Dialect::PostgreSql | Dialect::Unstated, _) => {
-            runnable_ddl(entity).map(|ddl| ensure_public_in_search_path(&ddl))
+            runnable_ddl(entity).map(|ddl| keep_public_on_search_path(&ddl).into_owned())
         }
         (Dialect::TSql, EntityType::Schema) => {
             // `]` doubles inside a bracketed name, then `'` inside the N'…' literal.
