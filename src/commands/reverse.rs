@@ -915,6 +915,60 @@ mod tests {
         }
     }
 
+    /// A stub table in a DBML document `dbd dbml` wrote is not the project's: it
+    /// stands in for a table a foreign key reaches that the document does not
+    /// define. `init --from-dbml` wrote it as a managed table — its referenced
+    /// columns and nothing else — and added its schema to `schemas:`, so the
+    /// next apply created a one-column copy of somebody else's table. It is
+    /// declared `external:` instead, whether its schema holds managed tables
+    /// or not.
+    #[test]
+    fn init_from_dbml_declares_a_stub_external_instead_of_building_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbml = tmp.path().join("schema.dbml");
+        std::fs::write(
+            &dbml,
+            "Table \"app\".\"profiles\" {\n  \"id\" int [pk]\n  \"account_id\" uuid\n  \"lookup_id\" int\n}\n\n\
+             Ref: \"app\".\"profiles\".\"account_id\" > \"billing\".\"accounts\".\"id\"\n\
+             Ref: \"app\".\"profiles\".\"lookup_id\" > \"app\".\"lookups\".\"id\"\n\n\
+             Table \"billing\".\"accounts\" {\n  \"id\" uuid\n\n  indexes {\n    id [unique]\n  }\n\n\
+             \x20 Note: 'External entity — managed outside this project'\n}\n\n\
+             Table \"app\".\"lookups\" {\n  \"id\" int\n\n  indexes {\n    id [unique]\n  }\n\n\
+             \x20 Note: 'Defined in this project, outside this document — only the referenced columns are shown'\n}\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("design.yaml");
+        cmd_init_from_dbml(
+            tmp.path(),
+            &dbml,
+            "dev",
+            &cfg,
+            Some("proj"),
+            "postgres",
+            1,
+            all_schemas(),
+            false,
+        )
+        .unwrap();
+
+        assert!(tmp.path().join("ddl/table/app/profiles.ddl").exists());
+        for stub in ["ddl/table/billing/accounts.ddl", "ddl/table/app/lookups.ddl"] {
+            assert!(
+                !tmp.path().join(stub).exists(),
+                "{stub} is a stub, not a table to build"
+            );
+        }
+        let config = dbd_core::config::read(&cfg).unwrap();
+        let mut externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+        externals.sort();
+        assert_eq!(externals, ["app.lookups", "billing.accounts"]);
+        assert!(
+            !config.schema_names().iter().any(|s| s == "billing"),
+            "a schema only a stub lives in is not the project's: {:?}",
+            config.schema_names()
+        );
+    }
+
     /// The introspected extensions go where the project format declares them —
     /// the target's `extensions:` list, with the schema when it is not
     /// `public` — and nowhere under `ddl/`, so the project loads with no error.
