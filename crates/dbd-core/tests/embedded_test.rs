@@ -5224,3 +5224,49 @@ async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
         assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
     }
 }
+
+// ── source.search_path: reconcile creates a pathless matview on it ────────────
+
+/// Reconcile creates an absent materialized view from its model, not its file,
+/// and ran that `CREATE` on a path of every managed schema in name order. A
+/// matview file that states no path was read against `source.search_path`, so a
+/// bare `a` in its body meant `app.a`; created on `"aaa", "app", public` it
+/// meant `aaa.a` instead — here a table without the column, so reconcile failed
+/// building a view `apply` builds without complaint.
+#[tokio::test]
+async fn reconcile_creates_a_pathless_matview_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "pathless_mv_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: pathless_mv_test\nsource:\n  dialect: postgresql\n  search_path: [app]\n\
+         schemas:\n  - aaa\n  - app\n",
+        &[
+            (
+                "ddl/table/aaa/a.ddl",
+                "set search_path to aaa;\ncreate table if not exists a (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/app/a.ddl",
+                "create table if not exists a (id integer primary key, x integer);\n",
+            ),
+            (
+                "ddl/materialized_view/app/m.ddl",
+                "create materialized view if not exists m as select x from a;\n",
+            ),
+        ],
+    );
+
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the matview's body resolves on source.search_path, as apply runs its file");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'm'",
+        "materialized view app.m",
+    )
+    .await;
+}
