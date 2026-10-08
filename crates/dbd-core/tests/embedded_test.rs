@@ -6661,3 +6661,136 @@ async fn a_version_failing_after_its_enum_values_commit_runs_again_once_fixed() 
     let diff = design.diff_live(&*adapter, None).await.expect("diff");
     assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
 }
+
+// ── A preview refuses and orders as the run does ─────────────────────────────
+
+/// `apply` refuses a pending migration whose `data.sql` still holds a `--
+/// TODO:`, but `apply --dry-run` listed the migration — the TODO's `'???'`
+/// included — and said "no issues". The preview refuses with the run's own
+/// words, and so does `Design::apply` under `dry_run`.
+#[tokio::test]
+async fn a_preview_refuses_a_pending_migration_with_an_unresolved_todo_as_the_run_does() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'meh', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "drop meh");
+    let design = released(dir);
+
+    let run = design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the run refuses the unresolved TODO")
+        .to_string();
+    assert!(run.contains("TODO"), "{run}");
+    let preview = design
+        .pending_migration_preview(&*adapter, None, None)
+        .await
+        .expect_err("the preview refuses it too")
+        .to_string();
+    assert_eq!(preview, run);
+    let dry_run = design
+        .apply(&*adapter, None, true, None, Progress::none())
+        .await
+        .expect_err("and so does a dry run of apply")
+        .to_string();
+    assert_eq!(dry_run, run);
+}
+
+/// The preview listed migration steps grouped by entity — every pending
+/// version of one table, then the next — while the run executes them version
+/// by version. It now lists exactly the steps the run starts, in its order.
+#[tokio::test]
+async fn the_migration_preview_lists_the_steps_in_the_order_the_run_takes_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "preview_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: preview_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text);\n",
+        )],
+        &[],
+        "v5",
+    );
+    let design = released(dir);
+
+    let preview = design.pending_migration_preview(&*adapter, None, None).await.unwrap();
+    let listed: Vec<(u32, String)> = preview.steps.iter().map(|s| (s.version, s.entity.clone())).collect();
+    assert_eq!(
+        listed,
+        vec![
+            (2, "app.counters".to_string()),
+            (3, "app.notes".to_string()),
+            (4, "app.notes".to_string()),
+            (5, "app.counters".to_string()),
+        ],
+        "{:#?}",
+        preview.steps
+    );
+
+    let mut started: Vec<String> = Vec::new();
+    design
+        .apply(
+            &*adapter,
+            None,
+            false,
+            None,
+            Progress {
+                on_start: |d: &str| started.push(d.to_string()),
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |_| {},
+            },
+        )
+        .await
+        .expect("v1 → v5 applies");
+    let run: Vec<&String> = started
+        .iter()
+        .filter(|d| d.starts_with("drop ") || d.starts_with("migrate ") || d.as_str() == "table:app.counters")
+        .collect();
+    assert_eq!(
+        run,
+        vec![
+            "drop table:app.counters (v2)",
+            "migrate table:app.notes → v3",
+            "migrate table:app.notes → v4",
+            "table:app.counters",
+        ],
+        "the run takes them in the order the preview lists them: {started:#?}"
+    );
+}
