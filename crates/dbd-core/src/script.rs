@@ -112,10 +112,34 @@ pub(crate) fn ensure_public_in_search_path(sql: &str) -> String {
 ///   the schema on apply).
 /// - Extensions and roles exist only in PostgreSQL; another engine's script
 ///   says so in a comment rather than carrying PostgreSQL SQL, or nothing.
+/// - On SQL Server every entity's DDL ends its batch with `GO`, not only the
+///   schema's: `CREATE VIEW`, `CREATE PROCEDURE`, `CREATE FUNCTION` and
+///   `CREATE TRIGGER` must each be the first statement in a batch, and with the
+///   files written back to back a view shared its batch with the table before
+///   it — sqlcmd refused the script. A file that already ends in `GO` gets no
+///   second one.
 ///
 /// Unrecognised and unstated dialects are read as PostgreSQL by the parser, so
 /// they are written as PostgreSQL here too.
 pub fn combined_ddl(entity: &Entity, dialect: crate::parser::Dialect) -> Option<String> {
+    let ddl = generated_or_authored_ddl(entity, dialect)?;
+    Some(match dialect {
+        crate::parser::Dialect::TSql if !ends_its_batch(&ddl) => format!("{}\nGO", ddl.trim_end()),
+        _ => ddl,
+    })
+}
+
+/// Whether T-SQL `ddl` already closes its batch: its last line holds only `GO`
+/// (sqlcmd reads the separator case-insensitively).
+fn ends_its_batch(ddl: &str) -> bool {
+    ddl.trim_end()
+        .lines()
+        .next_back()
+        .is_some_and(|last| last.trim().eq_ignore_ascii_case("go"))
+}
+
+/// [`combined_ddl`] before SQL Server's batch separator is added.
+fn generated_or_authored_ddl(entity: &Entity, dialect: crate::parser::Dialect) -> Option<String> {
     use crate::parser::Dialect;
     match (dialect, entity.entity_type) {
         (Dialect::PostgreSql | Dialect::Unstated, _) => {
