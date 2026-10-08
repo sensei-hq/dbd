@@ -599,6 +599,108 @@ mod tests {
         assert!(out.contains("on delete cascade"), "{out}");
     }
 
+    // ── Literals, bodies and comments are text ──────────────
+
+    /// Statements whose text holds what a hand-rolled scanner misreads: an
+    /// `E''` string with a backslash-escaped quote, `U&''` with `UESCAPE`,
+    /// bit and hex strings, a `$tag$` body (one nesting `$$`), a `BEGIN
+    /// ATOMIC` body, nested block comments, quoted identifiers holding `"`,
+    /// `;` and `--`, a comment-only tail and a last statement with no `;`.
+    const TRICKY: &[&str] = &[
+        "create table if not exists t (\n  id int primary key,\n  note text default E'it\\'s; tricky'\n);",
+        "create table u (a text default U&'d\\0061t\\+000061 select', b text default U&'x!0041' uescape '!');",
+        "create table b (b bit(4) default B'0101', x bytea default '\\xDEAD', y bytea default X'FF');",
+        "create table q (a text default 'O''Brien; -- not a comment', b text default 'SELECT /* nor */ this');",
+        "comment on table t is E'line one\\nline two; -- still text';",
+        "create or replace function app.f() returns text language plpgsql as $body$\nBEGIN\n  -- SELECT stays; here\n  RETURN 'x';\nEND;\n$body$;",
+        "create function g() returns text language sql as $fn$ select $$a;b$$ || 'c' $fn$;",
+        "create view v as select 'a;b' as \"Semi;Colon\", \"we\"\"ird\" from t where note <> E'back\\\\slash';",
+        "create table \"we\"\"ird;--\" (\"Col; x\" int, y text default '');",
+        "/* outer /* nested; */ still; */\n-- it's; here\ncreate table c (id int);",
+        "create function h() returns int language sql begin atomic select 1; select 2; end;",
+        "create index t_live_idx on t (note) where note <> 'x;y' and note <> E'a\\'b';",
+        "create type mood as enum ('happy;', 'sad''s', E'it\\'s');",
+        "set search_path to app; -- path\ncreate table app.t2 (id int, s text default 'set search_path to x;');",
+        "do $$ begin raise notice 'it''s; %', 1; end $$;",
+        "create table k (a int -- first; one\n, b text default E'x\\'y' -- second\n);",
+        "create table z (id int);\n-- the end",
+        "select 1 -- trailing, no semicolon",
+    ];
+
+    /// Every token of `sql` that is text rather than SQL — strings of every
+    /// kind (`$tag$` bodies included), quoted identifiers and comments — in
+    /// order, as libpg_query's scanner reads them. A comment's trailing
+    /// spaces are layout, not text.
+    fn opaque_tokens(sql: &str) -> Vec<String> {
+        use pg_query::protobuf::Token;
+        let scanned = pg_query::scan(sql).unwrap_or_else(|e| panic!("{e}:\n{sql}"));
+        scanned
+            .tokens
+            .iter()
+            .filter_map(|t| {
+                let text = &sql[t.start as usize..t.end as usize];
+                match Token::try_from(t.token).ok()? {
+                    Token::Sconst | Token::Usconst | Token::Bconst | Token::Xconst | Token::CComment => {
+                        Some(text.to_string())
+                    }
+                    Token::SqlComment => Some(text.trim_end().to_string()),
+                    Token::Ident | Token::Uident
+                        if !text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') =>
+                    {
+                        Some(text.to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// What `sql` means: libpg_query's tree for it, deparsed — keyword case,
+    /// layout and comments aside.
+    fn meaning(sql: &str) -> String {
+        pg_query::parse(sql)
+            .and_then(|p| p.deparse())
+            .unwrap_or_else(|e| panic!("{e}:\n{sql}"))
+    }
+
+    /// `E'it\'s; tricky'` became a three-line default: the splitter ended the
+    /// statement at the `;` inside the literal, which it took to close at
+    /// `\'`. A `$tag$` body was split at its own `;`s and its `END` recased.
+    /// Splitting and every rewrite now read the text with libpg_query, so for
+    /// every input, in every keyword case and query style, the output means
+    /// what the input did and every literal, quoted name and comment in it is
+    /// the same, byte for byte.
+    #[test]
+    fn formatting_changes_no_literal_and_no_meaning() {
+        let configs = [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve]
+            .into_iter()
+            .flat_map(|case| {
+                [crate::config::QueryStyle::River, crate::config::QueryStyle::None].map(|style| FormatConfig {
+                    keyword_case: case.clone(),
+                    query_style: style,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        let whole = TRICKY.join("\n\n");
+        for input in TRICKY.iter().copied().chain([whole.as_str()]) {
+            for config in &configs {
+                let out = format_ddl(input, config);
+                let label = format!("{:?}/{:?}", config.keyword_case, config.query_style);
+                assert_eq!(
+                    meaning(&out),
+                    meaning(input),
+                    "{label} changed the meaning of:\n{input}\n--- into ---\n{out}"
+                );
+                assert_eq!(
+                    opaque_tokens(&out),
+                    opaque_tokens(input),
+                    "{label} changed a literal, name or comment in:\n{input}\n--- into ---\n{out}"
+                );
+            }
+        }
+    }
+
     // ── River formatter tests ─────────────────────────────
 
     fn river_config() -> FormatConfig {
