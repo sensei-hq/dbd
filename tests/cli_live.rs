@@ -754,3 +754,75 @@ async fn a_scoped_apply_that_fails_still_names_the_hook_it_skipped() {
         combined(&o)
     );
 }
+
+// ── reconcile runs the design's grants and apply hooks ───────────────────────
+
+/// `reconcile` is the pre-release `apply`, and a reconciled database must be the
+/// one an apply builds. It never ran the design's grants or its `apply.before`
+/// / `apply.after` hooks, so a role had no access to a schema it was granted
+/// and a hook's setup or seed data never happened. The after-hook writes a table
+/// only reconcile creates, so it can only succeed after the writes.
+#[tokio::test]
+async fn reconcile_runs_the_designs_grants_and_apply_hooks() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\nsource:\n  dialect: postgresql\n\
+         schemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+         \x20   grants:\n      app:\n        app_reader: [usage, select]\n\
+         apply:\n  before:\n    - sql/before.sql\n  after:\n    - sql/after.sql\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/before.sql"),
+        "create schema if not exists hooks;\ncreate table if not exists hooks.log (step text);\n\
+         insert into hooks.log values ('before');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("sql/after.sql"),
+        "insert into app.t (id) values (1);\ninsert into hooks.log values ('after');\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["reconcile"]);
+    assert!(o.status.success(), "reconcile failed: {}", combined(&o));
+
+    // Each predicate must hold, checked in the database through dbd-core's own
+    // adapter: a DO block that raises names what is missing.
+    let adapter = dbd_core::connect(&url, "clilive").await.unwrap();
+    for (predicate, what) in [
+        (
+            "SELECT 1 WHERE (SELECT string_agg(step, ',' ORDER BY step DESC) FROM hooks.log) = 'before,after'",
+            "both hooks' rows",
+        ),
+        (
+            "SELECT 1 FROM app.t WHERE id = 1",
+            "the after-hook's row in a table reconcile created",
+        ),
+        (
+            "SELECT 1 WHERE has_schema_privilege('app_writer', 'app', 'USAGE') \
+             AND has_schema_privilege('app_reader', 'app', 'USAGE')",
+            "the schema grants",
+        ),
+    ] {
+        let sql = format!(
+            "DO $$ BEGIN IF NOT EXISTS ({predicate}) THEN RAISE EXCEPTION '{} missing'; END IF; END $$",
+            what.replace('\'', "''")
+        );
+        adapter
+            .execute_script(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}\n{}", combined(&o)));
+    }
+}
