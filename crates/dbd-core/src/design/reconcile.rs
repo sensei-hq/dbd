@@ -271,6 +271,10 @@ impl Design {
             ));
         }
         self.refuse_without_a_structured_model("reconcile")?;
+        // A dev reconcile of a database marked prod is refused before it plans
+        // anything, `dry_run` included: a plan for a run the guard refuses
+        // previews something that cannot happen.
+        self.guard_env(adapter).await?;
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;

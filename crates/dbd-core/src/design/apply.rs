@@ -117,6 +117,9 @@ impl Design {
         C: FnMut(ApplyComplete),
     {
         let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
+        // Before the first hook or write: a dev run against a database marked
+        // prod is refused, not left to re-mark it (see `check_env_guard`).
+        self.guard_env(adapter).await?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the

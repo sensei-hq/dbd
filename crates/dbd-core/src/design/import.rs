@@ -622,6 +622,10 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ImportComplete),
     {
+        // An import picks its data by `-e`: a dev import into a database
+        // marked prod would load `import/dev/` seed data into production.
+        self.guard_env(adapter).await?;
+
         let mut warnings = self.import_warnings(name);
 
         // Resolve the scope once. The plan filter and the after-script hooks

@@ -15,6 +15,7 @@ use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
 mod apply;
+mod env_guard;
 mod hooks;
 mod import;
 mod plan;
