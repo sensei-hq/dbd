@@ -68,6 +68,8 @@ ddl/
 
 Files use the `.ddl` or `.sql` extension. Schemas are auto-added from these paths, so a `ddl/table/config/…` file implies the `config` schema even if it isn't listed under `schemas:`.
 
+There is no `ddl/extension/` or `ddl/schema/` folder: extensions are declared in the target's `extensions:` list and schemas under `schemas:` in `design.yaml`, because dbd generates both statements itself. `dbd inspect` reports a file in either folder as an error, and `dbd doctor` names the `design.yaml` entry to write instead.
+
 **Use the singular type folder** (`table`, `function`, …) — it's canonical. The plural form (`functions/`, `tables/`, …) is still accepted for backward compatibility (and `matview/` for `materialized_view/`), but `dbd doctor` flags it and `dbd doctor --fix` migrates plural folders to singular. If a singular folder already exists, the contents are merged in; on a same-name file collision the **newer** file (by modification time) is kept and the older one is saved alongside as `<name>.ddl.bkp` (reported so you can reconcile).
 
 ## Configure
@@ -134,7 +136,18 @@ views, then functions and procedures — and a real dependency moves an entity
 later when it needs to: a view that calls a function is applied after the
 function. On PostgreSQL the whole run is one transaction.
 
-Preview the order without a database:
+The database records which environment it was built for, and a run without `-e`
+is `-e prod`. Build a development database with `-e dev` from its first run:
+one first built without it is marked prod, and from then on a `-e dev` run
+against it is refused, so that dev seed data never reaches production (see
+[global options](04-commands.md#global-options)).
+
+```sh
+dbd apply -e dev
+```
+
+Preview the order — offline, or, when a database is configured, checked against
+it the way the real run checks it, with its pending migrations listed:
 
 ```sh
 dbd apply --dry-run
