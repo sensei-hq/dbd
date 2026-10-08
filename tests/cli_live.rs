@@ -587,7 +587,7 @@ fn unversioned_scoped_project(dir: &Path) {
 /// same way. Without one it stays a database-free preview.
 #[tokio::test]
 async fn reset_dry_run_refuses_where_the_real_reset_would() {
-    let (_pg, url) = start_pg().await;
+    let (pg, url) = start_pg().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     unversioned_scoped_project(dir);
@@ -620,12 +620,11 @@ async fn reset_dry_run_refuses_where_the_real_reset_would() {
     );
 
     // ── A database pinned to another scope ──
-    // `-e dev`: `-e` defaults to prod, and the prod guard must not be what fires.
-    let o = dbd(
-        dir,
-        &url,
-        &["apply", "-e", "dev", "--scope", "hub", "--allow-scope-change"],
-    );
+    // A dev database of its own: `-e` defaults to prod, and the prod guard must
+    // not be what fires — and a dev run may not re-mark the prod one above.
+    pg.create_database("pinned").await.unwrap();
+    let url = pg.settings().url("pinned");
+    let o = dbd(dir, &url, &["apply", "-e", "dev", "--scope", "hub"]);
     assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
 
     let real = dbd(dir, &url, &["reset"]);
