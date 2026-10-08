@@ -22,8 +22,19 @@ pub(crate) fn is_serial_type(ty: &str) -> bool {
     )
 }
 
-/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');`, then its `COMMENT ON
-/// TYPE` when it has one — the comment the parser reads back from the file.
+/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');` inside Postgres's guard
+/// for a conditional `CREATE TYPE`, then its `COMMENT ON TYPE` when it has one
+/// — the comment the parser reads back from the file.
+///
+/// # Re-runnable
+///
+/// Postgres has no `CREATE TYPE … IF NOT EXISTS`; the `DO … EXCEPTION WHEN
+/// duplicate_object` block is its idiom for one, and the enum parser reads the
+/// statement inside it. Bare, the file failed the second time it ran — `psql
+/// -f` over a reversed project applied back to the database it came from, for
+/// one — while every other file reverse writes runs twice (see
+/// [`emit_table`]). Like `CREATE TABLE IF NOT EXISTS`, the guard leaves an
+/// existing type as it is. `COMMENT ON` runs twice on its own.
 pub fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -34,7 +45,9 @@ pub fn emit_enum(entity: &Entity) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let qname = format!("{}.{}", q(schema), q(name));
-    let mut out = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    let create = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    let tag = dollar_tag(&create);
+    let mut out = format!("DO {tag} BEGIN\n  {create}\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND {tag};");
     if let Some(comment) = &entity.comment {
         out.push_str(&format!("\nCOMMENT ON TYPE {qname} IS '{}';", esc(comment)));
     }
@@ -325,6 +338,25 @@ pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &st
     }
     sql.push(';');
     sql
+}
+
+/// A dollar-quote tag that does not occur in `body`: `$$`, or `$dbd$`,
+/// `$dbd1$`, … when a label carries the plain one. A tag the body contains
+/// would close the quote early.
+fn dollar_tag(body: &str) -> String {
+    if !body.contains("$$") {
+        return "$$".to_string();
+    }
+    (0..)
+        .map(|n| {
+            if n == 0 {
+                "$dbd$".to_string()
+            } else {
+                format!("$dbd{n}$")
+            }
+        })
+        .find(|tag| !body.contains(tag.as_str()))
+        .expect("an unbounded sequence of tags has one the body lacks")
 }
 
 fn quote_cols(cols: &[String]) -> String {
