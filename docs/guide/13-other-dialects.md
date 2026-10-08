@@ -141,9 +141,8 @@ scope's entities.
 - **Tables**, with their columns, `NOT NULL`, defaults, primary keys, unique
   constraints, foreign keys, `CHECK` constraints, indexes (`CREATE INDEX`) and
   comments where the target keeps them. A foreign key and a `CHECK` keep their
-  names (`CONSTRAINT [people_amt_ck] CHECK (…)`); a primary key and a unique
-  constraint are written unnamed. Identity and `serial` columns are numbered by
-  the target; generated columns are computed by it.
+  names (`CONSTRAINT [people_amt_ck] CHECK (…)`). Identity and `serial` columns
+  are numbered by the target; generated columns are computed by it.
 - **Views** and **materialized views**, as `CREATE VIEW`. A materialized view
   becomes a plain view, which is reported, and each of its indexes is reported
   and left out. On MySQL and SQL Server the `SELECT` is passed through
