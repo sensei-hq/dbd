@@ -487,7 +487,7 @@ fn canonical_datetime(s: &str) -> Option<String> {
 /// comes back `now()`, `coalesce(…)` comes back `COALESCE(…)`. Comparing those
 /// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
 /// re-spelled, so the next diff reported the same change — forever.
-fn canonical_default(raw: &str, data_type: &str) -> String {
+pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     // Postgres keeps `nextval('s')`'s argument as an OID and reports it as
     // `nextval('s'::regclass)`; a design without the cast read as a changed
     // default on every run. Both sides take the reported form — valid SQL with
@@ -1146,7 +1146,7 @@ fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
 /// A fixed suffix rather than a generated one: the whole recreation runs in a
 /// single implicit transaction, so the name exists only inside it, and a fixed
 /// name is what an operator reading a failed run's SQL can act on.
-const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
+pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 
 /// Converge an enum whose declared value set **lost** a member.
 ///
@@ -1381,17 +1381,28 @@ fn indexes_to_rebuild<'a>(
         if read.is_empty() {
             continue;
         }
-        let reads = |expr: &str| read.iter().any(|c| crate::sql_expr::reads_column(expr, c));
-        for ix in &t.indexes {
-            if ix.predicate.as_deref().is_some_and(reads)
-                || ix.columns.iter().any(|k| k.is_expression && reads(&k.name))
-            {
-                out.push((t, ix));
-            }
-        }
+        out.extend(indexes_reading_columns(t, &read).into_iter().map(|ix| (t, ix)));
     }
     out.sort_by(|a, b| (&a.0.schema, &a.0.name, &a.1.name).cmp(&(&b.0.schema, &b.0.name, &b.1.name)));
     out
+}
+
+/// The indexes on `table` whose `WHERE` predicate or expression key reads any
+/// of `columns` — the ones Postgres cannot rebuild across an enum type swap of
+/// those columns. Shared by reconcile's swap and the migration `dbd snapshot`
+/// writes for the same change.
+pub(crate) fn indexes_reading_columns<'a>(
+    table: &'a TableSnapshot,
+    columns: &[&str],
+) -> Vec<&'a crate::entity::IndexDef> {
+    let reads = |expr: &str| columns.iter().any(|c| crate::sql_expr::reads_column(expr, c));
+    table
+        .indexes
+        .iter()
+        .filter(|ix| {
+            ix.predicate.as_deref().is_some_and(reads) || ix.columns.iter().any(|k| k.is_expression && reads(&k.name))
+        })
+        .collect()
 }
 
 /// `canonical` with each table's indexes taken from the same table in `raw`.
@@ -1459,7 +1470,7 @@ fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
 /// the view it selects from — which is the order they have to be dropped in.
 /// The iteration is bounded by the entity count so a `refers` cycle terminates
 /// rather than spinning.
-fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+pub(crate) fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
     let views: Vec<&Entity> = entities
         .iter()
         .filter(|e| matches!(e.entity_type, EntityType::View | EntityType::MaterializedView))
