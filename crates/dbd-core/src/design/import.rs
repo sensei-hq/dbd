@@ -919,6 +919,50 @@ mod tests {
         assert!(mock.imported.lock().unwrap().is_empty(), "nothing loads");
     }
 
+    /// A data file loads into the table its path names. One named for a view
+    /// — `import/staging/items_v.csv` beside `ddl/view/staging/items_v.ddl` —
+    /// got as far as the run's truncation: every staging table before it in
+    /// the plan was emptied, then `TRUNCATE` failed on the view with `"items_v"
+    /// is not a table`, and nothing loaded. It is refused before anything
+    /// touches the database, naming the file and that its target is a view.
+    #[tokio::test]
+    async fn a_data_file_for_a_view_is_refused_before_any_truncate() {
+        let (tmp, _) = project_with_staging(
+            Some("staging"),
+            &[STAGED_ITEMS, ("staging/items_v.csv", "id,name\n1,a\n")],
+        );
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/view/staging")).unwrap();
+        std::fs::write(
+            dir.join("ddl/view/staging/items_v.ddl"),
+            "set search_path to staging;\ncreate or replace view items_v as select id, name from items;\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let mock = MockAdapter::new();
+        let err = design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("a file loading a view must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/staging/items_v.csv") && msg.contains("staging.items_v") && msg.contains("view"),
+            "the refusal names the file, its target, and that the target is a view: {msg}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "no TRUNCATE of the staging table before it: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing loads");
+        // And the preview refuses what the run refuses.
+        let err = design
+            .scoped_import_plan(None, None)
+            .expect_err("the plan refuses it too");
+        assert!(err.to_string().contains("import/staging/items_v.csv"), "{err}");
+    }
+
     /// Every preview prints this plan, so a dry run refuses what the run
     /// refuses rather than listing a load that will never happen.
     #[test]
