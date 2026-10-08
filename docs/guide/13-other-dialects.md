@@ -104,8 +104,10 @@ UTF-16 file saved *without* a byte-order mark looks like.
 
 Every reader of a DDL file decodes it this way — `apply`, `deploy`, `combine`,
 `format`, `doctor`, `merge` and the migration readers as well as the scan — so a
-UTF-16 file applies like any other. Data files under `import/` are read as UTF-8
-only.
+UTF-16 file applies like any other. `dbd format` and `dbd inspect --fix` write a
+file back in the encoding they read it in: an SSMS file stays UTF-16 behind its
+byte-order mark, and a UTF-8 byte-order mark is kept. Data files under `import/`
+are read as UTF-8 only.
 
 ## `dbd emit`
 
@@ -125,6 +127,10 @@ dbd emit --dialect sqlite --scope hub -f hub.sqlite.sql
 | `-f`, `--file` | Destination, default `schema.sql` |
 | `--report` | Also write every downgrade as a JSON array |
 
+`-f` and `--report` must resolve inside the project — a bare name resolves
+against the project root — and a path outside it is refused rather than
+overwriting a file dbd does not own.
+
 The source must be a PostgreSQL project — the only dialect dbd reads into
 columns. A T-SQL, MySQL or SQLite project is refused, and so is
 `--dialect postgresql` (use `combine`). `--scope` limits the output to the
@@ -136,11 +142,12 @@ scope's entities.
   constraints, foreign keys, `CHECK` constraints, indexes (`CREATE INDEX`) and
   comments where the target keeps them. Identity and `serial` columns are
   numbered by the target; generated columns are computed by it.
-- **Views** and **materialized views**, as `CREATE VIEW` with the `SELECT`
-  passed through untranslated — and reported, since anything
-  PostgreSQL-specific inside it has to be checked by hand. A materialized view
+- **Views** and **materialized views**, as `CREATE VIEW`. A materialized view
   becomes a plain view, which is reported, and each of its indexes is reported
-  and left out.
+  and left out. On MySQL and SQL Server the `SELECT` is passed through
+  untranslated — and reported, since anything PostgreSQL-specific inside it has
+  to be checked by hand. On SQLite it is written again from PostgreSQL's parse
+  tree (see [below](#sqlite-views-and-checks)).
 - **Sequences.** SQL Server gets `CREATE SEQUENCE`, every bound resolved to
   PostgreSQL's and spelled out (SQL Server's own defaults start at the type's
   minimum), and a `nextval('s')` default becomes `NEXT VALUE FOR`. MySQL and
@@ -150,14 +157,20 @@ scope's entities.
 - **Schemas.** SQL Server gets a `CREATE SCHEMA` for every schema the script
   uses, `dbo` aside; MySQL and SQLite fold the schema into the name.
 - **Functions, procedures and triggers** are skipped and reported: their bodies
-  do not translate.
-- Extensions, roles and enum *types* produce no statement of their own.
+  do not translate. That includes a trigger written in a table's file, after its
+  `CREATE TABLE`.
+- **Extensions, roles, grants and RLS policies** have no equivalent the script
+  could carry, so each is reported as not emitted: an extension or a role by
+  name, grants once per schema (with the roles and privileges), and policies
+  once per `policies/` file. Enum *types* produce no statement of their own;
+  their columns become text (below).
 - A file dbd could not parse is reported as missing — `a table whose file could
   not be parsed -> nothing` — rather than left out without a word.
 
-A `CHECK` expression, a generated column's expression and a partial index's
-predicate are passed through untranslated and reported, the same way a view
-body is. An index the target would reject outright is left out and reported, so
+A generated column's expression is passed through untranslated and reported on
+every target, a partial index's predicate on SQL Server and SQLite, and a
+`CHECK` expression on MySQL and SQL Server — the same way a view body is there. An index
+the target would reject outright is left out and reported, so
 the script still applies: an expression key on SQL Server, a key on an
 unbounded `text`/`bytea`/`json` column on MySQL or SQL Server. MySQL has no
 partial indexes, so there one becomes an index over every row (reported). A
@@ -169,6 +182,35 @@ own.
 in a batch, so the T-SQL script ends every statement with `GO` — the batch
 separator `sqlcmd` and SSMS read. `GO` is not T-SQL: a driver that sends the
 script in one call must split it on the `GO` lines first.
+
+### SQLite views and CHECKs
+
+Copied verbatim, a PostgreSQL view or `CHECK` breaks a SQLite script: SQLite
+has no schemas, so `core.cities` names a database that is not attached;
+`POSITION('-' IN code)` and `slug ~ '…'` are syntax errors; and a `CREATE TABLE`
+that fails takes the whole table with it. So on SQLite dbd writes each view's
+query and each `CHECK` expression again from PostgreSQL's parse tree, node by
+node, from what SQLite has with the same meaning:
+
+- table names become the names the script creates — `core.cities` reads
+  `"core_cities" AS "cities"`;
+- `POSITION(a IN b)` becomes `instr(b, a)`;
+- PostgreSQL's `NULLS FIRST`/`LAST` order and `LIKE` escape (`ESCAPE '\'`) are
+  spelled out, and every result column is named as PostgreSQL names it.
+
+```sql
+CREATE VIEW "app_v1" AS SELECT "id" AS "id", instr("name", 'a') AS "p" FROM "app_city" AS "city" WHERE "name" LIKE 'x\_%' ESCAPE '\' ORDER BY "name" NULLS FIRST;
+```
+
+The first construct outside that set refuses the whole statement: the view or
+`CHECK` is left out and reported with the reason (for a window
+`array_agg()`: SQLite has no `array_agg()` dbd can map PostgreSQL's to), and a
+view that reads a left-out view is left out with it. Nothing
+PostgreSQL-only can reach the script, so it applies; a refusal costs only what
+SQLite could not have run. A rewritten statement is still reported, because the
+engines differ even where the SQL reads the same (`LIKE` ignores ASCII case,
+values compare by column affinity). The output needs SQLite 3.39 or later, for
+`RIGHT`/`FULL JOIN`, `NULLS FIRST`/`LAST`, `FILTER` and window functions.
 
 ### Downgrades
 
@@ -187,9 +229,15 @@ nobody reads.
 | `boolean` | `TINYINT(1)` | `bit` | `INTEGER` |
 | `numeric(p,s)` | `DECIMAL(p,s)` | `decimal(p,s)` | `NUMERIC` |
 | `double precision` | `DOUBLE` | `float` | `REAL` |
+| `real` / `float4` | `FLOAT` | `real` | `REAL` |
+| `char(n)` | `CHAR(n)` | `nchar(n)` | `TEXT` |
 | `timestamptz` | `DATETIME` | `datetimeoffset` | `TEXT` |
 | `timestamp` | `DATETIME` | `datetime2` | `TEXT` |
 | `date` | `DATE` | `date` | `TEXT` |
+| `time` | `TIME` | `time` | `TEXT` |
+| `timetz` | `TIME` ⚠ — the offset is not kept | `time` ⚠ — the same | `TEXT` |
+| `interval` | `VARCHAR(255)` ⚠ | `nvarchar(255)` ⚠ | `TEXT` ⚠ |
+| `inet`, `cidr` | `VARCHAR(49)` ⚠ | `nvarchar(49)` ⚠ | `TEXT` ⚠ |
 | `bytea` | `BLOB` | `varbinary(max)` | `BLOB` |
 | `jsonb`, `json` | `JSON` | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
 | `uuid` | `CHAR(36)` ⚠ | `uniqueidentifier` | `TEXT` ⚠ |
@@ -206,12 +254,16 @@ nobody reads.
 | a literal default | the literal, without its `::cast` | the same | the same |
 | any other default | left out ⚠ | left out ⚠ | left out ⚠ |
 | a materialized view | a view ⚠ | a view ⚠ | a view ⚠ |
+| a view's query, a `CHECK` | untranslated ⚠ | untranslated ⚠ | written again ⚠, or left out ⚠ |
 | comments | table and column `COMMENT`; a view's ⚠ | `MS_Description` on tables, columns and views | none ⚠ |
 | a foreign key to a table not in the script | left out ⚠ | left out ⚠ | left out ⚠ |
+| extensions, roles, grants, RLS policies | nothing ⚠ | nothing ⚠ | nothing ⚠ |
 
 ⚠ = reported. An **enum** column becomes plain text on every target — MySQL's
-`ENUM` is not used and no `CHECK` is added — and is reported as "if it is an
-enum, the allowed values are no longer enforced". MySQL and SQLite have no
+`ENUM` is not used and no `CHECK` is added — and is reported as an enum whose
+allowed values are no longer enforced. That reason is given only for a type the
+design declares as an enum; any other type dbd has no mapping for (`point`,
+`money`) becomes text too, reported as unmapped. MySQL and SQLite have no
 schemas, so the schema is folded into the name with an underscore, and every
 reference to the table has to be updated to match.
 
@@ -233,13 +285,21 @@ Some losses are still **not** reported, so check for them by hand:
   SQLite, `varchar(n)` its length on SQLite; a bare `varchar` becomes
   `VARCHAR(255)`/`nvarchar(255)` and a bare `numeric` `DECIMAL(65,30)`/
   `decimal(38,10)`.
+- **A view's column list** — `CREATE VIEW v (a, b) AS …` comes out with the
+  query's own column names on every target.
+
+Copied verbatim but reported: a view's query and a `CHECK` on MySQL and SQL
+Server, a generated column's expression on every target, and a partial index's
+predicate on SQL Server and SQLite.
 
 The MySQL and SQL Server output is written from those engines' documented
 syntax and has not been run against a server, so apply it to a scratch
 database before trusting it.
 
-The schema-name folds and the skipped routines appear in the summary and the
-report but not as comments in the file — they have no single line to sit on.
+The schema-name folds appear in the summary and the report but not as comments
+in the file — they have no single line to sit on. The skipped routines and
+triggers, and the extensions, roles, grants and policies left out, are each
+noted in the file as well, where the statement would have been.
 
 ### The report
 
