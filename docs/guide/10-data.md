@@ -137,7 +137,7 @@ Error: Safety guard: environment guard: this database is marked prod, but this r
 
 The rest of that message says how to rebuild a database that is not production
 but was marked prod by a run without `-e` — see
-[the environment](04-commands.md#--environment). `dbd import -n X -f file` loads
+[the environment](04-commands.md#global-options). `dbd import -n X -f file` loads
 one file you name, not an environment's folder, and is not checked.
 
 ## What a run does
