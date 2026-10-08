@@ -90,6 +90,9 @@ pub struct MigrationStepPreview {
 pub enum MigrationAction {
     /// A migration added it; its DDL creates it.
     Create,
+    /// A migration adds values to it (an enum); they run, and commit, before
+    /// the rest of the version.
+    EnumValues,
     /// A migration altered it; its `.sql` runs.
     Migrate,
     /// A migration altered it; its `.data.sql` runs, after every schema change

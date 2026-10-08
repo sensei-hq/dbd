@@ -62,8 +62,27 @@ impl Design {
         versions.reverse();
 
         let mut steps = Vec::new();
+        // The entities whose enum values a version commits first: their
+        // `.sql` runs those statements again as no-ops, so the preview lists
+        // them once, where they take effect.
+        let mut hoisted: std::collections::HashSet<(u32, &str)> = std::collections::HashSet::new();
         for (step, version) in plan.steps.iter().zip(versions) {
             match step {
+                ExecutionStep::AddEnumValues {
+                    migration_version,
+                    scripts,
+                } => {
+                    for (entity, script) in scripts {
+                        hoisted.insert((*migration_version, entity.as_str()));
+                        steps.push(MigrationStepPreview {
+                            version: *migration_version,
+                            entity: entity.clone(),
+                            action: MigrationAction::EnumValues,
+                            statements: planned_statements_of(script),
+                            runs: true,
+                        });
+                    }
+                }
                 ExecutionStep::CreateEntity(entity) => {
                     steps.push(MigrationStepPreview {
                         version,
@@ -80,11 +99,23 @@ impl Design {
                     migration_sql_path,
                     migration_version,
                 } if migration_sql_path.exists() => {
+                    let sql = crate::source_text::read_to_string(migration_sql_path)?;
+                    let statements = if hoisted.contains(&(*migration_version, entity_name.as_str())) {
+                        let rest =
+                            planned_statements_where(&sql, |piece| !crate::script::is_enum_value_addition(piece));
+                        // Nothing left once its values moved ahead.
+                        if rest.is_empty() {
+                            continue;
+                        }
+                        rest
+                    } else {
+                        planned_statements_of(&sql)
+                    };
                     steps.push(MigrationStepPreview {
                         version: *migration_version,
                         entity: entity_name.clone(),
                         action: MigrationAction::Migrate,
-                        statements: planned_statements(migration_sql_path)?,
+                        statements,
                         runs: true,
                     });
                 }
@@ -384,6 +415,10 @@ impl Design {
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
         // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
+        //
+        // The one exception is a version that adds enum values: the run
+        // commits after running them, and carries on in a new transaction —
+        // see `ExecutionStep::AddEnumValues`.
         let use_txn =
             adapter.supports_transactional_apply() && std::env::var_os("DBD_NO_TX").is_none() && !plan.steps.is_empty();
 
@@ -406,6 +441,12 @@ impl Design {
                     &mut progress.on_done,
                 )
                 .await?;
+                // A version's new enum values commit before the rest of it
+                // uses them (see `ExecutionStep::AddEnumValues`).
+                if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                    adapter.commit_batch().await?;
+                    adapter.begin_batch().await?;
+                }
             }
             Ok(())
         }
@@ -556,13 +597,32 @@ impl Design {
                         // dbd writes migrations as UTF-8, but a hand-edit in
                         // SSMS does not stay that way — see `source_text`.
                         let sql = crate::source_text::read_to_string(migration_sql_path)?;
-                        adapter.execute_script(&sql).await?;
+                        // Its enum values already ran, and committed, at the
+                        // head of the version; here they are no-ops.
+                        adapter
+                            .execute_script(&crate::script::idempotent_enum_value_additions(&sql))
+                            .await?;
                     }
                     Ok(())
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
                 counts.migrated(entity_name);
+            }
+            ExecutionStep::AddEnumValues {
+                migration_version,
+                scripts,
+            } => {
+                for (entity_name, script) in scripts {
+                    let type_tag = entity_map
+                        .get(entity_name.as_str())
+                        .map(|e| e.entity_type.tag())
+                        .unwrap_or_else(|| "entity".to_string());
+                    let desc = format!("add values {type_tag}:{entity_name} → v{migration_version}");
+                    on_start(&desc);
+                    let result = adapter.execute_script(script).await;
+                    report_step_result(&desc, on_done, result)?;
+                }
             }
             ExecutionStep::MigrateData {
                 entity_name,
@@ -939,9 +999,25 @@ fn planned_statements(path: &std::path::Path) -> Result<Vec<PlannedStatement>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let sql = crate::source_text::read_to_string(path)?;
-    let pieces: Vec<&str> = pg_query::split_with_parser(&sql).unwrap_or_else(|_| vec![sql.as_str()]);
-    Ok(pieces.into_iter().filter_map(planned_statement).collect())
+    Ok(planned_statements_of(&crate::source_text::read_to_string(path)?))
+}
+
+/// [`planned_statements`] of script text.
+fn planned_statements_of(sql: &str) -> Vec<PlannedStatement> {
+    planned_statements_where(sql, |_| true)
+}
+
+/// [`planned_statements_of`], keeping the statements `keep` accepts. A script
+/// the grammar cannot split is shown whole.
+fn planned_statements_where(sql: &str, keep: impl Fn(&str) -> bool) -> Vec<PlannedStatement> {
+    match pg_query::split_with_parser(sql) {
+        Ok(pieces) => pieces
+            .into_iter()
+            .filter(|p| keep(p))
+            .filter_map(planned_statement)
+            .collect(),
+        Err(_) => planned_statement(sql).into_iter().collect(),
+    }
 }
 
 /// One statement as [`planned_statements`] shows it, or `None` for a piece

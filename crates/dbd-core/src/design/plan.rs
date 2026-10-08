@@ -28,6 +28,22 @@ pub enum ExecutionStep {
         migration_sql_path: PathBuf,
         migration_version: u32,
     },
+    /// Run the `ALTER TYPE … ADD VALUE` statements of one version's migration
+    /// files — `(entity, script)` pairs, from
+    /// [`crate::script::enum_value_additions`] — ahead of the rest of that
+    /// version, then commit the run's transaction and open the next.
+    ///
+    /// Postgres will not use an enum value inside the transaction that added
+    /// it ("unsafe use of new value"), and the rest of the version may: a
+    /// default, a CHECK, a data script. So a run that adds enum values is one
+    /// transaction up to and including each version's additions, and another
+    /// from there. The plan records the version before it first (a
+    /// [`ExecutionStep::SetVersion`]), so a later failure leaves a database
+    /// whose record says where it is.
+    AddEnumValues {
+        migration_version: u32,
+        scripts: Vec<(String, String)>,
+    },
     /// Run an altered entity's `.data.sql`. Its own step, after every schema
     /// change of the same version: a data script may read what another table
     /// gains in that version.
@@ -134,6 +150,8 @@ fn plan_current(valid_entities: &[&Entity]) -> ExecutionPlan {
 /// Migrate forward, one pending version at a time, each run whole before the
 /// next starts — as running them one release at a time would:
 ///
+/// 0. the enum values it adds, committed before the rest of it runs (see
+///    [`ExecutionStep::AddEnumValues`]);
 /// 1. its creates and schema changes (`.sql`), in dependency order;
 /// 2. its data scripts (`.data.sql`), in dependency order — after every schema
 ///    change of the version, since one table's script may read what another
@@ -192,8 +210,29 @@ fn plan_migrate(
                 .is_some_and(|schema| scope_names.is_some_and(|s| s.contains(&schema)))
     };
 
+    let mut previous: Option<u32> = None;
     for migration in pending_migrations {
         let names = |list: &[String], e: &Entity| list.contains(&e.name);
+
+        // Enum values first, committed with everything before them.
+        let additions: Vec<(String, String)> = valid_entities
+            .iter()
+            .filter(|e| names(&migration.altered, e))
+            .filter_map(|e| {
+                let path = migration_entity_sql_path(&migration.migration_dir, &e.name, ".sql");
+                let sql = crate::source_text::read_to_string(&path).ok()?;
+                crate::script::enum_value_additions(&sql).map(|script| (e.name.clone(), script))
+            })
+            .collect();
+        if !additions.is_empty() {
+            if let Some(version) = previous {
+                steps.push(ExecutionStep::SetVersion(version));
+            }
+            steps.push(ExecutionStep::AddEnumValues {
+                migration_version: migration.to_version,
+                scripts: additions,
+            });
+        }
 
         // Creates and schema changes, in dependency order. What a table refers
         // to and has no migrations of its own — a function its default calls —
@@ -256,6 +295,7 @@ fn plan_migrate(
             version: migration.to_version,
             checksum: migration.checksum.clone(),
         });
+        previous = Some(migration.to_version);
     }
 
     // Every entity of the run re-applies its DDL, on the migrated objects. A

@@ -701,12 +701,14 @@ pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::
     for step in &preview.steps {
         let action = match step.action {
             MigrationAction::Create => "create",
+            MigrationAction::EnumValues => "add values to",
             MigrationAction::Migrate => "migrate",
             MigrationAction::Data => "migrate data of",
             MigrationAction::Drop => "drop",
         };
         let note = match (step.action, step.runs) {
             (MigrationAction::Create, _) => " (from its DDL)",
+            (MigrationAction::EnumValues, _) => " (committed before the rest of the version)",
             (MigrationAction::Drop, false) => " — not in this database, so skipped",
             _ => "",
         };

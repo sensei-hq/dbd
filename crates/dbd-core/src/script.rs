@@ -137,6 +137,123 @@ fn search_path_statement(entries: &[crate::entity::PathEntry]) -> String {
     format!("SET search_path TO {};", names.join(", "))
 }
 
+/// One statement of a migration script, as the enum-value handling sees it.
+enum MigrationStatement {
+    /// `ALTER TYPE … ADD VALUE`, deparsed with `IF NOT EXISTS` — and whether
+    /// the script already said so.
+    AddValue {
+        idempotent: String,
+        as_written: bool,
+    },
+    /// `SET search_path …` or `RESET search_path`: the context of what follows.
+    SearchPath,
+    Other,
+}
+
+/// Classify one statement `piece`, by its parse tree.
+fn migration_statement(piece: &str) -> MigrationStatement {
+    use pg_query::NodeEnum;
+    let Ok(mut parsed) = pg_query::parse(piece) else {
+        return MigrationStatement::Other;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_mut_slice() else {
+        return MigrationStatement::Other;
+    };
+    match stmt.stmt.as_mut().and_then(|n| n.node.as_mut()) {
+        // `RENAME VALUE` is the same node with `old_val` set.
+        Some(NodeEnum::AlterEnumStmt(alter)) if alter.old_val.is_empty() && !alter.new_val.is_empty() => {
+            let as_written = alter.skip_if_new_val_exists;
+            alter.skip_if_new_val_exists = true;
+            match pg_query::deparse(&parsed.protobuf) {
+                Ok(idempotent) => MigrationStatement::AddValue { idempotent, as_written },
+                Err(_) => MigrationStatement::Other,
+            }
+        }
+        Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+            MigrationStatement::SearchPath
+        }
+        _ => MigrationStatement::Other,
+    }
+}
+
+/// The `ALTER TYPE … ADD VALUE` statements of migration script `sql`, each as
+/// `ADD VALUE IF NOT EXISTS`, with the `SET search_path` statements among them
+/// kept in place so each names the type it named in the script. `None` when
+/// the script adds no enum value, or the grammar cannot split it.
+///
+/// What an apply runs and commits ahead of the rest of a version: Postgres
+/// will not use an enum value inside the transaction that added it ("unsafe
+/// use of new value"), and the rest of the version may — a default, a CHECK,
+/// a data script. `IF NOT EXISTS` because a run that fails after this commit
+/// leaves the value in place, and the next run adds it again.
+pub fn enum_value_additions(sql: &str) -> Option<String> {
+    let pieces = pg_query::split_with_parser(sql).ok()?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut adds = false;
+    for piece in pieces {
+        match migration_statement(piece) {
+            MigrationStatement::AddValue { idempotent, .. } => {
+                adds = true;
+                kept.push(idempotent);
+            }
+            MigrationStatement::SearchPath => kept.push(piece.trim().to_string()),
+            MigrationStatement::Other => {}
+        }
+    }
+    adds.then(|| format!("{};\n", kept.join(";\n")))
+}
+
+/// Migration script `sql` with each `ALTER TYPE … ADD VALUE` as `ADD VALUE IF
+/// NOT EXISTS`, and every other byte as written.
+///
+/// What runs as the script itself once [`enum_value_additions`] has committed
+/// its values: the additions are then no-ops, and the script's other
+/// statements run where the script put them. Also what lets a run that
+/// creates an enum from the design's DDL — which already has every value —
+/// go on to a later version's `ADD VALUE` of one of them.
+pub fn idempotent_enum_value_additions(sql: &str) -> String {
+    let Ok(pieces) = pg_query::split_with_parser(sql) else {
+        return sql.to_string();
+    };
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for piece in pieces {
+        let MigrationStatement::AddValue {
+            idempotent,
+            as_written: false,
+        } = migration_statement(piece)
+        else {
+            continue;
+        };
+        // `split_with_parser` returns slices of `sql`, and a slice opens with
+        // whatever comments precede its statement: those are kept, and the
+        // statement is replaced from its first token on.
+        let start = piece.as_ptr() as usize - sql.as_ptr() as usize + first_token_at(piece);
+        out.push_str(&sql[copied..start]);
+        out.push_str(&idempotent);
+        copied = piece.as_ptr() as usize - sql.as_ptr() as usize + piece.len();
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
+
+/// The byte offset in `piece` of its first token that is not a comment — where
+/// its statement begins. 0 when the scanner cannot read it.
+fn first_token_at(piece: &str) -> usize {
+    use pg_query::protobuf::Token;
+    let comment = |t: i32| t == Token::SqlComment as i32 || t == Token::CComment as i32;
+    pg_query::scan(piece)
+        .ok()
+        .and_then(|scan| scan.tokens.into_iter().find(|t| !comment(t.token)))
+        .and_then(|t| usize::try_from(t.start).ok())
+        .unwrap_or(0)
+}
+
+/// Whether statement `piece` is an `ALTER TYPE … ADD VALUE`.
+pub(crate) fn is_enum_value_addition(piece: &str) -> bool {
+    matches!(migration_statement(piece), MigrationStatement::AddValue { .. })
+}
+
 /// Ensure `public` is included in any SET search_path statement.
 /// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
 /// but omit `public`, which hides extensions installed in the public schema.
