@@ -63,7 +63,8 @@ database.
 |---|---|
 | `issues` | entities with errors that block the given scope — what `apply` refuses on |
 | `out_of_scope_issues` | entities with errors the scope does not build |
-| `warnings` | entities with warnings |
+| `warnings` | entities with warnings that the scope builds — all of them without a scope |
+| `out_of_scope_warnings` | entities with warnings the scope does not build, kept apart as the errors are (new in 0.25) |
 | `gaps` | dependency gaps, when a scope is passed |
 
 `report` takes `&mut self` because it caches the validation.
@@ -95,12 +96,14 @@ PostgreSQL, SQLite or Convex — and refuses MySQL and SQL Server URLs by name
 pass `&*adapter`. The concrete adapters are public too —
 `adapter::postgres::PostgresAdapter::new(url, project)` and so on.
 
-An adapter of your own implements `DatabaseAdapter`. Two methods arrived in 0.25,
-both with defaults: `stamp_matview(qualified, stamp)` records a materialized
-view's drift stamp (a no-op unless the target has materialized views; Postgres
-keeps it in `dbd.matview_stamps`), and `truncate_table(table)` is the import's
-truncate step (`TRUNCATE TABLE` unless overridden — SQLite runs `DELETE FROM`,
-Convex nothing, since its import replaces the table).
+An adapter of your own implements `DatabaseAdapter`. Three methods arrived in
+0.25, all with defaults: `stamp_matview(qualified, stamp)` records a materialized
+view's drift stamp and `forget_matview_stamps(qualified)` deletes the stamps of
+views the caller has just dropped (both no-ops unless the target has
+materialized views; Postgres keeps them in `dbd.matview_stamps`), and
+`truncate_table(table)` is the import's truncate step (`TRUNCATE TABLE` unless
+overridden — SQLite runs `DELETE FROM`, Convex nothing, since its import
+replaces the table).
 
 ## Scope
 
@@ -162,7 +165,16 @@ would act on, behind the same gates and without a database — the list
 The three callbacks travel together in one `Progress` value; they are not three
 arguments. `Progress::none()` is a silent run. `ApplyComplete` carries
 `strategy` (`Fresh`, `Migrate` or `Current`), `from_version`, `to_version`,
-`applied`, `migrated`, `created`, `dropped`, the hook counts and any warnings.
+`applied`, `migrated`, `created`, `dropped` (the drops that ran), the hook
+counts, any warnings, and — new in 0.25 — `previously_built`: on a `Fresh` run,
+whether the database was already built without a recorded version, which is not
+a fresh install.
+
+The hooks a scope skips are in `ApplyComplete::warnings`, which only a run that
+succeeds produces. `hook_skips(scope)` returns the same lines without running
+anything — the decision the run makes — so a caller can say them first, as
+`dbd apply` and `deploy` do, and a run that then fails still explains itself.
+A hook file that is missing is an error there too.
 
 `apply` does not apply RLS policies or the configured grants.
 `apply_grants(adapter, scope)` applies the grants — under a scope, only on the
@@ -170,6 +182,13 @@ schemas the scope builds — and returns a `GrantsOutcome`: `None` when the desi
 declares none, `Applied`, or `Unsupported` on SQLite and Convex, which have no
 grant model. `deploy` does both; `design::apply_policies` applies the policies
 alone.
+
+What is granted is `design.config().effective_schema_grants()` — the
+`schemas:` grants with the first target's `grants:` merged on top, keyed schema
+→ role → permissions. It is one definition for both sides: `apply_grants` grants
+exactly it, and `reset` revokes exactly it before dropping the roles, so the
+revoke cannot drift from the grant. (`script::build_reset_script` takes that map
+as its final argument.)
 
 ## Deploy
 
@@ -191,11 +210,15 @@ design
 
 `deploy` is the pipeline `dbd deploy` runs: apply, then the configured grants
 (`apply_grants`, reported in `DeployComplete::grants`), then import, then every
-policy under `policies/`. A failing policy file does not
+policy under `policies/`. Before the first statement it runs `check_import_plan`,
+so what the import phase would refuse — a data file outside `import.staging`, a
+staging table whose loader is ambiguous — is refused before anything is applied.
+A failing policy file does not
 fail the deploy — it lands in `policies.failed`, and `warnings()` lists it with
-the apply and import warnings and any policy the scope skipped.
-`deploy_with_progress(adapter, dry_run, scope, Progress { … })` adds the per-step
-callbacks.
+the apply and import warnings and any policy the scope skipped, in pipeline
+order; `policy_warnings()` is the policy phase's share alone, for a caller that
+reports phase by phase. `deploy_with_progress(adapter, dry_run, scope,
+Progress { … })` adds the per-step callbacks.
 
 To deploy from GitHub as the CLI does, resolve the source to a local directory
 first (this is the `deploy` feature):
@@ -225,14 +248,24 @@ for (file, err) in &report.failed {
 `dbd import` does — truncate, load, procedures, `import.after`. The truncate goes
 through the adapter (`DatabaseAdapter::truncate_table`), so it runs on SQLite and
 Convex too. Only a procedure is a loader: `ImportPlanEntry.procedure` names the
-procedure that reads the staging table, never a function.
+procedure chosen to load the staging table — one per table, called once, picked
+as [import and export](10-data.md#which-procedure-loads-a-table) describes —
+never a function. A table with two data files is two entries and one load: the
+procedure is on the first entry only.
+
+`check_import_plan(name)` is every refusal an import path makes before it
+touches the database: a `name` that selects no data file, a data file outside
+`import.staging`, a staging table with two equal claims to its loader. It needs
+no database, so a caller can refuse before it connects; `import_data`,
+`scoped_import_plan` and `deploy` all run it.
 
 `scoped_import_plan(name, scope)` is the plan a run under `scope` keeps, with one
 line per entry it leaves out saying which table is outside the scope — an entry
 needs every table its procedure writes and, when the design declares it, its
 staging table. `import_warnings(name)` lists what the scan and the plan left out
 before any scope: a missing `import/`, another environment's files, a data file
-that failed to parse, a function reading a staging table no procedure loads.
+that failed to parse, a function reading a staging table no procedure loads, a
+procedure reading one it does not load.
 `design::import_entry_in_scope` is deprecated in favour of `scoped_import_plan`.
 
 `apply_policies` takes an optional `(scope_name, working_set)` pair; `None`
@@ -290,8 +323,11 @@ std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
 `schema_model::build(design, scope)` is the model `dbd diagram` encodes (see
 [The schema viewer](11-schema-viewer.md#the-model)). It returns
 `Result<SchemaModel>`: a scope whose `deps: include` closure needs something the
-scope excludes is refused, as every command refuses it. It does not read
-`snapshots/`, so attach the changelog yourself. Under a scope, filter the
+scope excludes is refused, as every command refuses it. A file dbd could not
+parse is not in the model; `Design::unparsed(&scope)` lists those entities — what
+a document generated under that scope leaves out — so you can name them, as
+`dbd diagram` and `dbd dbml` do. It does not read `snapshots/`, so attach the
+changelog yourself. Under a scope, filter the
 history with `history::load_scoped(project_dir, keep)`, where `keep(schema,
 name)` says which tables and enums to keep. `scope::admits` is the predicate
 `dbd diagram` passes: it answers from the scope's working set — closure
@@ -401,6 +437,9 @@ inside a dbd project and wrong outside one.
   state, so a scan parallelises.
 - `source_text::read_to_string(path)` decodes a file the way dbd does — UTF-8,
   or UTF-16 with a byte-order mark — rather than failing on what SSMS writes.
+  `source_text::read_with_encoding(path)` also returns the `Encoding` it found
+  (`Utf8`, `Utf8Bom`, `Utf16Le`, `Utf16Be`), and `Encoding::encode(text)` writes
+  text back in it — what `dbd format` uses to leave a file's encoding as it was.
 
 To learn about a directory without parsing it:
 
@@ -415,10 +454,16 @@ if let Some(survey) = dbd_core::survey(project_dir)? {
 These checks are made by the `dbd` command, not by the `Design` methods. An
 embedder that wants them makes them itself:
 
-- **The scope guard.** `dbd apply`, `deploy`, `reconcile` and `reset` refuse to
-  write under a scope other than the one the database is pinned to.
-  `Design::apply`, `deploy` and `reconcile` do not check — and they re-pin the
-  database to whatever scope they are given.
+- **The scope guard.** `dbd apply`, `deploy`, `reconcile`, `reset` and
+  `policies` refuse to write under a scope other than the one the database is
+  pinned to. `Design::apply`, `deploy` and `reconcile` do not check — and they
+  re-pin the database to whatever scope they are given — and neither do
+  `Design::reset` or `design::apply_policies`.
+- **Reset's preview.** `Design::reset` checks its own guard (a database marked
+  prod, or with applied migrations) unless forced; `dbd reset --dry-run` checks
+  it too, given a database, through the public
+  `Design::check_reset_guard(meta)`, so a preview refuses where the reset would.
+  `reset_script` alone checks nothing.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.
 - **Grants on apply.** `dbd apply` calls `Design::apply_grants` after
