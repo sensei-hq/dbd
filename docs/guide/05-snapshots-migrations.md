@@ -111,6 +111,12 @@ dropped once no column uses it
 Before 0.25 the change took three stages through a `TEXT` column, and failed on
 any view over the column and on an enum default.
 
+Three cases the generated migration does not handle, so check them by hand: a
+column that is an *array* of the enum is not seen; when the same snapshot also
+drops a table using the enum, the renamed old type is left behind; and a view
+over the column in a scope the database does not build is dropped and not
+recreated.
+
 Each version's `migrations/NNN/graph.json` records its place in the run as `"stage": {"index": k, "of": n}` — `1/1` for an ordinary version — so tools can group the stages back into the one change they make up; the viewer's changelog does exactly that. Graphs written before the marker existed have no `stage`, and are read by their snapshot's `(stage k/n)` description instead.
 
 ## Data corrections (*.data.sql)

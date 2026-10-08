@@ -1084,7 +1084,8 @@ index whose columns exactly match a PK/UNIQUE constraint is treated as that cons
 backing index and suppressed; an unparseable CHECK is shown with an `advisory`. How Postgres
 renders a name inside a live default depends on the reading session's `search_path`, which a
 pooled connection can inherit from an earlier DDL file, so a bare `nextval('s')` in a file can
-still read as drift now and then.
+still read as drift now and then. A negative default (`-1`, which Postgres reports as
+`'-1'::integer`) and a `varbit` column read as drift on every run.
 
 ---
 
