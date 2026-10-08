@@ -115,17 +115,28 @@ The reference target: every feature works here.
 - **Bookkeeping** lives in a `dbd` schema: `dbd.meta` (project, environment,
   version, pinned scope), `dbd.migrations`, and `dbd.matview_stamps` (each
   materialized view's drift stamp — kept out of the view's `COMMENT`, which is
-  the author's). The schema is not in PostgREST's default `db-schemas`, is never
-  reverse-engineered, and is never dropped.
+  the author's; `reset` deletes the rows of the matviews it drops), and, once a
+  JSON import has run, the `import_jsonb_to_table` procedure. The schema is not
+  in PostgREST's default `db-schemas`, is never reverse-engineered, and is never
+  dropped.
 - **Legacy bookkeeping heals itself.** Databases written by older dbd versions
   kept `_dbd_meta`/`_dbd_migrations` in `public` (or, after a scoped apply, in
   other schemas). The next `apply`, `deploy`, `reconcile` or `reset` folds them
   into `dbd.meta`/`dbd.migrations` in one transaction and drops the originals.
-  Read-only commands work on an unhealed database.
-- **Import** streams CSV and TSV through `COPY`. JSON and JSON Lines records are
-  staged as bound `jsonb` values and moved into the table by a procedure the
-  load installs as `staging.import_jsonb_to_table` (creating the `staging`
-  schema if needed). The truncate before a load is `TRUNCATE`.
+  The same heal copies a drift stamp that dbd before 0.25 kept as a
+  materialized view's comment into `dbd.matview_stamps` — before anything
+  re-runs the view's file, whose own `COMMENT ON` would erase it — and leaves
+  the comment for its author. Read-only commands work on an unhealed database.
+- **Import** streams CSV and TSV through `COPY`, into the columns the file's
+  header names — `COPY t (cols…) FROM STDIN WITH (FORMAT csv)`, with the header
+  row taken off first — so the file's column order need not be the table's. JSON
+  and JSON Lines records are staged as bound `jsonb` values in `dbd.import_tmp`
+  and moved into the table by `dbd.import_jsonb_to_table`, a procedure the load
+  installs itself in dbd's own `dbd` schema; no other schema is created. (Before
+  0.25 it lived in a schema called `staging`, created whatever your staging
+  schemas were called; a database an earlier dbd imported JSON into keeps its
+  `staging.import_jsonb_to_table` — drop it if nothing else uses it.) The
+  truncate before a load is `TRUNCATE`.
 
 ## SQLite
 
@@ -150,9 +161,14 @@ target:
   model).` **Policies** are PostgreSQL SQL, so each policy file fails.
 - **Import** writes multi-row `INSERT … VALUES (?,?),(?,?), …` batches of at most
   500 rows (or 32,000 bound values) in one transaction, matching CSV columns to
-  the header's names and JSON records to their keys. SQLite has no `TRUNCATE`,
-  so the default truncate runs `DELETE FROM` instead; with `truncate: false`,
-  rows are appended.
+  the header's names and JSON records to their keys. CSV and TSV are read as
+  RFC 4180, as PostgreSQL reads them — quoted delimiters, line breaks and doubled
+  quotes, nothing trimmed, a quoted field never NULL — so a file PostgreSQL
+  exported imports unchanged. SQLite has no `TRUNCATE`, so the default truncate
+  runs `DELETE FROM` instead; with `truncate: false`, rows are appended.
+- **Export** writes CSV and TSV as PostgreSQL's `COPY` does: NULL as an empty
+  field, `''` as `""`, and a value holding the delimiter, a quote or a line break
+  quoted — so an export loads back to the same values here or into PostgreSQL.
 - **Not available:** `diff`, `reconcile` and `emit` refuse a SQLite project,
   because the `verbatim` reader builds no structured model to compare or
   translate; `refresh` has no materialized views to refresh.
