@@ -11,8 +11,11 @@ description: >-
   enums, materialized-view drift misuse, seed data that can never load (an
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
   convention, a `--scope` that drops them, a data file outside `import.staging`,
-  a CSV header that does not name its table's columns, or two procedures with an
-  equal claim to one staging table), RLS expected from `dbd apply`
+  a CSV header that does not name its table's columns, a JSON key that names no
+  column, a file setting a generated column, two procedures with an equal claim
+  to one staging table, a pre-0.25 `export -o import/<schema>` round trip, or a
+  dev database built without `-e dev`), `ddl/extension/`/`ddl/schema/` files
+  dbd never reads, RLS expected from `dbd apply`
   without `--with-policies`, post-DDL SQL parked in `import.after` (which
   never runs on `dbd apply`) instead of `apply.after`, a scoped
   `reconcile --prune` on a dbd older than 0.24.1, and any `reconcile --prune`
@@ -93,6 +96,11 @@ file evidence).
    VIEW` filed under `ddl/view/` (or a plain `CREATE VIEW` under `ddl/materialized_view/`). dbd
    types by folder, so a misfiled matview makes `dbd reset` emit `DROP VIEW` on it (`"… is not a
    view"`). `dbd doctor` detects this; the fix is to move the file (not auto-fixed).
+   Also flag any file under `ddl/extension/` or `ddl/schema/`: dbd reads neither — extensions
+   are declared in the target's `extensions:` (with `schema:`) and schemas under `schemas:` —
+   so `dbd inspect` refuses such a file (one for a schema already listed is silently ignored).
+   `dbd doctor` names the design.yaml entry each one becomes; the fix is to declare it there and
+   delete the file.
 5. **String-set `CHECK` → enum** — a `CHECK (col IN ('a','b',…))` (or `= ANY(ARRAY[…])`, or an
    `OR`-chain of `col = '…'`) on a fixed set of string literals is better modeled as a Postgres
    `enum` (`ddl/enum/<schema>/<name>.ddl`). Advisory (same rule `dbd inspect` suggests).
@@ -105,7 +113,19 @@ file evidence).
    - An `import/<env>/…` directory whose `<env>` matches no environment the project actually
      deploys with (check `-e`/`--environment` in install scripts, CI, Makefiles, READMEs).
      `import/dev/staging/x.csv` is invisible to a `-e prod` deploy — by design, and dbd now warns,
-     but the *layout* is still the bug when no run ever uses that env.
+     but the *layout* is still the bug when no run ever uses that env. From 0.25 a file directly
+     in `import/dev/` or `import/prod/` is env-gated too (SQLite's env-only data lives there), so
+     a schema named `dev` or `prod` cannot keep files directly in that folder.
+   - A **dev database built without `-e dev`**: `-e` defaults to prod, so the first `apply`/
+     `deploy` without it marks the database prod, and from 0.25 every later `-e dev` run against
+     it — `apply`, `deploy`, `reconcile`, `import` — is refused (the environment guard; no
+     override). Flag a dev setup script whose first build omits `-e dev` while later steps pass
+     it. Fix: pass `-e dev` from the first run; for a database already marked, a full
+     `dbd reset --force` (it forgets the mark), then `-e dev`.
+   - A **pre-0.25 export round trip**: `dbd export … -o import/<schema>` now writes
+     `import/<schema>/<schema>/<table>.<fmt>`, a folder import reads as another env's and never
+     loads. Fix: `-o import` (export keeps the schema folder), or for views in their own schema,
+     export and move the files under the staging schema's folder.
    - Data files outside the convention: anything under `data/` or `seeds/` rather than
      `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
    - A `--scope` in the deploy command whose working set excludes the staging tables (or the
@@ -126,7 +146,12 @@ file evidence).
      - two procedures that read the same staging table with an **equal claim** to load it —
        neither named `import_<table>`, both reading only that staging table. dbd calls one loader
        per staging table; name the loader `import_<table>` (and call the other from it or from
-       `import.after`).
+       `import.after`);
+     - a JSON/JSONL record with a **key that names no column** of its table (it used to be
+       dropped silently), and any data file — CSV header or JSON key — that **sets a generated
+       column**;
+     - under a deploy's `--scope`, a staging table the scope keeps whose **loader procedure the
+       scope leaves out**.
    - Evidence: the `import/` tree next to the actual deploy/install invocation; `import.staging`
      in `design.yaml`; the first line of each CSV/TSV against its table's DDL; the procedures
      under `ddl/procedure/` that read each staging table.
@@ -147,9 +172,9 @@ file evidence).
    setup rather than data loading: attaching tables to a publication (Supabase realtime),
    `grant`s, or anything whose own comment says it must "run once every entity exists".
    `import.after` runs **only with the import phase** — `dbd import` and `dbd deploy` — so on
-   `dbd apply` it silently does nothing. The fix is `apply.after`, which runs on `apply` and
-   `deploy` and lands after every entity is applied, before the configured grants and
-   `policies/`.
+   `dbd apply` it silently does nothing. The fix is `apply.after`, which runs on `apply`,
+   `deploy` and `reconcile` and lands after every entity is applied, before the configured
+   grants and `policies/`.
    - When moving such a hook, check whether it needs an explicit `writes:`. dbd derives a
      script's tables by parsing it; a realtime hook typically names its tables as *data* inside
      `array['a','b']` and `format('… %I', t)`, where derivation returns empty. A script with no
