@@ -6205,3 +6205,66 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
     assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
     assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
 }
+
+// ── A reverse-engineered enum file runs twice ─────────────────────────────────
+
+/// Every other file reverse-engineering writes can run twice — `CREATE TABLE
+/// IF NOT EXISTS`, `CREATE OR REPLACE VIEW` — because a reversed project is
+/// applied back to the database it was read from, and `psql -f` over its files
+/// is how many people do that. An enum was a bare `CREATE TYPE`, which fails
+/// the second time with `type … already exists` (`dbd apply` copes by checking
+/// first; nothing else does). It is written in Postgres's idiom for a
+/// conditional `CREATE TYPE` — the `DO … duplicate_object` guard the enum
+/// parser already reads — and reads back to the same labels and comment.
+#[tokio::test]
+async fn a_reverse_engineered_enum_file_runs_twice_and_reads_back_the_same() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.mood AS ENUM ('happy', 'it''s $$ fine', 'sad'); \
+             COMMENT ON TYPE app.mood IS 'how a day went';",
+        )
+        .await
+        .unwrap();
+    let entities = adapter.introspect().await.expect("introspect");
+    let mood = entities
+        .iter()
+        .find(|e| e.name == "app.mood")
+        .expect("app.mood introspected");
+    // What `init --from-db` writes: the emitted DDL through the formatter.
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(mood).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+
+    // Against the database it came from, and again.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the enum file failed: {e}\n{file}"));
+    }
+    // And against one that has no such type yet.
+    adapter.execute_script("DROP TYPE app.mood").await.unwrap();
+    adapter
+        .execute_script(&file)
+        .await
+        .unwrap_or_else(|e| panic!("the enum file failed on a fresh schema: {e}\n{file}"));
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_type t WHERE t.oid = 'app.mood'::regtype \
+           AND (SELECT array_agg(enumlabel ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid) \
+               = ARRAY['happy', 'it''s $$ fine', 'sad']::name[]",
+        "app.mood with its three labels in order",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/enum/app/mood.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    let labels: Vec<&str> = back.enum_values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(labels, ["happy", "it's $$ fine", "sad"], "{file}");
+    assert_eq!(back.comment.as_deref(), Some("how a day went"), "{file}");
+}
