@@ -2408,9 +2408,12 @@ import:
         let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
         let err = design.resolve_scope(Some("contradicts"), None).unwrap_err().to_string();
         assert!(
-            err.contains("citext") && err.contains("ext"),
+            err.contains("'citext' installs into 'ext'"),
             "names the extension and its schema: {err}"
         );
+        // Said once: the message read "its extension 'citext' (installs into
+        // 'ext') installs into".
+        assert_eq!(err.matches("installs into").count(), 1, "{err}");
         design
             .resolve_scope(Some("consistent"), None)
             .expect("excluding the schema is fine when the scope installs no extension into it");
