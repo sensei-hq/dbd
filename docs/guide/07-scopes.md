@@ -50,7 +50,13 @@ bare schema or `schema.*` takes the schema's sequences with it, and
 
 A scope also keeps the `CREATE SCHEMA` of the schema each extension it installs
 goes into (the extension's `schema:`), so a scope that selects nothing in that
-schema still has it — unless the scope excludes the schema by name.
+schema still has it. A scope that excludes that schema by name while keeping
+the extension contradicts itself — the extension would have nowhere to go — and
+every command refuses it where it resolves the scope:
+
+```
+Error: scope 'reporting' excludes the schema its extension 'vector' (installs into 'extensions') installs into — stop excluding that schema, or leave the extension out of the scope's `extensions:` allowlist
+```
 
 A scope may also be the bare string `all` (`everything: all` above): the full
 set under another name. Any other bare string is refused.
@@ -143,13 +149,15 @@ The ignoring commands print
 `⚠ --scope hub ignored: this command operates on the whole design, not a scope`,
 and `--deps` given to one of them is warned about the same way.
 
-`inspect`, `apply --dry-run`, `deploy --dry-run`, `combine`, `dbml`, `export` and
-`refresh` announce the narrowing with one line, counted the same way by each —
-`scope 'hub': 2 of 7 entities`: the working set, `deps: include` closure
-included, out of every entity the design declares, externals left out of both.
-`graph` records the scope in its JSON instead (`"scope": "hub"`), because its
-stdout is a contract. The others filter without a line, so don't read its
-absence as "nothing was narrowed".
+Every command that honours a scope announces the narrowing with one line,
+counted the same way by each — `scope 'hub': 2 of 7 entities`: the working set,
+`deps: include` closure included, out of every entity the design declares,
+externals left out of both. That is `inspect`, `apply`, `deploy`, `import`,
+`reconcile`, `diff`, `combine`, `emit`, `dbml`, `diagram`, `export`, `refresh`,
+`policies` and `reset`, real runs and dry runs alike. `diff --json` prints the
+line on stderr, so stdout stays JSON; `graph` records the scope in its JSON
+instead (`"scope": "hub"`), because its stdout is a contract. An unscoped run
+prints no line.
 
 A dry run filters exactly as its real run does: `apply --dry-run` honours the
 scope's `extensions:` allowlist and refuses what `apply` refuses;
@@ -210,19 +218,24 @@ database to the latest version.
 
 A table removed from the design is in no working set any more, so its drop step
 belongs to the scopes that occupy its schema: a scoped `apply` or `deploy` runs
-the drop of a table in one of its schemas — and only where the table still
-exists, so a database whose scope never built it skips the step rather than
-fail on it.
+the drop of a table in one of its schemas — `migrations/<NNN>/<schema>/<table>.sql`,
+as `dbd snapshot` wrote it — and only where the table still exists, so a
+database whose scope never built it skips the step rather than fail on it. Only
+a drop that ran is counted in the summary.
 
 ## Hooks and policies under a scope
 
 Both are filtered by what they touch:
 
-- **Hook scripts** (`apply.before`, `apply.after`, `import.after`) run only when
-  every table they depend on is in the working set. dbd derives a script's
-  tables by parsing it; when the tables are *data* (inside `format()` or an
-  `array[…]`), declare them with `writes:`. A script with no derivable tables
-  and no `writes:` always runs. See [Hook scripts](03-design-yaml.md#hook-scripts).
+- **Hook scripts** (`apply.before`, `apply.after`, `import.after`) are skipped
+  when they depend on a table the design manages outside the working set. A
+  table the design does not manage — an `external:` one, or one the hook
+  creates itself — never causes a skip. dbd derives a script's tables by
+  parsing it; when the tables are *data* (inside `format()` or an `array[…]`),
+  declare them with `writes:`. A script with no derivable tables and no
+  `writes:` always runs. An `apply.*` skip is named before the run starts and
+  in `apply --dry-run` and `deploy --dry-run`. See
+  [Hook scripts](03-design-yaml.md#hook-scripts).
 - **Policies** are filtered by path: `policies/<schema>/<table>.sql` names its
   table, and a policy whose table is outside the working set is skipped and
   reported rather than run against a database that lacks its schema. A file off
@@ -235,8 +248,9 @@ scope to *stop* a script or a policy running.
 
 The first `apply`, `deploy` or `reconcile` **pins** a database to the scope it
 was built with, in the `scope` column of the bookkeeping table (`dbd.meta` on
-PostgreSQL, `_dbd_meta` on SQLite). A later `apply`, `deploy`, `reconcile` or
-`reset` under a different scope is refused:
+PostgreSQL, `_dbd_meta` on SQLite). A later `apply`, `deploy`, `reconcile`,
+`reset` or `policies` under a different scope is refused — as are
+`reconcile --dry-run`, and `reset --dry-run` when a database is configured:
 
 ```
 Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
@@ -247,8 +261,10 @@ Applying a different scope would build a divergent schema.
 That stops a forgotten or mistyped `--scope` from building half a schema in the
 wrong database. To re-point a database on purpose, pass `--allow-scope-change`:
 an `apply`, `deploy` or `reconcile` then re-pins it to the new scope. On `reset`
-the flag (like `--force`) only bypasses the check — a reset does not re-pin. A database created
-before scopes existed is unpinned and pins on its next write.
+the flag (like `--force`) only bypasses the check — a reset does not re-pin.
+`policies` takes no such flag, since it never re-pins: run it under the pinned
+scope, or re-point the database with `apply --allow-scope-change` first. A
+database created before scopes existed is unpinned and pins on its next write.
 
 To host several modules in one database, define one scope that includes them
 all, rather than switching a database back and forth between scopes.
