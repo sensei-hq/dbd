@@ -1912,6 +1912,38 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(found)
     }
 
+    async fn roles_held_elsewhere(&self, roles: &[String]) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if roles.is_empty() {
+            return Ok(Default::default());
+        }
+        // `pg_shdepend` is the server's record of what each role holds in each
+        // database — grants, default privileges, ownership, policies — readable
+        // from any of them. A database's own owner is recorded on the database.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT r.rolname::text, db.datname::text \
+             FROM pg_shdepend d \
+             JOIN pg_roles r ON r.oid = d.refobjid \
+             JOIN pg_database db ON db.oid = d.dbid \
+             WHERE d.refclassid = 'pg_authid'::regclass \
+               AND d.dbid <> (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND r.rolname = ANY($1) \
+             UNION \
+             SELECT r.rolname::text, db.datname::text \
+             FROM pg_database db JOIN pg_roles r ON r.oid = db.datdba \
+             WHERE db.datname <> current_database() AND r.rolname = ANY($1) \
+             ORDER BY 1, 2",
+        )
+        .bind(roles)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading what the project's roles hold elsewhere failed: {e}")))?;
+        let mut held: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (role, database) in rows {
+            held.entry(role).or_default().push(database);
+        }
+        Ok(held)
+    }
+
     async fn live_matviews(&self) -> Result<Vec<Entity>> {
         self.introspect_matviews().await
     }

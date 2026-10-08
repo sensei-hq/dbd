@@ -264,6 +264,43 @@ pub fn build_reset_script(
     schemas: &[String],
     grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<Option<String>, String> {
+    build_reset_script_keeping(
+        entities,
+        roles,
+        extensions,
+        target,
+        drop_schemas,
+        drop_extensions,
+        schemas,
+        grants,
+        &[],
+    )
+}
+
+/// [`build_reset_script`], keeping the roles named in `keep`: their grants in
+/// this database are revoked like every other role's, but they are not
+/// dropped.
+///
+/// A role is server-wide, and one this design declares may hold privileges or
+/// objects in another database on the same server — one built from the same
+/// design. Dropping it there breaks that database; trying failed this reset.
+/// The caller decides which to keep from the server's catalogs (see
+/// [`crate::adapter::DatabaseAdapter::roles_held_elsewhere`]). Revoking a kept
+/// role's grants here still matters: they are this database's, and left in
+/// place they would keep the role "held elsewhere" from the other database's
+/// own reset, so no reset would ever drop it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_reset_script_keeping(
+    entities: &[&Entity],
+    roles: &[RoleEntry],
+    extensions: &[String],
+    target: &str,
+    drop_schemas: bool,
+    drop_extensions: bool,
+    schemas: &[String],
+    grants: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    keep: &[String],
+) -> Result<Option<String>, String> {
     let mut lines = entity_drop_lines(entities);
 
     // ── Optional schema DROPs (filtered by protected rules) ───
@@ -288,7 +325,7 @@ pub fn build_reset_script(
     // ── Role DROPs (postgres only, reverse order) ─────────────
     if target == "postgres" {
         lines.extend(revoke_grant_lines(roles, grants, &dropped_schemas));
-        for role in roles.iter().rev() {
+        for role in roles.iter().rev().filter(|r| !keep.contains(&r.name)) {
             lines.push(role_drop_block(&role.name));
         }
     }
@@ -500,17 +537,23 @@ fn revoke_grant_lines(
 /// A role that still holds a privilege or owns an object cannot be dropped, and
 /// Postgres says so as `role "x" cannot be dropped because some objects depend
 /// on it` — the *what* is only in the error's DETAIL, which the driver's
-/// message leaves out. The refusal stands (reset revokes only what dbd granted,
-/// and never `DROP OWNED BY`, which would drop objects the project does not
-/// own); this only makes it say which role and why.
+/// message leaves out. The refusal stands (reset revokes only the schema grants
+/// design.yaml declares, and never `DROP OWNED BY`, which would drop objects
+/// the project does not own); this only makes it say which role and why.
+///
+/// It does not say *who* granted what is left: it said "privileges dbd did not
+/// grant", which was false for the grants dbd made in another database, and is
+/// for any a hook or policy file made. What reset can say is that it does not
+/// revoke them.
 fn role_drop_block(role: &str) -> String {
     format!(
         "DO $$ DECLARE held text; BEGIN\n  \
          DROP ROLE IF EXISTS \"{}\";\n\
          EXCEPTION WHEN dependent_objects_still_exist THEN\n  \
          GET STACKED DIAGNOSTICS held = PG_EXCEPTION_DETAIL;\n  \
-         RAISE EXCEPTION 'reset cannot drop role \"%\" — it still holds privileges dbd did not grant, \
-         or owns objects: %. Revoke or reassign them, then re-run reset.', '{}', \
+         RAISE EXCEPTION 'reset cannot drop role \"%\" — it still holds privileges or owns objects \
+         reset does not revoke (it revokes only the schema grants design.yaml declares): %. \
+         Revoke or reassign them, then re-run reset.', '{}', \
          replace(held, E'\\n', '; ') USING ERRCODE = 'dependent_objects_still_exist';\n\
          END $$;",
         quote_ident(role),

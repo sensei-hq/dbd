@@ -243,6 +243,19 @@ pub trait DatabaseAdapter: Send + Sync {
             .collect())
     }
 
+    /// The other databases on this server where each of `roles` holds
+    /// anything — a privilege, a default privilege, an object, or the database
+    /// itself — as role → those databases' names, sorted. A role missing from
+    /// the map holds nothing elsewhere.
+    ///
+    /// Roles are server-wide, so a role this design declares is shared by
+    /// every database on the server built from it. `reset` keeps one another
+    /// database holds rather than break that database. Default: none (targets
+    /// without server-wide roles).
+    async fn roles_held_elsewhere(&self, _roles: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        Ok(HashMap::new())
+    }
+
     /// Introspect the live database and return a complete `Vec<Entity>` covering
     /// schemas, extensions, enums, tables (with columns, constraints, indexes,
     /// and comments), and views — in that order.

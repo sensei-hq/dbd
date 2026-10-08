@@ -54,8 +54,13 @@ impl Design {
             Self::check_reset_guard(adapter.get_project_meta().await?.as_ref())?;
         }
 
-        let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope)?;
-        let mut summary = ResetComplete::default();
+        let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
+        let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
+        let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?;
+        let mut summary = ResetComplete {
+            roles_kept,
+            ..Default::default()
+        };
         if let Some(sql) = &plan.sql {
             let existed = adapter.existing_objects(&plan.objects).await?;
             // The matviews that exist now and not after the drop are the ones
@@ -116,7 +121,54 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<Option<String>> {
-        Ok(self.reset_plan(target, drop_schemas, drop_extensions, scope)?.sql)
+        self.reset_script_keeping(target, drop_schemas, drop_extensions, scope, &[])
+    }
+
+    /// [`Self::reset_script`], keeping the roles named in `keep` — those
+    /// [`Self::roles_kept_by_reset`] found another database holding — as the
+    /// real run does. A preview with a database to ask uses this, so it does
+    /// not list a `DROP ROLE` the run will not perform.
+    pub fn reset_script_keeping(
+        &self,
+        target: &str,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+        keep: &[String],
+    ) -> Result<Option<String>> {
+        Ok(self.reset_plan(target, drop_schemas, drop_extensions, scope, keep)?.sql)
+    }
+
+    /// The design's roles a reset of the database `adapter` reaches must keep,
+    /// because they hold something in another database on the same server.
+    ///
+    /// Roles are server-wide: two databases built from one design share them.
+    /// A reset of one dropped them out from under the other — or failed trying,
+    /// with an error that called dbd's own grants there ones "dbd did not
+    /// grant". Only a full reset on a postgres target drops roles, so only one
+    /// asks; the answer comes from the server's catalogs, read-only.
+    pub async fn roles_kept_by_reset(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        target: &str,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<Vec<KeptRole>> {
+        if target != "postgres" || matches!(scope, Some(s) if !s.is_all) {
+            return Ok(Vec::new());
+        }
+        let roles: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Role)
+            .map(|e| e.name.clone())
+            .collect();
+        let held = adapter.roles_held_elsewhere(&roles).await?;
+        let mut kept: Vec<KeptRole> = held
+            .into_iter()
+            .map(|(role, databases)| KeptRole { role, databases })
+            .collect();
+        kept.sort_by(|a, b| a.role.cmp(&b.role));
+        Ok(kept)
     }
 
     /// [`Self::reset_script`]'s SQL, and every object it drops — by kind and
@@ -128,6 +180,7 @@ impl Design {
         drop_schemas: bool,
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
+        keep: &[String],
     ) -> Result<ResetPlan> {
         // Roles aren't scope-selectable, so only a full reset drops them; a
         // subset scope leaves shared roles intact. Every role the design
@@ -231,9 +284,15 @@ impl Design {
 
         // Roles are dropped on a postgres target only (see `build_reset_script`).
         if target == "postgres" {
-            objects.extend(roles.iter().rev().map(|r| (EntityType::Role, r.name.clone())));
+            objects.extend(
+                roles
+                    .iter()
+                    .rev()
+                    .filter(|r| !keep.contains(&r.name))
+                    .map(|r| (EntityType::Role, r.name.clone())),
+            );
         }
-        let sql = script::build_reset_script(
+        let sql = script::build_reset_script_keeping(
             &entities,
             &roles,
             &extensions,
@@ -242,6 +301,7 @@ impl Design {
             drop_extensions,
             &schemas,
             &grants,
+            keep,
         )
         .map_err(DbdError::SafetyGuard)?;
         Ok(ResetPlan { sql, objects })
@@ -261,6 +321,18 @@ pub struct ResetComplete {
     /// in the order it dropped them. Only what existed before and is gone
     /// after: an object the database never had is not counted.
     pub dropped: Vec<(EntityType, String)>,
+    /// The design's roles the reset left in place because another database on
+    /// the server holds something of theirs.
+    pub roles_kept: Vec<KeptRole>,
+}
+
+/// A role [`Design::reset`] kept, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptRole {
+    pub role: String,
+    /// The other databases on the server where it holds privileges or objects
+    /// (or which it owns).
+    pub databases: Vec<String>,
 }
 
 impl ResetComplete {

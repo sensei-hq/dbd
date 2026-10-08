@@ -74,15 +74,27 @@ pub async fn cmd_reset(
         // A preview of a reset the real run would refuse is a false promise, so
         // with a database to ask, ask it first. With none configured the plan
         // is all there is to show, and the dry run stays database-free.
+        // The roles the real run keeps are asked of the same database, so the
+        // preview does not list a `DROP ROLE` the run will not perform.
+        let mut kept = Vec::new();
         if let Some(url) = super::configured_database_url(config, database_url)? {
             let adapter = get_adapter(config, Some(&url)).await?;
             check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+            kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
         }
+        let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
         let sql = design
-            .reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?
+            .reset_script_keeping(target, drop_schemas, drop_extensions, Some(&resolved), &keep)?
             .unwrap_or_else(|| "-- nothing to drop".to_string());
         output::info(verbosity, "[dry-run] Reset would run:");
         output::always(&sql);
+        let preview = dbd_core::ResetComplete {
+            roles_kept: kept,
+            ..Default::default()
+        };
+        for line in kept_role_lines(&preview) {
+            output::info(verbosity, &format!("[dry-run] {line}"));
+        }
         return Ok(());
     }
 
@@ -111,7 +123,9 @@ pub async fn cmd_reset(
 pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<String> {
     use dbd_core::EntityType;
     if summary.dropped.is_empty() {
-        return vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
+        let mut lines = vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
+        lines.extend(kept_role_lines(summary));
+        return lines;
     }
     let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut parts: Vec<String> = [
@@ -144,7 +158,25 @@ pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<Str
             roles.join(", ")
         ));
     }
-    vec![format!("Reset dropped {}.", parts.join(", "))]
+    let mut lines = vec![format!("Reset dropped {}.", parts.join(", "))];
+    lines.extend(kept_role_lines(summary));
+    lines
+}
+
+/// One line per role the reset kept: which, and the databases that hold it.
+fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    summary
+        .roles_kept
+        .iter()
+        .map(|k| {
+            format!(
+                "Role {} kept: it holds privileges or objects in database {} — roles are server-wide, \
+                 and dropping it would break that database.",
+                k.role,
+                k.databases.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
