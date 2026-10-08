@@ -2293,8 +2293,13 @@ mod tests {
         );
         // And the last stage is the design, so the next snapshot is empty.
         let last = &result.snapshots[1].snapshot;
-        assert_eq!(last.enums[0].values, vec!["active", "inactive"]);
-        assert_eq!(last.tables[0].columns[1].data_type, "public.status_type");
+        let design = prepare_snapshot(&entities, None, 99, "design").snapshot;
+        assert!(
+            diff::diff(&canonical_types(last), &canonical_types(&design)).is_empty(),
+            "the last stage ends at the design: {:?} vs {:?}",
+            last.enums,
+            design.enums
+        );
     }
 
     #[test]
