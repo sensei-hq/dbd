@@ -1821,7 +1821,15 @@ fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut V
     let args = t.find('(').map(|i| t[i..].trim()).unwrap_or("");
 
     match (base, target) {
-        ("jsonb" | "json", Target::MySql) => "JSON".to_string(),
+        ("jsonb", Target::MySql) => "JSON".to_string(),
+        // MySQL normalizes a JSON document as `jsonb` does; `json` keeps the
+        // text it was given, so only `json` loses something here.
+        ("json", Target::MySql) => lose(
+            "JSON",
+            "MySQL's JSON stores a document normalized — keys sorted, a duplicated key kept once, \
+             whitespace dropped — where `json` keeps the text as written, so a document reads back \
+             differently from how it was stored",
+        ),
         ("jsonb" | "json", Target::TSql) => lose(
             "nvarchar(max)",
             "SQL Server has no JSON column type here, so it is stored as text and the \

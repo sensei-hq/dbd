@@ -838,7 +838,19 @@ fn type_text(type_name: &protobuf::TypeName) -> Option<String> {
     let rendered = rendered
         .strip_prefix(&format!("CREATE TABLE {FRAME} ({FRAME} "))?
         .strip_suffix(')')?;
-    Some(without_typmod_spaces(rendered))
+    Some(without_typmod_spaces(without_catalog(rendered)))
+}
+
+/// Postgres's grammar names every SQL-standard type through `pg_catalog`, and
+/// its deparser writes most of them back bare (`int`, `varchar(30)`) — but not
+/// `json`, `bit` or `bit varying`, which come out as `pg_catalog.json`,
+/// `pg_catalog.bit(3)` and `pg_catalog.varbit(5)`. Kept, the qualification made
+/// `emit` miss its `json` mapping (MySQL got `VARCHAR(255)`) and spelled the
+/// type that way in DBML. A type named through `pg_catalog` is the same type
+/// bare, as `reconcile::canonical_type` already treats it, so the comparisons
+/// that strip it there see no change.
+fn without_catalog(rendered: &str) -> &str {
+    rendered.strip_prefix("pg_catalog.").unwrap_or(rendered)
 }
 
 /// Postgres's deparser writes a type-modifier list as `numeric(10, 2)`, but
