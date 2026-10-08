@@ -1218,6 +1218,81 @@ mod tests {
         );
     }
 
+    // ── import.after under a scope: the preview and the run agree ────────────
+
+    /// A staging table, a live `core.items`, an `import.after` hook updating
+    /// `core.items`, and two scopes: `core_only` keeps the hook's table,
+    /// `no_core` leaves it out.
+    const HOOKED_PROJECT: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: t\nschemas:\n  - staging\n  - core\nimport:\n  staging: [staging]\n  after:\n    - import/after.sql\n\
+             scopes:\n  core_only:\n    includes: [core]\n  no_core:\n    excludes: [core]\n",
+        ),
+        (
+            "ddl/table/staging/items.ddl",
+            "set search_path to staging;\ncreate table if not exists items (id integer);\n",
+        ),
+        (
+            "ddl/table/core/items.ddl",
+            "set search_path to core;\ncreate table if not exists items (id integer primary key);\n",
+        ),
+        ("import/staging/items.csv", "id\n1\n"),
+        ("import/after.sql", "update core.items set id = id;\n"),
+    ];
+
+    /// Whether the real import under `scope` runs the `import.after` hook.
+    async fn the_run_executes_the_hook(design: &Design, scope: &str) -> bool {
+        let resolved = design.resolve_scope(Some(scope), None).unwrap();
+        let mock = MockAdapter::new();
+        design
+            .import_data(&mock, None, false, Some(&resolved), Progress::none())
+            .await
+            .unwrap();
+        mock.scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("update core.items"))
+    }
+
+    /// The hook touches `core.items`, which `core_only` builds: the run
+    /// executes it. The preview said it was skipped — it judged the hook
+    /// against the working set as though that were what the scope leaves out,
+    /// the reverse of the run's rule.
+    #[tokio::test]
+    async fn the_import_preview_runs_a_hook_the_scoped_run_runs() {
+        let (_tmp, design) = project_from(HOOKED_PROJECT);
+        assert!(
+            the_run_executes_the_hook(&design, "core_only").await,
+            "precondition: the run executes it"
+        );
+
+        let resolved = design.resolve_scope(Some("core_only"), None).unwrap();
+        let (runnable, skips) = design.import_after_preview(Some(&resolved)).unwrap();
+        assert_eq!(runnable, vec!["import/after.sql".to_string()], "skips: {skips:?}");
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
+    /// The other direction: `no_core` leaves `core.items` out, so the run
+    /// skips the hook — and the preview said it would run it.
+    #[tokio::test]
+    async fn the_import_preview_skips_a_hook_the_scoped_run_skips() {
+        let (_tmp, design) = project_from(HOOKED_PROJECT);
+        assert!(
+            !the_run_executes_the_hook(&design, "no_core").await,
+            "precondition: the run skips it"
+        );
+
+        let resolved = design.resolve_scope(Some("no_core"), None).unwrap();
+        let (runnable, skips) = design.import_after_preview(Some(&resolved)).unwrap();
+        assert!(runnable.is_empty(), "{runnable:?}");
+        assert!(
+            skips.len() == 1 && skips[0].contains("import/after.sql") && skips[0].contains("core.items"),
+            "the skip names the hook and the table the scope leaves out: {skips:?}"
+        );
+    }
+
     /// Shared seed data in `import/staging/` and dev-only rows in
     /// `import/dev/staging/` are two data files for one table. Both load, and
     /// then the table's loader runs — once, over both. It ran once per file,
