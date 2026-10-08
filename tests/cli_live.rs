@@ -754,3 +754,48 @@ async fn a_scoped_apply_that_fails_still_names_the_hook_it_skipped() {
         combined(&o)
     );
 }
+
+// ── a dev run against a prod database is refused ────────────────────────────
+
+/// The audit's repro: `apply -e prod`, then a dev run of apply, deploy,
+/// reconcile or import. Each re-marked the database `dev`, so `reset` — which
+/// refuses a prod database — went ahead. Each must exit non-zero naming the
+/// database's env and the way out, and `reset` must stay refused.
+#[tokio::test]
+async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays_refused() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::create_dir_all(dir.join("import/dev/app")).unwrap();
+    std::fs::write(dir.join("import/dev/app/widgets.csv"), "id,name\n7,dev-seed\n").unwrap();
+
+    let o = dbd(dir, &url, &["-e", "prod", "apply"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+
+    for command in [&["apply"][..], &["deploy"], &["reconcile"], &["import"]] {
+        let args = [&["-e", "dev"][..], command].concat();
+        let o = dbd(dir, &url, &args);
+        assert!(
+            !o.status.success(),
+            "`dbd {}` must be refused on a prod database: {}",
+            args.join(" "),
+            combined(&o)
+        );
+        assert!(
+            combined(&o).contains("marked prod") && combined(&o).contains("-e prod"),
+            "`dbd {}` must name the env and what to do: {}",
+            args.join(" "),
+            combined(&o)
+        );
+    }
+
+    let o = dbd(dir, &url, &["-e", "dev", "reset"]);
+    assert!(
+        !o.status.success() && combined(&o).contains("prod"),
+        "reset must stay refused on the prod database: {}",
+        combined(&o)
+    );
+    let csv = exported_widgets(dir, &url);
+    assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
+}

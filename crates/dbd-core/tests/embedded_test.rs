@@ -5224,3 +5224,106 @@ async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
         assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
     }
 }
+
+// ── A dev run against a prod database is refused ──────────────────────────────
+
+const ENV_GUARD_YAML: &str = "project:\n  name: env_guard\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+
+const ENV_GUARD_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/items.ddl",
+        "set search_path to app;\ncreate table if not exists items (id int primary key, name text);\n",
+    ),
+    // Seed data only a dev database should ever get.
+    ("import/dev/app/items.csv", "id,name\n1,dev-seed\n"),
+];
+
+fn env_guard_design(dir: &std::path::Path, env: &str) -> Design {
+    write_project(dir, ENV_GUARD_YAML, ENV_GUARD_FILES);
+    Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).expect("load design")
+}
+
+/// `apply -e prod` and then `apply -e dev` rewrote `dbd.meta.env` to `dev`,
+/// which lifted the prod guard on `reset` — and a dev deploy or import loaded
+/// `import/dev/` seed data into the production database. A dev run against a
+/// database marked prod is itself the mistake, so every command that records
+/// the environment (and import, which picks its data by it) refuses it before
+/// writing anything, and the database stays marked prod.
+#[tokio::test]
+async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "env_guard").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let prod = env_guard_design(tmp.path(), "prod");
+    let dev = env_guard_design(tmp.path(), "dev");
+
+    prod.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the prod apply");
+    let meta = adapter.get_project_meta().await.unwrap().expect("apply records meta");
+    assert_eq!(meta.env, "prod");
+
+    let refusals = [
+        (
+            "apply",
+            dev.apply(&*adapter, None, false, None, Progress::none()).await.err(),
+        ),
+        ("deploy", dev.deploy(&*adapter, false, None, |_| {}).await.err()),
+        (
+            "reconcile",
+            dev.reconcile(&*adapter, false, false, false, None, Progress::none())
+                .await
+                .err(),
+        ),
+        (
+            "import",
+            dev.import_data(&*adapter, None, false, None, Progress::none())
+                .await
+                .err(),
+        ),
+    ];
+    for (command, err) in refusals {
+        let err = err
+            .unwrap_or_else(|| panic!("a dev {command} against a prod database must be refused"))
+            .to_string();
+        assert!(
+            err.contains("marked prod") && err.contains("-e prod"),
+            "the {command} refusal must name the database's env and what to do: {err}"
+        );
+    }
+
+    let meta = adapter.get_project_meta().await.unwrap().expect("meta");
+    assert_eq!(meta.env, "prod", "a refused dev run must not re-mark the database");
+    assert!(
+        Design::check_reset_guard(Some(&meta)).is_err(),
+        "reset must stay blocked on the prod database"
+    );
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.items WHERE name = 'dev-seed'",
+        "dev seed data in the prod database",
+    )
+    .await;
+}
+
+/// The guard is one-way. A database marked dev may be promoted to prod: that
+/// only tightens what `reset` allows.
+#[tokio::test]
+async fn a_database_marked_dev_may_be_promoted_to_prod() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "env_guard").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dev = env_guard_design(tmp.path(), "dev");
+    let prod = env_guard_design(tmp.path(), "prod");
+
+    dev.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the dev apply");
+    prod.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("promoting a dev database to prod");
+
+    let meta = adapter.get_project_meta().await.unwrap().expect("meta");
+    assert_eq!(meta.env, "prod");
+}
