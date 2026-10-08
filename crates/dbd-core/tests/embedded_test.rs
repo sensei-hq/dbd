@@ -5858,6 +5858,41 @@ async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() 
     .await;
 }
 
+/// The way out for a database a run without `-e` marked prod: reset it, with
+/// `--force`, and build it again with `-e dev`. The reset dropped the objects
+/// and the migrations but kept the `dbd.meta` row, so the rebuilt database was
+/// still marked prod and the dev run was refused — there was no way out short
+/// of a new database. A full reset leaves nothing of the project behind, its
+/// record of the database included.
+#[tokio::test]
+async fn a_forced_full_reset_lets_a_mis_marked_database_be_rebuilt_as_dev() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "env_guard").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let prod = env_guard_design(tmp.path(), "prod");
+    let dev = env_guard_design(tmp.path(), "dev");
+
+    prod.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect_err("an unforced reset of a prod database is refused");
+    prod.reset(&*adapter, "postgres", true, false, false, None)
+        .await
+        .expect("a forced reset");
+    assert!(
+        adapter.get_project_meta().await.unwrap().is_none(),
+        "a full reset forgets the database's record of the project"
+    );
+
+    dev.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the reset database is rebuilt with -e dev");
+    let meta = adapter.get_project_meta().await.unwrap().expect("apply records meta");
+    assert_eq!(meta.env, "dev");
+}
+
 /// The guard is one-way. A database marked dev may be promoted to prod: that
 /// only tightens what `reset` allows.
 #[tokio::test]
