@@ -6517,3 +6517,147 @@ async fn a_named_apply_refuses_while_migrations_are_pending() {
         .await
         .expect("with nothing pending, a named apply applies its entity");
 }
+
+// ── An enum value a version adds can be used in that version ─────────────────
+
+const MOOD_YAML: &str = "project:\n  name: enum_add_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+
+/// The enum and table files of a version: `values` for `app.mood`, and the
+/// columns of `app.people` after its key.
+fn mood_files(values: &str, columns: &str) -> [(String, String); 2] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            format!("set search_path to app;\ncreate table if not exists people (id integer primary key{columns});\n"),
+        ),
+    ]
+}
+
+fn cut_mood_version(dir: &std::path::Path, values: &str, columns: &str, description: &str) {
+    let files = mood_files(values, columns);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    cut_version(dir, MOOD_YAML, &files, &[], description);
+}
+
+/// Adding `'archived'` and making it the default in one version failed with
+/// `unsafe use of new value "archived"`: the migration ran in one transaction,
+/// and Postgres will not use an enum value before the transaction that added
+/// it commits. Reconcile, which commits as it goes, handled the same change.
+/// The value is now committed ahead of the rest of its version — here across
+/// a jump over two such versions.
+#[tokio::test]
+async fn an_enum_value_a_version_adds_can_be_used_in_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id) VALUES (1);")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived', 'paused'",
+        ", mood mood not null default 'archived', was mood not null default 'paused'",
+        "v3 adds was",
+    );
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived,paused}'",
+        "enum app.mood with archived and paused",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'paused'",
+        "the row, given the new column's default",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// What stays atomic. The enum values a version adds commit before the rest of
+/// it runs; everything else of the run is one transaction. So when the rest
+/// fails, the values stay, nothing else of the version does, the database still
+/// records the version before — and the next run, once the script is fixed,
+/// adds nothing twice.
+#[tokio::test]
+async fn a_version_failing_after_its_enum_values_commit_runs_again_once_fixed() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    let people_sql = dir.join("migrations/002/app/people.sql");
+    let generated = std::fs::read_to_string(&people_sql).unwrap();
+    std::fs::write(&people_sql, format!("{generated}\nSELECT 1 / 0;\n")).unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the broken script fails the run");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived}'",
+        "the committed enum value",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'people' \
+         AND column_name = 'mood' AND column_default LIKE '''ok''%'",
+        "the default the failed run rolled back",
+    )
+    .await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "v2 is not recorded");
+
+    std::fs::write(&people_sql, generated).unwrap();
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the fixed version applies over its committed value");
+    assert_eq!(adapter.get_db_version().await.unwrap(), 2);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
