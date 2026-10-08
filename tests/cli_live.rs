@@ -242,7 +242,9 @@ async fn export_counts_what_it_writes_and_names_what_the_scope_left_out() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     listed_export_project(dir);
-    assert!(dbd(dir, &url, &["apply"]).status.success());
+    // Built under the scope it exports: export refuses a database pinned to
+    // another scope, as apply does.
+    assert!(dbd(dir, &url, &["apply", "--scope", "app_only"]).status.success());
 
     let out = dir.join("out");
     let o = dbd(
