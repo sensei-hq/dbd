@@ -610,6 +610,13 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
     if entity.schema_path.stated() || !entity.entity_type.has_schema() {
         return;
     }
+    // A file that did not parse has no path the parser could record — its
+    // `SET search_path` may be its first line — so "states no SET
+    // search_path" beside its parse error was false. The parse error is the
+    // finding.
+    if !entity.errors.is_empty() {
+        return;
+    }
     // A dialect with no schema path at all has nothing to warn about. T-SQL
     // resolves an unqualified name against the connecting user's default
     // schema and MySQL has no schemas — neither has a `search_path`, and

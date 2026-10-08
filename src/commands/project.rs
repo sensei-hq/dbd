@@ -272,20 +272,24 @@ fn fix_stale_files(stale_files: &[dbd_core::doctor::StaleFile], verbosity: Verbo
 }
 
 /// Migrate plural DDL folders to their singular canonical form, returning how
-/// many moves succeeded.
+/// many folders were migrated in full.
+///
+/// A folder is one issue — that is how `doctor` finds and reports it — so it
+/// is one fixed, however many files moving it took. Counting the moves, doctor
+/// found "2 issues" and fixed "4". A folder any of whose files failed to move
+/// is not fixed.
 fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Verbosity) -> usize {
     use dbd_core::doctor::DdlMoveOutcome;
     let mut fixed = 0;
     for d in plural_dirs {
+        let mut all_moved = true;
         for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
             match outcome {
                 DdlMoveOutcome::RenamedDir { from, to } => {
                     output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::MovedFile { from, to } => {
                     output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::BackedUp {
                     winner,
@@ -300,12 +304,15 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
                         loser.display(),
                         backup.display()
                     ));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::Error { path, error } => {
                     output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                    all_moved = false;
                 }
             }
+        }
+        if all_moved {
+            fixed += 1;
         }
     }
     fixed

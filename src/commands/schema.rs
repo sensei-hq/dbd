@@ -50,7 +50,16 @@ pub async fn cmd_inspect(
     // A `-n` that names nothing reported "Everything looks ok" on an empty
     // selection; under a scope, a name the scope does not build did the same.
     if let Some(n) = name {
-        design.resolve_name(n, Some(&resolved))?;
+        // An `external:` name is known to the design but has no DDL — dbd reads
+        // nothing of it, so there is nothing here to check. `apply -n` refuses
+        // it for the same reason, and "Everything looks ok" over it was the
+        // false all-clear a `-n` selecting nothing used to give.
+        if design.resolve_name(n, Some(&resolved))?.entity_type == EntityType::External {
+            anyhow::bail!(
+                "{n} is declared `external:` — dbd has no DDL for it, so there is nothing to inspect; \
+                 it only resolves references to it"
+            );
+        }
     }
     let report = design.report(name, Some(&resolved));
 

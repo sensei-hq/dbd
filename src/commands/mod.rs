@@ -561,15 +561,38 @@ pub(super) async fn get_adapter(
 ) -> Result<Box<dyn dbd_core::DatabaseAdapter>> {
     let design_config = dbd_core::config::read(config).context("Failed to read config")?;
 
-    let url = match database_url {
+    // An exported-but-empty `$DATABASE_URL` reaches here as `-d ""` (clap reads
+    // the variable for `-d`); it names no database, so the target's URL is
+    // asked instead, as `configured_database_url` does.
+    let url = match database_url.filter(|u| !u.is_empty()) {
         Some(u) => u.to_string(),
         None => {
             let target = design_config.get_target(None).context("No target configured")?;
-            target
+            let configured = target
                 .url
                 .clone()
-                .map(|u| resolve_env_vars(&u))
-                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?
+                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?;
+            let url = resolve_env_vars(&configured);
+            // A `$VAR` the environment does not have comes back as itself, and
+            // the driver then reported `relative URL without a base` — true of
+            // the string `$DATABASE_URL`, and no help to someone who forgot to
+            // export it. Say which variable, and how to supply it.
+            if let Some(var) = configured.strip_prefix('$') {
+                let state = if url == configured {
+                    Some("not set")
+                } else if url.is_empty() {
+                    Some("empty")
+                } else {
+                    None
+                };
+                if let Some(state) = state {
+                    anyhow::bail!(
+                        "target.url is ${var}, but {var} is {state} — export {var}=postgres://user:password@host:5432/database, \
+                         or pass the URL with -d <url>"
+                    );
+                }
+            }
+            url
         }
     };
 
