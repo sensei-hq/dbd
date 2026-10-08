@@ -280,6 +280,13 @@ do — load, read, refresh or secure tables the database was not built with —
 and the way through. A
 database created before scopes existed is unpinned and pins on its next write.
 
+The pin lives in the same bookkeeping row as the environment the database was
+built for, and a full `reset` — `--scope all`, or no `--scope` when no `default:`
+is defined — deletes that row, so the next `apply` pins the database afresh. A
+scoped reset leaves the pin, and the rest of the row, where it was. The
+environment is guarded the way the scope is: a `-e dev` run against a database
+marked prod is refused (see [global options](04-commands.md#global-options)).
+
 To host several modules in one database, define one scope that includes them
 all, rather than switching a database back and forth between scopes.
 

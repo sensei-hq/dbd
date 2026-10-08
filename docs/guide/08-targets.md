@@ -120,7 +120,9 @@ The reference target: every feature works here.
   transaction.
 - **Bookkeeping** lives in a `dbd` schema: `dbd.meta` (project, environment,
   version, pinned scope — the row a full `reset` deletes, so the next apply
-  records the database afresh), `dbd.migrations`, and `dbd.matview_stamps` (each
+  records the database afresh; its environment is what reset's prod guard reads,
+  and why a `-e dev` run against a database marked prod is refused),
+  `dbd.migrations`, and `dbd.matview_stamps` (each
   materialized view's drift stamp — kept out of the view's `COMMENT`, which is
   the author's; `reset` deletes the rows of the matviews it drops), and, once a
   JSON import has run, the `import_jsonb_to_table` procedure. The schema is not
