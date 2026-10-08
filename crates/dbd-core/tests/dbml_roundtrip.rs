@@ -267,8 +267,10 @@ fn an_index_keeps_its_key_order_and_null_handling_through_dbml_and_back() {
     }
 
     assert!(index(td, "orders_ext_ref_uq").nulls_not_distinct, "\n{dbml}");
-    let constraint = index(td, "orders_ref_code_uq");
-    assert!(constraint.unique && constraint.nulls_not_distinct, "\n{dbml}");
+    assert!(
+        uniques(td).contains(&(Some("orders_ref_code_uq"), vec!["ref_code"], true)),
+        "the constraint comes back as one, NULLS NOT DISTINCT kept:\n{dbml}"
+    );
 }
 
 /// `[unique]` and `[increment]` were read and then lost: the parser threw

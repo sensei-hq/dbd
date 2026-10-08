@@ -1184,7 +1184,8 @@ mod tests {
     }
 
     /// DBML has no table-constraint syntax for UNIQUE; its spelling is a unique
-    /// index, single-column or composite, carrying the constraint's name.
+    /// index, single-column or composite, carrying the constraint's name — and
+    /// a note saying it is a constraint, which `dbml_parse` reads back as one.
     #[test]
     fn a_table_level_unique_constraint_is_written_as_a_named_unique_index() {
         let entity = make_table_entity(
@@ -1206,10 +1207,13 @@ mod tests {
 
         let block = emit_table("shop.orders", "shop", entity.table_def.as_ref().unwrap());
         assert!(
-            block.contains("ref_code [unique, name: 'orders_ref_code_uq']"),
+            block.contains("ref_code [unique, name: 'orders_ref_code_uq', note: 'unique constraint']"),
             "got:\n{block}"
         );
-        assert!(block.contains("(customer_id, ref_code) [unique]"), "got:\n{block}");
+        assert!(
+            block.contains("(customer_id, ref_code) [unique, note: 'unique constraint']"),
+            "got:\n{block}"
+        );
     }
 
     /// DBML writes an index expression in backticks — bare, `lower(email)`
