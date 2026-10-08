@@ -96,14 +96,28 @@ PostgreSQL, SQLite or Convex — and refuses MySQL and SQL Server URLs by name
 pass `&*adapter`. The concrete adapters are public too —
 `adapter::postgres::PostgresAdapter::new(url, project)` and so on.
 
-An adapter of your own implements `DatabaseAdapter`. Three methods arrived in
-0.25, all with defaults: `stamp_matview(qualified, stamp)` records a materialized
-view's drift stamp and `forget_matview_stamps(qualified)` deletes the stamps of
-views the caller has just dropped (both no-ops unless the target has
-materialized views; Postgres keeps them in `dbd.matview_stamps`), and
-`truncate_table(table)` is the import's truncate step (`TRUNCATE TABLE` unless
-overridden — SQLite runs `DELETE FROM`, Convex nothing, since its import
-replaces the table).
+An adapter of your own implements `DatabaseAdapter`. 0.25 adds one method you
+must write: `forget_project_meta()` deletes the database's record of the
+project — its env, version and scope pin — which a full `reset` now does, so
+the next apply records the database afresh. The rest arrive with defaults:
+
+- `stamp_matview(qualified, stamp)` records a materialized view's drift stamp,
+  and `forget_matview_stamps(qualified)` deletes the stamps of views the caller
+  has just dropped — both no-ops unless the target has materialized views
+  (Postgres keeps them in `dbd.matview_stamps`). `live_matviews()` returns the
+  deployed materialized views with their definition and indexes, which is how
+  `apply` recognises one a brownfield database already has; none by default.
+- `truncate_table(table)` is the import's truncate step — `TRUNCATE TABLE`
+  unless overridden; SQLite runs `DELETE FROM`, Convex nothing, since its
+  import replaces the table.
+- `existing_objects(objects)` says which of a list of `(kind, name)` exist.
+  `reset` asks before and after it drops, so it reports what it dropped rather
+  than what it ran — every drop is `IF EXISTS`. The default answers for tables
+  and views from `list_entities`.
+- `roles_held_elsewhere(roles)` maps each role to the other databases on the
+  server where it holds anything, so `reset` can keep a role another database
+  still uses. Roles are server-wide; the default, for a target without them, is
+  none.
 
 ## Scope
 
@@ -161,6 +175,29 @@ limits the run to one entity, and is refused when it names nothing the scope
 builds, as `resolve_name` says. `entities_to_apply(name, scope)` is what it
 would act on, behind the same gates and without a database — the list
 `dbd apply --dry-run` prints.
+
+Before its first hook or write, `apply` asks the database two questions, and
+refuses on either answer — under `dry_run` too, since the database is there to
+ask:
+
+- **Is this run's env allowed here?** `Design::check_env_guard(meta, env)`
+  refuses a run whose env is not prod against a database marked prod. A dev run
+  would re-mark it dev — lifting `reset`'s prod guard — and its import would
+  load `import/dev/` data into production. It is one-way: a dev database may be
+  promoted to prod. `deploy`, `reconcile` and `import_data` check it too.
+- **Is the project at least as new as the database?**
+  `Design::check_version_guard(db_version, design_version)` refuses a design
+  whose `project.version` is behind the version the database records (an
+  unversioned design counts as 0). The plan would otherwise come out current
+  and re-apply the older DDL over the newer schema. Neither guard has an
+  override.
+
+`pending_migration_preview(adapter, name, scope)` lists the migration steps the
+run would take against that database, from the version it records, under the
+same gates and scope — a `MigrationPreview` of steps, each with the statements
+its files run and a `drops` flag on the destructive ones; a drop of a table the
+database does not have is marked as one the run skips. It writes nothing; it is
+what `dbd apply --dry-run` lists when it has a database.
 
 The three callbacks travel together in one `Progress` value; they are not three
 arguments. `Progress::none()` is a silent run. `ApplyComplete` carries
@@ -295,11 +332,63 @@ for stmt in &plan.altered {
 
 `diff_live` is `dbd diff`: read-only, returning a `SchemaDiff` (`changes`,
 `warnings`, `advisories`, `matview_drift`; `is_empty()` when in sync).
-`reconcile` returns the `ReconcilePlan` and, unless `dry_run`, executes it.
+`reconcile` returns the `ReconcilePlan` and, unless `dry_run`, executes it —
+with the design's `apply.before` and `apply.after` hooks around the writes,
+scoped as `apply` scopes them, so a reconciled database is the one an apply
+builds. `ReconcileComplete` counts them in `before_scripts` and
+`after_scripts`. Like `apply`, it does not apply the configured grants: call
+`apply_grants` after it, as `dbd reconcile` does. It checks the env guard, not
+the version guard — a reconcile records the project's version even over a newer
+one.
 
 Both refuse a project whose reader builds no structured model (T-SQL, MySQL,
 SQLite) and a Convex adapter. **`reconcile` does not check `project.released`**
 — the CLI does; see [What the CLI adds](#what-the-cli-adds).
+
+## Reset
+
+```rust
+use dbd_core::{Design, EntityType};
+
+let design = Design::from_config(path, "dev")?;
+let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+let scope = design.resolve_scope(None, None)?;
+
+let done = design
+    .reset(&*adapter, "postgres", /* force */ false, /* schemas */ false, /* extensions */ false, Some(&scope))
+    .await?;
+println!("{} table(s) and {} view(s) dropped", done.count(EntityType::Table), done.count(EntityType::View));
+for kept in &done.roles_kept {
+    println!("kept role {}: {} still uses it", kept.role, kept.databases.join(", "));
+}
+```
+
+`reset(adapter, target, force, drop_schemas, drop_extensions, scope)` is
+`dbd reset`. `target` names the protected set — `postgres`, `supabase` or
+`sqlite`; the CLI passes the design's target key unless `--target` overrides it.
+Unless `force`, it runs `check_reset_guard` first. It returns a
+`ResetComplete`: `dropped`, every `(kind, name)` it found and dropped — read
+from the database before and after, because every drop is `IF EXISTS` and the
+script alone cannot tell a reset that emptied the schema from one that found
+nothing — with `count(kind)` to tally them, as `dbd reset` prints; and
+`roles_kept`, a `KeptRole` (`role`, `databases`) for each role it left in place
+because another database on the server holds something of it.
+
+A full reset — one whose scope resolves to `all` — also forgets the database's
+record of the project — env, version and scope pin — so the next apply records
+it afresh; a scoped reset leaves that record, and the rest of the project, in
+place. (Through `resolve_scope(None, None)`, a design that defines a `default:`
+scope resolves to it, so that reset is a scoped one.) A scoped reset drops without
+`CASCADE`, so it fails, naming the dependent, rather than reach outside its
+scope.
+
+`reset_script(target, drop_schemas, drop_extensions, scope)` is the SQL alone,
+with no database and no guard. `roles_kept_by_reset(adapter, target, scope)` asks
+the server which roles a reset must keep, and `reset_script_keeping(…, keep)`
+leaves their `DROP ROLE` out — what `dbd reset --dry-run` prints when it has a
+database, so the preview does not list a drop the run will not make. Underneath,
+`script::build_reset_script_keeping`, `build_scoped_reset_script` and
+`build_sqlite_reset_script` build the full, scoped and SQLite scripts.
 
 ## Documentation output
 
@@ -319,6 +408,13 @@ let mut model = dbd_core::schema_model::build(&design, None)?;
 model.history = dbd_core::history::load(design.project_dir())?;
 std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
 ```
+
+`combine` writes each file as `apply` runs it, and `script::runnable_ddl(entity)`
+is that DDL: the file's own text, with
+`SET search_path TO <source.search_path>, public` ahead of it when the file
+states no path of its own (one that does keeps its own, which wins). The file's
+text is never rewritten — the path is a statement in front of it — so the script
+`combine` writes creates each object where `apply` would.
 
 `schema_model::build(design, scope)` is the model `dbd diagram` encodes (see
 [The schema viewer](11-schema-viewer.md#the-model)). It returns
@@ -385,6 +481,29 @@ for d in &downgrades {
 `emit_schema(design, target, scope)` is `dbd emit`: the script — with a comment
 at every downgrade, and for SQL Server a `GO` after every statement — and the
 same downgrades as a list. See [Other dialects](13-other-dialects.md#dbd-emit).
+
+## Reverse-engineer a database
+
+`dbd init --from-db` and `dbd merge` are built from the `reverse` module's
+pieces, which an embedder can reuse. Three are new in 0.25, for what a reversed
+project declares in `design.yaml` rather than as DDL files:
+
+- `SchemaSelect.supabase` says the source is Supabase, so its platform schemas
+  are left out unless `all` is set. It is off by default — on any other
+  PostgreSQL, `auth`, `extensions`, `cron` and `net` are the project's own —
+  and the CLI sets it from `looks_like_supabase(entities)` (both an `auth` and a
+  `storage` schema). `left_out_schemas(db_schemas, &select)` returns each schema
+  the selection drops with its `LeftOut` reason (`Platform`, `Excluded`,
+  `NotListed`), so a caller can name every one.
+- `Declared::from_entities(entities, selected)` collects the database's
+  extensions (with their schema) and every table a foreign key reaches outside
+  the selected schemas; `design_yaml_with(project, dialect, schemas, version,
+  &declared)` writes them as the target's `extensions:` and as `external:`
+  entries, since the scanner refuses `ddl/extension/` and `ddl/schema/` files.
+- `doctor::detect_declared_kind_files(project_dir, config)` finds such files in
+  an existing project, each with the name and schema its `CREATE` statement
+  gives and whether `design.yaml` already declares it — what `dbd doctor`
+  reports.
 
 ## Parse SQL without a project
 
@@ -454,11 +573,16 @@ if let Some(survey) = dbd_core::survey(project_dir)? {
 These checks are made by the `dbd` command, not by the `Design` methods. An
 embedder that wants them makes them itself:
 
-- **The scope guard.** `dbd apply`, `deploy`, `reconcile`, `reset` and
-  `policies` refuse to write under a scope other than the one the database is
-  pinned to. `Design::apply`, `deploy` and `reconcile` do not check — and they
-  re-pin the database to whatever scope they are given — and neither do
-  `Design::reset` or `design::apply_policies`.
+- **The scope guard.** `dbd apply`, `deploy`, `reconcile`, `reset`, `import`,
+  `export`, `refresh` and `policies` refuse a database pinned to a scope other
+  than the one the run asks for. `Design::apply`, `deploy` and `reconcile` do
+  not check — and they re-pin the database to whatever scope they are given —
+  and neither do `Design::reset`, `import_data` or `design::apply_policies`.
+  (The env guard and the version guard are the library's own; see
+  [Apply](#apply).)
+- **The dry runs' questions.** Given a database, `dbd apply --dry-run` and
+  `deploy --dry-run` check the scope pin and `check_version_guard`, and list
+  `pending_migration_preview`; `policies --dry-run` checks the pin.
 - **Reset's preview.** `Design::reset` checks its own guard (a database marked
   prod, or with applied migrations) unless forced; `dbd reset --dry-run` checks
   it too, given a database, through the public
@@ -466,8 +590,9 @@ embedder that wants them makes them itself:
   `reset_script` alone checks nothing.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.
-- **Grants on apply.** `dbd apply` calls `Design::apply_grants` after
-  `Design::apply`; `Design::deploy` includes them.
+- **Grants on apply and reconcile.** `dbd apply` and `dbd reconcile` call
+  `Design::apply_grants` after `Design::apply` and `Design::reconcile`;
+  `Design::deploy` includes them.
 
 ```rust
 use dbd_core::Design;

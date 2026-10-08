@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xa3631c9f9ba7763c
+// docs-digest: 0x2ca497cb25a857a4
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -985,6 +985,50 @@ async fn doc_docs_guide_12_embedding_md_9() -> dbd_core::Result<()> {
     let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
+    use dbd_core::{Design, EntityType};
+
+    let design = Design::from_config(path, "dev")?;
+    let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+    let scope = design.resolve_scope(None, None)?;
+
+    let done = design
+        .reset(
+            &*adapter,
+            "postgres",
+            /* force */ false,
+            /* schemas */ false,
+            /* extensions */ false,
+            Some(&scope),
+        )
+        .await?;
+    println!(
+        "{} table(s) and {} view(s) dropped",
+        done.count(EntityType::Table),
+        done.count(EntityType::View)
+    );
+    for kept in &done.roles_kept {
+        println!("kept role {}: {} still uses it", kept.role, kept.databases.join(", "));
+    }
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 10
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_10() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
     use std::path::Path;
 
     let design = dbd_core::Design::from_config(path, "prod")?;
@@ -1002,9 +1046,9 @@ async fn doc_docs_guide_12_embedding_md_9() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 10
+// docs/guide/12-embedding.md — block 11
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_10() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_11() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1035,9 +1079,9 @@ async fn doc_docs_guide_12_embedding_md_10() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 11
+// docs/guide/12-embedding.md — block 12
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_11() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1069,9 +1113,9 @@ async fn doc_docs_guide_12_embedding_md_11() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 12
+// docs/guide/12-embedding.md — block 13
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1098,9 +1142,9 @@ async fn doc_docs_guide_12_embedding_md_12() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 13
+// docs/guide/12-embedding.md — block 14
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1136,9 +1180,9 @@ async fn doc_docs_guide_12_embedding_md_13() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 14
+// docs/guide/12-embedding.md — block 15
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_15() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1165,9 +1209,9 @@ async fn doc_docs_guide_12_embedding_md_14() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 15
+// docs/guide/12-embedding.md — block 16
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_15() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1198,9 +1242,9 @@ async fn doc_docs_guide_12_embedding_md_15() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 16
+// docs/guide/12-embedding.md — block 17
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
