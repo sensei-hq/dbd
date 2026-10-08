@@ -498,11 +498,24 @@ mod tests {
         assert!(is_internal("dbd"));
     }
 
+    /// Supabase's platform denylist is Supabase's: `auth`, `extensions`,
+    /// `cron` and `net` are ordinary schema names on any other PostgreSQL, and
+    /// were dropped from a plain database without a word. By default nothing
+    /// but the Postgres internals is left out.
     #[test]
-    fn excludes_internal_and_supabase_by_default() {
-        let db = v(&["public", "app", "pg_catalog", "auth", "storage", "pg_toast_x"]);
+    fn a_plain_database_keeps_the_schemas_the_supabase_denylist_names() {
+        let db = v(&[
+            "public",
+            "app",
+            "pg_catalog",
+            "auth",
+            "extensions",
+            "cron",
+            "net",
+            "pg_toast_x",
+        ]);
         let got = select_schemas(&db, &SchemaSelect::default());
-        assert_eq!(got, v(&["public", "app"]));
+        assert_eq!(got, v(&["public", "app", "auth", "extensions", "cron", "net"]));
     }
 
     #[test]

@@ -839,9 +839,8 @@ mod tests {
 
     fn all_schemas() -> SchemaSelect {
         SchemaSelect {
-            only: vec![],
-            exclude: vec![],
             all: true,
+            ..Default::default()
         }
     }
 
@@ -909,6 +908,141 @@ mod tests {
         let design = dbd_core::Design::from_config_with_dir(&cfg, "dev", Some(tmp.path())).unwrap();
         let errors: Vec<&String> = design.entities().iter().flat_map(|e| &e.errors).collect();
         assert!(errors.is_empty(), "the reversed project must load clean: {errors:?}");
+    }
+
+    fn table(name: &str, fk_to: Option<(&str, &str)>) -> dbd_core::Entity {
+        use dbd_core::entity::{ColumnDef, ForeignKey, TableConstraint, TableDef};
+        let mut t = dbd_core::Entity::new(dbd_core::EntityType::Table, name);
+        let constraints = fk_to
+            .map(|(schema, table)| {
+                vec![TableConstraint::ForeignKey(ForeignKey {
+                    name: Some(format!("{}_fk", t.name.replace('.', "_"))),
+                    columns: vec!["id".into()],
+                    ref_schema: Some(schema.into()),
+                    ref_table: table.into(),
+                    ref_columns: vec!["id".into()],
+                    on_delete: None,
+                    on_update: None,
+                    ref_schema_source: Default::default(),
+                })]
+            })
+            .unwrap_or_default();
+        t.table_def = Some(TableDef {
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                data_type: "uuid".into(),
+                nullable: false,
+                default_value: None,
+                is_pk: false,
+                is_unique: false,
+                identity: None,
+                generated: None,
+                comment: None,
+                inline_fk: None,
+            }],
+            constraints,
+            indexes: vec![],
+            comments: Default::default(),
+        });
+        t
+    }
+
+    /// A database with `auth`, `extensions`, `cron` and `net` schemas — and
+    /// `storage` too when `supabase`, which is what identifies Supabase.
+    fn platform_named_schemas(supabase: bool) -> Vec<dbd_core::Entity> {
+        let mut pgcrypto = dbd_core::Entity::new(dbd_core::EntityType::Extension, "pgcrypto");
+        pgcrypto.schema = Some("extensions".into());
+        let mut entities: Vec<dbd_core::Entity> = ["public", "app", "auth", "extensions", "cron", "net"]
+            .iter()
+            .map(|s| dbd_core::Entity::schema(s))
+            .collect();
+        entities.extend([
+            pgcrypto,
+            table("auth.users", None),
+            table("app.profiles", Some(("auth", "users"))),
+            table("cron.jobs", None),
+            table("net.requests", None),
+        ]);
+        if supabase {
+            entities.push(dbd_core::Entity::schema("storage"));
+            entities.push(table("storage.objects", None));
+        }
+        entities
+    }
+
+    fn init_into(dir: &std::path::Path, entities: Vec<dbd_core::Entity>, sel: SchemaSelect, dialect: &str) {
+        init_with_entities(
+            dir,
+            &dir.join("design.yaml"),
+            "dev",
+            entities,
+            "proj",
+            1,
+            sel,
+            false,
+            dialect,
+            "init from database",
+        )
+        .unwrap();
+    }
+
+    /// `init --from-db` applied Supabase's platform denylist to every
+    /// database, so a plain one lost its `auth`, `extensions`, `cron` and
+    /// `net` schemas — pgcrypto with them — without a word.
+    #[test]
+    fn init_from_a_plain_database_keeps_the_schemas_supabase_reserves_for_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_into(
+            tmp.path(),
+            platform_named_schemas(false),
+            SchemaSelect::default(),
+            "postgres",
+        );
+
+        let config = dbd_core::config::read(&tmp.path().join("design.yaml")).unwrap();
+        let schemas = config.schema_names();
+        for kept in ["auth", "extensions", "cron", "net", "app"] {
+            assert!(
+                schemas.contains(&kept.to_string()),
+                "`{kept}` must be kept: {schemas:?}"
+            );
+        }
+        let extensions: Vec<&str> = config.target["postgres"].extensions.iter().map(|e| e.name()).collect();
+        assert_eq!(extensions, vec!["pgcrypto"]);
+        assert!(tmp.path().join("ddl/table/auth/users.ddl").exists());
+    }
+
+    /// A foreign key into a schema the project leaves out points at a table
+    /// the project does not build. It is declared `external:`, as the
+    /// Supabase scaffold declares `auth.users`, so the reference resolves —
+    /// whether the schema was left out by `--exclude-schema` or by Supabase's
+    /// platform denylist.
+    #[test]
+    fn init_declares_an_external_for_a_table_a_foreign_key_reaches_outside_the_project() {
+        let excluded = tempfile::tempdir().unwrap();
+        init_into(
+            excluded.path(),
+            platform_named_schemas(false),
+            SchemaSelect {
+                exclude: vec!["auth".into()],
+                ..Default::default()
+            },
+            "postgres",
+        );
+        let supabase = tempfile::tempdir().unwrap();
+        init_into(
+            supabase.path(),
+            platform_named_schemas(true),
+            SchemaSelect::default(),
+            "supabase",
+        );
+
+        for dir in [excluded.path(), supabase.path()] {
+            let config = dbd_core::config::read(&dir.join("design.yaml")).unwrap();
+            let externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(externals, vec!["auth.users"], "in {}", dir.display());
+            assert!(!config.schema_names().contains(&"auth".to_string()));
+        }
     }
 
     /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.

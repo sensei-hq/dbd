@@ -871,3 +871,62 @@ async fn a_reverse_engineered_project_applies_to_its_own_database_and_to_a_fresh
     let o = dbd(dir, &fresh, &["diff", "--exit-code"]);
     assert!(o.status.success(), "drift on the fresh database: {}", combined(&o));
 }
+
+// ── init --from-db says what it leaves out ──────────────────────────────────
+
+/// On a database with Supabase's `auth` and `storage` schemas, the platform
+/// schemas are left out — and `init --from-db` dropped them without a word,
+/// and wrote nothing for the foreign key into `auth.users`. Every schema left
+/// out is named with the reason, and the referenced table is declared
+/// `external:`, so the project inspects clean.
+#[tokio::test]
+async fn init_from_db_names_every_schema_it_leaves_out_and_declares_what_a_foreign_key_reaches() {
+    let (_pg, url) = start_pg().await;
+    dbd_core::connect(&url, "platform")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid PRIMARY KEY);
+             CREATE SCHEMA storage; CREATE TABLE storage.objects (id uuid PRIMARY KEY);
+             CREATE SCHEMA extensions; CREATE EXTENSION pgcrypto WITH SCHEMA extensions;
+             CREATE SCHEMA audit; CREATE TABLE audit.log (id int PRIMARY KEY);
+             CREATE SCHEMA app;
+             CREATE TABLE app.profiles (id uuid PRIMARY KEY REFERENCES auth.users (id));",
+        )
+        .await
+        .expect("build the database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db", "--exclude-schema", "audit"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    let said = combined(&o);
+    for (schema, why) in [
+        ("auth", "Supabase"),
+        ("storage", "Supabase"),
+        ("extensions", "Supabase"),
+        ("audit", "--exclude-schema"),
+    ] {
+        assert!(
+            said.lines()
+                .any(|l| l.contains(&format!("`{schema}`")) && l.contains(why)),
+            "`{schema}` must be named as left out ({why}): {said}"
+        );
+    }
+    assert!(
+        said.lines().any(|l| l.contains("`pgcrypto`")),
+        "an extension left out with its schema must be named too: {said}"
+    );
+
+    let config = dbd_core::config::read(&dir.join("design.yaml")).unwrap();
+    let externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(externals, vec!["auth.users"]);
+
+    let o = dbd(dir, &url, &["inspect"]);
+    assert!(o.status.success(), "inspect failed: {}", combined(&o));
+    assert!(
+        !combined(&o).contains("auth.users"),
+        "the declared external must resolve: {}",
+        combined(&o)
+    );
+}
