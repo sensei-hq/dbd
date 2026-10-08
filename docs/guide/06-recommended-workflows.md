@@ -43,6 +43,9 @@ schemas. Two kinds of destruction each need their own opt-in:
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 
+Reconcile runs the design's `apply.before` and `apply.after` hooks and its `grants:` too, scoped
+as `apply` scopes them, so a dev loop on reconcile builds the database `apply` would.
+
 Reconcile is not one transaction: it writes in the dependency order `apply` uses, each step
 committing as it runs, so a step that fails stops the run with the earlier steps applied. Fix the
 cause and run it again — what is already in place is no longer drift.
@@ -75,9 +78,19 @@ dbd format         # normalize to your conventions (introspected column order is
 **refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
 use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
 
+The reversed project applies cleanly back to the database it came from — the DDL is re-runnable
+(`IF NOT EXISTS`, `OR REPLACE`), so the first `dbd apply` records the version and changes nothing,
+and `dbd diff` afterwards is empty — and to a fresh one. Its extensions are in the target's
+`extensions:`, its schemas under `schemas:`, and a table a foreign key reaches outside what was
+captured under `external:`; every schema left out is named as it is left out. The DDL is fully
+qualified and states no `SET search_path`, so `dbd inspect` notes that on every file; nothing in the
+files depends on the path, so the note is harmless.
+
 Adopting a Supabase database? `init --from-db` recognises it by Supabase's `auth` and `storage`
-schemas and names the target `supabase`, so Supabase's own schemas are protected (see
-[targets and adapters](08-targets.md#what-the-supabase-key-changes)).
+schemas, names the target `supabase`, so Supabase's own schemas are protected (see
+[targets and adapters](08-targets.md#what-the-supabase-key-changes)), and leaves its platform
+schemas out of the project. Only a Supabase database loses them: on any other PostgreSQL, an `auth`
+or `extensions` schema is the project's own and is captured.
 
 #### Snapshots, but not released
 
@@ -109,7 +122,9 @@ dbd merge postgres://host/newdb          # pull the new tables in (+ snapshot th
 dbd apply --scope billing -d $BILLING_URL   # deploy just that module to its own database
 ```
 
-`merge` never edits `design.yaml` and never deletes files (orphans are reported, not removed), and
+`merge` edits nothing in `design.yaml` but `project.version`, and never deletes files (orphans are
+reported, not removed; an extension, an external table or a schema the config should declare is
+warned about, for you to add), and
 it **refuses** if the source database is behind your project version (see Version safety below).
 
 ### Start from a dbdiagram.io / dbdocs design
@@ -135,9 +150,9 @@ dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the dif
 
 | Source | Captured |
 |--------|----------|
-| **Postgres / Supabase** (`--from-db postgres://…`) | schemas, extensions, enums, tables (columns, defaults, identity, PK/FK/unique/check, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns), views, materialized views (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`). **Not** captured: triggers. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target. |
+| **Postgres / Supabase** (`--from-db postgres://…`) | schemas (under `schemas:`), extensions (in the target's `extensions:`), enums with their comments, tables (columns, defaults, identity, PK/FK/unique/check with their names, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns), views and materialized views with their comments (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`); a table a foreign key reaches outside the project is declared `external:`. **Not** captured: triggers. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target, and only there are its platform schemas left out. |
 | **SQLite** (`--from-db sqlite://…`) | tables, user indexes, and views — captured **verbatim** from `sqlite_master` (CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID` all survive). No schemas/enums/functions/sequences/roles; triggers skipped. Files land flat (`ddl/table/<name>.ddl`); `design.yaml` carries `schemas: []`. |
-| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes and key order survive; a table-level UNIQUE comes back as a named unique index; enum comments are lost. |
+| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes and key order survive; a table-level UNIQUE comes back as its named constraint, and a stub table as an `external:` entry; enum comments are lost. |
 
 The generated `design.yaml` target comes from the source: the connection URL scheme
 (`postgres://` → `postgres`, `sqlite://`/`file:` → `sqlite`), `supabase` for a PostgreSQL database
