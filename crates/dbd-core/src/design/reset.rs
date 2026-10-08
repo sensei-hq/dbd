@@ -31,8 +31,9 @@ impl Design {
     /// are only dropped on a full reset — a subset scope leaves shared roles
     /// intact since roles are not scope-selectable. The bookkeeping of what it
     /// drops goes too: the project's recorded migrations, the drift stamp of
-    /// every materialized view the reset removed, and — on a full reset — the
-    /// database's record of the project (env, version, scope pin).
+    /// every materialized view the reset removed, and — on a reset of all the
+    /// database was built with — the database's record of the project (env,
+    /// version, scope pin).
     ///
     /// Returns what it dropped, read from the database before and after rather
     /// than from the script: every drop is `IF EXISTS`, so the script alone
@@ -51,8 +52,9 @@ impl Design {
         // — every ownership operation calls this up front.
         adapter.heal_bookkeeping().await?;
 
+        let marks = self.database_marks(adapter).await?;
         if !force {
-            Self::check_reset_guard(&self.database_marks(adapter).await?)?;
+            Self::check_reset_guard(&marks)?;
         }
 
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
@@ -82,13 +84,17 @@ impl Design {
                 .collect();
         }
         adapter.clear_project_migrations().await?;
-        // A full reset leaves nothing of the project, so its record of the
-        // database goes too, and the next apply records it afresh. That is the
-        // way to rebuild, with `-e dev`, a database a run without `-e` marked
-        // prod: the env guard refuses a dev run against the mark, and the mark
-        // survived the reset. A scoped reset leaves the rest of the project —
-        // and its version and pin — in place.
-        if scope.is_none_or(|s| s.is_all) {
+        // A reset of everything the database was built with leaves nothing of
+        // the project, so its record of the database goes too, and the next
+        // apply records it afresh. That is the way to rebuild, with `-e dev`, a
+        // database a run without `-e` marked prod: the env guard refuses a dev
+        // run against the mark, and the mark survived the reset. "Everything"
+        // is the all-scope, or the scope the database is pinned to — a design
+        // with a `default:` scope builds and resets under it, and a bare
+        // `reset --force` there kept the mark. A narrower scope leaves the rest
+        // of the project — and its version and pin — in place.
+        let pinned = marks.own.as_ref().and_then(|m| m.scope.as_deref());
+        if scope.is_none_or(|s| s.is_all || pinned == Some(s.name.as_str())) {
             adapter.forget_project_meta().await?;
         }
 
