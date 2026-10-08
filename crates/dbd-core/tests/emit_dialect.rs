@@ -693,11 +693,13 @@ fn the_clock_and_a_random_uuid_are_translated() {
 
 /// MySQL takes a default on a TEXT column only as an expression — `('open')`,
 /// not `'open'` — and reads a backslash in a string as an escape, which a
-/// PostgreSQL literal does not.
+/// PostgreSQL literal does not. `text` is a LONGTEXT there (see
+/// `text_and_bytea_get_a_mysql_type_as_large_as_postgres_allows`), and the
+/// rule covers every TEXT size.
 #[test]
 fn mysql_gets_a_text_default_as_an_expression_and_its_backslashes_escaped() {
     let (mysql, _) = emit_with(Dialect::MySql, "", &DEFAULTS, None);
-    assert!(mysql.contains("`status` TEXT NOT NULL DEFAULT ('open')"), "{mysql}");
+    assert!(mysql.contains("`status` LONGTEXT NOT NULL DEFAULT ('open')"), "{mysql}");
     assert!(mysql.contains(r"DEFAULT 'a\\b'"), "{mysql}");
 }
 
@@ -1131,7 +1133,7 @@ const COMMENTED: [(&str, &str); 2] = [
 fn mysql_carries_table_and_column_comments() {
     let (sql, report) = emit_with(Dialect::MySql, "", &COMMENTED, None);
     assert!(
-        sql.contains(r"`name` TEXT COMMENT 'What they''re called\nin full'"),
+        sql.contains(r"`name` LONGTEXT COMMENT 'What they''re called\nin full'"),
         "{sql}"
     );
     assert!(sql.contains(") COMMENT='Everyone we know';"), "{sql}");
@@ -1542,6 +1544,12 @@ fn declared_type(sql: &str, dialect: Dialect, column: &str) -> String {
 /// PostgreSQL writes a precision before the zone — `timestamp (3) with time
 /// zone` — so reading the type up to its parenthesis took it for a plain
 /// `timestamp`, and SQL Server got a `datetime2` with no offset.
+///
+/// A time or timestamp keeps its fractional seconds. PostgreSQL's default is
+/// microseconds; MySQL's TIME and DATETIME default to whole seconds, so a bare
+/// `TIME` rounded every value to the second. MySQL gets `(6)`, or the declared
+/// precision; SQL Server, whose default is finer than PostgreSQL's, gets the
+/// declared precision when there is one.
 #[test]
 fn a_built_in_type_with_an_equivalent_maps_faithfully() {
     let files = [(
@@ -1558,10 +1566,10 @@ fn a_built_in_type_with_an_equivalent_maps_faithfully() {
                 ("letter", "CHAR(1)"),
                 ("ratio", "FLOAT"),
                 ("f4", "FLOAT"),
-                ("opens", "TIME"),
+                ("opens", "TIME(6)"),
                 ("opens_ms", "TIME(3)"),
-                ("closes", "TIME"),
-                ("stamped", "DATETIME"),
+                ("closes", "TIME(6)"),
+                ("stamped", "DATETIME(3)"),
             ],
         ),
         (
@@ -1574,7 +1582,7 @@ fn a_built_in_type_with_an_equivalent_maps_faithfully() {
                 ("opens", "time"),
                 ("opens_ms", "time(3)"),
                 ("closes", "time"),
-                ("stamped", "datetimeoffset"),
+                ("stamped", "datetimeoffset(3)"),
             ],
         ),
         (
@@ -1927,5 +1935,222 @@ fn json_and_jsonb_become_the_targets_json_type() {
             assert!(doc[0].reason.contains("validate"), "{dialect:?}: {:?}", doc[0]);
             assert_eq!(bin.len(), 1, "{dialect:?}: `jsonb` is reported as it was: {report:?}");
         }
+    }
+}
+
+// ── A type the target would refuse is switched or clamped, and reported ────
+
+/// The type each column is declared with, keyed by column, and each column's
+/// report entries — for asserting a whole table at once.
+fn declared_types(sql: &str, dialect: Dialect, columns: &[&str]) -> Vec<(String, String)> {
+    columns
+        .iter()
+        .map(|c| (c.to_string(), declared_type(sql, dialect, c)))
+        .collect()
+}
+
+/// Each reported column carries its note in the script as well: the report is
+/// the only safeguard, and it is written twice.
+fn noted_inline(sql: &str, report: &[Downgrade], column: &str) -> bool {
+    !about(report, column).is_empty() && sql.contains(&format!("-- dbd: `{column}` was"))
+}
+
+/// `emit` copied a length or precision across whatever the target allows:
+/// `nvarchar(5000)` (SQL Server's nvarchar holds at most 4,000), `VARCHAR(70000)`
+/// (MySQL's at most 16,383 utf8mb4 characters), `DECIMAL(50,40)` (MySQL keeps
+/// at most 30 digits after the point, SQL Server 38 in all) — DDL the target
+/// refuses, and nothing reported. Each now becomes the target's own type that
+/// holds it — its large text type, or the widest decimal it has — and the loss
+/// is reported, inline and in the list. An unbounded `varchar` was silently
+/// VARCHAR(255); it is the target's unbounded text, as `text` is, and loses
+/// nothing. An unbounded `numeric` was silently DECIMAL(65,30)/decimal(38,10);
+/// that bound is now reported. SQLite keeps a NUMERIC value as a 64-bit integer
+/// or a float, so more digits than those hold are reported too.
+#[test]
+fn a_length_or_precision_beyond_the_target_is_switched_or_clamped_and_reported() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, wide varchar(5000), huge varchar(70000), \
+         fine decimal(50,40), big numeric(40), free varchar, amount numeric, price numeric(10,2));",
+    )];
+    // (column, emitted type, reported, what the reason must name)
+    type Expect = [(&'static str, &'static str, bool, &'static str); 7];
+    let expected: [(Dialect, Expect); 3] = [
+        (
+            Dialect::MySql,
+            [
+                ("wide", "VARCHAR(5000)", false, ""),
+                ("huge", "MEDIUMTEXT", true, "16,383"),
+                ("fine", "DECIMAL(40,30)", true, "30"),
+                ("big", "DECIMAL(40)", false, ""),
+                ("free", "LONGTEXT", false, ""),
+                ("amount", "DECIMAL(65,30)", true, "65"),
+                ("price", "DECIMAL(10,2)", false, ""),
+            ],
+        ),
+        (
+            Dialect::TSql,
+            [
+                ("wide", "nvarchar(max)", true, "4,000"),
+                ("huge", "nvarchar(max)", true, "4,000"),
+                ("fine", "decimal(38,28)", true, "38"),
+                ("big", "decimal(38,0)", true, "38"),
+                ("free", "nvarchar(max)", false, ""),
+                ("amount", "decimal(38,10)", true, "38"),
+                ("price", "decimal(10,2)", false, ""),
+            ],
+        ),
+        (
+            Dialect::Sqlite,
+            [
+                ("wide", "TEXT", false, ""),
+                ("huge", "TEXT", false, ""),
+                ("fine", "NUMERIC", true, "15"),
+                ("big", "NUMERIC", true, "64-bit"),
+                ("free", "TEXT", false, ""),
+                ("amount", "NUMERIC", true, "15"),
+                ("price", "NUMERIC", false, ""),
+            ],
+        ),
+    ];
+    for (dialect, columns) in expected {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        for (column, ty, reported, names) in columns {
+            assert_eq!(
+                declared_type(&sql, dialect, column),
+                ty,
+                "{dialect:?} `{column}`:\n{sql}"
+            );
+            let entries = about(&report, column);
+            if reported {
+                assert_eq!(entries.len(), 1, "{dialect:?}: `{column}` is reported once: {report:?}");
+                assert_eq!(entries[0].to, ty, "{dialect:?}: the report names what was emitted");
+                assert!(
+                    entries[0].reason.contains(names),
+                    "{dialect:?}: `{column}` names the limit {names}: {:?}",
+                    entries[0]
+                );
+                assert!(
+                    noted_inline(&sql, &report, column),
+                    "{dialect:?}: `{column}` noted inline:\n{sql}"
+                );
+            } else {
+                assert!(
+                    entries.is_empty(),
+                    "{dialect:?}: `{column}` maps faithfully: {entries:?}"
+                );
+            }
+        }
+    }
+}
+
+/// PostgreSQL's `text` and `bytea` hold up to a gigabyte; MySQL's TEXT and BLOB
+/// hold 65,535 bytes — as few as 16,383 utf8mb4 characters — so a longer value
+/// was refused, unreported. LONGTEXT and LONGBLOB hold four gigabytes, so the
+/// mapping is faithful and stays out of the report.
+#[test]
+fn text_and_bytea_get_a_mysql_type_as_large_as_postgres_allows() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, body text, blob bytea);",
+    )];
+    let (sql, report) = emit_with(Dialect::MySql, "", &files, None);
+    assert_eq!(
+        declared_types(&sql, Dialect::MySql, &["body", "blob"]),
+        vec![("body".into(), "LONGTEXT".into()), ("blob".into(), "LONGBLOB".into())]
+    );
+    assert!(report.iter().all(|d| d.column.is_none()), "{report:?}");
+}
+
+/// A row of MySQL's holds at most 65,535 bytes outside its TEXT and BLOB
+/// columns, counted at the character set's widest — four bytes a character in
+/// utf8mb4. Four `varchar(5000)` columns need 80,008: each is legal alone, and
+/// the CREATE TABLE is refused ("Row size too large"). The widest columns are
+/// stored as TEXT — which counts ten bytes — until the row fits, and each is
+/// reported: a value longer than its length is no longer refused. A column an
+/// index reads is the last chosen, since TEXT would leave the index out.
+#[test]
+fn a_mysql_row_wider_than_mysql_allows_moves_its_widest_columns_to_text() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, a varchar(700), b varchar(5000), c varchar(5000), \
+         d varchar(5000), e varchar(5000));\n\
+         create index t_a_idx on t (a);",
+    )];
+    let (sql, report) = emit_with(Dialect::MySql, "", &files, None);
+    let types = declared_types(&sql, Dialect::MySql, &["a", "b", "c", "d", "e"]);
+    assert_eq!(types[0].1, "VARCHAR(700)", "the indexed column keeps its type:\n{sql}");
+    let moved: Vec<&str> = types
+        .iter()
+        .filter(|(_, ty)| ty == "TEXT")
+        .map(|(c, _)| c.as_str())
+        .collect();
+    assert_eq!(
+        moved,
+        vec!["b"],
+        "one column is enough to fit, the first of the widest:\n{sql}"
+    );
+    let entries = about(&report, "b");
+    assert!(
+        entries.len() == 1 && entries[0].to == "TEXT" && entries[0].reason.contains("65,535"),
+        "the move is reported with the limit: {report:?}"
+    );
+    assert!(noted_inline(&sql, &report, "b"), "{sql}");
+    assert!(sql.contains("t_a_idx"), "the index stays:\n{sql}");
+}
+
+/// SQL Server keeps a row's fixed-length columns — nchar among them — within
+/// 8,060 bytes; only variable-length ones may overflow it. Three `char(2000)`
+/// columns are 12,000 bytes as nchar, and the CREATE TABLE is refused. The
+/// widest become nvarchar, which may overflow, until the row fits — no longer
+/// padded, and reported.
+#[test]
+fn a_sql_server_row_wider_than_sql_server_allows_moves_its_widest_nchar_to_nvarchar() {
+    let files = [(
+        "table/app/t.ddl",
+        "create table t (id integer primary key, a char(2000), b char(2000), c char(2000));",
+    )];
+    let (sql, report) = emit_with(Dialect::TSql, "", &files, None);
+    assert_eq!(
+        declared_types(&sql, Dialect::TSql, &["a", "b", "c"]),
+        vec![
+            ("a".into(), "nvarchar(2000)".into()),
+            ("b".into(), "nchar(2000)".into()),
+            ("c".into(), "nchar(2000)".into()),
+        ],
+        "{sql}"
+    );
+    let entries = about(&report, "a");
+    assert!(
+        entries.len() == 1 && entries[0].reason.contains("8,060") && entries[0].reason.contains("padded"),
+        "{report:?}"
+    );
+    assert!(noted_inline(&sql, &report, "a"), "{sql}");
+}
+
+/// An unbounded `varchar` is now the target's unbounded text, so it is keyed
+/// the way `text` is: bounded in a key (reported), and an ordinary index on it
+/// left out (reported) — not silently cut to 255 characters for every row.
+#[test]
+fn an_unbounded_varchar_is_keyed_as_text_is() {
+    let files = [(
+        "table/app/k.ddl",
+        "create table k (code varchar primary key, note varchar);\n\
+         create index k_note_idx on k (note);",
+    )];
+    for (dialect, bounded) in [(Dialect::MySql, "VARCHAR(255)"), (Dialect::TSql, "nvarchar(450)")] {
+        let (sql, report) = emit_with(dialect, "", &files, None);
+        assert_eq!(declared_type(&sql, dialect, "code"), bounded, "{dialect:?}:\n{sql}");
+        assert!(
+            about(&report, "code").iter().any(|d| d.to == bounded),
+            "{dialect:?}: the bound is reported: {report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.from.contains("k_note_idx") && d.to == "no index"),
+            "{dialect:?}: {report:?}"
+        );
+        assert!(!statements(&sql).contains("CREATE INDEX"), "{dialect:?}:\n{sql}");
     }
 }
