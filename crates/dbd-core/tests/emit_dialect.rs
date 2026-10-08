@@ -2177,3 +2177,159 @@ fn a_mysql_clock_default_has_its_columns_fractional_precision() {
         assert!(sql.contains(line), "{line}:\n{sql}");
     }
 }
+
+// ── Key names and NULLS NOT DISTINCT ────────────────────────────────────────
+
+/// Named keys, table-level and inline, and a UNIQUE that treats NULLs as
+/// equal — at table level and on a column.
+const NAMED_KEYS: [(&str, &str); 2] = [
+    (
+        "table/app/t.ddl",
+        "create table t (id integer, code varchar(40), alt varchar(40), \
+         constraint t_pk primary key (id), \
+         constraint t_code_uq unique nulls not distinct (code), \
+         constraint t_alt_uq unique (alt));",
+    ),
+    (
+        "table/app/u.ddl",
+        "create table u (id integer constraint u_pk primary key, \
+         email varchar(40) constraint u_email_uq unique, \
+         phone varchar(40) unique nulls not distinct);",
+    ),
+];
+
+/// `emit` wrote every primary key and UNIQUE without its name — `PRIMARY KEY
+/// (id)` for `constraint t_pk primary key (id)`, and an inline `constraint
+/// u_pk primary key` the same. SQL Server and SQLite take `CONSTRAINT name`
+/// on both, and MySQL on a UNIQUE; MySQL names every primary key `PRIMARY`,
+/// so there the name is reported instead of written.
+#[test]
+fn key_names_are_written_where_the_target_keeps_them() {
+    let keys = [
+        ("t_pk", "PRIMARY KEY"),
+        ("t_code_uq", "UNIQUE"),
+        ("t_alt_uq", "UNIQUE"),
+        ("u_pk", "PRIMARY KEY"),
+        ("u_email_uq", "UNIQUE"),
+    ];
+    for dialect in [Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_with(dialect, "", &NAMED_KEYS, None);
+        for (name, kind) in keys {
+            let quoted = if dialect == Dialect::TSql {
+                format!("[{name}]")
+            } else {
+                format!("\"{name}\"")
+            };
+            assert!(
+                sql.contains(&format!("CONSTRAINT {quoted} {kind} (")),
+                "{dialect:?}: `{name}` is written on its {kind}:\n{sql}"
+            );
+        }
+        assert!(
+            !report.iter().any(|d| d.from.contains("_pk") || d.from.contains("_uq`")),
+            "{dialect:?}: a name the target keeps is no loss: {report:?}"
+        );
+    }
+
+    let (mysql, report) = emit_with(Dialect::MySql, "", &NAMED_KEYS, None);
+    for name in ["t_code_uq", "t_alt_uq", "u_email_uq"] {
+        assert!(
+            mysql.contains(&format!("CONSTRAINT `{name}` UNIQUE (")),
+            "MySQL keeps a UNIQUE's name `{name}`:\n{mysql}"
+        );
+    }
+    for (table, name) in [("app.t", "t_pk"), ("app.u", "u_pk")] {
+        assert!(
+            !mysql.contains(&format!("CONSTRAINT `{name}`")),
+            "MySQL ignores it, so it is not written:\n{mysql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == table && d.from.contains(name) && d.to.contains("PRIMARY")),
+            "MySQL reports the primary key's lost name `{name}`: {report:?}"
+        );
+    }
+}
+
+/// `UNIQUE NULLS NOT DISTINCT` refuses a second row with a NULL key; MySQL's
+/// and SQLite's UNIQUE admit it. `emit` wrote a plain UNIQUE and said nothing.
+/// SQL Server's UNIQUE already admits one NULL, so there it is faithful.
+#[test]
+fn a_lost_nulls_not_distinct_is_reported() {
+    for dialect in [Dialect::MySql, Dialect::Sqlite] {
+        let (_, report) = emit_with(dialect, "", &NAMED_KEYS, None);
+        for (table, key) in [("app.t", "code"), ("app.u", "phone")] {
+            assert!(
+                report
+                    .iter()
+                    .any(|d| d.entity == table && d.from.contains("NULLS NOT DISTINCT") && d.from.contains(key)),
+                "{dialect:?}: the UNIQUE on `{key}` loses NULLS NOT DISTINCT: {report:?}"
+            );
+        }
+    }
+    let (_, report) = emit_with(Dialect::TSql, "", &NAMED_KEYS, None);
+    assert!(
+        !report.iter().any(|d| d.from.contains("NULLS NOT DISTINCT")),
+        "SQL Server's UNIQUE admits one NULL: {report:?}"
+    );
+}
+
+/// The clock on a `time` column is the time of day. SQLite got
+/// `CURRENT_TIMESTAMP` — a date and a time in a column of times — and MySQL
+/// a `TIME` defaulting to `CURRENT_TIMESTAMP`, which it refuses.
+const CLOCK: [(&str, &str); 1] = [(
+    "table/app/clock.ddl",
+    "create table clock (id integer primary key, starts time default now(), \
+     at time default current_time, stamp timestamptz default now());",
+)];
+
+#[test]
+fn a_clock_default_on_a_time_column_is_the_time_of_day() {
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &CLOCK, None);
+    assert!(sqlite.contains("\"starts\" TEXT DEFAULT CURRENT_TIME,"), "{sqlite}");
+    assert!(sqlite.contains("\"at\" TEXT DEFAULT CURRENT_TIME,"), "{sqlite}");
+    assert!(sqlite.contains("\"stamp\" TEXT DEFAULT CURRENT_TIMESTAMP"), "{sqlite}");
+
+    let (mysql, _) = emit_with(Dialect::MySql, "", &CLOCK, None);
+    assert!(mysql.contains("`starts` TIME(6) DEFAULT (CURRENT_TIME(6))"), "{mysql}");
+    assert!(mysql.contains("`at` TIME(6) DEFAULT (CURRENT_TIME(6))"), "{mysql}");
+
+    let (tsql, _) = emit_with(Dialect::TSql, "", &CLOCK, None);
+    assert!(
+        tsql.contains("[starts] time DEFAULT CONVERT(time, SYSDATETIME())"),
+        "{tsql}"
+    );
+    assert!(
+        tsql.contains("[at] time DEFAULT CONVERT(time, SYSDATETIME())"),
+        "{tsql}"
+    );
+}
+
+/// SQLite checks it: a row given only its key gets times of day.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_fills_a_time_column_with_the_time_of_day() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &CLOCK, None);
+    let row = on_sqlite(
+        &sql,
+        "insert into app_clock (id) values (1);",
+        "select (starts glob '[0-2][0-9]:[0-5][0-9]:[0-5][0-9]') || '|' || (at = starts) from app_clock",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(row, "1|1", "{sql}");
+}
+
+/// Every key fixture above, emitted for SQLite, applies there.
+#[cfg(feature = "sqlite")]
+#[test]
+fn the_emitted_sqlite_script_with_named_keys_applies() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &NAMED_KEYS, None);
+    let names = on_sqlite(
+        &sql,
+        "insert into app_t (id, code) values (1, 'a'); insert into app_u (id, email) values (1, 'x');",
+        "select group_concat(name, ',') from (select name from sqlite_master where type = 'table' order by name)",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(names, "app_t,app_u");
+}
