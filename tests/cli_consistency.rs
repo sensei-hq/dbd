@@ -1405,3 +1405,62 @@ fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
         stderr(&o)
     );
 }
+
+// ── merge --from-dbml of a scoped document ──────────────────────────────────
+
+/// A DBML document scoped to some schemas stands a stub in for every table a
+/// foreign key reaches outside them — whether the project builds that table
+/// or somebody else does. `merge --from-dbml` told the user to declare
+/// `core.accounts` under `external:` when the project manages it: an external
+/// is somebody else's table, and declaring one the project builds would stop
+/// it being built. A table the project manages is never called external; one
+/// it does not is still named.
+#[test]
+fn merge_from_a_scoped_dbml_document_never_calls_a_table_the_project_manages_external() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: scoped\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/table/core/accounts.ddl",
+        "set search_path to core;\ncreate table if not exists accounts (id uuid primary key);\n",
+    );
+    write(
+        dir,
+        "app.dbml",
+        "Table \"app\".\"people\" {\n  \"id\" int [pk]\n  \"account_id\" uuid\n  \"invoice_id\" uuid\n}\n\n\
+         Ref: \"app\".\"people\".\"account_id\" > \"core\".\"accounts\".\"id\"\n\
+         Ref: \"app\".\"people\".\"invoice_id\" > \"billing\".\"invoices\".\"id\"\n\n\
+         Table \"core\".\"accounts\" {\n  \"id\" uuid\n\n  indexes {\n    id [unique]\n  }\n\n\
+         \x20 Note: 'Defined in this project, outside this document — only the referenced columns are shown'\n}\n\n\
+         Table \"billing\".\"invoices\" {\n  \"id\" uuid\n\n  indexes {\n    id [unique]\n  }\n\n\
+         \x20 Note: 'External entity — managed outside this project'\n}\n",
+    );
+
+    let o = dbd(
+        dir,
+        &[
+            "merge",
+            "--from-dbml",
+            dir.join("app.dbml").to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !said
+            .lines()
+            .any(|l| l.contains("core.accounts") && l.contains("external")),
+        "core.accounts is the project's own table: {said}"
+    );
+    assert!(
+        said.lines()
+            .any(|l| l.contains("billing.invoices") && l.contains("external")),
+        "a table the project does not build is still named: {said}"
+    );
+}
