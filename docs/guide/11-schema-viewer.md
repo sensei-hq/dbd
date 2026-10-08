@@ -16,6 +16,11 @@ dbd diagram --json -f schema.json            # write the model as JSON instead
 The viewer is at `https://dbd.sensei-hq.com/diagram` unless `--site` or
 `$DBD_DIAGRAM_URL` says otherwise.
 
+A DDL file dbd cannot parse is left out of the model, and named as it is:
+`⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: …`.
+The rest is still drawn, so a diagram missing a table never reads as a complete
+one without a word. `dbd dbml` does the same.
+
 ## Privacy: the model lives in the URL
 
 `dbd diagram` builds the schema model, gzips it, base64url-encodes it and puts it
