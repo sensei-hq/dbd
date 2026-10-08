@@ -953,6 +953,89 @@ async fn json_values_and_identity_ids_survive_an_export_and_import() {
     }
 }
 
+// ── Test: a generated column is computed, not exported or imported ────────────
+
+/// The export wrote a generated column, and the import then refused it (COPY:
+/// "column is a generated column") — so no CSV export of a table with one
+/// imported back. The JSON load dropped the same key in silence. The export
+/// leaves a generated column out, the import recomputes it, and a data file
+/// that names one is refused in every format, saying why.
+#[tokio::test]
+async fn a_generated_column_is_left_out_of_an_export_and_refused_by_an_import() {
+    const TABLE: &str = "CREATE TABLE app.items (\n\
+                           id integer PRIMARY KEY\n\
+                         , price numeric\n\
+                         , doubled numeric GENERATED ALWAYS AS (price * 2) STORED\n\
+                         );";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA app; {TABLE} INSERT INTO app.items (id, price) VALUES (1, 1.50), (2, NULL);"
+        ))
+        .await
+        .unwrap();
+
+    for format in ["csv", "tsv", "jsonl"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.items");
+        entity.format = Some(format.to_string());
+        adapter
+            .export_data(&entity, Some(out.path()))
+            .await
+            .unwrap_or_else(|e| panic!("{format}: export failed: {e}"));
+        let file = out.path().join(format!("items.{format}"));
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(!written.contains("doubled"), "{format}: {written}");
+
+        adapter
+            .execute_script(&format!("DROP TABLE app.items; {TABLE}"))
+            .await
+            .unwrap();
+        entity.file = Some(file);
+        adapter
+            .import_data(&entity, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: the export imports back: {e}"));
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 WHERE (SELECT count(*) FROM app.items WHERE \
+               (id = 1 AND price = 1.50 AND doubled = 3.00) OR (id = 2 AND price IS NULL AND doubled IS NULL)) <> 2",
+            &format!("{format}: rows other than the exported ones"),
+        )
+        .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (file, body, format) in [
+        ("items.csv", "id,price,doubled\n3,1,2\n", "csv"),
+        ("items.jsonl", "{\"id\": 3, \"price\": 1, \"doubled\": 2}\n", "jsonl"),
+    ] {
+        let path = dir.path().join(file);
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Table, "app.items");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+        let err = adapter
+            .import_data(&entity, "", false)
+            .await
+            .expect_err("a value for a generated column must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doubled") && msg.contains("generated") && msg.contains(file),
+            "{format}: the column, why, and the file: {msg}"
+        );
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM app.items WHERE id = 3",
+            "a refused row",
+        )
+        .await;
+    }
+}
+
 // ── Test: a JSON key naming no column is refused ──────────────────────────────
 
 /// A CSV header naming a column the table lacks is refused, on Postgres and
