@@ -932,10 +932,20 @@ async fn json_values_and_identity_ids_survive_an_export_and_import() {
         )
         .await;
 
+        // The identity continues past the loaded ids — not into the gap below
+        // them, where a reused id would point a stale reference at a new row.
         adapter
             .execute_script("INSERT INTO app.docs (note) VALUES ('after the import')")
             .await
             .unwrap_or_else(|e| panic!("{format}: the next insert must get a fresh id: {e}"));
+        assert_catalog(
+            &*adapter,
+            true,
+            "SELECT 1 FROM app.docs WHERE note = 'after the import' \
+               AND id > (SELECT max(id) FROM app.expected)",
+            &format!("{format}: an id past the imported ones"),
+        )
+        .await;
         adapter
             .execute_script("DELETE FROM app.docs WHERE note = 'after the import'")
             .await
