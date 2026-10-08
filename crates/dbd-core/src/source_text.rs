@@ -77,6 +77,56 @@ pub fn decode(bytes: &[u8]) -> Decoded {
     }
 }
 
+/// How a source file sits on disk: the byte-order mark it opened with, if any.
+///
+/// What a tool that rewrites a file needs to write it back the way it found
+/// it. Formatting rewrote an SSMS file (UTF-16LE) as UTF-8, changing every byte
+/// of it for a change of layout nobody asked to be a change of encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Encoding {
+    /// UTF-8 without a BOM — everything dbd writes itself.
+    #[default]
+    Utf8,
+    /// UTF-8 behind a BOM.
+    Utf8Bom,
+    /// UTF-16LE behind a BOM — what SSMS saves.
+    Utf16Le,
+    /// UTF-16BE behind a BOM.
+    Utf16Be,
+}
+
+impl Encoding {
+    /// The encoding `bytes` announce with their BOM; UTF-8 when they have none.
+    fn of(bytes: &[u8]) -> Self {
+        match encoding_rs::Encoding::for_bom(bytes) {
+            Some((e, _)) if e == encoding_rs::UTF_16LE => Self::Utf16Le,
+            Some((e, _)) if e == encoding_rs::UTF_16BE => Self::Utf16Be,
+            Some(_) => Self::Utf8Bom,
+            None => Self::Utf8,
+        }
+    }
+
+    /// `text` in this encoding, behind its BOM — the inverse of reading it.
+    ///
+    /// UTF-16 by hand: `encoding_rs` implements the WHATWG Encoding Standard,
+    /// whose UTF-16 encoders output UTF-8.
+    pub fn encode(self, text: &str) -> Vec<u8> {
+        let utf16 = |bom: [u8; 2], unit_bytes: fn(u16) -> [u8; 2]| {
+            let mut bytes = bom.to_vec();
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit_bytes(unit));
+            }
+            bytes
+        };
+        match self {
+            Self::Utf8 => text.as_bytes().to_vec(),
+            Self::Utf8Bom => [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+            Self::Utf16Le => utf16([0xFF, 0xFE], u16::to_le_bytes),
+            Self::Utf16Be => utf16([0xFE, 0xFF], u16::to_be_bytes),
+        }
+    }
+}
+
 /// Read a source file, decoding by [`decode`].
 ///
 /// The replacement for `std::fs::read_to_string` on any path that might hold
@@ -84,10 +134,16 @@ pub fn decode(bytes: &[u8]) -> Decoded {
 /// which they are, because they call for different things: a binary under
 /// `ddl/` is a mistake to remove, and a non-UTF-8 file is one to re-encode.
 pub fn read_to_string(path: &Path) -> Result<String> {
+    read_with_encoding(path).map(|(text, _)| text)
+}
+
+/// [`read_to_string`], and the [`Encoding`] the file was in — for a tool that
+/// rewrites the file and must leave its encoding as it was.
+pub fn read_with_encoding(path: &Path) -> Result<(String, Encoding)> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let bytes = std::fs::read(path).map_err(|e| DbdError::Config(format!("read {}: {e}", path.display())))?;
     match decode(&bytes) {
-        Decoded::Text(text) => Ok(text),
+        Decoded::Text(text) => Ok((text, Encoding::of(&bytes))),
         Decoded::Binary => Err(DbdError::Config(format!(
             "read {}: this is binary, not SQL — it has null bytes and no byte-order mark",
             path.display()

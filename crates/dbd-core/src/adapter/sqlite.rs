@@ -342,7 +342,10 @@ impl DatabaseAdapter for SqliteAdapter {
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
-            "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
+            "csv" | "tsv" => {
+                let records = super::Delimited::new(&data, format == "tsv", file_path);
+                self.import_delimited(records, table, null_value).await
+            }
             "json" | "jsonl" => {
                 let records = super::json_records(&data, format, file_path)?;
                 self.import_json_records(&records, table).await
@@ -392,10 +395,13 @@ impl DatabaseAdapter for SqliteAdapter {
         match format {
             "csv" | "tsv" => {
                 let sep = if format == "tsv" { '\t' } else { ',' };
-                output.push_str(&columns.join(&sep.to_string()));
+                let header: Vec<String> = columns.iter().map(|c| delimited_cell(Some(c), sep)).collect();
+                output.push_str(&header.join(&sep.to_string()));
                 output.push('\n');
                 for row in &rows {
-                    let cells: Vec<String> = (0..columns.len()).map(|i| sqlite_cell_to_text(row, i)).collect();
+                    let cells: Vec<String> = (0..columns.len())
+                        .map(|i| delimited_cell(sqlite_cell_to_text(row, i).as_deref(), sep))
+                        .collect();
                     output.push_str(&cells.join(&sep.to_string()));
                     output.push('\n');
                 }
@@ -666,19 +672,25 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
-    async fn import_delimited(&self, data: &str, table: &str, tab: bool, null_value: &str) -> Result<()> {
-        let sep = if tab { '\t' } else { ',' };
-        let mut lines = data.lines();
-        let header_line = match lines.next() {
-            Some(h) if !h.trim().is_empty() => h,
-            _ => return Ok(()),
+    /// Load a CSV/TSV file's rows into `table`, each value into the column its
+    /// header names.
+    ///
+    /// Read by [`super::Delimited`], as Postgres reads the same file: each line
+    /// was split on the delimiter and every cell trimmed, so a quoted comma was
+    /// "too many columns" and a quote stayed in the value — a CSV Postgres
+    /// exported could not be imported here. An unquoted field matching
+    /// `null_value` is NULL; a quoted one is a value, as in Postgres's COPY,
+    /// which writes `''` as `""` and NULL as an empty field.
+    async fn import_delimited(&self, mut records: super::Delimited<'_>, table: &str, null_value: &str) -> Result<()> {
+        let Some(header) = records.next_record()? else {
+            return Ok(()); // An empty file: no columns, no rows.
         };
-        let columns: Vec<&str> = header_line.split(sep).map(|s| s.trim()).collect();
-        if columns.is_empty() {
-            return Ok(());
-        }
-        let col_count = columns.len();
-        let cols_clause = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let col_count = header.len();
+        let cols_clause = header
+            .iter()
+            .map(|f| crate::sql_quote::ident(&f.value))
+            .collect::<Vec<_>>()
+            .join(",");
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -688,23 +700,18 @@ impl SqliteAdapter {
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
         let mut batch: Vec<Vec<Option<String>>> = Vec::with_capacity(batch_rows);
-        for line in lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let values: Vec<&str> = line.split(sep).collect();
-            if values.len() != col_count {
+        while let Some(record) = records.next_record()? {
+            if record.len() != col_count {
                 return Err(DbdError::Config(format!(
-                    "csv row has {} columns, expected {col_count}",
-                    values.len()
+                    "{}: the row on line {} has {} field(s), but the header has {col_count}",
+                    records.file().display(),
+                    records.line(),
+                    record.len()
                 )));
             }
-            let row: Vec<Option<String>> = values
-                .iter()
-                .map(|v| {
-                    let t = v.trim();
-                    if t == null_value { None } else { Some(t.to_string()) }
-                })
+            let row: Vec<Option<String>> = record
+                .into_iter()
+                .map(|f| (f.quoted || f.value != null_value).then_some(f.value))
                 .collect();
             batch.push(row);
             if batch.len() >= batch_rows {
@@ -800,7 +807,10 @@ async fn flush_csv_batch(
     rows: &[Vec<Option<String>>],
 ) -> Result<()> {
     let placeholders = multi_row_placeholders(col_count, rows.len());
-    let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
+    let sql = format!(
+        "INSERT INTO {} ({cols_clause}) VALUES {placeholders}",
+        crate::sql_quote::ident(table)
+    );
     let mut q = sqlx::query(&sql);
     for row in rows {
         for cell in row {
@@ -876,17 +886,34 @@ impl JsonBindable {
     }
 }
 
-fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+/// A cell's text, `None` for NULL — kept apart from `''`, which a delimited
+/// export has to write differently.
+fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Option<String> {
     if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
-        return v.unwrap_or_default();
+        return v;
     }
     if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
-    String::new()
+    None
+}
+
+/// One CSV/TSV field as Postgres's `COPY … CSV` writes it, so the RFC 4180
+/// reader on the other side — this adapter's or Postgres's — reads back what
+/// was there: NULL is an empty field, `''` is `""`, and a value holding the
+/// delimiter, a quote or a line break is quoted with its quotes doubled.
+/// Joined bare, a comma in a value split the row, and NULL and `''` both came
+/// out empty.
+fn delimited_cell(value: Option<&str>, sep: char) -> String {
+    match value {
+        None => String::new(),
+        Some("") => "\"\"".to_string(),
+        Some(v) if v.contains([sep, '"', '\n', '\r']) => format!("\"{}\"", v.replace('"', "\"\"")),
+        Some(v) => v.to_string(),
+    }
 }
 
 fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json::Value {
@@ -1274,6 +1301,153 @@ mod tests {
     fn s14_multi_row_placeholders_shape() {
         assert_eq!(multi_row_placeholders(3, 1), "(?,?,?)");
         assert_eq!(multi_row_placeholders(2, 3), "(?,?),(?,?),(?,?)");
+    }
+
+    // ── CSV/TSV is read as CSV ───────────────────────────────────────────────
+
+    /// Load `body` as a `format` data file into `t (id INTEGER, v TEXT)`, and
+    /// read every row back in id order.
+    async fn load_delimited(format: &str, body: &str, null_value: &str) -> Result<Vec<(i64, Option<String>)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("t.{format}"));
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "staging.t");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+        a.import_data(&entity, null_value, false).await?;
+        Ok(
+            sqlx::query_as::<_, (i64, Option<String>)>("SELECT id, v FROM t ORDER BY id")
+                .fetch_all(&a.pool)
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn rows(expected: &[(i64, Option<&str>)]) -> Vec<(i64, Option<String>)> {
+        expected.iter().map(|(id, v)| (*id, v.map(str::to_string))).collect()
+    }
+
+    /// A SQLite export imports back to the same values. Cells were joined with
+    /// the delimiter unquoted, so a comma, quote or line break in a value broke
+    /// the row, and NULL and `''` both came out empty. Written as Postgres
+    /// writes CSV — quoted where needed, NULL empty, `''` as `""` — the RFC 4180
+    /// reader on the other side gets back what was there.
+    #[tokio::test]
+    async fn a_csv_export_imports_back_to_the_same_values() {
+        let expected = rows(&[
+            (1, Some("Japan, Nippon")),
+            (2, Some("say \"hi\"")),
+            (3, Some("two\nlines")),
+            (4, Some("  padded  ")),
+            (5, Some("")),
+            (6, None),
+        ]);
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        for (id, v) in &expected {
+            sqlx::query("INSERT INTO t (id, v) VALUES (?, ?)")
+                .bind(id)
+                .bind(v)
+                .execute(&a.pool)
+                .await
+                .unwrap();
+        }
+        let mut entity = Entity::new(EntityType::Table, "default.t");
+        entity.format = Some("csv".to_string());
+        let out = tempfile::tempdir().unwrap();
+        a.export_data(&entity, Some(out.path())).await.unwrap();
+        let body = std::fs::read_to_string(out.path().join("t.csv")).unwrap();
+
+        let got = load_delimited("csv", &body, "").await.expect("the export must import");
+        assert_eq!(got, expected, "{body}");
+    }
+
+    /// RFC 4180: a quoted field may hold the delimiter, a doubled quote and a
+    /// line break, and nothing is trimmed. Each line was split on commas and
+    /// every cell trimmed — a quoted comma was "too many columns", quotes were
+    /// kept in the value, and padding was lost — so a CSV Postgres exported
+    /// could not be imported here.
+    #[tokio::test]
+    async fn a_csv_is_read_as_rfc_4180() {
+        let got = load_delimited(
+            "csv",
+            "id,v\n1,\"Japan, Nippon\"\n2,\"say \"\"hi\"\"\"\n3,\"two\nlines\"\n4,  padded  \n",
+            "",
+        )
+        .await
+        .expect("import failed");
+        assert_eq!(
+            got,
+            rows(&[
+                (1, Some("Japan, Nippon")),
+                (2, Some("say \"hi\"")),
+                (3, Some("two\nlines")),
+                (4, Some("  padded  ")),
+            ])
+        );
+    }
+
+    /// RFC 4180 ends lines with CRLF; a `\r` is not part of the last value.
+    #[tokio::test]
+    async fn a_crlf_csv_loads_without_its_carriage_returns() {
+        let got = load_delimited("csv", "id,v\r\n1,a\r\n2,\"b\"\r\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a")), (2, Some("b"))]));
+    }
+
+    /// Quoting is how CSV tells an empty string from NULL: Postgres's COPY
+    /// writes NULL as an empty unquoted field and `''` as `""`, and reads them
+    /// back that way. An unquoted field matching `null_value` is NULL; a quoted
+    /// one is always a value — under the default sentinel and a configured one.
+    #[tokio::test]
+    async fn a_quoted_field_is_a_value_never_null() {
+        let got = load_delimited("csv", "id,v\n1,\n2,\"\"\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some(""))]));
+
+        let got = load_delimited("csv", "id,v\n1,\\N\n2,\"\\N\"\n3,\n", "\\N")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some("\\N")), (3, Some(""))]));
+    }
+
+    /// A TSV is the same format with a tab between fields, so a quoted field
+    /// may hold a tab.
+    #[tokio::test]
+    async fn a_tsv_field_may_quote_a_tab() {
+        let got = load_delimited("tsv", "id\tv\n1\t\"a\tb\"\n2\t c \n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a\tb")), (2, Some(" c "))]));
+    }
+
+    /// A quote left open runs to the end of the file: loading it would put
+    /// every row after it into one value. Refused, saying where it opened, and
+    /// nothing is loaded.
+    #[tokio::test]
+    async fn an_unterminated_quote_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,\"open\n3,c\n", "")
+            .await
+            .expect_err("an unterminated quote must be refused")
+            .to_string();
+        assert!(err.contains("quote") && err.contains("line 3"), "{err}");
+    }
+
+    /// A row with more or fewer fields than the header is refused, saying which.
+    #[tokio::test]
+    async fn a_row_with_the_wrong_field_count_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,b,c\n", "")
+            .await
+            .expect_err("a ragged row must be refused")
+            .to_string();
+        assert!(
+            err.contains("line 3") && err.contains('3') && err.contains('2'),
+            "{err}"
+        );
     }
 
     #[tokio::test]

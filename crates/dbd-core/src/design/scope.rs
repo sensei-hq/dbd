@@ -176,6 +176,21 @@ impl Design {
             .collect()
     }
 
+    /// The entities a command run under `scope` covers but dbd could not read
+    /// — what a document generated from the design leaves out.
+    ///
+    /// The same judgement [`Self::ensure_fully_parsed`] refuses on. A command
+    /// that writes documentation (`dbml`, `diagram`) names these instead and
+    /// writes what it can, as `emit` reports them: left out without a word, a
+    /// document missing a table reads exactly like a complete one.
+    pub fn unparsed(&self, scope: &ResolvedScope) -> Result<Vec<&Entity>> {
+        if scope.is_all {
+            return Ok(self.unparseable_in_scope(None, None, None));
+        }
+        let working = self.working_set(scope)?;
+        Ok(self.unparseable_in_scope(Some(scope), Some(&working), None))
+    }
+
     /// Refuse to act on a design dbd could not fully read.
     ///
     /// [`Self::entities_in_scope`] silently drops an entity that carries a parse
@@ -243,6 +258,19 @@ impl Design {
         let declared = keys(crate::reconcile::raw_snapshot_from_entities(&all));
         let wanted = keys(crate::reconcile::raw_snapshot_from_entities(&desired));
         declared.difference(&wanted).cloned().collect()
+    }
+
+    /// What the design manages that a working set leaves out — the names a
+    /// scoped hook must not touch. Externals are not the design's to manage.
+    pub(in crate::design) fn managed_outside(
+        &self,
+        working_set: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        self.entities
+            .iter()
+            .filter(|e| e.entity_type != EntityType::External && !working_set.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
     }
 
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its

@@ -51,11 +51,12 @@ pub(crate) fn derive_dependencies(sql: &str) -> Vec<String> {
 /// unscoped run, always runs every hook. An empty `deps` (derivation found
 /// nothing) also always runs: see [`derive_dependencies`]'s doc comment for why
 /// that must never mean "skip".
-pub(crate) fn hook_in_scope(deps: &[String], working_set: &HashSet<String>, is_all: bool) -> bool {
-    if is_all || deps.is_empty() {
-        return true;
-    }
-    deps.iter().all(|d| working_set.contains(d))
+pub(crate) fn hook_in_scope(deps: &[String], outside: &HashSet<String>, is_all: bool) -> bool {
+    // `outside` is what the design manages that the scope leaves out. A name
+    // the design does not manage — an `external:` table, one the hook creates
+    // itself — is not the scope's to judge: the working set never holds such
+    // names, so testing against it skipped those hooks under every scope.
+    is_all || !deps.iter().any(|d| outside.contains(d))
 }
 
 /// A hook's dependencies: declared if present, derived otherwise.
@@ -131,12 +132,12 @@ pub(in crate::design) fn plan_hooks(
         let script = entry.script();
         let sql = read_hook(&canon_root, script, kind)?;
 
-        if let Some((scope_name, working_set)) = scope {
+        if let Some((scope_name, outside)) = scope {
             let deps = dependencies_of(entry, &sql);
-            if !hook_in_scope(&deps, working_set, false) {
+            if !hook_in_scope(&deps, outside, false) {
                 let missing: Vec<&str> = deps
                     .iter()
-                    .filter(|d| !working_set.contains(*d))
+                    .filter(|d| outside.contains(*d))
                     .map(String::as_str)
                     .collect();
                 plan.warnings.push(format!(
@@ -342,13 +343,14 @@ mod tests {
         );
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("sql/loader.sql".to_string())];
-        let working = ws(&["app.target", "staging.a"]);
+        // What the design manages that the scope leaves out.
+        let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
             tmp.path(),
             &entries,
             HookKind::After,
-            Some(("partial", &working)),
+            Some(("partial", &outside)),
             false,
             &mut silent(),
         )
@@ -380,13 +382,13 @@ mod tests {
             script: "sql/dynamic.sql".to_string(),
             writes: vec!["app.target".to_string()],
         }];
-        let working = ws(&["app.target", "staging.a"]);
+        let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
             tmp.path(),
             &entries,
             HookKind::After,
-            Some(("partial", &working)),
+            Some(("partial", &outside)),
             false,
             &mut silent(),
         )
@@ -408,13 +410,13 @@ mod tests {
         let tmp = project_with_script("sql/pre.sql", "insert into staging.b values (1);");
         let mock = MockAdapter::new();
         let entries = vec![ScriptEntry::Path("sql/pre.sql".to_string())];
-        let working = ws(&["staging.a"]);
+        let outside = ws(&["staging.b"]);
         let outcome = run_hooks(
             &mock,
             tmp.path(),
             &entries,
             HookKind::Before,
-            Some(("partial", &working)),
+            Some(("partial", &outside)),
             false,
             &mut silent(),
         )
@@ -427,13 +429,13 @@ mod tests {
     #[test]
     fn a_script_whose_tables_are_all_in_scope_runs() {
         let deps = vec!["staging.a".to_string(), "staging.b".to_string()];
-        assert!(hook_in_scope(&deps, &ws(&["staging.a", "staging.b"]), false));
+        assert!(hook_in_scope(&deps, &ws(&["staging.c"]), false));
     }
 
     #[test]
     fn a_script_missing_one_table_is_skipped() {
         let deps = vec!["staging.a".to_string(), "staging.b".to_string()];
-        assert!(!hook_in_scope(&deps, &ws(&["staging.a"]), false));
+        assert!(!hook_in_scope(&deps, &ws(&["staging.b"]), false));
     }
 
     /// Derivation found nothing — the script's dependencies are unknowable, so

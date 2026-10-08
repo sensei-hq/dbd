@@ -486,6 +486,12 @@ pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
             "{} entities applied (no project.version — the database is not versioned).",
             s.applied
         ),
+        // The database had no version but was not empty — built before the
+        // project had one, typically. Its objects were applied over in place.
+        ApplyStrategy::Fresh if s.previously_built => format!(
+            "v{} recorded on a database that was already built but had no version — {} entities applied.",
+            s.to_version, s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
@@ -573,6 +579,26 @@ pub(super) async fn get_adapter(
         .context("Failed to connect to database")
 }
 
+/// The database a connecting command would reach, or `None` when nothing
+/// names one: `-d`/`DATABASE_URL`, else the default target's `url` with a
+/// `$VAR` resolved from the environment — the URL [`get_adapter`] connects to.
+/// An unset `$VAR`, or an empty value, names nothing.
+///
+/// For the commands that work offline but must ask a database that exists:
+/// `reset --dry-run` previews without one, and checks its guards against one.
+pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>) -> Result<Option<String>> {
+    let usable = |u: &str| !u.is_empty() && !u.starts_with('$');
+    if let Some(u) = database_url.filter(|u| usable(u)) {
+        return Ok(Some(u.to_string()));
+    }
+    let design_config = dbd_core::config::read(config).context("Failed to read config")?;
+    Ok(design_config
+        .get_target(None)
+        .and_then(|t| t.url.as_deref())
+        .map(resolve_env_vars)
+        .filter(|u| usable(u)))
+}
+
 fn resolve_env_vars(s: &str) -> String {
     if let Some(var) = s.strip_prefix('$') {
         std::env::var(var).unwrap_or_else(|_| s.to_string())
@@ -622,12 +648,30 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read {}", file.display()))
 }
 
-/// [`safe_read`] for a DDL file: decoded by `source_text` exactly as the
-/// project load decodes it (UTF-16 behind a BOM included), so a file the load
-/// reads is never one a command over the same tree cannot.
-pub(super) fn safe_read_ddl(root: &Path, file: &Path) -> Result<String> {
+/// Format one DDL file — rewriting it when `write` — in the encoding it was
+/// saved in; whether it needed formatting. Shared by `format` and
+/// `inspect --fix`, so the two cannot disagree about a file.
+///
+/// Read by `source_text` exactly as the project load reads it (UTF-16 behind a
+/// BOM included), so a file the load reads is never one this cannot.
+pub(super) fn format_in_place(
+    root: &Path,
+    file: &Path,
+    config: &dbd_core::config::FormatConfig,
+    write: bool,
+) -> Result<bool> {
     let canon = safe_canonicalize_within(root, file)?;
-    dbd_core::source_text::read_to_string(&canon).with_context(|| format!("Failed to read {}", file.display()))
+    let (content, encoding) = dbd_core::source_text::read_with_encoding(&canon)
+        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let formatted = dbd_core::formatter::format_ddl(&content, config);
+    if content == formatted {
+        return Ok(false);
+    }
+    if write {
+        std::fs::write(&canon, encoding.encode(&formatted)) // nosemgrep: path validated by safe_canonicalize_within
+            .with_context(|| format!("Failed to write {}", file.display()))?;
+    }
+    Ok(true)
 }
 
 pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {
@@ -1093,11 +1137,20 @@ mod tests {
         .unwrap();
     }
 
-    /// `dbd reset --dry-run` likewise returns before any adapter is built.
+    /// `dbd reset --dry-run` likewise needs no database when none is configured.
+    /// The copy's `url: $DATABASE_URL` is removed so a variable set in the shell
+    /// running the tests cannot give it one.
     #[tokio::test]
     async fn run_dispatches_reset_dry_run_without_a_database() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         run_in_copy(
             &Commands::Reset {
                 target: None,

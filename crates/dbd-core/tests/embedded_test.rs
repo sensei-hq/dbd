@@ -257,6 +257,145 @@ async fn import_data_honors_null_value_sentinel() {
     .await;
 }
 
+// ── Test: a CSV/TSV loads by its header, not by position ──────────────────────
+
+/// Create `staging.countries (code text, name text)` and load `body` into it as
+/// a `format` data file.
+async fn load_countries(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    format: &str,
+    body: &str,
+) -> dbd_core::error::Result<()> {
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS staging; CREATE TABLE staging.countries (code text, name text)")
+        .await
+        .expect("create table failed");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("countries.{format}"));
+    std::fs::write(&path, body).unwrap();
+    let mut entity = Entity::new(EntityType::Table, "staging.countries");
+    entity.file = Some(path);
+    entity.format = Some(format.to_string());
+    adapter.import_data(&entity, "", false).await
+}
+
+/// COPY skipped the header (`HEADER true`) without reading it, so each value
+/// went into the column at its position: a file headed `name,code` loaded
+/// `Germany` into `code`. SQLite maps by header name, so the same file loaded
+/// differently on the two engines. The header is a column list, quoting and
+/// all.
+#[tokio::test]
+async fn a_csv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "\"name\",code\nGermany,DE\n\"Japan, Nippon\",JP\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'JP' AND name = 'Japan, Nippon'",
+        "a quoted value under the column its header names",
+    )
+    .await;
+}
+
+/// TSV is the same load with a tab between columns.
+#[tokio::test]
+async fn a_tsv_loads_each_value_into_the_column_its_header_names() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "tsv", "name\tcode\nGermany\tDE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// Windows line endings: the rows are handed to COPY from just after the
+/// header's `\r\n`. Cut after the `\r`, they began with a stray `\n` that COPY
+/// reads as a row of its own.
+#[tokio::test]
+async fn a_csv_with_crlf_line_endings_loads() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "name,code\r\nGermany,DE\r\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header names a column as Postgres resolves an unquoted name: `Name` is
+/// `name`. A spreadsheet's capitalised header loaded before, by position; it
+/// must not be refused now that the header is read.
+#[tokio::test]
+async fn a_header_names_a_column_as_postgres_resolves_an_unquoted_name() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    load_countries(&*adapter, "csv", "Name,CODE\nGermany,DE\n")
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM staging.countries WHERE code = 'DE' AND name = 'Germany'",
+        "Germany under name, DE under code",
+    )
+    .await;
+}
+
+/// A header column the table does not have is a file for another table, or a
+/// renamed column — loading the rest by position or dropping it would both
+/// load wrong data. Refused, naming the column and what the table has, before
+/// a row is loaded.
+#[tokio::test]
+async fn a_header_column_the_table_does_not_have_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let err = load_countries(&*adapter, "csv", "name,iso_code\nGermany,DE\n")
+        .await
+        .expect_err("an unknown header column must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("iso_code") && msg.contains("staging.countries") && msg.contains("code, name"),
+        "the column, the table, and the columns it has: {msg}"
+    );
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM staging.countries",
+        "a row loaded from a refused file",
+    )
+    .await;
+}
+
 // ── Test: the default import empties a staging table before loading it ────────
 
 /// `truncate: true` is the default. The step moved behind
@@ -351,6 +490,90 @@ async fn a_function_reading_a_staging_table_does_not_fail_the_import() {
     .await;
 }
 
+// ── Test: each staging table's own loader runs ────────────────────────────────
+
+/// The audit's repro on a real database. `load_cities` joins the staged
+/// countries to find each city's country, and loader matching took the first
+/// procedure reading a staging table — so both staged tables got
+/// `load_cities`, it ran twice, `load_countries` never ran, and both targets
+/// stayed empty under a summary of "2 procedure(s) called".
+#[tokio::test]
+async fn each_staging_table_is_loaded_by_its_own_loader() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: t\nschemas:\n  - staging\n  - app\nimport:\n  staging: [staging]\n",
+    );
+    write(
+        "ddl/table/staging/countries.ddl",
+        "set search_path to staging;\ncreate table if not exists countries (code text, name text);\n",
+    );
+    write(
+        "ddl/table/staging/cities.ddl",
+        "set search_path to staging;\ncreate table if not exists cities (name text, country text);\n",
+    );
+    write(
+        "ddl/table/app/countries.ddl",
+        "set search_path to app;\ncreate table if not exists countries (code text primary key, name text);\n",
+    );
+    write(
+        "ddl/table/app/cities.ddl",
+        "set search_path to app;\n\
+         create table if not exists cities (name text, country_code text references app.countries (code));\n",
+    );
+    write(
+        "ddl/procedure/staging/load_countries.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_countries() language sql\n\
+         as $$ insert into app.countries (code, name) select code, name from staging.countries $$;\n",
+    );
+    write(
+        "ddl/procedure/staging/load_cities.ddl",
+        "set search_path to staging;\n\
+         create or replace procedure load_cities() language sql\n\
+         as $$ insert into app.cities (name, country_code)\n\
+               select c.name, k.code from staging.cities c\n\
+               join staging.countries s on s.name = c.country\n\
+               join app.countries k on k.code = s.code $$;\n",
+    );
+    write("import/staging/countries.csv", "code,name\nDE,Germany\n");
+    write("import/staging/cities.csv", "name,country\nBerlin,Germany\n");
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply failed");
+    design
+        .import_data(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("import failed");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.countries WHERE code = 'DE' AND name = 'Germany'",
+        "the country load_countries moves",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.cities WHERE name = 'Berlin' AND country_code = 'DE'",
+        "the city load_cities moves",
+    )
+    .await;
+}
+
 // ── Test: a `.json` file may hold a JSON array ────────────────────────────────
 
 /// A `.json` file is what most tools mean by one: a JSON array of records. The
@@ -397,6 +620,111 @@ async fn a_json_array_file_imports_one_row_per_record() {
         "a row count other than 2",
     )
     .await;
+}
+
+// ── Test: a JSON import leaves no schema the design did not declare ───────────
+
+/// dbd's JSON loader is its own machinery, and it was installed in a schema
+/// called `staging` whatever the project's staging schemas are called — so a
+/// JSON import created a schema the design never declared, which the next
+/// `reconcile --prune` or `diff` then had to account for.
+#[tokio::test]
+async fn a_json_import_creates_no_schema_the_design_does_not_declare() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text);")
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.jsonl");
+    std::fs::write(&path, "{\"id\": 1, \"name\": \"alpha\"}\n").unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.people");
+    entity.file = Some(path);
+    entity.format = Some("jsonl".to_string());
+
+    adapter.import_data(&entity, "", false).await.expect("the import runs");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND name = 'alpha'",
+        "the imported record",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'staging'",
+        "a `staging` schema the design never declared",
+    )
+    .await;
+}
+
+// ── Test: a Postgres CSV/TSV export imports into SQLite unchanged ─────────────
+
+/// `dbd export` from Postgres and `dbd import` into SQLite is how data moves
+/// between the engines, so every value must arrive as it left. Postgres writes
+/// real CSV — a comma or a newline quoted, a quote doubled, NULL as an empty
+/// field and `''` as `""` — and SQLite split each line on the delimiter and
+/// trimmed: the comma was "too many columns", quotes stayed in the value.
+#[tokio::test]
+async fn a_postgres_export_imports_into_sqlite_unchanged() {
+    let (_pg, url) = start_pg().await;
+    let pg = connect(&url, "embedded_test").await.unwrap();
+    // Everything CSV quoting exists for, plus the NULL/'' distinction.
+    let expected: Vec<(i64, Option<String>)> = [
+        (1, Some("Japan, Nippon")),
+        (2, Some("say \"hi\"")),
+        (3, Some("two\nlines")),
+        (4, Some("a\ttab")),
+        (5, Some("  padded  ")),
+        (6, Some("")),
+        (7, None),
+    ]
+    .iter()
+    .map(|(id, v)| (*id, v.map(str::to_string)))
+    .collect();
+    pg.execute_script(
+        r#"CREATE SCHEMA app;
+           CREATE TABLE app.countries (id integer, name text);
+           INSERT INTO app.countries VALUES
+             (1, 'Japan, Nippon'), (2, 'say "hi"'), (3, E'two\nlines'), (4, E'a\ttab'),
+             (5, '  padded  '), (6, ''), (7, NULL);"#,
+    )
+    .await
+    .unwrap();
+
+    for format in ["csv", "tsv"] {
+        let out = tempfile::tempdir().unwrap();
+        let mut export = Entity::new(EntityType::Table, "app.countries");
+        export.format = Some(format.to_string());
+        pg.export_data(&export, Some(out.path())).await.expect("export failed");
+
+        let db = out.path().join("target.db");
+        let sqlite_url = format!("sqlite://{}", db.display());
+        let sqlite = connect(&sqlite_url, "embedded_test").await.unwrap();
+        sqlite
+            .execute_script("CREATE TABLE countries (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let mut import = Entity::new(EntityType::Table, "app.countries");
+        import.file = Some(out.path().join(format!("countries.{format}")));
+        import.format = Some(format.to_string());
+        sqlite
+            .import_data(&import, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{format}: SQLite import failed: {e}"));
+
+        use sqlx::Connection as _;
+        let mut conn = sqlx::SqliteConnection::connect(&sqlite_url).await.unwrap();
+        let got: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, name FROM countries ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(got, expected, "{format}: the values Postgres exported");
+    }
 }
 
 // ── Test: JSONL export → import is a round trip ───────────────────────────────
@@ -668,6 +996,55 @@ async fn migration_upgrades_schema() {
     assert_eq!(v2.migrated, 1, "one entity migrated (items)");
 
     assert_column_exists(&*adapter, "app", "items", "notes").await;
+}
+
+// ── Test: init --from-db keeps a view's and a matview's own comment ───────────
+
+/// `init --from-db` wrote a table's comment and dropped a view's and a
+/// materialized view's: neither introspection read them nor the emitter wrote
+/// them. A matview comment that is a drift stamp a dbd before 0.25 wrote is
+/// dbd's, not the author's, and stays out of the file.
+#[tokio::test]
+async fn reverse_engineering_keeps_a_views_and_a_matviews_own_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.t (id int primary key); \
+             CREATE VIEW app.v AS SELECT id FROM app.t; \
+             COMMENT ON VIEW app.v IS 'the view''s comment'; \
+             CREATE MATERIALIZED VIEW app.mv AS SELECT id FROM app.t; \
+             COMMENT ON MATERIALIZED VIEW app.mv IS 'the matview'; \
+             CREATE MATERIALIZED VIEW app.stamped AS SELECT id FROM app.t; \
+             COMMENT ON MATERIALIZED VIEW app.stamped IS 'dbd:hash=v2:abc123';",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let emitted = |name: &str| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} introspected"));
+        dbd_core::emit::emit_entity(e).unwrap_or_default()
+    };
+
+    let v = emitted("app.v");
+    assert!(
+        v.contains(r#"COMMENT ON VIEW "app"."v" IS 'the view''s comment';"#),
+        "{v}"
+    );
+    let mv = emitted("app.mv");
+    assert!(
+        mv.contains(r#"COMMENT ON MATERIALIZED VIEW "app"."mv" IS 'the matview';"#),
+        "{mv}"
+    );
+    let stamped = emitted("app.stamped");
+    assert!(
+        !stamped.contains("COMMENT ON"),
+        "a legacy stamp is not the author's comment: {stamped}"
+    );
 }
 
 // ── Test 6: Postgres introspection ───────────────────────────────────────────
@@ -3577,7 +3954,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     )
     .unwrap();
     // A view over the enum column: this is what blocks `ALTER … TYPE` and has to
-    // be dropped first, then restored by pass C.
+    // be dropped first, then restored when reconcile re-applies its views.
     std::fs::write(
         dir.join("ddl/view/app/t_v.ddl"),
         "set search_path to app;\n\
@@ -3629,7 +4006,7 @@ async fn reconcile_removes_an_enum_value_by_recreating_the_type() {
     .await;
 
     // The rows survive the rewrite, the default survives the drop/restore, and
-    // the view pass C re-applied is queryable again.
+    // the view reconcile re-applied is queryable again.
     assert_catalog(
         &*adapter,
         true,
@@ -4374,4 +4751,476 @@ async fn reconcile_without_a_version_records_none_applied() {
         .reset(&*adapter, "postgres", false, false, false, None)
         .await
         .expect("a dev reset of an unversioned project is allowed");
+}
+
+/// A database a dbd before 0.25 stamped keeps its drift tracking on upgrade.
+/// That dbd kept the `dbd:hash` stamp in the matview's comment; 0.25 reads the
+/// comment only while no stamp row exists, and the first apply re-ran the
+/// file's own `COMMENT ON`, erasing the old stamp before anything recorded it.
+/// Every reconcile afterwards warned "not stamped by dbd".
+#[tokio::test]
+async fn an_upgraded_database_keeps_its_matview_drift_stamp() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_upgrade").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/materialized_view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: mv_upgrade\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/items.ddl"),
+        "set search_path to app;\ncreate table if not exists items (id int primary key, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/materialized_view/app/mv.ddl"),
+        "create materialized view if not exists app.mv as select id from app.items with data;\n\
+         comment on materialized view app.mv is 'Revenue per day';\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    load()
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("first apply");
+
+    // Put the database back the way 0.24 left it: the stamp in the comment,
+    // no stamp row.
+    adapter
+        .execute_script(
+            "DO $$ DECLARE s text; BEGIN \
+               SELECT stamp INTO s FROM dbd.matview_stamps WHERE matview = 'app.mv'; \
+               EXECUTE format('COMMENT ON MATERIALIZED VIEW app.mv IS %L', s); \
+               DELETE FROM dbd.matview_stamps; END $$;",
+        )
+        .await
+        .expect("simulate a 0.24 stamp");
+
+    load()
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply with 0.25");
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("app.mv")),
+        "the upgraded view is still tracked: {:?}",
+        plan.warnings
+    );
+}
+
+// ── Reconcile creates in the dependency order apply uses ──────────────────────
+
+/// Write `files` (path relative to `dir`, SQL) under a fresh project at `dir`
+/// whose `design.yaml` is `yaml`, and load it.
+fn write_project(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)]) -> Design {
+    std::fs::write(dir.join("design.yaml"), yaml).unwrap();
+    for (rel, sql) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, sql).unwrap();
+    }
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// Reconcile ran every table create before any function, so
+/// on a fresh database a table whose default calls a project function failed
+/// with `function core.default_tier() does not exist`, and a trigger declared in
+/// a table file failed on its trigger function — leaving the tables created
+/// before it behind. `apply` has always created both in dependency order; the
+/// entity refs record the default's call and the trigger's function, so the
+/// order is there to follow.
+///
+/// The second phase is the same mistake on the ALTER path: a column added to an
+/// existing table with a default calling a function that is new in this run.
+#[tokio::test]
+async fn reconcile_creates_functions_before_the_tables_whose_defaults_and_triggers_call_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fn_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: fn_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - core\n";
+    let default_tier = (
+        "ddl/function/core/default_tier.ddl",
+        "create or replace function core.default_tier() returns text\n\
+         language sql immutable as $$ select 'basic'::text $$;\n",
+    );
+    let touch = (
+        "ddl/function/core/touch.ddl",
+        "create or replace function core.touch() returns trigger\n\
+         language plpgsql as $$ begin new.touched_at := now(); return new; end $$;\n",
+    );
+    let accounts = (
+        "ddl/table/core/accounts.ddl",
+        "create table if not exists core.accounts (\n\
+           id   integer primary key\n\
+         , tier text    not null default core.default_tier()\n\
+         );\n",
+    );
+    let events = (
+        "ddl/table/core/events.ddl",
+        "create table if not exists core.events (\n\
+           id         integer primary key\n\
+         , touched_at timestamptz\n\
+         );\n\
+         create or replace trigger events_touch before insert or update on core.events\n\
+           for each row execute function core.touch();\n",
+    );
+
+    // ── Phase 1: a fresh database ──
+    let design = write_project(dir, yaml, &[default_tier, touch, accounts, events]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile on a fresh database must create the functions before the tables that call them");
+    adapter
+        .execute_script("INSERT INTO core.accounts (id) VALUES (1); INSERT INTO core.events (id) VALUES (1);")
+        .await
+        .expect("insert");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND tier = 'basic'",
+        "the default the function supplies",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.events WHERE id = 1 AND touched_at IS NOT NULL",
+        "touched_at set by the trigger",
+    )
+    .await;
+
+    // ── Phase 2: a new column on an existing table, defaulting to a new function ──
+    let design = write_project(
+        dir,
+        yaml,
+        &[
+            (
+                "ddl/function/core/default_region.ddl",
+                "create or replace function core.default_region() returns text\n\
+                 language sql immutable as $$ select 'eu'::text $$;\n",
+            ),
+            (
+                "ddl/table/core/accounts.ddl",
+                "create table if not exists core.accounts (\n\
+                   id     integer primary key\n\
+                 , tier   text    not null default core.default_tier()\n\
+                 , region text    not null default core.default_region()\n\
+                 );\n",
+            ),
+        ],
+    );
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the ALTER adding the column must run after the function its default calls");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM core.accounts WHERE id = 1 AND region = 'eu'",
+        "the new column default on the existing row",
+    )
+    .await;
+}
+
+// ── Enum value removal: only views are dropped ────────────────────────────────
+
+/// Removing an enum value recreates the type, and every view over a column of
+/// it has to go first. Every *entity* that transitively referenced the enum's
+/// table was emitted as `DROP VIEW`: the table with a foreign key to it, and the
+/// procedure and function whose bodies read it. The run failed with
+/// `"order_notes" is not a view`, so the value could not be removed from any
+/// enum whose table anything else referenced.
+///
+/// End to end: the tables keep their rows, the routines are not dropped, and
+/// the views — one over the column, one over that view — come back.
+#[tokio::test]
+async fn removing_an_enum_value_drops_only_the_views_over_its_column() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_dependents_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml =
+        "project:\n  name: enum_dependents_test\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let enum_file = |values: &str| {
+        (
+            "ddl/enum/app/order_status.ddl",
+            format!("set search_path to app;\ncreate type order_status as enum ({values});\n"),
+        )
+    };
+    let rest: Vec<(&str, &str)> = vec![
+        (
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists orders (\n\
+               id     integer primary key\n\
+             , status order_status not null default 'new'\n\
+             );\n",
+        ),
+        (
+            "ddl/table/app/order_notes.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_notes (\n\
+               id       integer primary key\n\
+             , order_id integer not null references orders (id)\n\
+             , note     text\n\
+             );\n",
+        ),
+        (
+            "ddl/view/app/open_orders.ddl",
+            "set search_path to app;\n\
+             create or replace view open_orders as select id, status from orders where status <> 'void';\n",
+        ),
+        (
+            "ddl/view/app/open_order_ids.ddl",
+            "set search_path to app;\n\
+             create or replace view open_order_ids as select id from open_orders;\n",
+        ),
+        (
+            "ddl/procedure/app/void_order.ddl",
+            "set search_path to app;\n\
+             create or replace procedure void_order(p_id integer)\n\
+             language plpgsql as $$\n\
+             begin\n\
+               update orders set status = 'void' where id = p_id;\n\
+             end $$;\n",
+        ),
+        (
+            "ddl/function/app/order_count.ddl",
+            "set search_path to app;\n\
+             create or replace function order_count() returns bigint\n\
+             language sql stable as $$ select count(*) from orders $$;\n",
+        ),
+    ];
+    let load = |values: &str| {
+        let (path, sql) = enum_file(values);
+        let mut files = rest.clone();
+        files.push((path, sql.as_str()));
+        write_project(dir, yaml, &files)
+    };
+
+    // ── Phase 1: build it, with rows in both tables ──
+    load("'new', 'paid', 'void'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile phase 1 failed");
+    adapter
+        .execute_script(
+            "INSERT INTO app.orders (id, status) VALUES (1, 'new'), (2, 'void'); \
+             INSERT INTO app.order_notes (id, order_id, note) VALUES (1, 1, 'keep me');",
+        )
+        .await
+        .expect("seed rows failed");
+
+    // ── Phase 2: remove the unused value ──
+    load("'new', 'void'")
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("removing an enum value must not drop the tables and routines that reference its table");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.order_status)::text) = '{new,void}'",
+        "enum app.order_status without paid",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.order_notes WHERE id = 1 AND note = 'keep me'",
+        "the row in app.order_notes",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.orders WHERE id = 2 AND status = 'void'",
+        "the rows in app.orders",
+    )
+    .await;
+    for routine in ["void_order", "order_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = 'app' AND p.proname = '{routine}'"
+            ),
+            &format!("routine app.{routine}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.open_order_ids WHERE id = 1",
+        "the views, recreated over the new type",
+    )
+    .await;
+    // The body names `orders` bare, as its file's `set search_path to app`
+    // allows, so it resolves on the caller's path. Set here, in the same script
+    // and so on the same connection: a pooled one may carry any earlier path.
+    adapter
+        .execute_script("SET search_path TO app; CALL app.void_order(1)")
+        .await
+        .expect("the procedure still runs against the recreated type");
+}
+
+// ── Reset with schema grants ──────────────────────────────────────────────────
+
+/// A design whose roles hold schema grants: one through `schemas:`, one through
+/// the target's `grants:`.
+const GRANTS_YAML: &str = "project:\n  name: grants_reset_test\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+    target:\n  postgres:\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+    \x20   grants:\n      app:\n        app_reader: [usage, select]\n";
+
+const GRANTS_TABLE: (&str, &str) = (
+    "ddl/table/app/t.ddl",
+    "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+);
+
+fn role_predicate(role: &str) -> String {
+    format!("SELECT 1 FROM pg_roles WHERE rolname = '{role}'")
+}
+
+/// The default `dbd reset` of any design with schema grants failed: it dropped
+/// the tables and then ran `DROP ROLE` on roles that still held USAGE on the
+/// surviving schema and the default privileges dbd set there, so Postgres
+/// refused and the whole reset rolled back. Only `--clean`, which drops the
+/// schema and its grants with it, worked.
+#[tokio::test]
+async fn the_default_reset_drops_roles_that_hold_the_designs_schema_grants() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "the default privileges deploy set on app",
+    )
+    .await;
+
+    design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect("the default reset must drop roles that hold the design's grants");
+
+    assert_table_absent(&*adapter, "app", "t").await;
+    assert_schema_exists(&*adapter, "app").await;
+    for role in ["app_writer", "app_reader"] {
+        assert_catalog(&*adapter, false, &role_predicate(role), &format!("role {role}")).await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'app'",
+        "default privileges on app",
+    )
+    .await;
+
+    // The database is back to where apply starts from.
+    design
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("re-deploy after reset");
+    assert_table_exists(&*adapter, "app", "t").await;
+}
+
+/// Reset revokes only what dbd granted. A privilege someone else gave one of
+/// the design's roles still blocks `DROP ROLE` — dbd must not guess at it, nor
+/// reach for `DROP OWNED BY`, which would drop objects the project does not
+/// own — but the error has to say which role and what it still holds, where
+/// Postgres's own message names the role and leaves the reason in a DETAIL the
+/// driver does not show. And the reset is one transaction: nothing is dropped.
+#[tokio::test]
+async fn a_role_holding_a_privilege_dbd_did_not_grant_fails_the_reset_naming_the_role_and_privilege() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "grants_reset_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), GRANTS_YAML, &[GRANTS_TABLE]);
+
+    design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA other; CREATE TABLE other.x (id integer); GRANT SELECT ON other.x TO app_writer;",
+        )
+        .await
+        .expect("grant outside the design");
+
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, None)
+        .await
+        .expect_err("a privilege dbd did not grant must still block the role drop")
+        .to_string();
+    assert!(err.contains("app_writer"), "the error must name the role: {err}");
+    assert!(
+        err.contains("privileges for table other.x"),
+        "the error must say what the role still holds: {err}"
+    );
+
+    assert_table_exists(&*adapter, "app", "t").await;
+    assert_catalog(&*adapter, true, &role_predicate("app_writer"), "role app_writer").await;
+}
+
+// ── Reset forgets the stamps of the matviews it drops ─────────────────────────
+
+/// `reset --clean` dropped the materialized view and left its row in
+/// `dbd.matview_stamps`. A stamp outliving its view describes something that no
+/// longer exists — and a later view of the same name, built by hand, would read
+/// as one dbd created. Both resets that drop the view must forget its stamp:
+/// the default one, which drops it by name, and `--clean`, which drops its
+/// schema.
+#[tokio::test]
+async fn reset_forgets_the_drift_stamp_of_every_materialized_view_it_drops() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "mv_stamp_reset").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: mv_stamp_reset\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/materialized_view/app/mv.ddl",
+                "create materialized view if not exists app.mv as select id from app.items with data;\n",
+            ),
+        ],
+    );
+    let stamp = "SELECT 1 FROM dbd.matview_stamps WHERE project = 'mv_stamp_reset' AND matview = 'app.mv'";
+
+    for (drop_schemas, drop_extensions, label) in [(false, false, "the default reset"), (true, true, "reset --clean")] {
+        design.deploy(&*adapter, false, None, |_| {}).await.expect("deploy");
+        assert_catalog(&*adapter, true, stamp, "the stamp deploy recorded for app.mv").await;
+
+        design
+            .reset(&*adapter, "postgres", false, drop_schemas, drop_extensions, None)
+            .await
+            .unwrap_or_else(|e| panic!("{label} failed: {e}"));
+
+        assert_catalog(
+            &*adapter,
+            false,
+            "SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = 'mv'",
+            "matview app.mv",
+        )
+        .await;
+        assert_catalog(&*adapter, false, stamp, &format!("the app.mv stamp after {label}")).await;
+    }
 }

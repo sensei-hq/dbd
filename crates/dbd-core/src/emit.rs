@@ -214,9 +214,12 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
             }
             s
         }
-        TableConstraint::Check { expression, .. } => {
-            format!("  CHECK ({expression})")
-        }
+        // The name is the constraint's identity to anything that catches its
+        // violation; dropped, a fresh apply names it `<table>_<col>_check`.
+        TableConstraint::Check { name, expression } => match name {
+            Some(name) => format!("  CONSTRAINT {} CHECK ({expression})", q(name)),
+            None => format!("  CHECK ({expression})"),
+        },
     }
 }
 
@@ -345,7 +348,12 @@ pub fn emit_view(entity: &Entity) -> String {
     let name = bare(&entity.name);
     let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
-    format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
+    let qname = format!("{}.{}", q(schema), q(name));
+    let mut out = format!("CREATE VIEW {qname} AS {body};");
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
+    }
+    out
 }
 
 /// `CREATE MATERIALIZED VIEW IF NOT EXISTS "schema"."name" AS <definition> WITH DATA;`
@@ -372,6 +380,12 @@ pub fn emit_matview(entity: &Entity) -> String {
             out.push('\n');
             out.push_str(&emit_index_sql(ix, &qname, name, true));
         }
+    }
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!(
+            "\nCOMMENT ON MATERIALIZED VIEW {qname} IS '{}';",
+            esc(comment)
+        ));
     }
     out
 }
@@ -674,6 +688,29 @@ mod tests {
         let mut p = Entity::new(EntityType::Procedure, "app.p");
         p.body = vec!["CREATE OR REPLACE PROCEDURE app.p() LANGUAGE sql AS $$ select 1 $$".into()];
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
+    }
+
+    /// A CHECK keeps the name it was given. Written unnamed, `init --from-dbml`
+    /// and `init --from-db` rebuilt `qty_positive` as Postgres's own
+    /// `t_qty_check` — a different constraint to anything that names it.
+    #[test]
+    fn a_named_check_round_trips_with_its_name() {
+        let ddl = "create table app.t (\n  qty int constraint qty_positive check (qty > 0),\n  code text check (length(code) < 10)\n);";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+
+        let reparsed = crate::parser::parse_entity(path, &emit_table(&entity)).unwrap();
+        let checks: Vec<Option<String>> = reparsed
+            .table_def
+            .unwrap()
+            .constraints
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::entity::TableConstraint::Check { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, [Some("qty_positive".to_string()), None]);
     }
 
     #[test]

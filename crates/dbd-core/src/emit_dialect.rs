@@ -27,7 +27,9 @@
 //! Every target has FOREIGN KEY, CHECK, CREATE INDEX and stored generated
 //! columns, so they are carried. A CHECK expression, a generated column's
 //! expression or an index predicate is PostgreSQL SQL that dbd does not
-//! translate, so it goes across verbatim and is reported, like a view body. An
+//! translate, so it goes across verbatim and is reported, like a view body —
+//! except a CHECK and a view body on SQLite, which are written again from the
+//! parse tree or left out (next section). An
 //! index the target would reject outright — an expression key on SQL Server, a
 //! key on an unbounded text column on MySQL or SQL Server — is left out and
 //! reported, so the script still applies. So is a foreign key to a table the
@@ -37,6 +39,19 @@
 //! is not left out: MySQL and SQL Server refuse it as it is, and dropping it
 //! would lose the key and every foreign key that points at it. The column is
 //! bounded instead (VARCHAR(255), nvarchar(450)) and the bound is reported.
+//!
+//! # View bodies and CHECKs on SQLite
+//!
+//! Copied verbatim, they failed the script: a view naming `core.cities` (the
+//! table is `core_cities` there), a CHECK using `POSITION(… IN …)` or `~`. So on
+//! SQLite each is written again from libpg_query's tree — table names resolved
+//! the way the file's `search_path` resolves them and flattened, functions and
+//! operators mapped — or, at the first construct SQLite has no form for, left
+//! out and reported, so the script applies. A view reading a table the script
+//! does not create (an `external:` one, one outside the scope, a view left out)
+//! is left out the same way. What is written is still reported: the SQL is
+//! SQLite's, and so are its semantics. `emit_dialect/sqlite.rs` says why both,
+//! and not one or the other.
 //!
 //! # Materialized views
 //!
@@ -86,8 +101,18 @@
 //! Functions, procedures and triggers. Their bodies are PL/pgSQL or SQL that
 //! does not translate, and dbd holds them as opaque text — emitting them would
 //! produce something that looks convertible and is not. They are reported as
-//! skipped so the omission is visible. So is anything whose file does not
-//! parse: there is no structure to translate, and the schema is missing it.
+//! skipped so the omission is visible — a trigger written beside its table too,
+//! which the model keeps only as an edge and is read back from the file. So is
+//! anything whose file does not parse: there is no structure to translate, and
+//! the schema is missing it.
+//!
+//! Extensions, roles, grants and RLS policies are not emitted either: none of
+//! the three loads PostgreSQL extensions, SQLite has no roles, permissions or
+//! row-level security at all, and the others model them differently enough
+//! that a translation would look right and grant the wrong thing. Each is
+//! reported — one entry per extension and role, per schema's grants, and per
+//! policy file — narrowed to the scope like everything else, so a script whose
+//! security rested on a policy does not read as complete.
 
 use crate::entity::{
     ColumnDef, Entity, EntityType, FkAction, ForeignKey, IdentityKind, IndexDef, IndexType, SortOrder, TableConstraint,
@@ -96,6 +121,8 @@ use crate::entity::{
 use crate::error::{DbdError, Result};
 use crate::parser::Dialect;
 use std::collections::HashSet;
+
+mod sqlite;
 
 /// One thing the target could not express faithfully.
 ///
@@ -248,14 +275,34 @@ pub fn emit_schema(
             .filter(|e| e.entity_type == EntityType::External)
             .map(|e| e.name.clone())
             .collect(),
+        relations: design
+            .entities()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.entity_type,
+                    EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::External
+                )
+            })
+            .map(|e| e.name.clone())
+            .collect(),
         sequences: entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Sequence && e.errors.is_empty())
             .map(|e| e.name.clone())
             .collect(),
+        enums: design
+            .entities()
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Enum)
+            .map(|e| e.name.clone())
+            .collect(),
     };
     let mut out: Vec<String> = Vec::new();
     let mut report = Vec::new();
+    // Every view the script has created so far — in dependency order, so a
+    // view reading one left out finds it missing.
+    let mut views: HashSet<String> = HashSet::new();
 
     // SQL Server keeps the schema in every name it is given (`[app].[orders]`),
     // and a schema that does not exist fails the first statement that names
@@ -308,9 +355,10 @@ pub fn emit_schema(
                 out.push(emit_table(e, &script, &mut report));
                 out.extend(emit_indexes(e, &script, &mut report));
                 out.extend(descriptions(e, target));
+                out.extend(skipped_triggers(e, target, &mut report));
             }
             EntityType::View | EntityType::MaterializedView => {
-                if let Some(sql) = emit_view(e, target, &mut report) {
+                if let Some(sql) = emit_view(e, &script, &mut views, &mut report) {
                     out.push(sql);
                     out.extend(descriptions(e, target));
                 }
@@ -321,24 +369,200 @@ pub fn emit_schema(
                 }
             }
             EntityType::Function | EntityType::Procedure | EntityType::Trigger => {
-                report.push(Downgrade {
+                // Noted in the file as well as listed: a reader of the script
+                // alone otherwise has no sign the routine ever existed.
+                let d = Downgrade {
                     entity: e.name.clone(),
                     column: None,
                     from: format!("a {}", e.entity_type.tag()),
                     to: "nothing".to_string(),
-                    reason: "its body is PL/pgSQL or SQL that does not translate, and dbd holds \
-                             it as opaque text — emitting it would look convertible and not be"
-                        .to_string(),
-                });
+                    reason: UNTRANSLATED_ROUTINE.to_string(),
+                };
+                out.push(d.comment(target));
+                report.push(d);
             }
-            // Schemas, extensions, enums and roles are handled where they are
-            // used (a column's type) or have no target equivalent worth a
-            // standalone statement.
+            EntityType::Extension | EntityType::Role => {
+                let d = not_carried(e, target);
+                out.push(d.comment(target));
+                report.push(d);
+            }
+            // A schema becomes `CREATE SCHEMA` on SQL Server and part of every
+            // name elsewhere (reported at each table); an enum becomes its
+            // columns' type. Neither is a statement of its own.
             _ => {}
         }
     }
 
+    // Last, where they would apply: after every object they name.
+    for d in grants_not_carried(design, scope, target)?
+        .into_iter()
+        .chain(policies_not_carried(design, scope, target)?)
+    {
+        out.push(d.comment(target));
+        report.push(d);
+    }
+
     Ok((join_script(&header, &out, target), report))
+}
+
+/// An extension or a role, which the script does not create.
+///
+/// Neither was mentioned anywhere — not in the file, not in the report — so a
+/// schema that needed `pgcrypto`, or a login its grants were written for, came
+/// out looking complete.
+fn not_carried(e: &Entity, target: Target) -> Downgrade {
+    let label = target.label();
+    let (from, reason) = match (e.entity_type, target) {
+        (EntityType::Extension, _) => (
+            "a PostgreSQL extension",
+            format!(
+                "{label} cannot load PostgreSQL extensions — whatever the schema took from it (a \
+                 function, a type, an operator) has to be replaced by hand"
+            ),
+        ),
+        (_, Target::Sqlite) => (
+            "a role",
+            "SQLite has no roles or permissions — anything that can open the file can read and \
+             write all of it"
+                .to_string(),
+        ),
+        (_, Target::MySql | Target::TSql) => (
+            "a role",
+            format!(
+                "a PostgreSQL role is a login and a group at once, with attributes {label} models \
+                 differently, so dbd does not translate it — create it by hand"
+            ),
+        ),
+    };
+    Downgrade {
+        entity: e.name.clone(),
+        column: None,
+        from: from.to_string(),
+        to: "nothing".to_string(),
+        reason,
+    }
+}
+
+/// One entry per schema whose grants a run under `scope` would apply — the
+/// same set `dbd apply` grants ([`crate::Design::declared_grants`]).
+fn grants_not_carried(
+    design: &crate::Design,
+    scope: Option<&crate::scope::ResolvedScope>,
+    target: Target,
+) -> Result<Vec<Downgrade>> {
+    let mut grants: Vec<(String, std::collections::HashMap<String, Vec<String>>)> =
+        design.declared_grants(scope)?.into_iter().collect();
+    grants.sort_by(|a, b| a.0.cmp(&b.0));
+    let reason = match target {
+        Target::Sqlite => {
+            "SQLite has no permissions — anything that can open the file can read and write all of it".to_string()
+        }
+        Target::MySql | Target::TSql => format!(
+            "dbd does not translate grants, and the roles they name are not emitted either — on {}, \
+             grant the same access by hand once the roles exist",
+            target.label()
+        ),
+    };
+    Ok(grants
+        .into_iter()
+        .map(|(schema, roles)| {
+            let mut roles: Vec<(String, Vec<String>)> = roles.into_iter().collect();
+            roles.sort();
+            let held: Vec<String> = roles
+                .iter()
+                .map(|(role, privileges)| format!("{role}: {}", privileges.join(", ")))
+                .collect();
+            Downgrade {
+                from: format!("grants on schema `{schema}` ({})", held.join("; ")),
+                entity: schema,
+                column: None,
+                to: "nothing".to_string(),
+                reason: reason.clone(),
+            }
+        })
+        .collect())
+}
+
+/// One entry per RLS policy file a run under `scope` would apply — the same
+/// filter `dbd policies` runs ([`crate::design::plan_policies`]).
+///
+/// A policy is what decides which rows a reader may see. Dropping one without
+/// a word left a script that applies cleanly and shows every row to anyone.
+fn policies_not_carried(
+    design: &crate::Design,
+    scope: Option<&crate::scope::ResolvedScope>,
+    target: Target,
+) -> Result<Vec<Downgrade>> {
+    let project_dir = design.project_dir();
+    let working_set = match scope.filter(|s| !s.is_all) {
+        Some(s) => Some((s.name.as_str(), design.working_set(s)?)),
+        None => None,
+    };
+    let plan = crate::design::plan_policies(project_dir, working_set.as_ref().map(|(n, ws)| (*n, ws)))?;
+    let reason = match target {
+        Target::MySql | Target::Sqlite => format!(
+            "{} has no row-level security, so every row is visible to anyone who can read the table",
+            target.label()
+        ),
+        Target::TSql => "SQL Server's row-level security is a security policy over an inline function, not \
+                         something these statements translate to — until one is written, every row is visible \
+                         to anyone who can read the table"
+            .to_string(),
+    };
+    Ok(plan
+        .applied
+        .iter()
+        .map(|file| {
+            let shown = file.strip_prefix(project_dir).unwrap_or(file).display().to_string();
+            Downgrade {
+                // A file outside the `policies/<schema>/<table>.sql` layout
+                // names no table; the file is then the only identity it has.
+                entity: crate::design::policy_target(file, project_dir).unwrap_or_else(|| shown.clone()),
+                column: None,
+                from: format!("the row-level security policies in `{shown}`"),
+                to: "nothing".to_string(),
+                reason: reason.clone(),
+            }
+        })
+        .collect())
+}
+
+/// Why a routine — and a trigger, which only fires one — is not emitted.
+///
+/// One sentence for all of them: a trigger is skipped because of what it runs,
+/// and two entries saying the same thing in different words make a reader
+/// wonder whether they follow different rules.
+const UNTRANSLATED_ROUTINE: &str = "its body is PL/pgSQL or SQL that does not translate, and dbd holds it as \
+                                    opaque text — emitting it would look convertible and not be";
+
+/// The triggers declared in `e`'s table file, each reported as skipped and
+/// noted where the table is.
+///
+/// A trigger beside its table is not an entity of its own — the model keeps it
+/// only as an edge to the routine it fires — so leaving it out reported
+/// nothing at all. It is read back from the file, as a sequence's options are.
+fn skipped_triggers(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Vec<String> {
+    let names = e
+        .file
+        .as_deref()
+        .and_then(|f| crate::source_text::read_to_string(f).ok())
+        .map(|sql| crate::parser::pg::tables::trigger_names(&sql))
+        .unwrap_or_default();
+    names
+        .into_iter()
+        .map(|name| {
+            let d = Downgrade {
+                entity: e.name.clone(),
+                column: None,
+                from: format!("the trigger `{name}`"),
+                to: "nothing".to_string(),
+                reason: UNTRANSLATED_ROUTINE.to_string(),
+            };
+            let note = d.comment(target);
+            report.push(d);
+            note
+        })
+        .collect()
 }
 
 /// What the script as a whole holds. A statement naming something outside it —
@@ -349,9 +573,57 @@ struct Script {
     tables: HashSet<String>,
     /// `schema.name` of every table the design declares `external:`.
     externals: HashSet<String>,
+    /// `schema.name` of every table, view, materialized view and external
+    /// table in the whole design — what a bare name in a view body can
+    /// resolve to, whether or not the script creates it.
+    relations: HashSet<String>,
     /// `schema.name` of every sequence in the emitted set. Only SQL Server
     /// creates them; a default drawing from one outside it cannot apply.
     sequences: HashSet<String>,
+    /// `schema.name` of every enum the design declares — the whole design,
+    /// since a column's type is what it is whatever the scope keeps.
+    enums: HashSet<String>,
+}
+
+impl Script {
+    /// Whether the type a column names is one of this project's enums. A bare
+    /// name matches an enum of that name in any schema: the column's file may
+    /// have reached it through its `search_path`.
+    fn is_enum(&self, ty: &str) -> bool {
+        self.enums.contains(ty) || (!ty.contains('.') && self.enums.iter().any(|n| n.rsplit('.').next() == Some(ty)))
+    }
+
+    /// What a table name in `e`'s body is in the script: `schema.name` as
+    /// written, or a bare `name` found the way PostgreSQL finds it — the first
+    /// schema on the file's `search_path` that has one, then `public`, which
+    /// dbd puts on every applied path. `views` is every view created so far.
+    fn relation(&self, e: &Entity, schema: Option<&str>, name: &str, views: &HashSet<String>) -> sqlite::Relation {
+        let found = match schema {
+            Some(s) => format!("{s}.{name}"),
+            None => e
+                .schema_path
+                .schemas()
+                .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
+                .map(|s| format!("{s}.{name}"))
+                .find(|q| self.relations.contains(q))
+                .unwrap_or_else(|| name.to_string()),
+        };
+        if self.tables.contains(&found) || views.contains(&found) {
+            let (schema, bare) = match found.split_once('.') {
+                Some((s, b)) => (Some(s), b),
+                None => (None, found.as_str()),
+            };
+            return sqlite::Relation::Created(qualified(schema, bare, self.target));
+        }
+        let why = if self.externals.contains(&found) {
+            "it is declared `external:`, someone else's to create"
+        } else if self.relations.contains(&found) {
+            "it is outside the scope, or was itself left out"
+        } else {
+            "nothing in the project declares it"
+        };
+        sqlite::Relation::Missing(format!("it reads `{found}`, which the script does not create — {why}"))
+    }
 }
 
 /// Whether `e` becomes an object in the target — and so needs its schema to
@@ -441,7 +713,7 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     let mut lines: Vec<String> = Vec::new();
     for c in &td.columns {
         let before = report.len();
-        let mut ty = map_type(&c.data_type, target, e, c, report);
+        let mut ty = map_type(&c.data_type, script, e, c, report);
         if bounded.contains(&c.name) {
             let to = key_bound(&c.data_type, target);
             report.push(Downgrade {
@@ -567,10 +839,50 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         }
     }
 
-    // CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd
-    // does not translate — so it goes across verbatim and is reported.
+    // CHECK exists everywhere, but its expression is PostgreSQL SQL. SQLite
+    // gets it written again from the parse tree, or not at all — a CHECK it
+    // cannot parse fails the CREATE TABLE and takes the table with it (see
+    // [`sqlite`]). The others get it verbatim, and reported.
     for con in &td.constraints {
         if let TableConstraint::Check { name, expression } = con {
+            let named = name
+                .as_ref()
+                .map(|n| format!("CONSTRAINT {} ", target.quote(n)))
+                .unwrap_or_default();
+            if target == Target::Sqlite {
+                let from = format!("a CHECK expression in PostgreSQL SQL (`{expression}`)");
+                let (d, check) = match sqlite::check(expression) {
+                    Ok(sql) => (
+                        Downgrade {
+                            entity: e.name.clone(),
+                            column: None,
+                            from,
+                            to: "the same check in SQLite's SQL".to_string(),
+                            reason: SQLITE_REWRITTEN.to_string(),
+                        },
+                        Some(sql),
+                    ),
+                    Err(sqlite::NoForm(why)) => (
+                        Downgrade {
+                            entity: e.name.clone(),
+                            column: None,
+                            from,
+                            to: "no CHECK".to_string(),
+                            reason: format!(
+                                "{why} — so the CHECK is left out and the table is still created; rows it \
+                                 refused are now accepted"
+                            ),
+                        },
+                        None,
+                    ),
+                };
+                lines.push(format!("  {}", d.comment(target)));
+                report.push(d);
+                if let Some(sql) = check {
+                    lines.push(format!("  {named}CHECK ({sql}),"));
+                }
+                continue;
+            }
             let d = Downgrade {
                 entity: e.name.clone(),
                 column: None,
@@ -582,10 +894,6 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
             };
             lines.push(format!("  {}", d.comment(target)));
             report.push(d);
-            let named = name
-                .as_ref()
-                .map(|n| format!("CONSTRAINT {} ", target.quote(n)))
-                .unwrap_or_default();
             lines.push(format!("  {named}CHECK ({expression}),"));
         }
     }
@@ -1262,7 +1570,14 @@ fn emit_index(
     Some(out.join("\n"))
 }
 
-fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<String> {
+/// A view — or a materialized view, as the plain view that is the nearest
+/// thing — with `views` gaining it once it is created.
+///
+/// On SQLite the body is written again from the parse tree, or the view is
+/// left out; see [`sqlite`] for why that and not a copy. Elsewhere it goes
+/// across as written, and is reported.
+fn emit_view(e: &Entity, script: &Script, views: &mut HashSet<String>, report: &mut Vec<Downgrade>) -> Option<String> {
+    let target = script.target;
     let lost = |from: String, to: &str, reason: String| Downgrade {
         entity: e.name.clone(),
         column: None,
@@ -1270,7 +1585,7 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
         to: to.to_string(),
         reason,
     };
-    let Some(body) = e.body.first() else {
+    let Some(written) = e.body.first() else {
         let d = lost(
             format!("a {} whose body dbd could not read", e.entity_type.tag()),
             "nothing",
@@ -1279,6 +1594,26 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
         let note = d.comment(target);
         report.push(d);
         return Some(note);
+    };
+    let body = match target {
+        Target::Sqlite => match sqlite::query(written, &|schema, name| script.relation(e, schema, name, views)) {
+            Ok(body) => body,
+            Err(sqlite::NoForm(why)) => {
+                let kind = match e.entity_type {
+                    EntityType::MaterializedView => "a materialized view",
+                    _ => "a view",
+                };
+                let d = lost(
+                    kind.to_string(),
+                    "nothing",
+                    format!("{why} — so it is left out and the script applies; anything that reads it is left out too"),
+                );
+                let note = d.comment(target);
+                report.push(d);
+                return Some(note);
+            }
+        },
+        Target::MySql | Target::TSql => written.clone(),
     };
     let name = table_name(e, target, report);
     let before = report.len();
@@ -1326,17 +1661,32 @@ fn emit_view(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> Option<
     {
         report.push(comment_lost(e, None, text, target));
     }
-    report.push(lost(
-        "a view body in PostgreSQL SQL".to_string(),
-        "the same text, untranslated",
-        "dbd translates types and structure, not expressions — anything PostgreSQL-specific inside \
-         the SELECT has to be checked by hand"
-            .to_string(),
-    ));
+    report.push(match target {
+        Target::Sqlite => lost(
+            "a view body in PostgreSQL SQL".to_string(),
+            "the same query in SQLite's SQL",
+            SQLITE_REWRITTEN.to_string(),
+        ),
+        Target::MySql | Target::TSql => lost(
+            "a view body in PostgreSQL SQL".to_string(),
+            "the same text, untranslated",
+            "dbd translates types and structure, not expressions — anything PostgreSQL-specific inside \
+             the SELECT has to be checked by hand"
+                .to_string(),
+        ),
+    });
     let mut out: Vec<String> = report[before..].iter().map(|d| d.comment(target)).collect();
     out.push(format!("CREATE VIEW {name} AS {body};"));
+    views.insert(e.name.clone());
     Some(out.join("\n"))
 }
+
+/// Why a view body or CHECK written again in SQLite's SQL is still reported:
+/// the text is SQLite's, and the engine under it is not PostgreSQL.
+const SQLITE_REWRITTEN: &str = "dbd wrote it again from PostgreSQL's parse tree — table names flattened, \
+     functions and operators mapped to SQLite's own — but the engines differ even where the SQL reads the \
+     same: LIKE ignores ASCII case, upper() and lower() change ASCII letters only, and values compare by \
+     column affinity — so the results are worth checking by hand";
 
 /// A sequence: `CREATE SEQUENCE` on SQL Server; everywhere else, a note where
 /// it would have been, and a report entry.
@@ -1427,7 +1777,9 @@ fn quote_all(columns: &[String], target: Target) -> String {
 }
 
 /// PostgreSQL's type as the target's, recording the loss when there is one.
-fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Vec<Downgrade>) -> String {
+fn map_type(pg: &str, script: &Script, e: &Entity, c: &ColumnDef, report: &mut Vec<Downgrade>) -> String {
+    let target = script.target;
+    let label = target.label();
     let t = pg.trim().to_lowercase();
     let mut lose = |to: &str, reason: &str| {
         report.push(Downgrade {
@@ -1452,9 +1804,21 @@ fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Ve
         );
     }
 
+    // PostgreSQL writes a zone after any precision — `time (3) with time zone`
+    // — so the zone is read off the end before the type is cut at its
+    // parenthesis. Cut first, it was a plain `time` or `timestamp`, and SQL
+    // Server got a `datetime2` with no offset.
+    let (t, zoned) = match t.strip_suffix(" with time zone") {
+        Some(rest) => (rest.trim(), true),
+        None => (t.strip_suffix(" without time zone").unwrap_or(&t).trim(), false),
+    };
     // `varchar(20)` keeps its length; match on the base.
-    let base = t.split('(').next().unwrap_or(&t).trim();
-    let args = t.find('(').map(|i| &t[i..]).unwrap_or("");
+    let base = match (t.split('(').next().unwrap_or(t).trim(), zoned) {
+        ("time", true) => "timetz",
+        ("timestamp", true) => "timestamptz",
+        (base, _) => base,
+    };
+    let args = t.find('(').map(|i| t[i..].trim()).unwrap_or("");
 
     match (base, target) {
         ("jsonb" | "json", Target::MySql) => "JSON".to_string(),
@@ -1524,23 +1888,98 @@ fn map_type(pg: &str, target: Target, e: &Entity, c: &ColumnDef, report: &mut Ve
         ("bytea", Target::TSql) => "varbinary(max)".to_string(),
         ("bytea", Target::Sqlite) => "BLOB".to_string(),
 
-        // Anything left is a user-defined type — most often an enum, which dbd
-        // knows the labels of only at the project level. Text plus a note is
-        // the honest floor; a CHECK would need the labels threaded here.
-        _ => {
-            let to = match target {
-                Target::MySql => "VARCHAR(255)",
-                Target::TSql => "nvarchar(255)",
-                Target::Sqlite => "TEXT",
-            };
-            lose(
-                to,
-                &format!(
-                    "`{base}` is not a built-in type here — if it is an enum, the allowed values \
-                     are no longer enforced"
+        // Blank-padded to its length on both targets that have it; PostgreSQL
+        // spells a bare `char` as `char(1)`. A bare `bpchar` has no length at
+        // all, so it is not this.
+        ("char" | "character" | "bpchar", _) if !args.is_empty() => {
+            let n: u32 = args.trim_matches(['(', ')']).trim().parse().unwrap_or(1);
+            match target {
+                Target::MySql if n <= 255 => format!("CHAR({n})"),
+                Target::MySql => lose(
+                    &format!("VARCHAR({n})"),
+                    "MySQL's CHAR holds at most 255 characters, so it is a VARCHAR — no longer padded to its length",
                 ),
-            )
+                Target::TSql if n <= 4000 => format!("nchar({n})"),
+                Target::TSql => lose(
+                    "nvarchar(max)",
+                    "SQL Server's nchar holds at most 4000 characters, so it is an nvarchar(max) — no longer \
+                     padded to its length",
+                ),
+                Target::Sqlite => "TEXT".to_string(),
+            }
         }
+
+        // Single precision everywhere.
+        ("real" | "float4", Target::MySql) => "FLOAT".to_string(),
+        ("real" | "float4", Target::TSql) => "real".to_string(),
+        ("real" | "float4", Target::Sqlite) => "REAL".to_string(),
+
+        // A time of day, its fractional precision kept; SQLite keeps every date
+        // and time as text, as it does `date`.
+        ("time", Target::MySql) => format!("TIME{args}"),
+        ("time", Target::TSql) => format!("time{args}"),
+        ("time", Target::Sqlite) => "TEXT".to_string(),
+
+        // Neither MySQL nor SQL Server keeps a time of day with its offset.
+        ("timetz", Target::MySql) => lose(
+            &format!("TIME{args}"),
+            "MySQL's TIME has no time zone, so a value's offset is not kept — times from different \
+             zones now compare as if they shared one",
+        ),
+        ("timetz", Target::TSql) => lose(
+            &format!("time{args}"),
+            "SQL Server's time has no time zone, so a value's offset is not kept — times from different \
+             zones now compare as if they shared one",
+        ),
+        ("timetz", Target::Sqlite) => "TEXT".to_string(),
+
+        // `interval day to second` names its fields after the type.
+        (b, _) if b == "interval" || b.starts_with("interval ") => lose(
+            &text_of(target, 255),
+            &format!(
+                "{label} has no interval type, so it is stored as its text form — adding it to a date, \
+                 or comparing two of them, no longer works"
+            ),
+        ),
+
+        ("inet" | "cidr", _) => lose(
+            // 49: the longest text form PostgreSQL writes — an IPv6 address
+            // with an IPv4 one inside it (45 characters) and a `/128` netmask.
+            &text_of(target, 49),
+            &format!(
+                "{label} has no type for a network address, so it is stored as its text form — an \
+                 address is no longer validated, and PostgreSQL's containment operators (<<, >>=) \
+                 have nothing to work on"
+            ),
+        ),
+
+        // Anything left is a type dbd does not map — an enum when the project
+        // declares one by that name, whose labels the target's text column no
+        // longer enforces. Text plus a note is the honest floor; a CHECK would
+        // need the labels threaded here. Only a declared enum is called one:
+        // `money` reported as "if it is an enum" sent readers looking for an
+        // enum that does not exist.
+        _ if script.is_enum(base) => lose(
+            &text_of(target, 255),
+            &format!("`{base}` is an enum, and {label} gets it as text — the allowed values are no longer enforced"),
+        ),
+        _ => lose(
+            &text_of(target, 255),
+            &format!(
+                "dbd has no {label} mapping for `{base}`, so it is stored as text — whatever the type \
+                 validated or computed is not carried"
+            ),
+        ),
+    }
+}
+
+/// A text column of up to `n` characters on `target` — SQLite's TEXT has no
+/// length.
+fn text_of(target: Target, n: u32) -> String {
+    match target {
+        Target::MySql => format!("VARCHAR({n})"),
+        Target::TSql => format!("nvarchar({n})"),
+        Target::Sqlite => "TEXT".to_string(),
     }
 }
 

@@ -11,27 +11,11 @@ use super::{CatalogData, DatabaseAdapter, ProjectMeta, ReferenceClass};
 mod bookkeeping;
 use bookkeeping::Bookkeeping;
 
-/// Ensure `public` is included in any SET search_path statement.
-/// DDL files often set search_path to specific schemas (e.g., `sensei, extensions`)
-/// but omit `public`, which hides extensions installed in the public schema.
-fn ensure_public_in_search_path(sql: &str) -> String {
-    let re = regex::Regex::new(r"(?i)(set\s+search_path\s+to\s+)([^;]+)(;)").unwrap();
-    re.replace_all(sql, |caps: &regex::Captures| {
-        let prefix = &caps[1];
-        let schemas = &caps[2];
-        let suffix = &caps[3];
-        if schemas.to_lowercase().contains("public") {
-            format!("{prefix}{schemas}{suffix}")
-        } else {
-            format!("{prefix}{schemas}, public{suffix}")
-        }
-    })
-    .to_string()
-}
 use crate::config::ResolvedMatview;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
+use crate::script::ensure_public_in_search_path;
 
 /// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
 /// 'a' = NO ACTION (unspecified — return None so the emitter omits the clause),
@@ -52,16 +36,21 @@ fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
 /// `import_jsonb_to_table` procedure is always created here (see
 /// [`PostgresAdapter::ensure_import_procedure`]), so the `CALL` is pinned to
 /// this schema — never the target table's schema, which has no such procedure.
-const JSONB_IMPORT_SCHEMA: &str = "staging";
+///
+/// dbd's own schema, beside its bookkeeping: it was `staging`, which a JSON
+/// import created in every project whatever its staging schemas are called —
+/// a schema the design never declared, visible to `diff` and `init --from-db`.
+/// `dbd` is excluded from introspection, so the machinery stays out of both.
+const JSONB_IMPORT_SCHEMA: &str = "dbd";
 
 /// Fully-qualified, dbd-owned staging table that jsonl rows are loaded into
 /// before `import_jsonb_to_table` moves them to the target. Schema-qualified so
-/// it resolves regardless of the session `search_path`, and `_dbd_`-prefixed so
-/// it never collides with a user table. Pooled connections don't share
+/// it resolves regardless of the session `search_path`, and in dbd's own schema
+/// so it never collides with a user table. Pooled connections don't share
 /// `search_path`, so an unqualified `_temp` resolves nondeterministically — the
 /// same failure mode fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]).
 /// See sensei-hq/dbd#6.
-const JSONB_IMPORT_TMP: &str = "staging._dbd_import_tmp";
+const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
 
 /// `CALL` that moves staged rows into `target` via the internal import
 /// procedure. Both the procedure schema and the source table are pinned and
@@ -246,6 +235,21 @@ impl PostgresAdapter {
             .await
             .map_err(|e| DbdError::Config(format!("pg_cron presence check failed: {e}")))?;
         Ok(row.get::<bool, _>("present"))
+    }
+
+    /// The columns of `table` (`schema.table`, or a bare name resolved through
+    /// the search_path), in table order. Empty when there is no such table:
+    /// `to_regclass` returns NULL for a missing relation instead of erroring.
+    async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT attname::text FROM pg_catalog.pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+        )
+        .bind(crate::sql_quote::qualified(table))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))
     }
 
     /// Static pattern matching for reference classification (offline fallback).
@@ -944,7 +948,8 @@ impl PostgresAdapter {
     async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("schemaname");
         let sql = format!(
-            "SELECT schemaname, viewname, definition \
+            "SELECT schemaname, viewname, definition, \
+                    obj_description(format('%I.%I', schemaname, viewname)::regclass, 'pg_class') AS comment \
              FROM pg_views \
              WHERE {ns_filter} \
              ORDER BY schemaname, viewname"
@@ -962,6 +967,7 @@ impl PostgresAdapter {
                 let definition: String = row.get("definition");
                 let mut e = Entity::new(EntityType::View, &format!("{schema}.{viewname}"));
                 e.body = vec![definition];
+                e.comment = row.get("comment");
                 e
             })
             .collect();
@@ -983,7 +989,8 @@ impl PostgresAdapter {
 
         let ns_filter = Self::schema_filter_column("schemaname");
         let sql = format!(
-            "SELECT schemaname, matviewname, definition \
+            "SELECT schemaname, matviewname, definition, \
+                    obj_description(format('%I.%I', schemaname, matviewname)::regclass, 'pg_class') AS comment \
              FROM pg_matviews \
              WHERE {ns_filter} \
              ORDER BY schemaname, matviewname"
@@ -1005,6 +1012,10 @@ impl PostgresAdapter {
 
             let mut e = Entity::new(EntityType::MaterializedView, &format!("{schema}.{matviewname}"));
             e.body = vec![definition];
+            // A dbd before 0.25 kept its drift stamp as the matview's whole
+            // comment; that is dbd's bookkeeping, not the author's comment.
+            let comment: Option<String> = row.get("comment");
+            e.comment = comment.filter(|c| crate::reconcile::parse_dbd_hash(Some(c)).is_none());
             if !indexes.is_empty() {
                 e.table_def = Some(TableDef {
                     columns: Vec::new(),
@@ -1297,12 +1308,32 @@ impl DatabaseAdapter for PostgresAdapter {
         };
 
         let format = entity.format.as_deref().unwrap_or("csv");
-        let qualified = entity.name.replace('.', "\".\"");
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
             "csv" | "tsv" => {
-                let delimiter = if format == "tsv" { ", DELIMITER E'\\t'" } else { "" };
+                // The header is a column list. `HEADER true` only skipped it,
+                // so each value loaded into the column at its position — a
+                // file headed `name,code` put the name into `code`. COPY now
+                // names the columns the header does, and gets only the rows.
+                let tab = format == "tsv";
+                let Some((header, rows_at)) = super::delimited_header(&data, tab, file_path)? else {
+                    return Ok(()); // An empty file: no columns, no rows.
+                };
+                let columns = self.table_columns(&entity.name).await?;
+                if columns.is_empty() {
+                    return Err(DbdError::Config(format!(
+                        "cannot import {} into {}: no such table",
+                        file_path.display(),
+                        entity.name
+                    )));
+                }
+                let column_list = super::header_columns(&header, &columns, &entity.name, file_path)?
+                    .iter()
+                    .map(|c| crate::sql_quote::ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let delimiter = if tab { ", DELIMITER E'\\t'" } else { "" };
                 // Postgres CSV COPY's default NULL is the empty unquoted string,
                 // which already matches today's behavior — only add the clause
                 // when a non-empty sentinel is configured.
@@ -1311,8 +1342,12 @@ impl DatabaseAdapter for PostgresAdapter {
                 } else {
                     format!(", NULL '{}'", null_value.replace('\'', "''"))
                 };
-                let copy_sql =
-                    format!("COPY \"{qualified}\" FROM STDIN WITH (FORMAT csv, HEADER true{delimiter}{null_clause})");
+                // Quoted part by part: replacing the dot left an embedded `"`
+                // free to close the quoting.
+                let copy_sql = format!(
+                    "COPY {} ({column_list}) FROM STDIN WITH (FORMAT csv{delimiter}{null_clause})",
+                    crate::sql_quote::qualified(&entity.name)
+                );
                 let mut conn = self
                     .pool
                     .acquire()
@@ -1322,7 +1357,7 @@ impl DatabaseAdapter for PostgresAdapter {
                     .copy_in_raw(&copy_sql)
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY failed: {e}")))?;
-                copy.send(data.as_bytes())
+                copy.send(&data.as_bytes()[rows_at..])
                     .await
                     .map_err(|e| DbdError::Config(format!("COPY send failed: {e}")))?;
                 copy.finish()
@@ -1751,14 +1786,16 @@ impl DatabaseAdapter for PostgresAdapter {
     async fn ensure_import_procedure(&self) -> Result<()> {
         // Embedded at compile time — always up to date with this version of dbd.
         const DDL: &str = include_str!("../../internal/import_jsonb_to_table.ddl");
-        self.execute_script("CREATE SCHEMA IF NOT EXISTS staging").await?;
+        self.execute_script(&format!("CREATE SCHEMA IF NOT EXISTS {JSONB_IMPORT_SCHEMA}"))
+            .await?;
         // Use sqlx::query() instead of execute_script() — sqlx::raw_sql() splits on all
         // semicolons including those inside $$-quoted PL/pgSQL bodies, which mangles
         // CREATE PROCEDURE. sqlx::query() sends the statement as a single unit.
-        sqlx::query(DDL)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("ensure staging.import_jsonb_to_table failed: {e}")))?;
+        sqlx::query(DDL).execute(&self.pool).await.map_err(|e| {
+            DbdError::Config(format!(
+                "ensure {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table failed: {e}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -1850,6 +1887,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.stamp_matview(guard.as_mut(), qualified, stamp).await
     }
 
+    async fn forget_matview_stamps(&self, qualified: &[String]) -> Result<()> {
+        self.bookkeeping.forget_matview_stamps(qualified).await
+    }
+
     async fn sync_refresh_jobs(&self, jobs: &[(String, ResolvedMatview)]) -> Result<()> {
         // Guard: never touch `cron.job` on a database without pg_cron (it would
         // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled
@@ -1889,7 +1930,7 @@ mod tests {
         // there — not to `activity`, which has no such procedure (Defect A).
         let sql = jsonb_import_call_sql("activity.assistant_events");
         assert!(
-            sql.contains("CALL staging.import_jsonb_to_table("),
+            sql.contains("CALL dbd.import_jsonb_to_table("),
             "CALL must target the staging procedure, got: {sql}"
         );
         assert!(
@@ -1919,8 +1960,9 @@ mod tests {
             JSONB_IMPORT_TMP.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
             "temp table must be qualified with the import schema: {JSONB_IMPORT_TMP}"
         );
-        assert!(
-            JSONB_IMPORT_TMP.contains("_dbd_"),
+        // dbd's own schema holds no user table, so nothing can be clobbered.
+        assert_eq!(
+            JSONB_IMPORT_SCHEMA, "dbd",
             "temp table must be dbd-namespaced to avoid clobbering user tables: {JSONB_IMPORT_TMP}"
         );
     }

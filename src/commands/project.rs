@@ -66,6 +66,7 @@ pub fn cmd_dbml(
     let entities = design.scoped_entities(&resolved)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
@@ -363,6 +364,11 @@ pub async fn cmd_deploy(
     let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
         .context("Failed to load design from source")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    // What the scope builds, not what the design declares: a scoped deploy
+    // never touches the rest, so the whole-design tally described a run that
+    // does not happen. Named for the run as for its preview.
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     if dry_run {
         // The real deploy's own gate (it runs `Design::apply`): scope gaps and
@@ -370,12 +376,11 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // The hooks the run would skip, decided as the run decides them.
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
 
-        // What the scope builds, not what the design declares: a scoped deploy
-        // never touches the rest, so the whole-design tally described a run
-        // that does not happen.
-        let (kept, total) = design.scope_counts(&resolved)?;
-        output::scope_filtered(&resolved, kept, total);
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
             output::scope_gaps(&resolved, &report.gaps);
@@ -417,6 +422,12 @@ pub async fn cmd_deploy(
     let meta = adapter.get_project_meta().await?;
     Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
+    // Said before the run, not in its summary: a deploy that fails never
+    // prints one, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(&resolved))? {
+        output::warn(&skip);
+    }
+
     // Delegate to the library's `Design::deploy` — apply + import + policies —
     // so `dbd deploy` and an embedder calling the crate run the same pipeline.
     output::info(verbosity, "Applying schema...");
@@ -440,16 +451,22 @@ pub async fn cmd_deploy(
     }
 
     let summary = summary.unwrap_or_default();
+    // Non-fatal diagnostics — skipped imports and failed policy files — are
+    // always surfaced, regardless of verbosity. A deploy that quietly loaded
+    // nothing is the failure mode this reporting exists to prevent. Each in the
+    // order its phase ran — schema, data, policies — so nothing reads as having
+    // happened before what it followed.
+    // The apply phase's warnings are the hook skips, already said before it.
+    for warning in &summary.import.warnings {
+        output::warn(warning);
+    }
     if !summary.policies.applied.is_empty() {
         output::info(
             verbosity,
             &format!("Applied {} policy file(s).", summary.policies.applied.len()),
         );
     }
-    // Non-fatal diagnostics — skipped imports and failed policy files — are
-    // always surfaced, regardless of verbosity. A deploy that quietly loaded
-    // nothing is the failure mode this reporting exists to prevent.
-    for warning in summary.warnings() {
+    for warning in summary.policy_warnings() {
         output::warn(&warning);
     }
     output::info(verbosity, &format_deploy_summary(&summary));
@@ -484,6 +501,8 @@ pub async fn cmd_reconcile(
     }
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let adapter = get_adapter(config, database_url).await?;
     reconcile_with_adapter(
         &*adapter,
@@ -859,7 +878,8 @@ mod tests {
             !lookups.contains("\"name\""),
             "a stub shows only the referenced columns:\n{dbml}"
         );
-        assert!(stub("\"config\".\"categories\"").contains("\"id\" varchar"), "{dbml}");
+        // Nothing defines it, so its key is typed like the column referencing it.
+        assert!(stub("\"config\".\"categories\"").contains("\"id\" uuid"), "{dbml}");
     }
 
     /// A missing config bails with an actionable "not found" error.

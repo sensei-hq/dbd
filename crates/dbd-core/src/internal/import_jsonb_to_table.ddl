@@ -16,7 +16,7 @@
 -- forced to NULL. Without this, a seed that omits a `not null default now()`
 -- column (e.g. `modified_at`) would violate the not-null constraint even though
 -- the default would have satisfied it.
-create or replace procedure staging.import_jsonb_to_table(
+create or replace procedure dbd.import_jsonb_to_table(
     p_source_table text
   , p_target_table text
 )

@@ -1,5 +1,7 @@
 use crate::config::DbmlDocConfig;
-use crate::entity::{ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef};
+use crate::entity::{
+    ColumnDef, Entity, EntityType, ForeignKey, IndexColumn, IndexDef, SchemaPath, TableConstraint, TableDef,
+};
 
 /// Parameters for DBML generation.
 pub struct DbmlParams<'a> {
@@ -63,6 +65,8 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
         .filter(|e| is_included(e, params))
         .collect();
 
+    let enums = EnumTypes::of(design);
+
     // Enums
     for entity in &filtered {
         if entity.entity_type == EntityType::Enum && !entity.enum_values.is_empty() {
@@ -78,7 +82,7 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
             sections.push(emit_table(
                 &entity.name,
                 entity.schema.as_deref().unwrap_or("public"),
-                table_def,
+                &enums.qualify_columns(table_def, &entity.schema_path),
             ));
         }
     }
@@ -101,7 +105,7 @@ fn generate_dbml_in(params: &DbmlParams, design: &[Entity]) -> DbmlDocument {
     // define: a Ref to an undefined table is a DBML error, whether the target
     // is an External, a table a scope or filter left out, or one the design
     // never declares.
-    let stubs = emit_ref_target_stubs(&included_tables, design);
+    let stubs = emit_ref_target_stubs(&included_tables, design, &enums);
     if !stubs.is_empty() {
         sections.push(stubs);
     }
@@ -291,6 +295,55 @@ fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
     block
 }
 
+/// The enums the design declares, by qualified name — what a column's type is
+/// checked against before it is written.
+///
+/// DBML finds a column's enum by name alone, while the SQL the column came from
+/// found it along its file's `search_path`. Written as the file spelled it,
+/// `mood` reached `init --from-dbml` with no path to resolve it on, and the
+/// rebuilt table's apply failed with `type "mood" does not exist`. So a type
+/// naming a declared enum is written qualified, as the table's own path
+/// resolves it; a built-in, or a name already qualified, is written as is.
+struct EnumTypes(std::collections::HashSet<String>);
+
+impl EnumTypes {
+    fn of(design: &[Entity]) -> Self {
+        Self(
+            design
+                .iter()
+                .filter(|e| e.entity_type == EntityType::Enum)
+                .map(qualified_name)
+                .collect(),
+        )
+    }
+
+    /// `data_type`, qualified when it names a declared enum on `path`.
+    fn column_type(&self, data_type: &str, path: &SchemaPath) -> String {
+        // `mood[]` names the enum `mood`; the array suffix rides along.
+        let (base, suffix) = data_type.split_at(data_type.find('[').unwrap_or(data_type.len()));
+        if base.contains('.') {
+            return data_type.to_string();
+        }
+        // `public` is searched last: apply appends it to every path a file
+        // states (`ensure_public_in_search_path`), and a file stating none
+        // resolves there.
+        path.schemas()
+            .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
+            .map(|schema| format!("{schema}.{base}"))
+            .find(|name| self.0.contains(name))
+            .map_or_else(|| data_type.to_string(), |name| format!("{name}{suffix}"))
+    }
+
+    /// `table_def` with each column's type as [`Self::column_type`] writes it.
+    fn qualify_columns(&self, table_def: &TableDef, path: &SchemaPath) -> TableDef {
+        let mut table_def = table_def.clone();
+        for column in &mut table_def.columns {
+            column.data_type = self.column_type(&column.data_type, path);
+        }
+        table_def
+    }
+}
+
 fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
@@ -460,9 +513,9 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
         settings.push(format!("{GENERATED_PROPERTY}: {}", dbml_string(expression)));
     }
     if let Some(ref comment) = col.comment {
-        // Inline notes must be single-line — collapse newlines
-        let inline = comment.trim().replace('\n', " ");
-        settings.push(format!("note: {}", dbml_string(&inline)));
+        // A setting stays on its column's line; `dbml_string` writes each line
+        // break as DBML's `\n` escape, which both parsers read back as one.
+        settings.push(format!("note: {}", dbml_string(comment.trim())));
     }
 
     let settings_str = if settings.is_empty() {
@@ -708,43 +761,76 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
 /// target is looked up in `design`: a table the design defines keeps the
 /// referenced columns' real types; an External, or a table the design never
 /// declares, has no types to give and gets `varchar`.
-fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity]) -> String {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+fn emit_ref_target_stubs(documented: &[&Entity], design: &[Entity], enums: &EnumTypes) -> String {
+    use std::collections::{BTreeMap, HashSet};
 
     let defined: HashSet<String> = documented.iter().map(|e| qualified_name(e)).collect();
-    let mut targets: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    let mut targets: BTreeMap<String, StubTarget> = BTreeMap::new();
     for entity in documented {
         let Some(table_def) = &entity.table_def else {
             continue;
         };
-        let inline = table_def.columns.iter().filter_map(|c| c.inline_fk.as_ref());
+        let type_of = |column: &str| {
+            table_def
+                .columns
+                .iter()
+                .find(|c| c.name == column)
+                .map(|c| enums.column_type(&c.data_type, &entity.schema_path))
+        };
+        // An inline FK's source is the column carrying it, whatever `columns` says.
+        let inline = table_def
+            .columns
+            .iter()
+            .filter_map(|c| c.inline_fk.as_ref().map(|fk| (fk, vec![type_of(&c.name)])));
         let table_level = table_def.constraints.iter().filter_map(|c| match c {
-            TableConstraint::ForeignKey(fk) => Some(fk),
+            TableConstraint::ForeignKey(fk) => Some((fk, fk.columns.iter().map(|col| type_of(col)).collect())),
             _ => None,
         });
-        for fk in inline.chain(table_level) {
+        for (fk, source_types) in inline.chain(table_level) {
             // Named exactly as `emit_ref` names the target, so the stub is the
             // table the Ref line points at.
             let target = format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table);
-            if !defined.contains(&target) {
-                targets
-                    .entry(target)
-                    .or_default()
-                    .extend(fk.ref_columns.iter().map(String::as_str));
+            if defined.contains(&target) {
+                continue;
+            }
+            let stub = targets.entry(target).or_default();
+            let key: Vec<&str> = fk.ref_columns.iter().map(String::as_str).collect();
+            if !stub.keys.contains(&key) {
+                stub.keys.push(key);
+            }
+            for (i, column) in fk.ref_columns.iter().enumerate() {
+                let source_type = source_types.get(i).cloned().flatten();
+                let entry = stub.columns.entry(column.as_str()).or_default();
+                if entry.is_empty()
+                    && let Some(source_type) = source_type
+                {
+                    *entry = source_type;
+                }
             }
         }
     }
 
     targets
         .iter()
-        .map(|(target, columns)| {
+        .map(|(target, stub)| {
             let known = design.iter().find(|e| {
                 matches!(e.entity_type, EntityType::Table | EntityType::External) && qualified_name(e) == *target
             });
-            emit_stub_block(target, columns, known)
+            emit_stub_block(target, stub, known, enums)
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What the document's foreign keys say about a table it does not define.
+#[derive(Default)]
+struct StubTarget<'a> {
+    /// Each referenced column, with the type of the first column seen
+    /// referencing it — what the stub falls back to when nothing declares one.
+    columns: std::collections::BTreeMap<&'a str, String>,
+    /// Each distinct column set a foreign key references, in first-seen order.
+    /// Postgres requires every one to be unique, so the stub declares it.
+    keys: Vec<Vec<&'a str>>,
 }
 
 /// `schema.table` for an entity, as the document's `Table` and `Ref` lines
@@ -755,19 +841,51 @@ fn qualified_name(entity: &Entity) -> String {
     format!("{schema}.{base}")
 }
 
-/// One stub `Table` block: the referenced `columns` of `target`, typed from
-/// `known` when the design defines it, and a note saying why it is a stub.
-fn emit_stub_block(target: &str, columns: &std::collections::BTreeSet<&str>, known: Option<&Entity>) -> String {
+/// One stub `Table` block: the referenced `columns` of `target`, and a note
+/// saying why it is a stub.
+///
+/// A column is typed from `known` when the design defines the table, else
+/// like the column referencing it — an `external:` declares no types, and the
+/// `varchar` it used to get made `dbml2sql` write a `uuid` foreign key to a
+/// `varchar` key, which Postgres refuses. `varchar` is left for a column with
+/// neither.
+fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enums: &EnumTypes) -> String {
     let (schema, table) = target.split_once('.').unwrap_or(("public", target));
-    let known_columns = known.and_then(|e| e.table_def.as_ref()).map(|td| td.columns.as_slice());
+    let known_columns = known.and_then(|e| e.table_def.as_ref().map(|td| (td.columns.as_slice(), &e.schema_path)));
 
     let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
-    for column in columns {
-        let data_type = known_columns
-            .and_then(|cols| cols.iter().find(|c| c.name == *column))
-            .map_or_else(|| "varchar".to_string(), |c| quote_type_if_needed(&c.data_type));
-        lines.push(format!("  \"{column}\" {data_type}"));
+    for (column, referencing_type) in &stub.columns {
+        let known_type = known_columns.and_then(|(cols, path)| {
+            cols.iter()
+                .find(|c| c.name == *column)
+                .map(|c| enums.column_type(&c.data_type, path))
+        });
+        let data_type = known_type
+            .or_else(|| (!referencing_type.is_empty()).then(|| referencing_type.clone()))
+            .unwrap_or_else(|| "varchar".to_string());
+        lines.push(format!("  \"{column}\" {}", quote_type_if_needed(&data_type)));
     }
+    // A foreign key's target is unique; said here, `dbml2sql` writes the
+    // constraint its foreign keys need instead of one Postgres refuses.
+    let keys: Vec<IndexDef> = stub
+        .keys
+        .iter()
+        .map(|key| IndexDef {
+            columns: key
+                .iter()
+                .map(|column| IndexColumn {
+                    name: column.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            unique: true,
+            ..Default::default()
+        })
+        .collect();
+    lines.push(String::new());
+    lines.push("  indexes {".to_string());
+    lines.extend(emit_indexes(&keys).into_iter().map(|line| format!("    {line}")));
+    lines.push("  }".to_string());
     let note = match known.map(|e| e.entity_type) {
         Some(EntityType::External) => "External entity — managed outside this project",
         Some(_) => "Defined in this project, outside this document — only the referenced columns are shown",
@@ -1491,6 +1609,55 @@ mod tests {
 
     // ── External entity stub tests ───────────────────────
 
+    /// A stub's referenced columns are declared unique, once per distinct set
+    /// a foreign key names. Postgres requires a foreign key's target to be
+    /// unique, so the reference itself says they are; without it `dbml2sql`
+    /// wrote a foreign key Postgres refuses with "there is no unique constraint
+    /// matching given keys".
+    #[test]
+    fn a_stub_declares_each_referenced_column_set_unique() {
+        let fk = |columns: &[&str], ref_columns: &[&str]| {
+            TableConstraint::ForeignKey(ForeignKey {
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                ref_schema: Some("auth".to_string()),
+                ref_table: "users".to_string(),
+                ref_columns: ref_columns.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        let profiles = make_table_entity(
+            "app.profiles",
+            vec![pk_col("id", "int"), col("user_id", "uuid"), col("tenant", "int")],
+            vec![fk(&["user_id"], &["id"]), fk(&["tenant", "user_id"], &["tenant", "id"])],
+        );
+        let entities = vec![profiles, Entity::new(EntityType::External, "auth.users")];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let stub = parsed.iter().find(|e| e.name == "auth.users").expect("stub read back");
+        let unique: Vec<Vec<&str>> = stub
+            .table_def
+            .as_ref()
+            .unwrap()
+            .indexes
+            .iter()
+            .filter(|ix| ix.unique)
+            .map(|ix| ix.columns.iter().map(|c| c.name.as_str()).collect())
+            .collect();
+        assert_eq!(unique, [vec!["id"], vec!["tenant", "id"]], "{}", doc.content);
+    }
+
     #[test]
     fn external_entity_renders_as_stub_table() {
         let table_entity = make_table_entity(
@@ -1530,13 +1697,106 @@ mod tests {
             doc.content.contains("Table \"auth\".\"users\""),
             "should have stub table for auth.users"
         );
+        // Typed like the column that references it: nothing declares an
+        // external's columns, and the `varchar` guess made `dbml2sql` write a
+        // `uuid` foreign key to a `varchar` key, which Postgres refuses.
+        let start = doc.content.find("Table \"auth\".\"users\" {").unwrap();
+        let stub = &doc.content[start..];
+        let stub = &stub[..stub.find('}').unwrap()];
         assert!(
-            doc.content.contains("\"id\" varchar"),
-            "stub should contain referenced column"
+            stub.contains("\"id\" UUID"),
+            "stub should type the referenced column like its foreign key:\n{}",
+            doc.content
         );
         assert!(
             doc.content.contains("External entity"),
             "stub should have external note"
+        );
+    }
+
+    /// A column comment keeps its line breaks. They were flattened to spaces
+    /// before the note was escaped, so a markdown comment came back from
+    /// `init --from-dbml` as one run-on line. DBML's `\n` escape keeps the note
+    /// on the one line both parsers read settings from.
+    #[test]
+    fn a_multi_line_column_comment_round_trips_with_its_line_breaks() {
+        let mut code = col("code", "text");
+        code.comment = Some("line one\n- line two".to_string());
+        let entities = vec![make_table_entity("app.t", vec![pk_col("id", "int"), code], vec![])];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let table = parsed.iter().find(|e| e.name == "app.t").expect("table read back");
+        let comment = table.table_def.as_ref().unwrap().columns[1].comment.as_deref();
+        assert_eq!(comment, Some("line one\n- line two"), "{}", doc.content);
+    }
+
+    /// An enum column's type is written the way the table's own `search_path`
+    /// resolves it. Written bare, `init --from-dbml` built `mood` unqualified,
+    /// and the apply failed with `type "mood" does not exist` — the enum lives
+    /// in `types`, which nothing on the new file's path names.
+    #[test]
+    fn an_enum_column_round_trips_with_the_schema_its_search_path_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/enum/types")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - types\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/types/mood.ddl"),
+            "set search_path to types;\ncreate type mood as enum ('calm', 'busy');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app, types;\n\
+             create table if not exists t (id int primary key, m mood not null, ms mood[]);\n",
+        )
+        .unwrap();
+        let design = crate::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let doc = generate_dbml(&DbmlParams {
+            entities: design.entities(),
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
+        let table = parsed.iter().find(|e| e.name == "app.t").expect("table read back");
+        let types: Vec<(&str, &str)> = table
+            .table_def
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            [("id", "int"), ("m", "types.mood"), ("ms", "types.mood[]")],
+            "{}",
+            doc.content
         );
     }
 

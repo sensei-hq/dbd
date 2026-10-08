@@ -279,9 +279,19 @@ pub fn resolve(
         Some(n) => match scopes.get(n) {
             Some(e) => (n.to_string(), Some(e)),
             None => {
-                let avail: Vec<&str> = scopes.keys().map(|s| s.as_str()).collect();
+                // `all` always exists, so it leads the list rather than being
+                // spliced onto it — joined the other way, a design with no
+                // scopes printed "Available: all, " and a list that never came.
+                let avail: Vec<&str> = std::iter::once("all")
+                    .chain(scopes.keys().map(String::as_str))
+                    .collect();
+                let none_defined = if scopes.is_empty() {
+                    " (design.yaml defines no `scopes:`)"
+                } else {
+                    ""
+                };
                 return Err(DbdError::Config(format!(
-                    "unknown scope '{n}'. Available: all, {}",
+                    "unknown scope '{n}'. Available: {}{none_defined}",
                     avail.join(", ")
                 )));
             }
@@ -338,6 +348,28 @@ pub fn resolve(
 
     add_present_schemas(&mut base, all_entities);
     let extensions: Option<HashSet<String>> = spec.extensions.as_ref().map(|v| v.iter().cloned().collect());
+
+    // A kept extension whose schema the scope excludes cannot be installed:
+    // the scope contradicts itself, and apply would fail on the missing
+    // schema. Say so here, where every command resolves the scope.
+    let contradictions: Vec<String> = all_entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Extension)
+        .filter(|e| extensions.as_ref().is_none_or(|allow| allow.contains(&e.name)))
+        .filter_map(|e| {
+            let schema = e.schema.as_ref()?;
+            excluded
+                .contains(schema)
+                .then(|| format!("'{}' (installs into '{schema}')", e.name))
+        })
+        .collect();
+    if !contradictions.is_empty() {
+        return Err(DbdError::Config(format!(
+            "scope '{scope_name}' excludes the schema its extension {} installs into — stop excluding \
+             that schema, or leave the extension out of the scope's `extensions:` allowlist",
+            contradictions.join(", ")
+        )));
+    }
     add_extension_schemas(&mut base, all_entities, extensions.as_ref(), &excluded);
 
     Ok(ResolvedScope {
@@ -611,6 +643,28 @@ mod tests {
         let scopes = scopes_yaml("hub:\n  includes: [config]\n");
         let err = resolve(&scopes, Some("nope"), None, &world(), &[]).unwrap_err();
         assert!(err.to_string().contains("unknown scope 'nope'"));
+    }
+
+    /// With no `scopes:` in design.yaml the list of choices is just `all`. It
+    /// read "Available: all, " — a dangling comma promising a list that never
+    /// came, which reads like a bug in the message rather than the answer.
+    #[test]
+    fn an_unknown_scope_with_none_defined_lists_only_all() {
+        let err = resolve(&IndexMap::new(), Some("nope"), None, &world(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("all, "), "no dangling separator: {err}");
+        assert!(err.contains("Available: all"), "`all` is still offered: {err}");
+        assert!(err.contains("no `scopes:`"), "and says why it is the only one: {err}");
+
+        let scopes = scopes_yaml("hub:\n  includes: [config]\n");
+        let err = resolve(&scopes, Some("nope"), None, &world(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Available: all, hub"),
+            "defined scopes follow `all`: {err}"
+        );
     }
 
     #[test]

@@ -121,8 +121,9 @@ impl Design {
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
-        let hook_scope = match (scope, working_set.as_ref()) {
-            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), ws)),
+        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
+        let hook_scope = match (scope, outside.as_ref()) {
+            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
             _ => None,
         };
 
@@ -198,6 +199,7 @@ impl Design {
                 before_scripts: before.ran,
                 after_scripts: after.ran,
                 warnings: [before.warnings, after.warnings].concat(),
+                previously_built: false,
             });
             return Ok(());
         }
@@ -219,6 +221,15 @@ impl Design {
             &pending,
             working_set.as_ref(),
         );
+
+        // No recorded version does not mean an empty database: one built
+        // before the project had a version records none, and neither does one
+        // built by hand. Asked before the plan runs, since its SetVersion step
+        // writes the very record this looks for.
+        let previously_built = plan.strategy == ApplyStrategy::Fresh && {
+            let live: std::collections::HashSet<String> = adapter.list_entities().await?.into_iter().collect();
+            adapter.get_project_meta().await?.is_some() || valid_entities.iter().any(|e| live.contains(&e.name))
+        };
 
         // Running tallies for the on_complete summary.
         let mut counts = ApplyCounts::default();
@@ -352,6 +363,7 @@ impl Design {
             before_scripts: before.ran,
             after_scripts: after.ran,
             warnings: [before.warnings, after.warnings].concat(),
+            previously_built,
         });
         Ok(())
     }
@@ -438,17 +450,23 @@ impl Design {
                 // Only where the table still exists: a generated drop is a bare
                 // `DROP TABLE … CASCADE`, and a database whose scope never had
                 // the table would fail on it.
-                let result: Result<()> = async {
+                let result: Result<bool> = async {
                     if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         // Decoded like the migration's `.sql` and `.data.sql`.
                         let sql = crate::source_text::read_to_string(drop_sql_path)?;
                         adapter.execute_script(&sql).await?;
+                        return Ok(true);
                     }
-                    Ok(())
+                    Ok(false)
                 }
                 .await;
-                report_step_result(&desc, on_done, result)?;
-                counts.dropped += 1;
+                // Counted only when it ran: the summary must not claim a drop
+                // that left the table where it was.
+                let dropped = matches!(result, Ok(true));
+                report_step_result(&desc, on_done, result.map(|_| ()))?;
+                if dropped {
+                    counts.dropped += 1;
+                }
             }
             ExecutionStep::RecordMigration { version, checksum } => {
                 let desc = format!("migration to v{version}");
@@ -461,6 +479,55 @@ impl Design {
             }
         }
         Ok(())
+    }
+
+    /// The grants a run under `scope` applies: schema → role → privileges.
+    ///
+    /// Every `schemas:` entry's `grants:`, with the target's `grants:` merged
+    /// on top — per schema, a target role adds to or overrides the universal
+    /// entry for that role — narrowed to the schemas the scope builds.
+    ///
+    /// One definition for [`Self::apply_grants`], which runs them, and
+    /// `dbd emit`, which has to report the ones it does not translate; two
+    /// copies would let the report list grants the database never got. The
+    /// merge itself is [`crate::config::DesignConfig::effective_schema_grants`],
+    /// which `reset` revokes from too.
+    pub(crate) fn declared_grants(
+        &self,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>> {
+        let mut schema_grants = self.config.effective_schema_grants();
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            schema_grants.retain(|schema, _| ws.contains(schema));
+        }
+        Ok(schema_grants)
+    }
+
+    /// The `apply.before` and `apply.after` hooks a run under `scope` skips,
+    /// one line each saying why — the run's own decision
+    /// ([`hooks::plan_hooks`]), made without running anything.
+    ///
+    /// The run reports these in [`ApplyComplete::warnings`], which only a run
+    /// that succeeds produces: a preview had no word of a skip, and neither
+    /// did a run that failed, though a skipped hook is often why it failed. So
+    /// a caller says them before the run. A hook file that is missing is an
+    /// error here, as it is in the run.
+    pub fn hook_skips(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let working_set = self.scope_working_set(scope)?;
+        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
+        let hook_scope = match (scope, outside.as_ref()) {
+            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
+            _ => None,
+        };
+        let mut skips = Vec::new();
+        for (entries, kind) in [
+            (&self.config.apply.before, hooks::HookKind::Before),
+            (&self.config.apply.after, hooks::HookKind::After),
+        ] {
+            skips.extend(hooks::plan_hooks(&self.project_dir, entries, kind, hook_scope)?.warnings);
+        }
+        Ok(skips)
     }
 
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
@@ -478,31 +545,20 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         scope: Option<&ResolvedScope>,
     ) -> Result<GrantsOutcome> {
-        let mut schema_grants = self.config.schema_grants();
-        let mut supabase_schemas: Vec<String> = vec![];
-        if let Some((target_name, target_config)) = self.config.target.iter().next() {
-            if let Some(ref grants) = target_config.grants {
-                for (schema, gc) in grants {
-                    schema_grants
-                        .entry(schema.clone())
-                        .or_default()
-                        .extend(gc.roles.clone());
-                }
-            }
-            // PostgREST USAGE grants ride along only when the user configured
-            // some grants, so a no-grants Supabase apply stays a no-op.
-            if target_name == "supabase" && !schema_grants.is_empty() {
-                supabase_schemas = self.config.schema_names();
-            }
-        }
-        if let Some(s) = scope.filter(|s| !s.is_all) {
-            let ws = self.working_set(s)?;
-            schema_grants.retain(|schema, _| ws.contains(schema));
-            supabase_schemas.retain(|schema| ws.contains(schema));
-        }
-
+        let schema_grants = self.declared_grants(scope)?;
         if schema_grants.is_empty() {
             return Ok(GrantsOutcome::None);
+        }
+        // PostgREST USAGE grants ride along only when the user configured
+        // some grants, so a no-grants Supabase apply stays a no-op.
+        let mut supabase_schemas: Vec<String> = if self.config.default_target() == Some("supabase") {
+            self.config.schema_names()
+        } else {
+            Vec::new()
+        };
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            supabase_schemas.retain(|schema| ws.contains(schema));
         }
         // A cross-target design may declare schema grants yet apply to SQLite
         // or Convex, which have no grant model to run them against.
@@ -575,6 +631,13 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(DeployComplete),
     {
+        // The import phase's refusals (`Design::check_import_plan`) — a data
+        // file outside `import.staging`, a staging table whose loader dbd
+        // cannot pick — are known before the first statement.
+        // Checked here, not when the import phase reaches them, so a refusal
+        // never leaves the deploy half done: schema applied, data not loaded.
+        self.check_import_plan(None)?;
+
         let mut apply_summary: Option<ApplyComplete> = None;
         let mut import_summary: Option<ImportComplete> = None;
 

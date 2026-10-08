@@ -154,6 +154,79 @@ fn apply_dry_run_under_a_scope_is_not_blocked_by_a_file_outside_it() {
     assert!(stdout(&out).contains("hub.nodes"), "{}", stdout(&out));
 }
 
+// ── a preview names the hooks its scope skips ───────────────────────────────
+
+/// An `apply.after` hook that writes `app.users`, which scope `hub` leaves out.
+fn add_app_only_after_hook(dir: &Path) {
+    let yaml = fs::read_to_string(dir.join("design.yaml")).unwrap();
+    write(
+        dir,
+        "design.yaml",
+        &format!("{yaml}\napply:\n  after:\n    - sql/seed_users.sql\n"),
+    );
+    write(dir, "sql/seed_users.sql", "insert into app.users (id) values (1);\n");
+}
+
+/// The real run skips a hook whose tables the scope leaves out, and says so —
+/// but only in the summary a successful run prints. The previews never named
+/// it, so a dry run promised a run that would quietly not seed anything.
+#[test]
+fn apply_and_deploy_dry_runs_name_a_hook_the_scope_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_app_only_after_hook(tmp.path());
+
+    for command in ["apply", "deploy"] {
+        let out = dbd(tmp.path(), &[command, "--dry-run", "--scope", "hub"]);
+        assert!(out.status.success(), "{command}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("after-script sql/seed_users.sql skipped") && stderr(&out).contains("app.users"),
+            "{command} --dry-run must name the skipped hook and why: {}",
+            stderr(&out)
+        );
+    }
+}
+
+// ── a document says what it leaves out ──────────────────────────────────────
+
+/// `dbml` and `diagram` cannot document a file dbd could not read, and both
+/// left it out with an exit of 0 and not a word — a document missing a table,
+/// indistinguishable from a complete one. `emit` already reports it; these
+/// now name it the same way, and still write what they can.
+#[test]
+fn dbml_and_diagram_name_a_file_they_leave_out_because_it_does_not_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    for args in [
+        &["dbml", "-f", "out.dbml"][..],
+        &["diagram", "--json", "-f", "out.json"][..],
+    ] {
+        let out = dbd(tmp.path(), args);
+        assert!(out.status.success(), "{args:?} still writes: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("broken.ddl") && stderr(&out).contains("could not be parsed"),
+            "{args:?} must name the file it leaves out: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// Like apply's refusal, the warning follows the scope: a file the scope does
+/// not document is not missing from it.
+#[test]
+fn dbml_under_a_scope_does_not_warn_about_a_file_outside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+    add_unparseable_app_table(tmp.path());
+
+    let out = dbd(tmp.path(), &["dbml", "-f", "out.dbml", "--scope", "hub"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("broken.ddl"), "{}", stderr(&out));
+}
+
 // ── policies --dry-run agrees with policies ─────────────────────────────────
 
 /// The real `policies` (and `deploy`) skip a policy whose table the scope does
@@ -174,6 +247,102 @@ fn policies_dry_run_under_a_scope_lists_only_the_scopes_policies() {
             .lines()
             .any(|l| l.contains("app/users.sql") && !l.contains("skipped")),
         "a policy outside the scope is never listed as one that would apply: {text}"
+    );
+}
+
+/// "Would apply policies:" headed a list that, under a scope with no policy of
+/// its own, was nothing but skips — a preview announcing work above a list of
+/// work it will not do. The heading is printed only over what would apply;
+/// skips are listed under their own.
+#[test]
+fn policies_dry_run_heads_what_would_apply_and_what_would_be_skipped_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_schema_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["policies", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no `{needle}`:\n{text}"));
+    assert!(
+        at("Would apply policies:") < at("hub/nodes.sql")
+            && at("hub/nodes.sql") < at("Would skip")
+            && at("Would skip") < at("app/users.sql"),
+        "the applied file under one heading, the skipped one under another:\n{text}"
+    );
+
+    std::fs::remove_file(tmp.path().join("policies/hub/nodes.sql")).unwrap();
+    let out = dbd(tmp.path(), &["policies", "--dry-run", "--scope", "hub"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !text.contains("Would apply policies:"),
+        "nothing would apply, so nothing is announced as applying:\n{text}"
+    );
+    assert!(
+        text.contains("Would skip") && text.contains("app/users.sql"),
+        "the skip is still listed, under its own heading:\n{text}"
+    );
+}
+
+// ── a file a command writes stays in the project ───────────────────────────
+
+/// `dbml` and `diagram` refused a path outside the project; `combine` and
+/// `emit` wrote wherever `-f` pointed. One rule now, the safer of the two: a
+/// file a command writes lands inside the project, or the command refuses
+/// before writing anything.
+#[test]
+fn every_command_that_writes_a_file_keeps_it_inside_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    two_schema_project(&project);
+    let out = |name: &str| outside.join(name).to_str().unwrap().to_string();
+    let inside = project.join("emitted.sql").to_str().unwrap().to_string();
+
+    for args in [
+        vec!["combine".to_string(), "-f".into(), out("combined.sql")],
+        vec![
+            "emit".into(),
+            "--dialect".into(),
+            "sqlite".into(),
+            "-f".into(),
+            out("emitted.sql"),
+        ],
+        vec![
+            "emit".into(),
+            "--dialect".into(),
+            "sqlite".into(),
+            "-f".into(),
+            inside.clone(),
+            "--report".into(),
+            out("report.json"),
+        ],
+        vec!["dbml".into(), "-f".into(), out("schema.dbml")],
+        vec!["diagram".into(), "--json".into(), "-f".into(), out("schema.json")],
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = dbd(&project, &args);
+        assert!(
+            !run.status.success(),
+            "{args:?} wrote outside the project: {}",
+            stdout(&run)
+        );
+        assert!(
+            stderr(&run).contains("outside project root"),
+            "{args:?}: refused for that reason: {}",
+            stderr(&run)
+        );
+    }
+    assert_eq!(
+        fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing was written outside"
+    );
+    assert!(
+        !Path::new(&inside).exists(),
+        "nor half a run inside: emit checks both paths first"
     );
 }
 
@@ -335,6 +504,83 @@ fn inspect_under_a_scope_advises_only_on_what_the_scope_builds() {
     );
 }
 
+/// `inspect -n` is about one entity, but it counted the whole design ("31
+/// entities") and advised on every other table — an RLS warning for tables the
+/// reader never asked about, under the name of the one they did.
+#[test]
+fn inspect_of_a_named_entity_counts_and_advises_on_that_entity_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    advisory_outside_hub_project(tmp.path());
+
+    let out = dbd(tmp.path(), &["inspect", "-n", "hub.nodes"]);
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert!(out.status.success(), "nothing wrong with hub.nodes:\n{text}\n{err}");
+    assert_eq!(summary_count(&text), Some(1), "one entity was inspected:\n{text}");
+    assert!(!text.contains("Suggestions:"), "no enum advice for app.orders: {text}");
+    assert!(!err.contains("No RLS policy"), "no RLS advice for app.orders: {err}");
+    assert!(
+        !text.contains("Materialized view errors"),
+        "no matview error for app.order_counts: {text}"
+    );
+
+    // Named, the entity the advice is about still gets it.
+    let out = dbd(tmp.path(), &["inspect", "-n", "app.orders"]);
+    let (text, err) = (stdout(&out), stderr(&out));
+    assert_eq!(summary_count(&text), Some(1), "{text}");
+    assert!(text.contains("Suggestions:"), "{text}");
+    assert!(err.contains("No RLS policy on 1 table(s)"), "{err}");
+}
+
+/// A scope building `core`, and a materialized view outside it that reads a
+/// table nobody declares — a warning, in a file the scope never builds.
+fn warned_outside_core_project(dir: &Path) {
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: warned\n\nsource:\n  dialect: postgresql\n\n\
+         schemas:\n  - core\n  - other\n\nscopes:\n  coreonly:\n    includes:\n      - core\n",
+    );
+    write(
+        dir,
+        "ddl/table/core/customers.ddl",
+        "set search_path to core;\ncreate table if not exists customers (id integer primary key);\n",
+    );
+    write(
+        dir,
+        "ddl/materialized_view/other/thing_counts.ddl",
+        "set search_path to other;\ncreate materialized view if not exists thing_counts as \
+         select count(*) from missing_table;\n",
+    );
+}
+
+/// Errors outside a scope were already kept apart from the scope's own; the
+/// warnings were not, so `inspect --scope coreonly` listed and counted a
+/// warning for a matview `coreonly` never builds.
+#[test]
+fn inspect_under_a_scope_counts_only_the_scopes_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    warned_outside_core_project(tmp.path());
+
+    let whole = stdout(&dbd(tmp.path(), &["inspect"]));
+    assert!(
+        whole.contains("thing_counts.ddl") && whole.contains("1 warning"),
+        "precondition: unscoped, the matview's warning is the design's: {whole}"
+    );
+
+    let out = dbd(tmp.path(), &["inspect", "--scope", "coreonly"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!text.contains("thing_counts.ddl"), "not listed as the scope's: {text}");
+    assert!(
+        text.contains("2 entities — no issues"),
+        "nor counted as the scope's: {text}"
+    );
+    assert!(
+        text.contains("1 warning(s) outside scope 'coreonly'"),
+        "but not hidden either — tallied as outside the scope: {text}"
+    );
+}
+
 // ── one count for one scope ─────────────────────────────────────────────────
 
 /// A `deps: include` scope whose closure adds an entity, an `extensions: []`
@@ -383,6 +629,8 @@ fn summary_count(text: &str) -> Option<usize> {
 /// inspect counted the scope before its dependency closure, apply did not
 /// print a scope line at all, combine and dbml counted externals and every
 /// extension the allowlist drops. Four numbers for one scope; there is one.
+/// And `emit`, `reset`, `policies`, `import` and `diagram` printed none, so a
+/// scoped run read exactly like the whole design's.
 #[test]
 fn every_command_counts_a_scope_the_same_way() {
     let tmp = tempfile::tempdir().unwrap();
@@ -390,6 +638,8 @@ fn every_command_counts_a_scope_the_same_way() {
     counted_scope_project(dir);
     let combined = dir.join("combined.sql");
     let dbml = dir.join("schema.dbml");
+    let emitted = dir.join("emitted.sql");
+    let model = dir.join("schema.json");
 
     let apply = dbd(dir, &["apply", "--dry-run", "--scope", "hub_edges"]);
     let applied = summary_count(&stdout(&apply)).expect("apply --dry-run prints a summary");
@@ -413,6 +663,47 @@ fn every_command_counts_a_scope_the_same_way() {
         (
             "deploy --dry-run",
             dbd(dir, &["deploy", "--dry-run", "--scope", "hub_edges"]),
+        ),
+        (
+            "emit",
+            dbd(
+                dir,
+                &[
+                    "emit",
+                    "--dialect",
+                    "sqlite",
+                    "--scope",
+                    "hub_edges",
+                    "-f",
+                    emitted.to_str().unwrap(),
+                ],
+            ),
+        ),
+        (
+            "reset --dry-run",
+            dbd(dir, &["reset", "--dry-run", "--scope", "hub_edges"]),
+        ),
+        (
+            "policies --dry-run",
+            dbd(dir, &["policies", "--dry-run", "--scope", "hub_edges"]),
+        ),
+        (
+            "import --dry-run",
+            dbd(dir, &["import", "--dry-run", "--scope", "hub_edges"]),
+        ),
+        (
+            "diagram --json",
+            dbd(
+                dir,
+                &[
+                    "diagram",
+                    "--json",
+                    "--scope",
+                    "hub_edges",
+                    "-f",
+                    model.to_str().unwrap(),
+                ],
+            ),
         ),
     ];
     for (cmd, out) in &runs {
@@ -466,6 +757,10 @@ fn an_unknown_name_is_an_error_on_every_command_that_takes_one() {
         &["graph", "-n", "app.nope"],
         &["refresh", "-n", "app.nope"],
         &["export", "-n", "app.nope"],
+        &["import", "--dry-run", "-n", "app.nope"],
+        // Refused before connecting: no DATABASE_URL is set, so a refusal that
+        // waited for the adapter would report the connection instead.
+        &["import", "-n", "app.nope"],
     ] {
         let out = dbd(tmp.path(), args);
         assert!(!out.status.success(), "{args:?} must fail: {}", stdout(&out));

@@ -46,6 +46,12 @@ pub struct ApplyComplete {
     /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
     /// Realtime must say so, not report a clean success.
     pub warnings: Vec<String>,
+    /// For a [`ApplyStrategy::Fresh`] run: whether the database was already
+    /// built before it — dbd had applied it without a version, or the design's
+    /// objects were already there. A database with no recorded version is not
+    /// necessarily empty, and calling this run a fresh install said it was.
+    /// Always `false` for the other strategies.
+    pub previously_built: bool,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
@@ -109,19 +115,26 @@ impl DeployComplete {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.apply.warnings.clone();
         out.extend(self.import.warnings.iter().cloned());
-        out.extend(
-            self.policies
-                .failed
-                .iter()
-                .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
-        );
-        out.extend(
-            self.policies
-                .skipped
-                .iter()
-                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
-        );
+        out.extend(self.policy_warnings());
         out
+    }
+
+    /// The policy phase's share of [`Self::warnings`]: one line per failed
+    /// policy file, then one per policy a scope excluded. Apart, so a caller
+    /// reporting phase by phase can print them after the policy phase's own
+    /// line rather than before it.
+    pub fn policy_warnings(&self) -> Vec<String> {
+        let failed = self
+            .policies
+            .failed
+            .iter()
+            .map(|(file, err)| format!("policy not applied: {} — {err}", file.display()));
+        let skipped = self
+            .policies
+            .skipped
+            .iter()
+            .map(|(file, why)| format!("policy skipped: {} — {why}", file.display()));
+        failed.chain(skipped).collect()
     }
 }
 
@@ -293,7 +306,14 @@ pub struct Report {
     /// reported, because a file that no scope builds is how a broken file goes
     /// unnoticed. Always empty without a scope, or under `all`.
     pub out_of_scope_issues: Vec<Entity>,
+    /// Entities with warnings that the active scope builds — all of them
+    /// without a scope, or under `all`.
     pub warnings: Vec<Entity>,
+    /// Entities with warnings that the active scope excludes, kept apart like
+    /// [`Self::out_of_scope_issues`]: listed and counted as the scope's, a
+    /// warning in a file the scope never builds read as something to fix
+    /// before the scoped run.
+    pub out_of_scope_warnings: Vec<Entity>,
     pub gaps: Vec<crate::scope::ScopeGap>,
 }
 
@@ -301,9 +321,12 @@ pub struct Report {
 #[derive(Debug, Clone)]
 pub struct ImportPlanEntry {
     pub table: Entity,
-    /// Procedure that reads from this staging table (matched by reads analysis).
+    /// The loader CALLed once the data files are loaded (picked by
+    /// `Design::import_plan`). A table with two data files has it on its first
+    /// entry only — it is called once, over the rows of both.
     pub procedure: Option<String>,
-    /// Config tables the procedure writes to.
+    /// The tables the table's loader writes — on every entry of the table, so a
+    /// scope judges its data files alike.
     pub writes: Vec<String>,
 }
 
@@ -1009,15 +1032,18 @@ impl Design {
         // report agrees with what a run would actually refuse on. Reporting an
         // out-of-scope parse error as blocking sends people to fix a file the
         // scoped run never reads.
-        let (issues, out_of_scope_issues) = match scope {
+        let ((issues, out_of_scope_issues), (warnings, out_of_scope_warnings)) = match scope {
             Some(s) if !s.is_all => match self.working_set(s) {
-                Ok(ws) => all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                Ok(ws) => (
+                    all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                    warnings.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                ),
                 // Working set unavailable: treat every error as blocking. The
                 // conservative direction — a spurious error is a nuisance, a
                 // hidden one is the failure this reporting exists to prevent.
-                Err(_) => (all_issues, Vec::new()),
+                Err(_) => ((all_issues, Vec::new()), (warnings, Vec::new())),
             },
-            _ => (all_issues, Vec::new()),
+            _ => ((all_issues, Vec::new()), (warnings, Vec::new())),
         };
 
         let gaps = match scope {
@@ -1030,6 +1056,7 @@ impl Design {
             issues,
             out_of_scope_issues,
             warnings,
+            out_of_scope_warnings,
             gaps,
         }
     }
@@ -2008,6 +2035,62 @@ import:
         );
     }
 
+    /// A role the design granted on a schema cannot be dropped while it holds
+    /// the grant: `role "app_writer" cannot be dropped because some objects
+    /// depend on it — privileges for schema app, default privileges …`, and the
+    /// whole default reset rolled back. Reset revokes what dbd granted — the
+    /// `schemas:` grants and the target's `grants:`, default privileges
+    /// included — on every schema that survives, before it drops the role. A
+    /// schema `--schemas` drops takes its grants with it, and a role the design
+    /// does not declare is not dropped, so neither needs a revoke.
+    #[test]
+    fn reset_revokes_the_designs_grants_on_surviving_schemas_before_dropping_its_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+             \x20       web_anon: [usage, select]\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+             \x20   grants:\n      app:\n        app_reader: [usage, select]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let sql = design.reset_script("postgres", false, false, None).unwrap().unwrap();
+        for (role, perms) in [("app_writer", "SELECT, INSERT"), ("app_reader", "SELECT")] {
+            let drop = sql
+                .find(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .unwrap_or_else(|| panic!("{role} is dropped: {sql}"));
+            for revoke in [
+                format!("REVOKE USAGE ON SCHEMA \"app\" FROM \"{role}\";"),
+                format!("REVOKE {perms} ON ALL TABLES IN SCHEMA \"app\" FROM \"{role}\";"),
+                format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"app\" REVOKE {perms} ON TABLES FROM \"{role}\";"),
+            ] {
+                let at = sql
+                    .find(&revoke)
+                    .unwrap_or_else(|| panic!("missing `{revoke}`:\n{sql}"));
+                assert!(at < drop, "`{revoke}` must run before {role} is dropped:\n{sql}");
+            }
+        }
+        assert!(
+            !sql.contains("FROM \"web_anon\""),
+            "a role the design does not declare is not dropped, so its grants stay:\n{sql}"
+        );
+
+        let clean = design.reset_script("postgres", true, false, None).unwrap().unwrap();
+        assert!(
+            !clean.contains("REVOKE"),
+            "`--schemas` drops app, and its grants with it:\n{clean}"
+        );
+    }
+
     #[tokio::test]
     async fn reset_blocked_in_prod() {
         let config_path = fixture_dir().join("design.yaml");
@@ -2017,6 +2100,61 @@ import:
         let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prod"));
+    }
+
+    /// `combine` writes the script `apply` would run. Apply adds `public` to every
+    /// `SET search_path` (so an extension installed there resolves); combine
+    /// wrote the files as they were, and `psql -f init.sql` failed where apply
+    /// succeeded.
+    #[test]
+    fn combine_writes_the_search_path_apply_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        assert!(sql.contains("set search_path to app, public;"), "{sql}");
+    }
+
+    /// A scope that keeps an extension but excludes the schema it installs into
+    /// contradicts itself: `inspect` passed it and apply failed with `schema
+    /// "ext" does not exist`. Refused where the scope is resolved, so every
+    /// command says so.
+    #[test]
+    fn a_scope_that_excludes_its_extensions_schema_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/core")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - ext\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: citext\n        schema: ext\n\
+             scopes:\n  contradicts:\n    includes: [core]\n    excludes: [ext]\n  consistent:\n    includes: [core]\n\
+             \x20   excludes: [ext]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let err = design.resolve_scope(Some("contradicts"), None).unwrap_err().to_string();
+        assert!(
+            err.contains("citext") && err.contains("ext"),
+            "names the extension and its schema: {err}"
+        );
+        design
+            .resolve_scope(Some("consistent"), None)
+            .expect("excluding the schema is fine when the scope installs no extension into it");
     }
 
     /// An extension installed `WITH SCHEMA x` needs `x`. Every scope keeps the
@@ -2059,6 +2197,57 @@ import:
             !names("bare").contains(&"extensions".to_string()),
             "a scope installing no extension needs no extension schema: {:?}",
             names("bare")
+        );
+    }
+
+    /// A scope skips a hook only for what the design manages outside it. A hook
+    /// touching an `external:` table — or one it creates itself — was skipped
+    /// under every named scope, because the working set never holds such names;
+    /// the apply then failed on the schema that hook was there to prepare.
+    #[tokio::test]
+    async fn a_scoped_apply_runs_hooks_that_touch_only_what_the_design_does_not_manage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/table/billing", "sql"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\n  - billing\nexternal:\n  - name: auth.users\n\
+             apply:\n  before:\n    - sql/auth.sql\n    - sql/billing.sql\n\
+             scopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/auth.sql"),
+            "create schema if not exists auth;\ncreate table if not exists auth.users (id uuid primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/billing.sql"),
+            "insert into billing.invoices (id) values (1);\n",
+        )
+        .unwrap();
+        for (schema, table) in [("app", "items"), ("billing", "invoices")] {
+            std::fs::write(
+                dir.join(format!("ddl/table/{schema}/{table}.ddl")),
+                format!("set search_path to {schema};\ncreate table if not exists {table} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+        let mock = MockAdapter::new();
+        design
+            .apply(&mock, None, false, Some(&scope), Progress::none())
+            .await
+            .unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(scripts.contains("auth.users"), "the external's hook runs: {scripts}");
+        assert!(
+            !scripts.contains("billing.invoices"),
+            "a hook on a managed table outside the scope does not: {scripts}"
         );
     }
 
@@ -2542,36 +2731,83 @@ import:
         );
     }
 
-    /// A `--name` that matches no staging file is a typo, and must not look
-    /// like an empty-but-healthy import.
+    /// A `-n` that names nothing is a typo. The import reported it as a
+    /// warning and carried on — exiting 0 and running every `import.after`
+    /// hook — so a mistyped name still ran the project's loader script. It is
+    /// refused before anything runs, in the words every other command uses for
+    /// a name that matches nothing.
     #[tokio::test]
-    async fn import_warns_when_name_filter_matches_nothing() {
+    async fn an_unknown_import_name_is_refused_before_anything_runs() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
+        assert!(
+            !design.config().import.after.is_empty(),
+            "precondition: the fixture declares an import.after hook"
+        );
 
         let mock = MockAdapter::new();
-        let mut summary: Option<ImportComplete> = None;
-        design
-            .import_data(
-                &mock,
-                Some("staging.does_not_exist"),
-                true,
-                None,
-                Progress {
-                    on_start: |_: &str| {},
-                    on_done: |_: &str, _: Option<&str>| {},
-                    on_complete: |s| summary = Some(s),
-                },
-            )
+        let err = design
+            .import_data(&mock, Some("staging.does_not_exist"), false, None, Progress::none())
             .await
-            .unwrap();
+            .expect_err("an unknown -n must be refused");
 
-        let summary = summary.expect("import must always report a summary");
-        assert_eq!(summary.tables, 0);
         assert!(
-            summary.warnings.iter().any(|w| w.contains("does_not_exist")),
-            "an unmatched --name must be reported: {:?}",
-            summary.warnings
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "nothing may run — no truncate, no CALL, no import.after hook: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "no data file may load");
+    }
+
+    /// The plan every preview prints is refused the same way, so a dry run
+    /// cannot accept a name the real run refuses.
+    #[test]
+    fn an_unknown_import_name_is_refused_by_the_plan() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        let err = design
+            .scoped_import_plan(Some("staging.does_not_exist"), None)
+            .expect_err("an unknown -n must be refused");
+        assert!(
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+    }
+
+    /// A table the design declares but has no data file for selects nothing to
+    /// load either. "No entity named" would be false, so the refusal says what
+    /// is actually missing.
+    #[test]
+    fn an_import_name_without_a_data_file_is_refused_naming_what_is_missing() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        assert!(
+            design.entities().iter().any(|e| e.name == "config.lookups"),
+            "precondition: config.lookups is a declared table"
+        );
+        let err = design
+            .scoped_import_plan(Some("config.lookups"), None)
+            .expect_err("a name with no data file selects nothing");
+        let msg = err.to_string();
+        assert!(msg.contains("config.lookups") && msg.contains("no data file"), "{msg}");
+    }
+
+    /// The wrong-`-e` case: the file exists, under another env's folder. The
+    /// refusal names it, since that is the one thing that tells the user what
+    /// to change.
+    #[test]
+    fn an_import_name_whose_file_belongs_to_another_env_says_which_file() {
+        let tmp = project_with_import_files(&[("dev/staging/seed.csv", "id\n1\n")]);
+        let design = load_project(tmp.path(), "prod");
+        let err = design
+            .scoped_import_plan(Some("staging.seed"), None)
+            .expect_err("a file of another env is not this run's to load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/dev/staging/seed.csv") && msg.contains("'prod'"),
+            "{msg}"
         );
     }
 
@@ -2733,6 +2969,45 @@ import:
         assert!(
             drops(&plan).is_empty(),
             "a schema the scope does not occupy is not its to drop in"
+        );
+    }
+
+    /// The drop a snapshot writes is the drop apply runs. `dbd snapshot` writes a
+    /// dropped table's statement to `<schema>/<table>.sql`; apply looked for
+    /// `<table>.drop.sql`, found nothing, and still counted the drop and
+    /// recorded the migration — the table outlived its removal from the design
+    /// on every database. Driven through the real snapshot, not a hand-written
+    /// file, so the two sides cannot disagree about the name again.
+    #[tokio::test]
+    async fn a_table_removed_from_the_design_is_dropped_by_the_next_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        let config = dir.join("design.yaml");
+        std::fs::write(&config, "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        for t in ["users", "legacy"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let load = || Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "baseline").unwrap();
+        std::fs::remove_file(dir.join("ddl/table/app/legacy.ddl")).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "drop legacy").unwrap();
+
+        let design = load();
+        assert_eq!(design.config().project.version, Some(2), "the second snapshot is v2");
+        let mock = MockAdapter::new()
+            .with_meta("dev", 1)
+            .with_known_entities(["app.legacy"]);
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("DROP TABLE"),
+            "the v2 drop of app.legacy runs: {scripts}"
         );
     }
 
