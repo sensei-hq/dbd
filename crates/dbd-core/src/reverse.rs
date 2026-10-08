@@ -470,6 +470,14 @@ impl Declared {
             })
             .filter(|(schema, _)| !selected.iter().any(|s| s == schema))
             .map(|(schema, table)| format!("{schema}.{table}"))
+            // And what the source itself says is not the project's: a stub a
+            // DBML document stands in for, whatever schema it is in.
+            .chain(
+                entities
+                    .iter()
+                    .filter(|e| e.entity_type == EntityType::External)
+                    .map(|e| e.name.clone()),
+            )
             .collect();
         externals.sort();
         externals.dedup();

@@ -847,6 +847,20 @@ struct StubTarget<'a> {
     keys: Vec<Vec<&'a str>>,
 }
 
+/// The note on a stub `Table` — one per reason the document does not define
+/// the table. [`crate::dbml_parse`] reads a table carrying one back as
+/// `external:`, not as a table to build: written as one, `init --from-dbml`
+/// made a one-column copy of somebody else's table for the next apply.
+pub(crate) const STUB_EXTERNAL_NOTE: &str = "External entity — managed outside this project";
+pub(crate) const STUB_OUT_OF_DOCUMENT_NOTE: &str =
+    "Defined in this project, outside this document — only the referenced columns are shown";
+pub(crate) const STUB_UNDEFINED_NOTE: &str = "Referenced, but not defined in this project";
+
+/// Whether `note` marks a stub `dbd dbml` wrote.
+pub(crate) fn is_stub_note(note: &str) -> bool {
+    [STUB_EXTERNAL_NOTE, STUB_OUT_OF_DOCUMENT_NOTE, STUB_UNDEFINED_NOTE].contains(&note.trim())
+}
+
 /// `schema.table` for an entity, as the document's `Table` and `Ref` lines
 /// name it.
 fn qualified_name(entity: &Entity) -> String {
@@ -901,9 +915,9 @@ fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enum
     lines.extend(emit_indexes(&keys).into_iter().map(|line| format!("    {line}")));
     lines.push("  }".to_string());
     let note = match known.map(|e| e.entity_type) {
-        Some(EntityType::External) => "External entity — managed outside this project",
-        Some(_) => "Defined in this project, outside this document — only the referenced columns are shown",
-        None => "Referenced, but not defined in this project",
+        Some(EntityType::External) => STUB_EXTERNAL_NOTE,
+        Some(_) => STUB_OUT_OF_DOCUMENT_NOTE,
+        None => STUB_UNDEFINED_NOTE,
     };
     lines.push(String::new());
     lines.push(format!("  Note: {}", dbml_string(note)));
@@ -1784,18 +1798,17 @@ mod tests {
             auto_group_by_schema: false,
         });
 
-        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap();
-        let stub = parsed.iter().find(|e| e.name == "auth.users").expect("stub read back");
-        let unique: Vec<Vec<&str>> = stub
-            .table_def
-            .as_ref()
-            .unwrap()
-            .indexes
-            .iter()
-            .filter(|ix| ix.unique)
-            .map(|ix| ix.columns.iter().map(|c| c.name.as_str()).collect())
+        // Read from the stub's own block: dbd's reader takes a stub back as
+        // `external:`, so this is what `dbml2sql` — which builds it — sees.
+        let start = doc.content.find("Table \"auth\".\"users\" {").expect("a stub");
+        let stub = &doc.content[start..];
+        let stub = &stub[..stub.find("\n}").unwrap()];
+        let unique: Vec<&str> = stub
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.ends_with("[unique]"))
             .collect();
-        assert_eq!(unique, [vec!["id"], vec!["tenant", "id"]], "{}", doc.content);
+        assert_eq!(unique, ["id [unique]", "(tenant, id) [unique]"], "{}", doc.content);
     }
 
     #[test]

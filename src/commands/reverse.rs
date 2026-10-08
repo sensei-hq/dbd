@@ -577,6 +577,9 @@ fn db_schemas(entities: &[dbd_core::Entity]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e.entity_type {
             dbd_core::EntityType::Schema => Some(e.name.clone()),
+            // An external is somebody else's table; its schema is not the
+            // database's to capture.
+            dbd_core::EntityType::External => None,
             _ => e.schema.clone(),
         })
         .collect();

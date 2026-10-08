@@ -59,6 +59,8 @@ struct Parser<'a> {
     pos: usize,
     tables: Vec<Entity>,
     enums: Vec<Entity>,
+    /// The stubs `dbd dbml` wrote, read back as what they stand for.
+    externals: Vec<Entity>,
     refs: Vec<PendingRef>,
     /// Distinct schemas seen, in first-seen order.
     schemas: Vec<String>,
@@ -71,6 +73,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             tables: Vec::new(),
             enums: Vec::new(),
+            externals: Vec::new(),
             refs: Vec::new(),
             schemas: Vec::new(),
         }
@@ -128,6 +131,7 @@ impl<'a> Parser<'a> {
         }
         out.append(&mut self.enums);
         out.append(&mut self.tables);
+        out.append(&mut self.externals);
         Ok(out)
     }
 
@@ -280,6 +284,16 @@ impl<'a> Parser<'a> {
         constraints.append(&mut uniques);
         constraints.append(&mut checks);
 
+        // A stub `dbd dbml` wrote stands in for a table this document does not
+        // define, and is declared, not built — its schema with it.
+        if table_note.as_deref().is_some_and(crate::dbml::is_stub_note) {
+            let mut external = Entity::new(EntityType::External, &qualified);
+            external.schema = Some(schema);
+            self.externals.push(external);
+            return Ok(());
+        }
+        self.note_schema(&schema);
+
         let comments = Self::table_comments_from(table_note, &columns);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -295,16 +309,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a table header line into `(schema, base)`, stripping the leading
-    /// keyword, an inline `{`, and any trailing `[settings]`; notes the schema.
-    fn parse_table_header(&mut self, header: &str) -> Result<(String, String)> {
+    /// keyword, an inline `{`, and any trailing `[settings]`. The schema is
+    /// noted by the caller, once it knows the table is not a stub.
+    fn parse_table_header(&self, header: &str) -> Result<(String, String)> {
         let after_kw = header.get(first_word(header).len()..).unwrap_or("").trim();
         let name_part = after_kw.split('{').next().unwrap_or("").trim();
         // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
         // strip a trailing settings group from the name part.
         let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
-        let (schema, base) = parse_qualified_name(name_only)?;
-        self.note_schema(&schema);
-        Ok((schema, base))
+        parse_qualified_name(name_only)
     }
 
     /// Assemble a table's `TableComments` from its `note` plus per-column notes
@@ -398,8 +411,9 @@ impl<'a> Parser<'a> {
                 on_delete: p.on_delete,
                 on_update: p.on_update,
             });
-            self.note_schema(&p.src_schema);
-            self.note_schema(&p.tgt_schema);
+            // No schema is noted here: each end's table notes its own when the
+            // document defines it, and a schema only a Ref names holds a table
+            // the document does not define — not one the project builds.
         }
         self.pos += 1;
         Ok(())
