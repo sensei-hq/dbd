@@ -30,7 +30,8 @@ Reconcile only diffs within the schemas the design declares, so it never touches
 schemas. Two kinds of destruction each need their own opt-in:
 
 - **`--allow-destructive`** — drop a *column* or constraint from a managed table, or remove a
-  *value* from an enum (the type is recreated; dependent managed views are dropped and re-applied).
+  *value* from an enum (the type is recreated; the managed views over a table with a column of
+  the enum are dropped and re-applied, and nothing else is dropped).
 - **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
   design (an orphan). Without `--prune`, orphans are reported and left in place. Under
   `--scope`, a table the design declares outside the scope is not an orphan — a scope narrows
@@ -41,6 +42,10 @@ schemas. Two kinds of destruction each need their own opt-in:
   `public`.
 
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
+
+Reconcile is not one transaction: it writes in the dependency order `apply` uses, each step
+committing as it runs, so a step that fails stops the run with the earlier steps applied. Fix the
+cause and run it again — what is already in place is no longer drift.
 
 **Cut v1 with `dbd release`.** When the schema stabilizes, `dbd release` (alias `dbd baseline`)
 writes a baseline snapshot at the current version and flips `project.released: true`:
