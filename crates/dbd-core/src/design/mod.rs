@@ -2095,12 +2095,23 @@ import:
 
     #[tokio::test]
     async fn apply_repins_scope_on_current_strategy() {
-        // A DB already at/above the latest version takes the Current strategy,
-        // whose plan has no SetVersion step. The scope must still be (re)pinned.
-        let config_path = fixture_dir().join("design.yaml");
-        let design = Design::from_config(&config_path, "dev").unwrap();
-        // db_version 99 >= any fixture latest_version → Current strategy.
-        let mock = MockAdapter::new().with_meta("dev", 99).with_scope("public");
+        // A DB already at the latest version takes the Current strategy, whose
+        // plan has no SetVersion step. The scope must still be (re)pinned. (A
+        // DB *above* the design's version is refused by the version guard.)
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\n  version: 7\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new().with_meta("dev", 7).with_scope("public");
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
@@ -2109,9 +2120,9 @@ import:
             .unwrap();
 
         let meta = mock.get_project_meta().await.unwrap().expect("meta");
-        // Re-pinned to the applied scope, and the version was preserved (not downgraded).
+        // Re-pinned to the applied scope, and the version was preserved.
         assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
-        assert_eq!(meta.version, 99);
+        assert_eq!(meta.version, 7);
     }
 
     /// `reset --clean` drops what the project installs: every role the design
