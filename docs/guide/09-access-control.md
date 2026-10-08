@@ -74,6 +74,19 @@ schemas the scope builds are applied — a grant on a schema that database was
 never given would fail the run — and on a `supabase` target the PostgREST
 `USAGE` grants below are narrowed the same way.
 
+### When they are revoked
+
+A full `dbd reset` on a `postgres` target drops the roles the design declares,
+and PostgreSQL refuses to drop a role that still holds a privilege. So before
+the `DROP ROLE`s, reset revokes exactly what `apply` granted those roles — the
+`USAGE`, the table privileges and the `ALTER DEFAULT PRIVILEGES` entry, from the
+same merged `schemas:` and target `grants:` — on every schema that survives the
+reset. The default-privileges entry it can revoke is the one set by the user
+running the reset; run reset as the user that ran `apply`. A role that still
+holds anything dbd did not grant fails the reset with an error naming the role
+and what it holds, and dbd never runs `DROP OWNED BY`. See
+[`dbd reset`](04-commands.md#dbd-reset).
+
 ### PostgREST on Supabase
 
 When the first target is named `supabase` and the design declares any grants,
@@ -158,3 +171,9 @@ A file off that layout has no derivable table and always applies.
 `dbd policies --dry-run` applies the same filter, listing what would apply and
 what it would skip. Scope filtering is a correctness aid, not a security
 boundary.
+
+`dbd policies` also runs the [scope guard](07-scopes.md#the-scope-guard): on a
+database pinned to `hub`, an unscoped run — or one under any other scope — is
+refused rather than securing tables that database was not built with. It has no
+`--allow-scope-change`, because it never re-pins; run it under the pinned scope,
+or re-point the database with `dbd apply --allow-scope-change` first.
