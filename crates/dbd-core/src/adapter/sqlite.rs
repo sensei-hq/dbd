@@ -1362,12 +1362,15 @@ mod tests {
             let file = out.path().join(format!("g.{format}"));
             let body = std::fs::read_to_string(&file).unwrap();
             let first = body.lines().next().unwrap_or_default();
-            let expected = match format {
-                "csv" => "id,a",
-                "tsv" => "id\ta",
-                _ => r#"{"id":1,"a":10}"#,
-            };
-            assert_eq!(first, expected, "{format}: only the columns an import can write");
+            match format {
+                "csv" => assert_eq!(first, "id,a", "only the columns an import can write"),
+                "tsv" => assert_eq!(first, "id\ta", "only the columns an import can write"),
+                _ => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(first).unwrap(),
+                    serde_json::json!({"id": 1, "a": 10}),
+                    "jsonl: only the columns an import can write"
+                ),
+            }
 
             let b = mem().await;
             b.execute_script(DDL).await.unwrap();
