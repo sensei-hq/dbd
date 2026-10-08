@@ -1254,6 +1254,54 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
 }
 
+// ── a renamed project.name does not lift the guards ─────────────────────────
+
+/// The audit's repro, through the binary: a production database pinned to
+/// `hub`, then `project.name` renamed. Every guard read the record by name, so
+/// `reset` with no `--force` dropped the tables, a dev run passed the env
+/// guard, and an unscoped apply passed the scope pin. Each — and the dry runs
+/// that check the same guards — must be refused, naming the project the
+/// database records and the likely rename. `--force` and
+/// `--allow-scope-change` are honoured as they are on the project's own mark.
+#[tokio::test]
+async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml.replace("name: scoped", "name: renamed")).unwrap();
+
+    for args in [
+        &["reset", "--scope", "hub"][..],
+        &["reset", "--scope", "hub", "--dry-run"],
+        &["-e", "dev", "apply", "--scope", "hub"],
+        &["apply"],
+        &["apply", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(
+            !o.status.success(),
+            "{args:?} must be refused for the renamed project: {}",
+            combined(&o)
+        );
+        assert!(
+            combined(&o).contains("'scoped'") && combined(&o).contains("project.name"),
+            "{args:?} names the project the database records, and the likely rename: {}",
+            combined(&o)
+        );
+    }
+    assert_eq!(schemas_of(&pg, &url, "nodes"), "hub", "the reset dropped nothing");
+
+    let o = dbd(dir, &url, &["reset", "--scope", "hub", "--dry-run", "--force"]);
+    assert!(o.status.success(), "--force is honoured: {}", combined(&o));
+    let o = dbd(dir, &url, &["apply", "--dry-run", "--allow-scope-change"]);
+    assert!(o.status.success(), "--allow-scope-change is honoured: {}", combined(&o));
+}
+
 // ── init --from-db writes a project that applies ────────────────────────────
 
 /// A database with every kind of object `init --from-db` captures.

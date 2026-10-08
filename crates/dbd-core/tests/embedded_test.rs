@@ -66,6 +66,16 @@ async fn assert_catalog(adapter: &dyn dbd_core::DatabaseAdapter, should_exist: b
         .unwrap_or_else(|e| panic!("assert_catalog({subject}) failed: {e}"));
 }
 
+/// Whether `predicate` finds anything — [`assert_catalog`]'s check, as a value.
+async fn catalog_holds(adapter: &dyn dbd_core::DatabaseAdapter, predicate: &str) -> bool {
+    adapter
+        .execute_script(&format!(
+            "DO $$ BEGIN IF NOT EXISTS ( {predicate} ) THEN RAISE EXCEPTION 'absent'; END IF; END $$"
+        ))
+        .await
+        .is_ok()
+}
+
 fn table_predicate(schema: &str, table: &str) -> String {
     format!("SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = '{schema}' AND tablename = '{table}'")
 }
@@ -5912,6 +5922,157 @@ async fn a_database_marked_dev_may_be_promoted_to_prod() {
 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod");
+}
+
+// ── A renamed project is held to the record its old name left ────────────────
+
+/// A design named `name` at `version` (0: unversioned) over the one schema
+/// `schema`, with a dev seed file — written into its own directory.
+fn named_design(dir: &std::path::Path, name: &str, version: u32, schema: &str, env: &str) -> Design {
+    let version = match version {
+        0 => String::new(),
+        v => format!("  version: {v}\n"),
+    };
+    write_project(
+        dir,
+        &format!("project:\n  name: {name}\n{version}source:\n  dialect: postgresql\nschemas:\n  - {schema}\n"),
+        &[
+            (
+                &format!("ddl/table/{schema}/items.ddl"),
+                &format!(
+                    "set search_path to {schema};\ncreate table if not exists items (id int primary key, name text);\n"
+                ),
+            ),
+            (&format!("import/dev/{schema}/items.csv"), "id,name\n1,dev-seed\n"),
+        ],
+    );
+    Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).expect("load design")
+}
+
+/// The audit's repro. Every guard read the database's record by
+/// `project.name` alone, so a renamed design read a production database
+/// another name had built as one dbd had never seen: `reset`, with no
+/// `--force`, dropped every table; a dev run passed the environment guard and
+/// loaded dev seed data; an older revision passed the version guard. The
+/// database still holds the design's objects and the old name's record of
+/// them, so those marks are the guards' marks — refused, naming the project
+/// the database does record and the likely rename — and `--force` still
+/// overrides the reset guard, as it does for the project's own mark.
+#[tokio::test]
+async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
+    let (pg, _url) = start_pg().await;
+    let (old, new, older) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let alpha = named_design(old.path(), "alpha", 2, "app", "prod");
+    // The same project, renamed — and a revision of it behind the database.
+    let prod = named_design(new.path(), "alpha2", 2, "app", "prod");
+    let dev = named_design(new.path(), "alpha2", 2, "app", "dev");
+    let behind = named_design(older.path(), "alpha2", 1, "app", "prod");
+
+    // Each run against a database of its own, built by `alpha` at v2 and
+    // marked prod, so what one run writes cannot decide another's outcome.
+    let mut failures: Vec<String> = Vec::new();
+    for (i, run) in ["reset", "a dev apply", "a dev import", "an older revision's apply"]
+        .into_iter()
+        .enumerate()
+    {
+        let db = format!("renamed{i}");
+        pg.create_database(&db).await.unwrap();
+        let url = pg.settings().url(&db);
+        let built = connect(&url, "alpha").await.unwrap();
+        alpha
+            .apply(&*built, None, false, None, Progress::none())
+            .await
+            .expect("alpha's prod apply");
+
+        let renamed = connect(&url, "alpha2").await.unwrap();
+        let err = match run {
+            "reset" => prod.reset(&*renamed, "postgres", false, false, false, None).await.err(),
+            "a dev apply" => dev.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+            "a dev import" => dev
+                .import_data(&*renamed, None, false, None, Progress::none())
+                .await
+                .err(),
+            _ => behind.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+        };
+        // Refused, naming the project the database records and the likely
+        // rename. Collected, so one run's failure does not hide another's.
+        match err.map(|e| e.to_string()) {
+            None => failures.push(format!("{run} of the renamed project was not refused")),
+            Some(e) if !(e.contains("'alpha'") && e.contains("project.name")) => {
+                failures.push(format!("{run} did not name 'alpha' and project.name: {e}"))
+            }
+            Some(_) => {}
+        }
+
+        // And nothing written: the tables kept, no dev seed data, no record
+        // made of the renamed project.
+        if !catalog_holds(&*built, &table_predicate("app", "items")).await {
+            failures.push(format!("{run} dropped app.items"));
+        } else if catalog_holds(&*built, "SELECT 1 FROM app.items WHERE name = 'dev-seed'").await {
+            failures.push(format!("{run} loaded dev seed data into the prod database"));
+        }
+        if renamed.get_project_meta().await.unwrap().is_some() {
+            failures.push(format!("{run} recorded the renamed project"));
+        }
+
+        if run == "reset" {
+            prod.reset(&*renamed, "postgres", true, false, false, None)
+                .await
+                .expect("--force overrides the reset guard, as it does on the project's own mark");
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// More than one project may share a database, each with its own record. A
+/// project's guards read its own record, and another project's only when the
+/// database holds this project's objects with no record of it — a rename.
+/// So a second project builds, runs dev, resets and rebuilds beside a
+/// production one at a higher version, and the production one stays guarded.
+#[tokio::test]
+async fn two_projects_in_one_database_are_each_guarded_by_their_own_record() {
+    let (_pg, url) = start_pg().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_prod = named_design(a_dir.path(), "first", 3, "app", "prod");
+    let a_dev = named_design(a_dir.path(), "first", 3, "app", "dev");
+    let b_dev = named_design(b_dir.path(), "second", 0, "bee", "dev");
+    let a = connect(&url, "first").await.unwrap();
+    let b = connect(&url, "second").await.unwrap();
+
+    a_prod
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect("the first project's prod apply");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("a second project's first dev apply, below the first's version");
+    b_dev
+        .import_data(&*b, None, false, None, Progress::none())
+        .await
+        .expect("its dev seed data");
+    b_dev
+        .reset(&*b, "postgres", false, false, false, None)
+        .await
+        .expect("its unforced reset: its own record is dev and unversioned");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("and its dev rebuild");
+
+    assert_table_exists(&*a, "app", "items").await;
+    a_dev
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect_err("the first project's own prod mark still refuses a dev run");
+    a_prod
+        .reset(&*a, "postgres", false, false, false, None)
+        .await
+        .expect_err("and an unforced reset");
 }
 
 // ── A brownfield matview is adopted only when it is the design's ──────────────

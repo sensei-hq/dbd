@@ -1105,6 +1105,51 @@ mod tests {
         assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
     }
 
+    /// `_dbd_meta` is keyed on `project.name` as `dbd.meta` is, and a renamed
+    /// design read a production SQLite database as one it had never seen:
+    /// `reset` with no `--force` dropped its tables. The database holds the
+    /// design's tables and only another name's record of them, so that record
+    /// is the guard's mark.
+    #[tokio::test]
+    async fn s11_a_renamed_project_is_held_to_the_record_its_old_name_left() {
+        use crate::design::{Design, Progress};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let url = format!("sqlite://{}", dir.join("app.db").display());
+        std::fs::write(dir.join("app.db"), "").unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table")).unwrap();
+        std::fs::write(
+            dir.join("ddl/table/items.ddl"),
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+        )
+        .unwrap();
+        let design = |name: &str| {
+            std::fs::write(
+                dir.join("design.yaml"),
+                format!("project:\n  name: {name}\nsource:\n  dialect: sqlite\nschemas: []\n"),
+            )
+            .unwrap();
+            Design::from_config_with_dir(&dir.join("design.yaml"), "prod", Some(dir)).unwrap()
+        };
+
+        let alpha = design("alpha");
+        let built = SqliteAdapter::new(&url, "alpha").await.unwrap();
+        alpha
+            .apply(&built, None, false, None, Progress::none())
+            .await
+            .expect("alpha's prod apply");
+
+        let renamed = design("alpha2");
+        let adapter = SqliteAdapter::new(&url, "alpha2").await.unwrap();
+        let err = renamed
+            .reset(&adapter, "sqlite", false, false, false, None)
+            .await
+            .expect_err("the renamed project's unforced reset of a prod database is refused")
+            .to_string();
+        assert!(err.contains("'alpha'") && err.contains("project.name"), "{err}");
+        assert_eq!(built.list_entities().await.unwrap(), vec!["items".to_string()]);
+    }
+
     /// A fresh DB with no `_dbd_meta` reads as `None` (not an error) — the pragma
     /// probe returns no columns, so the resilient read short-circuits cleanly
     /// rather than erroring on the absent table.
