@@ -10,7 +10,9 @@ description: >-
   reset emit DROP VIEW), string-set CHECK constraints that should be Postgres
   enums, materialized-view drift misuse, seed data that can never load (an
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
-  convention, or a `--scope` that drops them), RLS expected from `dbd apply`
+  convention, a `--scope` that drops them, a data file outside `import.staging`,
+  a CSV header that does not name its table's columns, or two procedures with an
+  equal claim to one staging table), RLS expected from `dbd apply`
   without `--with-policies`, post-DDL SQL parked in `import.after` (which
   never runs on `dbd apply`) instead of `apply.after`, a scoped
   `reconcile --prune` on a dbd older than 0.24.1, and any `reconcile --prune`
@@ -113,7 +115,21 @@ file evidence).
    - An import loader written as a **function** — dbd runs only procedures, so the function is
      never called and its target stays empty (dbd warns: `… has no loader procedure`); it must
      be a procedure.
-   - Evidence: the `import/` tree next to the actual deploy/install invocation.
+   - From dbd 0.25 these are **refused**, so the whole import (and a `deploy`, before it applies
+     anything) fails rather than loading less:
+     - a data file under `import/<schema>/` whose schema a non-empty `import.staging` does not
+       list — `import.staging` used to be ignored and is now enforced;
+     - a CSV/TSV whose **header does not name the target table's columns** — a header column
+       the table lacks, a column named twice, or a space after a comma (`id, name`; nothing is
+       trimmed). The header is matched exactly or folded to lower case; on PostgreSQL it used to
+       be skipped and the file loaded by position, so labels in the header worked until 0.25;
+     - two procedures that read the same staging table with an **equal claim** to load it —
+       neither named `import_<table>`, both reading only that staging table. dbd calls one loader
+       per staging table; name the loader `import_<table>` (and call the other from it or from
+       `import.after`).
+   - Evidence: the `import/` tree next to the actual deploy/install invocation; `import.staging`
+     in `design.yaml`; the first line of each CSV/TSV against its table's DDL; the procedures
+     under `ddl/procedure/` that read each staging table.
 8. **RLS expected but never applied** — an install path that runs `dbd apply` (RLS is opt-in,
    needs `--with-policies`) while the project has a `policies/` directory, or docs claiming
    `apply` covers policies. `dbd deploy` applies them unconditionally; `dbd apply` does not.
@@ -139,6 +155,10 @@ file evidence).
      `array['a','b']` and `format('… %I', t)`, where derivation returns empty. A script with no
      derivable deps and no `writes:` **always runs** (the safe direction) — so it is not broken,
      but it is also not scope-filtered until `writes:` is declared.
+   - Under `--scope` a hook is skipped only when it touches a table the design manages *outside*
+     the scope; a table under `external:`, or one the hook creates, never causes a skip (from
+     0.25 — before, such a hook was skipped under every named scope). Do not flag a hook for
+     naming an `external:` table.
    - Evidence: the `import.after` list in `design.yaml` plus the script's own content/comments.
 
 ## How to work
