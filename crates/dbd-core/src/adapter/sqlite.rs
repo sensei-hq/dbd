@@ -1320,6 +1320,69 @@ mod tests {
         assert!(body.contains("1,alice"), "row missing: {body}");
     }
 
+    /// The header came from the first row, so an empty table wrote an empty
+    /// line — a file no import can read as the table's columns. Postgres's
+    /// COPY writes the header either way.
+    #[tokio::test]
+    async fn an_empty_table_exports_its_header() {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE empty_t (id INTEGER, label TEXT)")
+            .await
+            .unwrap();
+        for (format, header) in [("csv", "id,label\n"), ("tsv", "id\tlabel\n")] {
+            let mut entity = Entity::new(EntityType::Table, "empty_t");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let body = std::fs::read_to_string(out.path().join(format!("empty_t.{format}"))).unwrap();
+            assert_eq!(body, header, "{format}");
+        }
+    }
+
+    /// A generated column is computed, and SQLite refuses a value for one
+    /// ("cannot INSERT into generated column"), so an export that wrote it
+    /// could not be imported back. The export writes what an import can, and
+    /// the import recomputes the rest.
+    #[tokio::test]
+    async fn an_export_leaves_out_generated_columns_and_imports_back() {
+        const DDL: &str = "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, \
+                           b INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+                           c INTEGER GENERATED ALWAYS AS (a * 3) VIRTUAL)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO g (id, a) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "g");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("g.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            let first = body.lines().next().unwrap_or_default();
+            let expected = match format {
+                "csv" => "id,a",
+                "tsv" => "id\ta",
+                _ => r#"{"id":1,"a":10}"#,
+            };
+            assert_eq!(first, expected, "{format}: only the columns an import can write");
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: the export imports back: {e}"));
+            let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as("SELECT id, a, b, c FROM g ORDER BY id")
+                .fetch_all(&b.pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![(1, 10, 20, 30), (2, 20, 40, 60)], "{format}");
+        }
+    }
+
     #[test]
     fn s11_builtins_sorted_for_binary_search() {
         // binary_search relies on alphabetical order — guard against typos
