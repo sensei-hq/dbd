@@ -121,11 +121,8 @@ impl Design {
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
@@ -515,11 +512,8 @@ impl Design {
     /// error here, as it is in the run.
     pub fn hook_skips(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
         let working_set = self.scope_working_set(scope)?;
-        let outside = working_set.as_ref().map(|ws| self.managed_outside(ws));
-        let hook_scope = match (scope, outside.as_ref()) {
-            (Some(s), Some(out)) if !s.is_all => Some((s.name.as_str(), out)),
-            _ => None,
-        };
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
         let mut skips = Vec::new();
         for (entries, kind) in [
             (&self.config.apply.before, hooks::HookKind::Before),

@@ -256,20 +256,17 @@ impl Design {
     /// warning per hook it would skip.
     ///
     /// Public so `dbd import --dry-run` previews exactly what the real run does
-    /// without opening a connection — the same reason
-    /// [`import_entry_in_scope`] is
-    /// public. Both share `plan_hooks`, so the
-    /// preview cannot drift from the run.
+    /// without opening a connection. The preview and the run share both the
+    /// scope rule ([`Design::hook_scope`]) and the decision (`plan_hooks`), so
+    /// neither can drift from the other.
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
-        let narrowed = match scope {
-            Some(s) if !s.is_all => Some((s.name.as_str(), self.working_set(s)?)),
-            _ => None,
-        };
+        let working_set = self.scope_working_set(scope)?;
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let plan = hooks::plan_hooks(
             &self.project_dir,
             &self.config.import.after,
             hooks::HookKind::After,
-            narrowed.as_ref().map(|(name, ws)| (*name, ws)),
+            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
         )?;
         Ok((
             plan.runnable.into_iter().map(|(script, _)| script).collect(),
@@ -624,16 +621,11 @@ impl Design {
     {
         let mut warnings = self.import_warnings(name);
 
-        // Resolve the scope once. The plan filter and the after-script hooks
-        // must agree on what "in scope" means — the two disagreeing is exactly
-        // how a loader came to run against half-loaded data.
-        let narrowed = match scope {
-            Some(s) if !s.is_all => {
-                self.check_scope_gaps(s)?;
-                Some((s.name.as_str(), self.working_set(s)?))
-            }
-            _ => None,
-        };
+        // Resolve the scope once, gap-gated before any write. The plan filter
+        // and the after-script hooks must agree on what "in scope" means — the
+        // two disagreeing is exactly how a loader came to run against
+        // half-loaded data.
+        let working_set = self.scope_working_set(scope)?;
 
         let (plan, skips) = self.scoped_import_plan(name, scope)?;
         warnings.extend(skips);
@@ -645,14 +637,13 @@ impl Design {
         let procedures = self
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
-        let outside = narrowed.as_ref().map(|(name, ws)| (*name, self.managed_outside(ws)));
-        let hook_scope = outside.as_ref().map(|(name, out)| (*name, out));
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let after = hooks::run_hooks(
             adapter,
             &self.project_dir,
             &self.config.import.after,
             hooks::HookKind::After,
-            hook_scope,
+            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
             dry_run,
             &mut progress,
         )
