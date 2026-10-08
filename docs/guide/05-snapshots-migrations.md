@@ -38,6 +38,15 @@ This:
 | Built but unversioned (no version recorded, but dbd applied it before, or the design's objects are already there) | Apply all DDL over what exists, mark latest version — `v2 recorded on a database that was already built but had no version` |
 | Behind (version < latest) | Run pending migrations, then apply DDL |
 | Current (version == latest) | Idempotent apply (CREATE IF NOT EXISTS) |
+| Ahead (version > the project's, or the project has none) | Refused before anything runs — `version guard: the database is at v3, but this project is at v2` |
+
+A database ahead of the project was built from a newer revision — typically a
+branch checked out from before the latest snapshot. Applying the older design
+would re-apply its DDL over the newer schema, which nothing short of a newer
+revision makes right, so `apply`, `deploy` and their dry runs refuse it and
+there is no flag to pass it. Before 0.25 the run said `Already up to date (v3)`
+and re-applied the older DDL. (`reconcile`, a pre-release command, is not
+covered: it records the project's version even over a newer one.)
 
 No recorded version does not mean an empty database: one built before the
 project had a version, or by hand, records none. `apply` tells the two apart and
@@ -46,6 +55,13 @@ says which it found, rather than calling the second a fresh install.
 On PostgreSQL every scenario runs in one transaction (unless `DBD_NO_TX` is
 set), so a migration that fails part-way leaves the database at the version it
 started from.
+
+To see what a run will do first, `dbd apply --dry-run` with a database
+configured lists the pending migrations it would execute before the entities —
+from the version the database records, under the same scope — with each
+statement that destroys something marked `⚠`, and a drop of a table the
+database does not have marked as skipped. Without a database it cannot know the
+recorded version, so it says the migrations are not listed.
 
 Snapshots record tables and enums. A migration under `--scope` runs only the
 steps for the scope's entities while the database's version still advances; the
@@ -84,10 +100,16 @@ v(N+1): DROP old column
 v(N): ADD new column with new type + data.sql (UPDATE SET new = old::type)
 v(N+1): DROP old column
 
-### Enum value removal (3 snapshots)
+### Enum value removal (2 snapshots)
 v(N): data.sql (TODO: map removed values to remaining)
-v(N+1): ALTER columns to TEXT + DROP old enum
-v(N+2): CREATE new enum + ALTER columns back
+v(N+1): the type swap — the old type renamed aside and the enum recreated with
+the declared values; for each column of it, the views and materialized views
+over it, the indexes that read it and its default dropped, the column moved
+across with `USING col::text::type`, and all of them restored; the old type
+dropped once no column uses it
+
+Before 0.25 the change took three stages through a `TEXT` column, and failed on
+any view over the column and on an enum default.
 
 Each version's `migrations/NNN/graph.json` records its place in the run as `"stage": {"index": k, "of": n}` — `1/1` for an ordinary version — so tools can group the stages back into the one change they make up; the viewer's changelog does exactly that. Graphs written before the marker existed have no `stage`, and are read by their snapshot's `(stage k/n)` description instead.
 
