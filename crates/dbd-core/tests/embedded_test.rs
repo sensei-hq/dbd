@@ -6457,3 +6457,101 @@ async fn a_constraints_state_a_reversed_file_cannot_carry_is_named() {
     let parent = entities.iter().find(|e| e.name == "app.parent").expect("app.parent");
     assert!(parent.warnings.is_empty(), "{:?}", parent.warnings);
 }
+
+// ── A foreign key's deferrability and MATCH survive reverse, diff, reconcile ──
+
+/// `DEFERRABLE INITIALLY DEFERRED` decides whether a transaction may insert a
+/// child before its parent; `MATCH FULL` whether a half-NULL key passes. The
+/// foreign-key model held neither, so `init --from-db` wrote both keys as
+/// plain ones — an application that relies on deferral then fails on the new
+/// database — and `diff` reported no difference, because neither side could
+/// say. Both are part of the key now: captured, emitted, parsed, compared,
+/// and converged by `reconcile`.
+#[tokio::test]
+async fn a_foreign_keys_deferrability_and_match_survive_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fk_attrs").await.unwrap();
+    const PARENT: &str = "set search_path to app;\n\
+        create table if not exists parent (id int primary key, code text, constraint parent_id_code unique (id, code));\n";
+    const DB: &str = "CREATE SCHEMA app; \
+        CREATE TABLE app.parent (id int PRIMARY KEY, code text, CONSTRAINT parent_id_code UNIQUE (id, code)); \
+        CREATE TABLE app.child (id int PRIMARY KEY, pid int, pcode text, \
+          CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) DEFERRABLE INITIALLY DEFERRED, \
+          CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code) MATCH FULL);";
+    adapter.execute_script(DB).await.unwrap();
+
+    // Reverse: both keys come out as they are.
+    let entities = adapter.introspect().await.expect("introspect");
+    let child = entities.iter().find(|e| e.name == "app.child").expect("app.child");
+    let reversed = dbd_core::emit::emit_entity(child).unwrap();
+    assert!(reversed.contains("MATCH FULL"), "{reversed}");
+    assert!(reversed.contains("DEFERRABLE INITIALLY DEFERRED"), "{reversed}");
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/child.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |child: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: fk_attrs\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/parent.ddl"), PARENT).unwrap();
+        std::fs::write(dir.join("ddl/table/app/child.ddl"), child).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let fk_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.child"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Constraint))
+        })
+    };
+
+    // Diff: a design with plain keys differs from this database; the reversed one does not.
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists child (id int primary key, pid int, pcode text,\n\
+           constraint child_pid_fk foreign key (pid) references parent (id),\n\
+           constraint child_full_fk foreign key (pid, pcode) references parent (id, code));\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(fk_changed(&d), "plain keys are not these keys: {:?}", d.changes);
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "the reversed keys are these keys: {:?}", d.changes);
+
+    // Reconcile: a database with plain keys converges onto the reversed design.
+    adapter
+        .execute_script(
+            "ALTER TABLE app.child DROP CONSTRAINT child_pid_fk, DROP CONSTRAINT child_full_fk, \
+               ADD CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id), \
+               ADD CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code);",
+        )
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND confkey = ARRAY[1]::int2[] AND condeferrable AND condeferred",
+        "a deferrable, initially deferred key on app.child (pid)",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND array_length(conkey, 1) = 2 AND confmatchtype = 'f'",
+        "a MATCH FULL key on app.child (pid, pcode)",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "converged: {:?}", d.changes);
+}
