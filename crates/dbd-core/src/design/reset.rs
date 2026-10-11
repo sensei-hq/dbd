@@ -96,7 +96,7 @@ impl Design {
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,
-    /// or one with applied migrations, is not reset. `meta` is the database's
+    /// or one versioned by a released project, is not reset. `meta` is the database's
     /// recorded meta (`None` for one dbd has never written to, which passes).
     ///
     /// Public so a preview refuses exactly where the real run does: `reset
@@ -111,10 +111,15 @@ impl Design {
                 "reset is blocked — database is marked as prod. Use --force to override.".to_string(),
             ));
         }
+        // A recorded version is what is known: a fresh install of a released
+        // project records its version with no migration ever run, and this
+        // said "has applied migrations" of it.
         if meta.version >= 1 {
-            return Err(DbdError::SafetyGuard(
-                "reset is blocked — database has applied migrations. Use --force to override.".to_string(),
-            ));
+            return Err(DbdError::SafetyGuard(format!(
+                "reset is blocked — the database is versioned at v{} (a released project's database). \
+                 Use --force to override.",
+                meta.version
+            )));
         }
         Ok(())
     }
