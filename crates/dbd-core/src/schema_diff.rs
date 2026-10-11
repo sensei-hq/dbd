@@ -99,19 +99,11 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
             }
         }
 
-        // Drop indexes that merely back a PK/UNIQUE constraint — introspection
-        // reports them, the parsed design does not. Match by covered columns.
-        let constraint_cols: std::collections::HashSet<Vec<String>> = t
-            .table_constraints
-            .iter()
-            .filter_map(|c| match c {
-                TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
-                    Some(columns.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        t.indexes.retain(|i| !backs_a_constraint(i, &constraint_cols));
+        // Drop indexes that merely back a PK/UNIQUE constraint — a live
+        // snapshot may carry them, the parsed design never does. Matched by
+        // the constraint's name, which its backing index always bears.
+        let backing = constraint_backing_keys(&t.table_constraints, |c| c.to_string());
+        t.indexes.retain(|i| !backs_a_constraint(i, &backing));
 
         // The columns whose `::text` cast Postgres inserted itself, so an index
         // predicate and a CHECK over a `varchar` column converge with the form
@@ -148,20 +140,53 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
     }
 }
 
+/// The `(name, columns)` of every named PRIMARY KEY / UNIQUE constraint in
+/// `constraints` — what [`backs_a_constraint`] matches an index against. Each
+/// column goes through `column`, so a caller comparing lowercased names keys
+/// them lowercased.
+pub(crate) fn constraint_backing_keys(
+    constraints: &[TableConstraint],
+    column: impl Fn(&str) -> String,
+) -> std::collections::HashSet<(String, Vec<String>)> {
+    constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::PrimaryKey {
+                name: Some(name),
+                columns,
+            }
+            | TableConstraint::Unique {
+                name: Some(name),
+                columns,
+                ..
+            } => Some((name.clone(), columns.iter().map(|c| column(c)).collect())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Whether this index exists only to back a PRIMARY KEY / UNIQUE constraint, and
-/// so should be compared as a constraint rather than as an index.
+/// so should be compared as a constraint rather than as an index. `backing` is
+/// [`constraint_backing_keys`] of the index's table.
 ///
-/// A constraint's backing index is always a plain index over the constrained
-/// columns: Postgres cannot build one from a `WHERE` clause or an expression. So a
-/// partial or expression index is a real index even when it covers exactly the
-/// constrained columns — `unique (library_id)` and
-/// `unique index (library_id) where project_id is null` enforce different things.
-pub(crate) fn backs_a_constraint(ix: &IndexDef, constraint_cols: &std::collections::HashSet<Vec<String>>) -> bool {
+/// Postgres names a constraint's backing index after the constraint, and
+/// builds it plain over the constrained columns — never from a `WHERE` clause
+/// or an expression. So an index backs a constraint when it bears the
+/// constraint's name over its columns, and only then. Matching the columns
+/// alone took for constraint backing any index the design declares over a
+/// key's columns — `create index t_id_idx on t (id)` beside `id … primary
+/// key` — and dropping it from the database left `diff` empty. A constraint
+/// with no name is the parsed design's, which never carries a backing index.
+/// A partial or expression index is a real index even when it covers exactly
+/// the constrained columns — `unique (library_id)` and `unique index
+/// (library_id) where project_id is null` enforce different things.
+pub(crate) fn backs_a_constraint(ix: &IndexDef, backing: &std::collections::HashSet<(String, Vec<String>)>) -> bool {
     if ix.predicate.is_some() || ix.columns.iter().any(|c| c.is_expression) {
         return false;
     }
+    let Some(name) = &ix.name else { return false };
     let cols: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
-    constraint_cols.contains(&cols)
+    backing.contains(&(name.clone(), cols))
 }
 
 /// Settle an index's default spellings so the authored and introspected forms of
