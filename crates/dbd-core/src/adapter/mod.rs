@@ -214,14 +214,16 @@ pub trait DatabaseAdapter: Send + Sync {
             .await
     }
 
-    /// Empty every one of `tables` before an import reloads them.
+    /// Empty every one of `tables` — given in load order, a referenced table
+    /// before one that references it — before an import reloads them.
     ///
-    /// By default one at a time, through [`Self::truncate_table`], with the
-    /// table that failed named — the database's own error ("cannot truncate a
-    /// table referenced in a foreign key constraint") names none. Postgres
-    /// truncates them in one statement instead (see its override).
+    /// By default one at a time, through [`Self::truncate_table`], in reverse
+    /// load order so a referencing table empties before the table it holds a
+    /// key to (SQLite enforces foreign keys on dbd's connections), and with
+    /// the table that failed named — the database's own error names none.
+    /// Postgres truncates them in one statement instead (see its override).
     async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
-        for table in tables {
+        for table in tables.iter().rev() {
             self.truncate_table(table).await.map_err(|e| {
                 crate::error::DbdError::Config(format!("emptying {table} before its import failed: {e}"))
             })?;
