@@ -1819,27 +1819,37 @@ impl DatabaseAdapter for PostgresAdapter {
             // file imported back as different values (or as no JSON at all).
             //
             // Each record is built field by field, as `row_to_json` builds it
-            // (`to_json` of each value), with one difference: `row_to_json`
-            // writes `null` for an SQL NULL and for a json/jsonb column holding
-            // the JSON value `null`, so the import could not tell them apart. A
-            // json/jsonb column that is SQL NULL is left out of its record — an
-            // absent key, which imports as NULL — and `null` is the JSON value.
+            // (`to_json` of each value), every column's key always written:
+            // an import gives a column absent from every record its DEFAULT,
+            // so a json column left out for its SQL NULLs came back as that
+            // DEFAULT. `null` is SQL NULL for every type — what Postgres's own
+            // `json_populate_record` reads it as — so the JSON value `null` in
+            // a json/jsonb column is written `{"$json": null}`, and a value
+            // that is itself a one-key `$json` object is wrapped the same way,
+            // so the import unwraps exactly one level (see
+            // `import_jsonb_to_table`).
             let fields: Vec<String> = columns
                 .iter()
                 .map(|c| {
                     let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(c.name.clone())));
-                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(&c.name));
+                    let column = format!("t.{}", crate::sql_quote::ident(&c.name));
+                    let value = format!("to_json({column})::text");
                     if c.json {
                         format!(
-                            "CASE WHEN t.{} IS NULL THEN NULL ELSE {key} || {value} END",
-                            crate::sql_quote::ident(&c.name)
+                            "{key} || CASE \
+                               WHEN {column} IS NULL THEN 'null' \
+                               WHEN jsonb_typeof(to_jsonb({column})) = 'null' \
+                                 OR (jsonb_typeof(to_jsonb({column})) = 'object' \
+                                     AND to_jsonb({column}) -> '$json' IS NOT NULL \
+                                     AND (SELECT count(*) FROM jsonb_object_keys(to_jsonb({column}))) = 1) \
+                               THEN '{{\"$json\":' || {value} || '}}' \
+                               ELSE {value} END"
                         )
                     } else {
                         format!("{key} || coalesce({value}, 'null')")
                     }
                 })
                 .collect();
-            // `array_to_string` skips the NULL a left-out field is.
             let sql = format!(
                 "SELECT '{{' || array_to_string(ARRAY[{}]::text[], ',') || '}}' FROM {qualified} t",
                 fields.join(", ")
