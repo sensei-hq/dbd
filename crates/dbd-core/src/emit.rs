@@ -131,7 +131,18 @@ pub fn emit_table(entity: &Entity) -> String {
             out.push_str(&emit_column_comment_sql(&qname, &c.name, c.comment.as_deref()));
         }
     }
+    push_triggers(&mut out, entity);
     out
+}
+
+/// Append `entity`'s triggers, each terminated with one `;` — after the
+/// table, where an authored table file keeps them (see [`Entity::triggers`]).
+fn push_triggers(out: &mut String, entity: &Entity) {
+    for trigger in &entity.triggers {
+        out.push('\n');
+        out.push_str(trigger.trim_end().trim_end_matches(';').trim_end());
+        out.push(';');
+    }
 }
 
 /// Render `COMMENT ON COLUMN <qname>."<column>" IS …;`.

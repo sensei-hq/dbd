@@ -468,6 +468,7 @@ fn merge_snapshot(
     for e in &externals {
         println!("  left out: table `{}` — declared under external:", e.name);
     }
+    report_what_is_lost(&kept);
     // Gate on entities, not schemas: a schema-less source (SQLite) has an empty
     // `selected` but non-empty `kept`.
     if kept.is_empty() {
@@ -674,6 +675,16 @@ fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect) {
     }
 }
 
+/// Name what the database holds that the captured files cannot carry — the
+/// notes the source attached to each entity it read. dbd prefers to capture
+/// a feature faithfully, and where its model cannot, it says what was lost
+/// rather than write a weaker object in silence.
+fn report_what_is_lost(kept: &[dbd_core::Entity]) {
+    for warning in kept.iter().flat_map(|e| &e.warnings) {
+        eprintln!("  warning: {warning}");
+    }
+}
+
 /// Build the write-plan from already-introspected entities, write `design.yaml`
 /// (init only), apply by **overwriting** in place (no `.bak`), and report. The caller
 /// owns the connection + introspection (so the version-safety gate can act on the
@@ -706,6 +717,8 @@ fn run_plan(
         println!("Nothing to reverse-engineer (no entities after filtering).");
         return Ok(vec![]);
     }
+
+    report_what_is_lost(&kept);
 
     // 2. build write-plan (emitted DDL is formatted so it matches `dbd format`)
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);

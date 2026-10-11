@@ -625,6 +625,78 @@ impl PostgresAdapter {
         Ok(entities)
     }
 
+    /// Every user trigger on a table in a user schema, as `(schema.table,
+    /// statement, warning)`: the statement that creates it, runnable twice, and
+    /// what it could not carry.
+    ///
+    /// `pg_get_triggerdef` gives the `CREATE [CONSTRAINT] TRIGGER` itself.
+    /// Postgres replaces an ordinary trigger (`CREATE OR REPLACE TRIGGER`) but
+    /// refuses to replace a constraint trigger, so one of those is dropped if
+    /// it exists first. Left out: the internal triggers behind foreign keys
+    /// (`tgisinternal`), the clones a partitioned table's trigger leaves on each
+    /// partition (`tgparentid`), and what an extension owns.
+    ///
+    /// Whether a trigger is enabled is not part of its definition: a disabled
+    /// one is captured as enabled, and the warning says so.
+    async fn introspect_triggers(&self) -> crate::error::Result<Vec<(String, String, Option<String>)>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_trigger", "t.oid");
+        // `tgparentid` exists from PG 13; read through `to_jsonb` so an older
+        // server yields NULL (no clones to skip) instead of an error.
+        let sql = format!(
+            "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid, true) AS def, \
+                    t.tgconstraint <> 0 AS is_constraint, t.tgenabled::text AS enabled \
+             FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE NOT t.tgisinternal \
+               AND coalesce((to_jsonb(t) ->> 'tgparentid')::oid, 0) = 0 \
+               AND {ns_filter} AND {owned} \
+             ORDER BY n.nspname, c.relname, t.tgname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_triggers failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema: String = row.get("nspname");
+                let table: String = row.get("relname");
+                let name: String = row.get("tgname");
+                let def: String = row.get("def");
+                let is_constraint: bool = row.get("is_constraint");
+                let enabled: String = row.get("enabled");
+                let statement = if is_constraint {
+                    format!(
+                        "DROP TRIGGER IF EXISTS {} ON {};\n{def}",
+                        crate::sql_quote::ident(&name),
+                        crate::sql_quote::qualified(&format!("{schema}.{table}"))
+                    )
+                } else {
+                    match def.strip_prefix("CREATE TRIGGER ") {
+                        Some(rest) => format!("CREATE OR REPLACE TRIGGER {rest}"),
+                        None => def,
+                    }
+                };
+                let state = match enabled.as_str() {
+                    "D" => Some("disabled"),
+                    "R" => Some("enabled for replica sessions only"),
+                    "A" => Some("enabled always, replica sessions included"),
+                    _ => None,
+                };
+                let warning = state.map(|state| {
+                    format!(
+                        "trigger {name} on {schema}.{table} is {state} in the database — dbd captures \
+                         its definition, so it is created enabled; run ALTER TABLE … ENABLE/DISABLE \
+                         TRIGGER by hand where that matters"
+                    )
+                });
+                (format!("{schema}.{table}"), statement, warning)
+            })
+            .collect())
+    }
+
     /// Introspect a table's columns.
     ///
     /// Reads, per column:
@@ -1854,7 +1926,14 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_extensions().await?);
         out.extend(self.introspect_sequences().await?);
         out.extend(self.introspect_enums().await?);
-        out.extend(self.introspect_tables().await?);
+        let mut tables = self.introspect_tables().await?;
+        for (table, statement, warning) in self.introspect_triggers().await? {
+            if let Some(entity) = tables.iter_mut().find(|e| e.name == table) {
+                entity.triggers.push(statement);
+                entity.warnings.extend(warning);
+            }
+        }
+        out.extend(tables);
         out.extend(self.introspect_views().await?);
         out.extend(self.introspect_matviews().await?);
         out.extend(self.introspect_functions().await?);
