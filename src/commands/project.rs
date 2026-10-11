@@ -1447,6 +1447,7 @@ mod tests {
             }],
             warnings: vec!["enum value dropped".to_string()],
             destructive: true,
+            ..Default::default()
         };
 
         let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");
