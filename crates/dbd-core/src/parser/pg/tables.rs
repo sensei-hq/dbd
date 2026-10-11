@@ -1114,6 +1114,34 @@ mod tests {
         assert!(e.refers_to("other.parent"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
+    /// In a column definition, `DEFERRABLE` and `INITIALLY DEFERRED` arrive as
+    /// constraint nodes of their own after the `REFERENCES` they modify, where
+    /// a table-level key carries them inside its own node. Ignored, a column's
+    /// deferred key read as an immediate one — a difference from the database
+    /// `diff` would then report forever. One after a `UNIQUE` modifies the
+    /// `UNIQUE`, not a key before it. `MATCH FULL` is the key's own.
+    #[test]
+    fn an_inline_fk_keeps_its_deferrability_and_match() {
+        let d = def("set search_path to app;\n\
+             create table t (\n\
+               a int references parent (id) deferrable initially deferred\n\
+             , b int references parent (id) deferrable\n\
+             , c int references parent (id) match full\n\
+             , d int references parent (id) unique deferrable\n\
+             , e int references parent (id)\n\
+             );");
+        let fk = |i: usize| d.columns[i].inline_fk.as_ref().expect("inline FK");
+        assert!(fk(0).deferrable && fk(0).initially_deferred, "{:?}", fk(0));
+        assert!(fk(1).deferrable && !fk(1).initially_deferred, "{:?}", fk(1));
+        assert!(fk(2).match_full && !fk(2).deferrable, "{:?}", fk(2));
+        assert!(
+            !fk(3).deferrable,
+            "DEFERRABLE after UNIQUE is the UNIQUE's: {:?}",
+            fk(3)
+        );
+        assert!(!fk(4).deferrable && !fk(4).match_full, "{:?}", fk(4));
+    }
+
     /// `references parent` with no column list targets the parent's primary key;
     /// the incumbent records `id`, and reconcile's FK shape compares against it.
     #[test]
