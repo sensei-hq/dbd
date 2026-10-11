@@ -1691,6 +1691,43 @@ mod tests {
         assert_eq!(score, None);
     }
 
+    /// A Postgres JSONL export writes a json column's JSON `null` as
+    /// `{"$json": null}`, and wraps a value that is itself a one-key `$json`
+    /// object the same way. SQLite has no json type: a JSON value lands as its
+    /// text, so the wrapper must come off one level here as it does on
+    /// Postgres — or SQLite stores the encoding instead of the value.
+    #[tokio::test]
+    async fn a_json_value_written_as_dollar_json_lands_as_its_own_text() {
+        use std::io::Write;
+        let a = mem().await;
+        a.execute_script("CREATE TABLE docs (id INTEGER, j TEXT)")
+            .await
+            .unwrap();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, r#"{{"id":1,"j":{{"$json":null}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":2,"j":{{"$json":{{"$json":5}}}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":3,"j":{{"a":1}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":4,"j":null}}"#).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.docs");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("jsonl".to_string());
+        a.import_data(&entity, "", false).await.unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, j FROM docs ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some("null".to_string())),
+                (2, Some(r#"{"$json":5}"#.to_string())),
+                (3, Some(r#"{"a":1}"#.to_string())),
+                (4, None),
+            ]
+        );
+    }
+
     /// Load `body` as a `json`-format file into a fresh `people` table and
     /// return its rows.
     async fn import_json(body: &str) -> Result<Vec<(i64, String)>> {
