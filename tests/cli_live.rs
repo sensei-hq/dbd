@@ -1453,3 +1453,89 @@ async fn reset_keeps_a_role_another_database_holds_and_names_that_database() {
         combined(&o)
     );
 }
+
+// ── Dry runs say what their run does ────────────────────────────────────────
+
+/// `reconcile --dry-run` listed the schema changes and stopped there, though
+/// the run goes on to its `apply.before` and `apply.after` hooks and the
+/// design's grants. The preview now names them.
+#[tokio::test]
+async fn reconcile_dry_run_names_the_hooks_and_grants_the_run_applies() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\nsource:\n  dialect: postgresql\n\
+         schemas:\n  - app:\n      grants:\n        app_writer: [usage, select]\n\
+         target:\n  postgres:\n    roles:\n      - name: app_writer\n\
+         apply:\n  before:\n    - sql/before.sql\n  after:\n    - sql/after.sql\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(dir.join("sql/before.sql"), "select 1;\n").unwrap();
+    std::fs::write(dir.join("sql/after.sql"), "select 2;\n").unwrap();
+
+    let o = dbd(dir, &url, &["reconcile", "--dry-run"]);
+    assert!(o.status.success(), "reconcile --dry-run failed: {}", combined(&o));
+    let out = stdout(&o);
+    for named in ["sql/before.sql", "sql/after.sql", "app_writer"] {
+        assert!(out.contains(named), "the preview names {named}: {out}");
+    }
+}
+
+/// Under a scope that none of v2's changes touch, `apply --dry-run` said "No
+/// pending migration to run (database at v1, design at v2)", and the run then
+/// said "Migrated v1 → v2". The preview now says what the run does: v2 is
+/// pending, has nothing to run in this scope, and is recorded.
+#[tokio::test]
+async fn a_scoped_dry_run_says_the_run_records_a_migration_it_has_nothing_to_run_for() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |people: &str| {
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: clilive\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+             scopes:\n  core_only:\n    includes: [core]\n",
+        )
+        .unwrap();
+        for d in ["ddl/table/app", "ddl/table/core"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("ddl/table/app/people.ddl"),
+            format!("set search_path to app;\ncreate table if not exists people (id integer primary key{people});\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/zones.ddl"),
+            "set search_path to core;\ncreate table if not exists zones (id integer primary key);\n",
+        )
+        .unwrap();
+    };
+    write("");
+    let o = dbd(dir, &url, &["snapshot", "--name", "v1"]);
+    assert!(o.status.success(), "snapshot v1: {}", combined(&o));
+    let o = dbd(dir, &url, &["apply", "--scope", "core_only"]);
+    assert!(o.status.success(), "apply v1: {}", combined(&o));
+    write(", nick text");
+    let o = dbd(dir, &url, &["snapshot", "--name", "v2"]);
+    assert!(o.status.success(), "snapshot v2: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply", "--scope", "core_only", "--dry-run"]);
+    assert!(o.status.success(), "dry run: {}", combined(&o));
+    let preview = stdout(&o);
+    assert!(!preview.contains("No pending migration"), "{preview}");
+    assert!(preview.contains("v2"), "the preview names v2: {preview}");
+
+    let o = dbd(dir, &url, &["apply", "--scope", "core_only"]);
+    assert!(o.status.success(), "apply v2: {}", combined(&o));
+    assert!(stdout(&o).contains("Migrated v1 → v2"), "{}", stdout(&o));
+}

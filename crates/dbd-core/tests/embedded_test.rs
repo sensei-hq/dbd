@@ -4329,8 +4329,15 @@ async fn removing_an_enum_value_still_in_use_fails_without_half_applying() {
     write_enum("'red', 'green'");
     let failed = load()
         .reconcile(&*adapter, false, true, false, None, Progress::none())
-        .await;
-    assert!(failed.is_err(), "a row holding the removed value must fail the run");
+        .await
+        .expect_err("a row holding the removed value must fail the run")
+        .to_string();
+    // The cast failure named the enum and the value, never the table: the
+    // step is the enum's, and a swap can move columns in many tables.
+    assert!(
+        failed.contains("app.t.c"),
+        "the failure names the column holding the value: {failed}"
+    );
 
     // Nothing half-applied: the type, the row and the view are all as they were.
     assert_catalog(

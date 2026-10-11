@@ -3463,6 +3463,67 @@ import:
         assert!(dropped.contains(&("config.legacy", 2)));
     }
 
+    /// The refusal of a destructive reconcile listed every altered table under
+    /// "dropped columns, constraints, or indexes" — here `app.b`, which only
+    /// gains a column. It lists what is destructive, and what each drops.
+    #[test]
+    fn the_destructive_refusal_lists_only_what_is_destructive() {
+        use crate::snapshot::{Snapshot, TableSnapshot};
+        let column = |name: &str| crate::entity::ColumnDef {
+            name: name.to_string(),
+            data_type: "text".to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+        };
+        let table = |name: &str, columns: &[&str]| TableSnapshot {
+            name: name.to_string(),
+            schema: "app".to_string(),
+            columns: columns.iter().map(|c| column(c)).collect(),
+            indexes: vec![],
+            table_constraints: vec![],
+        };
+        let snap = |tables: Vec<TableSnapshot>| Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables,
+            enums: vec![],
+        };
+        let live = snap(vec![table("a", &["id", "gone"]), table("b", &["id"])]);
+        let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
+
+        let plan = crate::reconcile::plan_reconcile(&live, &desired);
+        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+
+        assert!(err.contains("app.a") && err.contains("gone"), "{err}");
+        assert!(
+            !err.contains("app.b"),
+            "a table only gaining a column is not destructive: {err}"
+        );
+    }
+
+    /// A database versioned at v4 by a fresh install has no migration
+    /// recorded, but `reset` refused it as one with "applied migrations".
+    #[test]
+    fn reset_refuses_a_versioned_database_saying_it_is_versioned() {
+        let meta = crate::adapter::ProjectMeta {
+            project: "p".to_string(),
+            env: "dev".to_string(),
+            version: 4,
+            scope: None,
+            applied_at: None,
+        };
+        let err = Design::check_reset_guard(Some(&meta)).unwrap_err().to_string();
+        assert!(err.contains("versioned at v4"), "{err}");
+        assert!(!err.contains("applied migrations"), "{err}");
+    }
+
     /// The position of the first step `matches` picks out, for asserting order.
     fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
         plan.steps
