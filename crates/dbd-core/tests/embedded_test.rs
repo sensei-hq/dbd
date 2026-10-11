@@ -6657,3 +6657,93 @@ async fn an_exclusion_constraint_survives_reverse_diff_reconcile_and_apply() {
         .expect("apply to a fresh database");
     assert_catalog(&*fresh, true, exclusion, "the exclusion constraint on a fresh database").await;
 }
+
+// ── A column's collation survives reverse, diff and reconcile ─────────────────
+
+/// `COLLATE "C"` decides how a column's values sort and compare — byte order
+/// rather than the language's — and what a `LIKE 'abc%'` index can serve. The
+/// column model had no collation, so `init --from-db` wrote every such column
+/// with the database default, and `diff` could not see the difference. It is
+/// part of the column now: captured, emitted, parsed, compared, converged.
+#[tokio::test]
+async fn a_columns_collation_survives_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "coll").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.names (id int PRIMARY KEY, code text COLLATE \"C\", \
+               label varchar(20) COLLATE \"POSIX\", plain text);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names = entities.iter().find(|e| e.name == "app.names").expect("app.names");
+    let reversed = dbd_core::emit::emit_entity(names).unwrap();
+    assert!(reversed.contains("\"code\" text COLLATE \"C\""), "{reversed}");
+    assert!(
+        reversed.contains("\"label\" character varying(20) COLLATE \"POSIX\""),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.contains("\"plain\" text COLLATE"),
+        "the default is not written: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/names.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |names: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: coll\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/names.ddl"), names).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let columns_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.names"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Column))
+        })
+    };
+
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists names (id int primary key, code text, label varchar(20), plain text);\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        columns_changed(&d),
+        "default-collated columns are not these: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "the reversed columns are these: {:?}", d.changes);
+
+    // Reconcile moves a default-collated column onto the design's collation.
+    adapter
+        .execute_script("ALTER TABLE app.names ALTER COLUMN code TYPE text COLLATE \"default\"")
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute a JOIN pg_collation c ON c.oid = a.attcollation \
+           WHERE a.attrelid = 'app.names'::regclass AND a.attname = 'code' AND c.collname = 'C'",
+        "app.names.code collated \"C\"",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "converged: {:?}", d.changes);
+}
