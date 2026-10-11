@@ -1014,6 +1014,41 @@ mod tests {
         assert!(err.to_string().contains("import/staging/items_v.csv"), "{err}");
     }
 
+    /// A data file is `import/<schema>/<table>.<ext>`, or the same under an
+    /// env folder (`import/dev/…`, `import/prod/…`). One a folder deeper —
+    /// `import/staging/sub/x.csv` — was reported as "skipped — this run's env
+    /// is 'dev'", as though `-e staging` would load it, when no `-e` ever
+    /// could; and under an env folder it loaded into `staging.x`, the `sub`
+    /// folder silently dropped. Neither loads; each is named as a layout an
+    /// import does not read, with the layout it does.
+    #[test]
+    fn a_data_file_in_a_folder_an_import_does_not_read_is_named_as_such() {
+        let (_tmp, design) = project_with_staging(
+            Some("staging"),
+            &[
+                STAGED_ITEMS,
+                ("staging/sub/x.csv", "id,name\n1,a\n"),
+                ("dev/staging/sub/y.csv", "id,name\n1,a\n"),
+            ],
+        );
+        let warnings = design.import_warnings(None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("env is")),
+            "no env could load these, so none is blamed: {warnings:?}"
+        );
+        for file in ["import/staging/sub/x.csv", "import/dev/staging/sub/y.csv"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(file) && w.contains("import/<schema>/<table>")),
+                "{file} is named, with the layout an import reads: {warnings:?}"
+            );
+        }
+        let plan = design.import_plan(None);
+        let loaded: Vec<&str> = plan.iter().map(|e| e.table.name.as_str()).collect();
+        assert_eq!(loaded, ["staging.items"], "neither file loads");
+    }
+
     /// Every preview prints this plan, so a dry run refuses what the run
     /// refuses rather than listing a load that will never happen.
     #[test]
