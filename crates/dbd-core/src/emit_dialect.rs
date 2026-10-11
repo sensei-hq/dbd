@@ -819,6 +819,24 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
             TableConstraint::Unique { columns, .. } if !columns.is_empty() => {
                 lines.push(format!("  UNIQUE ({}),", quote_all(columns, target)));
             }
+            // No other engine has an exclusion constraint, and no other kind
+            // of constraint enforces what it does.
+            TableConstraint::Exclude { name, definition } => {
+                let d = Downgrade {
+                    entity: e.name.clone(),
+                    column: None,
+                    from: format!(
+                        "an exclusion constraint{} (`EXCLUDE {definition}`)",
+                        name.as_deref().map(|n| format!(" `{n}`")).unwrap_or_default()
+                    ),
+                    to: "no constraint".to_string(),
+                    reason: "the target has no EXCLUDE, so rows it refused — two that conflict under its \
+                             operators — are now accepted"
+                        .to_string(),
+                };
+                lines.push(format!("  {}", d.comment(target)));
+                report.push(d);
+            }
             _ => {}
         }
     }
