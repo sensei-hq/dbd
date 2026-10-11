@@ -646,6 +646,21 @@ pub(crate) async fn reconcile_with_adapter(
             .await
             .context("Reconcile planning failed")?;
         print_reconcile_plan(&plan, prune, verbosity);
+        // The run goes on to the apply hooks and the grants; a preview of it
+        // that stops at the schema changes leaves them out.
+        for hook in design.apply_hooks_to_run(Some(resolved))? {
+            output::info(verbosity, &format!("  run {hook}"));
+        }
+        let grants = design.grants_to_apply(Some(resolved))?;
+        if !grants.is_empty() {
+            if adapter.supports_schema_grants() {
+                for line in grants {
+                    output::info(verbosity, &format!("  grant on {line}"));
+                }
+            } else {
+                output::info(verbosity, "  Skipping schema grants (target has no grant model).");
+            }
+        }
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }

@@ -677,6 +677,24 @@ pub(super) async fn check_pinned_scope(
 pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
     use dbd_core::design::MigrationAction;
     // Versions spelled as the run's own summary spells them (`Migrated v1 → v3`).
+    // A scoped run whose pending migrations touch nothing in its scope still
+    // records them: the preview said "No pending migration to run", and the
+    // run then said "Migrated v4 → v7".
+    if preview.steps.is_empty() && !preview.recorded.is_empty() {
+        let versions: Vec<String> = preview.recorded.iter().map(|v| format!("v{v}")).collect();
+        output::info(
+            verbosity,
+            &format!(
+                "Pending migrations, v{} → v{} ({}): nothing in them runs in this scope; the run records \
+                 them and moves the database to v{}.",
+                preview.from_version,
+                preview.to_version,
+                versions.join(", "),
+                preview.to_version
+            ),
+        );
+        return;
+    }
     if preview.steps.is_empty() {
         output::info(
             verbosity,

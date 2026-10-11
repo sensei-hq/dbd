@@ -153,10 +153,19 @@ impl Design {
                 | ExecutionStep::SetVersion(_) => {}
             }
         }
+        let recorded = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::RecordMigration { version, .. } => Some(*version),
+                _ => None,
+            })
+            .collect();
         Ok(MigrationPreview {
             from_version,
             to_version,
             steps,
+            recorded,
         })
     }
 
@@ -811,6 +820,57 @@ impl Design {
             skips.extend(hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?.warnings);
         }
         Ok(skips)
+    }
+
+    /// The `apply.before` and `apply.after` hooks a run under `scope` executes,
+    /// as `"apply.before sql/x.sql"`, in the order it runs them — the run's own
+    /// decision ([`hooks::plan_hooks`]), made without running anything.
+    ///
+    /// For a preview of a run that executes hooks: `reconcile --dry-run`
+    /// listed the schema changes and never the hooks its run went on to.
+    pub fn apply_hooks_to_run(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let working_set = self.scope_working_set(scope)?;
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
+        let mut run = Vec::new();
+        for (entries, phase) in [
+            (&self.config.apply.before, "apply.before"),
+            (&self.config.apply.after, "apply.after"),
+        ] {
+            let kind = if phase == "apply.before" {
+                hooks::HookKind::Before
+            } else {
+                hooks::HookKind::After
+            };
+            run.extend(
+                hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?
+                    .runnable
+                    .into_iter()
+                    .map(|(script, _)| format!("{phase} {script}")),
+            );
+        }
+        Ok(run)
+    }
+
+    /// The grants a run under `scope` applies, one line per schema —
+    /// `"app: app_reader (usage, select); app_writer (usage, select, insert)"`
+    /// — sorted. Empty when the design declares none. For a preview: the
+    /// grants [`Self::apply_grants`] runs, said without running them.
+    pub fn grants_to_apply(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let grants = self.declared_grants(scope)?;
+        let mut lines: Vec<String> = grants
+            .into_iter()
+            .map(|(schema, roles)| {
+                let mut roles: Vec<String> = roles
+                    .into_iter()
+                    .map(|(role, privileges)| format!("{role} ({})", privileges.join(", ")))
+                    .collect();
+                roles.sort();
+                format!("{schema}: {}", roles.join("; "))
+            })
+            .collect();
+        lines.sort();
+        Ok(lines)
     }
 
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the

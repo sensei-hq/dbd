@@ -67,6 +67,10 @@ pub struct MigrationPreview {
     /// The migration steps the run takes, in the order it takes them. Empty
     /// when the run migrates nothing.
     pub steps: Vec<MigrationStepPreview>,
+    /// The versions the run records as applied. Not empty with `steps` empty
+    /// for a scoped run that none of the pending migrations touch: it runs
+    /// nothing for them, and still records them and moves the database on.
+    pub recorded: Vec<u32>,
 }
 
 /// One migration step of a run, for a preview.
