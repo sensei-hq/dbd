@@ -799,13 +799,13 @@ pub struct Entity {
     /// `None` for the Postgres/DBML paths, which reconstruct DDL from the structured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_ddl: Option<String>,
-    /// The triggers on this table, as the statements that create them — each
+    /// The triggers on this table or view, as the statements that create them — each
     /// one runnable twice (`CREATE OR REPLACE TRIGGER`, or a `DROP TRIGGER IF
     /// EXISTS` before a constraint trigger, which Postgres will not replace).
     ///
     /// Filled by the Postgres introspector alone, and written by
-    /// [`crate::emit::emit_table`] after the table, where an authored table
-    /// file keeps its triggers. The table parser reads a trigger there only as
+    /// [`crate::emit::emit_table`] and [`crate::emit::emit_view`] after the
+    /// table or view, where an authored file keeps its triggers. The parsers read a trigger there only as
     /// the edge to the function it fires — apply needs the order and nothing
     /// compares triggers — so a parsed entity leaves this empty. Without it,
     /// `init --from-db` wrote every table without its triggers, and `merge`

@@ -625,7 +625,7 @@ impl PostgresAdapter {
         Ok(entities)
     }
 
-    /// Every user trigger on a table in a user schema, as `(schema.table,
+    /// Every user trigger on a table or view in a user schema, as `(schema.name,
     /// statement, warning)`: the statement that creates it, runnable twice, and
     /// what it could not carry.
     ///
@@ -1926,15 +1926,16 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_extensions().await?);
         out.extend(self.introspect_sequences().await?);
         out.extend(self.introspect_enums().await?);
-        let mut tables = self.introspect_tables().await?;
-        for (table, statement, warning) in self.introspect_triggers().await? {
-            if let Some(entity) = tables.iter_mut().find(|e| e.name == table) {
+        // A trigger goes in the file of the table or view it is on.
+        let mut relations = self.introspect_tables().await?;
+        relations.extend(self.introspect_views().await?);
+        for (relation, statement, warning) in self.introspect_triggers().await? {
+            if let Some(entity) = relations.iter_mut().find(|e| e.name == relation) {
                 entity.triggers.push(statement);
                 entity.warnings.extend(warning);
             }
         }
-        out.extend(tables);
-        out.extend(self.introspect_views().await?);
+        out.extend(relations);
         out.extend(self.introspect_matviews().await?);
         out.extend(self.introspect_functions().await?);
         Ok(out)

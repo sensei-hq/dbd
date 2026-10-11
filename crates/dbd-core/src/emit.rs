@@ -136,7 +136,7 @@ pub fn emit_table(entity: &Entity) -> String {
 }
 
 /// Append `entity`'s triggers, each terminated with one `;` — after the
-/// table, where an authored table file keeps them (see [`Entity::triggers`]).
+/// table or view, where an authored file keeps them (see [`Entity::triggers`]).
 fn push_triggers(out: &mut String, entity: &Entity) {
     for trigger in &entity.triggers {
         out.push('\n');
@@ -422,6 +422,7 @@ pub fn emit_view(entity: &Entity) -> String {
     if let Some(comment) = &entity.comment {
         out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
     }
+    push_triggers(&mut out, entity);
     out
 }
 
