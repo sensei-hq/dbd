@@ -1452,3 +1452,60 @@ fn a_dry_run_does_not_create_a_sqlite_database_file() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+// ── reset refuses a --target the connection is not ──────────────────────────
+
+/// `reset --target postgres` on a SQLite project was accepted, connected, and
+/// failed on PostgreSQL's `CASCADE` — after it had read the database, and,
+/// with `--force`, with nothing said about why. A `--target` that is not the
+/// kind of database the connection reaches is refused before connecting.
+/// Each URL here leads nowhere, so a reset that connects fails differently.
+#[test]
+fn reset_refuses_a_target_the_connection_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cases = [
+        // (the project's target block, the --target it is refused)
+        (
+            format!("sqlite:\n    url: sqlite://{}/no/such/dir/app.db", dir.display()),
+            "postgres",
+            "SQLite",
+        ),
+        (
+            format!("sqlite:\n    url: sqlite://{}/no/such/dir/app.db", dir.display()),
+            "supabase",
+            "SQLite",
+        ),
+        (
+            "postgres:\n    url: postgres://nobody@127.0.0.1:1/absent".to_string(),
+            "sqlite",
+            "PostgreSQL",
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (target, flag, kind) in &cases {
+        write(
+            dir,
+            "design.yaml",
+            &format!(
+                "project:\n  name: mismatch\nsource:\n  dialect: postgresql\ntarget:\n  {target}\nschemas:\n  - app\n"
+            ),
+        );
+        write(
+            dir,
+            "ddl/table/app/t.ddl",
+            "set search_path to app;\ncreate table if not exists t (id int primary key);\n",
+        );
+        for args in [
+            &["reset", "--force", "--target", flag][..],
+            &["reset", "--dry-run", "--target", flag],
+        ] {
+            let out = dbd(dir, args);
+            let err = stderr(&out);
+            if out.status.success() || !(err.contains(&format!("--target {flag}")) && err.contains(kind)) {
+                failures.push(format!("{args:?} on a {kind} connection: {}{err}", stdout(&out)));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
