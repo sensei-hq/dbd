@@ -188,11 +188,11 @@ handled that another dropped — and fixed both in the code, test first.
   every type. A json/jsonb column holding the JSON value `null` is written
   `{"$json": null}` — as is any value that is itself a one-key `$json`
   object, wrapped once more — and the Postgres and SQLite imports unwrap one
-  level. On import, a column whose key no record carries takes its DEFAULT; on
-  Postgres a key missing from only some records is NULL in those, while SQLite
-  gives each record that leaves a key out the DEFAULT. A json/jsonb column was
-  left out of a record for its SQL NULLs, so one NULL in every row imported as
-  its DEFAULT.
+  level, so the JSON value `null` survives a round trip: 0.24.1 wrote both it
+  and SQL NULL as `null`, and imported both as SQL NULL. On import, a column
+  whose key no record carries takes its DEFAULT; on Postgres a key missing
+  from only some records is NULL in those, while SQLite gives each record that
+  leaves a key out the DEFAULT.
 - **A file directly in `import/dev/` or `import/prod/` belongs to that env**, on
   every engine; on SQLite it loaded in prod. A schema actually named `dev` or
   `prod` can no longer have files directly there.
@@ -614,8 +614,9 @@ handled that another dropped — and fixed both in the code, test first.
 - **A data file in a folder deeper than an import reads** —
   `import/staging/sub/x.csv`, `import/dev/staging/sub/y.csv` — is never
   loaded, and is named with the layouts an import does read. The first was
-  reported as skipped for another env, as though some `-e` could load it; the
-  second loaded into `staging.y`, its `sub` folder ignored.
+  reported as skipped for an env named `staging`, as though some `-e` could
+  load it; the second loaded into `staging.y` under `-e dev`, its `sub` folder
+  ignored.
 - **Import counts tables loaded, not data files**, and an ad-hoc `import -n -f`
   and its dry run print the scope line.
 - **A JSON record mentioning `set search_path to …` imports unchanged.**
@@ -760,11 +761,11 @@ hold is named, never weakened in silence.
 - A reversed enum is written inside `DO … EXCEPTION WHEN duplicate_object`,
   so `psql -f` runs its file twice.
 - `merge` never captures a table declared `external:` — it names it, left
-  out — and never tells you to declare external a table the project builds; it
-  warns about undeclared extensions and names only the schemas it wrote files
-  into. It wrote the Supabase scaffold's `auth.users` as a project file that
-  `reset` would then drop, and a scoped DBML document's stubs for the
-  project's own tables drew "declare it under external:".
+  out — so somebody else's table (the Supabase scaffold's `auth.users`) never
+  becomes a project file that `reset` would drop; and it never tells you to
+  declare external a table the project builds, as a scoped DBML document's
+  stubs would suggest. It warns about undeclared extensions and names only the
+  schemas it wrote files into.
 
 **The schema viewer**
 
