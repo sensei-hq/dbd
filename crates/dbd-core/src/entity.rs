@@ -618,6 +618,30 @@ pub struct ColumnDef {
     pub generated: Option<String>,
     pub comment: Option<String>,
     pub inline_fk: Option<ForeignKey>,
+    /// `COLLATE "C"` — the collation the column's values sort and compare
+    /// under, when it is not its type's default; `None` for the default.
+    /// Held as SQL, built by [`collation_sql`]: each part double-quoted, and
+    /// `pg_catalog` — where the built-in collations live — left off. A name
+    /// may itself hold a dot (`en_US.utf8`), so it is never split apart again.
+    ///
+    /// Part of the column's identity: byte order and a language's order put
+    /// rows in different places, and decide what a `LIKE 'abc%'` index can
+    /// serve. `#[serde(default)]`, and skipped when `None`, so snapshots of
+    /// ordinary columns are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+}
+
+/// A collation as SQL, for [`ColumnDef::collation`]: `"C"`, or
+/// `"schema"."name"` outside `pg_catalog`. Quoted unconditionally, so `C` —
+/// which Postgres would fold to `c` bare — keeps its case, and so the parser
+/// and the introspector spell one collation the same way.
+pub fn collation_sql(schema: Option<&str>, name: &str) -> String {
+    let quote = |part: &str| format!("\"{}\"", part.replace('"', "\"\""));
+    match schema {
+        Some(schema) if schema != "pg_catalog" => format!("{}.{}", quote(schema), quote(name)),
+        _ => quote(name),
+    }
 }
 
 /// Index definition.

@@ -723,6 +723,10 @@ impl PostgresAdapter {
                     format_type(a.atttypid, a.atttypmod) AS col_type, \
                     a.atttypid::regtype::text AS underlying_type, \
                     col_description(a.attrelid, a.attnum) AS col_comment, \
+                    CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation \
+                      THEN coll.collname::text END AS collation_name, \
+                    CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation \
+                      THEN coll_ns.nspname::text END AS collation_schema, \
                     EXISTS ( \
                       SELECT 1 FROM pg_depend d \
                       WHERE d.refclassid = 'pg_class'::regclass \
@@ -736,6 +740,9 @@ impl PostgresAdapter {
              JOIN pg_class cls ON cls.oid = a.attrelid \
              JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             JOIN pg_type ty ON ty.oid = a.atttypid \
+             LEFT JOIN pg_collation coll ON coll.oid = a.attcollation \
+             LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace \
              WHERE ns.nspname = $1 AND cls.relname = $2 \
                AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
@@ -759,6 +766,12 @@ impl PostgresAdapter {
                 let underlying_type: String = row.get("underlying_type");
                 let owns_default_seq: bool = row.get("owns_default_seq");
                 let comment: Option<String> = row.get("col_comment");
+                // Only a collation other than the type's own: the default is
+                // what an authored column that says nothing gets.
+                let collation_name: Option<String> = row.get("collation_name");
+                let collation_schema: Option<String> = row.get("collation_schema");
+                let collation =
+                    collation_name.map(|name| crate::entity::collation_sql(collation_schema.as_deref(), &name));
 
                 // Identity ('a' = ALWAYS, 'd' = BY DEFAULT, '' = none). Identity
                 // columns carry no user default.
@@ -819,6 +832,7 @@ impl PostgresAdapter {
                     generated,
                     comment,
                     inline_fk: None,
+                    collation,
                 }
             })
             .collect();

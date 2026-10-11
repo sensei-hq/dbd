@@ -286,6 +286,9 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
 /// `ALTER TABLE … ADD COLUMN …` for a newly added column.
 fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
     let mut stmt = format!("ALTER TABLE {} ADD COLUMN {} {}", entity_name, col.name, col.data_type);
+    if let Some(collation) = &col.collation {
+        stmt.push_str(&format!(" COLLATE {collation}"));
+    }
     if !col.nullable {
         stmt.push_str(" NOT NULL");
     }
@@ -364,6 +367,14 @@ fn push_column_alter_sql(
     }
 
     let type_changed = old_col.data_type != new_col.data_type;
+    // A collation is changed with the type it qualifies — `ALTER COLUMN … TYPE
+    // t COLLATE c` — and going back to the type's own is `COLLATE "default"`.
+    let collation_changed = old_col.collation != new_col.collation;
+    let collate = match &new_col.collation {
+        Some(collation) => format!(" COLLATE {collation}"),
+        None if collation_changed => " COLLATE \"default\"".to_string(),
+        None => String::new(),
+    };
 
     // A default the new type can't absorb blocks the type change itself —
     // `default for column "c" cannot be cast automatically to type status_t` —
@@ -390,8 +401,13 @@ fn push_column_alter_sql(
         // int → bigint), so it is unconditional rather than gated on a
         // cast-safety guess that can drift from Postgres's own cast catalog.
         lines.push(format!(
-            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}{collate} USING {}::{};",
             entity_name, new_col.name, new_col.data_type, new_col.name, new_col.data_type
+        ));
+    } else if collation_changed {
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}{collate};",
+            entity_name, new_col.name, new_col.data_type
         ));
     }
     if old_col.nullable != new_col.nullable {

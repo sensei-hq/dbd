@@ -953,6 +953,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tags".into(),
@@ -965,6 +966,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {

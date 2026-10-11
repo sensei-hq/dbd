@@ -2047,6 +2047,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 
@@ -4140,6 +4141,7 @@ mod enum_recreation_tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 

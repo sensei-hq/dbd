@@ -444,6 +444,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: Some(bare_fk("ns_inline")),
+            collation: None,
         };
         // Bare in the source, so the parser supplied `dojo.` — the shape the
         // resolver may re-point. The FK structs below say the same via

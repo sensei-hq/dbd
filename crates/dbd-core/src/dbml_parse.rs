@@ -656,6 +656,8 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
         generated: None,
         comment: None,
         inline_fk: None,
+        // DBML has no collation.
+        collation: None,
     };
     let mut checks = Vec::new();
 
@@ -1751,6 +1753,7 @@ mod tests {
                     generated: None,
                     comment: Some("The user's primary biography".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "nickname".into(),
@@ -1763,6 +1766,7 @@ mod tests {
                     generated: None,
                     comment: Some("User's display name".into()),
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -1845,6 +1849,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -1857,6 +1862,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -1887,6 +1893,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "code".into(),
@@ -1899,6 +1906,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order code".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "user_id".into(),
@@ -1911,6 +1919,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -1923,6 +1932,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "qty".into(),
@@ -1935,6 +1945,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -2222,6 +2233,7 @@ mod tests {
             generated: None,
             comment: Some(r"Windows path, e.g. C:\temp — the user's".into()),
             inline_fk: None,
+            collation: None,
         };
         let table_with_note = |name: &str, note: &str| {
             let mut t = Entity::new(EntityType::Table, name);

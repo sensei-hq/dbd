@@ -486,6 +486,19 @@ fn extract_column(
         nullable = false;
     }
 
+    // `COLLATE "C"`, spelled as introspection spells it (see
+    // `ColumnDef::collation`); `default` is no collation at all.
+    let collation = col_def
+        .coll_clause
+        .as_ref()
+        .map(|clause| string_list(&clause.collname))
+        .and_then(|parts| match parts.as_slice() {
+            [name] | [_, name] if name == "default" => None,
+            [name] => Some(crate::entity::collation_sql(None, name)),
+            [schema, name] => Some(crate::entity::collation_sql(Some(schema), name)),
+            _ => None,
+        });
+
     let column = ColumnDef {
         name,
         data_type,
@@ -497,6 +510,7 @@ fn extract_column(
         generated,
         comment: None,
         inline_fk,
+        collation,
     };
     Ok((column, checks))
 }

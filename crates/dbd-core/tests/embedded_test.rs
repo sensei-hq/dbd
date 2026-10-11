@@ -1602,6 +1602,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "title".into(),
@@ -1614,6 +1615,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "tags".into(),
@@ -1626,6 +1628,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
         ],
         constraints: vec![TableConstraint::PrimaryKey {

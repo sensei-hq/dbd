@@ -184,6 +184,9 @@ fn column_definition(c: &crate::entity::ColumnDef) -> String {
     }
 
     let mut col = format!("  {} {}", q(&c.name), c.data_type);
+    if let Some(collation) = &c.collation {
+        col.push_str(&format!(" COLLATE {collation}"));
+    }
 
     // Identity columns are implicitly NOT NULL and carry no default — emit the
     // GENERATED … AS IDENTITY clause and skip the default.
@@ -565,6 +568,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order PK".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "customer_id".into(),
@@ -577,6 +581,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "total_cents".into(),
@@ -589,6 +594,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -933,6 +939,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tsv".into(),
@@ -945,6 +952,7 @@ mod tests {
                     generated: Some("to_tsvector('english', coalesce(content, ''))".into()),
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -982,6 +990,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // identity column (ALWAYS): emit GENERATED ALWAYS AS IDENTITY, no default.
                 ColumnDef {
@@ -995,6 +1004,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // standalone-referencing column: keep its real type + nextval default.
                 ColumnDef {
@@ -1008,6 +1018,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -1059,6 +1070,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let mut e = Entity::new(EntityType::Table, "app.people");
         e.table_def = Some(TableDef {
@@ -1096,6 +1108,7 @@ mod tests {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             }],
             constraints: vec![],
             indexes: vec![],
@@ -1123,6 +1136,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
             name: Some(name.into()),
