@@ -1088,6 +1088,48 @@ async fn refresh_and_the_dry_runs_refuse_another_scope_on_a_pinned_database() {
     }
 }
 
+/// `diff` and `migrate --status` only read, so a database pinned to another
+/// scope is not refused — but they said nothing of the pin, and an unscoped
+/// diff of a `hub` database listed everything `hub` does not build as missing,
+/// with no word of why. Each names the pin in one line, and stays quiet where
+/// the run's scope is the pinned one. Under `--json` the note goes to stderr,
+/// leaving stdout the document.
+#[tokio::test]
+async fn diff_and_migrate_status_name_the_pin_of_a_database_pinned_to_another_scope() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [&["diff"][..], &["migrate", "--status"]] {
+        let o = dbd(dir, &url, args);
+        let notes = combined(&o)
+            .lines()
+            .filter(|l| l.contains("pinned to scope 'hub'"))
+            .count();
+        if !o.status.success() || notes != 1 {
+            failures.push(format!("{args:?} does not name the pin in one line: {}", combined(&o)));
+        }
+    }
+    let o = dbd(dir, &url, &["diff", "--json"]);
+    if serde_json::from_slice::<serde_json::Value>(&o.stdout).is_err()
+        || !String::from_utf8_lossy(&o.stderr).contains("pinned to scope 'hub'")
+    {
+        failures.push(format!(
+            "diff --json: stdout the document, the note on stderr: {}",
+            combined(&o)
+        ));
+    }
+    let o = dbd(dir, &url, &["diff", "--scope", "hub"]);
+    if !o.status.success() || combined(&o).contains("pinned to scope") {
+        failures.push(format!("diff --scope hub notes its own pin: {}", combined(&o)));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 // ── apply --dry-run names the pending migrations ────────────────────────────
 
 /// `dbd <args>` with no database: no `-d`, and no `$DATABASE_URL` to fall back on.
