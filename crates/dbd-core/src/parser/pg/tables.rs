@@ -296,13 +296,14 @@ fn process_create_table(
     for elt in &create.table_elts {
         match elt.node.as_ref() {
             Some(NodeEnum::ColumnDef(col_def)) => {
-                let (col, checks) = extract_column(col_def, default_schema, references, functions)?;
+                let (col, lifted) = extract_column(col_def, default_schema, references, functions)?;
                 columns.push(col);
                 // Postgres promotes a column-level CHECK to a table constraint,
                 // and introspection reports it as one. Dropping it would make
                 // every inline CHECK read as a live-only constraint reconcile
-                // offers to delete.
-                constraints.extend(checks);
+                // offers to delete. So with a named inline key, or an inline
+                // UNIQUE NULLS NOT DISTINCT (see `extract_column`).
+                constraints.extend(lifted);
             }
             Some(NodeEnum::Constraint(_)) => {}
             // The only other element Postgres's grammar allows here is
@@ -343,7 +344,19 @@ fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
     }
 }
 
-/// One column, plus any column-level `CHECK`s, which belong to the table.
+/// One column, plus the table-level constraints its own clauses amount to:
+/// every column-level `CHECK`, which belongs to the table, and a key the
+/// column's flags cannot carry whole.
+///
+/// `is_pk` and `is_unique` hold that the column is a key, and nothing else
+/// about it. An inline `constraint u_pk primary key` or `constraint u_email_uq
+/// unique` lost its name, so `emit` and the DBML wrote the key unnamed; an
+/// inline `unique nulls not distinct` lost the clause, so the design read as a
+/// plain UNIQUE against the database it built. Each becomes the table-level
+/// constraint it is equivalent to — the shape `constraint u_pk primary key
+/// (id)` already parses to: a primary key keeps `is_pk` beside its constraint,
+/// a UNIQUE is the constraint alone. A key with neither a name nor the clause
+/// stays a flag, as before.
 fn extract_column(
     col_def: &protobuf::ColumnDef,
     default_schema: &str,
@@ -372,7 +385,7 @@ fn extract_column(
     let mut generated: Option<String> = None;
     let mut default_value = None;
     let mut inline_fk = None;
-    let mut checks = Vec::new();
+    let mut lifted = Vec::new();
 
     for node in &col_def.constraints {
         let Some(NodeEnum::Constraint(c)) = node.node.as_ref() else {
@@ -383,8 +396,19 @@ fn extract_column(
             ConstrPrimary => {
                 is_pk = true;
                 nullable = false;
+                if let Some(constraint) = constraint_name(c) {
+                    lifted.push(TableConstraint::PrimaryKey {
+                        name: Some(constraint),
+                        columns: vec![name.clone()],
+                    });
+                }
             }
-            ConstrUnique => is_unique = true,
+            ConstrUnique if c.conname.is_empty() && !c.nulls_not_distinct => is_unique = true,
+            ConstrUnique => lifted.push(TableConstraint::Unique {
+                name: constraint_name(c),
+                columns: vec![name.clone()],
+                nulls_not_distinct: c.nulls_not_distinct,
+            }),
             ConstrNotnull => nullable = false,
             ConstrNull => nullable = true,
             ConstrDefault => {
@@ -398,7 +422,7 @@ fn extract_column(
             ConstrCheck => {
                 let rendered = constraint_expr(c, &name, "CHECK")?;
                 collect_function_refs(&rendered, default_schema, functions);
-                checks.push(TableConstraint::Check {
+                lifted.push(TableConstraint::Check {
                     name: constraint_name(c),
                     expression: rendered,
                 });
@@ -470,7 +494,7 @@ fn extract_column(
         comment: None,
         inline_fk,
     };
-    Ok((column, checks))
+    Ok((column, lifted))
 }
 
 /// One table-level constraint.
