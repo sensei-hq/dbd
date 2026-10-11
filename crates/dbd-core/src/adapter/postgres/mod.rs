@@ -1766,6 +1766,56 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
+    /// One `TRUNCATE` for every table an import reloads. Postgres refuses to
+    /// truncate a table another references — unless both are truncated
+    /// together — so staging tables linked by a foreign key failed one at a
+    /// time on every run. Together, they empty; and a statement Postgres still
+    /// refuses empties nothing. Its error names no table, so the tables are
+    /// named, with every key outside the set that holds one of them.
+    async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let list = tables
+            .iter()
+            .map(|t| crate::sql_quote::qualified(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Err(e) = self.execute_script(&format!("TRUNCATE TABLE {list}")).await else {
+            return Ok(());
+        };
+        let qualified: Vec<String> = tables.iter().map(|t| crate::sql_quote::qualified(t)).collect();
+        let blockers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT n.nspname || '.' || c.relname || ' (' || con.conname || ', a key to ' \
+                    || rn.nspname || '.' || rc.relname || ')' \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+             JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+             WHERE con.contype = 'f' \
+               AND con.confrelid IN (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
+               AND con.conrelid NOT IN (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
+             ORDER BY 1",
+        )
+        .bind(&qualified)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        let why = if blockers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — held by {}, outside the tables this import reloads; it truncates only its own",
+                blockers.join(", ")
+            )
+        };
+        Err(DbdError::Config(format!(
+            "emptying {} before the import failed, so nothing was emptied: {e}{why}",
+            tables.join(", ")
+        )))
+    }
+
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let format = entity.format.as_deref().unwrap_or("csv");
         // Refused rather than defaulted: the file is named for the format asked

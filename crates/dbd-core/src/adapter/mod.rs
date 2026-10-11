@@ -214,6 +214,21 @@ pub trait DatabaseAdapter: Send + Sync {
             .await
     }
 
+    /// Empty every one of `tables` before an import reloads them.
+    ///
+    /// By default one at a time, through [`Self::truncate_table`], with the
+    /// table that failed named — the database's own error ("cannot truncate a
+    /// table referenced in a foreign key constraint") names none. Postgres
+    /// truncates them in one statement instead (see its override).
+    async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
+        for table in tables {
+            self.truncate_table(table).await.map_err(|e| {
+                crate::error::DbdError::Config(format!("emptying {table} before its import failed: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Export a table's data to a file.
     ///
     /// `out_dir`:

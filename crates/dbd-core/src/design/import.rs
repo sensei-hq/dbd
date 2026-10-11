@@ -644,18 +644,22 @@ impl Design {
                 if placed[i] {
                     continue;
                 }
-                // Check if all dependencies are already placed
-                let deps_satisfied = entries[i].writes.iter().all(|write_target| {
-                    // Get FK deps of this write target
-                    let fk_deps = entity_refs.get(write_target).cloned().unwrap_or_default();
-                    // All FK deps that are also write targets of other entries must be placed
-                    fk_deps.iter().all(|dep| {
-                        !entries
-                            .iter()
-                            .enumerate()
-                            .any(|(j, other)| !placed[j] && j != i && other.writes.contains(dep))
-                    })
-                });
+                // Check if all dependencies are already placed: the tables its
+                // write targets reference must be written first, and so must the
+                // staging tables its own staging table references be loaded —
+                // a COPY into a staging table that references another fails on
+                // the foreign key until that table holds its rows.
+                let staging = &entries[i].table.name;
+                let deps_satisfied = std::iter::once(staging)
+                    .chain(entries[i].writes.iter())
+                    .flat_map(|t| entity_refs.get(t).cloned().unwrap_or_default())
+                    .all(|dep| {
+                        !entries.iter().enumerate().any(|(j, other)| {
+                            !placed[j]
+                                && j != i
+                                && (other.writes.contains(&dep) || (other.table.name == dep && dep != *staging))
+                        })
+                    });
 
                 if deps_satisfied {
                     sorted.push(entries[i].clone());
@@ -758,11 +762,17 @@ impl Design {
         D: FnMut(&str, Option<&str>),
     {
         if !dry_run {
+            // Together, in one call: a table may have two data files (a shared
+            // one and an env's own), and Postgres truncates tables linked by a
+            // foreign key only together.
+            let mut truncated: Vec<String> = Vec::new();
             for entry in plan {
-                if self.config.import.table_truncate(&entry.table.name) {
-                    adapter.truncate_table(&entry.table.name).await?;
+                let table = &entry.table.name;
+                if self.config.import.table_truncate(table) && !truncated.contains(table) {
+                    truncated.push(table.clone());
                 }
             }
+            adapter.truncate_tables(&truncated).await?;
         }
 
         let mut loaded: HashSet<&str> = HashSet::new();
