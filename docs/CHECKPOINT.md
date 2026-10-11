@@ -1,41 +1,39 @@
 # Checkpoint
 
-**Slice:** 0.25.0 — third re-audit fixes. `fix/audit-bugs` tip `0d6fdb8` (all
-gates green). Report: `/tmp/dbd-resume/reaudit3-report.md` — every earlier
-defect FIXED, ~32 new (8 high), mostly pre-existing.
+**Slice:** 0.25.0 — third re-audit fixes. All four fix branches are merged on
+`fix/audit-bugs` (tip `02ccca2`, all gates green); `docs/feature-coverage`
+merged it and carries the CHANGELOG and docs pass 3 on top.
 
-## In progress (agents)
+## Done
 
-- `dbd-apply` `fix/migrations-3`: version-by-version migrations (items 2, 3),
-  `apply -n` with pending migrations (1), enum add+use (9), migration/hook
-  scripts on source.search_path (10), reconcile enum/matview (11, 13), lows.
-- `dbd-emit` `fix/guards-3`: guards keyed on project.name (4), dry-run guards
-  (14), pin notes, lows.
-- `dbd-model` `fix/reverse-data-3`: merge externals (6), init --from-db
-  fidelity (7, 12, 18), JSONL null (15), SQLite BLOB (16).
-- `dbd-audit` `fix/format-dbml-3`: search_path regex → parsed (5), formatter
-  literals (8), emit key names (17), DBML reader/writer (18).
-- `dbd-docs` `docs/feature-coverage`: docs pass 2 (to 0d6fdb8) + audit-3 stale
-  guide items.
+- `fix/migrations-3`, `fix/guards-3`, `fix/reverse-data-3`, `fix/format-dbml-3`
+  merged into `fix/audit-bugs` (report: `/tmp/dbd-resume/reaudit3-report.md`).
+- `docs/feature-coverage`: CHANGELOG `[Unreleased]` corrected and extended for
+  the third round (false bullets fixed, Library API breaks incl.
+  `check_scope_guard(&DatabaseMarks)`, known limitations); every guide, README,
+  both llms files, both SKILL.md and agent copies, architecture notes. Site
+  copies regenerated and byte-identical; site tests 154/154; embedded 125/0.
+
+## Remaining
+
+- Merge `docs/feature-coverage` back into `fix/audit-bugs`.
+- Code defect found in docs pass 3 (not fixed): a DBML column name with an
+  escaped quote (`"we\"ird"`) makes `init --from-dbml` write a table file that
+  does not parse.
 
 ## Decisions (user)
 
 - #22 refuse older project; #25 reconcile grants+hooks; prod guard: no
-  override (a full `reset --force` forgets the mark — done `c114367`).
+  override (a reset under the all-scope or the pinned scope forgets the mark).
 - Full re-audit was run (3rd). Ask before a 4th.
-- Repo identity: local override removed; global Jerry Thomas <me@jerrythomas.name>
-  applies. After the fixes: `git filter-repo --mailmap` ALL non-Jerry identities
-  (dev@sensei-hq.com, jerry.thomas.in@icloud.com, users.noreply.github.com,
-  senecaglobal.com, GitHub committer) → Jerry Thomas <me@jerrythomas.name>;
-  backup bundle first; confirm before any force-push.
+- Repo identity: global Jerry Thomas <me@jerrythomas.name>. After the fixes:
+  `git filter-repo --mailmap` all non-Jerry identities → Jerry Thomas; backup
+  bundle first; confirm before any force-push.
 
 ## Next
-
-    # merge each fix branch (all gates) → CHANGELOG → final docs pass → ask about
+    # merge docs/feature-coverage → fix/audit-bugs (all gates) → ask about a
     # 4th audit → author rewrite → PR to develop
 
 ## Scratch (rm denied)
-
-- /tmp/dbdaudit-*, /tmp/dbdA3*, /tmp/dbdB_*.txt, /tmp/a1, /tmp/a2, /tmp/pgq-probe,
-  /tmp/dbd-{checkci,commit,core-embedded}.log, /tmp/dbdapply-*, /tmp/dbdprobe,
-  /tmp/dbd{pg55444,emit,ml,comb,fmt,json,uq,note,fsp,idx}.*
+- /tmp/dbdaudit-*, /tmp/dbdA3*, /tmp/dbdB_*.txt, /tmp/a1, /tmp/a2, /tmp/f1-*, /tmp/f2_mv.*,
+  /tmp/dbddocs3-* (incl. stopped cluster dbddocs3-pg.Z3uWLs), /tmp/dbd-resume/docs3-*
