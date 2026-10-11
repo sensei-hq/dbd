@@ -600,11 +600,10 @@ impl Design {
                         let sql = crate::source_text::read_to_string(migration_sql_path)?;
                         // Its enum values already ran, and committed, at the
                         // head of the version; here they are no-ops.
-                        // Bare names resolve as in a DDL file stating no path.
                         adapter
                             .execute_project_script(
                                 &crate::script::idempotent_enum_value_additions(&sql),
-                                self.script_search_path(),
+                                self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
                             )
                             .await?;
                     }
@@ -625,7 +624,12 @@ impl Design {
                         .unwrap_or_else(|| "entity".to_string());
                     let desc = format!("add values {type_tag}:{entity_name} → v{migration_version}");
                     on_start(&desc);
-                    let result = adapter.execute_project_script(script, self.script_search_path()).await;
+                    let result = adapter
+                        .execute_project_script(
+                            script,
+                            self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
+                        )
+                        .await;
                     report_step_result(&desc, on_done, result)?;
                 }
             }
@@ -642,7 +646,12 @@ impl Design {
                 on_start(&desc);
                 let result: Result<()> = async {
                     let sql = crate::source_text::read_to_string(data_sql_path)?;
-                    adapter.execute_project_script(&sql, self.script_search_path()).await
+                    adapter
+                        .execute_project_script(
+                            &sql,
+                            self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
+                        )
+                        .await
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
@@ -666,7 +675,10 @@ impl Design {
                     if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         // Decoded like the migration's `.sql` and `.data.sql`.
                         let sql = crate::source_text::read_to_string(drop_sql_path)?;
-                        adapter.execute_project_script(&sql, self.script_search_path()).await?;
+                        // Gone from the design, so `source.search_path` alone.
+                        adapter
+                            .execute_project_script(&sql, self.migration_search_path(None))
+                            .await?;
                         return Ok(true);
                     }
                     Ok(false)
@@ -691,6 +703,28 @@ impl Design {
             }
         }
         Ok(())
+    }
+
+    /// The path a migration file of `entity` runs on when it states none of
+    /// its own: the one `entity`'s DDL file runs on — the path that file
+    /// states, else `source.search_path` — and, for a table the design no
+    /// longer has, `source.search_path`. `None` is the session's default.
+    ///
+    /// `dbd snapshot` writes a column's type as the DDL file wrote it, so a
+    /// generated `ADD COLUMN was mood` needs the file's own path to find
+    /// `mood`; the project's alone failed it with `type "mood" does not
+    /// exist` (see [`crate::script::runnable_script`]).
+    fn migration_search_path<'a>(&'a self, entity: Option<&'a Entity>) -> Option<&'a [crate::entity::PathEntry]> {
+        use crate::entity::PathSource;
+        match entity {
+            Some(e)
+                if matches!(e.schema_path.source, PathSource::File | PathSource::Project)
+                    && !e.schema_path.entries.is_empty() =>
+            {
+                Some(&e.schema_path.entries)
+            }
+            _ => self.script_search_path(),
+        }
     }
 
     /// The pre-existing matviews among `applied` that carry no stamp and whose
