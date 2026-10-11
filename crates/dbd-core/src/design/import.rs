@@ -254,6 +254,14 @@ impl Design {
             ));
         }
 
+        for rel in &self.import_scan_skips.unrecognised {
+            warnings.push(format!(
+                "import/{} not loaded — an import reads import/<schema>/<table>.<ext>, or \
+                 import/<env>/<schema>/<table>.<ext> for env dev or prod, and no folder deeper",
+                rel.display()
+            ));
+        }
+
         for table in self.import_invalid_tables() {
             let file = table.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
             warnings.push(format!(
