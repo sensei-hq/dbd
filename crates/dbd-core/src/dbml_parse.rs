@@ -887,8 +887,19 @@ fn split_dotted(input: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
+    let mut escaped = false;
     for c in input.chars() {
         match c {
+            // An escaped character inside a quoted name is part of it — an
+            // escaped quote does not end the name.
+            _ if escaped => {
+                escaped = false;
+                cur.push(c);
+            }
+            '\\' if in_quote => {
+                escaped = true;
+                cur.push(c);
+            }
             '"' => {
                 in_quote = !in_quote;
                 cur.push(c);
@@ -909,7 +920,9 @@ fn split_dotted(input: &str) -> Vec<String> {
 fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
+        // A quoted name takes backslash escapes, as a string does in DBML:
+        // `"we\"ird"` is `we"ird` to @dbml/core.
+        unescape_dbml(&s[1..s.len() - 1])
     } else {
         s.to_string()
     }
@@ -920,10 +933,17 @@ fn unquote(s: &str) -> String {
 fn take_identifier(s: &str) -> Result<(String, &str)> {
     let s = s.trim_start();
     if let Some(rest) = s.strip_prefix('"') {
-        match rest.find('"') {
-            Some(end) => Ok((rest[..end].to_string(), &rest[end + 1..])),
-            None => Err(parse_err(format!("unterminated quoted identifier: {s}"))),
+        // The name ends at the first quote no backslash escapes.
+        let mut escaped = false;
+        for (at, c) in rest.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => return Ok((unescape_dbml(&rest[..at]), &rest[at + 1..])),
+                _ => {}
+            }
         }
+        Err(parse_err(format!("unterminated quoted identifier: {s}")))
     } else {
         // Bare identifier: up to whitespace or `[`.
         let end = s.find(|c: char| c.is_whitespace() || c == '[').unwrap_or(s.len());

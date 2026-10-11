@@ -244,13 +244,13 @@ fn emit_table_groups(included_tables: &[&Entity], explicit_groups: &[DbmlGroup],
 fn format_table_group(name: &str, tables: &[&String]) -> String {
     let mut sorted: Vec<&&String> = tables.iter().collect();
     sorted.sort();
-    let mut out = format!("TableGroup \"{}\" {{\n", name);
+    let mut out = format!("TableGroup {} {{\n", dbml_quoted_name(name));
     for t in sorted {
         let (schema, base) = match t.split_once('.') {
             Some((s, b)) => (s, b),
             None => ("public", t.as_str()),
         };
-        out.push_str(&format!("  \"{schema}\".\"{base}\"\n"));
+        out.push_str(&format!("  {}.{}\n", dbml_quoted_name(schema), dbml_quoted_name(base)));
     }
     out.push_str("}\n");
     out
@@ -347,12 +347,20 @@ impl EnumTypes {
 fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
-    let mut lines = vec![format!("Enum \"{}\".\"{}\" {{", schema, base_name)];
+    let mut lines = vec![format!(
+        "Enum {}.{} {{",
+        dbml_quoted_name(schema),
+        dbml_quoted_name(base_name)
+    )];
 
     for value in &entity.enum_values {
         match &value.note {
-            Some(note) => lines.push(format!("  \"{}\" [note: {}]", value.name, dbml_string(note))),
-            None => lines.push(format!("  \"{}\"", value.name)),
+            Some(note) => lines.push(format!(
+                "  {} [note: {}]",
+                dbml_quoted_name(&value.name),
+                dbml_string(note)
+            )),
+            None => lines.push(format!("  {}", dbml_quoted_name(&value.name))),
         }
     }
 
@@ -362,7 +370,11 @@ fn emit_enum(entity: &Entity) -> String {
 
 fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     let base_name = name.split('.').next_back().unwrap_or(name);
-    let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, base_name)];
+    let mut lines = vec![format!(
+        "Table {}.{} {{",
+        dbml_quoted_name(schema),
+        dbml_quoted_name(base_name)
+    )];
 
     // The primary key. A column's `[pk]` cannot carry a name, so a key with a
     // name of its own is a `pk` entry in the indexes block — DBML's one way to
@@ -543,7 +555,7 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
         format!(" [{}]", settings.join(", "))
     };
 
-    format!("  \"{}\" {}{}", col.name, data_type, settings_str)
+    format!("  {} {}{}", dbml_quoted_name(&col.name), data_type, settings_str)
 }
 
 fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
@@ -622,7 +634,7 @@ fn index_key(key: &IndexColumn) -> String {
     if key.is_expression {
         format!("`{}`", key.name)
     } else {
-        key.name.clone()
+        dbml_column_name(&key.name)
     }
 }
 
@@ -844,13 +856,18 @@ fn emit_all_refs(entities: &[Entity]) -> String {
 /// column, or `"schema"."table".("c1", "c2")` for a composite key.
 fn qualify_columns(schema: &str, table: &str, cols: &[String]) -> String {
     if cols.len() == 1 {
-        format!("\"{}\".\"{}\".\"{}\"", schema, table, cols[0])
+        format!(
+            "{}.{}.{}",
+            dbml_quoted_name(schema),
+            dbml_quoted_name(table),
+            dbml_quoted_name(&cols[0])
+        )
     } else {
         format!(
-            "\"{}\".\"{}\".({})",
-            schema,
-            table,
-            cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+            "{}.{}.({})",
+            dbml_quoted_name(schema),
+            dbml_quoted_name(table),
+            cols.iter().map(|c| dbml_quoted_name(c)).collect::<Vec<_>>().join(", ")
         )
     }
 }
@@ -1004,7 +1021,11 @@ fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enum
     let (schema, table) = target.split_once('.').unwrap_or(("public", target));
     let known_columns = known.and_then(|e| e.table_def.as_ref().map(|td| (td.columns.as_slice(), &e.schema_path)));
 
-    let mut lines = vec![format!("Table \"{schema}\".\"{table}\" {{")];
+    let mut lines = vec![format!(
+        "Table {}.{} {{",
+        dbml_quoted_name(schema),
+        dbml_quoted_name(table)
+    )];
     for (column, referencing_type) in &stub.columns {
         let known_type = known_columns.and_then(|(cols, path)| {
             cols.iter()
@@ -1014,7 +1035,11 @@ fn emit_stub_block(target: &str, stub: &StubTarget, known: Option<&Entity>, enum
         let data_type = known_type
             .or_else(|| (!referencing_type.is_empty()).then(|| referencing_type.clone()))
             .unwrap_or_else(|| "varchar".to_string());
-        lines.push(format!("  \"{column}\" {}", quote_type_if_needed(&data_type)));
+        lines.push(format!(
+            "  {} {}",
+            dbml_quoted_name(column),
+            quote_type_if_needed(&data_type)
+        ));
     }
     // A foreign key's target is unique; said here, `dbml2sql` writes the
     // constraint its foreign keys need instead of one Postgres refuses.
