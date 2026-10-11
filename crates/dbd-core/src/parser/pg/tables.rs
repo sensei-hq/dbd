@@ -371,14 +371,25 @@ fn extract_column(
     let mut identity = None;
     let mut generated: Option<String> = None;
     let mut default_value = None;
-    let mut inline_fk = None;
+    let mut inline_fk: Option<ForeignKey> = None;
     let mut checks = Vec::new();
+    // Whether the constraint before an attribute node (`DEFERRABLE`, …) was
+    // the `REFERENCES` — the one it then modifies.
+    let mut after_references = false;
 
     for node in &col_def.constraints {
         let Some(NodeEnum::Constraint(c)) = node.node.as_ref() else {
             return Err(format!("column {name:?} carries an unreadable constraint"));
         };
         use protobuf::ConstrType::*;
+        let is_attribute = matches!(
+            c.contype(),
+            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate
+        );
+        let modifies_references = is_attribute && after_references;
+        if !is_attribute {
+            after_references = c.contype() == ConstrForeign;
+        }
         match c.contype() {
             ConstrPrimary => {
                 is_pk = true;
@@ -441,8 +452,25 @@ fn extract_column(
                 collect_function_refs(&rendered, default_schema, functions);
                 generated = Some(rendered);
             }
-            // Deferrability modifiers carry no payload of their own.
-            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {}
+            // In a column definition, `DEFERRABLE` and `INITIALLY …` arrive as
+            // constraint nodes of their own, after the constraint they modify.
+            // A `REFERENCES` is the only one the model can hold them for.
+            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {
+                if let Some(fk) = inline_fk.as_mut().filter(|_| modifies_references) {
+                    match c.contype() {
+                        ConstrAttrDeferrable => fk.deferrable = true,
+                        ConstrAttrNotDeferrable => {
+                            fk.deferrable = false;
+                            fk.initially_deferred = false;
+                        }
+                        ConstrAttrDeferred => {
+                            fk.deferrable = true;
+                            fk.initially_deferred = true;
+                        }
+                        _ => fk.initially_deferred = false,
+                    }
+                }
+            }
             other => {
                 return Err(format!(
                     "column {name:?} has a {other:?} constraint dbd cannot represent"
