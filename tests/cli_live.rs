@@ -630,6 +630,64 @@ async fn export_to_a_directory_keeps_same_named_tables_from_different_schemas_ap
     assert!(!out.join("accounts.csv").exists(), "nothing is written flat");
 }
 
+/// The documented way to move a long-running system's data: export a live
+/// table straight into a staging schema's import folder, so the new
+/// database's import loads it there — `export -n core.accounts -o
+/// import/staging` → `import/staging/accounts.csv` → `staging.accounts`. Once
+/// `-o` grew a schema folder of its own (so same-named tables stay apart), the
+/// file landed at `import/staging/core/accounts.csv`, a layout no import
+/// reads, and the round trip loaded nothing. Into a schema folder of the
+/// project's `import/` tree, a table is written as the import reads it; two
+/// selected tables that would share a file there are refused, naming both,
+/// with nothing written.
+#[tokio::test]
+async fn export_into_an_import_schema_folder_writes_what_the_import_loads() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    same_named_tables_project(dir);
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::write(dir.join("live.jsonl"), "{\"id\":2,\"name\":\"live\"}\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-n", "core.accounts", "-f", "live.jsonl"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let staging = dir.join("import/staging");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "-n", "core.accounts", "-o", staging.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(
+        std::fs::read_to_string(staging.join("accounts.csv")).unwrap_or_default(),
+        "id,name\n2,live\n",
+        "written where the import loads it: {}",
+        combined(&o)
+    );
+    let o = dbd(dir, &url, &["import", "--dry-run"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(
+        combined(&o).contains("staging.accounts") && combined(&o).contains("import/staging/accounts.csv"),
+        "and the import plans it into staging.accounts: {}",
+        combined(&o)
+    );
+
+    // Both `accounts` tables into one schema folder would be one file.
+    std::fs::remove_file(staging.join("accounts.csv")).unwrap();
+    let o = dbd(dir, &url, &["export", "-o", staging.to_str().unwrap()]);
+    assert!(!o.status.success(), "two tables, one file — refused: {}", combined(&o));
+    let said = combined(&o);
+    assert!(
+        said.contains("core.accounts") && said.contains("staging.accounts"),
+        "naming both: {said}"
+    );
+    assert!(
+        std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "with nothing written: {said}"
+    );
+}
+
 /// `-s` says where the project is, and the default `export/` is the
 /// project's — it was written under whatever directory dbd ran in.
 #[tokio::test]
