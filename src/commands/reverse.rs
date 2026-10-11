@@ -719,9 +719,35 @@ fn run_plan(
     for name in declared.iter().flat_map(|d| &d.externals) {
         println!("  external: {name} — a foreign key references it, outside the captured schemas");
     }
+    // A schema is the project's when something was captured in it — a file
+    // written, or an extension declared with it as its `schema:` — or when
+    // `--schema` named it. Every database has a `public`, and listing an empty
+    // one claimed a schema the project holds nothing in, which `reset
+    // --clean` would drop. An extension in `public` is declared without a
+    // `schema:` (`public` is where one installs), so it needs none listed.
+    let captured_in = |schema: &String| {
+        kept.iter().any(|e| {
+            e.schema.as_ref() == Some(schema)
+                && match e.entity_type {
+                    dbd_core::EntityType::Schema => false,
+                    dbd_core::EntityType::Extension => schema != "public",
+                    _ => true,
+                }
+        })
+    };
+    let listed: Vec<String> = selected
+        .iter()
+        .filter(|s| sel.only.contains(s) || captured_in(s))
+        .cloned()
+        .collect();
+    if write_config {
+        for schema in selected.iter().filter(|s| !listed.contains(s)) {
+            println!("  left out: schema `{schema}` — nothing in it to capture (name it with --schema to keep it)");
+        }
+    }
     if let Some(declared) = declared.filter(|_| !dry_run) {
         let project = name.map(String::from).unwrap_or_else(|| "project".into());
-        let yaml = reverse::design_yaml_with(&project, dialect, &selected, version.unwrap_or(1), &declared);
+        let yaml = reverse::design_yaml_with(&project, dialect, &listed, version.unwrap_or(1), &declared);
         // Write to the resolved config path (project_dir/<--config>), matching what the
         // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
         // diverge under `--config custom.yaml`).
