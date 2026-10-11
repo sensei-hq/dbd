@@ -691,7 +691,10 @@ handled that another dropped — and fixed both in the code, test first.
   an undefined table.
 - Strings are escaped as DBML's lexer reads them, and the whole document is
   lexed by @dbml/parse's token rules, so a quote or backslash in a note or
-  default survives, and a column comment keeps its line breaks.
+  default survives, and a column comment keeps its line breaks. A name holding
+  a quote or a backslash is escaped when written and read back as itself; a
+  hand-written `"we\"ird"` no longer gives a table file that does not parse,
+  and the DDL dbd writes doubles a quote in any identifier.
 - An index's method (`type:`), and its `INCLUDE` columns, operator classes and
   storage parameters (`include:`, `opclass:` and `with:` lines in its note),
   are written and read back, as are a named primary key (a `pk` index entry
@@ -808,9 +811,7 @@ hold is named, never weakened in silence.
   Postgres's `'-1'::integer`) and on `varbit` columns.
 - `init --from-dbml` names every unnamed index `<table>_idx`, so a second
   unnamed index on one table collides on apply. dbd's DBML reader takes a
-  one-line note's leading whitespace off, and does not unescape a quote
-  escaped inside a quoted name: an enum value keeps the backslash, and a
-  column named `"we\"ird"` gives a table file that does not parse. The DBML
+  one-line note's leading whitespace off, as @dbml/core does. The DBML
   writer leaves out a foreign key's deferral and `MATCH FULL`, EXCLUDE
   constraints and column collations, which DBML has no syntax for, so they do
   not survive the round trip.
