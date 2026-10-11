@@ -1240,6 +1240,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 

@@ -836,6 +836,9 @@ struct FkShape {
     ref_columns: Vec<String>,
     on_delete: Option<FkAction>,
     on_update: Option<FkAction>,
+    match_full: bool,
+    deferrable: bool,
+    initially_deferred: bool,
 }
 
 /// The name-agnostic shape of an FK for cross-representation matching.
@@ -855,6 +858,11 @@ fn fk_shape(fk: &ForeignKey) -> FkShape {
         ref_columns: fk.ref_columns.clone(),
         on_delete: norm_action(fk.on_delete),
         on_update: norm_action(fk.on_update),
+        match_full: fk.match_full,
+        // `INITIALLY DEFERRED` implies `DEFERRABLE`; one spelled without the
+        // other is the same key.
+        deferrable: fk.deferrable || fk.initially_deferred,
+        initially_deferred: fk.initially_deferred,
     }
 }
 
@@ -1096,6 +1104,84 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
             continue;
         }
 
+        let diff = MigrationDiff {
+            entity_name: qname.clone(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(changes),
+        };
+        let sql = diff::generate_migration_sql(std::slice::from_ref(&diff));
+        if sql.trim().is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, sql);
+    }
+}
+
+// ── EXCLUDE convergence ─────────────────────────────────────
+
+/// Converge `EXCLUDE` constraints into an existing reconcile `plan`, as
+/// [`plan_check_convergence`] does CHECKs: [`canonicalize`] strips them, so
+/// they are matched here from the RAW snapshots by their definition read back
+/// through [`crate::sql_expr::canonical_exclusion`] — Postgres auto-names an
+/// unnamed one (`<table>_<columns>_excl`), so a name cannot be the identity.
+/// One the design declares and the database lacks is added; one the database
+/// has and the design dropped is removed by its live name, destructively.
+pub fn plan_exclusion_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    use crate::diff::{FieldChange, FieldDetail, FieldType};
+
+    fn exclusions(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
+        t.table_constraints
+            .iter()
+            .filter_map(|con| match con {
+                TableConstraint::Exclude { definition, .. } => Some((
+                    crate::sql_expr::canonical_exclusion(definition).unwrap_or_else(|| definition.clone()),
+                    con,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+        let desired_ex = exclusions(dt);
+        let live_ex = exclusions(lt);
+        let desired_keys: HashSet<&str> = desired_ex.iter().map(|(k, _)| k.as_str()).collect();
+        let live_keys: HashSet<&str> = live_ex.iter().map(|(k, _)| k.as_str()).collect();
+
+        let mut changes: Vec<FieldChange> = Vec::new();
+        for (key, con) in live_ex.iter().filter(|(k, _)| !desired_keys.contains(k.as_str())) {
+            let TableConstraint::Exclude { name: Some(_), .. } = con else {
+                plan.warnings.push(format!(
+                    "EXCLUDE {key} on {qname} is not in the design but has no constraint name — drop it manually"
+                ));
+                continue;
+            };
+            changes.push(FieldChange {
+                field_name: format!("ex:{key}"),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
+            });
+            plan.destructive = true;
+        }
+        for (key, con) in desired_ex.iter().filter(|(k, _)| !live_keys.contains(k.as_str())) {
+            changes.push(FieldChange {
+                field_name: format!("ex:{key}"),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*con).clone()))),
+            });
+        }
+        if changes.is_empty() {
+            continue;
+        }
         let diff = MigrationDiff {
             entity_name: qname.clone(),
             entity_type: EntityType::Table,
@@ -2018,6 +2104,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 
@@ -4140,6 +4227,7 @@ mod enum_recreation_tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 

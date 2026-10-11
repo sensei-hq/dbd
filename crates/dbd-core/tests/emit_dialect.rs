@@ -391,6 +391,143 @@ fn foreign_keys_are_emitted_on_every_target() {
     }
 }
 
+/// A foreign key's `DEFERRABLE INITIALLY DEFERRED` and `MATCH FULL` are part
+/// of what it enforces. SQLite defers a key exactly so, and carries it; MySQL
+/// and SQL Server defer nothing; SQLite parses `MATCH FULL` and enforces it as
+/// `MATCH SIMPLE`, as does MySQL — so on those the key is emitted without the
+/// clause and the loss is reported, never dropped in silence.
+#[test]
+fn a_foreign_keys_deferral_and_match_are_carried_or_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/parent.ddl"),
+        "set search_path to app;\ncreate table if not exists parent (id integer primary key, code integer, \
+         constraint parent_id_code unique (id, code));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/child.ddl"),
+        "set search_path to app;\ncreate table if not exists child (\n  id integer primary key\n, pid integer\n, pcode integer\n, \
+         constraint child_pid_fk foreign key (pid) references parent (id) deferrable initially deferred\n, \
+         constraint child_full_fk foreign key (pid, pcode) references parent (id, code) match full\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+
+    let reported = |report: &[Downgrade], what: &str| {
+        report
+            .iter()
+            .any(|d| d.entity.ends_with("child") && d.from.to_uppercase().contains(what))
+    };
+    let (sql, report) = emit_schema(&design, Dialect::Sqlite, None).expect("emits");
+    assert!(
+        sql.to_uppercase().contains("DEFERRABLE INITIALLY DEFERRED"),
+        "SQLite defers: {sql}"
+    );
+    assert!(!reported(&report, "DEFERRABLE"), "carried, so not reported: {report:?}");
+    assert!(
+        reported(&report, "MATCH FULL"),
+        "SQLite does not enforce MATCH FULL: {report:?}"
+    );
+    for dialect in [Dialect::MySql, Dialect::TSql] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        // The statements, not the inline notes that report the loss.
+        let upper: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
+        assert!(
+            !upper.contains("DEFERRABLE") && !upper.contains("MATCH FULL"),
+            "{dialect:?} has neither clause: {sql}"
+        );
+        assert!(
+            reported(&report, "DEFERRABLE"),
+            "{dialect:?}: deferral lost: {report:?}"
+        );
+        assert!(
+            reported(&report, "MATCH FULL"),
+            "{dialect:?}: MATCH FULL lost: {report:?}"
+        );
+    }
+}
+
+/// A column's `COLLATE "C"` names a PostgreSQL collation; no target knows
+/// that name, so the column takes the target's default and the change in how
+/// its values sort and compare is reported.
+#[test]
+fn a_columns_collation_is_reported_on_every_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/codes.ddl"),
+        "set search_path to app;\ncreate table if not exists codes (\n  id integer primary key\n, code varchar(20) collate \"C\"\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        assert!(
+            report.iter().any(|d| d.entity.ends_with("codes")
+                && d.column.as_deref() == Some("code")
+                && d.from.contains("COLLATE")),
+            "{dialect:?}: the collation is reported: {report:?}\n{sql}"
+        );
+    }
+}
+
+/// No other engine has `EXCLUDE`. The table is emitted without it and the
+/// loss reported — two bookings of one room may then overlap — never dropped
+/// in silence.
+#[test]
+fn an_exclusion_constraint_is_reported_on_every_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/rooms.ddl"),
+        "set search_path to app;\ncreate table if not exists rooms (\n  id integer primary key\n, room integer not null\n, \
+         during tstzrange not null\n, constraint no_overlap exclude using gist (room with =, during with &&)\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        let statements: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
+        assert!(!statements.contains("EXCLUDE"), "{dialect:?} has no EXCLUDE: {sql}");
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity.ends_with("rooms") && d.from.contains("no_overlap") && d.from.contains("EXCLUDE")),
+            "{dialect:?}: the lost constraint is reported: {report:?}"
+        );
+    }
+}
+
 /// CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd does
 /// not translate — so it is emitted AND reported, the way a view body is.
 #[test]

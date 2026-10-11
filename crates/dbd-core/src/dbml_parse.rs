@@ -766,6 +766,10 @@ impl Parser {
                 ref_columns: r.target.columns,
                 on_delete: r.on_delete,
                 on_update: r.on_update,
+                // DBML has no words for these; a `Ref` is a plain key.
+                match_full: false,
+                deferrable: false,
+                initially_deferred: false,
                 // A DBML Ref's tables resolve to a schema, so nothing here
                 // was inferred from a search path.
                 ref_schema_source: crate::entity::SchemaSource::Stated,
@@ -974,6 +978,8 @@ fn parse_column(line: &str, table: &str) -> Result<ParsedColumn> {
         generated: None,
         comment: None,
         inline_fk: None,
+        // DBML has no collation.
+        collation: None,
     };
     let mut checks = Vec::new();
     let mut refs = Vec::new();
@@ -2082,6 +2088,7 @@ mod tests {
                     generated: None,
                     comment: Some("The user's primary biography".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "nickname".into(),
@@ -2094,6 +2101,7 @@ mod tests {
                     generated: None,
                     comment: Some("User's display name".into()),
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -2176,6 +2184,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -2188,6 +2197,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -2218,6 +2228,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "code".into(),
@@ -2230,6 +2241,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order code".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "user_id".into(),
@@ -2242,6 +2254,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -2254,6 +2267,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "qty".into(),
@@ -2266,6 +2280,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -2553,6 +2568,7 @@ mod tests {
             generated: None,
             comment: Some(r"Windows path, e.g. C:\temp — the user's".into()),
             inline_fk: None,
+            collation: None,
         };
         let table_with_note = |name: &str, note: &str| {
             let mut t = Entity::new(EntityType::Table, name);

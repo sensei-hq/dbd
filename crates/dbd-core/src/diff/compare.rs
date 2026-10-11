@@ -156,6 +156,7 @@ fn constraint_key(c: &TableConstraint) -> String {
             .clone()
             .unwrap_or_else(|| format!("fk:{}", fk.columns.join(","))),
         TableConstraint::Check { name, expression } => name.clone().unwrap_or_else(|| format!("ck:{expression}")),
+        TableConstraint::Exclude { name, definition } => name.clone().unwrap_or_else(|| format!("ex:{definition}")),
     }
 }
 

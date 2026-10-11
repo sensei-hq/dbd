@@ -466,16 +466,27 @@ pub(crate) async fn export_with_adapter(
 
     output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
-    // `-o` replaces the project's `export/`; the layout under it is the same.
+    // `-o` replaces the project's `export/`; the layout under it is the same —
+    // unless it names a schema folder of the project's `import/` tree, where
+    // each file is written as that import reads it (see `is_import_schema_folder`).
     let root = output.map_or_else(|| design.project_dir().join("export"), Path::to_path_buf);
+    let into_schema_folder = output.is_some_and(|out| is_import_schema_folder(design.project_dir(), out));
+    if into_schema_folder {
+        refuse_shared_files(&tables, &root)?;
+    }
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
         let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
 
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
+        let dir = if into_schema_folder {
+            root.clone()
+        } else {
+            export_dir(&root, &table.name)?
+        };
         adapter
-            .export_data(&export_entity, Some(&export_dir(&root, &table.name)?))
+            .export_data(&export_entity, Some(&dir))
             .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
@@ -486,6 +497,76 @@ pub(crate) async fn export_with_adapter(
         &format!("Export complete. Files written to {}", root.display()),
     );
     Ok(())
+}
+
+/// Whether `out` is a schema folder of the project's `import/` tree —
+/// `import/<schema>`, or `import/<env>/<schema>` under an env folder.
+///
+/// Exporting there is how a long-running system's data moves to a new
+/// database: `export -n core.accounts -o import/staging` writes
+/// `import/staging/accounts.csv`, which the new database's import loads into
+/// `staging.accounts`. Written under a schema folder of its own instead —
+/// `import/staging/core/accounts.csv`, `-o`'s layout everywhere else — the
+/// file sat where no import reads, and the round trip loaded nothing.
+///
+/// Compared as resolved paths: `-o` is read against the directory dbd runs
+/// in and the project against `-s`, and either may pass through a symlink
+/// (macOS's `/var` is `/private/var`). The folder need not exist yet.
+fn is_import_schema_folder(project_dir: &Path, out: &Path) -> bool {
+    let (Some(out), Some(import)) = (resolved(out), resolved(&project_dir.join("import"))) else {
+        return false;
+    };
+    let Ok(rel) = out.strip_prefix(&import) else {
+        return false;
+    };
+    let folders: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    match folders.as_slice() {
+        [env, _schema] => dbd_core::scanner::is_env_folder(env),
+        [schema] => !dbd_core::scanner::is_env_folder(schema),
+        _ => false,
+    }
+}
+
+/// `path` made absolute, with its deepest existing ancestor canonicalized —
+/// symlinks resolved — and the rest, which does not exist yet, appended.
+fn resolved(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return Some(rest.iter().rev().fold(real, |p, part| p.join(part)));
+        }
+        rest.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+/// Refuse an export into an import schema folder where two of `tables` would
+/// be one file — `core.accounts` and `staging.accounts` are both
+/// `accounts.csv` there — naming each pair, before anything is written.
+fn refuse_shared_files(tables: &[&dbd_core::Entity], root: &Path) -> Result<()> {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for table in tables {
+        let (_, bare) = table.name.rsplit_once('.').unwrap_or(("", &table.name));
+        by_file.entry(bare).or_default().push(&table.name);
+    }
+    let shared: Vec<String> = by_file
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(bare, names)| format!("  {bare}: {}", names.join(", ")))
+        .collect();
+    if shared.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "nothing exported: {} is a schema folder of the import tree, where a table is written as \
+         <table>.<format> — and these tables would be one file there:\n{}\n\
+         Export them one at a time with -n, or to -o {} to keep each under its schema",
+        root.display(),
+        shared.join("\n"),
+        root.parent().map(|p| p.display().to_string()).unwrap_or_default()
+    )
 }
 
 /// The directory `table`'s file is written to: `<root>/<schema>/`, or `<root>/`

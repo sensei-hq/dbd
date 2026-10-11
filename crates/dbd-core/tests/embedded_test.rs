@@ -879,8 +879,8 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
 /// - `GENERATED ALWAYS` identity ids were renumbered, breaking every foreign
 ///   key pointing at them.
 ///
-/// A JSON null stays the JSON value; an SQL NULL is exported as an absent key
-/// and imports as NULL. Ids import as-is, and the identity then continues past
+/// A JSON null stays the JSON value (exported as `{"$json": null}`); an SQL
+/// NULL is exported as `null` and imports as NULL. Ids import as-is, and the identity then continues past
 /// them, so the next insert does not collide — after a CSV import too, whose
 /// COPY kept the ids and left the sequence behind.
 #[tokio::test]
@@ -1612,6 +1612,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "title".into(),
@@ -1624,6 +1625,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "tags".into(),
@@ -1636,6 +1638,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
         ],
         constraints: vec![TableConstraint::PrimaryKey {
@@ -3828,6 +3831,60 @@ async fn dbd_schema_excluded_from_introspect_and_survives() {
     // dbd bookkeeping is still present (it's dbd-internal, not a project object)
     assert_table_exists(&*adapter, "dbd", "meta").await;
     assert_table_exists(&*adapter, "dbd", "migrations").await;
+}
+
+/// What an extension owns is the extension's: `CREATE EXTENSION` makes it and
+/// `DROP EXTENSION` removes it. Introspection left out only its functions, so
+/// `init --from-db` wrote an extension's tables, views, sequences and types
+/// into the project as the project's own — and `reset` then failed on every
+/// run, "cannot drop view … because extension … requires it". `diff` and
+/// `reconcile` read the same introspection, so it leaves out everything an
+/// extension owns, schemas included, and keeps the project's own objects —
+/// a table whose columns use an extension's types among them.
+#[tokio::test]
+async fn introspection_leaves_out_every_object_an_extension_owns() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    // pg_cron and PostGIS are not on the embedded server; `ALTER EXTENSION …
+    // ADD` makes an object an extension's exactly as its install script does.
+    adapter
+        .execute_script(
+            "CREATE EXTENSION citext; \
+             CREATE SCHEMA ext_own; ALTER EXTENSION citext ADD SCHEMA ext_own; \
+             CREATE TABLE public.ext_cfg (id int PRIMARY KEY); ALTER EXTENSION citext ADD TABLE public.ext_cfg; \
+             CREATE VIEW public.ext_v AS SELECT 1 AS x; ALTER EXTENSION citext ADD VIEW public.ext_v; \
+             CREATE MATERIALIZED VIEW public.ext_mv AS SELECT 1 AS x; \
+             ALTER EXTENSION citext ADD MATERIALIZED VIEW public.ext_mv; \
+             CREATE SEQUENCE public.ext_seq; ALTER EXTENSION citext ADD SEQUENCE public.ext_seq; \
+             CREATE TYPE public.ext_e AS ENUM ('a'); ALTER EXTENSION citext ADD TYPE public.ext_e; \
+             CREATE FUNCTION public.ext_f() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+             ALTER EXTENSION citext ADD FUNCTION public.ext_f(); \
+             CREATE TABLE public.mine (id int PRIMARY KEY, e public.ext_e, email citext);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for owned in [
+        "ext_own",
+        "public.ext_cfg",
+        "public.ext_v",
+        "public.ext_mv",
+        "public.ext_seq",
+        "public.ext_e",
+        "public.ext_f",
+    ] {
+        assert!(
+            !names.contains(&owned),
+            "{owned} is citext's, not the project's: {names:?}"
+        );
+    }
+    assert!(
+        names.contains(&"public.mine"),
+        "the project's own table stays: {names:?}"
+    );
+    assert!(names.contains(&"citext"), "and the extension itself: {names:?}");
 }
 
 // ── Reconcile convergence: PRIMARY KEY replacement ────────────────────────────
@@ -7526,4 +7583,707 @@ async fn search_path_text_survives_apply_and_combine() {
     }
     let combined = connect(&combined_url, "search_path_text").await.unwrap();
     assert_search_path_text_survived(&*combined, "combine").await;
+}
+
+// ── A reverse-engineered enum file runs twice ─────────────────────────────────
+
+/// Every other file reverse-engineering writes can run twice — `CREATE TABLE
+/// IF NOT EXISTS`, `CREATE OR REPLACE VIEW` — because a reversed project is
+/// applied back to the database it was read from, and `psql -f` over its files
+/// is how many people do that. An enum was a bare `CREATE TYPE`, which fails
+/// the second time with `type … already exists` (`dbd apply` copes by checking
+/// first; nothing else does). It is written in Postgres's idiom for a
+/// conditional `CREATE TYPE` — the `DO … duplicate_object` guard the enum
+/// parser already reads — and reads back to the same labels and comment.
+#[tokio::test]
+async fn a_reverse_engineered_enum_file_runs_twice_and_reads_back_the_same() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.mood AS ENUM ('happy', 'it''s $$ fine', 'sad'); \
+             COMMENT ON TYPE app.mood IS 'how a day went';",
+        )
+        .await
+        .unwrap();
+    let entities = adapter.introspect().await.expect("introspect");
+    let mood = entities
+        .iter()
+        .find(|e| e.name == "app.mood")
+        .expect("app.mood introspected");
+    // What `init --from-db` writes: the emitted DDL through the formatter.
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(mood).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+
+    // Against the database it came from, and again.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the enum file failed: {e}\n{file}"));
+    }
+    // And against one that has no such type yet.
+    adapter.execute_script("DROP TYPE app.mood").await.unwrap();
+    adapter
+        .execute_script(&file)
+        .await
+        .unwrap_or_else(|e| panic!("the enum file failed on a fresh schema: {e}\n{file}"));
+    // `chr(36)` is `$`: `assert_catalog` wraps its predicate in `DO $$ … $$`,
+    // which a literal `$$` would close.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_type t WHERE t.oid = 'app.mood'::regtype \
+           AND (SELECT array_agg(enumlabel ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid) \
+               = ARRAY['happy', 'it''s ' || repeat(chr(36), 2) || ' fine', 'sad']::name[]",
+        "app.mood with its three labels in order",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/enum/app/mood.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    let labels: Vec<&str> = back.enum_values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(labels, ["happy", "it's $$ fine", "sad"], "{file}");
+    assert_eq!(back.comment.as_deref(), Some("how a day went"), "{file}");
+}
+
+// ── A reverse-engineered table keeps its triggers ─────────────────────────────
+
+/// A trigger lives in its table's file — the table parser reads it there, as
+/// the edge to the function it fires. Introspection read none, so
+/// `init --from-db` wrote a table without its triggers, and `merge` overwrote
+/// an authored table file and deleted the triggers in it, without a word.
+/// The emitted table carries each trigger in a form that runs twice — `CREATE
+/// OR REPLACE TRIGGER`, or for a constraint trigger, which Postgres will not
+/// replace, a `DROP TRIGGER IF EXISTS` before it — and the file reads back
+/// clean. A disabled trigger is captured, and said to be disabled.
+#[tokio::test]
+async fn a_reverse_engineered_table_keeps_its_triggers() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+             CREATE TABLE app.tickets (id int PRIMARY KEY, title text); \
+             CREATE TRIGGER tickets_touch BEFORE INSERT OR UPDATE OF title ON app.tickets \
+               FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             CREATE CONSTRAINT TRIGGER tickets_check AFTER INSERT ON app.tickets \
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION app.touch(); \
+             CREATE TRIGGER tickets_off AFTER DELETE ON app.tickets FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             ALTER TABLE app.tickets DISABLE TRIGGER tickets_off;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let tickets = entities.iter().find(|e| e.name == "app.tickets").expect("app.tickets");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(tickets).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    let upper = file.to_uppercase();
+    for expected in [
+        "CREATE OR REPLACE TRIGGER TICKETS_TOUCH BEFORE INSERT OR UPDATE OF TITLE ON APP.TICKETS",
+        "DROP TRIGGER IF EXISTS \"TICKETS_CHECK\" ON \"APP\".\"TICKETS\"",
+        "CREATE CONSTRAINT TRIGGER TICKETS_CHECK AFTER INSERT ON APP.TICKETS DEFERRABLE INITIALLY DEFERRED",
+        "CREATE OR REPLACE TRIGGER TICKETS_OFF AFTER DELETE ON APP.TICKETS",
+    ] {
+        assert!(upper.contains(expected), "{expected} in:\n{file}");
+    }
+    assert!(
+        tickets
+            .warnings
+            .iter()
+            .any(|w| w.contains("tickets_off") && w.contains("disabled")),
+        "the disabled trigger is said to be disabled: {:?}",
+        tickets.warnings
+    );
+
+    // The file runs against the database it came from, twice.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the table file failed: {e}\n{file}"));
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.tickets'::regclass AND NOT tgisinternal \
+         HAVING count(*) = 3",
+        "the three triggers, once each",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/tickets.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.touch"),
+        "the file still fires app.touch: {:?}",
+        back.refs
+    );
+}
+
+/// An updatable view's `INSTEAD OF` trigger is the view's behaviour: without
+/// it, an insert into the view fails. Its file carries it as a table file
+/// carries a table's, and the view then depends on the function it fires —
+/// functions apply after views by default, so without that edge a fresh apply
+/// would create the trigger before its function existed.
+#[tokio::test]
+async fn a_reverse_engineered_view_keeps_its_instead_of_trigger() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.items (id int PRIMARY KEY, name text); \
+             CREATE VIEW app.items_v AS SELECT id, name FROM app.items; \
+             CREATE FUNCTION app.items_v_insert() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO app.items VALUES (NEW.id, NEW.name); RETURN NEW; END'; \
+             CREATE TRIGGER items_v_insert INSTEAD OF INSERT ON app.items_v \
+               FOR EACH ROW EXECUTE FUNCTION app.items_v_insert();",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let view = entities.iter().find(|e| e.name == "app.items_v").expect("app.items_v");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(view).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    assert!(
+        file.to_uppercase()
+            .contains("CREATE OR REPLACE TRIGGER ITEMS_V_INSERT INSTEAD OF INSERT ON APP.ITEMS_V"),
+        "{file}"
+    );
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the view file failed: {e}\n{file}"));
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/view/app/items_v.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.items_v_insert"),
+        "the view depends on the function its trigger fires: {:?}",
+        back.refs
+    );
+}
+
+// ── What a constraint's state a reversed file cannot carry is said ────────────
+
+/// A `NOT VALID` CHECK was captured as `CHECK (CHECK (n > 0) NOT VALID)` —
+/// `pg_get_constraintdef`'s text with only its prefix stripped — which no
+/// parser accepts, so the reversed project would not load. The expression is
+/// read on its own. What the state of a constraint means cannot be written in
+/// a table file that runs twice: `NOT VALID` takes `ALTER TABLE … ADD
+/// CONSTRAINT`, which fails the second time (inside `CREATE TABLE` Postgres
+/// validates it anyway), and `NOT ENFORCED` is not in the grammar dbd parses.
+/// So each is captured as an ordinary constraint and named, with what that
+/// means for the rows the database already holds.
+#[tokio::test]
+async fn a_constraints_state_a_reversed_file_cannot_carry_is_named() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.parent (id int PRIMARY KEY); \
+             CREATE TABLE app.loose (id int PRIMARY KEY, n int, pid int, m int, k int); \
+             INSERT INTO app.loose VALUES (1, -5, 99, -1, -1); \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_n_pos CHECK (n > 0) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_m_pos CHECK (m > 0) NOT ENFORCED; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_k_pos CHECK (k > 0) NO INHERIT NOT VALID;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let loose = entities.iter().find(|e| e.name == "app.loose").expect("app.loose");
+    let file = dbd_core::emit::emit_entity(loose).unwrap();
+    for check in ["CHECK (n > 0)", "CHECK (m > 0)", "CHECK (k > 0)"] {
+        assert!(file.contains(check), "{check} in:\n{file}");
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/loose.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "the file reads back: {:?}\n{file}", back.errors);
+
+    let said = loose.warnings.join("\n");
+    for (constraint, state) in [
+        ("loose_n_pos", "NOT VALID"),
+        ("loose_pid_fk", "NOT VALID"),
+        ("loose_m_pos", "NOT ENFORCED"),
+        ("loose_k_pos", "NO INHERIT"),
+        ("loose_k_pos", "NOT VALID"),
+    ] {
+        assert!(
+            loose
+                .warnings
+                .iter()
+                .any(|w| w.contains(constraint) && w.contains(state)),
+            "{constraint} is named as {state}: {said}"
+        );
+    }
+    // And nothing else: Postgres marks every primary key, unique and foreign
+    // key `connoinherit`, which says nothing a table file loses.
+    assert_eq!(loose.warnings.len(), 5, "one note per lost state, no more: {said}");
+    let parent = entities.iter().find(|e| e.name == "app.parent").expect("app.parent");
+    assert!(parent.warnings.is_empty(), "{:?}", parent.warnings);
+}
+
+// ── A foreign key's deferrability and MATCH survive reverse, diff, reconcile ──
+
+/// `DEFERRABLE INITIALLY DEFERRED` decides whether a transaction may insert a
+/// child before its parent; `MATCH FULL` whether a half-NULL key passes. The
+/// foreign-key model held neither, so `init --from-db` wrote both keys as
+/// plain ones — an application that relies on deferral then fails on the new
+/// database — and `diff` reported no difference, because neither side could
+/// say. Both are part of the key now: captured, emitted, parsed, compared,
+/// and converged by `reconcile`.
+#[tokio::test]
+async fn a_foreign_keys_deferrability_and_match_survive_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fk_attrs").await.unwrap();
+    const PARENT: &str = "set search_path to app;\n\
+        create table if not exists parent (id int primary key, code text, constraint parent_id_code unique (id, code));\n";
+    const DB: &str = "CREATE SCHEMA app; \
+        CREATE TABLE app.parent (id int PRIMARY KEY, code text, CONSTRAINT parent_id_code UNIQUE (id, code)); \
+        CREATE TABLE app.child (id int PRIMARY KEY, pid int, pcode text, \
+          CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) DEFERRABLE INITIALLY DEFERRED, \
+          CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code) MATCH FULL);";
+    adapter.execute_script(DB).await.unwrap();
+
+    // Reverse: both keys come out as they are.
+    let entities = adapter.introspect().await.expect("introspect");
+    let child = entities.iter().find(|e| e.name == "app.child").expect("app.child");
+    let reversed = dbd_core::emit::emit_entity(child).unwrap();
+    assert!(reversed.contains("MATCH FULL"), "{reversed}");
+    assert!(reversed.contains("DEFERRABLE INITIALLY DEFERRED"), "{reversed}");
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/child.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |child: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: fk_attrs\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/parent.ddl"), PARENT).unwrap();
+        std::fs::write(dir.join("ddl/table/app/child.ddl"), child).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let fk_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.child"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Constraint))
+        })
+    };
+
+    // Diff: a design with plain keys differs from this database; the reversed one does not.
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists child (id int primary key, pid int, pcode text,\n\
+           constraint child_pid_fk foreign key (pid) references parent (id),\n\
+           constraint child_full_fk foreign key (pid, pcode) references parent (id, code));\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(fk_changed(&d), "plain keys are not these keys: {:?}", d.changes);
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "the reversed keys are these keys: {:?}", d.changes);
+
+    // Reconcile: a database with plain keys converges onto the reversed design.
+    adapter
+        .execute_script(
+            "ALTER TABLE app.child DROP CONSTRAINT child_pid_fk, DROP CONSTRAINT child_full_fk, \
+               ADD CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id), \
+               ADD CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code);",
+        )
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND confkey = ARRAY[1]::int2[] AND condeferrable AND condeferred",
+        "a deferrable, initially deferred key on app.child (pid)",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND array_length(conkey, 1) = 2 AND confmatchtype = 'f'",
+        "a MATCH FULL key on app.child (pid, pcode)",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "converged: {:?}", d.changes);
+}
+
+// ── An EXCLUDE constraint is a constraint, end to end ─────────────────────────
+
+/// `EXCLUDE USING gist (room WITH =, during WITH &&)` is what stops two
+/// bookings of one room overlapping. Introspection read only its backing
+/// index, so `init --from-db` wrote a plain gist index — the speed kept, the
+/// rule gone — and `diff` stayed empty; a project could not declare one at all,
+/// because the table parser refused it. It is a constraint now: captured,
+/// emitted, parsed, compared by `diff`, converged by `reconcile`, applied.
+#[tokio::test]
+async fn an_exclusion_constraint_survives_reverse_diff_reconcile_and_apply() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "excl").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE EXTENSION btree_gist; CREATE SCHEMA app; \
+             CREATE TABLE app.rooms (id int PRIMARY KEY, room int NOT NULL, during tstzrange NOT NULL, \
+               CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, during WITH &&));",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let rooms = entities.iter().find(|e| e.name == "app.rooms").expect("app.rooms");
+    let reversed = dbd_core::emit::emit_entity(rooms).unwrap();
+    assert!(
+        reversed.contains("CONSTRAINT \"no_overlap\" EXCLUDE USING gist (room WITH =, during WITH &&)"),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.to_uppercase().contains("CREATE INDEX"),
+        "not a plain index: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/rooms.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "a project can declare one: {:?}", back.errors);
+
+    let project = |rooms: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: excl\nsource:\n  dialect: postgresql\n\
+             target:\n  postgres:\n    extensions:\n      - btree_gist\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/rooms.ddl"), rooms).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let rooms_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.rooms"
+                && matches!(&c.action, DiffAction::Change(fcs)
+                    if fcs.iter().any(|f| matches!(f.field_type, FieldType::Constraint | FieldType::Index)))
+        })
+    };
+
+    // Diff: the old capture — a plain gist index — is not this table; the new one is.
+    let (_weak_dir, weak) = project(
+        "set search_path to app;\n\
+         create table if not exists rooms (id int primary key, room int not null, during tstzrange not null);\n\
+         create index if not exists no_overlap on rooms using gist (room, during);\n",
+    );
+    let d = weak.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a gist index is not an exclusion constraint: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "the reversed table is this table: {:?}", d.changes);
+
+    // Reconcile puts a missing one back.
+    adapter
+        .execute_script("ALTER TABLE app.rooms DROP CONSTRAINT no_overlap")
+        .await
+        .unwrap();
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a dropped exclusion constraint is drift: {:?}",
+        d.changes
+    );
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    let exclusion = "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.rooms'::regclass AND contype = 'x'";
+    assert_catalog(&*adapter, true, exclusion, "the exclusion constraint on app.rooms").await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "converged: {:?}", d.changes);
+
+    // And the reversed project builds it on a database that has none of it.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = connect(&pg.settings().url("fresh"), "excl").await.unwrap();
+    rev.apply(&*fresh, None, false, None, Progress::none())
+        .await
+        .expect("apply to a fresh database");
+    assert_catalog(&*fresh, true, exclusion, "the exclusion constraint on a fresh database").await;
+}
+
+// ── A column's collation survives reverse, diff and reconcile ─────────────────
+
+/// `COLLATE "C"` decides how a column's values sort and compare — byte order
+/// rather than the language's — and what a `LIKE 'abc%'` index can serve. The
+/// column model had no collation, so `init --from-db` wrote every such column
+/// with the database default, and `diff` could not see the difference. It is
+/// part of the column now: captured, emitted, parsed, compared, converged.
+#[tokio::test]
+async fn a_columns_collation_survives_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "coll").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.names (id int PRIMARY KEY, code text COLLATE \"C\", \
+               label varchar(20) COLLATE \"POSIX\", plain text);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names = entities.iter().find(|e| e.name == "app.names").expect("app.names");
+    let reversed = dbd_core::emit::emit_entity(names).unwrap();
+    assert!(reversed.contains("\"code\" text COLLATE \"C\""), "{reversed}");
+    assert!(
+        reversed.contains("\"label\" character varying(20) COLLATE \"POSIX\""),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.contains("\"plain\" text COLLATE"),
+        "the default is not written: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/names.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |names: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: coll\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/names.ddl"), names).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let columns_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.names"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Column))
+        })
+    };
+
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists names (id int primary key, code text, label varchar(20), plain text);\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        columns_changed(&d),
+        "default-collated columns are not these: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "the reversed columns are these: {:?}", d.changes);
+
+    // Reconcile moves a default-collated column onto the design's collation.
+    adapter
+        .execute_script("ALTER TABLE app.names ALTER COLUMN code TYPE text COLLATE \"default\"")
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute a JOIN pg_collation c ON c.oid = a.attcollation \
+           WHERE a.attrelid = 'app.names'::regclass AND a.attname = 'code' AND c.collname = 'C'",
+        "app.names.code collated \"C\"",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "converged: {:?}", d.changes);
+}
+
+// ── What dbd's table model cannot hold is named, and partitions fold in ───────
+
+/// A partition is storage of its partitioned table, not a table of the
+/// project's: introspection flattened each into a table of its own beside a
+/// plain copy of its parent — so an export of both put every row in twice,
+/// and `reconcile --prune` read each partition of a declared table as an
+/// orphan to drop. A partitioned table is captured as one plain table that
+/// holds every row, and named with its partition key and partitions, as is
+/// what else the model has no field for: a deferrable primary key or unique
+/// constraint, inheritance, and `UNLOGGED`.
+#[tokio::test]
+async fn what_the_table_model_cannot_hold_is_named_and_partitions_fold_into_their_table() {
+    use dbd_core::diff::DiffAction;
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "unmodeled").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.events (id int, at date NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE app.events_2025 PARTITION OF app.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+             CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             CREATE TABLE app.base (id int PRIMARY KEY, kind text); \
+             CREATE TABLE app.special (extra text) INHERITS (app.base); \
+             CREATE UNLOGGED TABLE app.scratch (id int PRIMARY KEY); \
+             CREATE TABLE app.slots (id int, pos int, \
+               CONSTRAINT slots_pkey PRIMARY KEY (id) DEFERRABLE, \
+               CONSTRAINT slots_pos_key UNIQUE (pos) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for partition in ["app.events_2025", "app.events_2026"] {
+        assert!(
+            !names.contains(&partition),
+            "{partition} is storage, not a table: {names:?}"
+        );
+    }
+    let warned = |table: &str, words: &[&str]| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == table)
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(
+            e.warnings.iter().any(|w| words.iter().all(|word| w.contains(word))),
+            "{table} is named with {words:?}: {:?}",
+            e.warnings
+        );
+    };
+    warned(
+        "app.events",
+        &[
+            "PARTITION BY RANGE (at)",
+            "app.events_2025",
+            "app.events_2026",
+            "FOR VALUES FROM",
+        ],
+    );
+    warned("app.special", &["inherits", "app.base"]);
+    warned("app.scratch", &["UNLOGGED"]);
+    warned("app.slots", &["slots_pkey", "DEFERRABLE"]);
+    warned("app.slots", &["slots_pos_key", "INITIALLY DEFERRED"]);
+
+    // A design that declares the partitioned table has no orphans in its partitions.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: unmodeled\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let events = entities.iter().find(|e| e.name == "app.events").unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/events.ddl"),
+        dbd_core::emit::emit_entity(events).unwrap(),
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+    let d = design.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        !d.changes
+            .iter()
+            .any(|c| c.entity_name.starts_with("app.events_") && matches!(c.action, DiffAction::Drop)),
+        "no partition reads as an orphan: {:?}",
+        d.changes
+    );
+}
+
+// ── JSONL: SQL NULL, JSON null and an omitted key each mean one thing ─────────
+
+/// The JSONL export wrote a json/jsonb column's SQL NULL as an absent key —
+/// to keep it apart from the JSON value `null` — and an import gives a column
+/// absent from every record its DEFAULT, so a json column NULL in every row
+/// came back as `'{"d": 1}'`. Now every column's key is written, `null` is SQL
+/// NULL for every type (as Postgres's own `json_populate_record` reads it),
+/// and the JSON value `null` is `{"$json": null}`. A hand-written seed keeps
+/// its meanings: `null` is NULL, and a key left out takes the DEFAULT.
+#[tokio::test]
+async fn sql_null_json_null_and_an_omitted_key_each_survive_a_jsonl_round_trip() {
+    const TABLE: &str = "CREATE TABLE app.docs (id int PRIMARY KEY, \
+        j jsonb DEFAULT '{\"d\": 1}', k json DEFAULT '[1]', t text DEFAULT 'dflt');";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA app; {TABLE} \
+             INSERT INTO app.docs VALUES (1, NULL, NULL, NULL), (2, NULL, NULL, 'x'); \
+             CREATE TABLE app.expected AS SELECT id, j, k::text AS k, k IS NULL AS k_null, t FROM app.docs;"
+        ))
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.docs");
+    entity.format = Some("jsonl".to_string());
+    adapter.export_data(&entity, Some(out.path())).await.expect("export");
+    adapter
+        .execute_script(&format!("DROP TABLE app.docs; {TABLE}"))
+        .await
+        .unwrap();
+    entity.file = Some(out.path().join("docs.jsonl"));
+    adapter.import_data(&entity, "", false).await.expect("import");
+    assert_catalog(
+        &*adapter,
+        false,
+        "(SELECT id, j, k::text, k IS NULL, t FROM app.docs EXCEPT ALL SELECT * FROM app.expected) \
+         UNION ALL (SELECT * FROM app.expected EXCEPT ALL SELECT id, j, k::text, k IS NULL, t FROM app.docs)",
+        "a row that differs after the round trip (a NULL json column read back as its DEFAULT)",
+    )
+    .await;
+
+    // A hand-written seed: `null` is NULL, a key left out is the DEFAULT, and
+    // `{"$json": null}` is the JSON value null.
+    adapter.execute_script("TRUNCATE app.docs").await.unwrap();
+    let seed = out.path().join("seed.jsonl");
+    std::fs::write(
+        &seed,
+        "{\"id\": 10, \"j\": null, \"t\": null}\n{\"id\": 11, \"t\": \"y\"}\n{\"id\": 12, \"j\": {\"$json\": null}, \"t\": \"z\"}\n",
+    )
+    .unwrap();
+    let mut seeded = Entity::new(EntityType::Table, "app.docs");
+    seeded.format = Some("jsonl".to_string());
+    seeded.file = Some(seed);
+    adapter.import_data(&seeded, "", false).await.expect("import the seed");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 10 AND j IS NULL AND t IS NULL AND k::text = '[1]'",
+        "id 10: null is NULL, and k, left out of every record, takes its DEFAULT",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 12 AND j IS NOT NULL AND jsonb_typeof(j) = 'null'",
+        "id 12: {\"$json\": null} is the JSON value null",
+    )
+    .await;
 }

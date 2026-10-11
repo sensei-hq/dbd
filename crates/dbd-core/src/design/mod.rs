@@ -3662,6 +3662,7 @@ import:
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let table = |name: &str, columns: &[&str]| TableSnapshot {
             name: name.to_string(),

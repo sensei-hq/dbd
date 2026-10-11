@@ -22,8 +22,19 @@ pub(crate) fn is_serial_type(ty: &str) -> bool {
     )
 }
 
-/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');`, then its `COMMENT ON
-/// TYPE` when it has one — the comment the parser reads back from the file.
+/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');` inside Postgres's guard
+/// for a conditional `CREATE TYPE`, then its `COMMENT ON TYPE` when it has one
+/// — the comment the parser reads back from the file.
+///
+/// # Re-runnable
+///
+/// Postgres has no `CREATE TYPE … IF NOT EXISTS`; the `DO … EXCEPTION WHEN
+/// duplicate_object` block is its idiom for one, and the enum parser reads the
+/// statement inside it. Bare, the file failed the second time it ran — `psql
+/// -f` over a reversed project applied back to the database it came from, for
+/// one — while every other file reverse writes runs twice (see
+/// [`emit_table`]). Like `CREATE TABLE IF NOT EXISTS`, the guard leaves an
+/// existing type as it is. `COMMENT ON` runs twice on its own.
 pub fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -34,7 +45,9 @@ pub fn emit_enum(entity: &Entity) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let qname = format!("{}.{}", q(schema), q(name));
-    let mut out = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    let create = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    let tag = dollar_tag(&create);
+    let mut out = format!("DO {tag} BEGIN\n  {create}\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND {tag};");
     if let Some(comment) = &entity.comment {
         out.push_str(&format!("\nCOMMENT ON TYPE {qname} IS '{}';", esc(comment)));
     }
@@ -118,7 +131,18 @@ pub fn emit_table(entity: &Entity) -> String {
             out.push_str(&emit_column_comment_sql(&qname, &c.name, c.comment.as_deref()));
         }
     }
+    push_triggers(&mut out, entity);
     out
+}
+
+/// Append `entity`'s triggers, each terminated with one `;` — after the
+/// table or view, where an authored file keeps them (see [`Entity::triggers`]).
+fn push_triggers(out: &mut String, entity: &Entity) {
+    for trigger in &entity.triggers {
+        out.push('\n');
+        out.push_str(trigger.trim_end().trim_end_matches(';').trim_end());
+        out.push(';');
+    }
 }
 
 /// Render `COMMENT ON COLUMN <qname>."<column>" IS …;`.
@@ -160,6 +184,9 @@ fn column_definition(c: &crate::entity::ColumnDef) -> String {
     }
 
     let mut col = format!("  {} {}", q(&c.name), c.data_type);
+    if let Some(collation) = &c.collation {
+        col.push_str(&format!(" COLLATE {collation}"));
+    }
 
     // Identity columns are implicitly NOT NULL and carry no default — emit the
     // GENERATED … AS IDENTITY clause and skip the default.
@@ -234,15 +261,11 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
                 q(&fk.ref_table),
                 quote_cols(&fk.ref_columns),
             );
-            if let Some(a) = fk.on_delete {
-                s.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
-            }
-            if let Some(a) = fk.on_update {
-                s.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
-            }
+            push_fk_clauses(&mut s, fk);
             s
         }
         TableConstraint::Check { name, expression } => format!("  {}CHECK ({expression})", named(name)),
+        TableConstraint::Exclude { name, definition } => format!("  {}EXCLUDE {definition}", named(name)),
     }
 }
 
@@ -327,12 +350,52 @@ pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &st
     sql
 }
 
+/// A dollar-quote tag that does not occur in `body`: `$$`, or `$dbd$`,
+/// `$dbd1$`, … when a label carries the plain one. A tag the body contains
+/// would close the quote early.
+fn dollar_tag(body: &str) -> String {
+    if !body.contains("$$") {
+        return "$$".to_string();
+    }
+    (0..)
+        .map(|n| {
+            if n == 0 {
+                "$dbd$".to_string()
+            } else {
+                format!("$dbd{n}$")
+            }
+        })
+        .find(|tag| !body.contains(tag.as_str()))
+        .expect("an unbounded sequence of tags has one the body lacks")
+}
+
 fn quote_cols(cols: &[String]) -> String {
     cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
 }
 
 fn esc(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Everything a foreign key says after its referenced columns, in the order
+/// Postgres's grammar takes it: `MATCH FULL`, the referential actions, then
+/// `DEFERRABLE [INITIALLY DEFERRED]`. Shared with the migration and reconcile
+/// SQL, so a key is written the same wherever dbd writes one.
+pub(crate) fn push_fk_clauses(sql: &mut String, fk: &crate::entity::ForeignKey) {
+    if fk.match_full {
+        sql.push_str(" MATCH FULL");
+    }
+    if let Some(a) = fk.on_delete {
+        sql.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
+    }
+    if let Some(a) = fk.on_update {
+        sql.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
+    }
+    if fk.initially_deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    } else if fk.deferrable {
+        sql.push_str(" DEFERRABLE");
+    }
 }
 
 fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
@@ -379,6 +442,7 @@ pub fn emit_view(entity: &Entity) -> String {
     if let Some(comment) = &entity.comment {
         out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
     }
+    push_triggers(&mut out, entity);
     out
 }
 
@@ -477,9 +541,12 @@ mod tests {
                 note: None,
             },
         ];
+        // Guarded: Postgres has no `CREATE TYPE … IF NOT EXISTS`, and a bare
+        // one fails the second time the file runs.
         assert_eq!(
             emit_enum(&e),
-            "CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');"
+            "DO $$ BEGIN\n  CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;"
         );
     }
 
@@ -501,6 +568,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order PK".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "customer_id".into(),
@@ -513,6 +581,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "total_cents".into(),
@@ -525,6 +594,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -765,7 +835,8 @@ mod tests {
             .map(|c| match c {
                 crate::entity::TableConstraint::PrimaryKey { name, .. }
                 | crate::entity::TableConstraint::Unique { name, .. }
-                | crate::entity::TableConstraint::Check { name, .. } => name,
+                | crate::entity::TableConstraint::Check { name, .. }
+                | crate::entity::TableConstraint::Exclude { name, .. } => name,
                 crate::entity::TableConstraint::ForeignKey(fk) => fk.name,
             })
             .collect();
@@ -791,7 +862,8 @@ mod tests {
         e.comment = Some("how a person's day went".into());
         assert_eq!(
             emit_enum(&e),
-            "CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+            "DO $$ BEGIN\n  CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;\n\
              COMMENT ON TYPE \"app\".\"mood\" IS 'how a person''s day went';"
         );
     }
@@ -867,6 +939,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tsv".into(),
@@ -879,6 +952,7 @@ mod tests {
                     generated: Some("to_tsvector('english', coalesce(content, ''))".into()),
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -916,6 +990,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // identity column (ALWAYS): emit GENERATED ALWAYS AS IDENTITY, no default.
                 ColumnDef {
@@ -929,6 +1004,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // standalone-referencing column: keep its real type + nextval default.
                 ColumnDef {
@@ -942,6 +1018,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -993,6 +1070,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let mut e = Entity::new(EntityType::Table, "app.people");
         e.table_def = Some(TableDef {
@@ -1030,6 +1108,7 @@ mod tests {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             }],
             constraints: vec![],
             indexes: vec![],
@@ -1057,6 +1136,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
             name: Some(name.into()),

@@ -753,6 +753,20 @@ impl SqliteAdapter {
     /// exported could not be imported here. An unquoted field matching
     /// `null_value` is NULL; a quoted one is a value, as in Postgres's COPY,
     /// which writes `''` as `""` and NULL as an empty field.
+    /// The columns of `table` declared `BLOB` — the ones an import decodes a
+    /// `\x…` value into bytes for (see [`blob_from_text`]). Judged by the
+    /// declared type, as SQLite's own affinity rule reads `BLOB`, so a text
+    /// column keeps a text that merely looks like hex.
+    async fn blob_columns(&self, table: &str) -> Result<std::collections::HashSet<String>> {
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) WHERE upper(type) LIKE '%BLOB%'")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))?;
+        Ok(names.into_iter().collect())
+    }
+
     async fn import_delimited(&self, mut records: super::Delimited<'_>, table: &str, null_value: &str) -> Result<()> {
         let Some(header) = records.next_record()? else {
             return Ok(()); // An empty file: no columns, no rows.
@@ -763,6 +777,8 @@ impl SqliteAdapter {
             .map(|f| crate::sql_quote::ident(&f.value))
             .collect::<Vec<_>>()
             .join(",");
+        let blobs = self.blob_columns(table).await?;
+        let is_blob: Vec<bool> = header.iter().map(|f| blobs.contains(&f.value)).collect();
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -787,12 +803,12 @@ impl SqliteAdapter {
                 .collect();
             batch.push(row);
             if batch.len() >= batch_rows {
-                flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+                flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+            flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
         }
 
         tx.commit()
@@ -813,6 +829,7 @@ impl SqliteAdapter {
         // column set changes, flush whatever we have and start a new batch.
         let mut current_cols: Option<Vec<String>> = None;
         let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
+        let blobs = self.blob_columns(table).await?;
 
         for record in records {
             let value: serde_json::Value =
@@ -822,7 +839,16 @@ impl SqliteAdapter {
                 .ok_or_else(|| DbdError::Config("a json record must be a JSON object".into()))?;
 
             let cols: Vec<String> = obj.keys().cloned().collect();
-            let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();
+            let row: Vec<JsonBindable> = cols
+                .iter()
+                .map(|c| match &obj[c] {
+                    serde_json::Value::String(text) if blobs.contains(c) => match blob_from_text(text) {
+                        Some(bytes) => JsonBindable::Blob(bytes),
+                        None => JsonBindable::String(text.clone()),
+                    },
+                    value => JsonBindable::from(value),
+                })
+                .collect();
 
             let cols_changed = current_cols.as_ref().is_some_and(|cur| cur != &cols);
             if cols_changed {
@@ -875,20 +901,24 @@ async fn flush_csv_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: &str,
     cols_clause: &str,
-    col_count: usize,
+    is_blob: &[bool],
     rows: &[Vec<Option<String>>],
 ) -> Result<()> {
-    let placeholders = multi_row_placeholders(col_count, rows.len());
+    let placeholders = multi_row_placeholders(is_blob.len(), rows.len());
     let sql = format!(
         "INSERT INTO {} ({cols_clause}) VALUES {placeholders}",
         crate::sql_quote::ident(table)
     );
     let mut q = sqlx::query(&sql);
     for row in rows {
-        for cell in row {
-            q = match cell {
-                Some(s) => q.bind(s.clone()),
-                None => q.bind(None::<String>),
+        for (cell, blob) in row.iter().zip(is_blob) {
+            q = match (cell, blob) {
+                (Some(s), true) => match blob_from_text(s) {
+                    Some(bytes) => q.bind(bytes),
+                    None => q.bind(s.clone()),
+                },
+                (Some(s), false) => q.bind(s.clone()),
+                (None, _) => q.bind(None::<String>),
             };
         }
     }
@@ -919,6 +949,7 @@ async fn flush_jsonl_batch(
                 JsonBindable::Int(i) => q.bind(*i),
                 JsonBindable::Float(f) => q.bind(*f),
                 JsonBindable::String(s) => q.bind(s.clone()),
+                JsonBindable::Blob(b) => q.bind(b.clone()),
                 JsonBindable::Other(s) => q.bind(s.clone()),
             };
         }
@@ -937,6 +968,8 @@ enum JsonBindable {
     Int(i64),
     Float(f64),
     String(String),
+    /// A `\x…` string bound for a `BLOB` column (see [`blob_from_text`]).
+    Blob(Vec<u8>),
     Other(String),
 }
 
@@ -953,6 +986,13 @@ impl JsonBindable {
                 }
             }
             serde_json::Value::String(s) => Self::String(s.clone()),
+            // `{"$json": X}` is how a Postgres export writes a json column's
+            // JSON value when it is `null` or itself such an object (see
+            // `import_jsonb_to_table`): unwrapped one level, to X's text, as
+            // any other JSON value lands here.
+            serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("$json") => {
+                Self::Other(map["$json"].to_string())
+            }
             other => Self::Other(other.to_string()),
         }
     }
@@ -970,7 +1010,37 @@ fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Option<Stri
     if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
         return v.map(|n| n.to_string());
     }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return v.map(|bytes| blob_text(&bytes));
+    }
     None
+}
+
+/// A BLOB as text: `\x` and its bytes in lowercase hex — what PostgreSQL
+/// writes for a `bytea` and reads back, so a SQLite export loads into a
+/// `bytea` column, and [`blob_from_text`] reads it back into a BLOB. A BLOB
+/// has no text of its own; the cell readers knew only text and numbers, and
+/// wrote every one as NULL.
+fn blob_text(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("\\x");
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+/// The bytes [`blob_text`] wrote — `\x` then an even number of hex digits —
+/// or `None` for any other text, which then loads as the text it is.
+fn blob_from_text(text: &str) -> Option<Vec<u8>> {
+    let hex = text.strip_prefix("\\x")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// One CSV/TSV field as Postgres's `COPY … CSV` writes it, so the RFC 4180
@@ -999,6 +1069,11 @@ fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json:
         && let Some(jn) = serde_json::Number::from_f64(n)
     {
         return serde_json::Value::Number(jn);
+    }
+    // JSON has no bytes: a BLOB is the same `\x…` string PostgreSQL's
+    // `to_json` writes for a `bytea`.
+    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return serde_json::Value::String(blob_text(&bytes));
     }
     serde_json::Value::Null
 }
@@ -1457,6 +1532,82 @@ mod tests {
         }
     }
 
+    /// An import names its tables in load order — a referenced table before
+    /// one that references it — and SQLite enforces foreign keys on dbd's
+    /// connections, so emptying them in that order deleted the parent's rows
+    /// out from under the child's key and failed. They are emptied the other
+    /// way round, the referencing table first.
+    #[tokio::test]
+    async fn tables_linked_by_a_foreign_key_are_emptied_referencing_table_first() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+        a.truncate_tables(&["parent".to_string(), "child".to_string()])
+            .await
+            .expect("both empty");
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM parent) + (SELECT count(*) FROM child)")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// A BLOB has no text, and the export's cell readers knew only text and
+    /// numbers, so every BLOB was written as NULL — the file imported back
+    /// without its binary data, in every format. A BLOB is written as `\x`
+    /// and its bytes in hex — what PostgreSQL writes for a `bytea` and reads
+    /// back — and an import decodes that form into a BLOB for a column
+    /// declared `BLOB`, so the round trip is exact; an empty BLOB stays empty,
+    /// NULL stays NULL, and a text column keeps a text that looks like hex.
+    #[tokio::test]
+    async fn a_blob_survives_an_export_and_import_in_every_format() {
+        const DDL: &str = "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB, note TEXT)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO files VALUES (1, x'00ff10', 'bytes'), (2, x'', 'empty'), (3, NULL, '\\x00ff')")
+            .await
+            .unwrap();
+        let rows = |pool: &sqlx::SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, Option<Vec<u8>>, String, Option<String>)>(
+                    "SELECT id, data, typeof(data), note FROM files ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let expected = rows(&a.pool).await;
+        assert_eq!(expected[0].1.as_deref(), Some(&[0x00, 0xff, 0x10][..]));
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "files");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("files.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                body.contains("\\x00ff10"),
+                "{format}: the bytes, as PostgreSQL writes a bytea: {body}"
+            );
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: import failed: {e}"));
+            assert_eq!(rows(&b.pool).await, expected, "{format}: the rows exported\n{body}");
+        }
+    }
+
     /// A generated column is computed, and SQLite refuses a value for one
     /// ("cannot INSERT into generated column"), so an export that wrote it
     /// could not be imported back. The export writes what an import can, and
@@ -1773,6 +1924,43 @@ mod tests {
             .unwrap();
         let score: Option<f64> = r.try_get("score").unwrap();
         assert_eq!(score, None);
+    }
+
+    /// A Postgres JSONL export writes a json column's JSON `null` as
+    /// `{"$json": null}`, and wraps a value that is itself a one-key `$json`
+    /// object the same way. SQLite has no json type: a JSON value lands as its
+    /// text, so the wrapper must come off one level here as it does on
+    /// Postgres — or SQLite stores the encoding instead of the value.
+    #[tokio::test]
+    async fn a_json_value_written_as_dollar_json_lands_as_its_own_text() {
+        use std::io::Write;
+        let a = mem().await;
+        a.execute_script("CREATE TABLE docs (id INTEGER, j TEXT)")
+            .await
+            .unwrap();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, r#"{{"id":1,"j":{{"$json":null}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":2,"j":{{"$json":{{"$json":5}}}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":3,"j":{{"a":1}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":4,"j":null}}"#).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.docs");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("jsonl".to_string());
+        a.import_data(&entity, "", false).await.unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, j FROM docs ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some("null".to_string())),
+                (2, Some(r#"{"$json":5}"#.to_string())),
+                (3, Some(r#"{"a":1}"#.to_string())),
+                (4, None),
+            ]
+        );
     }
 
     /// Load `body` as a `json`-format file into a fresh `people` table and

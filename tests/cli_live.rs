@@ -513,6 +513,56 @@ async fn merge_reads_a_live_database_into_the_project() {
     assert!(!combined(&o).is_empty(), "merge must report what it would do");
 }
 
+/// A table the design declares `external:` is somebody else's — the Supabase
+/// scaffold's `auth.users` is the usual one. `merge` wrote it into the project
+/// as `ddl/table/auth/users.ddl`, after which `reset` planned `DROP TABLE
+/// "auth"."users" CASCADE`; and it warned that schema `auth` — and the empty
+/// `public` — were "written but not listed", when nothing of the project's
+/// was written to either. A declared external is never captured, and a
+/// schema is only reported for files actually written to it.
+#[tokio::test]
+async fn merge_never_captures_a_declared_external_and_names_only_schemas_it_wrote_to() {
+    let (_pg, url) = start_pg().await;
+    dbd_core::connect(&url, "platform")
+        .await
+        .unwrap()
+        .execute_script("CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid PRIMARY KEY);")
+        .await
+        .expect("build the database");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n\n\
+         external:\n  - name: auth.users\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/profiles.ddl"),
+        "set search_path to app;\n\
+         create table if not exists profiles (id uuid primary key references auth.users (id));\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["merge"]);
+    assert!(o.status.success(), "merge failed: {}", combined(&o));
+    let said = combined(&o);
+    assert!(
+        !dir.join("ddl/table/auth").exists(),
+        "a declared external is not the project's to capture: {said}"
+    );
+    for schema in ["auth", "public"] {
+        assert!(
+            !said.contains(&format!("schema `{schema}` written")),
+            "nothing was written to `{schema}`: {said}"
+        );
+    }
+    assert!(dir.join("ddl/table/app/profiles.ddl").exists(), "{said}");
+}
+
 // ── Ad-hoc data files ───────────────────────────────────────────────────────
 
 /// Export `app.widgets` as CSV through the binary and return the file's text.
@@ -578,6 +628,64 @@ async fn export_to_a_directory_keeps_same_named_tables_from_different_schemas_ap
     assert_eq!(staged, "id,name\n1,staged\n");
     assert_eq!(live, "id,name\n2,live\n");
     assert!(!out.join("accounts.csv").exists(), "nothing is written flat");
+}
+
+/// The documented way to move a long-running system's data: export a live
+/// table straight into a staging schema's import folder, so the new
+/// database's import loads it there — `export -n core.accounts -o
+/// import/staging` → `import/staging/accounts.csv` → `staging.accounts`. Once
+/// `-o` grew a schema folder of its own (so same-named tables stay apart), the
+/// file landed at `import/staging/core/accounts.csv`, a layout no import
+/// reads, and the round trip loaded nothing. Into a schema folder of the
+/// project's `import/` tree, a table is written as the import reads it; two
+/// selected tables that would share a file there are refused, naming both,
+/// with nothing written.
+#[tokio::test]
+async fn export_into_an_import_schema_folder_writes_what_the_import_loads() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    same_named_tables_project(dir);
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    std::fs::write(dir.join("live.jsonl"), "{\"id\":2,\"name\":\"live\"}\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-n", "core.accounts", "-f", "live.jsonl"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let staging = dir.join("import/staging");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "-n", "core.accounts", "-o", staging.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(
+        std::fs::read_to_string(staging.join("accounts.csv")).unwrap_or_default(),
+        "id,name\n2,live\n",
+        "written where the import loads it: {}",
+        combined(&o)
+    );
+    let o = dbd(dir, &url, &["import", "--dry-run"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(
+        combined(&o).contains("staging.accounts") && combined(&o).contains("import/staging/accounts.csv"),
+        "and the import plans it into staging.accounts: {}",
+        combined(&o)
+    );
+
+    // Both `accounts` tables into one schema folder would be one file.
+    std::fs::remove_file(staging.join("accounts.csv")).unwrap();
+    let o = dbd(dir, &url, &["export", "-o", staging.to_str().unwrap()]);
+    assert!(!o.status.success(), "two tables, one file — refused: {}", combined(&o));
+    let said = combined(&o);
+    assert!(
+        said.contains("core.accounts") && said.contains("staging.accounts"),
+        "naming both: {said}"
+    );
+    assert!(
+        std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "with nothing written: {said}"
+    );
 }
 
 /// `-s` says where the project is, and the default `export/` is the
@@ -809,6 +917,67 @@ async fn an_import_refuses_a_data_file_outside_the_staging_schemas_and_keeps_the
     let csv = exported_widgets(dir, &url);
     assert!(csv.contains("1,live"), "the live row must survive: {csv}");
     assert!(!csv.contains("replaced"), "and nothing may replace it: {csv}");
+}
+
+// ── staging tables linked by a foreign key import together ──────────────────
+
+/// Two staging tables, one referencing the other, each with a data file. The
+/// import emptied them one `TRUNCATE` at a time, and Postgres refuses to
+/// truncate a table another references — so the import failed on every run,
+/// saying "cannot truncate a table referenced in a foreign key constraint"
+/// without naming either table. Truncated together, with the referenced table
+/// loaded first, they import; a table outside the import that still holds a
+/// key to one is named, and nothing is emptied.
+#[tokio::test]
+async fn staging_tables_linked_by_a_foreign_key_import_together_and_a_blocker_is_named() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - staging\n  - app\n\n\
+         import:\n  staging: [staging]\n",
+    )
+    .unwrap();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "ddl/table/staging/parent.ddl",
+        "set search_path to staging;\ncreate table if not exists parent (id int primary key);\n",
+    );
+    write(
+        "ddl/table/staging/child.ddl",
+        "set search_path to staging;\ncreate table if not exists child (id int primary key, pid int references parent (id));\n",
+    );
+    write("import/staging/parent.csv", "id\n1\n");
+    write("import/staging/child.csv", "id,pid\n1,1\n");
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    for run in 1..=2 {
+        let o = dbd(dir, &url, &["-e", "dev", "import"]);
+        assert!(o.status.success(), "import run {run} failed: {}", combined(&o));
+    }
+
+    // A live table outside the import holding a key to a staging table.
+    write(
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key, pid int references staging.parent (id));\n",
+    );
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+    let o = dbd(dir, &url, &["-e", "dev", "import"]);
+    assert!(!o.status.success(), "a truncate the database refuses fails the import");
+    let said = combined(&o);
+    assert!(
+        said.contains("staging.parent") && said.contains("app.orders"),
+        "naming the table it empties and the one whose key blocks it: {said}"
+    );
+    let o = psql(&pg, &url, &["-Atc", "SELECT count(*) FROM staging.child"]);
+    assert_eq!(stdout(&o).trim(), "1", "and nothing was emptied: {said}");
 }
 
 // ── a skipped hook is named even when the run fails ─────────────────────────
@@ -1616,6 +1785,74 @@ async fn init_from_db_names_every_schema_it_leaves_out_and_declares_what_a_forei
         "the declared external must resolve: {}",
         combined(&o)
     );
+}
+
+// ── init --from-db --schema declares or names what the capture needs ────────
+
+/// `init --from-db --schema app` captured `app` and nothing it depends on:
+/// the `citext` its columns use was left out with `public` (so the project
+/// failed on a new database with `type "citext" does not exist`), and the
+/// enum from `ref`, the function from `util` and the extension installed in
+/// `extensions` were not mentioned at all. An extension the captured objects
+/// use is declared — it is the database's, not a schema's — when it installs
+/// into `public` or a captured schema; everything else they need from outside
+/// is named, with what needs it, so the user can capture it too.
+#[tokio::test]
+async fn init_from_db_scoped_declares_the_extensions_its_capture_uses_and_names_what_else_it_needs() {
+    let (pg, url) = start_pg().await;
+    const OUTSIDE: &str = "CREATE SCHEMA extensions; CREATE EXTENSION pgcrypto WITH SCHEMA extensions; \
+         CREATE SCHEMA ref; CREATE TYPE ref.mood AS ENUM ('ok', 'meh'); \
+         CREATE SCHEMA util; CREATE FUNCTION util.prio() RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    dbd_core::connect(&url, "scoped")
+        .await
+        .unwrap()
+        .execute_script(&format!(
+            "CREATE EXTENSION citext; {OUTSIDE} \
+             CREATE SCHEMA other; CREATE TABLE other.unused (id int); \
+             CREATE SCHEMA app; \
+             CREATE TABLE app.t (id int PRIMARY KEY, email citext, mood ref.mood DEFAULT 'ok', \
+               prio int DEFAULT util.prio(), token bytea DEFAULT extensions.gen_random_bytes(8));"
+        ))
+        .await
+        .expect("build the database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db", "--schema", "app"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    let said = combined(&o);
+
+    let config = dbd_core::config::read(&dir.join("design.yaml")).unwrap();
+    let extensions: Vec<&str> = config.target["postgres"].extensions.iter().map(|e| e.name()).collect();
+    assert_eq!(extensions, ["citext"], "the extension app's columns use: {said}");
+    for (needed, by) in [("ref.mood", "app.t"), ("util.prio()", "app.t"), ("pgcrypto", "app.t")] {
+        assert!(
+            said.lines().any(|l| l.contains(needed) && l.contains(by)),
+            "{needed}, needed by {by}, is named: {said}"
+        );
+    }
+    assert!(
+        !said.contains("other.unused"),
+        "what nothing captured uses is not: {said}"
+    );
+
+    // A database that has what the report named takes the project.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = pg.settings().url("fresh");
+    dbd_core::connect(&fresh, "scoped")
+        .await
+        .unwrap()
+        .execute_script(OUTSIDE)
+        .await
+        .unwrap();
+    let o = dbd(dir, &fresh, &["-e", "dev", "apply"]);
+    assert!(
+        o.status.success(),
+        "apply to a database with what was named: {}",
+        combined(&o)
+    );
+    let o = dbd(dir, &fresh, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on the fresh database: {}", combined(&o));
 }
 
 // ── reset says what it did ──────────────────────────────────────────────────

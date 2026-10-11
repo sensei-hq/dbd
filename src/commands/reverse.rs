@@ -13,6 +13,44 @@ fn undeclared_schemas(written: &[String], declared: &[String]) -> Vec<String> {
     result
 }
 
+/// The schemas `plan` writes a file into — the `<schema>` of every
+/// `ddl/<kind>/<schema>/<name>.ddl` it holds. A schema-less kind (a role)
+/// contributes none.
+fn written_schemas(plan: &reverse::WritePlan) -> Vec<String> {
+    plan.items
+        .iter()
+        .filter_map(|it| {
+            let parts: Vec<&str> = it.path.iter().filter_map(|c| c.to_str()).collect();
+            match parts.as_slice() {
+                ["ddl", _kind, schema, _file] => Some(schema.to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The tables the project at `project_dir` builds, as `schema.name`: every
+/// `ddl/table/<schema>/<name>` file under a schema `config` lists — the files
+/// a load of the project reads as tables. Read from the paths alone, so a file
+/// that does not parse still counts as the project's.
+fn managed_tables(
+    project_dir: &Path,
+    config: &dbd_core::config::DesignConfig,
+) -> Result<std::collections::HashSet<String>> {
+    let schemas = config.schema_names();
+    Ok(dbd_core::scanner::scan_ddl(project_dir)
+        .context("failed to scan the project's ddl/ folder")?
+        .iter()
+        .map(|path| dbd_core::Entity::from_file(path))
+        .filter(|e| {
+            e.entity_type == dbd_core::EntityType::Table
+                && e.errors.is_empty()
+                && e.schema.as_ref().is_some_and(|s| schemas.contains(s))
+        })
+        .map(|e| e.name)
+        .collect())
+}
+
 /// The extensions among `entities` that `config`'s target does not list, as
 /// `(name, schema)` with `schema` `None` for `public`.
 fn undeclared_extensions(
@@ -134,11 +172,16 @@ pub async fn cmd_init_from_db(
     // Decided before `entities` is consumed: the platform schemas that identify
     // Supabase are usually filtered out of what gets written.
     let target = init_target(&conn, &entities);
-    init_with_entities(
+    let deps = adapter
+        .dependencies()
+        .await
+        .context("reading what the database's objects depend on failed")?;
+    init_with_dependencies(
         project_dir,
         config_path,
         env,
         entities,
+        &deps,
         &project_name,
         version,
         sel,
@@ -253,6 +296,38 @@ fn init_with_entities(
     dialect: &str,
     snapshot_label: &str,
 ) -> Result<()> {
+    init_with_dependencies(
+        project_dir,
+        config_path,
+        env,
+        entities,
+        &[],
+        project_name,
+        version,
+        sel,
+        dry_run,
+        dialect,
+        snapshot_label,
+    )
+}
+
+/// [`init_with_entities`], with what the source's objects depend on — a
+/// database knows; a DBML file does not — so a capture of some schemas can
+/// declare the extensions it uses and name what else it needs.
+#[allow(clippy::too_many_arguments)]
+fn init_with_dependencies(
+    project_dir: &Path,
+    config_path: &Path,
+    env: &str,
+    entities: Vec<dbd_core::Entity>,
+    deps: &[dbd_core::adapter::Dependency],
+    project_name: &str,
+    version: u32,
+    sel: SchemaSelect,
+    dry_run: bool,
+    dialect: &str,
+    snapshot_label: &str,
+) -> Result<()> {
     // Only on Supabase are its platform schemas the platform's rather than the
     // project's. The target says which: detected from the database's own
     // schemas, or — DBML names no platform — the caller's `--target`.
@@ -271,6 +346,7 @@ fn init_with_entities(
         true,
         dialect,
         &FormatConfig::default(),
+        deps,
     )?;
 
     // Emit a baseline snapshot at `--version` so the new project is version-tracked
@@ -419,7 +495,18 @@ fn merge_snapshot(
     // Select schemas + keep only entities under a selected schema (same logic as
     // the normal path).
     let (selected, kept) = select_and_keep(entities, &sel);
-    report_left_out(entities, &sel);
+    report_left_out(entities, &sel, &[]);
+    // A table the design declares `external:` is somebody else's — the
+    // Supabase scaffold's `auth.users` is the usual one. Captured, it became a
+    // project file `reset` would then `DROP … CASCADE`.
+    let declared_externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    let (externals, kept): (Vec<_>, Vec<_>) = kept
+        .into_iter()
+        .partition(|e| e.entity_type == dbd_core::EntityType::Table && declared_externals.contains(&e.name.as_str()));
+    for e in &externals {
+        println!("  left out: table `{}` — declared under external:", e.name);
+    }
+    report_what_is_lost(&kept);
     // Gate on entities, not schemas: a schema-less source (SQLite) has an empty
     // `selected` but non-empty `kept`.
     if kept.is_empty() {
@@ -427,23 +514,35 @@ fn merge_snapshot(
         return Ok(());
     }
 
+    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
+
     // Warn about schemas written but not declared in design.yaml (spec line 67).
     // `merge` never edits config — it surfaces the gap so the user adds the schema.
+    // Only the schemas files land in: a schema the database has but nothing
+    // was written to — an empty `public`, or one holding only an external —
+    // has nothing for the project to include.
     let declared = config.schema_names();
-    for schema in undeclared_schemas(&selected, &declared) {
+    for schema in undeclared_schemas(&written_schemas(&plan), &declared) {
         eprintln!("  warning: schema `{schema}` written but not listed in design.yaml; add it to include those files");
     }
-    // An extension is declared in design.yaml, never written as a file, and
-    // `merge` never edits config — so one the target does not list is named,
-    // as an undeclared schema is.
-    let declared_externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    // A table a foreign key reaches outside the captured schemas is named, so
+    // the user can declare it `external:` — unless it is declared already, or
+    // the project builds it. A scoped DBML document stands a stub in for
+    // both kinds alike, and a merge narrowed by `--schema` reaches the
+    // project's own tables in the schemas it left out; an external is
+    // somebody else's table, and declaring one the project builds would stop
+    // the project building it.
+    let managed = managed_tables(project_dir, config)?;
     for name in reverse::Declared::from_entities(&kept, &selected).externals {
-        if !declared_externals.contains(&name.as_str()) {
+        if !declared_externals.contains(&name.as_str()) && !managed.contains(&name) {
             eprintln!(
                 "  warning: a foreign key references `{name}`, outside the captured schemas; declare it under external: in design.yaml"
             );
         }
     }
+    // An extension is declared in design.yaml, never written as a file, and
+    // `merge` never edits config — so one the target does not list is named,
+    // as an undeclared schema is.
     for (name, schema) in undeclared_extensions(&kept, config) {
         let entry = match schema {
             None => format!("`{name}`"),
@@ -453,8 +552,6 @@ fn merge_snapshot(
             "  warning: extension `{name}` is installed in the database but not declared; add {entry} to the target's extensions: list in design.yaml"
         );
     }
-
-    let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
     if dry_run {
         // Count straight off the plan — a dry-run writes nothing, so there's no
@@ -591,7 +688,10 @@ fn db_schemas(entities: &[dbd_core::Entity]) -> Vec<String> {
 /// Name every schema `sel` leaves out of `entities`, with why, and every
 /// extension that goes with one. Leaving them out is right — they are the
 /// platform's, or the user asked — but leaving them out silently was not.
-fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect) {
+///
+/// An extension in `declared` is not left out with its schema: the captured
+/// objects use it, so it is declared (see [`reverse::outside_needs`]).
+fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect, declared: &[(String, Option<String>)]) {
     let left_out = reverse::left_out_schemas(&db_schemas(entities), sel);
     for (schema, why) in &left_out {
         let why = match why {
@@ -607,12 +707,23 @@ fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect) {
     {
         if let Some(schema) = ext.schema.as_deref()
             && left_out.iter().any(|(s, _)| s == schema)
+            && !declared.iter().any(|(name, _)| *name == ext.name)
         {
             println!(
                 "  left out: extension `{}` — installed in schema `{schema}`, which is left out",
                 ext.name
             );
         }
+    }
+}
+
+/// Name what the database holds that the captured files cannot carry — the
+/// notes the source attached to each entity it read. dbd prefers to capture
+/// a feature faithfully, and where its model cannot, it says what was lost
+/// rather than write a weaker object in silence.
+fn report_what_is_lost(kept: &[dbd_core::Entity]) {
+    for warning in kept.iter().flat_map(|e| &e.warnings) {
+        eprintln!("  warning: {warning}");
     }
 }
 
@@ -637,10 +748,34 @@ fn run_plan(
     write_config: bool,
     dialect: &str,
     format: &FormatConfig,
+    deps: &[dbd_core::adapter::Dependency],
 ) -> Result<Vec<String>> {
     // 1. select schemas + keep only entities under a selected schema
     let (selected, kept) = select_and_keep(&entities, &sel);
-    report_left_out(&entities, &sel);
+    // Extensions go in the target's `extensions:` list — the project format
+    // has no DDL file for one (see `reverse::MANAGED_KINDS`) — and a table a
+    // foreign key reaches outside the captured schemas under `external:`.
+    // What else the captured objects need from outside is named: a database
+    // without it cannot take the project. Named on a dry run too: it is part
+    // of the plan.
+    let platform: Vec<String> = reverse::left_out_schemas(&db_schemas(&entities), &sel)
+        .into_iter()
+        .filter(|(_, why)| *why == reverse::LeftOut::Platform)
+        .map(|(schema, _)| schema)
+        .collect();
+    let mut declared = write_config.then(|| reverse::Declared::from_entities(&kept, &selected));
+    let needs = declared
+        .as_mut()
+        .map(|d| reverse::outside_needs(deps, &selected, &platform, d))
+        .unwrap_or_default();
+    report_left_out(
+        &entities,
+        &sel,
+        declared.as_ref().map(|d| d.extensions.as_slice()).unwrap_or_default(),
+    );
+    for need in &needs {
+        println!("  {need}");
+    }
     // Bail only when there's genuinely nothing to write. A schema-less source
     // (SQLite) yields entities with no schema → `selected` is empty but `kept`
     // is not, so gate on `kept`, not `selected`.
@@ -649,21 +784,44 @@ fn run_plan(
         return Ok(vec![]);
     }
 
+    report_what_is_lost(&kept);
+
     // 2. build write-plan (emitted DDL is formatted so it matches `dbd format`)
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
     // 3. write design.yaml (init only; only if absent; skip on dry-run)
-    // Extensions go in the target's `extensions:` list — the project format
-    // has no DDL file for one (see `reverse::MANAGED_KINDS`) — and a table a
-    // foreign key reaches outside the captured schemas under `external:`.
-    // Named on a dry run too: it is part of the plan.
-    let declared = write_config.then(|| reverse::Declared::from_entities(&kept, &selected));
     for name in declared.iter().flat_map(|d| &d.externals) {
         println!("  external: {name} — a foreign key references it, outside the captured schemas");
     }
+    // A schema is the project's when something was captured in it — a file
+    // written, or an extension declared with it as its `schema:` — or when
+    // `--schema` named it. Every database has a `public`, and listing an empty
+    // one claimed a schema the project holds nothing in, which `reset
+    // --clean` would drop. An extension in `public` is declared without a
+    // `schema:` (`public` is where one installs), so it needs none listed.
+    let captured_in = |schema: &String| {
+        kept.iter().any(|e| {
+            e.schema.as_ref() == Some(schema)
+                && match e.entity_type {
+                    dbd_core::EntityType::Schema => false,
+                    dbd_core::EntityType::Extension => schema != "public",
+                    _ => true,
+                }
+        })
+    };
+    let listed: Vec<String> = selected
+        .iter()
+        .filter(|s| sel.only.contains(s) || captured_in(s))
+        .cloned()
+        .collect();
+    if write_config {
+        for schema in selected.iter().filter(|s| !listed.contains(s)) {
+            println!("  left out: schema `{schema}` — nothing in it to capture (name it with --schema to keep it)");
+        }
+    }
     if let Some(declared) = declared.filter(|_| !dry_run) {
         let project = name.map(String::from).unwrap_or_else(|| "project".into());
-        let yaml = reverse::design_yaml_with(&project, dialect, &selected, version.unwrap_or(1), &declared);
+        let yaml = reverse::design_yaml_with(&project, dialect, &listed, version.unwrap_or(1), &declared);
         // Write to the resolved config path (project_dir/<--config>), matching what the
         // baseline-snapshot reload reads — not a hardcoded "design.yaml" (which would
         // diverge under `--config custom.yaml`).
@@ -999,6 +1157,7 @@ mod tests {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             }],
             constraints: vec![],
             indexes: vec![],
@@ -1051,7 +1210,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: None,
                     on_update: None,
-                    ref_schema_source: Default::default(),
+                    ..Default::default()
                 })]
             })
             .unwrap_or_default();
@@ -1067,6 +1226,7 @@ mod tests {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             }],
             constraints,
             indexes: vec![],
@@ -1171,6 +1331,39 @@ mod tests {
             assert_eq!(externals, vec!["auth.users"], "in {}", dir.display());
             assert!(!config.schema_names().contains(&"auth".to_string()));
         }
+    }
+
+    /// Every database has a `public` schema, and `init --from-db` listed it
+    /// under `schemas:` even when nothing in it was captured — so the
+    /// project claimed a schema it holds nothing in, and `reset --clean`
+    /// would drop it. A schema with nothing captured in it is left out, and
+    /// said so; one the user named with `--schema` is kept, empty or not.
+    #[test]
+    fn init_lists_no_schema_it_captured_nothing_in_unless_asked_for() {
+        let entities = || {
+            vec![
+                dbd_core::Entity::schema("public"),
+                dbd_core::Entity::schema("app"),
+                table("app.t", None),
+            ]
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        init_into(tmp.path(), entities(), SchemaSelect::default(), "postgres");
+        let config = dbd_core::config::read(&tmp.path().join("design.yaml")).unwrap();
+        assert_eq!(config.schema_names(), ["app"], "public holds nothing captured");
+
+        let asked = tempfile::tempdir().unwrap();
+        init_into(
+            asked.path(),
+            entities(),
+            SchemaSelect {
+                only: vec!["public".into(), "app".into()],
+                ..Default::default()
+            },
+            "postgres",
+        );
+        let config = dbd_core::config::read(&asked.path().join("design.yaml")).unwrap();
+        assert_eq!(config.schema_names(), ["app", "public"], "--schema public asked for it");
     }
 
     /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.

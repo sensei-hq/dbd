@@ -64,7 +64,58 @@ impl Design {
             self.check_import_name(n)?;
         }
         self.check_import_staging(name)?;
+        self.check_import_kinds(name)?;
         self.check_import_loaders(name)
+    }
+
+    /// Refuse a data file whose target the design declares as something other
+    /// than a table — a view, a materialized view, a sequence — naming each.
+    ///
+    /// A data file loads into the relation its path names, after the run has
+    /// truncated every staging table it loads. A view got that far: the
+    /// tables before it in the plan were emptied, `TRUNCATE` failed on the view
+    /// (`"items" is not a table`), and nothing loaded.
+    fn check_import_kinds(&self, name: Option<&str>) -> Result<()> {
+        let kind_of = |table: &str| {
+            let declared: Vec<EntityType> = self
+                .entities
+                .iter()
+                .filter(|e| e.name == table)
+                .map(|e| e.entity_type)
+                .collect();
+            if declared.contains(&EntityType::Table) {
+                return None;
+            }
+            declared.into_iter().find_map(|kind| match kind {
+                EntityType::View => Some("a view"),
+                EntityType::MaterializedView => Some("a materialized view"),
+                EntityType::Sequence => Some("a sequence"),
+                _ => None,
+            })
+        };
+        let not_tables: Vec<String> = self
+            .import_tables
+            .iter()
+            .filter(|t| name.is_none_or(|n| t.name == n))
+            .filter_map(|t| {
+                let kind = kind_of(&t.name)?;
+                let file = t
+                    .file
+                    .as_deref()
+                    .map(|f| f.strip_prefix(&self.project_dir).unwrap_or(f).display().to_string())
+                    .unwrap_or_default();
+                Some(format!("  {file} → {} ({kind})", t.name))
+            })
+            .collect();
+        if not_tables.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!(
+            "import refused: these data files load something that is not a table:\n{}\n\
+             An import truncates and loads tables; a view has no rows of its own to load. Move each \
+             file to import/<schema>/<table>.<ext> for the table it holds rows of.",
+            not_tables.join("\n")
+        )))
     }
 
     /// Whether `import.staging` lets an import load into `schema`.
@@ -200,6 +251,14 @@ impl Design {
             warnings.push(format!(
                 "{count} data file(s) under import/{env}/ skipped — this run's env is '{}'",
                 self.env
+            ));
+        }
+
+        for rel in &self.import_scan_skips.unrecognised {
+            warnings.push(format!(
+                "import/{} not loaded — an import reads import/<schema>/<table>.<ext>, or \
+                 import/<env>/<schema>/<table>.<ext> for env dev or prod, and no folder deeper",
+                rel.display()
             ));
         }
 
@@ -585,18 +644,22 @@ impl Design {
                 if placed[i] {
                     continue;
                 }
-                // Check if all dependencies are already placed
-                let deps_satisfied = entries[i].writes.iter().all(|write_target| {
-                    // Get FK deps of this write target
-                    let fk_deps = entity_refs.get(write_target).cloned().unwrap_or_default();
-                    // All FK deps that are also write targets of other entries must be placed
-                    fk_deps.iter().all(|dep| {
-                        !entries
-                            .iter()
-                            .enumerate()
-                            .any(|(j, other)| !placed[j] && j != i && other.writes.contains(dep))
-                    })
-                });
+                // Check if all dependencies are already placed: the tables its
+                // write targets reference must be written first, and so must the
+                // staging tables its own staging table references be loaded —
+                // a COPY into a staging table that references another fails on
+                // the foreign key until that table holds its rows.
+                let staging = &entries[i].table.name;
+                let deps_satisfied = std::iter::once(staging)
+                    .chain(entries[i].writes.iter())
+                    .flat_map(|t| entity_refs.get(t).cloned().unwrap_or_default())
+                    .all(|dep| {
+                        !entries.iter().enumerate().any(|(j, other)| {
+                            !placed[j]
+                                && j != i
+                                && (other.writes.contains(&dep) || (other.table.name == dep && dep != *staging))
+                        })
+                    });
 
                 if deps_satisfied {
                     sorted.push(entries[i].clone());
@@ -699,11 +762,17 @@ impl Design {
         D: FnMut(&str, Option<&str>),
     {
         if !dry_run {
+            // Together, in one call: a table may have two data files (a shared
+            // one and an env's own), and Postgres truncates tables linked by a
+            // foreign key only together.
+            let mut truncated: Vec<String> = Vec::new();
             for entry in plan {
-                if self.config.import.table_truncate(&entry.table.name) {
-                    adapter.truncate_table(&entry.table.name).await?;
+                let table = &entry.table.name;
+                if self.config.import.table_truncate(table) && !truncated.contains(table) {
+                    truncated.push(table.clone());
                 }
             }
+            adapter.truncate_tables(&truncated).await?;
         }
 
         let mut loaded: HashSet<&str> = HashSet::new();
@@ -917,6 +986,85 @@ mod tests {
             mock.scripts.lock().unwrap()
         );
         assert!(mock.imported.lock().unwrap().is_empty(), "nothing loads");
+    }
+
+    /// A data file loads into the table its path names. One named for a view
+    /// — `import/staging/items_v.csv` beside `ddl/view/staging/items_v.ddl` —
+    /// got as far as the run's truncation: every staging table before it in
+    /// the plan was emptied, then `TRUNCATE` failed on the view with `"items_v"
+    /// is not a table`, and nothing loaded. It is refused before anything
+    /// touches the database, naming the file and that its target is a view.
+    #[tokio::test]
+    async fn a_data_file_for_a_view_is_refused_before_any_truncate() {
+        let (tmp, _) = project_with_staging(
+            Some("staging"),
+            &[STAGED_ITEMS, ("staging/items_v.csv", "id,name\n1,a\n")],
+        );
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/view/staging")).unwrap();
+        std::fs::write(
+            dir.join("ddl/view/staging/items_v.ddl"),
+            "set search_path to staging;\ncreate or replace view items_v as select id, name from items;\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let mock = MockAdapter::new();
+        let err = design
+            .import_data(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("a file loading a view must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/staging/items_v.csv") && msg.contains("staging.items_v") && msg.contains("view"),
+            "the refusal names the file, its target, and that the target is a view: {msg}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "no TRUNCATE of the staging table before it: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing loads");
+        // And the preview refuses what the run refuses.
+        let err = design
+            .scoped_import_plan(None, None)
+            .expect_err("the plan refuses it too");
+        assert!(err.to_string().contains("import/staging/items_v.csv"), "{err}");
+    }
+
+    /// A data file is `import/<schema>/<table>.<ext>`, or the same under an
+    /// env folder (`import/dev/…`, `import/prod/…`). One a folder deeper —
+    /// `import/staging/sub/x.csv` — was reported as "skipped — this run's env
+    /// is 'dev'", as though `-e staging` would load it, when no `-e` ever
+    /// could; and under an env folder it loaded into `staging.x`, the `sub`
+    /// folder silently dropped. Neither loads; each is named as a layout an
+    /// import does not read, with the layout it does.
+    #[test]
+    fn a_data_file_in_a_folder_an_import_does_not_read_is_named_as_such() {
+        let (_tmp, design) = project_with_staging(
+            Some("staging"),
+            &[
+                STAGED_ITEMS,
+                ("staging/sub/x.csv", "id,name\n1,a\n"),
+                ("dev/staging/sub/y.csv", "id,name\n1,a\n"),
+            ],
+        );
+        let warnings = design.import_warnings(None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("env is")),
+            "no env could load these, so none is blamed: {warnings:?}"
+        );
+        for file in ["import/staging/sub/x.csv", "import/dev/staging/sub/y.csv"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(file) && w.contains("import/<schema>/<table>")),
+                "{file} is named, with the layout an import reads: {warnings:?}"
+            );
+        }
+        let plan = design.import_plan(None);
+        let loaded: Vec<&str> = plan.iter().map(|e| e.table.name.as_str()).collect();
+        assert_eq!(loaded, ["staging.items"], "neither file loads");
     }
 
     /// Every preview prints this plan, so a dry run refuses what the run

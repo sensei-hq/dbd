@@ -662,9 +662,9 @@ mod tests {
     #[test]
     fn table_sqlparser_cannot_read_still_errors() {
         let entity = parse_entity(
-            Path::new("ddl/table/app/excl.ddl"),
+            Path::new("ddl/table/app/inherits.ddl"),
             "set search_path to app;\n\
-             create table excl (id int primary key, r int4range, exclude using gist (r with &&));",
+             create table inherits (id int primary key) inherits (app.base);",
         )
         .unwrap();
         assert!(

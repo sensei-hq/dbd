@@ -861,32 +861,51 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         lines.push(format!("  UNIQUE ({}),", target.quote(&c.name)));
     }
     for con in &td.constraints {
-        if let TableConstraint::Unique {
-            name,
-            columns,
-            nulls_not_distinct,
-        } = con
-            && !columns.is_empty()
-        {
-            // SQL Server's UNIQUE already lets only one NULL in, as `NULLS NOT
-            // DISTINCT` does; the other two treat NULLs as distinct.
-            if *nulls_not_distinct && target != Target::TSql {
+        match con {
+            TableConstraint::Unique {
+                name,
+                columns,
+                nulls_not_distinct,
+            } if !columns.is_empty() => {
+                // SQL Server's UNIQUE already lets only one NULL in, as `NULLS NOT
+                // DISTINCT` does; the other two treat NULLs as distinct.
+                if *nulls_not_distinct && target != Target::TSql {
+                    let d = Downgrade {
+                        entity: e.name.clone(),
+                        column: None,
+                        from: format!("`NULLS NOT DISTINCT` on the UNIQUE ({})", columns.join(", ")),
+                        to: "NULLs that do not collide".to_string(),
+                        reason: format!(
+                            "{}'s UNIQUE treats NULLs as distinct, so the table now admits rows with NULL keys \
+                         that it refused",
+                            target.label()
+                        ),
+                    };
+                    lines.push(format!("  {}", d.comment(target)));
+                    report.push(d);
+                }
+                let named = key_name(e, name.as_deref(), Key::Unique, target, report, &mut lines);
+                lines.push(format!("  {named}UNIQUE ({}),", quote_all(columns, target)));
+            }
+            // No other engine has an exclusion constraint, and no other kind
+            // of constraint enforces what it does.
+            TableConstraint::Exclude { name, definition } => {
                 let d = Downgrade {
                     entity: e.name.clone(),
                     column: None,
-                    from: format!("`NULLS NOT DISTINCT` on the UNIQUE ({})", columns.join(", ")),
-                    to: "NULLs that do not collide".to_string(),
-                    reason: format!(
-                        "{}'s UNIQUE treats NULLs as distinct, so the table now admits rows with NULL keys \
-                         that it refused",
-                        target.label()
+                    from: format!(
+                        "an exclusion constraint{} (`EXCLUDE {definition}`)",
+                        name.as_deref().map(|n| format!(" `{n}`")).unwrap_or_default()
                     ),
+                    to: "no constraint".to_string(),
+                    reason: "the target has no EXCLUDE, so rows it refused — two that conflict under its \
+                             operators — are now accepted"
+                        .to_string(),
                 };
                 lines.push(format!("  {}", d.comment(target)));
                 report.push(d);
             }
-            let named = key_name(e, name.as_deref(), Key::Unique, target, report, &mut lines);
-            lines.push(format!("  {named}UNIQUE ({}),", quote_all(columns, target)));
+            _ => {}
         }
     }
 
@@ -1347,6 +1366,20 @@ fn column_types(e: &Entity, td: &TableDef, script: &Script) -> Vec<ColumnType> {
         .map(|c| {
             let mut notes = Vec::new();
             let ty = map_type(&c.data_type, script, e, c, &mut notes);
+            // A collation is named, and the names are PostgreSQL's: no target
+            // has `"C"` or an ICU locale under the same name. The column takes
+            // the target's default, which may sort and compare differently.
+            if let Some(collation) = &c.collation {
+                notes.push(Downgrade {
+                    entity: e.name.clone(),
+                    column: Some(c.name.clone()),
+                    from: format!("`COLLATE {collation}`"),
+                    to: "the target's default collation".to_string(),
+                    reason: "the collation is PostgreSQL's, by a name the target does not have, so the \
+                             column's values may sort, compare and match differently"
+                        .to_string(),
+                });
+            }
             ColumnType { ty, notes }
         })
         .collect();
@@ -1632,6 +1665,21 @@ fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Do
         quote_all(&fk.columns, target),
         quote_all(&fk.ref_columns, target)
     ));
+    // `MATCH FULL` goes right after the referenced columns. No target enforces
+    // it: SQLite parses it and treats every key as `MATCH SIMPLE`, MySQL
+    // ignores it, SQL Server has no such clause — so a half-NULL key the
+    // PostgreSQL design refuses would pass.
+    if fk.match_full {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: fk.columns.first().cloned(),
+            from: format!("a `MATCH FULL` foreign key ({})", fk.columns.join(", ")),
+            to: "a `MATCH SIMPLE` one".to_string(),
+            reason: "the target does not enforce MATCH FULL, so a key with some columns NULL and \
+                     others not is no longer refused"
+                .to_string(),
+        });
+    }
     for (verb, action) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
         let Some(action) = action else { continue };
         match fk_action(action, target) {
@@ -1643,6 +1691,31 @@ fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Do
                 to: "the default action".to_string(),
                 reason: "MySQL's InnoDB rejects SET DEFAULT, so referencing rows are no longer \
                          reset when the parent row changes"
+                    .to_string(),
+            }),
+        }
+    }
+    // SQLite defers a key exactly as `INITIALLY DEFERRED` does. A key that is
+    // deferrable but checked at once by default needs `SET CONSTRAINTS`, which
+    // SQLite lacks; MySQL and SQL Server defer nothing.
+    if fk.deferrable || fk.initially_deferred {
+        match target {
+            Target::Sqlite if fk.initially_deferred => sql.push_str(" DEFERRABLE INITIALLY DEFERRED"),
+            _ => report.push(Downgrade {
+                entity: e.name.clone(),
+                column: fk.columns.first().cloned(),
+                from: format!(
+                    "a `DEFERRABLE{}` foreign key ({})",
+                    if fk.initially_deferred {
+                        " INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    },
+                    fk.columns.join(", ")
+                ),
+                to: "one checked at once".to_string(),
+                reason: "the target cannot put the check off to the end of the transaction, so a \
+                         child row inserted before its parent is refused"
                     .to_string(),
             }),
         }
