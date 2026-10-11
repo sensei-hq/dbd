@@ -104,138 +104,58 @@ pub(in crate::formatter) struct ItemComments {
 
 /// Extract inline comments from a `CREATE TABLE` column list, one [`ItemComments`]
 /// per top-level (comma-separated) item, in source order. Returns `None` if the
-/// column-list parentheses can't be located. sqlparser discards comments, so this
-/// recovers them from the raw text; the caller only uses the result when it lines
-/// up 1:1 with the parsed items and otherwise keeps the original text verbatim.
+/// column list cannot be located. sqlparser discards comments, so this recovers
+/// them from the text — read as libpg_query's scanner reads it, so a `--`, a
+/// `,` or a `)` inside a string of any kind or a quoted identifier is neither a
+/// comment nor a boundary. The caller only uses the result when it lines up 1:1
+/// with the parsed items and otherwise keeps the original text verbatim.
+///
+/// Within each item, a comment before any code is `leading`; one after code is
+/// `trailing`.
 pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<ItemComments>> {
-    Some(segment_item_comments(table_body(original)?))
-}
-
-/// The text inside a `CREATE TABLE`'s outermost `( … )` column list (exclusive of
-/// the parentheses), or `None` if it can't be located. Skips string literals,
-/// quoted identifiers, and comments while finding the opener and its match.
-pub(in crate::formatter) fn table_body(sql: &str) -> Option<&str> {
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-
-    // Find the column-list opener: the first top-level '(' that is not inside a
-    // string/identifier/comment (a table name carries no parens).
-    let open = loop {
-        if i >= bytes.len() {
-            return None;
-        }
-        match bytes[i] {
-            b'\'' => i = scan_single_quoted(bytes, i),
-            b'"' => i = scan_double_quoted(bytes, i),
-            b'-' if bytes.get(i + 1) == Some(&b'-') => i = scan_line_comment(bytes, i),
-            b'/' if bytes.get(i + 1) == Some(&b'*') => i = scan_block_comment(bytes, i),
-            b'(' => break i,
-            _ => i += 1,
-        }
-    };
-
-    // Scan to the matching close paren, tracking depth (and skipping the same
-    // string/comment regions so a ')' inside them doesn't close early).
-    let mut depth = 0i32;
-    let mut j = open;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'\'' => {
-                j = scan_single_quoted(bytes, j);
-                continue;
-            }
-            b'"' => {
-                j = scan_double_quoted(bytes, j);
-                continue;
-            }
-            b'-' if bytes.get(j + 1) == Some(&b'-') => {
-                j = scan_line_comment(bytes, j);
-                continue;
-            }
-            b'/' if bytes.get(j + 1) == Some(&b'*') => {
-                j = scan_block_comment(bytes, j);
-                continue;
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&sql[open + 1..j]);
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    None
-}
-
-/// Split a column-list body into per-item comments at top-level commas. Within
-/// each item, a comment before any code is `leading`; one after code is
-/// `trailing`. Skips string literals and quoted identifiers so a `--`/`,` inside
-/// them is not mistaken for a comment or an item boundary.
-pub(in crate::formatter) fn segment_item_comments(body: &str) -> Vec<ItemComments> {
-    let bytes = body.as_bytes();
+    use pg_query::protobuf::Token as Kind;
+    let tokens = lex(original)?;
+    // The column list opens at the first `(`: a table name carries none.
+    let open = tokens.iter().position(|t| t.kind == Kind::Ascii40)?;
     let mut items: Vec<ItemComments> = Vec::new();
     let mut cur = ItemComments::default();
     let mut seen_code = false;
-    let mut depth = 0i32;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                seen_code = true;
-                i = scan_single_quoted(bytes, i);
-            }
-            b'"' => {
-                seen_code = true;
-                i = scan_double_quoted(bytes, i);
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                let end = scan_line_comment(bytes, i);
-                let text = body[i..end].trim_end().to_string();
-                if seen_code {
-                    cur.trailing.push(text);
-                } else {
-                    cur.leading.push(text);
-                }
-                i = end;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let end = scan_block_comment(bytes, i);
-                let text = body[i..end].trim().to_string();
-                if seen_code {
-                    cur.trailing.push(text);
-                } else {
-                    cur.leading.push(text);
-                }
-                i = end;
-            }
-            b'(' => {
+    let mut depth = 1usize;
+    for token in &tokens[open + 1..] {
+        match token.kind {
+            Kind::Ascii40 => {
                 depth += 1;
                 seen_code = true;
-                i += 1;
             }
-            b')' => {
+            Kind::Ascii41 => {
                 depth -= 1;
+                if depth == 0 {
+                    items.push(cur);
+                    return Some(items);
+                }
                 seen_code = true;
-                i += 1;
             }
-            b',' if depth == 0 => {
+            Kind::Ascii44 if depth == 1 => {
                 items.push(std::mem::take(&mut cur));
                 seen_code = false;
-                i += 1;
             }
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
-            _ => {
-                seen_code = true;
-                i += 1;
+            Kind::SqlComment | Kind::CComment => {
+                let text = token.text(original);
+                let text = if token.kind == Kind::SqlComment {
+                    text.trim_end()
+                } else {
+                    text.trim()
+                };
+                if seen_code {
+                    cur.trailing.push(text.to_string());
+                } else {
+                    cur.leading.push(text.to_string());
+                }
             }
+            _ => seen_code = true,
         }
     }
-    items.push(cur);
-    items
+    None
 }
 
 /// Render one column line for CREATE TABLE, applying the configured comma style.

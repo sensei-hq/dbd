@@ -325,7 +325,7 @@ impl EnumTypes {
             return data_type.to_string();
         }
         // `public` is searched last: apply appends it to every path a file
-        // states (`ensure_public_in_search_path`), and a file stating none
+        // states (`script::keep_public_on_search_path`), and a file stating none
         // resolves there.
         path.schemas()
             .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
@@ -364,16 +364,32 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     let base_name = name.split('.').next_back().unwrap_or(name);
     let mut lines = vec![format!("Table \"{}\".\"{}\" {{", schema, base_name)];
 
-    // Collect PK columns from table-level constraints
-    let pk_columns: std::collections::HashSet<String> = table_def
-        .constraints
-        .iter()
-        .filter_map(|c| match c {
-            TableConstraint::PrimaryKey { columns, .. } => Some(columns.clone()),
-            _ => None,
-        })
-        .flatten()
-        .collect();
+    // The primary key. A column's `[pk]` cannot carry a name, so a key with a
+    // name of its own is a `pk` entry in the indexes block — DBML's one way to
+    // name one — and its columns go unmarked. A name Postgres would give the
+    // key anyway (`<table>_pkey`) is left out: it comes back by itself, and the
+    // columns keep the `[pk]` dbdiagram.io draws.
+    let named_pk = table_def.constraints.iter().find_map(|c| match c {
+        TableConstraint::PrimaryKey {
+            name: Some(name),
+            columns,
+        } if !columns.is_empty() && *name != format!("{base_name}_pkey") => Some((name.clone(), columns.clone())),
+        _ => None,
+    });
+    let pk_columns: std::collections::HashSet<String> = if named_pk.is_some() {
+        std::collections::HashSet::new()
+    } else {
+        table_def
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::PrimaryKey { columns, .. } => Some(columns.clone()),
+                _ => None,
+            })
+            .flatten()
+            .chain(table_def.columns.iter().filter(|c| c.is_pk).map(|c| c.name.clone()))
+            .collect()
+    };
 
     for col in &table_def.columns {
         lines.push(emit_column(col, &pk_columns));
@@ -386,8 +402,10 @@ fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
     // same thing and still read as drift against the database the design
     // built — a constraint to drop, an index to create — so its note marks it
     // as a constraint (see `index_note`), and it reads back as one.
-    let idx_block: Vec<String> = unique_constraint_indexes(table_def)
-        .map(|ix| emit_index_line(&ix, true))
+    let idx_block: Vec<String> = named_pk
+        .iter()
+        .map(|(name, columns)| pk_index_line(name, columns))
+        .chain(unique_constraint_indexes(table_def).map(|ix| emit_index_line(&ix, true)))
         .chain(table_def.indexes.iter().map(|ix| emit_index_line(ix, false)))
         .collect();
     if !idx_block.is_empty() {
@@ -492,7 +510,7 @@ fn emit_column(col: &ColumnDef, pk_columns: &std::collections::HashSet<String>) 
     let data_type = quote_type_if_needed(&col.data_type);
     let mut settings = Vec::new();
 
-    if col.is_pk || pk_columns.contains(&col.name) {
+    if pk_columns.contains(&col.name) {
         settings.push("pk".to_string());
     }
     if let Some(kind) = col.identity {
@@ -532,6 +550,39 @@ fn emit_indexes(indexes: &[IndexDef]) -> Vec<String> {
     indexes.iter().map(|idx| emit_index_line(idx, false)).collect()
 }
 
+/// The `pk` entry of an `indexes { … }` block for a primary key named `name`.
+fn pk_index_line(name: &str, columns: &[String]) -> String {
+    let keys = if columns.len() == 1 {
+        dbml_column_name(&columns[0])
+    } else {
+        format!(
+            "({})",
+            columns
+                .iter()
+                .map(|c| dbml_column_name(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!("{keys} [pk, name: {}]", dbml_string(name))
+}
+
+/// A column name as an index key: quoted when it is not a plain word.
+fn dbml_column_name(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        dbml_quoted_name(name)
+    }
+}
+
+/// A DBML quoted name, `"…"`, its backslashes and quotes escaped.
+fn dbml_quoted_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// One entry of an `indexes { … }` block; `constraint` when it is a table-level
 /// UNIQUE constraint rather than an index.
 fn emit_index_line(idx: &IndexDef, constraint: bool) -> String {
@@ -544,6 +595,11 @@ fn emit_index_line(idx: &IndexDef, constraint: bool) -> String {
     let mut settings = Vec::new();
     if idx.unique {
         settings.push("unique".to_string());
+    }
+    // The access method is DBML's own `type:` — an identifier, which
+    // @dbml/core accepts for any method (`gin`, `gist`, `brin`, `hnsw` …).
+    if let Some(ref method) = idx.index_type {
+        settings.push(format!("type: {}", method.amname()));
     }
     if let Some(ref name) = idx.name {
         settings.push(format!("name: {}", dbml_string(name)));
@@ -573,12 +629,15 @@ fn index_key(key: &IndexColumn) -> String {
 /// The index `note:` convention: where dbd writes what DBML's index syntax
 /// cannot hold, and where [`crate::dbml_parse`] reads it back.
 ///
-/// DBML's index settings are `type` (btree or hash), `name`, `unique`, `pk` and
-/// `note`; its reference parser rejects anything else. So a partial index's
-/// `WHERE`, a key's sort order and `NULLS NOT DISTINCT` have nowhere to go but
-/// the note — and dropping them is not cosmetic. A unique index on
-/// `(customer_id) WHERE status = 'open'` came back from `init --from-dbml` as a
-/// unique index on `(customer_id)`: one order per customer, ever.
+/// DBML's index settings are `type`, `name`, `unique`, `pk` and `note`; its
+/// reference parser rejects anything else. `type` takes the access method — any
+/// identifier, in @dbml/core 10.3.0, whatever its error message says about
+/// btree and hash — so the method is written there. A partial index's `WHERE`,
+/// a key's sort order and operator class, `NULLS NOT DISTINCT`, `INCLUDE` and
+/// storage parameters have nowhere to go but the note — and dropping them is
+/// not cosmetic. A unique index on `(customer_id) WHERE status = 'open'` came
+/// back from `init --from-dbml` as a unique index on `(customer_id)`: one order
+/// per customer, ever; a covering index came back without its payload.
 ///
 /// The note holds one fact per line. These are the only lines read back, each
 /// matched exactly at the start of a line, and anything else is ignored (an
@@ -592,7 +651,12 @@ fn index_key(key: &IndexColumn) -> String {
 ///   direction, which is what Postgres means by an unadorned key. A line whose
 ///   entries do not cover every key, or do not parse, is ignored whole rather
 ///   than applied to the wrong keys.
+/// - `opclass: <entry>, <entry>, …` — one entry per key, in key order: its
+///   operator class, or `-` for the default. Written only when some key has
+///   one; a line that does not cover every key is ignored whole.
 /// - `nulls not distinct` — the index treats NULLs as equal.
+/// - `include: <column>, <column>, …` — the `INCLUDE` payload columns.
+/// - `with: <name> = <value>, …` — the access method's storage parameters.
 /// - `unique constraint` — the entry is a table-level UNIQUE constraint, not an
 ///   index. A database holds the two as different objects, so a constraint
 ///   read back as an index reads as drift against the database the design
@@ -603,8 +667,13 @@ pub(crate) mod index_note {
 
     const WHERE: &str = "where:";
     const ORDER: &str = "order:";
+    const OPCLASS: &str = "opclass:";
     const NULLS_NOT_DISTINCT: &str = "nulls not distinct";
+    const INCLUDE: &str = "include:";
+    const WITH: &str = "with:";
     const UNIQUE_CONSTRAINT: &str = "unique constraint";
+    /// An `opclass:` entry for a key that uses its type's default.
+    const DEFAULT_OPCLASS: &str = "-";
 
     /// The note for `ix` — `constraint` when it stands for a table-level UNIQUE
     /// — or `None` when DBML's own syntax already says it all.
@@ -624,8 +693,23 @@ pub(crate) mod index_note {
             let entries: Vec<String> = ix.columns.iter().map(order_entry).collect();
             lines.push(format!("{ORDER} {}", entries.join(", ")));
         }
+        if ix.columns.iter().any(|k| k.opclass.is_some()) {
+            let entries: Vec<&str> = ix
+                .columns
+                .iter()
+                .map(|k| k.opclass.as_deref().unwrap_or(DEFAULT_OPCLASS))
+                .collect();
+            lines.push(format!("{OPCLASS} {}", entries.join(", ")));
+        }
         if ix.nulls_not_distinct {
             lines.push(NULLS_NOT_DISTINCT.to_string());
+        }
+        if !ix.include.is_empty() {
+            lines.push(format!("{INCLUDE} {}", ix.include.join(", ")));
+        }
+        if !ix.with_options.is_empty() {
+            let options: Vec<String> = ix.with_options.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+            lines.push(format!("{WITH} {}", options.join(", ")));
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
@@ -644,8 +728,37 @@ pub(crate) mod index_note {
                 }
             } else if let Some(entries) = line.strip_prefix(ORDER) {
                 read_order(entries, &mut ix.columns);
+            } else if let Some(entries) = line.strip_prefix(OPCLASS) {
+                read_opclasses(entries, &mut ix.columns);
             } else if line == NULLS_NOT_DISTINCT {
                 ix.nulls_not_distinct = true;
+            } else if let Some(columns) = line.strip_prefix(INCLUDE) {
+                ix.include = list(columns);
+            } else if let Some(options) = line.strip_prefix(WITH) {
+                ix.with_options = list(options)
+                    .iter()
+                    .filter_map(|o| o.split_once('='))
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .collect();
+            }
+        }
+    }
+
+    /// The entries of a comma-separated line, trimmed, empty ones dropped.
+    fn list(entries: &str) -> Vec<String> {
+        entries
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn read_opclasses(entries: &str, keys: &mut [IndexColumn]) {
+        let parsed: Vec<String> = entries.split(',').map(|e| e.trim().to_string()).collect();
+        if parsed.len() == keys.len() && parsed.iter().all(|e| !e.is_empty()) {
+            for (key, opclass) in keys.iter_mut().zip(parsed) {
+                key.opclass = (opclass != DEFAULT_OPCLASS).then_some(opclass);
             }
         }
     }
@@ -742,7 +855,17 @@ fn qualify_columns(schema: &str, table: &str, cols: &[String]) -> String {
     }
 }
 
+/// One `Ref:` for `fk`, held by `source_schema.source_table`.
+///
+/// A foreign key with a name of its own is a named Ref — `Ref "name": …`,
+/// DBML's one place for it. A name Postgres would give the key anyway
+/// (`<table>_<columns>_fkey`) is left out: it comes back by itself.
 fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String {
+    let default_name = format!("{source_table}_{}_fkey", fk.columns.join("_"));
+    let named = match fk.name.as_deref() {
+        Some(name) if name != default_name => format!(" {}", dbml_quoted_name(name)),
+        _ => String::new(),
+    };
     let ref_schema = fk.ref_schema.as_deref().unwrap_or("public");
     let ref_table = &fk.ref_table;
 
@@ -763,7 +886,7 @@ fn emit_ref(source_schema: &str, source_table: &str, fk: &ForeignKey) -> String 
         format!(" [{}]", settings.join(", "))
     };
 
-    format!("Ref: {} > {}{}", source_cols, target_cols, settings_str)
+    format!("Ref{named}: {} > {}{}", source_cols, target_cols, settings_str)
 }
 
 /// Stub `Table` blocks for every table a Ref from `documented` points at that

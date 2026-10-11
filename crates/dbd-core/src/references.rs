@@ -50,7 +50,7 @@ fn resolve_entity_references(
 ) {
     // The parser qualifies bare references with the first search_path entry.
     // dbd appends `public` to every applied search_path (see
-    // `ensure_public_in_search_path`), so a bare name can resolve there too.
+    // `script::keep_public_on_search_path`), so a bare name can resolve there too.
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
     let search_path: Vec<String> = {
         // Only the NAMED entries: `"$user"` is the connecting role's schema and

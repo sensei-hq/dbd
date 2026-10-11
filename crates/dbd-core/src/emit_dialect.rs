@@ -700,6 +700,46 @@ fn table_name(e: &Entity, target: Target, report: &mut Vec<Downgrade>) -> String
     }
 }
 
+/// Which key [`key_name`] names.
+enum Key<'a> {
+    /// The primary key, on these columns.
+    Primary(&'a [String]),
+    Unique,
+}
+
+/// `CONSTRAINT <name> ` for a key the design names, where the target keeps the
+/// name — or nothing. Every target takes the clause on a UNIQUE, and SQL
+/// Server and SQLite on a primary key; MySQL names every primary key
+/// `PRIMARY`, whatever the DDL calls it, so there the name is reported (and
+/// noted above the key, in `lines`) rather than written to be ignored.
+fn key_name(
+    e: &Entity,
+    name: Option<&str>,
+    key: Key,
+    target: Target,
+    report: &mut Vec<Downgrade>,
+    lines: &mut Vec<String>,
+) -> String {
+    let Some(name) = name else {
+        return String::new();
+    };
+    match key {
+        Key::Primary(columns) if target == Target::MySql => {
+            let d = Downgrade {
+                entity: e.name.clone(),
+                column: None,
+                from: format!("the primary key's name `{name}` ({})", columns.join(", ")),
+                to: "the name `PRIMARY`".to_string(),
+                reason: "MySQL names every primary key PRIMARY, whatever the DDL calls it".to_string(),
+            };
+            lines.push(format!("  {}", d.comment(target)));
+            report.push(d);
+            String::new()
+        }
+        _ => format!("CONSTRAINT {} ", target.quote(name)),
+    }
+}
+
 fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> String {
     let target = script.target;
     let Some(td) = &e.table_def else {
@@ -723,6 +763,11 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     } else {
         inline_pk.clone()
     };
+    // The primary key's name, when the design gives it one.
+    let pk_name = td.constraints.iter().find_map(|con| match con {
+        TableConstraint::PrimaryKey { name: Some(name), .. } => Some(name.as_str()),
+        _ => None,
+    });
     let numbered = numbered_column(td, &pk, target, e.schema.as_deref());
     let types = column_types(e, td, script);
 
@@ -776,7 +821,13 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
         if let Some(clause) = numbering
             && target != Target::MySql
         {
-            col.push_str(&format!(" {clause}"));
+            // SQLite's numbered column is the primary key itself
+            // (`PRIMARY KEY AUTOINCREMENT`), so the key's name goes here.
+            let named = match pk_name {
+                Some(name) if target == Target::Sqlite => format!("CONSTRAINT {} ", target.quote(name)),
+                _ => String::new(),
+            };
+            col.push_str(&format!(" {named}{clause}"));
         }
         if !c.nullable {
             col.push_str(" NOT NULL");
@@ -800,26 +851,42 @@ fn emit_table(e: &Entity, script: &Script, report: &mut Vec<Downgrade>) -> Strin
     // SQLite's numbered column declares the key in place; a second, table-level
     // PRIMARY KEY is refused.
     let key_in_place = target == Target::Sqlite && numbered.is_some();
-    if !inline_pk.is_empty() && !key_in_place {
-        lines.push(format!("  PRIMARY KEY ({}),", quote_all(&inline_pk, target)));
+    // One PRIMARY KEY: a table with two is rejected by every target, and a
+    // table-level key marks its columns `is_pk` as well.
+    if !pk.is_empty() && !key_in_place {
+        let named = key_name(e, pk_name, Key::Primary(&pk), target, report, &mut lines);
+        lines.push(format!("  {named}PRIMARY KEY ({}),", quote_all(&pk, target)));
     }
     for c in td.columns.iter().filter(|c| c.is_unique && !c.is_pk) {
         lines.push(format!("  UNIQUE ({}),", target.quote(&c.name)));
     }
-
     for con in &td.constraints {
-        match con {
-            // Skipped when the columns already declared one inline — a table
-            // with two PRIMARY KEY clauses is rejected by every target.
-            TableConstraint::PrimaryKey { columns, .. }
-                if !columns.is_empty() && inline_pk.is_empty() && !key_in_place =>
-            {
-                lines.push(format!("  PRIMARY KEY ({}),", quote_all(columns, target)));
+        if let TableConstraint::Unique {
+            name,
+            columns,
+            nulls_not_distinct,
+        } = con
+            && !columns.is_empty()
+        {
+            // SQL Server's UNIQUE already lets only one NULL in, as `NULLS NOT
+            // DISTINCT` does; the other two treat NULLs as distinct.
+            if *nulls_not_distinct && target != Target::TSql {
+                let d = Downgrade {
+                    entity: e.name.clone(),
+                    column: None,
+                    from: format!("`NULLS NOT DISTINCT` on the UNIQUE ({})", columns.join(", ")),
+                    to: "NULLs that do not collide".to_string(),
+                    reason: format!(
+                        "{}'s UNIQUE treats NULLs as distinct, so the table now admits rows with NULL keys \
+                         that it refused",
+                        target.label()
+                    ),
+                };
+                lines.push(format!("  {}", d.comment(target)));
+                report.push(d);
             }
-            TableConstraint::Unique { columns, .. } if !columns.is_empty() => {
-                lines.push(format!("  UNIQUE ({}),", quote_all(columns, target)));
-            }
-            _ => {}
+            let named = key_name(e, name.as_deref(), Key::Unique, target, report, &mut lines);
+            lines.push(format!("  {named}UNIQUE ({}),", quote_all(columns, target)));
         }
     }
 
@@ -2554,6 +2621,8 @@ enum PgDefault {
     Now,
     /// `current_date`.
     Today,
+    /// The time of day: `current_time`, `localtime`.
+    TimeOfDay,
     /// `gen_random_uuid()`, or `uuid_generate_v4()` from `uuid-ossp`.
     RandomUuid,
     /// `nextval('seq')` — the sequence as written.
@@ -2650,6 +2719,9 @@ fn read_default(expr: &str, pg_type: &str) -> PgDefault {
             | Svf::SvfopLocaltimestamp
             | Svf::SvfopLocaltimestampN => PgDefault::Now,
             Svf::SvfopCurrentDate => PgDefault::Today,
+            Svf::SvfopCurrentTime | Svf::SvfopCurrentTimeN | Svf::SvfopLocaltime | Svf::SvfopLocaltimeN => {
+                PgDefault::TimeOfDay
+            }
             _ => PgDefault::Other,
         },
         Some(NodeEnum::FuncCall(f)) => {
@@ -2766,6 +2838,21 @@ fn column_default(
         PgDefault::Literal(Literal::Text(t)) => string_literal(&t, target),
         PgDefault::Literal(Literal::Bool(b)) => if b { "1" } else { "0" }.to_string(),
         PgDefault::Literal(Literal::Null) => "NULL".to_string(),
+        // The clock on a time-of-day column is the time of day. Written as the
+        // timestamp, SQLite stored a date and a time in a column of times, and
+        // MySQL refuses CURRENT_TIMESTAMP on a TIME column; an expression
+        // default takes CURRENT_TIME there, at the column's own precision.
+        // `time`, `timetz`, `time (3) with time zone` — not `timestamp`.
+        PgDefault::Now | PgDefault::TimeOfDay if matches!(base.split_whitespace().next(), Some("time" | "timetz")) => {
+            match target {
+                Target::MySql => match ty.trim().to_uppercase().split_once('(') {
+                    Some(("TIME", precision)) => format!("(CURRENT_TIME({precision})"),
+                    _ => "(CURRENT_TIME)".to_string(),
+                },
+                Target::Sqlite => "CURRENT_TIME".to_string(),
+                Target::TSql => "CONVERT(time, SYSDATETIME())".to_string(),
+            }
+        }
         // `now()` on a `date` column is today's date; MySQL refuses
         // CURRENT_TIMESTAMP on a DATE column.
         PgDefault::Now if base != "date" => match target {
@@ -2841,7 +2928,8 @@ fn column_default(
                 }
             }
         }
-        PgDefault::Other => {
+        // The time of day in a column that holds something else.
+        PgDefault::Other | PgDefault::TimeOfDay => {
             lose(
                 "no default",
                 format!(

@@ -15,7 +15,6 @@ use crate::config::ResolvedMatview;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
-use crate::script::ensure_public_in_search_path;
 
 /// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
 /// 'a' = NO ACTION (unspecified — return None so the emitter omits the clause),
@@ -1388,9 +1387,10 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn execute_script(&self, sql: &str) -> Result<()> {
-        // Ensure `public` is always in the search_path — extensions may be
-        // installed there and DDL files often SET search_path without including it.
-        let sql = ensure_public_in_search_path(sql);
+        // `public` stays on every path the script's own `SET search_path` sets —
+        // extensions may be installed there and DDL files often set a path
+        // without it. No text of the script is changed (see the function).
+        let sql = script::keep_public_on_search_path(sql);
         // Route through the open batch transaction if one exists (see `exec_raw`).
         self.exec_raw(&sql).await
     }
@@ -1557,10 +1557,10 @@ impl DatabaseAdapter for PostgresAdapter {
                 .await?;
 
                 // Stage each record as a JSON row — bound, not interpolated into
-                // `execute_script`, which rewrites every `set search_path to …;`
-                // in its text to add `public`. A record is data, and a value that
-                // quoted the statement was altered on the way in. On the pool, as
-                // the CSV `COPY` is: an import never runs inside an apply batch.
+                // a script: a record is data, and interpolated into SQL text it
+                // was read as SQL (a value quoting `set search_path to …;` was
+                // once rewritten on the way in). On the pool, as the CSV `COPY`
+                // is: an import never runs inside an apply batch.
                 let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
                 for record in records {
                     sqlx::query(&insert)

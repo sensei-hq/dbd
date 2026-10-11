@@ -1253,7 +1253,10 @@ impl Design {
                  graph; it only resolves references to it"
             )));
         }
-        let graphable = crate::scope::is_scopable;
+        // A file dbd could not parse is left out, as `dbd graph` tells the user
+        // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
+        // the end of an edge although nothing about it was read.
+        let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
@@ -1712,6 +1715,69 @@ mod tests {
         assert!(!graph.nodes.is_empty());
         assert!(graph.nodes.iter().all(|n| !n.name.starts_with("staging.")));
         assert!(graph.nodes.iter().any(|n| n.name.starts_with("config.")));
+    }
+
+    /// `dbd graph` said a file it could not parse "is left out" — and kept its
+    /// entity in `nodes`, in `layers`, and at the end of an edge. The graph now
+    /// leaves it out as the message says: no node, no layer entry, no edge to
+    /// it, whole or scoped.
+    #[test]
+    fn graph_leaves_out_an_entity_whose_file_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\nscopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        for (name, sql) in [
+            ("good", "create table if not exists app.good (id int primary key);\n"),
+            (
+                "bad",
+                "create table if not exists app.bad (id int primary key,, oops;\n",
+            ),
+            (
+                "child",
+                "create table if not exists app.child (id int primary key, bad_id int references app.bad (id));\n",
+            ),
+        ] {
+            std::fs::write(dir.join(format!("ddl/table/app/{name}.ddl")), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let all = design.resolve_scope(None, None).unwrap();
+        let scoped = design.resolve_scope(Some("app_only"), None).unwrap();
+        for (label, graph) in [
+            ("unscoped", design.graph(None, None).unwrap()),
+            ("all", design.graph(None, Some(&all)).unwrap()),
+            ("scoped", design.graph(None, Some(&scoped)).unwrap()),
+        ] {
+            let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert!(
+                names.contains(&"app.good") && names.contains(&"app.child"),
+                "{label}: {names:?}"
+            );
+            assert!(!names.contains(&"app.bad"), "{label}: no node for app.bad: {names:?}");
+            assert!(
+                graph.layers.iter().flatten().all(|n| n != "app.bad"),
+                "{label}: no layer holds app.bad: {:?}",
+                graph.layers
+            );
+            assert!(
+                graph.edges.iter().all(|e| e.from != "app.bad" && e.to != "app.bad"),
+                "{label}: no edge reaches app.bad"
+            );
+        }
+        assert_eq!(
+            design
+                .unparsed(&all)
+                .unwrap()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.bad"],
+            "and it is the one named as left out"
+        );
     }
 
     #[tokio::test]
@@ -2363,26 +2429,84 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
-    /// `combine` writes the script `apply` would run. Apply adds `public` to every
-    /// `SET search_path` (so an extension installed there resolves); combine
-    /// wrote the files as they were, and `psql -f init.sql` failed where apply
-    /// succeeded.
+    /// `combine` writes the script `apply` would run. Apply keeps `public` on
+    /// every path a file's own `SET search_path` sets (so an extension installed
+    /// there resolves); combine wrote the files as they were, and `psql -f
+    /// init.sql` failed where apply succeeded. The file's own statement is
+    /// still written exactly as it is — `public` comes from a statement of its
+    /// own after it.
     #[test]
     fn combine_writes_the_search_path_apply_uses() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
         std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
-        std::fs::write(
-            dir.join("ddl/table/app/t.ddl"),
-            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n",
-        )
-        .unwrap();
+        let file =
+            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n";
+        std::fs::write(dir.join("ddl/table/app/t.ddl"), file).unwrap();
         let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
         let out = dir.join("init.sql");
         design.combine(&out, None).unwrap();
         let sql = std::fs::read_to_string(&out).unwrap();
-        assert!(sql.contains("set search_path to app, public;"), "{sql}");
+        assert_eq!(
+            search_path_per_table(&sql).get("t").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "the table runs on the file's path, then public:\n{sql}"
+        );
+        assert!(
+            sql.contains("set search_path to app;\n"),
+            "the file's own statement is not rewritten:\n{sql}"
+        );
+    }
+
+    /// The `set search_path to …;` rewrite matched text anywhere, up to the next
+    /// `;`. Supabase's advice for a `SECURITY DEFINER` function is a `SET
+    /// search_path = ''` clause; with `to` it became `'' as $$ select 1, public;`
+    /// and the function failed with `column "public" does not exist`. A string
+    /// literal or a function body quoting the statement was altered the same
+    /// way. Only a top-level `SET search_path` statement is one, and none of
+    /// the text — clause, literal, body — is touched.
+    #[test]
+    fn combine_leaves_every_search_path_text_but_a_statement_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/function/app")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let files = [
+            (
+                "ddl/function/app/secure.ddl",
+                "create or replace function app.secure() returns int\n\
+                 language sql security definer set search_path = ''\nas $$ select 1; $$;\n",
+            ),
+            (
+                "ddl/function/app/secure_to.ddl",
+                "create or replace function app.secure_to() returns int\n\
+                 language sql security definer set search_path to ''\nas $$ select 2; $$;\n",
+            ),
+            (
+                "ddl/function/app/greet.ddl",
+                "create or replace function app.greet() returns text\n\
+                 language plpgsql set search_path to app\nas $$ begin return 'g; ok'; end; $$;\n",
+            ),
+            (
+                "ddl/table/app/notes.ddl",
+                "create table if not exists app.notes (id int primary key, \
+                 body text default 'set search_path to x; y', \
+                 note text default E'set search_path to x;\\' y');\n",
+            ),
+        ];
+        for (rel, sql) in files {
+            std::fs::write(dir.join(rel), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        for (rel, text) in files {
+            assert!(sql.contains(text.trim_end()), "{rel} is written byte for byte:\n{sql}");
+        }
+        assert!(pg_query::parse(&sql).is_ok(), "the script parses:\n{sql}");
     }
 
     /// The search path each `CREATE TABLE` in `sql` runs under: the args of the

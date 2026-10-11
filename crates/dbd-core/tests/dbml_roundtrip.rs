@@ -427,3 +427,122 @@ fn a_keyword_default_survives_dbml_and_back_as_the_keyword() {
         assert_eq!(default(td), default(before), "`{name}`'s default:\n{dbml}");
     }
 }
+
+/// The foreign keys of `td`, as `(name, columns)`.
+fn foreign_keys(td: &TableDef) -> Vec<(Option<&str>, Vec<&str>)> {
+    td.constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::ForeignKey(fk) => {
+                Some((fk.name.as_deref(), fk.columns.iter().map(String::as_str).collect()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The primary key of `td`, as `(name, columns)`.
+fn primary_key(td: &TableDef) -> Option<(Option<&str>, Vec<&str>)> {
+    td.constraints.iter().find_map(|c| match c {
+        TableConstraint::PrimaryKey { name, columns } => {
+            Some((name.as_deref(), columns.iter().map(String::as_str).collect()))
+        }
+        _ => None,
+    })
+}
+
+/// The DBML writer dropped an index's access method, its `INCLUDE` columns,
+/// its operator classes and storage parameters: `init --from-dbml` rebuilt a
+/// GIN index as a btree, a covering index without its payload. DBML's own
+/// `type:` setting carries the method; the rest goes in the index note, as a
+/// partial index's predicate does, and all of it comes back.
+#[test]
+fn an_index_keeps_its_method_include_opclass_and_storage_through_dbml_and_back() {
+    let docs = parse(
+        "ddl/table/shop/docs.ddl",
+        "create table shop.docs (\n\
+           id uuid primary key,\n\
+           name text,\n\
+           body jsonb,\n\
+           owner_id uuid,\n\
+           stamp timestamptz\n\
+         );\n\
+         create index docs_body_idx on shop.docs using gin (body);\n\
+         create index docs_owner_cover_idx on shop.docs (owner_id) include (name, stamp);\n\
+         create index docs_name_pattern_idx on shop.docs (name text_pattern_ops, owner_id) with (fillfactor = 70);",
+    );
+    let original = docs.table_def.clone().unwrap();
+    let dbml = document(&[docs]);
+    assert!(
+        dbml.contains("type: gin"),
+        "DBML's own setting carries the method:\n{dbml}"
+    );
+    let reversed = reverse(&dbml);
+    let td = table(&reversed, "shop.docs");
+    for name in ["docs_body_idx", "docs_owner_cover_idx", "docs_name_pattern_idx"] {
+        assert_eq!(index(td, name), index(&original, name), "{name}:\n{dbml}");
+    }
+    let gin = index(&original, "docs_body_idx");
+    assert_eq!(
+        gin.index_type,
+        Some(dbd_core::entity::IndexType::Gin),
+        "the test means something"
+    );
+}
+
+/// A primary key's and a foreign key's own names were lost: DBML has no
+/// constraint syntax for them, and the writer wrote neither. A named key is
+/// a `pk` index entry with `name:`, a named foreign key a named `Ref` — and a
+/// name Postgres would give the key anyway is left out, so the column keeps
+/// its `[pk]` and the document stays as it was.
+#[test]
+fn primary_and_foreign_key_names_survive_dbml_and_back() {
+    let owners = parse(
+        "ddl/table/shop/owners.ddl",
+        "create table shop.owners (id uuid, region text, constraint owners_key primary key (id, region));",
+    );
+    let pets = parse(
+        "ddl/table/shop/pets.ddl",
+        "create table shop.pets (\n\
+           id uuid,\n\
+           owner_id uuid,\n\
+           region text,\n\
+           vet_id uuid,\n\
+           constraint pets_pkey primary key (id),\n\
+           constraint pets_owner_fk foreign key (owner_id, region) references shop.owners (id, region),\n\
+           constraint pets_vet_id_fkey foreign key (vet_id) references shop.vets (id)\n\
+         );",
+    );
+    let vets = parse(
+        "ddl/table/shop/vets.ddl",
+        "create table shop.vets (id uuid primary key);",
+    );
+    let dbml = document(&[owners, pets, vets]);
+    assert!(
+        dbml.contains("[pk, name: 'owners_key']"),
+        "a named key is a named pk entry:\n{dbml}"
+    );
+    assert!(
+        !dbml.contains("pets_pkey") && !dbml.contains("pets_vet_id_fkey"),
+        "default names are left out:\n{dbml}"
+    );
+    let reversed = reverse(&dbml);
+
+    assert_eq!(
+        primary_key(table(&reversed, "shop.owners")),
+        Some((Some("owners_key"), vec!["id", "region"])),
+        "\n{dbml}"
+    );
+    let pets = table(&reversed, "shop.pets");
+    assert_eq!(primary_key(pets), Some((None, vec!["id"])), "\n{dbml}");
+    let mut fks = foreign_keys(pets);
+    fks.sort();
+    assert_eq!(
+        fks,
+        vec![
+            (None, vec!["vet_id"]),
+            (Some("pets_owner_fk"), vec!["owner_id", "region"])
+        ],
+        "\n{dbml}"
+    );
+}
