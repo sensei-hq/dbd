@@ -1991,6 +1991,69 @@ mod tests {
         );
     }
 
+    /// A name holding a quote or a backslash round-trips. The writer quoted
+    /// names without escaping them — `"we"ird"` is not DBML — and the reader
+    /// ended a quoted name at its first quote, escaped or not, so a column
+    /// came back as `we\` and the rebuilt table file did not parse.
+    #[test]
+    fn a_name_with_a_quote_or_a_backslash_round_trips() {
+        let mut mood = Entity::new(EntityType::Enum, "app.mood");
+        mood.enum_values = ["it's", "say \"hi\""]
+            .iter()
+            .map(|v| EnumValue {
+                name: v.to_string(),
+                note: None,
+            })
+            .collect();
+        let mut table = make_table_entity(
+            "app.t",
+            vec![pk_col("we\"ird", "int"), col("back\\slash", "text")],
+            vec![],
+        );
+        table.table_def.as_mut().unwrap().indexes.push(IndexDef {
+            name: Some("t_weird_idx".to_string()),
+            columns: vec![IndexColumn {
+                name: "we\"ird".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let entities = vec![mood, table];
+        let doc = generate_dbml(&DbmlParams {
+            entities: &entities,
+            project_name: "t",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+
+        let parsed = crate::dbml_parse::parse_dbml(&doc.content).unwrap_or_else(|e| panic!("{e}\n{}", doc.content));
+        let values: Vec<&str> = parsed
+            .iter()
+            .find(|e| e.name == "app.mood")
+            .unwrap()
+            .enum_values
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(values, ["it's", "say \"hi\""], "{}", doc.content);
+        let def = parsed
+            .iter()
+            .find(|e| e.name == "app.t")
+            .unwrap()
+            .table_def
+            .clone()
+            .unwrap();
+        let columns: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["we\"ird", "back\\slash"], "{}", doc.content);
+        assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{}", doc.content);
+    }
+
     /// A column comment keeps its line breaks. They were flattened to spaces
     /// before the note was escaped, so a markdown comment came back from
     /// `init --from-dbml` as one run-on line. DBML's `\n` escape keeps the note

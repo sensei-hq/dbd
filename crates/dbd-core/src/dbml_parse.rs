@@ -2795,4 +2795,28 @@ mod tests {
         let b = find_table(&entities, "app.b").table_def.as_ref().unwrap();
         assert_eq!(b.indexes[0].index_type, Some(crate::entity::IndexType::Gin));
     }
+
+    /// A quoted name reads its backslash escapes as @dbml/core reads them:
+    /// `"we\"ird"` is the column `we"ird`, and `"it\'s"` the value `it's`.
+    #[test]
+    fn a_quoted_name_reads_its_escapes() {
+        let entities = parse_dbml(
+            "Enum \"app\".\"mood\" {\n  \"it\\'s\"\n  \"say \\\"hi\\\"\"\n}\n\
+             Table \"app\".\"t\" {\n  \"we\\\"ird\" int\n  \"back\\\\slash\" int\n}\n",
+        )
+        .unwrap();
+        let mood = find_enum(&entities, "app.mood");
+        let values: Vec<&str> = mood.enum_values.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(values, ["it's", "say \"hi\""]);
+        let t = find_table(&entities, "app.t");
+        let columns: Vec<&str> = t
+            .table_def
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(columns, ["we\"ird", "back\\slash"]);
+    }
 }
